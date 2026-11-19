@@ -1,4 +1,6 @@
 import { Prisma } from '@/app/generated/prisma/client'
+import { mintDocumentNumber } from '@/lib/domain/numbering/mint'
+import { markWmsScopeDirtyInTx } from '@/lib/domain/wms/scope-dirty'
 import type { db } from '@/lib/db'
 import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, refreshSalesOrderLineCogs } from '@/lib/cost-layers'
 import { serializeCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
@@ -33,8 +35,11 @@ import {
 } from '@/lib/domain/sales/repack-recovery-affordance'
 import {
   countUnfinishedRefundReservationReleases,
+  describeUnknownReleaseStatuses,
+  listUnknownReleaseStatuses,
   type OutstandingReleaseReadClient,
 } from '@/lib/domain/sales/refund-reservation-release-outbox'
+import { loadNettedRefundLines } from '@/lib/domain/sales/refund-demand-netting'
 import { UNCOMMITTED_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
@@ -243,7 +248,7 @@ async function loadOrderLeafQuantities(
   // plan, so this check intentionally includes PICKING/PACKED rows as well as
   // SHIPPED rows. That makes concurrent dispatches race-safe for total-qty
   // validation: both transactions see the same active planned shipment set.
-  const [orderLines, activeShipmentLines, refundLines] = await Promise.all([
+  const [orderLines, activeShipmentLines] = await Promise.all([
     client.salesOrderLine.findMany({
       where: { orderId },
       // o3d-kouj: `fulfillmentRequirements` is the line's PINNED recipe — see the note below on
@@ -269,11 +274,10 @@ async function loadOrderLeafQuantities(
     // already nets refunds at BUILD time; this is the dispatch-time backstop for a shipment that
     // predates the refund. Runs under the order lock (transitionShipmentStatus), so a concurrent refund
     // is serialized.
-    client.salesOrderRefundLine.findMany({
-      where: { refund: { orderId } },
-      select: { salesOrderLineId: true, productId: true, qty: true },
-    }),
   ])
+  // o3d-hqvrp.77: units a refund RETURNED from already-shipped goods are not a cancellation, so they
+  // must not net out of what is still to ship.
+  const refundLines = await loadNettedRefundLines(client, { refund: { orderId } })
 
   // Shipment lines are LEAF-product rows: a kit order line expands to its component products, so a kit
   // line can have several shipment lines (one per component) under the same lineId. All quantities must
@@ -541,6 +545,15 @@ export async function confirmSalesOrderShipments(
       )
     }
 
+    // o3d-hqvrp.76: a hold stops fulfilment. Building shipments raised an ON_HOLD order to ALLOCATED
+    // (ON_HOLD -> ALLOCATED is a legal edge), silently lifting the hold, and for a withdrawal hold left
+    // withdrawalHoldAt set on an order that no longer showed as held. Refused before the first write.
+    if (so.status === 'ON_HOLD') {
+      throw new Error(
+        'This order is on hold, so shipments cannot be created for it. Release the hold first, then create the shipments.',
+      )
+    }
+
     const allocs = await tx.orderAllocation.findMany({
       where: { orderId },
       select: { lineId: true, productId: true, warehouseId: true, qty: true },
@@ -573,10 +586,7 @@ export async function confirmSalesOrderShipments(
     // (refund state is orthogonal now and a refund does not delete allocations).
     // Allocations are leaf-product rows, so a refunded sales line is expanded to its
     // component requirements (kit/BOM aware) before reducing the matching allocations.
-    const shipmentRefundLines = await tx.salesOrderRefundLine.findMany({
-      where: { refund: { orderId } },
-      select: { salesOrderLineId: true, productId: true, qty: true },
-    })
+    const shipmentRefundLines = await loadNettedRefundLines(tx, { refund: { orderId } })
     const refundProductIds = [...new Set(
       shipmentRefundLines.map((refundLine) => refundLine.productId).filter((id): id is string => !!id),
     )]
@@ -644,10 +654,13 @@ export async function confirmSalesOrderShipments(
     const createdShipments: ConfirmShipmentsResult['createdShipments'] = []
     for (const [warehouseId, whAllocs] of byWarehouse) {
       const pendingMetadata = pendingMetadataByWarehouse.get(warehouseId)
+      // A shipment carries a reference only when an operator has set a shipment pattern (Settings → Company → Numbering); until then this is null and the row is written exactly as before.
+      const reference = await mintDocumentNumber(tx, 'shipment')
       const created = await tx.shipment.create({
         data: {
           orderId,
           warehouseId,
+          ...(reference !== null ? { reference } : {}),
           status: 'PENDING',
           trackingNumber: pendingMetadata?.trackingNumber ?? null,
           shippingService: pendingMetadata?.shippingService ?? null,
@@ -668,6 +681,9 @@ export async function confirmSalesOrderShipments(
         totalQty: whAllocs.reduce((sum, allocation) => sum + shipmentBoundaryNumber(allocation.qty), 0),
       })
     }
+
+    // The shipments (and their lines) just changed: the warehouse's part of the order must be re-derived.
+    await markWmsScopeDirtyInTx(tx, orderId)
 
     // A FLOOR, not a move — see ORDER_STATUSES_AT_OR_BEYOND_ALLOCATED. An order already at or past
     // ALLOCATED keeps the status it has, so the residual shipments an order held short at PICKING or
@@ -814,6 +830,7 @@ export async function discardCancelledOrderShipmentsInTx(
     },
   })
   await tx.shipment.deleteMany({ where: { id: { in: discarded.map((row) => row.id) } } })
+  await markWmsScopeDirtyInTx(tx, orderId)
   return { discarded }
 }
 
@@ -985,6 +1002,7 @@ export async function reopenShipmentForRepack(
     }
 
     const previousStatus = String(shipment.status)
+    await markWmsScopeDirtyInTx(tx, shipment.orderId)
     await tx.shipment.update({
       where: { id: shipmentId },
       // Status ONLY. trackingNumber and shippingService are deliberately untouched — see the note
@@ -1082,6 +1100,10 @@ export async function validateDispatchPreservesRepackRecovery(
     orderHasUnreopenableCommitment,
   })) return null
 
+  const unknownStatuses = await listUnknownReleaseStatuses(orderId, {
+    client: client as unknown as OutstandingReleaseReadClient,
+  })
+
   return 'This order still owes a repack recovery, so its shipments cannot be dispatched yet. '
     + 'A refund on this order reduced what it is owed, and releasing the refunded units\u2019 stock '
     + 'reservation was deferred because the order already had a shipment \u2014 the release re-runs '
@@ -1090,6 +1112,7 @@ export async function validateDispatchPreservesRepackRecovery(
     + 'the re-allocation would be refused for ever and the reservation would have to be reconciled '
     + 'by hand. Reopen the order\u2019s committed shipments for repack, run \u201CFinish repack '
     + 'recovery\u201D on the order, then rebuild with \u201CCreate Shipments\u201D and dispatch that.'
+    + describeUnknownReleaseStatuses(unknownStatuses)
 }
 
 export async function transitionShipmentStatus(
@@ -1298,6 +1321,7 @@ export async function transitionShipmentStatus(
 
       const lockedProductIds = [...new Set(lockedShipment.lines.map((line) => line.productId))]
 
+      await markWmsScopeDirtyInTx(tx, lockedShipment.orderId)
       await tx.shipment.update({ where: { id: shipmentId }, data })
       const updatedShipment = await loadShipmentTransitionContext(tx, shipmentId)
       if (!updatedShipment) throw new Error('Shipment not found')
@@ -1471,6 +1495,12 @@ export async function transitionShipmentStatus(
     if (lockedOrder && SHIPMENT_TRANSITION_REFUSING_ORDER_STATUSES.has(String(lockedOrder.status))) {
       throw new Error(terminalOrderTransitionError(String(lockedOrder.status)))
     }
+    // o3d-hqvrp.76: an ON_HOLD order's shipments do not advance (the dispatch branch already refuses
+    // it). A warehouse progress report (allowRecordWhenNotReady) is the goods' physical state, so it
+    // is still recorded, as the warehouse dispatch is.
+    if (lockedOrder?.status === 'ON_HOLD' && !input.allowRecordWhenNotReady) {
+      throw new Error('This order is on hold, so its shipments cannot be advanced. Release the hold, then continue picking and packing.')
+    }
     await tx.$queryRaw`SELECT id FROM shipments WHERE id = ${shipmentId} FOR UPDATE`
     const locked = await tx.shipment.findUnique({
       where: { id: shipmentId },
@@ -1480,6 +1510,7 @@ export async function transitionShipmentStatus(
     if (locked.status === targetStatus) return false
     const lockedTransition = validateShipmentStatusTransition(locked.status, targetStatus)
     if (!lockedTransition.success) throw new Error(lockedTransition.error)
+    await markWmsScopeDirtyInTx(tx, locked.orderId)
     await tx.shipment.update({ where: { id: shipmentId }, data })
 
     // Verified AFTER the update on purpose: the check reads the non-PENDING set from the

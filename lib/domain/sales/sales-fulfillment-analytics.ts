@@ -53,6 +53,7 @@ import {
   REFUND_BASIS_NOTICE_GROSS_MARGIN,
   REFUND_BASIS_NOTICE_SALES,
   RETURNS_MIXED_BASIS_MARKER,
+  RETURNS_EXCHANGE_NOTICE,
   RETURNS_MIXED_BASIS_NOTICE,
 } from '@/lib/analytics/refund-figure-surfaces'
 import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
@@ -294,6 +295,14 @@ export type ReturnsReportRow = {
   refundValueUnknownBasis: string
   shippedQty: string
   returnRatePct: string
+  /** Returned units whose refund came with an exchange (replaced by other items on the same order): returned, but not a lost sale. */
+  exchangedQty: string
+  /** The credit of those exchanged returns, on its own basis (null where its credits are not all on one basis, the same admission as refundValueBase). */
+  exchangedRefundValueBase: string | null
+  /** The credit NOT exchanged: what really left the business as a refund (null where mixed). */
+  lostRefundValueBase: string | null
+  /** Return rate counting only the returns that were not exchanged. */
+  returnRateExcludingExchangesPct: string
 }
 
 export type FulfillmentReportRow = {
@@ -456,6 +465,8 @@ type RefundLineRow = {
     /** o3d-iigc round 5: NET / GROSS / null. Governs the line amounts under it. */
     totalsBasis: string | null
     refundedAt: Date
+    /** The replacement lines an exchange added to the order for this refund (Return exchanges); empty or absent for a refund that is not part of one. */
+    exchangeLines?: Array<{ qty: DecimalInput }>
     order: {
       customerName: string | null
       lines: Array<{ productId: string | null; qty: DecimalInput }>
@@ -2237,6 +2248,8 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
             // o3d-iigc round 5: the basis was not fetched, so the report could not have respected it.
             totalsBasis: true,
             refundedAt: true,
+            // An exchange recorded with the return adds replacement lines linked to this refund.
+            exchangeLines: { select: { qty: true } },
             order: { select: { customerName: true, lines: { select: { productId: true, qty: true } } } },
           },
         },
@@ -2325,7 +2338,14 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
     net: Prisma.Decimal
     gross: Prisma.Decimal
     unknown: Prisma.Decimal
+    /** The same figures for the part of the returns that came with an exchange. */
+    exchanged: Prisma.Decimal
+    exchangedNet: Prisma.Decimal
+    exchangedGross: Prisma.Decimal
+    exchangedUnknown: Prisma.Decimal
   }
+  // Replacement units per refund that carries an exchange, counted once however many return lines the refund has.
+  const replacementQtyByRefund = new Map<string, Prisma.Decimal>()
   const groups = new Map<string, ReturnsGroup>()
   for (const line of refundLines) {
     const productKey = line.productId ?? `desc:${line.description}`
@@ -2347,11 +2367,19 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
       refundValueUnknownBasis: '0',
       shippedQty: '0',
       returnRatePct: '0',
+      exchangedQty: '0',
+      exchangedRefundValueBase: '0',
+      lostRefundValueBase: '0',
+      returnRateExcludingExchangesPct: '0',
       refundIds: new Set<string>(),
       returned: new Prisma.Decimal(0),
       net: new Prisma.Decimal(0),
       gross: new Prisma.Decimal(0),
       unknown: new Prisma.Decimal(0),
+      exchanged: new Prisma.Decimal(0),
+      exchangedNet: new Prisma.Decimal(0),
+      exchangedGross: new Prisma.Decimal(0),
+      exchangedUnknown: new Prisma.Decimal(0),
     }
     current.refundIds.add(line.refundId)
     current.refundCount = current.refundIds.size
@@ -2362,12 +2390,25 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
     if (bucket === 'NET') current.net = current.net.add(amount)
     else if (bucket === 'GROSS') current.gross = current.gross.add(amount)
     else current.unknown = current.unknown.add(amount)
+    // A return that came with an exchange is returned AND replaced: its units and its credit are also counted on the exchanged side, so the report can show what was not a lost sale.
+    const replacements = line.refund.exchangeLines ?? []
+    if (replacements.length > 0) {
+      current.exchanged = current.exchanged.add(toDecimal(line.qty))
+      if (bucket === 'NET') current.exchangedNet = current.exchangedNet.add(amount)
+      else if (bucket === 'GROSS') current.exchangedGross = current.exchangedGross.add(amount)
+      else current.exchangedUnknown = current.exchangedUnknown.add(amount)
+      if (!replacementQtyByRefund.has(line.refundId)) {
+        replacementQtyByRefund.set(line.refundId, replacements.reduce((sum, replacement) => sum.add(toDecimal(replacement.qty)), new Prisma.Decimal(0)))
+      }
+    }
     groups.set(key, current)
   }
   const rows = [...groups.values()]
     .map((row) => {
       const shippedQty = row.productId ? shippedByProduct.get(row.productId) ?? new Prisma.Decimal(0) : new Prisma.Decimal(0)
       const stated = statedRefundValue(row.net, row.gross, row.unknown)
+      const exchangedStated = statedRefundValue(row.exchangedNet, row.exchangedGross, row.exchangedUnknown)
+      const lostStated = statedRefundValue(row.net.sub(row.exchangedNet), row.gross.sub(row.exchangedGross), row.unknown.sub(row.exchangedUnknown))
       return {
         productId: row.productId,
         sku: row.sku,
@@ -2383,6 +2424,10 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
         refundValueUnknownBasis: moneyString(row.unknown, baseCurrency),
         shippedQty: qtyString(shippedQty),
         returnRatePct: pctString(row.returned, shippedQty),
+        exchangedQty: qtyString(row.exchanged),
+        exchangedRefundValueBase: exchangedStated.value == null ? null : moneyString(exchangedStated.value, baseCurrency),
+        lostRefundValueBase: lostStated.value == null ? null : moneyString(lostStated.value, baseCurrency),
+        returnRateExcludingExchangesPct: pctString(row.returned.sub(row.exchanged), shippedQty),
       }
     })
     // o3d-iigc round 3's rule, applied to the report that was RANKED by the mixed figure: a row
@@ -2401,6 +2446,13 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
   const totalGross = [...groups.values()].reduce((sum, row) => sum.add(row.gross), new Prisma.Decimal(0))
   const totalUnknown = [...groups.values()].reduce((sum, row) => sum.add(row.unknown), new Prisma.Decimal(0))
   const statedTotal = statedRefundValue(totalNet, totalGross, totalUnknown)
+  const totalExchanged = [...groups.values()].reduce((sum, row) => sum.add(row.exchanged), new Prisma.Decimal(0))
+  const totalExchangedNet = [...groups.values()].reduce((sum, row) => sum.add(row.exchangedNet), new Prisma.Decimal(0))
+  const totalExchangedGross = [...groups.values()].reduce((sum, row) => sum.add(row.exchangedGross), new Prisma.Decimal(0))
+  const totalExchangedUnknown = [...groups.values()].reduce((sum, row) => sum.add(row.exchangedUnknown), new Prisma.Decimal(0))
+  const exchangedTotalStated = statedRefundValue(totalExchangedNet, totalExchangedGross, totalExchangedUnknown)
+  const lostTotalStated = statedRefundValue(totalNet.sub(totalExchangedNet), totalGross.sub(totalExchangedGross), totalUnknown.sub(totalExchangedUnknown))
+  const totalReplacementQty = [...replacementQtyByRefund.values()].reduce((sum, qty) => sum.add(qty), new Prisma.Decimal(0))
   return {
     generatedAt: generatedAt.toISOString(),
     dateFrom: dateOnly(window.dateFrom),
@@ -2409,6 +2461,10 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
     pageInfo: paged.pageInfo,
     totals: {
       returnedQty: qtyString(totalReturned),
+      exchangedQty: qtyString(totalExchanged),
+      replacementQty: qtyString(totalReplacementQty),
+      exchangedRefundValueBase: exchangedTotalStated.value == null ? RETURNS_MIXED_BASIS_MARKER : moneyString(exchangedTotalStated.value, baseCurrency),
+      lostRefundValueBase: lostTotalStated.value == null ? RETURNS_MIXED_BASIS_MARKER : moneyString(lostTotalStated.value, baseCurrency),
       // `refundValueBase` is the whole period on ONE basis, or the MIXED marker. The three buckets
       // are always present, so a reader always sees how much credit exists.
       refundValueBase: statedTotal.value == null ? RETURNS_MIXED_BASIS_MARKER : moneyString(statedTotal.value, baseCurrency),
@@ -2420,9 +2476,87 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
     notices: [
       'Returns analysis uses SalesOrderRefundLine values and compares returned quantity with SALE_DISPATCH quantity in the same period. Return rate is a same-period returned ÷ same-period dispatched metric, not an order-cohort return rate.',
       'Dispatched quantity for kit products is converted from component movements to whole ordered units via the fulfillment-requirement graph, so the return rate divides like units by like units.',
+      RETURNS_EXCHANGE_NOTICE,
       RETURNS_MIXED_BASIS_NOTICE,
     ],
   }
+}
+
+/** One row of the returns-by-reason summary: the structured ReturnReason (or "Unspecified" for refunds with none), how many refunds, and what they credited. */
+export type ReturnsByReasonRow = {
+  reasonId: string | null
+  reason: string
+  refundCount: number
+  returnedQty: string
+  /** The credit on its own basis, or null when the group's credits are not all on one basis (the same admission as ReturnsReportRow.refundValueBase). */
+  refundValueBase: string | null
+  refundValueBasis: string
+  refundValueNetBasis: string
+  refundValueGrossBasis: string
+  refundValueUnknownBasis: string
+}
+
+export const RETURN_REASON_UNSPECIFIED = 'Unspecified'
+
+/**
+ * Returns by configured return reason: refund counts, returned quantity and credit value per ReturnReason, over the same refund lines and period as the
+ * Returns report. A refund counts once however many lines it has. Refunds with no reason (everything before reasons existed, manual refunds where none was
+ * picked, WooCommerce text that matched no reason) are grouped as "Unspecified". The free-text refund reason is not consulted.
+ */
+export async function getReturnsByReasonReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<{ rows: ReturnsByReasonRow[] }> {
+  const client = clientFromDeps(deps)
+  const generatedAt = nowFromDeps(deps)
+  const baseCurrency = await baseCurrencyFromDeps(deps)
+  const window = period(filters, generatedAt)
+  const lines = await client.salesOrderRefundLine.findMany({
+    where: refundLinesRaisedInPeriodWhere(window.dateFrom, window.dateToExclusive),
+    select: {
+      refundId: true,
+      qty: true,
+      totalBase: true,
+      refund: { select: { totalsBasis: true, returnReasonId: true, returnReason: { select: { name: true } } } },
+    },
+    take: SOURCE_ROW_LIMIT + 1,
+  }) as unknown as Array<{ refundId: string; qty: DecimalInput; totalBase: DecimalInput; refund: { totalsBasis: string | null; returnReasonId: string | null; returnReason: { name: string } | null } }>
+  assertSourceLimit(lines.length, SOURCE_ROW_LIMIT, 'Returns-by-reason source rows')
+  type Group = { reasonId: string | null; reason: string; refundIds: Set<string>; returned: Prisma.Decimal; net: Prisma.Decimal; gross: Prisma.Decimal; unknown: Prisma.Decimal }
+  const groups = new Map<string, Group>()
+  for (const line of lines) {
+    const reasonId = line.refund.returnReasonId
+    const key = reasonId ?? ''
+    const group: Group = groups.get(key) ?? {
+      reasonId,
+      reason: line.refund.returnReason?.name ?? RETURN_REASON_UNSPECIFIED,
+      refundIds: new Set<string>(),
+      returned: new Prisma.Decimal(0),
+      net: new Prisma.Decimal(0),
+      gross: new Prisma.Decimal(0),
+      unknown: new Prisma.Decimal(0),
+    }
+    group.refundIds.add(line.refundId)
+    group.returned = group.returned.add(toDecimal(line.qty))
+    const amount = toDecimal(line.totalBase)
+    const bucket = refundTotalsBasis(line.refund.totalsBasis)
+    if (bucket === 'NET') group.net = group.net.add(amount)
+    else if (bucket === 'GROSS') group.gross = group.gross.add(amount)
+    else group.unknown = group.unknown.add(amount)
+    groups.set(key, group)
+  }
+  const rows = [...groups.values()].map((group): ReturnsByReasonRow => {
+    const stated = statedRefundValue(group.net, group.gross, group.unknown)
+    return {
+      reasonId: group.reasonId,
+      reason: group.reason,
+      refundCount: group.refundIds.size,
+      returnedQty: qtyString(group.returned),
+      refundValueBase: stated.value == null ? null : moneyString(stated.value, baseCurrency),
+      refundValueBasis: stated.basis,
+      refundValueNetBasis: moneyString(group.net, baseCurrency),
+      refundValueGrossBasis: moneyString(group.gross, baseCurrency),
+      refundValueUnknownBasis: moneyString(group.unknown, baseCurrency),
+    }
+  }).sort((a, b) => b.refundCount - a.refundCount || a.reason.localeCompare(b.reason))
+  return { rows }
 }
 
 export async function getFulfillmentAnalyticsReport(filters: SalesAnalyticsFilters = {}, deps?: SalesFulfillmentAnalyticsDeps): Promise<SalesAnalyticsReport<FulfillmentReportRow>> {

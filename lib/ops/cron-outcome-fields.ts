@@ -44,7 +44,7 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
     consumed: ['failed', 'backReferenceRepair.failed', 'creditNoteAllocationReenqueue.failed', 'landedCostJournalOutbox.failed', 'provisionalPostingRefusals.failed', 'errors'],
     ignored: { provisionalPostingRefusals: 'the replay result as a whole; its failure count is `provisionalPostingRefusals.failed`, which is consumed' },
   },
-  'activity-cleanup': {},
+  'activity-cleanup': { consumed: ['attachmentFiles.failed'] },
   backup: { consumed: ['error', 'uploadError', 'cleanupError'], skipState: { skipped: true, reason: 'x' } },
   'delivery-status': { consumed: ['failed'] },
   'email-outbox': {
@@ -52,7 +52,7 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
     ignored: { unresolvedWithoutSend: 'the quietest of the four claim-loss counts: nothing was delivered and nothing attributed, so there is no incident (see the field comment in lib/email-outbox.ts); a row left unresolved is reclaimed by the stale-claim pass, and one that keeps failing reaches `parked`, which is consumed' },
   },
   'fx-rates': {
-    consumed: ['failed', 'error', 'pendingWcOrderRetry.failed', 'pendingWcReceiptRetry.queue.failed', 'pendingWcReceiptRetry.queue.error', 'pendingWcReceiptRetry.orphans.failed', 'pendingWcReceiptRetry.orphans.error', 'stepFailures[].error', 'connectorPushFailures', 'pendingWcOrderRetryFailures'],
+    consumed: ['failed', 'error', 'pendingWcOrderRetry.failed', 'pendingWcReceiptRetry.queue.failed', 'pendingWcReceiptRetry.queue.error', 'pendingWcReceiptRetry.orphans.failed', 'pendingWcReceiptRetry.orphans.error', 'paymentMatching.failed', 'paymentMatching.error', 'stepFailures[].error', 'connectorPushFailures', 'pendingWcOrderRetryFailures'],
     breakdownOf: {},
     ignored: {
       'pendingWcReceiptRetry.orphans': 'the sweep result as a whole; its failure count is `pendingWcReceiptRetry.orphans.failed`, which is consumed',
@@ -81,6 +81,7 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
     ignored: { deliveryFailures: 'decides `status` (FAILED when a breach could not be alerted), which the mapping reads' },
   },
   'recompute-product-lead-times': { consumed: ['failed'] },
+  'product-sync-marks': { consumed: ['failed'] },
   'reconciliation-pack': {},
   'reallocation-sweep': {
     consumed: ['errors', 'directCreateMarkers.errors', 'failures', 'stockEnqueueFailures'],
@@ -101,12 +102,17 @@ export const cronFailureFields: Record<CronOutcomeSlug, CronFieldDeclaration> = 
       'connectors.woocommerce.invoiceDocumentPublications.deadLettered',
       'connectors.woocommerce.invoiceDocumentPublications.errors',
       'connectors.woocommerce.invoiceDocumentPublications.error',
+      'connectors.woocommerce.trackingReconcile.failed',
+      'connectors.woocommerce.trackingReconcile.error',
+      'connectors.woocommerce.trackshipRefires.deadLettered',
+      'connectors.woocommerce.trackshipRefires.errors',
+      'connectors.woocommerce.trackshipRefires.error',
     ],
   },
   'wc-reconcile': {
     skipState: { skipped: true, reason: 'x' },
-    consumed: ['orders.errors', 'cancellations.errors', 'products.errors', 'products.permanentErrors', 'refundStockCorrections.error', 'stock.queued.errors', 'stock.sync.errors', 'stock.errors', 'heldSalesInvoices.readError'],
-    breakdownOf: { 'stock.queued.failed': 'stock.queued.errors' },
+    consumed: ['orders.errors', 'cancellations.errors', 'products.errors', 'products.permanentErrors', 'refundStockCorrections.error', 'productPushRetrySweep.error', 'stock.queued.errors', 'stock.sync.errors', 'stock.errors', 'heldSalesInvoices.readError'],
+    breakdownOf: { 'stock.queued.failed': 'stock.queued.errors', 'stock.sync.abortedRemaining': 'stock.sync.errors' },
     ignored: { 'stock.sync.aborted': 'a stock push refused before any work (the setting is off, no credentials or warehouses, or the outbound-write hold): the route reports it as a skip (`reconciliation_refused`) that leaves the pass due, by design; a push that failed in flight carries `stock.sync.errors`, which is consumed', 'heldSalesInvoices.stillStuck': 'held sales invoices waiting on the accounting connector: each pass logs the stuck invoices as an activity warning, and counting them would keep the run red for as long as accounting is disconnected' },
   },
   'wc-withdrawal-sweep': {

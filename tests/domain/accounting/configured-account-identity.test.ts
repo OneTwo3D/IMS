@@ -30,6 +30,8 @@ mock.module('@/lib/db', {
       inventorySnapshot: { findMany: async () => [{ valueBase: '10', valueReplayReliable: true }] },
       inventorySnapshotRun: { findUnique: async () => ({ id: 'r' }) },
       setting: { findUnique: async () => ({ value: '2020-01-01' }) },
+      // The reconciliation also looks for recent sweeps.
+      accountingSyncLog: { findMany: async () => [] },
     },
   },
 })

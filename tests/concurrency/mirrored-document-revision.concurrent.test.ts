@@ -56,6 +56,18 @@ function xeroAppliedAt(secondsAfterCreate: number) {
   return new Date(Date.UTC(2026, 7, 19, 12, 0, secondsAfterCreate))
 }
 
+/**
+ * The unique index behind a P2002 as the driver adapter reports it. Prisma 7.8 gave the column list
+ * ({ fields: ['"externalSystem"', '"externalId"'] }); 7.10 gives the index name instead
+ * ({ index: 'accounting_events_externalSystem_externalId_key' }). Either names exactly the
+ * (externalSystem, externalId) index and nothing else — any other constraint still fails.
+ */
+function isExternalReferenceConstraint(constraint: unknown): boolean {
+  const { fields, index } = (constraint ?? {}) as { fields?: unknown; index?: unknown }
+  if (Array.isArray(fields)) return fields.length === 2 && fields[0] === '"externalSystem"' && fields[1] === '"externalId"'
+  return index === 'accounting_events_externalSystem_externalId_key'
+}
+
 test(
   'a posted invoice revision takes the external id from the event it revises, in one live transaction (o3d-cvj9)',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
@@ -363,10 +375,9 @@ test(
     assert.equal(observed.length, 1, 'the transaction must have reached its assertions')
     const [seen] = observed
     assert.equal(seen.code, 'P2002', 'the collision must still surface as the unique violation')
-    assert.deepEqual(
-      seen.constraint,
-      { fields: ['"externalSystem"', '"externalId"'] },
-      'and it must be the external-reference index that rejected it, not some other constraint',
+    assert.ok(
+      isExternalReferenceConstraint(seen.constraint),
+      `and it must be the external-reference index that rejected it, not some other constraint (got ${JSON.stringify(seen.constraint)})`,
     )
     assert.equal(seen.holderStatus, 'POSTED', 'the unrelated document must not be superseded')
     assert.equal(seen.holderExternalId, invoiceId, 'and it must keep its external id')
@@ -607,10 +618,9 @@ test(
     const [seen] = observed
     assert.equal(seen.transactionStillUsable, true)
     assert.equal(seen.code, 'P2002', 'an unordered pair must leave the unique violation fatal')
-    assert.deepEqual(
-      seen.constraint,
-      { fields: ['"externalSystem"', '"externalId"'] },
-      'and it must be the external-reference index that rejected it, not some other constraint',
+    assert.ok(
+      isExternalReferenceConstraint(seen.constraint),
+      `and it must be the external-reference index that rejected it, not some other constraint (got ${JSON.stringify(seen.constraint)})`,
     )
     assert.deepEqual(seen.rows.map((row) => row.amount), [100, 120, 140])
     assert.deepEqual(

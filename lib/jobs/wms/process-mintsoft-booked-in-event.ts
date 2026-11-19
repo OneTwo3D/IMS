@@ -280,8 +280,8 @@ function incrementCounter(counters: MintsoftBookedInCounters, result: ProcessMin
  */
 export async function enqueueMintsoftBookedInRecheckForAsn(
   externalAsnId: string,
-  options: { reason?: string; now?: () => Date } = {},
-): Promise<MintsoftBookedInCounters & { created: boolean }> {
+  options: { reason?: string; now?: () => Date; respectRetryDelay?: boolean } = {},
+): Promise<MintsoftBookedInCounters & { created: boolean; deferred?: number }> {
   const normalized = externalAsnId.trim()
   if (!normalized) throw new Error('externalAsnId is required')
 
@@ -290,7 +290,14 @@ export async function enqueueMintsoftBookedInRecheckForAsn(
     select: { id: true },
   })
   if (outstanding) {
-    return { ...(await replayMintsoftBookedInEventsForAsn(normalized)), created: false }
+    // The AUTOMATIC pass must not retry an event before its schedule says so: replaying ignores `nextRetryAt`,
+    // so a recheck every tick would burn the retry budget (and write a warning) far faster than the ladder intends.
+    // An operator's explicit Re-check leaves this off and goes now.
+    const replay = await replayMintsoftBookedInEventsForAsn(
+      normalized,
+      options.respectRetryDelay ? { onlyDue: true, now: (options.now ?? (() => new Date()))() } : {},
+    )
+    return { ...replay, created: false }
   }
 
   const at = (options.now ?? (() => new Date()))()
@@ -320,14 +327,17 @@ export async function enqueueMintsoftBookedInRecheckForAsn(
   return { ...counters, created: true }
 }
 
-export async function replayMintsoftBookedInEventsForAsn(externalAsnId: string): Promise<MintsoftBookedInCounters> {
+export async function replayMintsoftBookedInEventsForAsn(
+  externalAsnId: string,
+  options: { onlyDue?: boolean; now?: Date } = {},
+): Promise<MintsoftBookedInCounters & { deferred?: number }> {
   const events = await db.wmsInboundReceiptEvent.findMany({
     where: buildMintsoftWebhookReplayForAsnWhere(externalAsnId),
     orderBy: { receivedAt: 'asc' },
-    select: { id: true },
+    select: { id: true, nextRetryAt: true },
   })
 
-  const counters = {
+  const counters: MintsoftBookedInCounters & { deferred?: number } = {
     processed: 0,
     duplicates: 0,
     pending: 0,
@@ -335,7 +345,13 @@ export async function replayMintsoftBookedInEventsForAsn(externalAsnId: string):
     failed: 0,
   }
 
+  const now = options.now ?? new Date()
   for (const event of events) {
+    if (options.onlyDue && event.nextRetryAt && event.nextRetryAt.getTime() > now.getTime()) {
+      // Not due: leave it alone. Reported so a caller holding a marker knows work is still owed.
+      counters.deferred = (counters.deferred ?? 0) + 1
+      continue
+    }
     incrementCounter(counters, await processMintsoftBookedInEvent(event.id))
   }
 

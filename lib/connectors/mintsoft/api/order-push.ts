@@ -5,6 +5,7 @@ import type {
   WmsMergedSurvivorLookup,
   WmsOrderItemRef,
   WmsOrderCancelResult,
+  WmsOrderHoldResult,
   WmsOrderPushInput,
   WmsOrderPushLine,
   WmsOrderPushResult,
@@ -15,6 +16,7 @@ import { roundTransmittedMoney } from '@/lib/connectors/wms/transmitted-money'
 import { extractMintsoftArrayPayload, extractMintsoftArrayPayloadStrict, extractMintsoftObjectPayload } from './normalizers'
 import { mintsoftRequest } from './client'
 import { assertMintsoftOrderClient, mergedParts as mintsoftMergedParts, requireMintsoftClientId } from './orders'
+import { readShopIossNumber } from '@/lib/domain/accounting/shop-ioss-number'
 import { getMintsoftSettings, parseMintsoftPositiveId } from '../settings/schema'
 
 /**
@@ -128,7 +130,11 @@ export function parseDefaultCourierId(raw: string | null | undefined): number | 
   return Number.isInteger(id) && id > 0 ? id : null
 }
 
-export function buildPushPayload(input: WmsOrderPushInput, courier: CourierOption, includeItems = true): Record<string, unknown> {
+export function buildPushPayload(
+  input: WmsOrderPushInput,
+  courier: CourierOption,
+  includeItems = true,
+): Record<string, unknown> {
   const a = input.shippingAddress
   const payload: Record<string, unknown> = {
     OrderNumber: input.orderNumber,
@@ -156,6 +162,9 @@ export function buildPushPayload(input: WmsOrderPushInput, courier: CourierOptio
   // with includeItems=false, and a Mintsoft order's VAT number may be immutable once
   // created — don't risk an amend rejection by re-sending it.
   if (includeItems && input.vatNumber) payload.VATNumber = input.vatNumber
+  // The shop's own IOSS number (resolved at create time by pushMintsoftOrder, only behind the setting and only for IOSS-stamped orders):
+  // create payload only, like the VAT number.
+  if (includeItems && input.iossNumber) payload.IOSSNumber = input.iossNumber
   if (includeItems) {
     // The order-update endpoint (NewOrder) ignores items, so creates send them here and
     // amendments are reconciled separately via the /Items sub-resource endpoints
@@ -404,6 +413,10 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   // never start a lifecycle we cannot finish.
   const clientId = await getPushClientId('Mintsoft order push')
   const settings = await getMintsoftSettings()
+  // The IOSS number is resolved HERE from the current shop setting (not from a copy stored on the order), for IOSS-stamped orders only, so an
+  // operator's change or clear applies to every order not yet created in Mintsoft. A cleared/invalid setting sends no IOSSNumber.
+  const iossNumber = settings.mintsoft_send_ioss_number === 'true' && input.iossStamped ? await readShopIossNumber() : null
+  if (iossNumber) input = { ...input, iossNumber }
   // Courier selection: a configured shipping-service → CourierServiceId mapping
   // wins; else pass the name through for the WMS to resolve; else (no service on
   // the order at all) fall straight to the configured default id if one is set.
@@ -938,18 +951,35 @@ function amendmentIdentityRefusal(identity: WarehouseOrderIdentity, orderNumber:
   return null
 }
 
+/**
+ * THE AMEND GATE, as one read: the warehouse order must exist, be this order (not merged, not another number) and still be NEW. Null when it can be amended; otherwise the refusal the amendment answers with.
+ * updateMintsoftOrder runs it before it writes, and the sales-order edit asks it (probeMintsoftOrderAmendable) before it commits a line change, so the two can never disagree about what "amendable" means.
+ */
+async function amendGateRefusal(externalOrderId: string, clientId: number, expectedOrderNumber: string | null): Promise<WmsOrderUpdateResult | null> {
+  const { found, isNew, orderNumber, identity } = await fetchMintsoftOrderStatusId(externalOrderId, clientId, expectedOrderNumber)
+  if (!found) return { updated: false, status: 'NOT_FOUND' }
+  const refusal = amendmentIdentityRefusal(identity, orderNumber)
+  if (refusal) return refusal
+  if (!isNew) return { updated: false, status: 'NOT_NEW' }
+  return null
+}
+
+/** READ-ONLY. Can this warehouse order be amended right now? Throws when the warehouse cannot be read (the caller treats that as unknown). Writes nothing. */
+export async function probeMintsoftOrderAmendable(externalOrderId: string, expectedOrderNumber: string | null): Promise<{ amendable: true } | { amendable: false; status: string }> {
+  const clientId = await getPushClientId('Mintsoft order amendability read')
+  const refusal = await amendGateRefusal(externalOrderId, clientId, expectedOrderNumber)
+  return refusal ? { amendable: false, status: refusal.status } : { amendable: true }
+}
+
 export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrderPushInput): Promise<WmsOrderUpdateResult> {
   const clientId = await getPushClientId('Mintsoft order update')
-  const { found, isNew, orderNumber, identity } = await fetchMintsoftOrderStatusId(externalOrderId, clientId, input.orderNumber)
-  if (!found) return { updated: false, status: 'NOT_FOUND' }
   // THE IDENTITY GATE, before any order post or item write. MERGED (flagged MergedOrder=True): the order holds other orders' goods and the
   // absorbing order keeps the survivor's id, so its link can still name it; amending it would diff ALL its lines against this one
   // order's, so the link is handed to the merged paths. MISMATCH / UNVERIFIABLE (not flagged, but the number is not the one IMS pushed, or
   // is missing: a merge whose flag is missing, a rename, an incomplete detail): the same safety, but it proves nothing about a merge, so
   // the link is NOT moved to MERGED; the caller raises a durable notice and leaves the amendment due. Only OK amends.
-  const refusal = amendmentIdentityRefusal(identity, orderNumber)
-  if (refusal) return refusal
-  if (!isNew) return { updated: false, status: 'NOT_NEW' }
+  const gateRefusal = await amendGateRefusal(externalOrderId, clientId, input.orderNumber)
+  if (gateRefusal) return gateRefusal
 
   const settings = await getMintsoftSettings()
   const courierMap = settings.mintsoft_courier_service_map
@@ -1139,6 +1169,46 @@ export async function cancelMintsoftOrder(
     return { cancelled: true, status: 'CANCELLED' }
   }
   throw new Error(toStr(data?.Message) ?? 'Mintsoft order cancel failed')
+}
+
+/**
+ * HOLD a Mintsoft order for a person to merge (GET /api/Order/{id}/MarkAwaitingConfirmation), for MERGE HOLDS ONLY (o3d-zvec.12).
+ *
+ * Unlike the cancel-based hold of a withdrawal, this keeps the order (a cancelled order cannot be merged). It is a WRITE through GET, classified so by
+ * read-allowlist.ts. There is NO release verb here and none is called anywhere: a merge hold is confirmed by a person in the warehouse's own screens
+ * (the owner's ruling; the stale-marker hazard of o3d-3a0t is why IMS keeps the hold's identity in its own table and never releases on a guess).
+ *
+ * The gate is the cancel gate's: the order is read through the ClientId-scoped ownership read, must carry exactly the number IMS pushed, must not be
+ * merged already, and must be NEW (a merge hold on an order past NEW would be a lie). Then ONE request. The answer is told apart:
+ *   - a READ or REQUEST that failed in transport (timeout, 5xx, a redirect-followed 4xx, the outbound-write hold) THROWS: the outcome is unknown and the
+ *     caller must not treat it as a refusal or as a hold;
+ *   - a definite refusal (Success false, or a direct 4xx) RETURNS `held: false, status: 'REFUSED'` with the warehouse's message: nothing changed.
+ */
+export async function holdMintsoftOrderForMerge(
+  externalOrderId: string,
+  /** REQUIRED: the number IMS pushed for the order (null is refused as unverifiable). */
+  options: { expectedOrderNumber: string | null },
+): Promise<WmsOrderHoldResult> {
+  const clientId = await getPushClientId('Mintsoft order merge hold')
+  const { found, statusId, merged, orderNumber, identity } = await fetchMintsoftOrderStatusId(externalOrderId, clientId, options.expectedOrderNumber)
+  if (!found) return { held: false, status: 'NOT_FOUND' }
+  if (identity === 'MISMATCH') return { held: false, status: 'IDENTITY_MISMATCH', ...(orderNumber ? { mergedSurvivorNumber: orderNumber } : {}) }
+  if (identity === 'UNVERIFIABLE') return { held: false, status: 'IDENTITY_UNVERIFIABLE' }
+  if (merged) return { held: false, status: 'MERGED_SURVIVOR', ...(orderNumber ? { mergedSurvivorNumber: orderNumber } : {}) }
+  if (statusId === MINTSOFT_STATUS_CANCELLED) return { held: false, status: 'ALREADY_CANCELLED' }
+  if (statusId !== MINTSOFT_STATUS_NEW) return { held: false, status: 'NOT_HOLDABLE' }
+
+  const result = await mintsoftRequest<unknown>(`/api/Order/${encodeURIComponent(externalOrderId)}/MarkAwaitingConfirmation`)
+  if (result.error) {
+    const refused = result.held !== true && result.status >= 400 && result.status < 500 && result.status !== 408 && result.redirectsFollowed === 0
+    if (refused) return { held: false, status: 'REFUSED', message: result.error }
+    throw new Error(result.error)
+  }
+  const data = extractMintsoftObjectPayload(result.data) as RawOrder | null
+  if (data?.Success === true) return { held: true, status: 'HELD' }
+  if (data && data.Success === false) return { held: false, status: 'REFUSED', message: toStr(data.Message) ?? 'Mintsoft refused the hold' }
+  // No readable verdict: the outcome is unknown, so it is not a refusal.
+  throw new Error('Mintsoft order merge hold: the answer carried no Success verdict, so IMS cannot tell whether the order was held')
 }
 
 const sameRef = (a: WmsOrderItemRef, b: WmsOrderItemRef) => a.externalItemId === b.externalItemId && a.sku === b.sku && a.quantity === b.quantity

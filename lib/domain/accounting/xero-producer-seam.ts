@@ -1,6 +1,6 @@
-import { producerBeforeCutoffNotice, producerShadowNotice } from '@/lib/security/producer-disposition-constants'
+import { producerBeforeCutoffNotice, producerHeldNotice, producerShadowNotice } from '@/lib/security/producer-disposition-constants'
 import type { ProducerDecision } from '@/lib/security/producer-disposition'
-import { createdBeforeCutoffFloor, producerCutoffFloor, producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
+import { createdBeforeCutoffFloor, producerCutoffFloor, producerOperationCutoffFloor, producerOperationEgressVerdict, producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
 import { AccountingSyncType } from '@/app/generated/prisma/client'
 import type { OutboundConnector } from '@/lib/security/outbound-write-hold-constants'
 import {
@@ -102,6 +102,9 @@ export const XERO_OBLIGATION_SOURCES: Readonly<Record<AccountingSyncType, XeroOb
   INVENTORY_ADJUSTMENT: { kind: 'payload', field: 'date' },
   SALES_INVOICE: { kind: 'payload', field: 'date' },
   SALES_INVOICE_UPDATE: { kind: 'payload', field: 'date' },
+  // The delete is dated by the document it removes: the producer writes the document's own date into `date`.
+  SALES_INVOICE_DELETE: { kind: 'payload', field: 'date' },
+  PURCHASE_INVOICE_DELETE: { kind: 'payload', field: 'date' },
   INVOICE_PAYMENT: { kind: 'payload', field: 'paymentDate' },
   // The bill attachment is raised from the posted purchase invoice row (enqueuePurchaseInvoiceFollowUps).
   BILL_ATTACHMENT: { kind: 'parent', via: [['PURCHASE_INVOICE', 'PURCHASE_INVOICE_UPDATE']] },
@@ -110,6 +113,8 @@ export const XERO_OBLIGATION_SOURCES: Readonly<Record<AccountingSyncType, XeroOb
   // The invoice note is raised from the posted INVOICE_PDF row, which is raised from the posted sales invoice row (enqueueSalesInvoiceFollowUps).
   WC_INVOICE_NOTE: { kind: 'parent', via: [['INVOICE_PDF'], ['SALES_INVOICE', 'SALES_INVOICE_UPDATE']] },
   CREDIT_NOTE: { kind: 'payload', field: 'date' },
+  // o3d-ngmt.22: the void carries the day it was raised (the payload's own `date`), the day the process-time hold is judged against.
+  CREDIT_NOTE_VOID: { kind: 'payload', field: 'date' },
   PURCHASE_CREDIT_NOTE: { kind: 'payload', field: 'date' },
   PURCHASE_CREDIT_NOTE_ALLOCATION: { kind: 'payload', field: 'date' },
   STOCK_IN_TRANSIT: { kind: 'payload', field: 'date' },
@@ -122,6 +127,7 @@ export const XERO_OBLIGATION_SOURCES: Readonly<Record<AccountingSyncType, XeroOb
   DAILY_BATCH_INVENTORY_RECONCILIATION: { kind: 'payload', field: 'date' },
   DAILY_BATCH_COGS_RECONCILIATION: { kind: 'payload', field: 'date' },
   DAILY_BATCH_TRANSIT_RECONCILIATION: { kind: 'payload', field: 'date' },
+  DAILY_BATCH_GRIR_RECLASS: { kind: 'payload', field: 'date' },
   UNEARNED_REV_REVERSAL: { kind: 'payload', field: 'date' },
   ALLOCATION_REVERSAL: { kind: 'payload', field: 'date' },
   BILL_PAYMENT: { kind: 'payload', field: 'paymentDate' },
@@ -246,6 +252,39 @@ export function xeroProducerSeamVerdict(input: {
 }
 
 /**
+ * THE DELIVERY GATE OF ONE QUEUED ACCOUNTING ROW, per operation: asked at the claim boundary, after the producer decision said LIVE. It answers for the
+ * row's OWN operation (a bill and a daily batch are step X; the invoice note is step X too but writes to WooCommerce), so a destination opened by an
+ * earlier step never lets a later step's row out. When the only thing missing is the owner's confirmation (absent, or not read yet) the row is HELD and
+ * retried, with no attempt spent and nothing shadowed. Null when the row may be delivered, or the hold is not enforced, or the type is no destination write.
+ */
+export function xeroRowDeliveryHold(input: {
+  type: string
+  env?: Record<string, string | undefined>
+  now?: Date
+  attestations?: ReadonlySet<string>
+}): { message: string; awaiting: boolean } | null {
+  if (Object.prototype.hasOwnProperty.call(ACCOUNTING_SYNC_TYPE_EXCLUSIONS, input.type)) return null
+  const target = destinationAndOperationForSyncType(input.type)
+  if (!target) return null
+  const context = {
+    ...(input.env ? { env: input.env } : {}),
+    ...(input.now ? { now: input.now } : {}),
+    ...(input.attestations ? { attestations: input.attestations } : {}),
+  }
+  const verdict = producerOperationEgressVerdict(target.destination, target.operation as MappedOperation<typeof target.destination>, context)
+  if (verdict.kind !== 'held') return null
+  return {
+    message: producerHeldNotice({ connector: target.destination, reason: verdict.decision.reason, owner: verdict.decision.owner }),
+    awaiting: verdict.awaiting !== undefined,
+  }
+}
+
+/** Every accounting sync type whose delivery gate holds right now (see {@link xeroRowDeliveryHold}): a selection leaves these out so held rows cannot fill a bounded batch. */
+export function xeroHeldDeliveryTypes(input: Omit<Parameters<typeof xeroRowDeliveryHold>[0], 'type'> = {}): AccountingSyncType[] {
+  return Object.values(AccountingSyncType).filter((type) => xeroRowDeliveryHold({ ...input, type }) !== null)
+}
+
+/**
  * THE WRITER-SIDE CUT-OFF FOR ACCOUNTING ROWS: EACH ROW IS FLOORED BY THE LIVE-FROM INSTANT OF THE DESTINATION IT WRITES TO.
  *
  * Every queued row is an AccountingSyncLog row, but not every type writes to Xero: a WC_INVOICE_NOTE writes to WooCommerce
@@ -285,14 +324,22 @@ export function xeroCutoffFloor(context?: FloorContext): Date | null {
   return producerCutoffFloor('xero', context ?? {})
 }
 
-/** The same cut-off for the accounting rows whose destination is WooCommerce (the invoice note), from the WooCommerce live-from instant. */
+/**
+ * The same cut-off for the accounting rows whose destination is WooCommerce (the invoice note): the live-from instant of the NOTE'S OWN step (step X),
+ * not of the earliest step that opened WooCommerce. A note created after step M went live and before step X belongs to Xeroom, which still writes it.
+ */
 export function wooAccountingCutoffFloor(context?: FloorContext): Date | null {
+  return producerOperationCutoffFloor('woocommerce', 'order.invoice-note', context ?? {})
+}
+
+/** The destination-level WooCommerce floor (earliest live step): the stricter-reading floor of a row type nobody has classified. */
+function wooDestinationCutoffFloor(context?: FloorContext): Date | null {
   return producerCutoffFloor('woocommerce', context ?? {})
 }
 
 /** Whether ANY accounting-row floor is in force: the guard of the call sites that read a row's creation time only to compare it with a floor. */
 export function accountingCutoffInForce(context?: FloorContext): boolean {
-  return xeroCutoffFloor(context) !== null || wooAccountingCutoffFloor(context) !== null
+  return xeroCutoffFloor(context) !== null || wooAccountingCutoffFloor(context) !== null || wooDestinationCutoffFloor(context) !== null
 }
 
 /**
@@ -308,21 +355,28 @@ export function xeroBeforeCutoffRefusal(
   if (row.type !== undefined && Object.prototype.hasOwnProperty.call(ACCOUNTING_SYNC_TYPE_EXCLUSIONS, row.type)) return null
   for (const connector of floorDestinationsForType(row.type)) {
     if (connector !== 'xero' && connector !== 'woocommerce') continue
-    const floor = connector === 'xero' ? xeroCutoffFloor(context) : wooAccountingCutoffFloor(context)
+    // A row of a type the map names for WooCommerce is judged by its OWN operation's floor; a type nobody classified by the destination-level one.
+    const own = row.type !== undefined && TYPE_INDEX.has(row.type)
+    const floor = connector === 'xero' ? xeroCutoffFloor(context) : own ? wooAccountingCutoffFloor(context) : wooDestinationCutoffFloor(context)
     if (floor !== null && createdBeforeCutoffFloor(row.createdAt, floor)) return producerBeforeCutoffNotice({ connector, cutoff: floor })
   }
   return null
 }
 
-/** The NOT clause for the rows created before their own destination's floor; none when neither floor is in force. */
+/**
+ * The NOT clause for the rows created before their own floor; none when no floor is in force. A WooCommerce-bound type (the invoice note) is
+ * judged by its own operation's floor (`wooFloor`); a type nobody classified by the destination-level WooCommerce floor (`wooDestinationFloor`).
+ */
 function beforeFloorsClause(
   xeroFloor: Date | null,
   wooFloor: Date | null,
+  wooDestinationFloor: Date | null,
   extra: Record<string, unknown>,
 ): { NOT?: Record<string, unknown> } {
   const parts: Record<string, unknown>[] = []
   if (xeroFloor !== null) parts.push({ ...extra, createdAt: { lt: xeroFloor }, type: { notIn: NOT_A_XERO_WRITE } })
-  if (wooFloor !== null) parts.push({ ...extra, createdAt: { lt: wooFloor }, type: { in: WOO_FLOORED_TYPES } })
+  if (wooFloor !== null && WOO_SYNC_TYPES.length > 0) parts.push({ ...extra, createdAt: { lt: wooFloor }, type: { in: [...WOO_SYNC_TYPES] } })
+  if (wooDestinationFloor !== null && UNMAPPED_SYNC_TYPES.length > 0) parts.push({ ...extra, createdAt: { lt: wooDestinationFloor }, type: { in: [...UNMAPPED_SYNC_TYPES] } })
   if (parts.length === 0) return {}
   return { NOT: parts.length === 1 ? parts[0] : { OR: parts } }
 }
@@ -330,10 +384,15 @@ function beforeFloorsClause(
 /**
  * The same rule as a where-fragment, for a claim or a selection: "NOT (created before its destination's floor AND a write type)". Empty with no
  * floor, so a query that spreads it is the legacy query exactly. The sync log's own statuses are untouched: a settled or cancelled row is not
- * delivered by any query that carries this, so it needs no exception here. `wooFloor` defaults to the WooCommerce floor of this moment.
+ * delivered by any query that carries this, so it needs no exception here. `wooFloor` defaults to the invoice-note floor of this moment and
+ * `wooDestinationFloor` to the destination-level WooCommerce floor.
  */
-export function xeroNotBeforeCutoffWhere(floor: Date | null, wooFloor: Date | null = wooAccountingCutoffFloor()): { NOT?: Record<string, unknown> } {
-  return beforeFloorsClause(floor, wooFloor, {})
+export function xeroNotBeforeCutoffWhere(
+  floor: Date | null,
+  wooFloor: Date | null = wooAccountingCutoffFloor(),
+  wooDestinationFloor: Date | null = wooDestinationCutoffFloor(),
+): { NOT?: Record<string, unknown> } {
+  return beforeFloorsClause(floor, wooFloor, wooDestinationFloor, {})
 }
 
 /**
@@ -343,6 +402,10 @@ export function xeroNotBeforeCutoffWhere(floor: Date | null, wooFloor: Date | nu
  * the floor moved may still be in flight, and waiting behind an undetermined attempt is the money-safe answer. Empty with no floor, so a
  * query that spreads it is the legacy query exactly.
  */
-export function xeroNotNeverDeliverablePendingWhere(floor: Date | null, wooFloor: Date | null = wooAccountingCutoffFloor()): { NOT?: Record<string, unknown> } {
-  return beforeFloorsClause(floor, wooFloor, { status: 'PENDING' })
+export function xeroNotNeverDeliverablePendingWhere(
+  floor: Date | null,
+  wooFloor: Date | null = wooAccountingCutoffFloor(),
+  wooDestinationFloor: Date | null = wooDestinationCutoffFloor(),
+): { NOT?: Record<string, unknown> } {
+  return beforeFloorsClause(floor, wooFloor, wooDestinationFloor, { status: 'PENDING' })
 }

@@ -37,16 +37,43 @@ A live preview updates as you adjust colours, so you can see the result before s
 
 ### Document Numbering
 
-Configure the prefix and padding for auto-generated document numbers:
+Found on the **Numbering** tab. Two parts work together.
 
-| Document Type | Example |
+**Prefixes.** The table at the top sets the prefix each document type starts with (for example `SO-`, `PO-`, `INV-`, `CN-`) and the prefixes of the shopping connectors. Until you set a pattern (below), IMS numbers documents with the defaults:
+
+| Document type | Default number |
 |---|---|
-| Sales Order | SO-00001 |
-| Purchase Order | PO-00001 |
-| Invoice | INV-00001 |
-| Credit Note | CN-00001 |
+| Sales order entered by hand | `SO-20261117-A7X2` (prefix, date, four random characters) |
+| Purchase order | `PO-20261117-K3B9` (prefix, date, four random characters) |
+| Credit note | `CN-2026-00001` (prefix, year, a counter that starts again each year) |
+| Shipment | no number |
 
-Set your preferred prefix (e.g. `SO`, `INV`) and padding length (e.g. 5 digits) for each type.
+**Number patterns.** The card below the table lets you set a pattern and a counter for each document IMS numbers itself: **sales orders entered by hand, purchase orders (and freight orders), credit notes and shipments**. A pattern is plain text (letters, digits and `- _ . / #`) with these tokens:
+
+| Token | Gives |
+|---|---|
+| `{YYYY}` / `{YY}` | the year, four or two digits |
+| `{MM}` / `{DD}` | the month / the day, two digits |
+| `{SEQ}` | the counter exactly as it is: `7`, `42`, `1043`. **Never padded.** |
+| `{SEQ:n}` | the counter padded with zeros to n digits (1 to 12): `{SEQ:5}` gives `00042`. A longer number is not cut. |
+| `{RAND:n}` | n random letters and digits (1 to 8), for documents that are not numbered in sequence |
+
+A pattern must contain `{SEQ}` or `{RAND:n}`. Examples: `ORD-{YYYY}-{SEQ}` gives `ORD-2026-1`, `ORD-2026-2`, and so on; `PO{YY}{MM}-{SEQ:4}` gives `PO2611-0001`.
+
+- **Next number.** The card shows the next number the pattern will give, updating when you leave the box, before anything is saved. A random part is shown as a sample.
+- **The counter restarts with its period.** A pattern with `{YYYY}` or `{YY}` counts from 1 each year, with `{MM}` each month, with `{DD}` each day; without a date token there is one counter for ever. A period that already holds documents carries on after the highest number in it.
+- **Changing a pattern never renumbers a document.** Only documents created afterwards use it. The counter carries on, so a change from `ORD-{SEQ}` to `SALE{SEQ:4}` after `ORD-12` gives `SALE0013`.
+- **A failed save can leave a gap.** A sales order or purchase order takes its number just before it is saved; if the save then fails, that number is not used again, so the sequence can skip a number. Credit note numbers have no gaps from failed saves.
+- **Taken numbers are skipped.** If the next number is already used by another document of that type, IMS takes the next free one. If 1,001 numbers in a row are taken it refuses, and the message tells you to move the counter past them.
+- **Set next number.** Type the number you want the next document to get and press **Set next number**. You can move the counter forward as far as you like. You cannot go back to or below a number already in use: IMS refuses and names the highest one in use.
+- **Emptying a pattern** and saving returns the type to its default (above). **Shipments** carry no reference until you set a shipment pattern; a shipment that is re-planned before it is picked is replaced and takes the next number, so shipment numbers can have gaps.
+- The number is minted once, stored on the document, and read from there everywhere: the PDF, the warehouse and the accounting system (a credit note's number is the one sent to Xero) all show the same value.
+- Needs the **Settings > Company** permission.
+
+**Not configurable here.**
+
+- **Sales invoice numbers.** Xeroom owns sales invoices, so the card lists them as owned by Xeroom and read-only, and IMS does not change how they are numbered. The invoice prefix in the table above is unchanged and applies only to invoices IMS itself numbers for orders entered by hand.
+- **WooCommerce order numbers.** An order imported from WooCommerce keeps the storefront's order number (with its connector prefix) and is never renumbered. Its invoice number is the storefront's own.
 
 ### Email / SMTP
 
@@ -100,6 +127,7 @@ Found at **Settings > Inventory**, this section includes:
 - **Product Categories** — manage the reporting category tree. Add top-level categories or sub-categories under any node; rename inline; move a subtree under a new parent (cycles are prevented); delete a node to promote its children one level up and reassign its products to the parent. The same leaf name can be reused under different parents — for example `Apparel > T-Shirts` and `Promo > T-Shirts` are distinct. WooCommerce product sync mirrors the WC category tree into this list automatically, so connected stores stay in step without manual entry.
 - **Stock adjustment reasons** — define selectable reasons for manual stock adjustments
 - **Accounting mapping** — when an accounting connector is enabled, each adjustment reason can be linked to an account code
+- **Return reasons** — the list of reasons an operator can pick when processing a refund (for example *Arrived damaged*, *Wrong item sent*, *Changed mind*). Each reason has a name, a sort order and an Active flag, like the stock adjustment reasons. Needs the Settings permission. Names must be unique ignoring case. Set a reason **Inactive** to retire it: it leaves the refund dialog but keeps its history in the Returns report. A reason that refunds already use cannot be deleted. A WooCommerce refund whose reason text matches an **active** reason name (ignoring case and surrounding spaces) is mapped to it when it is imported; any other text is left unmapped. IMS never creates a reason by itself, and the free-text refund reason is never changed by this list.
 
 ## Sales Settings
 
@@ -130,10 +158,25 @@ Two read-only lists sit at the bottom of **Settings > Sales**:
 - **Recent Tax Rate Fallbacks** — recent events where a line's tax rate could not be matched and a fallback was used or blocked. Use it to find the rate that needs mapping (see [Troubleshooting](troubleshooting.md)).
 - **Recent Invoice PDF Token Security Signals** — orders whose customer invoice PDF link was used from a copied session or a changed address. An unexpected entry is worth a look; an empty list is normal.
 
+## Custom Fields
+
+Found at **Settings > Custom fields** (needs the company settings permission). Add your own typed fields to **products** (and their variants) and to **sales orders**, with no software change. Both use the same definitions, grouped on screen by a **group** (namespace) you choose, such as `logistics` or `manufacturing`.
+
+- **Add field.** Give it a label, a group, a **key** and a type. The key is lower-case letters, digits and underscores, is unique among the fields for products (and, separately, among those for orders), and **cannot be changed later**: it is the CSV column name (`cf:key`) and the address of the sales order list filter.
+- **Types.** Text (free text, or a **drop-down** if you list choices, one per line), whole number, decimal number (exact, up to 10 decimal places), yes / no, date, date and time (UTC), JSON and link (a web address starting http:// or https://).
+- **Required when saved** stops a value being cleared once it is set. It does not stop a product or order being created without it, and it does not touch existing records.
+- **Changing a field.** The label, group, sort order, required flag and shown/hidden flag can always change. The **type is fixed as soon as any value exists** (the page says how many). To change the type, hide the field and add a new one. A drop-down's choices can change, but a choice that is already used by a value cannot be removed.
+- **Hide / show.** Hiding a field removes it from the product and order pages, the product CSV and the list filter. **No value is deleted**: showing the field again brings every value back. A field with no values can also be deleted.
+- **Limits.** Up to 100 fields per kind (product or order), up to 100 choices on a drop-down, 2,000 characters of text.
+- **Not sent anywhere.** Values stay in IMS: they are not sent to WooCommerce, Mintsoft or Xero, and orders imported from WooCommerce start with no values. Variants keep their own values (nothing is inherited from the variable parent).
+- **Audit.** Creating, changing, hiding and deleting a field is written to the Activity Log.
+
 ## Purchasing Settings
 
 - **Purchase units** — define units of measure with conversion factors (e.g. 1 case = 12 units)
 - **Landed cost distribution method** — choose how landed costs are allocated across purchase order lines
+- **Minimum margin** — the lowest gross margin a purchase order line may have, against the product's list price ex-VAT (Admin only). Set a **global minimum %** (0 to 99.99), and optionally a different minimum for individual **categories** and **products**; the most specific one wins (product, then its parent product, then category, then global). Choose **Warn** (the line is marked on the PO form) or **Block** (the server refuses to save or send the order until an override note is entered; the note is recorded on the order with who and when). Leave everything empty for no minimum, which is the default and changes nothing. A line whose margin cannot be worked out is never blocked. Internal only: see Purchasing, "Minimum margin (warn or block)".
+- **Purchase order approval threshold** — **Settings > Company > Documents**. An amount in base currency (ex VAT). A goods purchase order at or above it must be approved by a user holding the `purchasing.approve` permission (Administrators and Managers; never the order's creator) before it can be sent or emailed to the supplier. Blank or 0 (the default) means no approval is needed. See [Purchasing](purchasing.md#purchase-order-approval).
 
 ## Accounting Settings
 
@@ -148,7 +191,7 @@ The page has four tabs: **Financial Year**, **Tax**, **Currencies** and **FX Rat
 - **FX Rates** (FX Rates tab) — the current exchange rate per currency (pin a **manual override** with the pencil icon, clear it to go back to the fetched rate), the log of recent pushes to the store, and an **Integration health** card (last fetch, last fetch attempt, last WooCommerce push, currencies under manual override, and a **Probe helper plugin** button that checks the onetwoInventory Helper plugin is reachable).
 - **Exchange-rate source** (FX Rates tab) — `ECB (frankfurter)` is the default and what you should leave selected: IMS fetches the daily European Central Bank rates for its own use. It does not push them to the store: helper plugin 1.3.0 refuses rate pushes, and the store's currency switcher owns the storefront rates. An `Aelia` option (read the rates from the store's currency switcher instead) exists on the same card but is **not yet switched on**: it needs the onetwoInventory Helper plugin 1.3.0 or later deployed on the store first and the owner's go-ahead, so do not choose it until you are told to. The card asks you to confirm before it switches.
 - **FX rate schedule** (Currencies tab) — shows when rates were last updated and has the **Update Now** button for an immediate update. Whether the automatic update runs, and when, is set on the **FX Rate Update** job in **Settings > System > Scheduler** (daily at 07:00 by default).
-- **Reverse-charge accounting tax types** — connector-specific tax codes that IMS swaps in for any line whose `TaxRate.reverseCharge` is true. Configure `accounting_reverse_charge_sales_tax_type` (typical Xero: `ECOUTPUTSERVICES`) and `accounting_reverse_charge_purchase_tax_type` (typical Xero: `REVERSECHARGES`). Empty values disable the swap — the line posts with the parent `TaxRate.accountingTaxType` and is not flagged as reverse-charge on the VAT return.
+- **Reverse-charge accounting tax types** — connector-specific tax codes that IMS swaps in for any line whose `TaxRate.reverseCharge` is true. Configure `accounting_reverse_charge_sales_tax_type` (typical Xero: `ECOUTPUTSERVICES`) and `accounting_reverse_charge_purchase_tax_type` (typical Xero: `REVERSECHARGES`). An empty **sales** value no longer lets a reverse-charge sales line post on its taxable code: a native sales invoice is refused with a message naming the setting (WooCommerce order import is unchanged). The purchase value is unchanged (empty: the bill line keeps its parent `TaxRate.accountingTaxType`).
 
 The organisation base currency is not changed here. It is defined in **Settings > Company** and is treated as a one-time setup choice for a live system.
 
@@ -282,7 +325,8 @@ Full system backup and restore functionality is available for administrator-led 
 
 Backups can be uploaded to remote storage to keep them off the application server:
 
-1. On the **Storage** tab, fill in the **S3 Compatible Storage** card (endpoint (blank for AWS S3), region, bucket, access key, secret key, optional path prefix) or the **SFTP Server** card (host, port, username, password or private key, **Host Fingerprint** (required, it pins the server's identity so a wrong host is refused) and remote path) and save it. Changing an S3 endpoint or the SFTP host or fingerprint changes where backups are sent, so check the values first.
+1. On the **Storage** tab, fill in the **S3 Compatible Storage** card (endpoint (blank for AWS S3), region, bucket, access key, secret key, optional path prefix) or the **SFTP Server** card (host, port, username, password or private key, **Host Fingerprint** (required, it pins the server's identity so a wrong host is refused) and remote path) and save it. Changing an S3 endpoint or the SFTP host or fingerprint changes where backups are sent, so check the values first. Saving the Storage settings, creating a backup and uploading one all ask you to **Confirm it's you**; when you change the S3 endpoint/bucket or the SFTP host, port or user you must also re-enter the secret key, password or private key.
+   - **Encrypt backups before upload** (Storage tab, off by default): uploads the SQL backup as an encrypted `.sql.enc`. The key lives in the server environment (`BACKUP_ENCRYPTION_KEY`, else `SETTINGS_ENCRYPTION_KEY`), not in the backup; keep a copy in your secret store, because an encrypted backup cannot be restored without it. To restore, decrypt it first with `scripts/decrypt-backup.ts` (see `docs/backup-restore.md`), then use **Restore from File**.
 2. On the **Scheduler** tab, set **Auto-upload** to **S3** or **SFTP**. Every scheduled backup then uploads both the `.sql` and `.manifest.json` files.
 
 For a backup you made by hand, use the cloud icon (**Upload to S3**) or the server icon (**Upload via SFTP**) on its row.
@@ -339,7 +383,7 @@ This means an admin viewing the activity log can see who did what but not see se
 
 ## System Settings
 
-**Settings > System** has five tabs: **Releases** (the current version, what changed and the release history), **Plugins**, **Scheduler**, **Data Retention** (which also holds the activity-log retention) and **Database Reset**.
+**Settings > System** has five tabs: **Releases** (the current version, what changed and the release history; the same read-only notes are open to every internal role (not supplier-portal users) at **Help > What's New** (`/help/releases`), which is where the What's New notification links), **Plugins**, **Scheduler**, **Data Retention** (which also holds the activity-log retention) and **Database Reset**.
 
 - **Plugins** — enable or disable shopping/accounting connector plugins. Disabled plugins are hidden from menus and shared UI.
   - Each plugin has a switch, and **Save & Apply** at the bottom saves the selection and updates the scheduler's crontab to match. If the selection saves but the crontab could not be updated, an amber message says so and tells you what to do; the selection itself is kept.
@@ -370,7 +414,9 @@ This means an admin viewing the activity log can see who did what but not see se
   On **Xero**, a compacted accounting sync row is **still repaired**: the repair sweep can still
   write its external id onto the order or bill, because everything that write needs survives
   compaction. What cannot survive is the follow-up work built from the payload (invoice PDF, payment
-  registration, bill attachment). If the sweep repairs one of these rows — or if you retry one by hand
+  registration, bill attachment). A compacted **journal** also keeps the per-account net the Allocated
+  Inventory reversal proof reads, so it stays provable (see *Xero Sync*); a journal whose payload cannot be
+  read is left uncompacted and reported. If the sweep repairs one of these rows — or if you retry one by hand
   from the Accounting Sync page, which settles it against the id it already has rather than
   re-sending it — a WARNING is written to the activity log
   (`xero_backreference_followups_discarded`) naming the document, so you can check whether its PDF or
@@ -422,7 +468,7 @@ Defaults are what the Scheduler shows until you change them. "On" means switched
 | `/api/cron/fx-rates` | Fetch exchange rates from frankfurter.dev (the ECB rates) and replay any WooCommerce orders waiting for a rate. With the Aelia FX source (not yet switched on) it would read them from the store instead | Daily at 07:00 | On |
 | `/api/cron/wc-reconcile` | WooCommerce backup reconciliation of orders and products and stock catch-up | Hourly | On |
 | `/api/cron/wc-withdrawal-sweep` | Re-check every order IMS refused (EU withdrawal requests, orders held back by the status selection or an unmapped status) against the live store | Every 15 min | On |
-| `/api/cron/shopping-webhook-inbox` | Process stored WooCommerce webhook events and retry queued "completed" pushes | Every 5 min | On |
+| `/api/cron/shopping-webhook-inbox` | Process stored WooCommerce webhook events, retry queued "completed" pushes, and (only when `trackship_refire_enabled` is `true`) re-register shipped orders TrackShip holds no shipment for | Every 5 min | On |
 | `/api/cron/accounting-sync` | Drain the pending accounting sync queue | Every 5 min | On |
 | `/api/cron/accounting-payment-poll` | Detect paid invoices and bills in Xero | Every 15 min | On |
 | `/api/cron/accounting-payment-reconcile` | Slow backlog check of every linked invoice and bill against its current Xero status (report only unless switched to apply) | Daily at 03:00 | On |
@@ -433,11 +479,12 @@ Defaults are what the Scheduler shows until you change them. "On" means switched
 | `/api/cron/accounting-fx-revaluation` | Unrealised FX on open AR/AP | Daily | Not in the Scheduler list; schedule it from the server's own cron if you use accounting |
 | `/api/cron/delivery-status` | Tracking provider polling | Every 15 min | On |
 | `/api/cron/refund-reservation-release` | Safety net that releases stock reservations for refunded units | Every 15 min | On |
+| `/api/cron/product-sync-marks` | Sends the shop and warehouse sync owed by products edited by CSV, 25 products per run | Every 5 min | On |
 | `/api/cron/reallocation-sweep` | Re-run allocation for processing orders left short | Every 15 min | On |
 | `/api/cron/invariant-check` | Scheduled data-integrity check (see below) | Daily at 04:00 | On |
 | `/api/cron/read-sync-liveness` | Hourly check that every read feed that keeps IMS current (store order sweep, warehouse despatch poll and status refresh, account balance snapshots, tax rates, chart refresh) has succeeded recently; alerts administrators once per breach | Hourly (at :25) | On |
 | `/api/cron/writers-check` | Hourly record of whether IMS and another system could both write the same thing; for the switchover only | Hourly (at :40) | Off |
-| `/api/cron/invoice-documents` | Fetch the customer invoice PDF from the ledger for storefront orders after a set start date | Every 15 min | Off |
+| `/api/cron/invoice-documents` | Fetch the customer invoice PDF from the ledger for storefront orders after a set start date, and for any historic order a customer has asked for (when on-demand fetch is on) | Every 15 min | Off |
 | `/api/cron/backup` | Database backup (also controlled from Backup & Restore) | Daily at 01:00 | Off until you switch it on |
 | `/api/cron/product-lifecycle-archive` | Auto-archive exhausted EOL products | Daily at 00:30 | On |
 | `/api/cron/recompute-product-lead-times` | Recompute each product's observed supplier lead time for Reorder Planning | Daily at 04:00 | On |

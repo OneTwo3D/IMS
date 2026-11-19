@@ -38,7 +38,7 @@ test('CENSUS 1: every file that RENDERS a PDF document is classified', () => {
   const table: Record<string, Verdict> = {
     'lib/order-email.ts': GUARDED('assertNoStoreCreditInvoiceDocument(so)'),
     'app/api/invoice/[id]/route.ts': GUARDED('storeCreditInvoiceDocumentRefusal(creditBlock)'),
-    'app/api/sales-order/[id]/route.ts': GUARDED('orderDocumentMoney(so)'),
+    'lib/sales-order-pdf.ts': GUARDED('orderDocumentMoney(so)'), // the ONE sales order / quote renderer (the download route, the order confirmation attachment and the quote email all call it)
     'lib/pdf.ts': EXEMPT('the createPdfDocument definition; renders nothing itself'),
     'app/api/packing-slip/[id]/route.ts': EXEMPT('packing slip: lines and quantities, no money totals'),
     'app/api/packing-slips/route.ts': EXEMPT('batch packing slips (several orders in one PDF, same renderer): lines and quantities, no money totals'),
@@ -69,6 +69,11 @@ test('CENSUS 2: every place a STORED invoice PDF is served is the accounting sys
     'lib/connectors/woocommerce/sync/invoice-document-jobs.ts', 'lib/connectors/woocommerce/sync/invoice-document.ts',
     'lib/domain/invoice-documents/current-document.ts', 'lib/invoice-pdf.ts', 'lib/order-email.ts',
   ].sort(), 'a new place serves a stored invoice PDF: classify it')
+  // A stored CREDIT NOTE is the ledger's own document for one refund (it states the refund's credit, never an order total, so the
+  // store-credit rule for invoices does not apply). It is read by the customer credit note route, through the one reader.
+  const creditNoteReaders = grepFiles('(loadCurrentCreditNotePdf|loadCreditNotePdf)\\(')
+  precondition('stored credit note servers', { files: creditNoteReaders })
+  assert.deepEqual(creditNoteReaders, ['app/api/shopping/[connector]/credit-note-pdf/route.ts', 'lib/domain/invoice-documents/current-document.ts'].sort(), 'a new place serves a stored credit note PDF: classify it')
   // Stored PDFs are written only by the Xero INVOICE_PDF follow-up (saveInvoicePdf), which never runs for a credit order.
   assert.ok(read('lib/connectors/xero/sync-processor.ts').includes('saveInvoicePdf'))
 
@@ -76,14 +81,15 @@ test('CENSUS 2: every place a STORED invoice PDF is served is the accounting sys
     ['SALES_ORDER_CONFIRMATION', EXEMPT('order confirmation: shows the credit as its own line, so it adds up (census 1)')],
     ['INVOICE', GUARDED('getInvoiceQueueData(orderId)')],
     ['ACCOUNTING_INVOICE', GUARDED('getAccountingInvoiceQueueData(orderId)')],
+    ['SALES_QUOTE', EXEMPT('quotation (a draft with a flag): an offer, not an invoice; the sales order renderer shows any credit as its own line (census 1), and the email only goes while the quote switch is on')],
   ])
   const queued = [...new Set(
-    [...read('app/actions/email.ts').matchAll(/kind: '([A-Z_]+)'/g), ...read('lib/accounting-email.ts').matchAll(/kind: '([A-Z_]+)'/g)].map((m) => m[1]),
+    [...read('app/actions/email.ts').matchAll(/kind: '([A-Z_]+)'/g), ...read('app/actions/sales-quotes.ts').matchAll(/kind: '([A-Z_]+)'/g), ...read('lib/accounting-email.ts').matchAll(/kind: '([A-Z_]+)'/g)].map((m) => m[1]),
   )].sort()
   precondition('queued email kinds', { queued, dispatch: 'SHIPMENT_DISPATCHED (lib/dispatch-email.ts)' })
   assert.deepEqual(queued, [...kinds.keys()].sort())
   const prepared = [...read('lib/order-email.ts').matchAll(/kind === '([A-Z_]+)'/g)].map((m) => m[1]).sort()
-  assert.deepEqual(prepared, ['ACCOUNTING_INVOICE', 'INVOICE', 'SALES_ORDER_CONFIRMATION', 'SHIPMENT_DISPATCHED'], 'a new outbox kind is prepared: classify it')
+  assert.deepEqual(prepared, ['ACCOUNTING_INVOICE', 'INVOICE', 'SALES_ORDER_CONFIRMATION', 'SALES_QUOTE', 'SHIPMENT_DISPATCHED'], 'a new outbox kind is prepared: classify it')
   assert.ok(read('lib/order-email.ts').slice(read('lib/order-email.ts').indexOf('async function buildDispatchEmail')).includes('itemLines'), 'the dispatch email lists items and tracking only')
   assert.doesNotMatch(read('lib/order-email.ts').slice(read('lib/order-email.ts').indexOf('async function buildDispatchEmail'), read('lib/order-email.ts').indexOf('export async function getSalesOrderConfirmationQueueData')), /totalForeign/, 'SHIPMENT_DISPATCHED shows no total')
   const email = read('app/actions/email.ts')
@@ -109,7 +115,7 @@ test('the order documents show the credit beside the Total, so their figures add
   const helper = read('lib/pdf-order-money.ts')
   assert.ok(helper.includes('storeCreditForeign: n(so.storeCreditForeign)'), 'the shared helper hands the order credit to the view')
   assert.ok(helper.includes('documentTotalsRows(view'), 'the shared helper prints the shared totals block')
-  for (const file of ['lib/order-email.ts', 'app/api/sales-order/[id]/route.ts', 'app/api/invoice/[id]/route.ts']) {
+  for (const file of ['lib/order-email.ts', 'lib/sales-order-pdf.ts', 'app/api/invoice/[id]/route.ts']) {
     const src = read(file)
     assert.ok(src.includes('orderDocumentMoney(so)') && src.includes('drawTotalsRows('), `${file} prints the shared totals block`)
   }

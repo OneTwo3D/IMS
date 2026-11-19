@@ -346,16 +346,18 @@ test('SO-H2: a LIVE order whose invoice would not book to its total is refused a
   const orders = await s.db.salesOrder.count()
   const allocations = await s.db.orderAllocation.count()
   const syncRows = await s.db.accountingSyncLog.count()
-  // The header names the 20% code but the order is told 10%: shipping is stored with 10% VAT and sent on the 20% code.
+  // The header names the 20% code but the order is told 10%: shipping would be stored with 10% VAT and sent on the 20% code, so the invoice would not book to the total. The header rate guard now refuses this
+  // mismatch before the reconciliation is reached (the named rate's value wins), so the operator sees TAX_RATE_CHANGED; either way nothing is written. A consistent order still reconciles and goes through below.
   const r = await createSalesOrder(orderInput({ pricesIncludeVat: false, lines: [line(100)], taxRateName: 'AUD Sales 20', taxRateValue: 0.1, shippingForeign: 10 }) as never)
   assert.equal(r.success, false)
-  assert.match(String(r.error), /^The invoice built for this order would total 132\.00 GBP but the order totals 131\.00 GBP/, 'the operator sees the message itself, not an error class')
+  assert.match(String(r.error), /^TAX_RATE_CHANGED: the tax rate is now 0\.2 but this order was prepared with 0\.1/, 'the operator sees the message itself, not an error class')
   assert.equal(await s.db.salesOrder.count(), orders, 'no order was written')
   assert.equal(await s.db.orderAllocation.count(), allocations, 'no stock was allocated')
   assert.equal(await s.db.accountingSyncLog.count(), syncRows, 'no invoice was queued')
-  // The same order as a DRAFT is saved (it is checked at finalisation), and the consistent live order still goes through.
+  // The same mismatched header is refused as a DRAFT too (the header rate is checked when the order is prepared), and the consistent live order still goes through.
   const draft = await createSalesOrder(orderInput({ isDraft: true, pricesIncludeVat: false, lines: [line(100)], taxRateName: 'AUD Sales 20', taxRateValue: 0.1, shippingForeign: 10 }) as never)
-  assert.equal(draft.success, true, draft.error)
+  assert.equal(draft.success, false)
+  assert.match(String(draft.error), /^TAX_RATE_CHANGED/)
   const ok = await createSalesOrder(orderInput({ pricesIncludeVat: false, lines: [line(100)], taxRateName: 'AUD Sales 20', taxRateValue: 0.2, shippingForeign: 10 }) as never)
   assert.equal(ok.success, true, ok.error)
   assert.equal((await invoiceRows(ok.order!.id)).length, 1)
@@ -563,7 +565,7 @@ async function seedBill() {
   assert.equal(created.success, true, String(created.error))
   const po = await s.db.purchaseOrder.findUniqueOrThrow({ where: { reference: ref }, select: { id: true } })
   await s.db.purchaseOrder.update({ where: { id: po.id }, data: { status: 'PO_SENT' } })
-  const bill = await createInvoice(po.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-1', lines: [{ kind: 'product', poLineId: (await s.db.purchaseOrderLine.findFirstOrThrow({ where: { poId: po.id }, select: { id: true } })).id, qtyBilled: 10, unitCostForeign: 12 }] } as never)
+  const bill = await createInvoice(po.id, { invoiceDate: '2026-11-01', invoiceNumber: 'SUP-1', allowDuplicateInvoiceNumber: true, lines: [{ kind: 'product', poLineId: (await s.db.purchaseOrderLine.findFirstOrThrow({ where: { poId: po.id }, select: { id: true } })).id, qtyBilled: 10, unitCostForeign: 12 }] } as never)
   assert.equal(bill.success, true, String(bill.error))
   const invoice = await s.db.purchaseInvoice.findFirstOrThrow({ where: { poId: po.id }, select: { id: true, lines: { select: { id: true } } } })
   return { poId: po.id, invoice }

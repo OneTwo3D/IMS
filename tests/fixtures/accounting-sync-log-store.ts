@@ -17,6 +17,8 @@ export type SyncLogRow = {
   referenceId: string
   externalTransactionId: string | null
   payload: unknown
+  /** o3d-oyur: the per-account summary compaction keeps when it drops `payload`. Absent reads as NULL. */
+  payloadAccountNets?: unknown
   errorMessage: string | null
   retryCount: number
   attemptRevision: number

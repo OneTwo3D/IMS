@@ -2,7 +2,7 @@
 
 import { useState, useTransition, useEffect } from 'react'
 import { useRouter } from 'next/navigation'
-import { Search, X, Plus, Loader2, AlertTriangle } from 'lucide-react'
+import { Search, X, Plus, Loader2, AlertTriangle, Pencil, Check } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -18,6 +18,8 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { createPurchaseOrder, updatePurchaseOrder, getSupplierLastPrices, type PoDetail } from '@/app/actions/purchase-orders'
 import { createSupplier, type SupplierRow } from '@/app/actions/suppliers'
 import { previewPoLineMargins, type PoMarginPreview } from '@/app/actions/purchase-order-margin'
+import { updateProductListPrice } from '@/app/actions/product-list-price'
+import { MARGIN_BLOCK_ERROR_PREFIX, marginBlockMessageForDisplay } from '@/lib/domain/purchasing/margin-threshold-constants'
 import type { ProductRow } from '@/app/actions/products'
 import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow, PurchaseUnitRow } from '@/app/actions/settings'
@@ -30,6 +32,7 @@ import { FX_RATE_CHANGED_FORM_MESSAGE, fxBlocksSubmit, isFxRateChangedError, usa
 import { formatCountryDisplay, toIsoCountryCode } from '@/lib/countries'
 import { selectablePoWarehouses } from '@/lib/domain/purchasing/po-warehouse-eligibility'
 import type { TaxCategory } from '@/app/generated/prisma/client'
+import { LineNotesField } from './po-line-note'
 
 type Warehouse = { id: string; code: string; name: string; country?: string | null; contactName?: string | null; email?: string | null; phone?: string | null; addressLine1?: string | null; addressLine2?: string | null; city?: string | null; postcode?: string | null; availableForPurchaseOrders?: boolean }
 
@@ -95,6 +98,8 @@ type LineItem = {
   discount: string // user-entered discount, e.g. "5%" or "2.50"
   /** Optional per-line delivery date (YYYY-MM-DD). '' = inherit the order's Expected Delivery. */
   expectedDelivery: string
+  /** Internal per-line remark; '' = none. Never sent to the supplier. */
+  notes: string
   productCategory: TaxCategory
   // Per-line tax rate. When `taxRateAutoResolved` is true, the line follows
   // the order/supplier rate; when false the user has manually overridden it.
@@ -187,6 +192,8 @@ type AdditionalCost = {
   amountForeign: number
   vatable: boolean
   distributionMethod: string
+  /** 'SHIPPING' tags the buyer's shipping estimate; null = untagged. */
+  kind: 'SHIPPING' | null
 }
 
 function makeKey() {
@@ -203,6 +210,11 @@ function parseDiscount(input: string, lineTotal: number): number {
   }
   const abs = parseFloat(s)
   return isNaN(abs) ? 0 : abs
+}
+
+/** A price string without trailing zeros, for the edit box: "10.500000" becomes "10.5". */
+function trimPrice(p: string): string {
+  return p.includes('.') ? p.replace(/0+$/, '').replace(/\.$/, '') : p
 }
 
 export function PoFormDialog({ suppliers, products, warehouses, currencies, taxRates: taxRatesProp, purchaseUnits, companyHomeCountry, onClose, existingPo, showMargin = false }: Props) {
@@ -318,6 +330,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
         amountForeign: cl.amountForeign,
         vatable: cl.vatable,
         distributionMethod: cl.distributionMethod,
+        kind: cl.kind,
       }))
     }
     if (existingPo.directFreightForeign > 0) {
@@ -327,6 +340,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
         amountForeign: existingPo.directFreightForeign,
         vatable: false,
         distributionMethod: 'BY_VALUE',
+        kind: null,
       }]
     }
     return []
@@ -382,6 +396,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
         unitCostForeign: Math.round(displayUnitCost * 10000) / 10000,
         discount: l.discountStr ?? '',
         expectedDelivery: l.expectedDelivery ? l.expectedDelivery.slice(0, 10) : '',
+        notes: l.notes ?? '',
         productCategory: (product?.taxCategory ?? 'STANDARD') as TaxCategory,
         // Re-derive line VAT from the order/supplier default on load (auto), so
         // it always tracks the supplier's Default VAT Rate. The net unit cost is
@@ -508,6 +523,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
       qty: 1, purchaseUnitId: '', unitCostForeign: Math.round(displayCost * 10000) / 10000,
       discount: '',
       expectedDelivery: '',
+      notes: '',
       productCategory,
       taxRateId: resolved.taxRateId,
       taxRateValue: resolved.taxRateValue,
@@ -700,6 +716,12 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
   // Internal margin preview (o3d-ywzag slice 1, read-only). The server computes on Decimal from the product's list
   // price; the form only sends what was typed. Debounced, and a stale answer never overwrites a newer one.
   const [marginPreview, setMarginPreview] = useState<PoMarginPreview | null>(null)
+  // Bumped after a list-price edit so the margin is recomputed by the server from the new price (o3d-hqvrp.381).
+  const [marginTick, setMarginTick] = useState(0)
+  // The override note for a line below the minimum margin in block mode (o3d-hqvrp.380). The server decides; this only carries the note.
+  const [marginOverrideNote, setMarginOverrideNote] = useState('')
+  const [serverBlockedMargin, setServerBlockedMargin] = useState(false)
+  const [priceEdit, setPriceEdit] = useState<{ productId: string; value: string; saving: boolean; error: string } | null>(null)
   const marginRequestKey = showMargin
     ? JSON.stringify({
         pricesIncludeVat,
@@ -724,8 +746,23 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
         .catch(() => { if (!cancelled) setMarginPreview({ success: false, error: 'Margin unavailable' }) })
     }, 300)
     return () => { cancelled = true; clearTimeout(timer) }
-  }, [showMargin, marginRequestKey])
+  }, [showMargin, marginRequestKey, marginTick])
   const marginByKey = new Map((marginPreview && marginPreview.success ? marginPreview.lines : []).map((r) => [r.key, r]))
+  const thresholdMode = marginPreview && marginPreview.success ? marginPreview.thresholdMode : null
+  const belowMinimumCount = marginPreview && marginPreview.success ? marginPreview.lines.filter((r) => r.threshold.state === 'below').length : 0
+  const needsOverrideNote = showMargin && ((thresholdMode === 'block' && belowMinimumCount > 0) || serverBlockedMargin)
+
+  async function saveListPrice() {
+    if (!priceEdit) return
+    setPriceEdit({ ...priceEdit, saving: true, error: '' })
+    const result = await updateProductListPrice({ productId: priceEdit.productId, exVatPrice: priceEdit.value })
+    if (!result.success) {
+      setPriceEdit({ ...priceEdit, saving: false, error: result.error })
+      return
+    }
+    setPriceEdit(null)
+    setMarginTick((n) => n + 1)
+  }
   const baseMoney = (n: string) => formatMoney(Number(n), baseCurrency.symbol, baseCurrency.symbolPosition) // decimal-boundary-ok: display-only
 
   const filteredProducts = products.filter((p) => {
@@ -758,9 +795,11 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
         amountForeign: ac.amountForeign,
         vatable: ac.vatable,
         distributionMethod: ac.distributionMethod,
+        ...(ac.kind ? { kind: ac.kind } : {}),
       })),
       orderDiscountStr: orderDiscount || undefined,
       orderDiscountForeign,
+      marginOverrideNote: showMargin && marginOverrideNote.trim() ? marginOverrideNote.trim() : undefined,
       lines: lines.map((l, i) => {
         // Discount is computed against the displayed line gross (in
         // purchase-unit cost terms). Since `qty * unitCostForeign` is
@@ -782,6 +821,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
           sortOrder: i,
           discountStr: l.discount || undefined,
           expectedDelivery: l.expectedDelivery || null,
+          notes: l.notes.trim() || null,
           discountAmount: discAmount > 0 ? discAmount : undefined,
           // Only send the id when the user has manually overridden this line.
           // Auto lines pass null so the server applies the order/supplier rate.
@@ -800,7 +840,8 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
           setCurrencyAndRate(currency)
           setError(FX_RATE_CHANGED_FORM_MESSAGE)
         } else {
-          setError(result.error ?? 'Failed to update PO')
+          if (result.error?.startsWith(MARGIN_BLOCK_ERROR_PREFIX)) setServerBlockedMargin(true)
+          setError(marginBlockMessageForDisplay(result.error ?? 'Failed to update PO'))
         }
       } else {
         const result = await createPurchaseOrder({ ...payload, expectedFxRate: fxRate ?? undefined })
@@ -813,7 +854,8 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
           setCurrencyAndRate(currency)
           setError(FX_RATE_CHANGED_FORM_MESSAGE)
         } else {
-          setError(result.error ?? 'Failed to create PO')
+          if (result.error?.startsWith(MARGIN_BLOCK_ERROR_PREFIX)) setServerBlockedMargin(true)
+          setError(marginBlockMessageForDisplay(result.error ?? 'Failed to create PO'))
         }
       }
     })
@@ -1048,6 +1090,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                   <TableRow key={line.key}>
                     <TableCell>
                       <ProductLink productId={line.productId} sku={line.sku} name={line.productName} />
+                      <LineNotesField value={line.notes} onChange={(v) => setLines((p) => p.map((l) => l.key === line.key ? { ...l, notes: v } : l))} />
                     </TableCell>
                     {purchaseUnits.length > 0 && (
                       <TableCell>
@@ -1154,6 +1197,53 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                               <div className="text-[11px]">{row.result.message}</div>
                             </div>
                           )}
+                          {row && row.threshold.state === 'below' && (
+                            <div
+                              className={`mt-0.5 flex items-center justify-end gap-1 text-[11px] font-medium ${thresholdMode === 'block' ? 'text-destructive' : 'text-amber-700 dark:text-amber-400'}`}
+                              data-testid="po-line-margin-threshold"
+                              data-state={thresholdMode === 'block' ? 'block' : 'warn'}
+                            >
+                              <AlertTriangle className="h-3 w-3" aria-hidden />
+                              {thresholdMode === 'block'
+                                ? `Below the ${row.threshold.minPct}% minimum: blocked without an override note`
+                                : `Below the ${row.threshold.minPct}% minimum (warning)`}
+                            </div>
+                          )}
+                          {row && row.threshold.state === 'unknown' && (
+                            <div className="mt-0.5 text-[11px] text-muted-foreground" data-testid="po-line-margin-threshold" data-state="unknown">
+                              Margin unknown: not checked against the {row.threshold.minPct}% minimum
+                            </div>
+                          )}
+                          {row && row.listPriceEditable && (
+                            priceEdit && priceEdit.productId === line.productId ? (
+                              <div className="mt-1 flex flex-col items-end gap-1" data-testid="po-line-price-edit">
+                                <div className="flex items-center gap-1">
+                                  <Input
+                                    aria-label={`New list price ex-VAT for ${line.sku}`}
+                                    className="h-7 w-24 text-right font-mono text-xs"
+                                    inputMode="decimal"
+                                    value={priceEdit.value}
+                                    onChange={(e) => setPriceEdit({ ...priceEdit, value: e.target.value, error: '' })}
+                                    onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); void saveListPrice() } if (e.key === 'Escape') setPriceEdit(null) }}
+                                  />
+                                  <button type="button" aria-label="Save list price" disabled={priceEdit.saving} onClick={() => void saveListPrice()} className="text-muted-foreground hover:text-foreground">
+                                    {priceEdit.saving ? <Loader2 className="h-3 w-3 animate-spin" /> : <Check className="h-3 w-3" />}
+                                  </button>
+                                  <button type="button" aria-label="Cancel list price edit" onClick={() => setPriceEdit(null)} className="text-muted-foreground hover:text-foreground"><X className="h-3 w-3" /></button>
+                                </div>
+                                <span className="text-[11px] text-muted-foreground">Ex-VAT list price{row.listPriceStoredVatInclusive ? ' (stored VAT-inclusive)' : ''}. Syncs to the shop and warehouse through the normal product sync.</span>
+                                {priceEdit.error && <span className="text-[11px] text-destructive" role="alert">{priceEdit.error}</span>}
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                className="mt-0.5 inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+                                onClick={() => setPriceEdit({ productId: line.productId, value: row.result.kind === 'ok' ? trimPrice(row.result.salesPrice) : '', saving: false, error: '' })}
+                              >
+                                <Pencil className="h-3 w-3" aria-hidden /> Edit sales price
+                              </button>
+                            )
+                          )}
                           {(row?.currentCostBase || lastPrice) && (
                             <div className="font-mono text-[11px] text-muted-foreground">
                               {row?.currentCostBase && <span title="Average landed cost of the stock on hand">cost now {baseMoney(row.currentCostBase)}</span>}
@@ -1176,6 +1266,25 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
               })}
             </TableBody>
           </Table>
+        )}
+
+        {needsOverrideNote && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs space-y-2" data-testid="po-margin-override">
+            <p className="font-medium text-destructive">
+              {belowMinimumCount > 0 ? `${belowMinimumCount} line${belowMinimumCount === 1 ? ' is' : 's are'} below the minimum gross margin.` : 'The server found a line below the minimum gross margin.'} This order cannot be saved without an override note.
+            </p>
+            <Label htmlFor="marginOverrideNote" className="text-xs">Override note</Label>
+            <Textarea
+              id="marginOverrideNote"
+              value={marginOverrideNote}
+              onChange={(e) => setMarginOverrideNote(e.target.value)}
+              rows={2}
+              maxLength={500}
+              placeholder="Why is this order acceptable below the minimum margin?"
+              className="text-sm resize-none"
+            />
+            <p className="text-muted-foreground">Recorded on the order with your name and the time. Internal only.</p>
+          </div>
         )}
 
         {showMargin && lines.length > 0 && (
@@ -1248,7 +1357,7 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
           <h2 className="font-medium text-sm text-muted-foreground uppercase tracking-wide">Additional Costs</h2>
           <Button
             variant="outline" size="sm"
-            onClick={() => setAdditionalCosts((prev) => [...prev, { key: makeKey(), description: '', amountForeign: 0, vatable: false, distributionMethod: 'BY_VALUE' }])}
+            onClick={() => setAdditionalCosts((prev) => [...prev, { key: makeKey(), description: '', amountForeign: 0, vatable: false, distributionMethod: 'BY_VALUE', kind: null }])}
           >
             <Plus className="h-3 w-3 mr-1" />Add Cost
           </Button>
@@ -1283,6 +1392,15 @@ export function PoFormDialog({ suppliers, products, warehouses, currencies, taxR
                       className="rounded border-input"
                     />
                     VAT
+                  </label>
+                  <label className="flex items-center gap-1 text-xs whitespace-nowrap cursor-pointer shrink-0" title="Tag this line as your own shipping estimate. A supplier-quoted shipping replaces it (when enabled).">
+                    <input
+                      type="checkbox"
+                      checked={ac.kind === 'SHIPPING'}
+                      onChange={(e) => setAdditionalCosts((prev) => prev.map((c) => c.key === ac.key ? { ...c, kind: e.target.checked ? 'SHIPPING' : null } : c))}
+                      className="rounded border-input"
+                    />
+                    Shipping
                   </label>
                   <select
                     value={ac.distributionMethod}

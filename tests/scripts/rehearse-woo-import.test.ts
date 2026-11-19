@@ -19,7 +19,7 @@ import type { FakeWooCommerce } from '@/tests/helpers/fake-woocommerce'
  * comment above it; the change was made, the arm went red, and the change was reverted (md5-verified).
  */
 
-// IMS_SCRATCH_ROOT, when set, moves the throwaway clusters off the SSD (unset: /var/tmp, as always). A real rehearsal refuses a RAM-backed (tmpfs/ramfs) parent, so on a genuinely
+// IMS_SCRATCH_ROOT, when set, moves the throwaway clusters off the SSD (unset: the original TMPDIR, never /var/tmp). A real rehearsal refuses a RAM-backed (tmpfs/ramfs) parent, so on a genuinely
 // tmpfs scratch root these tests cannot run; a disk-backed RAM disk (ext4 on zram) is fine.
 const SCRATCH_PARENT = scratchRoot()
 const REPO_CWD = process.cwd()

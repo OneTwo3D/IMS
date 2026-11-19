@@ -31,7 +31,7 @@ A refused login after an HTTP 401 is a pure hold only when that 401 came straigh
 
 ### Producer-side hold for WooCommerce (before the grant, and after it)
 
-The grant above is the transport's permission. A second, earlier check decides whether IMS should PRODUCE a WooCommerce write at all: when `PRODUCER_HOLD_ENFORCED_DESTINATIONS` names `woocommerce`, a write is produced only once both `WC_WRITEBACK_ALLOWED_ORIGIN` and `WC_WRITES_LIVE_FROM` are in force and the ownership map says IMS owns that operation. Until then every WooCommerce write IMS would have made (stock, order completion, cancel and hold, tracking, partial shipments, the WMS-status note, product details, exchange rates, the FX helper check, webhook registration, the invoice note) is kept as a shadow record and nothing is queued or sent; the queue drains for stock, order completion, cancel and hold claim nothing and spend no attempts. Stock stays Qoblex's and exchange rates stay with the Aelia plugin until their live-from instant. The forced stock push also stays behind the "Push stock levels to WooCommerce" setting. Check the posture of an installation before and after switching anything on: with the hold on and no live-from instant, a stock change, a shipment or a button press must leave `integration_outbox` unchanged and add or count a row in `outbound_shadow_writes` with destination `woocommerce`. See "Producer-side hold" in the installation guide for the variables and `help-docs/woocommerce.md` for what an operator sees.
+The grant above is the transport's permission. A second, earlier check decides whether IMS should PRODUCE a WooCommerce write at all: when `PRODUCER_HOLD_ENFORCED_DESTINATIONS` names `woocommerce`, a write is produced only once `WC_WRITEBACK_ALLOWED_ORIGIN` and the live-from instant of the operation's switchover step are in force and the ownership map says IMS owns that operation. The live-from instant is per step, not per destination: the order status, tracking, partial-shipment, product-meta, withdrawal-outcome and TrackShip writes go live with step M (`MINTSOFT_WRITES_LIVE_FROM`, because the bridge that is retired there wrote them), stock, webhooks and customer e-mail with step W (`WC_WRITES_LIVE_FROM`), and the invoice note and document with step X (`XERO_WRITES_LIVE_FROM`). Turning on `wc_stock_sync_enabled` is refused until an administrator has recorded the owner's confirmation that the Qoblex stock push is stopped (`npm run writers:attest`, or the Owner confirmations page at `/sync/writer-confirmations`). Until then every WooCommerce write IMS would have made (stock, order completion, cancel and hold, tracking, partial shipments, the WMS-status note, product details, exchange rates, the FX helper check, webhook registration, the invoice note) is kept as a shadow record and nothing is queued or sent; the queue drains for stock, order completion, cancel and hold claim nothing and spend no attempts. Stock stays Qoblex's until step W and exchange rates stay with the Aelia plugin throughout. The forced stock push also stays behind the "Push stock levels to WooCommerce" setting. Check the posture of an installation before and after switching anything on: with the hold on and no live-from instant, a stock change, a shipment or a button press must leave `integration_outbox` unchanged and add or count a row in `outbound_shadow_writes` with destination `woocommerce`. See "Producer-side hold" in the installation guide for the variables and `help-docs/woocommerce.md` for what an operator sees.
 
 
 ## 1. WC → IMS product create/update
@@ -125,11 +125,13 @@ Expected result:
 
 ## 5. Customer-facing invoice PDF download
 
+This check follows the switch-on, overlap and rollback procedure in [ops/invoice-documents-switchover-runbook.md](ops/invoice-documents-switchover-runbook.md); do that first.
+
 1. Pick an IMS-generated invoice for a WooCommerce-backed order.
 2. From the WC storefront, sign in as the order's customer and open the order page.
 3. Click **Download Invoice**.
 4. Verify:
-   - The download link is served via the `wc-invoice-handoff` WordPress helper plugin (not a direct IMS URL).
+   - The download link is served via the **onetwoInventory Helper** WordPress plugin (`onetwoinventory-helper.php`; older notes called it `wc-invoice-handoff`) and is not a direct IMS URL.
    - The token used by the handoff is single-use and scoped to that customer + order.
    - The PDF streams back through the storefront, not via an IMS login redirect.
 5. Repeat the download from a different network/incognito session as the same customer to confirm a fresh token is issued for each request.

@@ -1,6 +1,7 @@
 import { rateBinding, type TaxBindingBasis } from '@/lib/accounting/reverse-charge'
 import { noVatRateKind } from '@/lib/domain/accounting/purchase-document-tax-types'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
+import { addMoney, multiplyMoney, roundMoney, toDecimal } from '@/lib/domain/math/decimal'
 // ---------------------------------------------------------------------------
 // Supplier credit-note domain logic (audit-g5u2)
 //
@@ -74,12 +75,172 @@ export function validateRecordSupplierCreditNote(params: {
 }
 
 /**
- * A Xero-bound supplier credit against a bill with REVERSE-CHARGE lines is refused. The IMS credit amount is the bill's gross (net plus the self-accounted VAT) while Xero holds the
- * bill's net, and the transit movement is taken from the VAT ratio: the figures disagree and a full credit could exceed the Xero bill. The proper design (net payable cap, the same amount on
- * the Xero line, the allocation and the transit movement) is separate work; until then the credit is raised in Xero directly. Local-only credits (nothing goes to Xero) are unaffected.
+ * A supplier credit against a bill with REVERSE-CHARGE lines is raised against the bill's NET PAYABLE: what is actually owed to the supplier, which is each reverse-charge line's net
+ * (the self-accounted VAT is never paid to the supplier) plus each standard line's net and VAT. IMS stores the bill's total WITH the self-accounted VAT, so the total is not the figure
+ * to credit: the credit is capped at the net payable, and that one amount is the Xero credit lines, the allocation to the bill and the transit movement.
  */
-export const SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_MESSAGE = withLedgerCheck(
-  'Supplier credits against reverse-charge bills are not posted from IMS yet: raise this credit in Xero directly. The credit note was not posted and is still a draft.',
+export const SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE = (payable: string, available: string) => withLedgerCheck(
+  `This bill has reverse-charge lines, so a credit against it is limited to what is owed to the supplier (${payable}, excluding the VAT the bill accounts for itself); `
+  + `${available} is still creditable. The credit note was not posted and is still a draft: record it again for no more than that amount.`,
+)
+
+/** One bill line's booked treatment, as the net-payable planner reads it. */
+export type SupplierCreditBillLine = {
+  taxType: string | undefined
+  rate: number
+  taxRateId?: string
+  reverseCharge: boolean
+  /** The line's net (before any VAT). */
+  net: number
+}
+
+/** What a bill line obliges the buyer to pay the supplier: its net for a reverse-charge line, net plus its (per-line rounded) VAT otherwise. */
+function linePayable(line: SupplierCreditBillLine, currency: string) {
+  return line.reverseCharge ? roundMoney(line.net, currency) : addMoney(roundMoney(line.net, currency), roundMoney(multiplyMoney(line.net, line.rate), currency))
+}
+
+/** The bill's NET PAYABLE: the sum of what each line obliges the buyer to pay the supplier. */
+export function billNetPayable(lines: ReadonlyArray<SupplierCreditBillLine>, currency: string): number {
+  return lines.reduce((sum, l) => addMoney(sum, linePayable(l, currency)), toDecimal(0)).toNumber()
+}
+
+export type ReverseChargeCreditPlan = {
+  /** One Xero credit line per bill line that carries a share of the credit: exclusive net, the line's own booked code. */
+  lines: Array<{ net: number; vat: number; taxType: string | undefined; taxRateId?: string; reverseCharge: boolean }>
+  /** The credit's net: the sum of the line nets. This is what leaves the transit clearing account. */
+  netTotal: number
+  /** What Xero will hold as the credit's total (net lines plus the VAT Xero adds on standard lines); never above the credit amount. This is what is allocated to the bill. */
+  xeroTotal: number
+}
+
+/**
+ * SPLIT A CREDIT OF `amount` (against the bill's net payable) ACROSS THE BILL'S LINES, pro rata to what each owes the supplier, as exclusive net Xero lines on each line's own booked code.
+ * A reverse-charge line's share is its net (Xero self-accounts the VAT under the reverse-charge code, as it did on the bill); a standard line's share is gross and is turned back
+ * into net and VAT, so the credit mirrors the bill exactly: a full credit reproduces every bill line. Returns null when the credit exceeds the net payable.
+ */
+export function planReverseChargeSupplierCredit(params: { amount: number; lines: ReadonlyArray<SupplierCreditBillLine>; currency: string }): ReverseChargeCreditPlan | 'exceeds' | 'inexact' {
+  const { currency } = params
+  const places = roundMoney(1.23456789, currency).decimalPlaces()
+  const minor = toDecimal(1).div(toDecimal(10).pow(places))
+  const toMinor = (d: ReturnType<typeof toDecimal>) => d.div(minor).toDecimalPlaces(0, 4).toNumber()
+  const payables = params.lines.map((l) => linePayable(l, currency))
+  const total = payables.reduce((a, b) => addMoney(a, b), toDecimal(0))
+  const amount = roundMoney(params.amount, currency)
+  if (!total.gt(0) || amount.gt(total)) return 'exceeds'
+  const A = toMinor(amount)
+  const n = params.lines.length
+  const cap = payables.map(toMinor)
+  const isRc = params.lines.map((l) => l.reverseCharge)
+  // The most net a line can carry is its own net (a full credit reproduces the bill line).
+  const maxNet = params.lines.map((l, i) => (isRc[i] ? cap[i] : toMinor(roundMoney(l.net, currency))))
+  // What Xero holds for a line of `net` minor units: a reverse-charge line is its net (the VAT is self-accounted); a standard line is net plus its own VAT rounded to the minor unit.
+  const grossCache = new Map<string, number>()
+  const gross = (i: number, net: number): number => {
+    if (isRc[i]) return net
+    const key = `${params.lines[i].rate}|${net}`
+    let g = grossCache.get(key)
+    if (g === undefined) { g = net + toDecimal(net).mul(toDecimal(params.lines[i].rate)).toDecimalPlaces(0, 4).toNumber(); grossCache.set(key, g) }
+    return g
+  }
+
+  // 1. STANDARD LINES FIRST: their gross takes only some values (VAT rounds per line), so their nets are chosen first, pro rata (largest remainder on the gross share) and then
+  //    brought under the credit. Reverse-charge lines are exact at any minor-unit amount, so they absorb what is left.
+  const payMinor = cap
+  const totalMinor = payMinor.reduce((a, b) => a + b, 0)
+  const exact = payMinor.map((p) => (A * p) / totalMinor)
+  const shares = exact.map((e) => Math.floor(e + 1e-9))
+  let leftover = A - shares.reduce((a, b) => a + b, 0)
+  const order = exact.map((e, i) => ({ i, rem: e - shares[i] })).filter((r) => payMinor[r.i] > shares[r.i]).sort((x, y) => y.rem - x.rem || x.i - y.i)
+  for (const r of order) { if (leftover <= 0) break; shares[r.i]++; leftover-- }
+  const nets = shares.map((sh, i) => (isRc[i] ? 0 : Math.min(maxNet[i], Math.round(sh / (1 + params.lines[i].rate)))))
+  const stdIdx = params.lines.map((_, i) => i).filter((i) => !isRc[i])
+  const rcIdx = params.lines.map((_, i) => i).filter((i) => isRc[i])
+  const sumStd = () => stdIdx.reduce((a, i) => a + gross(i, nets[i]), 0)
+  const rcCap = rcIdx.reduce((a, i) => a + cap[i], 0)
+  const guard = n * 4 + 100
+  // Too much from the standard lines: take a minor unit of net off the largest, round and round.
+  const byNetDesc = [...stdIdx].sort((x, y) => nets[y] - nets[x])
+  for (let g = 0, k = 0; g < guard && sumStd() > A && byNetDesc.length > 0; g++, k++) {
+    const i = byNetDesc[k % byNetDesc.length]
+    if (nets[i] > 0) nets[i]--
+  }
+  // Too little to be absorbed by the reverse-charge lines: add a minor unit of net where that does not pass the credit.
+  for (let g = 0; g < guard && A - sumStd() > rcCap; g++) {
+    const room = A - sumStd()
+    const i = stdIdx.find((j) => nets[j] < maxNet[j] && gross(j, nets[j] + 1) - gross(j, nets[j]) <= room)
+    if (i === undefined) break
+    nets[i]++
+  }
+  const remaining = A - sumStd()
+  let solved = remaining >= 0 && remaining <= rcCap
+  if (solved) {
+    // 2. The reverse-charge lines take the rest, largest remainder on their payable, each within its own net.
+    const rcNets = new Map<number, number>()
+    const rcExact = rcIdx.map((i) => (rcCap > 0 ? (remaining * cap[i]) / rcCap : 0))
+    const rcShares = rcExact.map((e, k) => Math.min(cap[rcIdx[k]], Math.floor(e + 1e-9)))
+    let left = remaining - rcShares.reduce((a, b) => a + b, 0)
+    const rcOrder = rcIdx.map((_, k) => k).sort((x, y) => (rcExact[y] - rcShares[y]) - (rcExact[x] - rcShares[x]) || x - y)
+    while (left > 0) {
+      let gave = false
+      for (const k of rcOrder) { if (left > 0 && rcShares[k] < cap[rcIdx[k]]) { rcShares[k]++; left--; gave = true } }
+      if (!gave) break
+    }
+    if (left > 0) solved = false
+    else rcIdx.forEach((i, k) => rcNets.set(i, rcShares[k]))
+    if (solved) rcNets.forEach((v, i) => { nets[i] = v })
+  }
+  if (!solved) {
+    // 3. NO EXACT FIT YET (no reverse-charge line to absorb the gap, or too little room on them): search exactly. Every combination of nets within each line's own net is considered
+    //    (a reachability table over the credit in minor units), so the credit is refused only when NO combination equals it. Bounded: a bill too large to search is refused.
+    const work = nets.reduce((acc, _, i) => acc + (Math.min(maxNet[i], A) + 1) * (A + 1), 0)
+    if (work > 60_000_000) return 'inexact'
+    const reach: Uint8Array[] = [new Uint8Array(A + 1)]
+    reach[0][0] = 1
+    for (let i = 0; i < n; i++) {
+      const next = new Uint8Array(A + 1)
+      const prev = reach[i]
+      const top = Math.min(maxNet[i], A)
+      for (let net = 0; net <= top; net++) {
+        const g = gross(i, net)
+        if (g > A) break
+        for (let sum = 0; sum + g <= A; sum++) if (prev[sum]) next[sum + g] = 1
+      }
+      reach.push(next)
+    }
+    if (!reach[n][A]) return 'inexact'
+    let sum = A
+    for (let i = n - 1; i >= 0; i--) {
+      let chosen = -1
+      const top = Math.min(maxNet[i], A)
+      for (let net = 0; net <= top; net++) {
+        const g = gross(i, net)
+        if (g > sum) break
+        if (reach[i][sum - g]) { chosen = net; break }
+      }
+      if (chosen < 0) return 'inexact'
+      nets[i] = chosen
+      sum -= gross(i, chosen)
+    }
+  }
+  // VERIFY what Xero will hold (exclusive nets plus each standard line's VAT, per line) against the credit; never plan a mismatch.
+  const totalGross = nets.reduce((a, v, i) => a + gross(i, v), 0)
+  if (totalGross !== A || nets.some((v, i) => v < 0 || v > maxNet[i])) return 'inexact'
+  const lines: ReverseChargeCreditPlan['lines'] = []
+  let netSum = 0
+  params.lines.forEach((l, i) => {
+    if (nets[i] <= 0) return
+    netSum += nets[i]
+    const net = toDecimal(nets[i]).mul(minor)
+    const vat = toDecimal(gross(i, nets[i]) - nets[i]).mul(minor)
+    lines.push({ net: net.toNumber(), vat: vat.toNumber(), taxType: l.taxType, ...(l.taxRateId ? { taxRateId: l.taxRateId } : {}), reverseCharge: l.reverseCharge })
+  })
+  return { lines, netTotal: toDecimal(netSum).mul(minor).toNumber(), xeroTotal: amount.toNumber() }
+}
+
+/** The credit cannot be split across the bill's lines into amounts Xero reproduces exactly: nothing is sent. */
+export const SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_INEXACT_MESSAGE = withLedgerCheck(
+  'This credit cannot be split across the lines of the reverse-charge bill into amounts that add up to exactly the credit once VAT is rounded line by line. '
+  + 'The credit note was not posted and is still a draft: record it again for a slightly different amount, such as the full remaining amount.',
 )
 
 /** Shown to the operator when a supplier credit note is raised against a bill whose lines carry more than one VAT treatment. */
@@ -268,14 +429,24 @@ export function buildSupplierCreditNoteSyncPayload(params: {
   // rather than netting the amount down. Standard/freight credits carry a GROSS
   // amount and post INCLUSIVE. Defaults to inclusive.
   lineAmountsIncludeTax?: boolean
+  /**
+   * A credit against a bill with reverse-charge lines (planReverseChargeSupplierCredit): one EXCLUSIVE net line per bill line, each on its own booked code, replacing the single
+   * line; the allocation is then `allocateAmount`. `amountForeign`, `taxType` and `lineAmountsIncludeTax` are ignored for the lines.
+   */
+  reverseChargePlan?: ReverseChargeCreditPlan
 }): Record<string, unknown> {
-  return {
-    creditNoteNumber: mintedSupplierCreditNoteNumber(params.creditNoteId),
-    contactName: params.supplierName,
-    date: params.date,
-    currency: params.currency,
-    currencyRateToBase: params.fxRateToBase,
-    lines: [
+  const planned = params.reverseChargePlan
+  const lines = planned
+    ? planned.lines.map((l, i) => ({
+      description: `${params.reason ?? 'Supplier credit note'} (bill line ${i + 1})`,
+      quantity: 1,
+      unitAmount: l.net,
+      accountCode: params.transitAccount,
+      taxType: l.taxType,
+      ...(noVatRateKind(l.taxType) ? { noTaxKind: noVatRateKind(l.taxType) } : {}),
+      ...(l.taxRateId ? rateBinding(l.taxRateId, 'purchase_line') : {}),
+    }))
+    : [
       {
         description: params.reason ?? 'Supplier credit note',
         quantity: 1,
@@ -286,14 +457,21 @@ export function buildSupplierCreditNoteSyncPayload(params: {
         ...(noVatRateKind(params.taxType) ? { noTaxKind: noVatRateKind(params.taxType) } : {}),
         ...(params.taxRateBasis ? rateBinding(params.taxRateId, params.taxRateBasis) : {}),
       },
-    ],
+    ]
+  return {
+    creditNoteNumber: mintedSupplierCreditNoteNumber(params.creditNoteId),
+    contactName: params.supplierName,
+    date: params.date,
+    currency: params.currency,
+    currencyRateToBase: params.fxRateToBase,
+    lines,
     // Standard/freight: the amount is GROSS (the over-credit cap is the bill's
     // gross total), so post tax-INCLUSIVE — Xero splits net + VAT under the
     // mirrored tax type (treating it as net would add VAT on top and over-credit).
     // Reverse charge: the amount is NET and posts EXCLUSIVE so Xero applies the
     // notional RC VAT on top, mirroring the net/exclusive RC bill. With a NONE
     // tax type inclusive vs exclusive is identical (no VAT).
-    lineAmountsIncludeTax: params.lineAmountsIncludeTax ?? true,
+    lineAmountsIncludeTax: planned ? false : (params.lineAmountsIncludeTax ?? true),
     reference: params.reference ?? undefined,
     supplierId: params.supplierId,
     // audit-v08m: only carried when the bill has an external id — the follow-up
@@ -430,19 +608,29 @@ export function decidePurchaseCreditNotePost(input: {
     }
   }
 
-  if (lookup.claims.length > 1) {
+  // o3d-n0o5f: a VOIDED or DELETED document no longer holds the number, so it is not a duplicate. Once the operator has voided the
+  // extras, the one live survivor is adopted even though the voided siblings still come back from the lookup.
+  const voidedStatuses = new Set(['VOIDED', 'DELETED'])
+  const liveClaims = lookup.claims.filter((c) => !voidedStatuses.has(c.status.toUpperCase()))
+  const claims = liveClaims.length > 0 ? liveClaims : lookup.claims
+
+  if (liveClaims.length > 1) {
     return {
       action: 'refuse',
       retryable: false,
       reason:
-        withLedgerCheck(`NOTHING WAS SENT. The ledger already holds ${lookup.claims.length} credit notes numbered ${number} `
-        + `(${lookup.claims.map((c) => `${c.creditNoteId} ${c.status}`).join(', ')}). That number is minted from `
+        // o3d-n0o5f: the ledger HOLDS these documents - that is what the refusal states - so the generic "act only if it is absent"
+        // preamble (withLedgerCheck) would tell the operator not to do the very repair this message is for. The check comes first
+        // and the repair follows once the duplicate is confirmed.
+        `NOTHING WAS SENT. The ledger already holds ${liveClaims.length} live credit notes numbered ${number} `
+        + `(${liveClaims.map((c) => `${c.creditNoteId} ${c.status}`).join(', ')}). That number is minted from `
         + `this credit note's primary key, so every one of them is a duplicate of THIS credit note and payables `
-        + `is understated by all but one. Void the extras in Xero, then retry so IMS links the survivor.`),
+        + `is understated by all but one. Check them in Xero first; once you have confirmed they are all copies of this credit note, `
+        + `void the extras in Xero (keep one). Voided and deleted copies are ignored, so on the retry IMS links the one that is left.`,
     }
   }
 
-  const [claim] = lookup.claims
+  const [claim] = claims
   if (claim) {
     if (ADOPTABLE_STATUSES.has(claim.status.toUpperCase())) {
       return {

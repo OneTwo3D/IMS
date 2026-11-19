@@ -202,11 +202,14 @@ export type WcFullProduct = {
   categories: { id: number; name: string; slug: string }[]
   tags: { id: number; name: string; slug: string }[]
   images: { id: number; src: string; name: string; alt: string; date_modified_gmt?: string }[]
-  attributes: { id: number; name: string; position: number; visible: boolean; variation: boolean; options: string[] }[]
+  attributes: { id: number; name: string; slug?: string; position: number; visible: boolean; variation: boolean; options: string[] }[]
   variations: number[]
   meta_data: WcMeta[]
   parent_id: number
   global_unique_id?: string  // WC 9.2+ native GTIN/EAN/UPC/ISBN field
+  customs_commodity_code?: string  // WC 11.3 native customs fields
+  customs_country_of_origin?: string  // ISO 3166-1 alpha-2
+  customs_description?: string  // <= 35 chars, plain text
 }
 
 export type WcVariation = {
@@ -229,6 +232,9 @@ export type WcVariation = {
   meta_data: WcMeta[]
   parent_id: number
   global_unique_id?: string
+  customs_commodity_code?: string  // in view context a variation inherits its parent's value
+  customs_country_of_origin?: string
+  customs_description?: string
 }
 
 export type WcTrackingItem = {
@@ -266,6 +272,13 @@ export type StockSyncResult = SyncResult & {
    */
   aborted?: boolean
   /**
+   * A credentials rebind aborted the push part-way: how many pushes were never attempted, and the notice for it. Carried on the result,
+   * NOT only as the last entry of `errors`, because a reader that truncates `errors` (the manual sync screen shows 20) would drop it.
+   * Distinct from `aborted` (a refusal before any work started, "nothing was pushed").
+   */
+  abortedRemaining?: number
+  abortNotice?: string
+  /**
    * The producer-side hold kept this push as a shadow instead of sending it. Always accompanies `aborted`. NOT a failure to
    * retry, NOT queued, NOT pushed: nothing was sent and nothing is waiting.
    */
@@ -280,4 +293,6 @@ export type StockSyncResult = SyncResult & {
    * stopped before it read anything. Always accompanies `aborted`. Nothing was sent. NOT a reconciliation: callers must not stamp it.
    */
   held?: boolean
+  /** Variable parents skipped this pass because their variation list could not be read completely (reported, not a window error). */
+  skippedParents?: string[]
 }

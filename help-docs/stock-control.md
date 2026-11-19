@@ -14,6 +14,8 @@ On a product's page, use the stock adjustment form: choose the warehouse, enter 
 - **Unit cost** (base currency). Leave blank to use the product's average cost. It is **required for an addition when the product has no existing cost** at all, because stock booked at zero would be sold later at zero cost; the form then refuses with a message asking for a unit cost. Enter **0** only for genuinely free stock such as samples.
 - Removals always take the cost of the oldest layers (FIFO), so no cost is asked for.
 
+**Removing stock that is reserved for orders.** A removal that is larger than the available stock (on hand minus reserved) is refused, with a message to release the reservations first. An administrator can switch on the setting `stock_adjustment_release_reserved` (off by default): a single removal, or a bulk batch of one line, then releases the allocations of the newest orders first, as far as the removal needs, in the same step, and records each release on the order. Allocations that a picked, packed or shipped shipment already covers, or that have already been posted to the accounts, are not released, and the removal is refused as before if that leaves too little. Transfers and purchase-order returns are not affected.
+
 ### Bulk Adjustment
 
 At **Stock Control > Stock Adjustments**, click **New Adjustment** to adjust several products in one batch.
@@ -24,7 +26,7 @@ At **Stock Control > Stock Adjustments**, click **New Adjustment** to adjust sev
 
 Saving the same batch twice by accident (a double click or a retry) does not book it twice.
 
-The page also offers **Import Opening Stock** (a CSV of `sku`, `warehouseCode`, `qty` and `unitCostBase`; each product and warehouse can have opening stock applied only once), a stock-levels export with warehouse and "Include bundles" options, and a CSV **Template**, **Export** and **Import** for adjustments. Below the buttons the history lists every adjustment; use the pencil on a row to change its quantity or note.
+The page also offers **Import Opening Stock** (a CSV of `sku`, `warehouseCode`, `qty` and `unitCostBase`; each product and warehouse can have opening stock applied only once), a stock-levels export with warehouse and "Include bundles" options, and a CSV **Template**, **Export** and **Import** for adjustments. Below the buttons the history lists every adjustment; use the pencil on a row to change its quantity or note. A valued adjustment that has no reason (every row of an adjustments CSV import, which has no reason column), a reason with no account, or no mapped inventory account cannot post a journal: with Xero sync and the inventory-adjustment sync type on, it appears in the exception inbox as a stock adjustment journal to post by hand. Nothing is raised while Xero sync or that sync type is off.
 
 ### Adjustment Reasons
 
@@ -139,7 +141,7 @@ Stock the warehouse system has already brought in (through its stock sync) count
 ### Cancelling
 
 - A **draft** can be cancelled at any time (after a confirmation); no stock has moved.
-- An **in-transit** transfer is cancelled with **Cancel dispatch** (the no-entry icon beside the receive buttons), which returns the stranded stock to the source warehouse. Use it only if the transfer will never be received. It is refused, and the icon is hidden, once any part of the transfer has been received or the warehouse system has brought stock in; finish receiving it instead.
+- An **in-transit** transfer is cancelled with **Cancel dispatch** (the no-entry icon beside the receive buttons), which returns the stranded stock to the source warehouse. Use it only if the transfer will never be received. It is refused, and the icon is hidden, once any part of the transfer has been received or the warehouse system has brought stock in; finish receiving it instead. Cancelling the dispatch also closes the transfer's warehouse ASN in IMS (so it no longer holds align-down for its SKUs); IMS cannot cancel it in Mintsoft, so the screen tells you to ask the warehouse to cancel it. It is refused while the ASN's creation is unconfirmed or the warehouse has booked it in and IMS has not yet reconciled that; use **Recheck booked-in** first.
 
 ### Importing transfers from CSV
 

@@ -1,5 +1,6 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { businessDateYmd } from '@/lib/business-date'
 import { roundQuantity, type DecimalInput } from '@/lib/domain/math/decimal'
 
 /**
@@ -34,6 +35,8 @@ import { roundQuantity, type DecimalInput } from '@/lib/domain/math/decimal'
  *   - SUPPLIER_RETURN            — return reversal DR transit / CR inventory; +.
  *   - CUSTOMER_RETURN_IN_TRANSIT — a refund of shipped goods not yet back: the COGS reversal
  *                                  DR transit / CR COGS; + the dispatch-cost value of the units.
+ *   - GRIR_RECLASS              — the daily-batch GR/IR reclass (behind `grir_xero_posting_enabled`): DR transit / CR GR/IR when goods received
+ *                                  not billed rose, the reverse when it fell; signed. The sourceRef is the batch reference, no order.
  *
  * `baseDelta` is the signed base-currency transit movement at the highest precision
  * the source carries. Idempotent on `idempotencyKey` (the transit-affecting
@@ -51,6 +54,7 @@ export type TransitSubledgerMovementSource =
   | 'PURCHASE_ORDER_CANCEL'
   | 'SUPPLIER_RETURN'
   | 'CUSTOMER_RETURN_IN_TRANSIT'
+  | 'GRIR_RECLASS'
 
 type TransitSubledgerMovementClient = Pick<Prisma.TransactionClient, 'transitSubledgerMovement'>
 
@@ -60,7 +64,9 @@ type TransitSubledgerMovementClient = Pick<Prisma.TransactionClient, 'transitSub
 // OUTSIDE its own GL day's window and the day would perpetually flag. Date inputs
 // (sites passing `new Date()`) MUST be truncated to match the string callers.
 function toJournalDate(value: Date | string): Date {
-  const isoDay = (typeof value === 'string' ? value : value.toISOString()).slice(0, 10)
+  // A Date is a business-day (Europe/London) instant, the same calendar the journal it records is dated on. The UTC day was an
+  // hour (BST) or more away from it, so a midnight-crossing row landed in the wrong GL window.
+  const isoDay = typeof value === 'string' ? value.slice(0, 10) : businessDateYmd(value)
   return new Date(`${isoDay}T00:00:00.000Z`)
 }
 

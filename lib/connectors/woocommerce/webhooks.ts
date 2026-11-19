@@ -23,6 +23,7 @@ import {
   recordIncomingWcWebhook,
   shouldSuppressWcWebhookEcho,
 } from '@/lib/connectors/woocommerce/sync/stock-sync-jobs'
+import { rerunDeferredWcOrderDivergence } from '@/lib/connectors/woocommerce/sync/order-divergence'
 import { queueRefundStockCorrections } from '@/lib/connectors/woocommerce/sync/refund-stock-correction'
 import { verifyWcWebhook } from '@/lib/connectors/woocommerce/sync/webhook-verify'
 import { judgeWebhookOrigin, type WebhookOriginJudgement } from '@/lib/connectors/webhook-origin'
@@ -555,6 +556,8 @@ async function handleOrderWebhook(payload: unknown, topic: string | null) {
       // coverage check never nets, so a complete 3PL dispatch is refused until they land. A
       // retried delivery re-reads the order from page one, so this is self-clearing (o3d-ecbj r5).
       refundSweep = await syncRefundsForOrder(wcOrder.id)
+      // A divergence comparison deferred for a refund IMS had not recorded is repeated now that the sweep has run (the refund path itself is untouched). Never throws.
+      await rerunDeferredWcOrderDivergence(wcOrder)
       if (!refundSweep.complete) {
         failures.push(`syncRefundsForOrder: incomplete refund read — ${refundSweep.error ?? 'unknown error'}`)
       }
@@ -879,6 +882,30 @@ async function handleProductWebhook(payload: unknown, originAttestation: string)
   // is the same cross-store write the import fence exists to prevent, arriving by a second
   // door, so the refusal has to cover both.
   const origin = await judgeWcDeliveryOrigin(originAttestation)
+  // o3d-h5b79: header-only evidence (`store-header:`) is HELD, as for orders and refunds. X-WC-Webhook-Source sits
+  // outside the HMAC, so a signed body replayed with a forged header must not pass as the bound store, and a header
+  // naming another store is not proof of foreignness either. 503 so the inbox retries and then dead-letters visibly.
+  if (origin.scope === 'header' && (origin.verdict === 'same-store' || origin.verdict === 'foreign-store')) {
+    await logActivity({
+      entityType: 'SYNC',
+      action: 'wc_product_webhook_held',
+      tag: 'sync',
+      level: 'ERROR',
+      description: `WooCommerce product webhook for ${productPayload.sku} is held: the only thing naming its store is `
+        + 'the X-WC-Webhook-Source header, which is not covered by the signature, so it does not prove who sent it. '
+        + 'Nothing was imported and no stock was corrected. It is retried and then appears under Sync > Exceptions.',
+      metadata: {
+        externalId: productPayload.id,
+        sku: productPayload.sku,
+        verdict: origin.verdict,
+        originAttestation: origin.attestation,
+        deliveryStore: origin.deliveryStore,
+        boundStore: origin.boundStore,
+        originScope: origin.scope,
+      },
+    })
+    return NextResponse.json({ ok: false, held: true, error: 'Delivery held: sending store could not be proven exactly' }, { status: 503 })
+  }
   if (origin.verdict === 'foreign-store' || origin.verdict === 'unproven') {
     // ACKNOWLEDGED, not retried. The payload was captured at receipt and is frozen: no retry
     // can make a store-A body describe store B, so all ~24 attempts would reach this identical
@@ -933,7 +960,38 @@ async function handleProductWebhook(payload: unknown, originAttestation: string)
   // fix (o3d-uh2).
   let productSyncError: string | null = null
 
+  // o3d-hqvrp.107: the Sync-page product settings decide whether WooCommerce may write IMS products, exactly as the
+  // hourly poll reads them (reconcile.ts): product sync not explicitly disabled (an unset key imports, as before) AND direction from_wc / both (unset reads as from_wc).
+  // With `to_wc` (IMS is master), sync off, or an unrecognised direction the delivery is acknowledged and NOT imported,
+  // else a shop-manager edit would overwrite IMS and the next push would send it back. A read failure propagates (500,
+  // retried): an unreadable setting must not read as consent. The stock correction below is a separate setting and unchanged.
+  let productImportAllowed = true
   if (canSyncProduct) {
+    const [enabledSetting, directionSetting] = await Promise.all([
+      db.setting.findUnique({ where: { key: 'wc_sync_product_enabled' } }),
+      db.setting.findUnique({ where: { key: 'wc_sync_product_direction' } }),
+    ])
+    const direction = directionSetting?.value
+    const importsFromWc = !direction || direction === 'from_wc' || direction === 'both'
+    // An UNSET enabled key keeps the behaviour before .107 (the webhook imported): only an explicit 'false' skips.
+    const syncDisabled = enabledSetting?.value === 'false'
+    if (syncDisabled || !importsFromWc) {
+      productImportAllowed = false
+      await logActivity({
+        entityType: 'SYNC',
+        action: 'wc_product_webhook_import_skipped',
+        tag: 'sync',
+        level: 'INFO',
+        description: `WooCommerce product webhook for ${productPayload.sku} was not imported: `
+          + (syncDisabled
+            ? 'product sync is disabled (wc_sync_product_enabled).'
+            : `the product direction is ${direction ?? 'unset'}, which does not import from WooCommerce (wc_sync_product_direction).`),
+        metadata: { externalId: productPayload.id, sku: productPayload.sku, productSyncEnabled: enabledSetting?.value ?? null, direction: direction ?? null },
+      })
+    }
+  }
+
+  if (canSyncProduct && productImportAllowed) {
     // No `observedVersion` is passed, and that is not an omission (o3d-wgl6). That argument
     // fences a payload the CALLER fetched against a rebind that landed since; the origin check
     // above already answers that question for a webhook, using the sending store's own identity
@@ -999,7 +1057,7 @@ async function handleProductWebhook(payload: unknown, originAttestation: string)
         },
       })
     }
-  } else if (typeof productPayload.id === 'number') {
+  } else if (!canSyncProduct && typeof productPayload.id === 'number') {
     await logActivity({
       entityType: 'SYNC',
       action: 'wc_product_webhook',
@@ -1178,7 +1236,7 @@ export async function handleWcWebhook(
   const originAttestation = readWcDeliveryOrigin(
     request,
     parsed.value,
-    resource === 'products' ? 'trusted' : 'header-unsigned',
+    resource === 'products' ? 'header-unsigned-containment' : 'header-unsigned',
   )
 
   const result: PersistWcWebhookEventResult = await dependencies.persistWebhookEvent(

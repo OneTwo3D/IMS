@@ -145,13 +145,15 @@ test('product incoming stock breakdown sums only remaining inbound quantities', 
     // every figure below is unchanged from before that change.
     wmsAsnLineMap: {
       findMany: async (args?: unknown) => {
-        const where = (args as { where: { asn?: { status: { in: string[] } }; sourceType?: string } }).where
+        const where = (args as { where: { asn?: { OR: [{ status: { in: string[] } }, { status: string; closedAt: null }] }; sourceType?: string } }).where
         if (!where.asn) {
           // The landed-quantity loaders (transfer arm, and since o3d-papk the PO arm).
           assert.ok(['STOCK_TRANSFER_LINE', 'PURCHASE_ORDER_LINE'].includes(where.sourceType ?? ''))
           return []
         }
-        wmsAsnStatusFilter = where.asn.status.in
+        wmsAsnStatusFilter = where.asn.OR[0].status.in
+        // o3d-42a05: a BOOKED_IN ASN whose receipt is not yet applied (closedAt null) still expects units.
+        assert.deepEqual(where.asn.OR[1], { status: 'BOOKED_IN', closedAt: null })
         return [
           {
             sourceType: 'PURCHASE_ORDER_LINE',
@@ -182,7 +184,7 @@ test('product incoming stock excludes unconfirmed WMS ASN create states', async 
     productionOrder: { findMany: async () => [] },
     wmsAsnLineMap: {
       findMany: async (args?: unknown) => {
-        const statuses = (args as { where: { asn: { status: { in: string[] } } } }).where.asn.status.in
+        const statuses = (args as { where: { asn: { OR: [{ status: { in: string[] } }] } } }).where.asn.OR[0].status.in
         assert.equal(statuses.includes('CREATE_PENDING'), false)
         assert.equal(statuses.includes('CREATE_IN_FLIGHT'), false)
         return []

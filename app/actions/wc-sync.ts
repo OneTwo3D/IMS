@@ -1,5 +1,6 @@
 'use server'
 
+import { refuseGuardedSettingWithoutAttestation, type AttestationDb } from '@/lib/domain/writer-attestation/store'
 import { resolveWritableTaxRateId } from '@/lib/tax/writable-tax-rate'
 import { lockStorefrontMappingWrites, repointStorefrontTaxMapping } from '@/lib/tax/storefront-mapping-write'
 import { revalidatePath } from 'next/cache'
@@ -13,6 +14,7 @@ import {
   getSettingValue,
   getSettingValues,
   maskSettingSecret,
+  SENSITIVE_SETTING_KEYS,
   serializeSettingValue,
 } from '@/lib/settings-store'
 import { validateWooCommerceBaseUrl } from '@/lib/connectors/woocommerce/url-safety'
@@ -34,6 +36,7 @@ import {
 } from '@/lib/connectors/woocommerce/connection-test-gate'
 import { normaliseStoreIdentity } from '@/lib/connectors/woocommerce/tax-rate-plan'
 import { normaliseWcOrderStatus } from '@/lib/connectors/woocommerce/order-status-filter'
+import { WC_WEBHOOK_SECRET_GRACE_HOURS, WC_WEBHOOK_SECRET_PREVIOUS_KEY, WC_WEBHOOK_SECRET_PREVIOUS_UNTIL_KEY } from '@/lib/connectors/woocommerce/sync/webhook-verify'
 import {
   UNRESOLVED_WC_ORDER_ROW_DESCRIPTIONS,
   isUnresolvedWcOrderRowFamily,
@@ -61,8 +64,14 @@ export type WcSyncSettings = {
   wc_sync_product_direction: string
   wc_stock_sync_enabled: string
   wc_cogs_sync_enabled: string
+  /** o3d-taro: push the estimated back-in-stock date (`_oti_eta_date` product meta) with the stock push. Default 'false'. */
+  wc_back_in_stock_date_enabled: string
   /** o3d-mu0a: GTIN/MPN identifier split for the storefront and warehouse product writes. Default 'false'. */
   product_identifier_split_enabled: string
+  /** Read-only report of WooCommerce orders that no longer match the IMS order (Sync > Exceptions). Default 'false'. Changes nothing when off. */
+  wc_order_divergence_detection_enabled: string
+  /** Courier -> AST provider slug on the tracking IMS writes to WooCommerce. Default 'false'. */
+  wc_ast_provider_mapping_enabled: string
   // The webhook secret itself is never sent to the client (masked to ''); the
   // UI only needs to know whether one is configured.
   wc_webhook_secret: string
@@ -100,8 +109,8 @@ export type WcSyncSettings = {
  */
 const SYNC_SETTING_KEYS = [
   'wc_sync_enabled', 'wc_sync_order_statuses',
-  'wc_sync_product_enabled', 'wc_sync_product_direction', 'wc_stock_sync_enabled', 'wc_cogs_sync_enabled',
-  'product_identifier_split_enabled',
+  'wc_sync_product_enabled', 'wc_sync_product_direction', 'wc_stock_sync_enabled', 'wc_cogs_sync_enabled', 'wc_back_in_stock_date_enabled',
+  'product_identifier_split_enabled', 'wc_order_divergence_detection_enabled', 'wc_ast_provider_mapping_enabled',
   'wc_webhook_secret', 'wc_webhook_last_received_at', 'wc_order_webhook_last_received_at', 'wc_product_webhook_last_received_at',
   'wc_order_webhook_last_processed_at', 'wc_product_webhook_last_processed_at',
   'last_wc_order_sync_at', 'last_wc_order_reconcile_at', 'last_wc_product_sync_at', 'last_wc_product_reconcile_at', 'last_wc_stock_sync_at',
@@ -135,7 +144,10 @@ const SYNC_DEFAULTS: WcSyncSettings = {
   wc_sync_product_direction: 'from_wc',
   wc_stock_sync_enabled: 'false',
   wc_cogs_sync_enabled: 'false',
+  wc_back_in_stock_date_enabled: 'false',
   product_identifier_split_enabled: 'false',
+  wc_order_divergence_detection_enabled: 'false',
+  wc_ast_provider_mapping_enabled: 'false',
   wc_webhook_secret: '',
   wc_webhook_secret_set: 'false',
   wc_webhook_last_received_at: '',
@@ -311,6 +323,12 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
   // Cheap, local and specific, so it is decided before the remote currency probe and the
   // connection gate: an operator who unticked every status should be told that, not handed
   // whichever unrelated check happens to fail first.
+  // Turning the stock push ON needs the owner's confirmation that Qoblex's push is stopped (two writers would otherwise push stock).
+  const attestationRefusal = await refuseGuardedSettingWithoutAttestation(data, {
+    db: db as unknown as AttestationDb,
+    currentValue: (key) => getSettingValue(key),
+  })
+  if (attestationRefusal) return { success: false, error: attestationRefusal, code: 'writer_attestation_required' }
   const emptyStatusSelection = rejectEmptyWcOrderStatusSelection(data.wc_sync_order_statuses)
   if (emptyStatusSelection) {
     return { success: false, error: emptyStatusSelection, code: 'wc_no_order_statuses_selected' }
@@ -327,6 +345,10 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
   if (!gate.ok) return { success: false, error: gate.error }
   const ops = Object.entries(data)
     .filter((entry): entry is [string, string] => SYNC_SETTING_KEYS.includes(entry[0]) && !MACHINE_MANAGED_SYNC_KEYS.has(entry[0]) && typeof entry[1] === 'string')
+    // SEC-M8: a masked secret means "keep the stored one". It skips the step-up gate above
+    // (shouldFreshGateSecretWrite), so it must also skip the write, or a caller could set the
+    // webhook secret to a value it knows ("abcd****") without ever re-authenticating.
+    .filter(([k, v]) => !(isMaskedSecret(v) && SENSITIVE_SETTING_KEYS.has(k)))
     .map(([k, v]) =>
       db.setting.upsert({
         where: { key: k },
@@ -334,6 +356,23 @@ export async function saveWcSyncSettings(data: Partial<WcSyncSettings>): Promise
         update: { value: serializeSettingValue(k, v ?? '') },
       }),
     )
+  // o3d-hqvrp.91: a rotated webhook secret leaves every existing WC webhook signing with the old one
+  // until "Setup Webhooks" is re-run, so keep the replaced secret for a grace window instead of
+  // refusing every delivery (verifyWcWebhook accepts it until the stored expiry).
+  const newSecret = typeof data.wc_webhook_secret === 'string' ? data.wc_webhook_secret : null
+  if (newSecret && !isMaskedSecret(newSecret)) {
+    const priorSecret = await getSettingValue('wc_webhook_secret')
+    if (priorSecret && priorSecret !== newSecret) {
+      const until = String(Date.now() + WC_WEBHOOK_SECRET_GRACE_HOURS * 3_600_000)
+      for (const [key, value] of [[WC_WEBHOOK_SECRET_PREVIOUS_KEY, priorSecret], [WC_WEBHOOK_SECRET_PREVIOUS_UNTIL_KEY, until]] as const) {
+        ops.push(db.setting.upsert({
+          where: { key },
+          create: { key, value: serializeSettingValue(key, value) },
+          update: { value: serializeSettingValue(key, value) },
+        }))
+      }
+    }
+  }
   await db.$transaction(ops)
   await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Updated WooCommerce sync settings' })
   revalidatePath('/sync')
@@ -945,6 +984,26 @@ const WC_WEBHOOK_DEFS = [
   { name: 'OTI – Product updated', topic: 'product.updated', path: '/api/webhooks/shopping/woocommerce/products' },
 ] as const
 
+/**
+ * "Revoke previous secret now" (o3d-hqvrp.91): a rotation keeps the replaced secret valid for the grace window so existing
+ * webhooks do not fail. When the old secret LEAKED that window is the problem, so this clears it immediately. Same gate as
+ * writing the secret itself (sync permission plus a fresh admin sign-in).
+ */
+export async function revokePreviousWcWebhookSecret(): Promise<{ success: boolean; error?: string; code?: string; reason?: string }> {
+  await requireSyncPermission()
+  try {
+    await requireFreshAdmin()
+  } catch (e) {
+    const freshAuthFailure = freshAuthFailureResult(e)
+    if (freshAuthFailure) return freshAuthFailure
+    throw e
+  }
+  await db.setting.deleteMany({ where: { key: { in: [WC_WEBHOOK_SECRET_PREVIOUS_KEY, WC_WEBHOOK_SECRET_PREVIOUS_UNTIL_KEY] } } })
+  await logActivity({ entityType: 'SETTING', tag: 'settings', action: 'updated', description: 'Revoked the previous WooCommerce webhook secret' })
+  revalidatePath('/sync')
+  return { success: true }
+}
+
 export async function createWcWebhooks(): Promise<{
   success: boolean
   created: number
@@ -967,13 +1026,13 @@ export async function createWcWebhooks(): Promise<{
   const webhookShadow = await wooWebhookRegistrationShadow()
   if (webhookShadow) return { success: false, created: 0, existing: 0, errors: [webhookShadow.notice] }
 
-  const { wcFetch, wcPost } = await import('@/lib/connectors/woocommerce/api')
+  const { wcFetch, wcPost, wcPut } = await import('@/lib/connectors/woocommerce/api')
 
   // List existing webhooks to avoid duplicates
   const { data: existing, error: listError } = await wcFetch('/webhooks', { per_page: '100' })
   if (listError) return { success: false, created: 0, existing: 0, errors: [listError] }
 
-  const existingWebhooks = Array.isArray(existing) ? existing as Array<{ topic?: string; delivery_url?: string }> : []
+  const existingWebhooks = Array.isArray(existing) ? existing as Array<{ id?: number | string; topic?: string; delivery_url?: string }> : []
 
   let created = 0
   let alreadyExist = 0
@@ -982,11 +1041,18 @@ export async function createWcWebhooks(): Promise<{
   for (const def of WC_WEBHOOK_DEFS) {
     const deliveryUrl = `${appUrl}${def.path}`
 
-    const isDuplicate = existingWebhooks.some(
-      (wh) => wh.topic === def.topic && wh.delivery_url === deliveryUrl,
-    )
+    const matching = existingWebhooks.filter((wh) => wh.topic === def.topic && wh.delivery_url === deliveryUrl)
+    const isDuplicate = matching.length > 0
     if (isDuplicate) {
       alreadyExist++
+      // o3d-hqvrp.91: an existing hook keeps the secret it was created with, so after a rotation
+      // push the current one to EVERY matching hook (a store can hold duplicates for one topic and URL; a hook left on the
+      // old secret would start failing silently when the grace window ends). Each failure is reported.
+      for (const hook of matching) {
+        if (hook.id === undefined) continue
+        const { error: updateError } = await wcPut(`/webhooks/${hook.id}`, { secret })
+        if (updateError) errors.push(`${def.topic}: could not update the secret on webhook ${hook.id}: ${updateError}`)
+      }
       continue
     }
 

@@ -157,6 +157,7 @@ mock.module('@/lib/db', {
           return (CREDIT_LINES as Array<{ refund: { orderId: string } }>).filter((line) => scope.includes(line.refund.orderId))
         },
       },
+      shipmentLine: { findMany: async () => [] },
       product: {
         findMany: async (args?: { where?: Record<string, unknown> }) => {
           PRODUCT_WHERE = args?.where ?? null
@@ -447,7 +448,7 @@ test('a NET credit that reached no row still bounds the totals (o3d-kyey)', asyn
   assert.equal(totals.grossMarginBaseBound, 'upper')
   const page = await pageCells()
   assert.equal(page.footer('revenue'), '£100.00 ≤')
-  assert.equal(page.summary.get('Credit off-report — no revenue row here (net / gross / unproven)'), '£10.00 / £0.00 / £0.00')
+  assert.equal(page.summary.get('Credit off-report — line or product has no revenue row in this window (net / gross / unproven)'), '£10.00 / £0.00 / £0.00')
 })
 
 test('a credit line naming nothing keyable is separated from one naming a row we lack (o3d-rv4a)', async () => {
@@ -1348,7 +1349,7 @@ test('an Unmatched row keeps the credit against its matched line in its own cred
   // And it still marks the period figures, as help-docs/analytics.md says: nothing subtracted it.
   assert.match(page.footer('revenue'), / ≤$/, `the revenue footer is ${page.footer('revenue')}`)
   assert.equal(page.summary.get('Credit off-report — nothing to attribute to (net / gross / unproven)'), '£0.00 / £0.00 / £0.00')
-  assert.equal(page.summary.get('Credit off-report — no revenue row here (net / gross / unproven)'), '£0.00 / £0.00 / £0.00')
+  assert.equal(page.summary.get('Credit off-report — line or product has no revenue row in this window (net / gross / unproven)'), '£0.00 / £0.00 / £0.00')
   const notice = page.notices.find((line) => /Unmatched|matched to a sales order line/.test(line))
   assert.ok(notice, `no unmatched-row notice; notices were ${JSON.stringify(page.notices)}`)
   // The false claim, as an absence, and the true one, as substance.

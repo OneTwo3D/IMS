@@ -79,9 +79,11 @@ import { freshAuthFailureResult, requireFreshPermission, requirePermission } fro
 import {
   IntegrationOutboxAdminError,
   listIntegrationOutboxAdminRows,
+  toAdminIntegrationOutboxRow,
   replayIntegrationOutboxAdminRow,
 } from '@/lib/domain/integrations/outbox-admin'
 import { INTEGRATION_OUTBOX_STATUS } from '@/lib/domain/integrations/outbox'
+import { UNKNOWN_RELEASE_STATUS_ROW_WHERE } from '@/lib/domain/sales/refund-reservation-release-outbox'
 import {
   DEAD_RECEIPT_EVENT_STATUS,
   buildDeadReceiptEventReplayData,
@@ -387,6 +389,8 @@ export type PennyMismatchRow = {
 
 export type OutboxFailureRow = {
   id: string
+  /** True when the row's status is not one this version recognises: Replay cannot work and an administrator must act. */
+  unrecognisedStatus: boolean
   connector: string
   operation: string
   status: string
@@ -828,6 +832,8 @@ export type ExceptionInboxSummary = {
   wmsOperatorTasksOpen: number
   /** Standing refusals of an action (an order change the warehouse could not take, a split order that cannot complete) that need a person: serious and medium ones (counted in the total). */
   refusedActionsOpen: number
+  /** WooCommerce orders that no longer match the IMS order (WC_ORDER_DIVERGED; counted in the total). Read-only: IMS changed nothing. */
+  wcOrderDivergencesOpen: number
   unresolvedDrift: number
   /** Open systemic-failure incidents: a sweep read a pass as a connector-wide fault and parked nothing (counted in the total). */
   systemicFailures: number
@@ -904,6 +910,7 @@ export type ExceptionInboxData = {
 // either recovers or lands here as PERMANENT_FAILED. Listing mid-backoff rows
 // would surface self-resolving noise, and "acknowledging" them (flipping to
 // PERMANENT_FAILED) would not have removed them from this same list.
+const KNOWN_OUTBOX_STATUS_VALUES = Object.values(INTEGRATION_OUTBOX_STATUS)
 const OUTBOX_FAILURE_STATUSES = [
   INTEGRATION_OUTBOX_STATUS.PERMANENT_FAILED,
 ]
@@ -1259,7 +1266,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // VALIDATION_FAILED or AMBIGUOUS_CREATE order reaches the warehouse only via a human, so it
     // belongs in the same total. Kept through the merge with o3d-0bfh's follow-up obligations.
     db.wmsOrderPushLink.count({ where: WMS_PUSH_INBOX_WHERE }),
-    db.integrationOutbox.count({ where: { status: { in: OUTBOX_FAILURE_STATUSES } } }),
+    db.integrationOutbox.count({ where: { OR: [{ status: { in: OUTBOX_FAILURE_STATUSES } }, UNKNOWN_RELEASE_STATUS_ROW_WHERE] } }),
     db.wmsInboundReceiptEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
     db.wmsWebhookEvent.count({ where: { processingStatus: DEAD_RECEIPT_EVENT_STATUS } }),
     // Store (WooCommerce) deliveries that ran out of retries, including order and refund deliveries held because
@@ -1300,6 +1307,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   const wmsOperatorTasksOpen = await db.wmsOperatorTask.count({ where: { status: 'OPEN' } })
   // HIGH and MEDIUM only: LOW is noise by design (listed on the page, never counted).
   const refusedActionsOpen = await db.refusedAction.count({ where: { resolvedAt: null, severity: { in: ['HIGH', 'MEDIUM'] } } })
+  const wcOrderDivergencesOpen = await db.wcOrderDivergence.count({ where: { resolvedAt: null } })
   const systemicFailures = (await loadActiveSystemicIncidents()).length
   const maintenanceRecovery = countMaintenanceRecovery(await loadMaintenanceRecoveryState())
   const deadReceiptEvents = deadReceipts + deadWebhooks + deadShoppingWebhooks
@@ -1320,6 +1328,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     giftCardLinesToResolve,
     wmsOperatorTasksOpen,
     refusedActionsOpen,
+    wcOrderDivergencesOpen,
     unresolvedDrift: driftIncidents.length,
     systemicFailures,
     accountingFollowUpObligations,
@@ -1328,7 +1337,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // Not in `total` — see the field's own comment: an operator settling a refusal is not a second debt.
     accountingHandPostClaims: handPostClaims,
     total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks
-      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + wcOrderEdits + blockedWcOrders + wcCompletionRefusals + doublePostageFlags + giftCardLinesToResolve + wmsOperatorTasksOpen + refusedActionsOpen + driftIncidents.length + systemicFailures
+      + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + wcOrderEdits + blockedWcOrders + wcCompletionRefusals + doublePostageFlags + giftCardLinesToResolve + wmsOperatorTasksOpen + refusedActionsOpen + wcOrderDivergencesOpen + driftIncidents.length + systemicFailures
       + accountingFollowUpObligations + outstandingPostingRefusals + unconfirmedPostingRefusals,
   }
 }
@@ -1429,7 +1438,12 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     // The admin list filter takes a single status, so query each failure status
     // and merge — filtering one mixed recent page would hide failures older
     // than the newest 50 rows of ANY status.
-    Promise.all(OUTBOX_FAILURE_STATUSES.map((status) => listIntegrationOutboxAdminRows({ status, limit: SECTION_LIMIT })))
+    // Plus release rows in a status this binary does not know: they block dispatch and no other read raises them.
+    Promise.all([
+      ...OUTBOX_FAILURE_STATUSES.map((status) => listIntegrationOutboxAdminRows({ status, limit: SECTION_LIMIT })),
+      db.integrationOutbox.findMany({ where: UNKNOWN_RELEASE_STATUS_ROW_WHERE, orderBy: { updatedAt: 'desc' }, take: SECTION_LIMIT })
+        .then((rows) => ({ rows: rows.map(toAdminIntegrationOutboxRow) })),
+    ])
       .then((results) => results
         .flatMap((result) => result.rows)
         .sort((left, right) => new Date(right.updatedAt as never).getTime() - new Date(left.updatedAt as never).getTime())
@@ -1801,6 +1815,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     wmsPushDeadLetters: pushLinks.map((link) => buildBlockedWmsPushRow(link)),
     outboxFailures: outbox.map((row) => ({
       id: row.id,
+      unrecognisedStatus: !(KNOWN_OUTBOX_STATUS_VALUES as string[]).includes(row.status),
       connector: row.connector,
       operation: row.operation,
       status: row.status,

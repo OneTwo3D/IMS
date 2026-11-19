@@ -1,5 +1,9 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
+import { PROVEN_LEDGER_FACT_WHERE } from '@/lib/domain/accounting/ledger-standing'
+import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
+import { lockOrderFirst, recomputeSalesOrderInvoicingState, type InvoicingStateClient } from '@/lib/domain/sales/invoicing-state-sites'
 import { voidMirroredAccountingEventsForOrder } from './accounting-event-mirror'
 import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from './money-attempt-provenance'
 import { UNCLAIMED_ATTEMPT_REVISION, nextAttemptRevision, type AttemptRef } from './sync-log-attempt'
@@ -105,6 +109,44 @@ export async function assertNoSalesInvoicePostingInFlight(
 }
 
 /**
+ * The invoice for an order that stands in the ledger, if one exists. Cancelling an order never touches it, so a cancellation of such an
+ * order leaves a receivable, its revenue deferral and its allocation journals standing in the ledger.
+ *
+ * WHAT COUNTS: an IMS SALES_INVOICE row that is a PROVEN LEDGER FACT (`PROVEN_LEDGER_FACT_WHERE`): the connector's own writeback or an operator
+ * release of a connector id, SYNCED or naming a document. A Xeroom-era invoice counts only through such a row. A WooCommerce invoice number is never
+ * evidence: the importer stores one on every numbered order, including ones IMS invoices itself and that never posted.
+ *
+ * WHAT DOES NOT: a FAILED row that merely carries an id, a row whose cancellation the connector VERIFIED, an operator-asserted or
+ * operator-settled NOT-posted row, and a HELD_SHADOW row.
+ */
+export async function findPostedSalesInvoiceSync(
+  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
+  orderId: string,
+): Promise<{ id: string; connector: string; type: string } | null> {
+  return tx.accountingSyncLog.findFirst({
+    where: {
+      referenceId: orderId,
+      type: { in: [...SALES_INVOICE_SYNC_TYPES] },
+      AND: [
+        PROVEN_LEDGER_FACT_WHERE,
+        { OR: [{ settlementBasis: null }, { settlementBasis: { not: VERIFIED_REVERSAL_SETTLEMENT_BASIS } }] },
+      ],
+    },
+    select: { id: true, connector: true, type: true },
+  })
+}
+
+/** What a MANUAL cancellation of an order with a posted invoice is told. Every step named here is one the operator can take. */
+export function cancelWithPostedInvoiceMessage(invoice: { connector: string; id: string }): string {
+  return `This order's invoice is already posted to ${invoice.connector} (${invoice.id}), and cancelling the order neither voids it nor credits it, so the receivable and its revenue deferral would stay in the ledger. Refund the order in full first (the refund raises the credit note), then cancel it.`
+}
+
+/** What the operator task for a STOREFRONT cancellation of an order with a posted invoice says. The order is already cancelled, and a cancelled order cannot be refunded in IMS. */
+export function cancelledWithPostedInvoiceTaskText(invoice: { connector: string; id: string }, orderNumber: string): string {
+  return withLedgerCheck(`Order ${orderNumber} was cancelled by the storefront while its invoice is posted to ${invoice.connector} (${invoice.id}). IMS raised no void or credit note and cannot refund a cancelled order, so the invoice must be credited: raise a credit note against it in ${invoice.connector} by hand. The order's revenue deferral and inventory allocation journals also stay in the ledger until they are reversed by hand.`)
+}
+
+/**
  * When a sales order is cancelled, retire its still-pending SALES_INVOICE accounting work so the
  * real-time sync drain does not post an ACCREC invoice for a sale that never happened (o3d-5rs). A
  * cancel is only permitted pre-dispatch, so there is genuinely no revenue to recognise.
@@ -129,6 +171,8 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
   // cancellation simply proceeded and the invoice landed anyway. This is the invariant that stops it,
   // placed HERE so no caller of this module can skip it.
   await assertNoSalesInvoicePostingInFlight(tx, orderId, now)
+  // The cancellation's own order lock (the caller took it) is the canonical first lock; this holds it for a caller that did not.
+  await lockOrderFirst(tx, orderId)
 
   const staleProcessingCutoff = new Date(now.getTime() - STALE_PROCESSING_MS)
   const reason = 'Cancelled: sales order cancelled before the invoice posted (no revenue to recognise).'
@@ -269,6 +313,10 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
     reason,
   })
 
+  // The retired rows may have been the order's only invoice (a queued invoice whose order was cancelled before it posted is no invoice):
+  // the state is re-derived, and a row that DID post keeps it (the cancellation sweep never touches a row that names a document).
+  if (neverClaimed.count + retired.length > 0) await recomputeSalesOrderInvoicingState(tx as unknown as InvoicingStateClient, orderId)
+
   return neverClaimed.count + retired.length
 }
 
@@ -306,6 +354,8 @@ export async function retireSalesInvoiceForCancelledOrder(
   /** The row is retired because THIS ATTEMPT is superseded, not because the sale is gone: its mirrored event is voided revivably, so the replacement attempt can take the document up. */
   attemptOnly = false,
 ): Promise<boolean> {
+  // Canonical lock order: the order row before the sync row this retires (a no-op when the guard that called this already holds it).
+  await lockOrderFirst(client, orderId)
   const fenced = attempt.attemptRevision !== UNCLAIMED_ATTEMPT_REVISION
   // BOTH claim identities in the predicate, and the retirement ADVANCES the one that is an identity.
   //
@@ -345,5 +395,6 @@ export async function retireSalesInvoiceForCancelledOrder(
     reason,
     ...(attemptOnly ? { attemptOnly: true } : {}),
   })
+  await recomputeSalesOrderInvoicingState(client as unknown as InvoicingStateClient, orderId)
   return true
 }

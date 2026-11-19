@@ -1,5 +1,6 @@
 'use server'
 
+import { markWmsScopeDirtyInTx } from '@/lib/domain/wms/scope-dirty'
 import type { ShipmentServiceClient } from '@/lib/domain/sales/shipment-service'
 import { revalidatePath } from 'next/cache'
 import type { Prisma } from '@/app/generated/prisma/client'
@@ -24,6 +25,7 @@ import {
 } from '@/lib/products/fulfillment-requirement-snapshot'
 import { validateSalesOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
+import { QUOTE_ACTION_REFUSAL, assertNotQuoteUnderLock } from '@/lib/domain/sales/sales-quote-guard'
 import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import {
   allocateSalesOrder,
@@ -406,6 +408,8 @@ export async function autoAllocateOrder(
     // under-lock status to still be in this set; otherwise allocation is an explicit no-op (skipped:true,
     // committed:false, no error). See AllocateSalesOrderInput.requireStatusUnderLock.
     requireStatusUnderLock?: readonly SalesOrderStatus[]
+    // SO-to-PO pegging: the receipt's peg pass. See AllocateSalesOrderInput.capPeggedLines.
+    capPeggedLines?: boolean
   },
 ): Promise<{
   success: boolean
@@ -453,6 +457,7 @@ export async function autoAllocateOrder(
       trimUnshippedWhenShipmentsExist: options?.trimUnshippedWhenShipmentsExist,
       onReconciledInTx: options?.onReconciledInTx,
       requireStatusUnderLock: options?.requireStatusUnderLock,
+      capPeggedLines: options?.capPeggedLines,
       userId: actingUserId,
     })
     allocationCommitted = true
@@ -560,6 +565,7 @@ export async function updateAllocation(
 
     await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, alloc.orderId)
+      await assertNotQuoteUnderLock(tx, alloc.orderId, 'stock cannot be allocated to it')
 
       // o3d-4kfh: RE-READ THE ROW UNDER THE ORDER LOCK, and derive EVERYTHING from that read.
       //
@@ -741,6 +747,8 @@ export async function updateAllocation(
       // row would hold. `newQty === 0` let 0.00004 through to a row Postgres stores as 0.0000 —
       // an allocation row claiming nothing, which every structural check then reads as a component
       // missing from the set — while the reservation moved by 0.00004.
+      // The allocation set is about to change: the warehouse's part of the order must be re-derived.
+      await markWmsScopeDirtyInTx(tx, locked.orderId)
       if (requestedQty.lte(0)) {
         await tx.orderAllocation.delete({ where: { id: allocationId } })
       } else {
@@ -919,6 +927,7 @@ export async function addAllocation(
 
     await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
+      await assertNotQuoteUnderLock(tx, orderId, 'stock cannot be allocated to it')
       await resetAllocationAccountingIfStaged(tx, orderId)
       const graph = await loadFulfillmentProductGraph(tx, [productId])
 
@@ -1052,6 +1061,7 @@ export async function addAllocation(
         })
         qtyBeforeByLeaf.set(leafProductId, toDecimal(existing?.qty ?? 0))
 
+        await markWmsScopeDirtyInTx(tx, orderId)
         if (existing) {
           await tx.orderAllocation.update({
             where: { id: existing.id },
@@ -1508,6 +1518,7 @@ export async function confirmAllocations(
     if (options?.internalBypassToken !== INTERNAL_ACTION_BYPASS) {
       await requirePermission('sales.process')
     }
+    if ((await db.salesOrder.findUnique({ where: { id: orderId }, select: { isQuote: true } }))?.isQuote) return { success: false, error: QUOTE_ACTION_REFUSAL('its allocations cannot be confirmed into shipments') }
     const result = await confirmSalesOrderShipments(db, orderId)
 
     revalidatePath('/sales')

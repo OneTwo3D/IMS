@@ -23,3 +23,30 @@ export function buildPasswordResetUrl(baseUrl: string, token: string): string {
   const trimmed = baseUrl.replace(/\/+$/, '')
   return `${trimmed}/reset-password?token=${encodeURIComponent(token)}`
 }
+
+export const PASSWORD_RESET_COOLDOWN_MS = 2 * 60_000
+
+type ResetLimiter = (key: string, max: number, windowMs: number) => Promise<{ allowed: boolean }>
+
+/**
+ * Whether a reset request may send an email. The caller answers the same silent
+ * acknowledgement either way.
+ *
+ * Nothing here can stop a victim's own reset: the only per-address limit is a short
+ * COOLDOWN (at most one email per address per 2 minutes), so an attacker who spams an
+ * address only means a reset email has just been sent to the owner's inbox. The hard
+ * caps are per source IP and are skipped when the IP is unknown (they would be one
+ * shared bucket for everybody).
+ */
+export async function passwordResetEmailAllowed(input: {
+  email: string
+  ip: string
+  limiter: ResetLimiter
+}): Promise<boolean> {
+  const { email, ip, limiter } = input
+  if (ip !== 'unknown') {
+    if (!(await limiter(`pwreset-ip:${ip}`, 20, 15 * 60_000)).allowed) return false
+    if (!(await limiter(`pwreset:${email}:${ip}`, 5, 15 * 60_000)).allowed) return false
+  }
+  return (await limiter(`pwreset-cool:${email}`, 1, PASSWORD_RESET_COOLDOWN_MS)).allowed
+}

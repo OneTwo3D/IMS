@@ -11,6 +11,7 @@ import type { runScheduledInvariantCheck } from '@/lib/cron/invariant-check'
 import type { fetchAllFxRatesInternal } from '@/lib/currencies/fx-refresh'
 import type { retryPendingWcOrdersWaitingForFx } from '@/lib/connectors/woocommerce/sync/order-import'
 import type { sweepUnregisteredReceipts } from '@/lib/domain/accounting/receipt-registration-sweep'
+import type { runPaymentMatchingPass } from '@/lib/domain/accounting/payment-matching'
 import type { writeDailyInventorySnapshot } from '@/lib/domain/inventory/inventory-snapshot'
 import type { runInvoiceDocumentSweep } from '@/lib/domain/invoice-documents/sweep'
 import type { getInvoiceDocumentHealth } from '@/lib/domain/invoice-documents/health'
@@ -32,11 +33,16 @@ import type { WcErasureSweepOutcome } from '@/lib/connectors/woocommerce/sync/an
 import type { purgeExpiredActivityLogs, purgeExpiredCronRuns } from '@/lib/activity-log-cleanup'
 import type { purgeExpiredData } from '@/lib/data-retention'
 import type { ProcessPendingWcWebhookEventsResult } from '@/lib/jobs/woocommerce/process-shopping-webhook-events'
-import type { processShoppingOrderCompletions, processShoppingOrderStatusPushes, processShoppingInvoiceDocumentPublications } from '@/lib/shopping'
+import type { reconcileShoppingTrackingPushes, processShoppingOrderCompletions, processShoppingOrderStatusPushes, processShoppingInvoiceDocumentPublications, processShoppingTrackshipRefires } from '@/lib/shopping'
 import type { XeroDailyBatchResult } from '@/lib/connectors/xero/daily-sync'
 import { counts, from, enumResult, noFailureSignal, num, permanentLists, structural, worstOutcome } from './cron-outcome-helpers'
 import { mintsoftCronOutcomes as warehouseConnectorCronOutcomes } from '@/lib/connectors/mintsoft/cron-outcomes' // wms-connector-boundary-ok: 2026-11-13: the registry spreads the connector's own entries
 import type { CronOutcomeClass } from './cron-run'
+
+/** A merge-hold failure carried on a WMS sweep result: the maintenance threw, or a hold could not be placed. */
+function mergeHoldFailure(r: { mergeHoldMaintenance?: unknown; mergeCandidateDetection?: { detection: string } }): CronOutcomeClass | null {
+  return r.mergeHoldMaintenance || r.mergeCandidateDetection?.detection === 'holds-failed' ? 'failed' : null
+}
 
 export { worstOutcome }
 
@@ -71,6 +77,7 @@ type FxRatesCronResult = (Ret<typeof fetchAllFxRatesInternal> | { error: string 
     queue: Ret<typeof retryPendingWcOrdersWaitingForFx> | { error: string }
     orphans: Ret<typeof sweepUnregisteredReceipts> | { error: string }
   }
+  paymentMatching: Ret<typeof runPaymentMatchingPass> | { error: string }
   stepFailures?: Array<{ step: string; error: string }>
 }
 type AccountingSyncCronResult = {
@@ -93,6 +100,7 @@ type ActivityCleanupCronResult = {
   cronRuns: Ret<typeof purgeExpiredCronRuns>
   dataRetention: Ret<typeof purgeExpiredData>
   wmsMutationEvents: number
+  attachmentFiles: { removed: number; failed: string[] }
 }
 type ReallocationSweepCronResult = Partial<Ret<typeof sweepUnallocatedProcessingOrders>> & {
   directCreateMarkers: Ret<typeof sweepUnresolvedDirectCreateMarkers> | null
@@ -112,6 +120,10 @@ export type ShoppingDrain =
   | Ret<typeof processShoppingOrderCompletions>
   | Ret<typeof processShoppingOrderStatusPushes>
   | Ret<typeof processShoppingInvoiceDocumentPublications>
+  | Ret<typeof processShoppingTrackshipRefires>
+  | { skipped: boolean; reason?: string; error?: string }
+export type TrackingReconcileDrain =
+  | Ret<typeof reconcileShoppingTrackingPushes>
   | { skipped: boolean; reason?: string; error?: string }
 type ShoppingWebhookInboxCronResult = {
   connectors: {
@@ -119,6 +131,8 @@ type ShoppingWebhookInboxCronResult = {
       orderCompletions: ShoppingDrain
       orderStatusPushes: ShoppingDrain
       invoiceDocumentPublications: ShoppingDrain
+      trackingReconcile: TrackingReconcileDrain
+      trackshipRefires: ShoppingDrain
     }
   }
 }
@@ -152,8 +166,8 @@ export const cronOutcomes = {
     const sweepFailure = r.errors && r.errors.length > 0 ? structural({ errors: r.errors }) : null
     return from(r, counts(r, ['failed']), structural(r), sweepFailure)
   },
-  // a purge reports what it deleted; there is no failure signal short of a throw
-  'activity-cleanup': (r: ActivityCleanupCronResult) => noFailureSignal(r),
+  // a purge reports what it deleted; the one failure signal is an attachment file owed a deletion that could not be removed (attachmentFiles.failed: string[])
+  'activity-cleanup': (r: ActivityCleanupCronResult) => from(r, (r.attachmentFiles?.failed.length ?? 0) > 0 ? 'failed' : null),
   // `error` (the dump or its manifest failed); `uploadError` (a configured remote target did not take the copy); `cleanupError` (retention purge failed)
   backup: (r: BackupCronResult) => from(r, 'error' in r || 'uploadError' in r || 'cleanupError' in r ? 'failed' : null),
   // failed: number (a refused or unanswered TrackShip lookup, an order that could not be marked delivered)
@@ -175,6 +189,8 @@ export const cronOutcomes = {
   'invoice-documents': (r: InvoiceDocumentsCronResult) =>
     from(r, r.stoppedEarly ? structural({ error: r.stoppedEarly }) : null, num(r.failed) > 0 ? 'failed' : null),
   // an archive pass reports what it archived and skipped; there is no failure signal short of a throw
+  // failed: number (products whose storefront or warehouse hand-over threw; they keep their mark and are retried, then parked)
+  'product-sync-marks': (r: { failed: number }) => from(r, num(r.failed) > 0 ? 'failed' : null),
   'product-lifecycle-archive': (r: { scanned: number; archived: number; skippedWithStock: number; skippedWithIncoming: number }) => noFailureSignal(r),
   // status: FAILED = a stale feed that no admin could be told about
   'read-sync-liveness': (r: Ret<typeof runReadSyncLivenessAlarmLive>) => from(r, r.status === 'FAILED' ? 'failed' : null),
@@ -192,7 +208,7 @@ export const cronOutcomes = {
   // failed: number (events that failed to process) and error texts, per connector tick and per drain
   'shopping-webhook-inbox': (r: ShoppingWebhookInboxCronResult) => from(r, counts(r, ['failed', 'deadLettered']), structural(r)),
   // error texts and lists in each section (orders, products, stock, queued pushes); held pushes are recognised by their text;
-  // refundStockCorrections.error (the queueing of open refund stock corrections threw); products.permanentErrors: permanent import conflicts, reported apart from errors and never cleared without an operator
+  // productPushRetrySweep.error (the product-push retry sweep threw); refundStockCorrections.error (the queueing of open refund stock corrections threw); products.permanentErrors: permanent import conflicts, reported apart from errors and never cleared without an operator
   // heldSalesInvoices.readError: the held-invoice release sweep could not read its queue or the orders behind it (a database read: never held)
   'wc-reconcile': (r: WcReconcileResult | Skip) =>
     from(r, structural(r), permanentLists(r, ['permanentErrors']), 'heldSalesInvoices' in r && r.heldSalesInvoices?.readError ? 'failed' : null),
@@ -203,11 +219,12 @@ export const cronOutcomes = {
   // fenceCheckErrors, claimErrors and linkWriteErrors: a withdrawal-fence check, create-claim transaction or recovery-pass link write that THREW (the order is skipped and retried, but the sweep could not decide it)
   // systemicSuppressed: orders and links that ran out of retries in a pass read as a connector-wide fault and so were left unparked (the breaker's verdict). A FAILED run, never green: an outage handled gracefully is still an outage
   // operatorTaskErrors: operator tasks ("raise a warehouse query") that could not be recorded this run (retried next run). operatorTasksRaised and operatorTasksOpen are information: an open task is a person's to-do, never a failure
-  'wms-order-push': (r: WmsOrderPushSweepResult) => from(r, counts(r, ['failed', 'deadLettered', 'shadowUnrecorded', 'validationFailed', 'createClaimParked', 'fenceCheckErrors', 'claimErrors', 'linkWriteErrors', 'operatorTaskErrors', 'systemicSuppressed'])),
+  // mergeHoldMaintenance (the merge-hold upkeep threw) and mergeCandidateDetection.detection 'holds-failed' (a merge hold could not be placed): a FAILED run, retried on the next sweep
+  'wms-order-push': (r: WmsOrderPushSweepResult) => from(r, counts(r, ['failed', 'deadLettered', 'shadowUnrecorded', 'validationFailed', 'createClaimParked', 'fenceCheckErrors', 'claimErrors', 'linkWriteErrors', 'operatorTaskErrors', 'systemicSuppressed']), mergeHoldFailure(r)),
   // status enum; counters.errors: number
   'wms-order-reconcile': (r: WmsOrderReconcileResult) => enumResult(r, ['errors']),
   // failed: number; probeFailures: number (a presence probe that threw, apart from the expected unresolved states); pushFailures / pushHeld: whole-batch counts of failed and hold-refused pushes (`errors` is cut at 20 for display, so the mapping reads the counts); errors: string[] (storefront status pushes that failed, held-aware)
-  'wms-order-status': (r: WmsOrderStatusSweepResult) => from(r, counts(r, ['failed', 'probeFailures', 'pushFailures']), structural(r)),
+  'wms-order-status': (r: WmsOrderStatusSweepResult) => from(r, counts(r, ['failed', 'probeFailures', 'pushFailures']), structural(r), mergeHoldFailure(r)),
   // status: FAILED = breaches nobody could be alerted to
   'wms-watchdog': (r: WmsWatchdogResult): CronOutcomeClass => (r.status === 'FAILED' ? 'failed' : r.status === 'SKIPPED' ? 'skipped' : 'ok'),
   // status: FAILED

@@ -3,6 +3,7 @@ import { EmailRecipientErasedError } from '@/lib/domain/erasure/email-recipient'
 import { assertNoStoreCreditInvoiceDocument } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import { renderEmailHtml } from '@/lib/email-template'
 import { loadCurrentInvoicePdf } from '@/lib/domain/invoice-documents/current-document'
+import { isInvoiceDocumentPublishingEnabled } from '@/lib/domain/invoice-documents/publishing-switch'
 import { formatCountryDisplay } from '@/lib/countries'
 import {
   createPdfDocument,
@@ -15,11 +16,13 @@ import {
 } from '@/lib/pdf'
 import { formatMoney, type SymbolPos } from '@/lib/utils'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
-import { orderDocumentMoney, drawTotalsRows, invoiceDocumentIdentity } from '@/lib/pdf-order-money'
+import { orderDocumentMoney, drawTotalsRows, invoiceDocumentIdentity, invoiceLineVatDetail } from '@/lib/pdf-order-money'
 import { getBaseCurrencyDisplay } from '@/lib/base-currency'
 import { formatDateTime } from '@/lib/format-datetime'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { getTrackingUrl } from '@/lib/tracking'
+import { getCurrencyFormat, renderSalesOrderPdf, SALES_ORDER_PDF_LINE_SELECT, type SalesOrderPdfSource } from '@/lib/sales-order-pdf'
+import { buildSalesQuoteEmail } from '@/lib/sales-quote-email'
 import { buildPurchaseOrderEmail, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
 
 type EmailAttachment = { filename: string; content: Buffer; contentType?: string }
@@ -32,55 +35,7 @@ type SendGuard = <T>(send: () => Promise<T>) => Promise<SendGuardOutcome<T>>
 export type PreparedEmail = { to: string; subject: string; html: string; attachments?: EmailAttachment[]; sendGuard?: SendGuard; sendDeadlineMs?: number; singleSend?: boolean }
 type QueueEmailData = { to: string; subject: string; reference: string }
 
-type SoForPdf = {
-  id: string
-  externalOrderNumber: string | null
-  orderNumber?: string | null
-  pricesIncludeVat?: boolean | null
-  shoppingLinks?: { connector: string }[] | null
-  currency: string
-  customerName: string | null
-  customerEmail: string | null
-  billingAddress: unknown
-  shippingAddress: unknown
-  subtotalForeign: unknown
-  shippingForeign: unknown
-  shippingService: string | null
-  taxForeign: unknown
-  taxRateName: string | null
-  taxRatePercent: unknown
-  totalForeign: unknown
-  totalBase: unknown
-  taxBase: unknown
-  discountAmount: unknown
-  /** Store credit, GROSS: a payment. Shown beside the Total on an order document, never on an invoice. */
-  storeCreditForeign?: unknown
-  storeCreditAssessment?: unknown
-  invoiceNumber: string | null
-  invoicedAt: Date | null
-  paidAt: Date | null
-  expectedDelivery: Date | null
-  notes: string | null
-  createdAt: Date
-  invoicePdfPath?: string | null
-  lines: {
-    description: string
-    sku: string | null
-    qty: unknown
-    unitPriceForeign: unknown
-    discountAmount: unknown
-    totalForeign: unknown
-    taxForeign?: unknown
-    taxRate?: { rate: unknown } | null
-  }[]
-}
-
-async function getCurrencyFormat(code: string): Promise<{ sym: string; symPos: SymbolPos; money: (n: number) => string }> {
-  const row = await db.currency.findUnique({ where: { code } })
-  const sym = row?.symbol ?? (code === 'GBP' ? '£' : code)
-  const symPos: SymbolPos = row?.symbolPosition ?? 'PREFIX'
-  return { sym, symPos, money: (n: number) => formatMoney(n, sym, symPos) }
-}
+type SoForPdf = SalesOrderPdfSource
 
 async function getTemplate(type: string) {
   return db.documentTemplate.findUnique({
@@ -94,96 +49,13 @@ async function getSalesOrderEmailOrder(orderId: string): Promise<SoForPdf | null
     where: { id: orderId },
     include: {
       shoppingLinks: { select: { connector: true } },
-      lines: {
-        select: {
-          description: true,
-          sku: true,
-          qty: true,
-          unitPriceForeign: true,
-          discountAmount: true,
-          totalForeign: true,
-          taxForeign: true,
-          taxRate: { select: { rate: true } },
-        },
-      },
+      lines: { select: SALES_ORDER_PDF_LINE_SELECT },
     },
   })
 }
 
 async function generateSalesOrderPdf(so: SoForPdf, branding: Awaited<ReturnType<typeof getBranding>>): Promise<Buffer> {
-  const tpl = await getTemplate('sales_order')
-  const tz = await getDisplayTimeZone()
-  const orderRef = getSalesOrderReference(so)
-  const { doc } = createPdfDocument({ title: `Order ${orderRef}` })
-  const date = formatDateTime(so.createdAt, { day: 'numeric', month: 'long', year: 'numeric' }, tz)
-  const shipAddr = so.shippingAddress as Record<string, string> | null
-  const recipientAddr = shipAddr ? [shipAddr.line1, shipAddr.line2, shipAddr.city, shipAddr.postcode, formatCountryDisplay(shipAddr.country)].filter(Boolean).join('\n') : ''
-
-  await drawHeader(doc, branding, {
-    title: 'Sales Order',
-    reference: orderRef,
-    date,
-    recipient: { name: so.customerName ?? 'Customer', address: recipientAddr, email: so.customerEmail },
-  })
-
-  if (tpl?.headerNote) {
-    doc.font('Helvetica').fontSize(8).fillColor('#555').text(tpl.headerNote, 50, doc.y, { width: 495 })
-    doc.y += 8
-  }
-
-  if (so.expectedDelivery) {
-    doc.font('Helvetica').fontSize(9).fillColor('#333').text(`Expected delivery: ${formatDateTime(so.expectedDelivery, { day: 'numeric', month: 'long', year: 'numeric' }, tz)}`, 50, doc.y)
-    doc.y += 6
-  }
-  if (so.shippingService) {
-    doc.font('Helvetica').fontSize(9).fillColor('#333').text(`Shipping: ${so.shippingService}`, 50, doc.y)
-    doc.y += 10
-  }
-
-  const { sym, symPos } = await getCurrencyFormat(so.currency)
-  const { view, totalsRows } = orderDocumentMoney(so)
-  const columns: PdfTableColumn[] = [
-    { label: '#', width: 25, align: 'right' },
-    { label: 'SKU', width: 70 },
-    { label: 'Description', width: 195, wrap: true },
-    { label: 'Qty', width: 40, align: 'right' },
-    { label: `Price ${view.basisLabel} (${sym})`, width: 65, align: 'right' },
-    { label: 'Discount', width: 50, align: 'right' },
-    { label: `Total ${view.basisLabel} (${sym})`, width: 65, align: 'right' },
-  ]
-  const rows = so.lines.map((l, i) => [
-    String(i + 1),
-    l.sku ?? '',
-    l.description,
-    String(Number(l.qty)),
-    Number(l.unitPriceForeign).toFixed(2),
-    Number(l.discountAmount) > 0 ? `-${Number(l.discountAmount).toFixed(2)}` : '',
-    view.lines[i].total.toFixed(2),
-  ])
-  drawTable(doc, columns, rows, branding)
-  drawTotalsRows(doc, totalsRows, (v) => formatMoney(v, sym, symPos), columns)
-
-  if (tpl?.footerNote) {
-    doc.y += 10
-    doc.font('Helvetica').fontSize(8).fillColor('#555').text(tpl.footerNote, 50, doc.y, { width: 495 })
-  }
-  if (tpl?.termsText) {
-    doc.y += 10
-    doc.font('Helvetica-Bold').fontSize(7).fillColor('#888').text('TERMS & CONDITIONS', 50, doc.y)
-    doc.font('Helvetica').fontSize(7).fillColor('#888').text(tpl.termsText, 50, doc.y + 2, { width: 495 })
-  }
-  if (tpl?.showPaymentTerms && tpl?.paymentTermsText) {
-    doc.y += 8
-    doc.font('Helvetica').fontSize(8).fillColor('#555').text(`Payment terms: ${tpl.paymentTermsText}`, 50, doc.y)
-  }
-  if (so.notes) {
-    doc.y += 15
-    doc.font('Helvetica').fontSize(7).fillColor('#888').text('NOTES', 50, doc.y)
-    doc.font('Helvetica').fontSize(9).fillColor('#333').text(so.notes, 50, doc.y + 2, { width: 495 })
-  }
-
-  drawFooter(doc, 'Thank you for your order.', branding, { customFooter: tpl?.customFooter, contactEmail: branding.salesEmail })
-  return pdfToBuffer(doc)
+  return renderSalesOrderPdf(so, branding, { variant: 'order' })
 }
 
 async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typeof getBranding>>): Promise<Buffer> {
@@ -219,17 +91,20 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
   const { view, totalsRows } = orderDocumentMoney(so)
   const columns: PdfTableColumn[] = [
     { label: '#', width: 25, align: 'right' },
-    { label: 'Description', width: 230, wrap: true },
+    { label: 'Description', width: 190, wrap: true },
     { label: 'Qty', width: 40, align: 'right' },
     { label: `Price ${view.basisLabel} (${sym})`, width: 65, align: 'right' },
+    { label: 'VAT rate', width: 40, align: 'right' },
     { label: `${view.vatIsAdditional ? 'VAT' : 'incl. VAT'} (${sym})`, width: 55, align: 'right' },
     { label: `Total ${view.basisLabel} (${sym})`, width: 75, align: 'right' },
   ]
+  const vatDetail = invoiceLineVatDetail(so.lines)
   const rows = so.lines.map((l, i) => [
     String(i + 1),
     l.description + (l.sku ? ` (${l.sku})` : ''),
     String(Number(l.qty)),
     Number(l.unitPriceForeign).toFixed(2),
+    vatDetail.rateCells[i],
     Number(l.taxForeign ?? 0).toFixed(2),
     view.lines[i].total.toFixed(2),
   ])
@@ -238,6 +113,7 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
   // keep the totals block together rather than splitting it across the page break.
   if (doc.y + 90 > 780) doc.addPage()
   drawTotalsRows(doc, totalsRows, (v) => formatMoney(v, sym, symPos), columns)
+  if (vatDetail.reverseChargeNote) doc.font('Helvetica-Bold').fontSize(8).fillColor('#444').text(vatDetail.reverseChargeNote, 50, doc.y + 6, { width: 495 })
 
   const base = await getBaseCurrencyDisplay()
   if (so.currency !== base.code) {
@@ -276,6 +152,8 @@ async function generateInvoicePdf(so: SoForPdf, branding: Awaited<ReturnType<typ
 async function buildSalesOrderConfirmationEmail(orderId: string): Promise<PreparedEmail> {
   const so = await getSalesOrderEmailOrder(orderId)
   if (!so) throw new Error('Order not found')
+  // At send time too: a confirmation queued before the order was a quote is not sent for the quote.
+  if ((so as { isQuote?: boolean }).isQuote) throw new Error('This is a quote, not an order: no order confirmation is sent for a quote')
   if (!so.customerEmail) throw new Error('No customer email address')
 
   const branding = await getBranding()
@@ -305,6 +183,28 @@ async function buildSalesOrderConfirmationEmail(orderId: string): Promise<Prepar
   }
 }
 
+/**
+ * The PDF the `INVOICE` e-mail (the manual and the queued customer invoice mail, ownership row `customer-email.invoice`) attaches.
+ *
+ * SWITCH OFF (`wc_invoice_document_enabled`, the default): exactly what it always was, the invoice IMS renders itself.
+ * SWITCH ON: the ONE customer invoice, the ledger's own PDF IMS stored (the same file the My Account button serves, through the same reader
+ * and its refusals), so the customer is never mailed a different rendering of the number. If IMS holds a stored document for the order that it
+ * will not serve right now (withdrawn, changed since, number shared, file missing or altered), the mail is NOT sent with a rendering of its own: it
+ * fails and stays queued for the next attempt, after the recheck has had its chance. An order with no stored document and no flat file
+ * (IMS has not fetched it yet) keeps the rendering it always had.
+ */
+async function invoiceEmailPdf(orderId: string, so: SoForPdf, branding: Awaited<ReturnType<typeof getBranding>>): Promise<Buffer> {
+  if (await isInvoiceDocumentPublishingEnabled()) {
+    const stored = await loadCurrentInvoicePdf(orderId)
+    if (stored) return stored
+    const held = await db.salesOrderInvoiceDocument.findFirst({ where: { orderId, kind: 'INVOICE', refundId: null, supersededAt: null }, select: { id: true } })
+    if (held) {
+      throw new Error('The stored invoice document is not available to send right now (withdrawn, changed, shared or its file is not intact); the invoice e-mail waits rather than attaching a different rendering of the invoice')
+    }
+  }
+  return generateInvoicePdf(so, branding)
+}
+
 async function buildInvoiceEmail(orderId: string, options?: { accountingPdf?: boolean }): Promise<PreparedEmail> {
   const so = await getSalesOrderEmailOrder(orderId)
   if (!so) throw new Error('Order not found')
@@ -317,7 +217,7 @@ async function buildInvoiceEmail(orderId: string, options?: { accountingPdf?: bo
   const { money } = await getCurrencyFormat(so.currency)
   const pdfBuffer = options?.accountingPdf
     ? await loadCurrentInvoicePdf(orderId)
-    : await generateInvoicePdf(so, branding)
+    : await invoiceEmailPdf(orderId, so, branding)
   if (!pdfBuffer) {
     throw new Error(options?.accountingPdf ? 'Invoice PDF file not found on disk' : 'Failed to generate invoice PDF')
   }
@@ -423,9 +323,10 @@ async function buildDispatchEmail(orderId: string): Promise<PreparedEmail> {
 export async function getSalesOrderConfirmationQueueData(orderId: string): Promise<QueueEmailData> {
   const so = await db.salesOrder.findUnique({
     where: { id: orderId },
-    select: { id: true, orderNumber: true, externalOrderNumber: true, customerEmail: true },
+    select: { id: true, orderNumber: true, externalOrderNumber: true, customerEmail: true, isQuote: true },
   })
   if (!so) throw new Error('Order not found')
+  if (so.isQuote) throw new Error('This is a quote, not an order: use Send quote. No order confirmation is sent for a quote.')
   if (!so.customerEmail) throw new Error('No customer email address')
   const ref = getSalesOrderReference(so)
   return { to: so.customerEmail, subject: `Order Confirmation ${ref}`, reference: ref }
@@ -470,5 +371,6 @@ export async function prepareQueuedEmail(kind: string, referenceType: string | n
   if (kind === 'INVOICE') return buildInvoiceEmail(referenceId)
   if (kind === 'ACCOUNTING_INVOICE') return buildInvoiceEmail(referenceId, { accountingPdf: true })
   if (kind === 'SHIPMENT_DISPATCHED') return buildDispatchEmail(referenceId)
+  if (kind === 'SALES_QUOTE') return buildSalesQuoteEmail(referenceId) // SALES_QUOTE_EMAIL_KIND, spelled out so the document census sees the kind
   return null
 }

@@ -840,7 +840,7 @@ test('the quiesce harness takes the SAME advisory key and the SAME row locks, in
 //   * MIGRATION RUNNERS. `prisma migrate deploy` applies repo-authored SQL that is never seen by
 //     any TypeScript scan, and three migrations in this repo already write `settings` rows. It runs
 //     from .sh files, which the walker did not even open.
-//   * SHELL EXECUTION PATHS. install.sh, update.sh, deploy.sh, backup.sh and provision-ims-tenant.sh
+//   * SHELL EXECUTION PATHS. install.sh, update.sh, deploy.sh and provision-ims-tenant.sh
 //     all reach this database — as psql, pg_dump or a migration runner — and every one of them was
 //     invisible for the same reason: the file walker collected `.ts`/`.tsx` only.
 //
@@ -1136,7 +1136,6 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   // and cannot move a plugin key. Its own pg connection only reads the stored storefront credentials (reconciliation-pack/woo-credentials.ts).
   'lib/tax/vat-difference-run.ts': 'runtime-assembled-sql',
   'scripts/landed-cost-e2e-fixture.ts': 'runtime-assembled-sql',
-  'scripts/backup.sh': 'dump-only',
   'scripts/check-prisma-drift.mjs': 'schema-diff-only',
   // o3d-o8cp's documented-vs-read guard. It opens .env.example, CLAUDE.md, docs/ and the repo's
   // TypeScript, and executes nothing anywhere; it is discovered here purely because its header

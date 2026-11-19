@@ -303,6 +303,14 @@ export type SupplierAgingRow = {
   billedWithPaymentMarker: number
   billedWithoutPaymentMarker: number
   /**
+   * o3d-tomf. POSTED supplier credit notes on this supplier's committed POs (`SupplierCreditNote.amountBase`,
+   * GROSS / VAT-inclusive: the SAME basis as `billedAmount`). Published BESIDE the billed figures instead of
+   * being netted into them, because a credit note is tied to a bill only optionally, so it cannot be placed in
+   * one marker group or age band without inventing evidence. `billedAmount - creditedAmount` is what remains
+   * billed after credits. See SUPPLIER_CREDIT_NOTES_NOT_NETTED_BASIS.
+   */
+  creditedAmount: number
+  /**
    * ALWAYS WITHHELD (o3d-8u4h). Was a hardcoded `0`, which asserted that nothing had ever been
    * paid to this supplier. No amount paid to a supplier is recorded anywhere in the schema.
    * See SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED.
@@ -351,6 +359,8 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
           // o3d-8u4h: `paidAt` is the ONLY settlement fact the schema holds for a supplier bill.
           // Without it in the select, every bill aged forever and Due was the whole ledger.
           invoices: { select: { totalBase: true, invoiceDate: true, paidAt: true } },
+          // o3d-tomf: only POSTED credit notes reduce what is owed; a DRAFT is not a document yet.
+          supplierCreditNotes: { where: { status: 'POSTED' }, select: { amountBase: true } },
           returns: { select: { lines: { select: { qtyReturned: true, poLine: { select: { unitCostBase: true } } } } } },
         },
       },
@@ -365,7 +375,7 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
     // or the "sum once, round once" rule the split relies on is only approximately true.
     const zero = new Prisma.Decimal(0)
     let grossAmount = zero, tax = zero, landedCosts = zero, billedAmount = zero, refunds = zero
-    let billedMarked = zero, billedUnmarked = zero
+    let billedMarked = zero, billedUnmarked = zero, credited = zero
     let unmarked0_30 = zero, unmarked31_60 = zero, unmarked61_90 = zero, unmarked91plus = zero
     const leadTimes: number[] = []
 
@@ -378,6 +388,7 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
       // lib/domain/purchasing/return-credit-basis and taken at that precision here. Unchanged by
       // this round, and it is not part of a published add-back — nothing is split out of it.
       refunds = refunds.add(new Prisma.Decimal(headerDiscountedReturnCreditBase(po)))
+      for (const cn of po.supplierCreditNotes ?? []) credited = credited.add(new Prisma.Decimal(cn.amountBase))
       for (const inv of po.invoices) {
         const t = new Prisma.Decimal(inv.totalBase)
         billedAmount = billedAmount.add(t)
@@ -498,6 +509,7 @@ export async function getSupplierAging(): Promise<SupplierAgingRow[]> {
       billedAmount: billed.parent,
       billedWithPaymentMarker: billed.components[0],
       billedWithoutPaymentMarker: billed.components[1],
+      creditedAmount: roundToMinorUnit(credited),
       paidAmount: null,
       dueAmount: null,
       billedWithoutPaymentMarker0_30: bands.components[0], billedWithoutPaymentMarker31_60: bands.components[1],

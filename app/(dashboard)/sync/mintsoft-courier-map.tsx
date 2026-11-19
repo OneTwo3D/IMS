@@ -7,6 +7,10 @@ import { Button } from '@/components/ui/button'
 import {
   getMintsoftCourierServiceMap,
   getMintsoftOrderDispatchSettings,
+  getMintsoftSendIossNumber,
+  getShopIossNumber,
+  saveShopIossNumber,
+  saveMintsoftSendIossNumber,
   saveMintsoftCourierServiceMap,
   saveMintsoftOrderDispatchSettings,
 } from '@/app/actions/mintsoft-sync'
@@ -216,6 +220,74 @@ export function MintsoftOrderDispatchSection() {
         </Button>
         {error && <span className="text-xs text-destructive">{error}</span>}
       </div>
+    </Card>
+  )
+}
+
+/**
+ * Whether the order create push sends `IOSSNumber`. Off by default; Mintsoft is live, so it is an explicit opt-in. Saves on change.
+ */
+export function MintsoftSendIossNumberSection() {
+  const [enabled, setEnabled] = useState(false)
+  const [shopNumber, setShopNumber] = useState('')
+  const [loaded, setLoaded] = useState(false)
+  const [error, setError] = useState('')
+  const [saving, startSaving] = useTransition()
+
+  useEffect(() => {
+    getShopIossNumber().then(setShopNumber).catch(() => undefined)
+    getMintsoftSendIossNumber()
+      .then(setEnabled)
+      .catch(() => undefined)
+      .finally(() => setLoaded(true))
+  }, [])
+
+  function handleChange(next: boolean) {
+    setError('')
+    startSaving(async () => {
+      const result = await saveMintsoftSendIossNumber(next)
+      if (result.success) setEnabled(next)
+      else setError(result.error ?? 'Failed to save the IOSS number setting.')
+    })
+  }
+
+  function handleSaveNumber() {
+    setError('')
+    startSaving(async () => {
+      const result = await saveShopIossNumber(shopNumber)
+      if (!result.success) setError(result.error ?? 'Failed to save the IOSS number.')
+    })
+  }
+
+  return (
+    <Card className="p-4 space-y-2">
+      <h3 className="text-sm font-medium">IOSS number on order push</h3>
+      <div className="flex items-center gap-2">
+        <label className="text-xs font-medium" htmlFor="shop-ioss-number">Shop IOSS number</label>
+        <input
+          id="shop-ioss-number"
+          value={shopNumber}
+          onChange={(event) => setShopNumber(event.target.value)}
+          disabled={!loaded || saving}
+          placeholder="IM1234567890"
+          className="w-44 rounded-md border border-input bg-background px-3 py-1 font-mono text-xs"
+        />
+        <Button size="sm" onClick={handleSaveNumber} disabled={!loaded || saving}>Save</Button>
+      </div>
+      <label className="flex items-center gap-2 text-sm" htmlFor="mintsoft-send-ioss-number">
+        <input
+          id="mintsoft-send-ioss-number"
+          type="checkbox"
+          checked={enabled}
+          disabled={!loaded || saving}
+          onChange={(event) => handleChange(event.target.checked)}
+        />
+        Send the IOSS number to Mintsoft (<code className="rounded bg-muted px-1">IOSSNumber</code>)
+      </label>
+      <p className="text-xs text-muted-foreground">
+        Off by default. The shop IOSS number is stored on orders that the EU VAT treatment has put under IOSS (nothing is worked out again here). When the switch is on, a new order is created in Mintsoft with that number, only for orders that carry one. Orders already in Mintsoft are not changed.
+      </p>
+      {error && <span className="text-xs text-destructive">{error}</span>}
     </Card>
   )
 }

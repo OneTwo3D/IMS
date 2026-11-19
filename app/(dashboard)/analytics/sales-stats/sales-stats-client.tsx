@@ -15,7 +15,7 @@ import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { formatMoney } from '@/lib/utils'
 import { filterAndSortRows, presentColumns, presentColumnKeys, sanitiseSavedView, resolveSavedViewTab, ownedSavedViews, foreignSavedViewNotice } from '@/lib/analytics/table-filter-sort'
-import { boundSuffix, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+import { boundSuffix, boundDisclosureSentence, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 
 type Tab = 'products' | 'shipments' | 'details' | 'invoices' | 'refunds' | 'aging'
 type FilterRule = { id: string; field: string; operator: string; value: string }
@@ -255,11 +255,7 @@ function SummaryCard({ label, value, bound = 'exact', boundedBy, widthKnown = tr
       </p>
       {marked && (
         <p className="text-[10px] leading-tight text-orange-600" title={title}>
-          {bound === 'upper'
-            ? <>Upper bound &mdash; {boundedBy} of refunds not subtracted</>
-            : widthKnown
-              ? <>Direction not established &mdash; {boundedBy} of refunds not subtracted</>
-              : 'Direction not established \u2014 some credit this figure could not subtract is negative'}
+          {boundDisclosureSentence(bound, boundedBy ?? '', widthKnown === true)}
         </p>
       )}
     </div>
@@ -670,7 +666,7 @@ export function SalesStatsClient({ productStats, shipments, details, invoices, r
         : <span className="tabular-nums text-xs font-mono font-medium" title={row.netTotalBasis === 'NET' ? 'Ex-VAT: this order\u2019s credits are on the NET basis, so the figure is the ex-VAT order total less them' : row.netTotalBasis === 'GROSS' ? 'VAT-inclusive: this order\u2019s credits are on the GROSS basis' : undefined}>{fmtBase(v)}</span>
       if (key === 'netTotalBasis') return <span className="text-xs text-muted-foreground">{v}</span>
       if (key === 'refundsTotal') return <span className="tabular-nums text-xs font-mono text-orange-600">{v > 0 ? fmtBase(v) : '—'}</span>
-      if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0.01 ? 'text-orange-600 font-medium' : ''}`}>{v > 0.01 ? `${row.dueBound === 'indeterminate' ? '≈ ' : row.dueBound === 'upper' ? '≤ ' : ''}${fmtBase(v)}` : '—'}</span>
+      if (key === 'dueAmount') return <span className={`tabular-nums text-xs font-mono ${v > 0.01 || row.dueBound === 'indeterminate' ? 'text-orange-600 font-medium' : ''}`}>{v > 0.01 || row.dueBound === 'indeterminate' ? `${row.dueBound === 'indeterminate' ? '≈ ' : row.dueBound === 'upper' ? '≤ ' : ''}${fmtBase(v)}` : '—'}</span>
       if (key === 'avgDso') return <span className="tabular-nums text-xs text-muted-foreground">{v > 0 ? `${v}d` : '—'}</span>
       if (key === 'overdue0_30') return <span className="tabular-nums text-xs font-mono">{v > 0 ? fmtBase(v) : '—'}</span>
       if (key === 'overdue31_60') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-orange-600' : ''}`}>{v > 0 ? fmtBase(v) : '—'}</span>

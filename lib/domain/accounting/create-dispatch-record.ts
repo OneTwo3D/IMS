@@ -146,7 +146,7 @@ export type CreateReplayPolicy =
   | 'not-a-create'
 
 export const CREATE_REPLAY_POLICY: Record<AccountingSyncType, CreateReplayPolicy> = {
-  // The eighteen ManualJournal types. `POST /ManualJournals`, no natural key of any kind.
+  // The nineteen ManualJournal types. `POST /ManualJournals`, no natural key of any kind.
   COGS_JOURNAL: 'no-remedy',
   INVENTORY_ADJUSTMENT: 'no-remedy',
   STOCK_IN_TRANSIT: 'no-remedy',
@@ -159,6 +159,7 @@ export const CREATE_REPLAY_POLICY: Record<AccountingSyncType, CreateReplayPolicy
   DAILY_BATCH_INVENTORY_RECONCILIATION: 'no-remedy',
   DAILY_BATCH_COGS_RECONCILIATION: 'no-remedy',
   DAILY_BATCH_TRANSIT_RECONCILIATION: 'no-remedy',
+  DAILY_BATCH_GRIR_RECLASS: 'no-remedy',
   UNEARNED_REV_REVERSAL: 'no-remedy',
   ALLOCATION_REVERSAL: 'no-remedy',
   REALISED_FX_JOURNAL: 'no-remedy',
@@ -167,6 +168,8 @@ export const CREATE_REPLAY_POLICY: Record<AccountingSyncType, CreateReplayPolicy
   MANUFACTURING_RECLASS: 'no-remedy',
 
   CREDIT_NOTE: 'natural-key-upsert',
+  // o3d-ngmt.22: a status write to a credit note that already stands; it creates nothing, and the void reads the document first.
+  CREDIT_NOTE_VOID: 'not-a-create',
   TAX_RATE_SYNC: 'natural-key-upsert',
   PURCHASE_INVOICE: 'create-only-refuses',
   SALES_INVOICE: 'number-fenced',
@@ -177,6 +180,9 @@ export const CREATE_REPLAY_POLICY: Record<AccountingSyncType, CreateReplayPolicy
 
   SALES_INVOICE_UPDATE: 'not-a-create',
   PURCHASE_INVOICE_UPDATE: 'not-a-create',
+  // A delete writes to a document that already stands in the ledger; it creates nothing, and a repeat finds the number already released.
+  SALES_INVOICE_DELETE: 'not-a-create',
+  PURCHASE_INVOICE_DELETE: 'not-a-create',
   BILL_ATTACHMENT: 'not-a-create',
   INVOICE_PDF: 'not-a-create',
   INVOICE_EMAIL: 'not-a-create',

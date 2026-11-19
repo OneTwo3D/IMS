@@ -1,10 +1,12 @@
 import { db } from '@/lib/db'
 // decimal-boundary-ok: report-only (accounting invariant finding details)
+import { allocationDebitRecreateTargets, allocationPassRaisedNoJournalByDesign } from '@/lib/domain/accounting/allocation-debit-passes'
 import { decimalToNumber, type DecimalLike } from '@/lib/decimal'
 import { isFullyShippedTerminalStatus } from '@/lib/domain/accounting/revenue-recognition'
 import { SHADOWED_OBLIGATION_WHERE, isShadowedObligation, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
 import { loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory-gl-reconciliation'
 import { loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
+import { COGS_CROSS_CHECK_FLOWS, TRANSIT_CROSS_CHECK_FLOWS, crossCheckSubledgerAgainstQueuedJournals, type SubledgerCrossCheck } from '@/lib/domain/accounting/subledger-journal-cross-check'
 import { loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
 import { reversalRecordVerdict } from '@/lib/domain/sales/refund-reversal-record'
 
@@ -53,6 +55,9 @@ type SalesOrderAccountingRow = {
   inventoryAllocatedDate: Date | string | null
   // o3d-0qoo: the exact A2 batch referenceId (pairs with inventoryAllocatedDate).
   inventoryAllocatedBatchRef?: string | null
+  // o3d-gzfm: the pass history (`SalesOrder.allocationBatchPasses`). The ref above is the LATEST pass's;
+  // an earlier pass is only visible here. Optional for pure-evaluator fixtures; absent = one batch.
+  allocationBatchPasses?: unknown
   allocationBatchAmount: DecimalLike
   shipments: Array<{
     id: string
@@ -203,6 +208,11 @@ type AccountingSyncLogRow = {
 }
 
 export type AccountingInvariantRows = {
+  /**
+   * o3d-gzfm: start of the sync-log retention window the rows were read over. An earlier A2 pass whose
+   * batch is dated before it is not asked about (its log may have been pruned). Optional: absent = no bound.
+   */
+  historicalBatchCutoff?: Date | null
   salesOrders: SalesOrderAccountingRow[]
   postedShipments: ShipmentAccountingRow[]
   syncLogs: AccountingSyncLogRow[]
@@ -755,28 +765,48 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     }
 
     if (hasA2) {
-      const { expectedReferenceId, referenceSource, hasSyncEvidence } = dailyBatchSyncEvidence(
-        syncLogIndex,
-        'A2',
-        'DAILY_BATCH_INVENTORY_ALLOC',
-        order.inventoryAllocatedBatchRef,
-        order.inventoryAllocatedDate,
-      )
+      // o3d-gzfm: ask about EVERY A2 batch the order contributed to, not just the latest pass's stamp.
+      // The first target is the current stamp (unchanged); the rest come from the pass history and are
+      // bounded by the retention window. Each finding carries its batch reference so two findings on
+      // one order are distinguishable.
+      const targets = order.allocationBatchPasses == null
+        ? [{ batchRef: order.inventoryAllocatedBatchRef ?? null, stagedAt: order.inventoryAllocatedDate, index: 0 }]
+        : allocationDebitRecreateTargets({
+          allocationBatchAmount: null,
+          allocationBatchPasses: order.allocationBatchPasses,
+          inventoryAllocatedBatchRef: order.inventoryAllocatedBatchRef?.trim() || null,
+          inventoryAllocatedDate: null,
+        }, { retentionCutoff: rows.historicalBatchCutoff ?? null }).map((target, index) => ({
+          batchRef: target.batchRef,
+          stagedAt: index === 0 ? order.inventoryAllocatedDate : target.stagedAt,
+          index,
+        })).filter((target) => target.index === 0
+          // An earlier pass that raised no journal by design (no log id, zero amount) has none to be missing.
+          || !target.batchRef || !allocationPassRaisedNoJournalByDesign(order.allocationBatchPasses, target.batchRef))
+      for (const target of targets) {
+        const { expectedReferenceId, referenceSource, hasSyncEvidence } = dailyBatchSyncEvidence(
+          syncLogIndex,
+          'A2',
+          'DAILY_BATCH_INVENTORY_ALLOC',
+          target.batchRef,
+          target.stagedAt,
+        )
 
-      if (!hasSyncEvidence) {
-        findings.push({
-          severity: 'warning',
-          code: 'sales_order_inventory_allocation_without_sync_evidence',
-          orderId: order.id,
-          message: `Sales order ${label} has A2 inventory allocation but no live daily batch sync evidence`,
-          details: {
-            status: order.status,
-            inventoryAllocatedDate: order.inventoryAllocatedDate,
-            expectedReferenceId,
-            referenceSource,
-            allocationBatchAmount: decimalToNumber(order.allocationBatchAmount),
-          },
-        })
+        if (!hasSyncEvidence) {
+          findings.push({
+            severity: 'warning',
+            code: 'sales_order_inventory_allocation_without_sync_evidence',
+            orderId: order.id,
+            message: `Sales order ${label} has A2 inventory allocation but no live daily batch sync evidence`,
+            details: {
+              status: order.status,
+              inventoryAllocatedDate: order.inventoryAllocatedDate,
+              expectedReferenceId,
+              referenceSource,
+              allocationBatchAmount: decimalToNumber(order.allocationBatchAmount),
+            },
+          })
+        }
       }
     }
 
@@ -1153,6 +1183,7 @@ export async function collectAccountingInvariantRows(
         unearnedRevenueAmount: true,
         inventoryAllocatedDate: true,
         inventoryAllocatedBatchRef: true,
+        allocationBatchPasses: true,
         allocationBatchAmount: true,
         shipments: {
           select: {
@@ -1314,7 +1345,46 @@ export async function collectAccountingInvariantRows(
     }) as unknown as Promise<ReversalNeverRecordedRefundRow[]>,
   ])
 
-  return { salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds, reversalNeverRecordedRefunds }
+  return { salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds, reversalNeverRecordedRefunds, historicalBatchCutoff: retentionCutoff }
+}
+
+/**
+ * The finding for an inventory reconciliation, or null. A `flag` that is only the recurring-sweep cap (the residue is within the
+ * per-day limit, it recurs) is a warning with its own code and wording; any other `flag` is a gap beyond rounding tolerance, critical.
+ */
+export function inventoryGlReconciliationFinding(
+  inventoryReconciliation: Awaited<ReturnType<typeof loadInventoryGlReconciliation>>,
+): AccountingInvariantFinding | null {
+  if (!inventoryReconciliation.available || inventoryReconciliation.action !== 'flag') return null
+  if (inventoryReconciliation.recurringSweepCap) {
+    const cap = inventoryReconciliation.recurringSweepCap
+    return {
+      severity: 'warning',
+      code: 'inventory_recurring_residue_not_swept',
+      message: `Recurring small residue not swept (cap reached): the inventory subledger (${inventoryReconciliation.subledgerValue.toFixed(2)}) differs from the GL balance (${inventoryReconciliation.glBalance.toFixed(2)}) by ${inventoryReconciliation.delta.toFixed(2)}, within the ${inventoryReconciliation.sweepLimit.toFixed(2)} per-day limit, but sweeping it would take the net swept over the last 30 days to ${cap.projectedNet.toFixed(2)}, past the ${cap.cap.toFixed(2)} cap`,
+      details: {
+        balanceDate: inventoryReconciliation.balanceDate,
+        glBalance: inventoryReconciliation.glBalance,
+        subledgerValue: inventoryReconciliation.subledgerValue,
+        delta: inventoryReconciliation.delta,
+        sweepLimit: inventoryReconciliation.sweepLimit,
+        recurringSweepCap: cap,
+      },
+    }
+  }
+  return {
+    severity: 'critical',
+    code: 'inventory_gl_subledger_mismatch',
+    message: `GL inventory balance (${inventoryReconciliation.glBalance.toFixed(2)}) does not reconcile to the cost-layer subledger (${inventoryReconciliation.subledgerValue.toFixed(2)}) beyond rounding tolerance`,
+    details: {
+      balanceDate: inventoryReconciliation.balanceDate,
+      glProvenance: inventoryReconciliation.glProvenance ?? null,
+      glBalance: inventoryReconciliation.glBalance,
+      subledgerValue: inventoryReconciliation.subledgerValue,
+      delta: inventoryReconciliation.delta,
+      sweepLimit: inventoryReconciliation.sweepLimit,
+    },
+  }
 }
 
 export async function runAccountingInvariantReport(options: {
@@ -1331,21 +1401,8 @@ export async function runAccountingInvariantReport(options: {
   // rounding-difference sweep (scjz.60c-2). Degrades silently when the inventory
   // account is unmapped or no trial-balance snapshot exists yet.
   const inventoryReconciliation = await loadInventoryGlReconciliation()
-  if (inventoryReconciliation.available && inventoryReconciliation.action === 'flag') {
-    findings.push({
-      severity: 'critical',
-      code: 'inventory_gl_subledger_mismatch',
-      message: `GL inventory balance (${inventoryReconciliation.glBalance.toFixed(2)}) does not reconcile to the cost-layer subledger (${inventoryReconciliation.subledgerValue.toFixed(2)}) beyond rounding tolerance`,
-      details: {
-        balanceDate: inventoryReconciliation.balanceDate,
-        glProvenance: inventoryReconciliation.glProvenance ?? null,
-        glBalance: inventoryReconciliation.glBalance,
-        subledgerValue: inventoryReconciliation.subledgerValue,
-        delta: inventoryReconciliation.delta,
-        sweepLimit: inventoryReconciliation.sweepLimit,
-      },
-    })
-  }
+  const inventoryFinding = inventoryGlReconciliationFinding(inventoryReconciliation)
+  if (inventoryFinding) findings.push(inventoryFinding)
 
   // khdw: reconcile the GL COGS account to its IMS subledger period movement
   // (Σ dispatch cogsBatchAmount − Σ refund cogsReversalBase). Only a gap beyond the
@@ -1389,6 +1446,55 @@ export async function runAccountingInvariantReport(options: {
         delta: transitReconciliation.delta,
         sweepLimit: transitReconciliation.sweepLimit,
       },
+    })
+  }
+
+  // Independent of the GL: the journals as queued against what the sub-ledger recorded for the same window. A GL reconciliation that
+  // agrees proves the journal arrived with the sub-ledger's own figure; this names a sub-ledger gap (a posting site that records no row,
+  // a row with a different figure) that the GL comparison cannot tell from a ledger fault. A warning, as it is a diagnostic.
+  const crossCheckFailures: Array<{ code: string; label: string; window: { openingExclusive: string; closingInclusive: string }; error: string }> = []
+  for (const check of [
+    { reconciliation: cogsReconciliation, ledger: 'cogs' as const, flows: COGS_CROSS_CHECK_FLOWS, code: 'cogs_subledger_queued_journal_mismatch', label: 'COGS' },
+    { reconciliation: transitReconciliation, ledger: 'transit' as const, flows: TRANSIT_CROSS_CHECK_FLOWS, code: 'transit_subledger_queued_journal_mismatch', label: 'Transit' },
+  ]) {
+    const reconciliation = check.reconciliation
+    if (!reconciliation.available || !reconciliation.accountCode || !reconciliation.windowOpening) continue
+    let result: SubledgerCrossCheck
+    try {
+      result = await crossCheckSubledgerAgainstQueuedJournals({
+        accountCode: reconciliation.accountCode,
+        openingExclusive: reconciliation.windowOpening,
+        closingInclusive: reconciliation.balanceDate,
+        ...check.flows,
+      }, check.ledger)
+    } catch (err) {
+      // The cross-check is a diagnostic and must not fail the report, but a failure to run it is itself reported (never swallowed): carried out of the loop and raised as a finding below.
+      crossCheckFailures.push({ code: check.code, label: check.label, window: { openingExclusive: reconciliation.windowOpening, closingInclusive: reconciliation.balanceDate }, error: err instanceof Error ? err.message : String(err) })
+      continue
+    }
+    if (result.inconclusive) {
+      findings.push({
+        severity: 'info',
+        code: `${check.code}_inconclusive`,
+        message: `The ${check.label} sub-ledger could not be compared with the queued journals: ${result.otherAccountJournalCount} journal(s) in the window carry lines for other accounts but not ${reconciliation.accountCode}, so the account was probably re-bound; the comparison resumes once the window is past it`,
+        details: { window: { openingExclusive: reconciliation.windowOpening, closingInclusive: reconciliation.balanceDate }, ...result },
+      })
+      continue
+    }
+    if (result.agrees) continue
+    findings.push({
+      severity: 'warning',
+      code: check.code,
+      message: `The ${check.label} sub-ledger recorded ${result.ledgerNet.toFixed(2)} for the window, but the journals queued for the same window move the account by ${result.queuedNet.toFixed(2)} (a difference of ${result.delta.toFixed(2)} against a rounding allowance of ${result.tolerance.toFixed(2)}${result.unreadableJournalCount > 0 ? `; ${result.unreadableJournalCount} journal(s) could not be read${result.compactedJournalCount > 0 ? `, ${result.compactedJournalCount} of them compacted` : ''}` : ''}${result.notLiveJournalCount > 0 ? `; ${result.notLiveJournalCount} FAILED or cancelled journal(s) worth ${result.notLiveNet.toFixed(2)} are reported apart from the queued figure` : ''})`,
+      details: { window: { openingExclusive: reconciliation.windowOpening, closingInclusive: reconciliation.balanceDate }, ...result },
+    })
+  }
+  for (const failure of crossCheckFailures) {
+    findings.push({
+      severity: 'info',
+      code: `${failure.code}_unavailable`,
+      message: `The ${failure.label} sub-ledger could not be compared with the queued journals: the check failed to run (${failure.error}), so this report says nothing about it`,
+      details: { window: failure.window },
     })
   }
 

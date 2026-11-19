@@ -17,6 +17,7 @@ import {
   SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS,
   SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS,
   SUPPLIER_BILLED_ROUNDING_RECONCILIATION,
+  SUPPLIER_CREDIT_NOTES_NOT_NETTED_BASIS,
 } from '@/lib/domain/purchasing/supplier-payment-basis'
 import { saveView, type SavedView } from '@/app/actions/sales-stats'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
@@ -113,6 +114,7 @@ const AGING_FIELDS: FieldDef[] = [
   // Both are amounts BILLED and the headings say only that. Paid stays off this table entirely.
   { key: 'billedWithPaymentMarker', label: 'Billed w/ payment marker', type: 'number' },
   { key: 'billedWithoutPaymentMarker', label: 'Billed w/o payment marker', type: 'number' },
+  { key: 'creditedAmount', label: 'Credited (POSTED credit notes)', type: 'number' },
   // o3d-8u4h round 2: the heading carries the withholding, because a heading is read and a tooltip
   // is not. See lib/analytics/withheld-figure-cell.ts.
   { key: 'dueAmount', label: `Due${WITHHELD_HEADING_SUFFIX}`, type: 'number' },
@@ -135,6 +137,7 @@ const AGING_NOTICES: { heading: string; body: string }[] = [
   { heading: 'Billed w/ payment marker', body: SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS },
   { heading: 'Billed w/o payment marker, and the four age bands', body: SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS },
   // o3d-8u4h round 3: the row asks to be added up, so how it was made to add up is on the page too.
+  { heading: 'Credited (POSTED credit notes)', body: SUPPLIER_CREDIT_NOTES_NOT_NETTED_BASIS },
   { heading: 'How the split adds up', body: SUPPLIER_BILLED_ROUNDING_RECONCILIATION },
 ]
 
@@ -170,7 +173,7 @@ const DEFAULT_COLS: Record<Tab, string[]> = {
   products: ['sku', 'name', 'type', 'barcode', 'mpn', 'supplierName', 'qtyOrdered', 'qtyReceived', 'totalBase', 'avgUnitCostBase', 'incomingQty', 'poCount', 'createdAt'],
   received: ['productName', 'poReference', 'supplierName', 'grnReference', 'sku', 'warehouseCode', 'qtyReceived', 'status', 'totalBase', 'landedUnitCostBase', 'unitCostBase', 'receivedAt'],
   bills: ['poReference', 'supplierName', 'invoiceNumber', 'productName', 'sku', 'qtyBilled', 'invoiceDate', 'status', 'totalForeign', 'totalBase', 'supplierInvoiceUrl'],
-  aging: ['supplierName', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'billedWithPaymentMarker', 'billedWithoutPaymentMarker', 'dueAmount', 'billedWithoutPaymentMarker0_30', 'billedWithoutPaymentMarker31_60', 'billedWithoutPaymentMarker61_90', 'billedWithoutPaymentMarker91plus'],
+  aging: ['supplierName', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'billedWithPaymentMarker', 'billedWithoutPaymentMarker', 'creditedAmount', 'dueAmount', 'billedWithoutPaymentMarker0_30', 'billedWithoutPaymentMarker31_60', 'billedWithoutPaymentMarker61_90', 'billedWithoutPaymentMarker91plus'],
   details: ['productName', 'reference', 'sku', 'barcode', 'mpn', 'type', 'supplierName', 'status', 'qty', 'totalBase', 'createdAt'],
 }
 
@@ -324,7 +327,7 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
   function isRightAligned(key: string): boolean {
     const f = fields.find((fd) => fd.key === key)
     if (f?.type === 'number') return true
-    if (['totalBase', 'totalForeign', 'qtyReceived', 'qtyBilled', 'unitCostBase', 'landedUnitCostBase', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'billedWithPaymentMarker', 'billedWithoutPaymentMarker', 'dueAmount', 'billedWithoutPaymentMarker0_30', 'billedWithoutPaymentMarker31_60', 'billedWithoutPaymentMarker61_90', 'billedWithoutPaymentMarker91plus', 'qty', 'unitCostForeign'].includes(key)) return true
+    if (['totalBase', 'totalForeign', 'qtyReceived', 'qtyBilled', 'unitCostBase', 'landedUnitCostBase', 'grossAmount', 'discounts', 'refunds', 'netAmount', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'billedWithPaymentMarker', 'billedWithoutPaymentMarker', 'creditedAmount', 'dueAmount', 'billedWithoutPaymentMarker0_30', 'billedWithoutPaymentMarker31_60', 'billedWithoutPaymentMarker61_90', 'billedWithoutPaymentMarker91plus', 'qty', 'unitCostForeign'].includes(key)) return true
     return false
   }
 
@@ -370,6 +373,7 @@ export function PurchaseStatsClient({ products, received, bills, aging, details,
       if (key === 'landedCosts' || key === 'tax') return <span className="tabular-nums text-xs font-mono text-muted-foreground">{v > 0 ? fmtBase(v) : '—'}</span>
       if (key === 'billedAmount') return <span className="tabular-nums text-xs font-mono" title="VAT-inclusive value of every supplier bill on this supplier's committed POs, marked or not">{fmtBase(v)}</span>
       if (key === 'billedWithPaymentMarker') return <span className="tabular-nums text-xs font-mono text-muted-foreground" title={SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS}>{v > 0 ? fmtBase(v) : MEASURED_ZERO_CELL_TEXT}</span>
+      if (key === 'creditedAmount') return <span className="tabular-nums text-xs font-mono text-orange-600" title={SUPPLIER_CREDIT_NOTES_NOT_NETTED_BASIS}>{v > 0 ? fmtBase(v) : MEASURED_ZERO_CELL_TEXT}</span>
       if (key === 'billedWithoutPaymentMarker') return <span className={`tabular-nums text-xs font-mono ${v > 0 ? 'text-destructive font-medium' : ''}`} title={SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS}>{v > 0 ? fmtBase(v) : MEASURED_ZERO_CELL_TEXT}</span>
       // o3d-8u4h: WITHHELD. This cell used to print the whole billed ledger in red, forever, under
       // the word "Due" — the report had no payment offset of any kind, so it was asserting that

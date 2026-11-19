@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import { lockOrderForRow, recomputeInvoicingStateForRow } from '@/lib/domain/sales/invoicing-state-sites'
 import { db } from '@/lib/db'
 import { HELD_SHADOW_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
@@ -16,7 +17,7 @@ import { explainProducerDisposition, parseProducerCutoff, type ProducerDecision 
 import {
   producerRetiredShadowNotice,
   producerUnknownOutcomeNotice,
-  PRODUCER_CUTOFF_ENV,
+  destinationCutoffEnvNames,
 } from '@/lib/security/producer-disposition-constants'
 import { isOutboundWriteHeldText, OUTBOUND_CONNECTORS, type OutboundConnector } from '@/lib/security/outbound-write-hold-constants'
 import { ACCOUNTING_SYNC_TYPE_EXCLUSIONS, ownershipRowFor, ownershipTargetForOutboxOperation } from '@/lib/security/writer-ownership-map'
@@ -95,8 +96,11 @@ export function resolveRetirementCutoffs(
       cutoffs[destination] = given
       continue
     }
-    const parsed = parseProducerCutoff(env[PRODUCER_CUTOFF_ENV[destination]])
-    if (parsed.ok) cutoffs[destination] = parsed.at
+    // The earliest readable live-from instant of the steps that write to this destination (WooCommerce: steps M, W and X).
+    const readable = destinationCutoffEnvNames(destination)
+      .map((name) => parseProducerCutoff(env[name]))
+      .flatMap((parsed) => (parsed.ok ? [parsed.at] : []))
+    if (readable.length > 0) cutoffs[destination] = readable.reduce((a, b) => (b.getTime() < a.getTime() ? b : a))
   }
   return cutoffs
 }
@@ -435,6 +439,10 @@ function retirementDecision(destination: OutboundConnector, operation: string, s
 }
 
 async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementItem, scope: RetirementScope, now: Date): Promise<RetirementOutcome> {
+  // CANONICAL LOCK ORDER: THE SALES ORDER FIRST, THEN THE SYNC ROW (cancellation's order). The row's order is resolved by an unlocked read, locked, and only then is
+  // the row locked and re-read under the guards below (so a row that moved in between is simply re-classified). lib/domain/sales/invoicing-state.ts.
+  const owner = await tx.accountingSyncLog.findUnique({ where: { id: item.id }, select: { type: true, referenceType: true, referenceId: true } })
+  if (owner) await lockOrderForRow(tx, owner)
   // Under a row lock, and re-derived: the row must still be Xero's, still queued, and still created before the effective cut-off.
   await tx.$queryRaw`SELECT id FROM accounting_sync_logs WHERE id = ${item.id} FOR UPDATE`
   const row = await tx.accountingSyncLog.findUnique({
@@ -484,6 +492,7 @@ async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementI
       summary: { type: row.type, connector: 'xero', retired: true },
       decision: retirementDecision(destination, operation, scope, now),
     })
+    await lockOrderForRow(tx, row)
     const updated = await tx.accountingSyncLog.updateMany({
       where: guard,
       data: {
@@ -495,6 +504,7 @@ async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementI
       },
     })
     if (updated.count === 0) throw new RetirementConflict('the row changed while it was being retired')
+    await recomputeInvoicingStateForRow(tx, row)
     await attachShadowSyncLog(tx, recorded.id, row.id)
     const mirrorNote = await mirrorBlockedBySibling(tx, row)
     if (mirrorNote === null) {
@@ -505,11 +515,13 @@ async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementI
     }
     return { item, result: 'shadowed', detail: mirrorNote === null ? verdict.reason : `${verdict.reason}; ${mirrorNote}` }
   }
+  await lockOrderForRow(tx, row)
   const updated = await tx.accountingSyncLog.updateMany({
     where: guard,
     data: { status: 'FAILED', errorMessage: notice, attemptRevision: { increment: 1 } },
   })
   if (updated.count === 0) throw new RetirementConflict('the row changed while it was being parked')
+  await recomputeInvoicingStateForRow(tx, row)
   const parkMirrorNote = await mirrorBlockedBySibling(tx, row)
   if (parkMirrorNote === null) {
     await updateMirroredAccountingEventStatus(tx, {

@@ -1,3 +1,4 @@
+import { asnHasReceiptEvidence, readAlignUpReceiptEvidenceEnabled } from '@/lib/connectors/mintsoft/settings/align-up-receipt-evidence'
 import { randomUUID } from 'crypto'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
@@ -71,6 +72,7 @@ import {
 } from '@/lib/accounting'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { recordGrirReceipt } from '@/lib/domain/accounting/grir-subledger-movement'
 import {
   CONTRIBUTING_LANDED_COST_LINK_WHERE,
   computeLandedCostForPendingLines,
@@ -78,6 +80,7 @@ import {
 import { headerDiscountFactorForPo, unabsorbedBaseForQty, type LandedAllocationFloor } from '@/lib/domain/purchasing/landed-cost-allocation'
 import { logFlooredLandedCredit } from '@/lib/domain/purchasing/landed-cost-floor-activity'
 import type { FlooredLandedCreditEntry } from '@/lib/domain/purchasing/landed-cost-floor-text'
+import { businessDateYmd } from '@/lib/business-date'
 import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selection-lock'
 
 /**
@@ -88,6 +91,11 @@ import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selecti
  * Best-effort post-commit: a failure is surfaced as a WARNING, never thrown.
  */
 async function enqueueAlignmentStockSync(binding: SyncBinding, productId: string, sku: string): Promise<StockEnqueueOutcome> {
+  // SO-to-PO pegging: units the alignment just landed on a purchase-order line go to the order pegged to it first. Best-effort,
+  // IMS-internal; a no-op for a product nothing is pegged on.
+  const { allocatePeggedOrdersForProducts } = await import('@/lib/fulfillment/peg-allocator')
+  const pegPass = await allocatePeggedOrdersForProducts([productId], { source: 'wms_alignment', referenceId: binding.id, referenceLabel: 'WMS stock alignment' })
+  if (pegPass.errors > 0) console.error(`[peg-pass] ${pegPass.errors} pegged order(s) failed to allocate after the WMS alignment (each is in the activity log; the reallocation sweep retries)`)
   try {
     await enqueueStockSync([productId], 'IMS_CHANGE')
     return 'ok'
@@ -903,6 +911,8 @@ async function getAlignmentCandidateLines(
         select: {
           externalAsnId: true,
           createdAt: true,
+          status: true,
+          lastCallbackAt: true,
         },
       },
     },
@@ -998,6 +1008,8 @@ async function getAlignmentCandidateLines(
   const refused: RefusedAlignmentCandidate[] = []
   const parentTransferIds = new Set<string>()
   const asnMapIds = new Set<string>(lines.map((line) => line.asnMapId))
+  // o3d-hqvrp.121: with the switch on, an ASN the warehouse has not reported anything against cannot absorb a rise in stock.
+  const requireReceiptEvidence = await readAlignUpReceiptEvidenceEnabled(tx as unknown as Parameters<typeof readAlignUpReceiptEvidenceEnabled>[0])
 
   for (const line of lines) {
     // FIRST, BEFORE ANY FACT ABOUT THIS ROW IS READ. Under the locks, a row this
@@ -1021,6 +1033,16 @@ async function getAlignmentCandidateLines(
         externalAsnId: line.asn.externalAsnId,
         reason: 'the ASN line was created after this run took its row locks',
         kind: 'raced',
+      })
+      continue
+    }
+
+    if (requireReceiptEvidence && !asnHasReceiptEvidence(line.asn)) {
+      refused.push({
+        asnLineMapId: line.id,
+        externalAsnId: line.asn.externalAsnId,
+        reason: `the warehouse has reported nothing booked in against this ASN (status ${line.asn.status}, no callback), so a rise in Mintsoft stock is not treated as its receipt (a return, stock-take or mis-booking raises stock too)`,
+        kind: 'unusable',
       })
       continue
     }
@@ -2027,6 +2049,15 @@ export async function applyMintsoftAlignmentForProduct(params: {
         // `wms-purchase-receipt:<poId>:<eventId>` nor `purchase-receipt:<poId>:<receiptRef>`; and
         // because the movement id is fresh per allocation, one sweep crediting two ASN lines of one
         // order posts two journals for two disjoint quantities rather than one merged amount.
+        // GR/IR accrual: the same units the layer above carries, at the PO goods unit cost, keyed on this allocation's movement so a replay records
+        // nothing. In this transaction, whether or not Xero posting is on.
+        await recordGrirReceipt(tx, {
+          poId: purchaseCost.poId,
+          sourceRef: purchaseCost.poId,
+          keyBase: `wms-align-up:${candidate.id}:${movement.id}`,
+          at: now,
+          lines: [{ poLineId: candidate.sourceLineId, qty: allocation.qty }],
+        })
         const receiptValueBase = multiplyMoney(toDecimal(allocation.qty), toDecimal(unitCostBase))
         if (accountingConnector && accountingSettings.syncEnabled && receiptValueBase.gt(0)) {
           const amount = roundQuantity(receiptValueBase, 2).toNumber()
@@ -2039,7 +2070,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
           // "are these still the right account codes".
           const accounts = await accountsForPosting(accountingConnector)
           const payload = {
-            date: now.toISOString().slice(0, 10),
+            date: businessDateYmd(now),
             reference: `Receipt: ${purchaseCost.poReference}`,
             narration: `Stock receipt for PO ${purchaseCost.poReference} via Mintsoft alignment against ASN `
               + `${candidate.asn.externalAsnId}`,

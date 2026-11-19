@@ -43,6 +43,8 @@ import { commitDirtyOrderOutcome, loadDirtyOrdersForGuard, parseDirtySnapshot } 
 import { assertWcAttemptMayStillSend } from '../attempt-fence'
 import { OutboundWriteHeldError, outboundWriteRefusal } from '@/lib/security/outbound-write-grant'
 import { wooProducerSeam, type WooShadow } from '../producer-seam'
+import { wooDrainHold } from '../producer-egress'
+import { loadBackInStockDates } from '@/lib/domain/inventory/back-in-stock-date'
 import {
   WC_SYNC_ADVISORY_LOCK_KEY,
   WC_SETTINGS_VERSION_KEY,
@@ -55,6 +57,11 @@ import {
 } from '@/lib/products/lifecycle'
 import type { WcFullProduct, StockSyncResult, WcVariation } from './types'
 import { completedOrdersModifiedAfter, loadWcHeldUnitsByProduct, WC_COMPLETED_HISTORY_COVERED_KEY, WC_ORDER_RESET_MARKER_KEY, encodeCoveredHistoryBoundary, trustedCoveredHistoryBoundary, type HeldProductRef, type WcHeldUnitsDeps } from './stock-held-orders'
+
+/** o3d-taro: the setting that turns the back-in-stock date push on. Absent or anything but 'true' is OFF (the default). */
+export const WC_BACK_IN_STOCK_DATE_SETTING = 'wc_back_in_stock_date_enabled'
+/** o3d-taro: the WooCommerce product meta key. Value is a plain YYYY-MM-DD date, or '' when there is no date to show. */
+export const WC_ETA_DATE_META_KEY = '_oti_eta_date'
 
 const SKU_LOOKUP_CONCURRENCY = 8
 const WC_BATCH_SIZE = 100
@@ -198,6 +205,7 @@ async function persistMappingIfVersionMatches(
   | { ok: true }
   | { ok: false; reason: 'version_changed' }
   | { ok: false; reason: 'mapping_changed' }
+  | { ok: false; reason: 'collision'; error: string }
   | { ok: false; reason: 'error'; error: string }
 > {
   try {
@@ -225,8 +233,17 @@ async function persistMappingIfVersionMatches(
       return { ok: true as const }
     })
   } catch (e) {
-    return { ok: false as const, reason: 'error' as const, error: String(e) }
+    return classifyMappingPersistError(e)
   }
+}
+
+/**
+ * Only a real unique-constraint violation (Prisma P2002: another product already holds this externalProductId) is a collision, and so
+ * permanent. A pool timeout, dropped connection, deadlock or statement timeout is transient: it keeps its own message and holds the window.
+ */
+export function classifyMappingPersistError(e: unknown): { ok: false; reason: 'collision' | 'error'; error: string } {
+  const code = e && typeof e === 'object' ? (e as { code?: unknown }).code : undefined
+  return { ok: false, reason: code === 'P2002' ? 'collision' : 'error', error: String(e) }
 }
 
 type MappingInvalidationLog = {
@@ -300,7 +317,14 @@ export type PushEntry = {
     stock_quantity: number
     manage_stock: boolean
     cost_of_goods_sold?: { values: { defined_value: string }[] }
+    /** o3d-taro: only present when the back-in-stock date push is enabled AND the value changed or is non-empty. */
+    meta_data?: { key: string; value: string }[]
   }
+  /**
+   * o3d-taro: the date this push settles for the product ('' = cleared). Undefined whenever the feature is off, so nothing about the
+   * push or its persisted state changes. Never sent to WooCommerce (only `payload` is).
+   */
+  etaDate?: string
 }
 
 export type VariantPushEntry = PushEntry & {
@@ -374,11 +398,13 @@ async function persistSuccessfulPushState(
         lastPushedQty: entry.payload.stock_quantity,
         lastPushedAt: pushedAt,
         lastPushedRemoteId: String(entry.externalId),
+        ...(entry.etaDate !== undefined ? { lastPushedEtaDate: entry.etaDate } : {}),
       },
       update: {
         lastPushedQty: entry.payload.stock_quantity,
         lastPushedAt: pushedAt,
         lastPushedRemoteId: String(entry.externalId),
+        ...(entry.etaDate !== undefined ? { lastPushedEtaDate: entry.etaDate } : {}),
       },
     })
   }
@@ -432,6 +458,108 @@ async function invalidateMappingInLockedTx(
       externalId: entry.externalId,
       reason,
     },
+  }
+}
+
+// o3d-hqvrp.100: every run clamps to min(snapshot, fresh) ONCE, before a batch loop that can run for minutes, so a later batch could post an
+// older, higher figure over a lower one a concurrent job had pushed meanwhile (and record it as lastPushedQty, hiding the echo). Each batch now
+// re-reads current availability for its own products and clamps down, and that read + the POST run under one in-process lock so the order
+// in which runs read is the order in which they write. (Across server processes only the shorter per-batch window remains.)
+let stockPushLockTail: Promise<void> = Promise.resolve()
+
+export async function withStockPushLock<T>(fn: () => Promise<T>): Promise<T> {
+  const previous = stockPushLockTail
+  let release!: () => void
+  stockPushLockTail = new Promise<void>((resolve) => { release = resolve })
+  await previous
+  try {
+    return await fn()
+  } finally {
+    release()
+  }
+}
+
+/** Stock ids a batch's availability depends on: the products and every component beneath them, nested kits included. */
+function stockIdsForBatch(batch: PushEntry[], productById: Map<string, CandidateProduct>): string[] {
+  const ids = new Set<string>()
+  const visit = (id: string, depth: number) => {
+    if (ids.has(id) || depth > 12) return
+    ids.add(id)
+    for (const component of productById.get(id)?.productComponents ?? []) visit(component.componentId, depth + 1)
+  }
+  for (const entry of batch) visit(entry.productId, 0)
+  return [...ids]
+}
+
+export type BatchClampContext = {
+  productById: Map<string, CandidateProduct>
+  whIds: string[]
+  heldByProduct: ReadonlyMap<string, number> | undefined
+  /** o3d-taro: the back-in-stock date push is on. A clamp to 0 then recomputes the date meta exactly as the normal path does. */
+  etaEnabled?: boolean
+  previousStateByProductId?: ReadonlyMap<string, { lastPushedEtaDate: string | null }>
+}
+
+/**
+ * Lower (never raise) each entry's quantity to what is available now. A database error here never aborts the run: the batch is sent
+ * unclamped (exactly what it would have been before the clamp existed) and the failure is logged.
+ */
+async function clampBatchToCurrentStock(batch: PushEntry[], ctx: BatchClampContext): Promise<void> {
+  const batchProducts = batch
+    .map((entry) => ctx.productById.get(entry.productId))
+    .filter((product): product is CandidateProduct => product != null)
+  if (batchProducts.length === 0) return
+  let fresh: Map<string, number>
+  try {
+    fresh = await computeFreshAvailableByProduct(
+      batchProducts,
+      ctx.productById,
+      ctx.whIds,
+      stockIdsForBatch(batch, ctx.productById),
+      ctx.heldByProduct,
+    )
+  } catch (error) {
+    console.error('[wc-stock-push] could not re-read current stock for a batch; sending it unclamped', error)
+    await logActivity({
+      entityType: 'SYNC', action: 'stock_sync_clamp_failed', tag: 'sync', level: 'WARNING',
+      description: `Stock push could not re-read current stock for a batch of ${batch.length}; the batch was sent unclamped`,
+      metadata: { error: error instanceof Error ? error.message : String(error), skus: batch.slice(0, 10).map((entry) => entry.sku) },
+    }).catch(() => undefined)
+    return
+  }
+  const loweredToZero: PushEntry[] = []
+  for (const entry of batch) {
+    const available = fresh.get(entry.productId)
+    if (available === undefined) continue
+    const clamped = Math.floor(Math.min(entry.payload.stock_quantity, available))
+    if (clamped < entry.payload.stock_quantity) {
+      const wasPositive = entry.payload.stock_quantity > 0
+      entry.payload.stock_quantity = clamped
+      if (wasPositive && clamped <= 0) loweredToZero.push(entry)
+    }
+  }
+  if (!ctx.etaEnabled || loweredToZero.length === 0) return
+  // The date meta was decided from the pre-clamp quantity. A product now at 0 gets the same treatment as one that was at 0 to begin with:
+  // only a simple stockable product can carry a date, and only committed, dated, not-late supply produces one.
+  const eligible = loweredToZero.filter((entry) => {
+    const product = ctx.productById.get(entry.productId)
+    return product != null && (product.type === 'SIMPLE' || product.type === 'VARIANT') && !shouldForceWooZeroStock(product.lifecycleStatus)
+  })
+  if (eligible.length === 0) return
+  try {
+    const dates = await loadBackInStockDates(eligible.map((entry) => entry.productId))
+    for (const entry of eligible) {
+      const etaDate = dates.get(entry.productId) ?? ''
+      entry.etaDate = etaDate
+      if (etaDate !== '' || (ctx.previousStateByProductId?.get(entry.productId)?.lastPushedEtaDate ?? '') !== '') {
+        entry.payload.meta_data = [{ key: WC_ETA_DATE_META_KEY, value: etaDate }]
+      } else {
+        delete entry.payload.meta_data
+      }
+    }
+  } catch (error) {
+    // The quantity is already lowered (safe); only the date is left as decided before the clamp, to be corrected by the next push.
+    console.error('[wc-stock-push] could not look up the back-in-stock date after a clamp to 0', error)
   }
 }
 
@@ -501,6 +629,18 @@ async function pushBatchWithFence(
   })
 }
 
+/**
+ * o3d-hqvrp.101: errors that retrying the window can never clear, because they describe the catalogue and not a failed call: a variant
+ * whose parent has no SKU in IMS, an ambiguous SKU (the catalogue must be deduplicated), a kit cycle, an externalProductId collision.
+ * They stay in `errors` (reported, logged) but do not withhold the window's completion: otherwise one such product would hold the daily
+ * reconcile at its window for ever and every product after it would never be reconciled. Transient errors (a failed lookup, a rebind,
+ * a failed push) still hold the window.
+ */
+const PERMANENT_WINDOW_ERROR = /^(KIT cycle detected|externalProductId collision|lookup failure for SKU .+?: (variant has no parent SKU in IMS|ambiguous))/
+export function isPermanentWindowError(message: string): boolean {
+  return PERMANENT_WINDOW_ERROR.test(message)
+}
+
 // A gate-refusal result: the run was refused before any work started. Marked
 // `aborted` so a manual push surfaces it as an error and the job queue
 // retains the job for retry (see shouldRetainJob) instead of treating it as
@@ -565,6 +705,25 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     summary: { source: options?.source ?? null, forceAll: options?.forceAll === true, productCount: scopedProductIds ? scopedProductIds.length : null },
   })
   if (!seam.proceed) return shadowedStockResult(seam)
+  // STEP W NEEDS THE OWNER'S WORD THAT QOBLEX HAS STOPPED PUSHING STOCK. A push decided LIVE but made while that confirmation is absent (or not read yet) is HELD,
+  // not shadowed: nothing is sent, nothing is stamped as pushed, and the next run (or the drain) sends it once the confirmation is recorded. Setting
+  // wc_stock_sync_enabled earlier does not bypass it.
+  const stockHold = wooDrainHold(undefined, 'stock')
+  if (stockHold.held) return heldStockResult(stockHold.queuedNotice)
+  // o3d-taro: the back-in-stock date rides this push as product meta, which is its OWN operation of the ownership map ('product.meta':
+  // the plugin owns it in P1). Asked only when the setting is on; a shadow switches the date off for this run and leaves the stock push alone.
+  const etaSetting = await db.setting.findUnique({ where: { key: WC_BACK_IN_STOCK_DATE_SETTING } })
+  let etaEnabled = false
+  if (etaSetting?.value === 'true') {
+    const etaSeam = await wooProducerSeam({
+      operation: 'product.meta',
+      subjectType: 'StockPushEtaMeta',
+      subjectId: scopedProductIds ? [...scopedProductIds].sort().join(',').slice(0, 400) || '(none)' : '(all products)',
+      payload: { metaKey: WC_ETA_DATE_META_KEY, products: scopedProductIds ? [...scopedProductIds].sort() : 'all' },
+      summary: { source: options?.source ?? null, productCount: scopedProductIds ? scopedProductIds.length : null },
+    })
+    etaEnabled = etaSeam.proceed
+  }
   const forceProductIds = new Set(options?.forceProductIds ?? [])
   const forceAll = options?.forceAll === true
 
@@ -740,7 +899,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // (failed SKU lookup, preflight page, mapping that could not be saved or cleared, duplicate external id, kit availability
   // error, failed or rejected push entry, credentials rebound) appends to `result.errors`, so any error withholds `chunk` and
   // the caller retries the window instead of moving past it. A product with no WooCommerce match is not an error.
-  const windowHandled = (): boolean => result.errors.length === 0
+  const windowHandled = (): boolean => result.errors.every(isPermanentWindowError)
   const chunkOutcome = (): StockSyncResult['chunk'] =>
     chunkWindow ? { nextCursor: chunkNextCursor, totalCandidates: allCandidates.length } : undefined
 
@@ -896,7 +1055,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       connector: WC_STOCK_SYNC_CONNECTOR,
       productId: { in: products.map((product) => product.id) },
     },
-    select: { productId: true, lastPushedQty: true, lastPushedRemoteId: true },
+    select: { productId: true, lastPushedQty: true, lastPushedRemoteId: true, lastPushedEtaDate: true },
   })
   const previousStateByProductId = new Map(
     previousStates.map((state) => [state.productId, state]),
@@ -950,9 +1109,11 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // log, unmatched counts — all intact for the operator-facing report.
   let versionBumpedMidRun = false
 
+  // SKUs of variants whose parent was skipped this pass: reported, neither errors nor unmatched.
+  const skippedParentSkus = new Set<string>()
   if (needsResolution.length > 0) {
     await options?.onProgress?.({ phase: 'resolving', processed: 0, synced: 0, total: needsResolution.length })
-    const { resolved, errors: lookupErrors, totalAttempts, failedAttempts } =
+    const { resolved, errors: lookupErrors, totalAttempts, failedAttempts, skippedParents } =
       await resolveSkusInParallel(needsResolution, creds)
 
     // If every single lookup call failed, treat as a WC outage — bail hard.
@@ -974,8 +1135,20 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       return result
     }
 
+    // o3d-hqvrp.104: a parent whose variation list cannot be read (over the cap, or a page that keeps failing) is skipped for this pass. It is
+    // reported, but is not a window error: otherwise one such parent would hold the daily reconcile at its window for ever.
+    for (const sku of skippedParents.flatMap((parent) => parent.skus)) skippedParentSkus.add(sku)
+    if (skippedParents.length > 0) {
+      result.skippedParents = skippedParents.map((parent) => `${parent.parentSku} (${parent.skus.length} variant(s)): ${parent.reason}`)
+      await logActivity({
+        entityType: 'SYNC', action: 'stock_sync_parent_skipped', tag: 'sync', level: 'WARNING',
+        description: `Stock sync skipped ${skippedParents.length} variable parent(s) this pass because their variation list could not be read completely; their variants were not pushed`,
+        metadata: { parents: result.skippedParents.slice(0, 10) },
+      })
+    }
+
     // Partial failures: record as errors, leave those SKUs out of matched/unmatched counting.
-    const failedLookupSkus = new Set(lookupErrors.map((e) => e.sku))
+    const failedLookupSkus = new Set([...lookupErrors.map((e) => e.sku), ...skippedParentSkus])
     for (const err of lookupErrors) {
       result.errors.push(`lookup failure for SKU ${err.sku}: ${err.error}`)
     }
@@ -1014,9 +1187,14 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         result.errors.push(
           `WooCommerce mapping for ${p.sku} (IMS ${p.id}) was claimed by another sync while resolving it; left as-is`,
         )
-      } else {
+      } else if (outcome.reason === 'collision') {
         result.errors.push(
           `externalProductId collision: could not persist ${target.externalId} for IMS product ${p.id} (SKU ${p.sku}): ${outcome.error}`,
+        )
+      } else {
+        // A transient failure (timeout, connection, deadlock): its own message, so it holds the reconcile window and is retried.
+        result.errors.push(
+          `mapping persist failed: could not persist ${target.externalId} for IMS product ${p.id} (SKU ${p.sku}): ${outcome.error}`,
         )
       }
     }
@@ -1177,7 +1355,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // -------- Count matched/unmatched from final effective state --------
   for (const p of products) {
     if (effectiveTargets.has(p.id)) result.matched++
-    else if (!result.errors.some((msg) => msg.includes(`SKU ${p.sku}`))) {
+    else if (!skippedParentSkus.has(p.sku) && !result.errors.some((msg) => msg.includes(`SKU ${p.sku}`))) {
       // Only count as "unmatched" if there wasn't a lookup/drift error for this SKU.
       // Those are counted as errors, not catalog mismatches.
       result.unmatched++
@@ -1238,6 +1416,26 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     result.errors.push(`Stock push skipped ${held.blockedProductIds.size} product(s): an on-hold/processing WooCommerce order names a variation IMS cannot resolve, so their stock cannot be proven safe.`)
   }
 
+  // -------- Back-in-stock dates (o3d-taro; only with the setting on) --------
+  // Only a simple stockable product at zero pushed availability can carry a date, and only committed, dated, not-late supply produces one.
+  const stockQuantityFor = (product: CandidateProduct): number => resolvePushStockQuantity(
+    availableByProduct.get(product.id) ?? 0,
+    freshAvailableByProduct.get(product.id) ?? 0,
+    shouldForceWooZeroStock(product.lifecycleStatus),
+  )
+  let etaDateByProduct = new Map<string, string>()
+  if (etaEnabled) {
+    const zeroIds = products
+      .filter((product) => effectiveTargets.has(product.id)
+        && (product.type === 'SIMPLE' || product.type === 'VARIANT')
+        && !shouldForceWooZeroStock(product.lifecycleStatus)
+        && stockQuantityFor(product) <= 0)
+      .map((product) => product.id)
+    etaDateByProduct = await loadBackInStockDates(zeroIds)
+  }
+  const unchangedEta = (entry: PushEntry, prev: { lastPushedEtaDate: string | null } | undefined): boolean =>
+    entry.etaDate === undefined || (prev?.lastPushedEtaDate ?? '') === entry.etaDate
+
   // -------- Build push entries --------
   const pushEntries: PushEntry[] = []
   const variantPushEntries: VariantPushEntry[] = []
@@ -1255,11 +1453,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
       result.skipped++
       continue
     }
-    const stockQuantity = resolvePushStockQuantity(
-      availableByProduct.get(product.id) ?? 0,
-      freshAvailableByProduct.get(product.id) ?? 0,
-      shouldForceWooZeroStock(product.lifecycleStatus),
-    )
+    const stockQuantity = stockQuantityFor(product)
     const payload: PushEntry['payload'] = {
       id: target.externalId,
       stock_quantity: stockQuantity,
@@ -1269,6 +1463,14 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     if (cogs !== undefined) {
       payload.cost_of_goods_sold = { values: [{ defined_value: cogs.toFixed(2) }] }
     }
+    let etaDate: string | undefined
+    if (etaEnabled) {
+      // '' = no date (stock returned, supply gone, undated or late). The meta is written when it has a value or when it clears a value we pushed before.
+      etaDate = (stockQuantity <= 0 ? etaDateByProduct.get(product.id) : undefined) ?? ''
+      if (etaDate !== '' || (previousStateByProductId.get(product.id)?.lastPushedEtaDate ?? '') !== '') {
+        payload.meta_data = [{ key: WC_ETA_DATE_META_KEY, value: etaDate }]
+      }
+    }
     if (isVariationCandidate(product) && target.parentWcId != null) {
       const entry: VariantPushEntry = {
         productId: product.id,
@@ -1276,6 +1478,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         externalId: target.externalId,
         parentWcId: target.parentWcId,
         payload,
+        ...(etaDate !== undefined ? { etaDate } : {}),
       }
       const prev = previousStateByProductId.get(product.id)
       if (
@@ -1284,12 +1487,13 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         && prev?.lastPushedQty === entry.payload.stock_quantity
         && prev.lastPushedRemoteId != null
         && prev.lastPushedRemoteId === String(entry.externalId)
+        && unchangedEta(entry, prev)
       ) {
         continue
       }
       variantPushEntries.push(entry)
     } else {
-      const entry: PushEntry = { productId: product.id, sku: product.sku, externalId: target.externalId, payload }
+      const entry: PushEntry = { productId: product.id, sku: product.sku, externalId: target.externalId, payload, ...(etaDate !== undefined ? { etaDate } : {}) }
       const prev = previousStateByProductId.get(product.id)
       if (
         !forceAll
@@ -1297,6 +1501,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         && prev?.lastPushedQty === entry.payload.stock_quantity
         && prev.lastPushedRemoteId != null
         && prev.lastPushedRemoteId === String(entry.externalId)
+        && unchangedEta(entry, prev)
       ) {
         continue
       }
@@ -1337,15 +1542,20 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // belong to), but continuing would keep pushing to the old store
   // after the operator explicitly disconnected it. Break out and
   // surface the abort instead.
+  const clampCtx: BatchClampContext = { productById, whIds, heldByProduct, etaEnabled, previousStateByProductId }
   await options?.onProgress?.({ phase: 'pushing', processed: 0, synced: 0, total: pushEntries.length })
   for (let i = 0; i < pushEntries.length; i += WC_BATCH_SIZE) {
     const batch = pushEntries.slice(i, i + WC_BATCH_SIZE)
-    const batchOutcome = await pushBatchWithFence(batch, creds, syncVersion)
+    const batchOutcome = await withStockPushLock(async () => {
+      await clampBatchToCurrentStock(batch, clampCtx)
+      return pushBatchWithFence(batch, creds, syncVersion)
+    })
     if (batchOutcome.status === 'version_changed') {
       const remaining = pushEntries.length - i
-      result.errors.push(
-        `WooCommerce credentials were rebound mid-run — aborted ${remaining} remaining push(es) to avoid pushing to a disconnected store`,
-      )
+      const abortNotice = `WooCommerce credentials were rebound mid-run — aborted ${remaining} remaining push(es) to avoid pushing to a disconnected store`
+      result.errors.push(abortNotice)
+      result.abortedRemaining = (result.abortedRemaining ?? 0) + remaining
+      result.abortNotice = abortNotice
       await logActivity({
         entityType: 'SYNC', action: 'stock_sync', tag: 'sync', level: 'WARNING',
         description: `Stock sync aborted mid-push: WC settings version changed (${syncVersion} → ${batchOutcome.currentVersion})`,
@@ -1396,12 +1606,16 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     for (const group of byParent.values()) {
       for (let i = 0; i < group.length; i += WC_VARIATION_BATCH_SIZE) {
         const batch = group.slice(i, i + WC_VARIATION_BATCH_SIZE)
-        const outcome = await pushVariantBatchWithFence(batch, creds, syncVersion)
+        const outcome = await withStockPushLock(async () => {
+          await clampBatchToCurrentStock(batch, clampCtx)
+          return pushVariantBatchWithFence(batch, creds, syncVersion)
+        })
         if (outcome.status === 'version_changed') {
           const remaining = variantPushEntries.length - processedVariantEntries
-          result.errors.push(
-            `WooCommerce credentials were rebound mid-run — aborted ${remaining} remaining variation push(es) to avoid pushing to a disconnected store`,
-          )
+          const abortNotice = `WooCommerce credentials were rebound mid-run — aborted ${remaining} remaining variation push(es) to avoid pushing to a disconnected store`
+          result.errors.push(abortNotice)
+          result.abortedRemaining = (result.abortedRemaining ?? 0) + remaining
+          result.abortNotice = result.abortNotice ? `${result.abortNotice}; ${abortNotice}` : abortNotice
           await logActivity({
             entityType: 'SYNC', action: 'stock_sync', tag: 'sync', level: 'WARNING',
             description: `Stock sync aborted mid-variation-push: WC settings version changed (${syncVersion} → ${outcome.currentVersion})`,
@@ -2208,6 +2422,32 @@ async function pushVariantBatchWithFence(
   })
 }
 
+/** The most variation pages read for one parent (WooCommerce caps a page at 100; the product import reads up to 1,000 variations). */
+const MAX_VARIATION_PAGES = 20
+
+/**
+ * Every variation of a parent, paged. Reading page 1 alone left variants beyond the first 100 counted as unmatched and never
+ * pushed. A failed later page is an error (a partial list must not pass as complete); a short page ends the read.
+ */
+async function fetchAllVariationsOfParent(
+  parentWcId: number,
+  creds: ConnectorCredentials,
+): Promise<{ data: unknown; error?: string; overCap?: boolean }> {
+  const all: unknown[] = []
+  for (let page = 1; page <= MAX_VARIATION_PAGES; page++) {
+    const res = await safeWcFetch(
+      `/products/${parentWcId}/variations`,
+      { per_page: '100', page: String(page) },
+      creds,
+    )
+    if (res.error) return { data: null, error: res.error }
+    const rows = Array.isArray(res.data) ? res.data : []
+    all.push(...rows)
+    if (rows.length < 100) return { data: all }
+  }
+  return { data: null, overCap: true, error: `parent WC ${parentWcId} has more than ${MAX_VARIATION_PAGES * 100} variations; refusing a partial read` }
+}
+
 /**
  * Resolve SKUs → WC product ids with bounded parallelism.
  * Returns both resolved ids and any transport errors so the caller can
@@ -2233,7 +2473,10 @@ async function resolveSkusInParallel(
   errors: { sku: string; error: string }[]
   totalAttempts: number
   failedAttempts: number
+  /** Parents left out of this pass (over the variation cap only; page and transport errors stay in `errors`). Their variants are neither errors nor unmatched. */
+  skippedParents: { parentSku: string; skus: string[]; reason: string }[]
 }> {
+  const skippedParents: { parentSku: string; skus: string[]; reason: string }[] = []
   const resolved = new Map<string, EffectiveTarget>()
   const errors: { sku: string; error: string }[] = []
   let totalAttempts = 0
@@ -2279,6 +2522,11 @@ async function resolveSkusInParallel(
     const parentWcId = parents[0]?.id
     if (typeof parentWcId !== 'number') continue
 
+    // o3d-hqvrp.104: the parent's whole variation list is read at most ONCE per parent (not once per 100-variant batch), and a parent whose
+    // list cannot be read is skipped for this pass instead of failing its variants (which would hold the daily reconcile window for good).
+    let allVariations: Awaited<ReturnType<typeof fetchAllVariationsOfParent>> | undefined
+    let skipped: { parentSku: string; skus: string[]; reason: string } | undefined
+
     for (let i = 0; i < group.length; i += WC_VARIATION_BATCH_SIZE) {
       const batch = group.slice(i, i + WC_VARIATION_BATCH_SIZE)
       totalAttempts++
@@ -2311,16 +2559,21 @@ async function resolveSkusInParallel(
         continue
       }
 
-      const variationLookup = await safeWcFetch(
-        `/products/${parentWcId}/variations`,
-        { per_page: '100' },
-        creds,
-      )
+      allVariations ??= await fetchAllVariationsOfParent(parentWcId, creds)
+      const variationLookup = allVariations
       if (variationLookup.error) {
-        failedAttempts++
-        for (const product of batch) {
-          errors.push({ sku: product.sku, error: variationLookup.error })
+        if (!variationLookup.overCap) {
+          // A page or transport error is transient: report it per SKU exactly as before, so a SALE outbox job stays queued
+          // (shouldRetainJob keys on errors) and the reconcile window is held. Only the deterministic over-cap case is skipped.
+          failedAttempts++
+          for (const product of batch) errors.push({ sku: product.sku, error: variationLookup.error })
+          continue
         }
+        if (!skipped) {
+          skipped = { parentSku, skus: [], reason: variationLookup.error }
+          skippedParents.push(skipped)
+        }
+        skipped.skus.push(...batch.map((product) => product.sku))
         continue
       }
       const variations = (variationLookup.data as WcVariation[] | null) ?? []
@@ -2382,7 +2635,7 @@ async function resolveSkusInParallel(
     () => worker(),
   )
   await Promise.all(workers)
-  return { resolved, errors, totalAttempts, failedAttempts }
+  return { resolved, errors, totalAttempts, failedAttempts, skippedParents }
 }
 
 // ---------------------------------------------------------------------------
@@ -2460,6 +2713,13 @@ export async function startManualWcStockSync(): Promise<void> {
   })
 }
 
+/** The errors the manual sync screen shows (first 20): a mid-run rebind abort is listed FIRST so per-item errors cannot push it out. */
+export function manualProgressErrors(result: { errors: string[]; abortedRemaining?: number; abortNotice?: string }): string[] {
+  if (!result.abortedRemaining || !result.abortNotice) return result.errors.slice(0, 20)
+  const notice = result.abortNotice
+  return [notice, ...result.errors.filter((e) => !notice.includes(e)).slice(0, 19)]
+}
+
 async function runManualWcStockPush(progress: ManualStockSyncProgress): Promise<void> {
   const result = await pushStockToWc({
     forceAll: true,
@@ -2488,9 +2748,11 @@ async function runManualWcStockPush(progress: ManualStockSyncProgress): Promise<
   progress.status = result.errors.length > 0 || result.aborted === true ? 'error' : 'done'
   progress.synced = result.synced
   progress.total = Math.max(progress.total, result.synced)
-  progress.errors = result.errors.slice(0, 20)
+  progress.errors = manualProgressErrors(result)
   progress.message = result.aborted === true
     ? `${result.message?.trim() || 'Stock push refused'} — nothing was pushed`
+    : result.abortedRemaining
+      ? `Stock push aborted part-way: WooCommerce credentials were rebound mid-run, ${result.abortedRemaining} push(es) were never attempted — ${result.synced} synced`
     : result.message?.trim()
       ? result.message.trim()
       : result.errors.length > 0

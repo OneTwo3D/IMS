@@ -61,7 +61,7 @@ export const salesAnalyticsEmptyTotals = {
   sales: { revenue: '0', netRevenue: '0', netRevenueBound: 'exact', tax: '0', shipping: '0', discount: '0', refundsGrossBasis: '0', refundsNetBasis: '0', refundsUnknownBasis: '0' },
   customers: { revenueBase: '0', netRevenueBase: '0', netRevenueBaseBound: 'exact', netRevenueExVatBase: '0', grossProfitBase: '0', grossProfitBaseBound: 'exact', costCapturedRows: '0', costInconsistentRows: '0', arExposureBase: '0', arExposureBaseBound: 'exact', refundsNetBasis: '0', refundsGrossBasis: '0', refundsUnknownBasis: '0' },
   margin: { revenueBase: '0', revenueBaseBound: 'exact', cogsBase: '0', grossProfitBase: '0', grossProfitBaseBound: 'exact', marginPct: '0', marginPctBound: 'exact', refundsNetBasis: '0', refundsGrossBasis: '0', refundsUnknownBasis: '0', refundsUnattributedNetBasis: '0', refundsUnattributedGrossBasis: '0', refundsUnattributedUnknownBasis: '0', refundsOutsideReportNetBasis: '0', refundsOutsideReportGrossBasis: '0', refundsOutsideReportUnknownBasis: '0' },
-  returns: { refundValueBase: '0', refundValueBasis: 'NONE', refundValueNetBasis: '0', refundValueGrossBasis: '0', refundValueUnknownBasis: '0', returnedQty: '0' },
+  returns: { refundValueBase: '0', refundValueBasis: 'NONE', refundValueNetBasis: '0', refundValueGrossBasis: '0', refundValueUnknownBasis: '0', returnedQty: '0', exchangedQty: '0', replacementQty: '0', exchangedRefundValueBase: '0', lostRefundValueBase: '0' },
   fulfillment: { shippedOrders: '0', shippedQty: '0' },
   throughput: { orders: '0', shipments: '0', lines: '0', queueDepth: '0' },
 } as const satisfies Record<string, Record<string, string>>

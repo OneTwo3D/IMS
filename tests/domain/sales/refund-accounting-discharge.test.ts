@@ -47,6 +47,7 @@ test('o3d-fj4m: a reversal decided never to post is discharged with relief 0 in 
   assert.equal(updates[0].data.accountingWarning, null)
   assert.equal(updates[0].data.accountingRetrySyncs, Prisma.DbNull)
   assert.equal(updates[0].data.allocatedReliefAmount, 0, 'the relief recorded for a journal that will never exist is written down')
+  assert.equal(updates[0].data.unearnedReversedAmount, 0, 'the unearned reversal recorded for a journal that will never exist is zeroed in the same write')
 })
 
 test('o3d-fj4m: a QUEUED reversal leaves the relief untouched (the control: the key is absent, not 0)', async () => {
@@ -56,6 +57,7 @@ test('o3d-fj4m: a QUEUED reversal leaves the relief untouched (the control: the 
   assert.equal(updates.length, 1)
   assert.equal(updates[0].data.accountingRetryRequired, false)
   assert.equal('allocatedReliefAmount' in updates[0].data, false, 'the journal exists, so what staging recorded is resolved against it by the next refund')
+  assert.equal('unearnedReversedAmount' in updates[0].data, false, 'and the unearned figure is never zeroed')
 })
 
 test('o3d-fj4m: only THIS refund\'s UNEARNED_REV_REVERSAL counts (isolating: another refund, another type)', () => {

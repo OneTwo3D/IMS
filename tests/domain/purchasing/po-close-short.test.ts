@@ -9,6 +9,7 @@ import {
   PoLiveAsnRefusedError,
   retirePurchaseOrderLocked,
 } from '@/lib/domain/purchasing/po-close-short'
+import { LandedCostChartUnreadableError, type LandedCostChartRead } from '@/lib/domain/purchasing/landed-cost-service'
 
 type FakeLine = { id: string; qty: number; qtyReceived: number; sku: string }
 
@@ -124,4 +125,26 @@ test('computeBilledAheadOfReceipt reports only lines billed beyond what landed, 
   assert.deepEqual(rows, [{ poLineId: 'a', sku: 'SKU-A', billedQty: 100, landedQty: 60, excessQty: 40, excessValueBase: 200 }])
   assert.match(describeBilledAhead(rows) ?? '', /SKU-A: billed 100, received 60 \(40 over, about 200\.00 base\)/)
   assert.equal(describeBilledAhead([]), null)
+})
+
+// o3d-d0gog: an unreadable accounting chart is fatal only where the operation actually revalues.
+const UNREADABLE_CHART: LandedCostChartRead = { ok: false, error: new LandedCostChartUnreadableError(new Error('decrypt failed')) }
+
+test('o3d-d0gog: closing a part-received order that revalues nothing succeeds even though the chart read failed', async () => {
+  for (const intent of ['close', 'cancel'] as const) {
+    const t = fakeTx({ status: 'PARTIALLY_RECEIVED', lines: twoLines })
+    const outcome = await retirePurchaseOrderLocked(t.tx, 'po', intent, undefined, UNREADABLE_CHART)
+    assert.equal(outcome.newStatus, 'CLOSED')
+    assert.equal(outcome.landedCostRecalc, null, 'no freight, so no revaluation and no chart needed')
+    assert.deepEqual(t.writes, [{ status: 'CLOSED' }])
+  }
+})
+
+test('o3d-d0gog: a close-short that WOULD revalue freight refuses on the unreadable chart before any write', async () => {
+  const t = fakeTx({ status: 'PARTIALLY_RECEIVED', lines: twoLines, freight: [{ amountBase: 50 }] })
+  await assert.rejects(
+    () => retirePurchaseOrderLocked(t.tx, 'po', 'close', undefined, UNREADABLE_CHART),
+    (error: unknown) => error instanceof LandedCostChartUnreadableError,
+  )
+  assert.deepEqual(t.writes, [], 'the status was not written')
 })

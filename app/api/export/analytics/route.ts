@@ -6,12 +6,14 @@ import { generateForecasts } from '@/app/actions/forecasting'
 import { toCsv, csvResponseFor } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
+import { canAccessOverviewAnalytics } from '@/lib/security/overview-analytics-access'
 import { canAccessPurchasingAnalytics } from '@/lib/security/purchasing-analytics-access'
 import {
   SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED,
   SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS,
   SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS,
   SUPPLIER_BILLED_ROUNDING_RECONCILIATION,
+  SUPPLIER_CREDIT_NOTES_NOT_NETTED_BASIS,
 } from '@/lib/domain/purchasing/supplier-payment-basis'
 
 export async function GET(req: NextRequest) {
@@ -20,6 +22,9 @@ export async function GET(req: NextRequest) {
 
   const type = req.nextUrl.searchParams.get('type') ?? 'products'
   if (!hasPermission(session.user.role, 'analytics')) {
+    return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
+  }
+  if (!canAccessOverviewAnalytics(session.user.role)) {
     return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
   }
   if (type.startsWith('po_') && !canAccessPurchasingAnalytics(session.user.role)) {
@@ -200,12 +205,13 @@ export async function GET(req: NextRequest) {
         netAmountExVat: r.netAmount.toFixed(2), landedCosts: r.landedCosts.toFixed(2), tax: r.tax.toFixed(2), totalAmount: r.totalAmount.toFixed(2),
         billedAmount: r.billedAmount.toFixed(2),
         billedWithPaymentMarker: r.billedWithPaymentMarker.toFixed(2), billedWithoutPaymentMarker: r.billedWithoutPaymentMarker.toFixed(2),
+        creditedAmount: r.creditedAmount.toFixed(2),
         dueAmount: r.dueAmount?.toFixed(2) ?? '',
         billedWithoutPaymentMarker0_30: r.billedWithoutPaymentMarker0_30.toFixed(2), billedWithoutPaymentMarker31_60: r.billedWithoutPaymentMarker31_60.toFixed(2),
         billedWithoutPaymentMarker61_90: r.billedWithoutPaymentMarker61_90.toFixed(2), billedWithoutPaymentMarker91plus: r.billedWithoutPaymentMarker91plus.toFixed(2),
         poCount: r.poCount, avgLeadTimeDays: r.avgLeadTimeDays }))
       return csvResponseFor(req, 
-        toCsv(data, ['supplierName', 'grossAmount', 'refunds', 'netAmountExVat', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'billedWithPaymentMarker', 'billedWithoutPaymentMarker', 'dueAmount', 'billedWithoutPaymentMarker0_30', 'billedWithoutPaymentMarker31_60', 'billedWithoutPaymentMarker61_90', 'billedWithoutPaymentMarker91plus', 'poCount', 'avgLeadTimeDays']),
+        toCsv(data, ['supplierName', 'grossAmount', 'refunds', 'netAmountExVat', 'landedCosts', 'tax', 'totalAmount', 'billedAmount', 'billedWithPaymentMarker', 'billedWithoutPaymentMarker', 'creditedAmount', 'dueAmount', 'billedWithoutPaymentMarker0_30', 'billedWithoutPaymentMarker31_60', 'billedWithoutPaymentMarker61_90', 'billedWithoutPaymentMarker91plus', 'poCount', 'avgLeadTimeDays']),
         `supplier-aging-${date}.csv`,
         // Report-level, because the reason is the same on every row: the export metadata rides both
         // the X-IMS-Export-Metadata header and, when the request carries `?metadata=1`, `#` comment rows at
@@ -214,6 +220,7 @@ export async function GET(req: NextRequest) {
           dueAmount: SUPPLIER_PAYMENT_AMOUNT_NOT_RECORDED,
           billedWithPaymentMarker: SUPPLIER_BILLED_WITH_PAYMENT_MARKER_BASIS,
           billedWithoutPaymentMarker: SUPPLIER_BILLED_WITHOUT_PAYMENT_MARKER_BASIS,
+          creditedAmount: SUPPLIER_CREDIT_NOTES_NOT_NETTED_BASIS,
           // o3d-8u4h round 3: a spreadsheet reader is the one most likely to sum the columns, and
           // the only one who cannot ask why the sum came out to the penny it did.
           billedAmount: SUPPLIER_BILLED_ROUNDING_RECONCILIATION,

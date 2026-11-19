@@ -11,7 +11,7 @@ import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@
 import { ProductLink } from '@/components/inventory/product-link'
 import type { KpiSummary, ChartPoint, TopProduct, RecentOrder, IncomingPO, Period, CompareMode } from '@/app/actions/dashboard'
 import { getDashboardData } from '@/app/actions/dashboard'
-import { boundSuffix, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
+import { boundSuffix, bridgeTooltipNote, type DerivedFigureBound } from '@/lib/domain/sales/derived-figure-bound'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { OnboardingBanner } from '@/components/layout/onboarding-banner'
@@ -25,6 +25,8 @@ type Props = {
   periodLabel: string; compLabel: string; initialPeriod: Period; initialCompare: CompareMode
   showOnboardingBanner?: boolean
   needsAttention?: NeedsAttentionView | null
+  /** False hides COGS, profit, margin and inventory value (the server has already zeroed them). */
+  costFiguresVisible?: boolean
 }
 
 /**
@@ -260,7 +262,7 @@ function DesktopChartFrame({
   )
 }
 
-export function DashboardClient({ kpi: initKpi, chartData: initChart, topProducts: initTop, recentOrders, incomingPOs, periodLabel: initPL, compLabel: initCL, initialPeriod, initialCompare, showOnboardingBanner, needsAttention }: Props) {
+export function DashboardClient({ kpi: initKpi, chartData: initChart, topProducts: initTop, recentOrders, incomingPOs, periodLabel: initPL, compLabel: initCL, initialPeriod, initialCompare, showOnboardingBanner, needsAttention, costFiguresVisible = false }: Props) {
   const formatDateTime = useFormatDateTime()
   const fmtDateShort = (iso: string) => formatDateTime(iso, { day: 'numeric', month: 'short' })
   const baseCurrency = useBaseCurrency()
@@ -277,11 +279,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
     // printed one anyway.
     const bound: DerivedFigureBound = point ? (isComp ? point.compNetSalesBound : point.netSalesBound) : 'exact'
     const amount = fmtBaseFull(Number(value))
-    const note = bound === 'upper'
-      ? ' ≤ (upper bound — refunds not on the net basis are not subtracted)'
-      : bound === 'indeterminate'
-        ? ' ? (direction not established — some credit this bucket could not subtract is negative)'
-        : ''
+    const note = bridgeTooltipNote(bound)
     return [`${amount}${note}`, isComp ? compLabel : periodLabel]
   }
   const marginTooltipFormatter = (value: unknown, name: unknown, item?: { payload?: ChartPoint }): [string, string] =>
@@ -409,6 +407,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
             </p>
           )}
         </Card>
+        {costFiguresVisible && (
         <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
             <p className="text-xs text-muted-foreground">COGS</p>
@@ -418,6 +417,8 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
           {/* o3d-iigc: profit is net sales less COGS, so it inherits net sales' upper bound. */}
           <p className={`text-[11px] mt-0.5 truncate ${kpi.netSalesBoundCurrent === 'exact' ? 'text-muted-foreground' : 'text-orange-600'}`} title={linearBoundTitle(kpi.netSalesBoundCurrent)}>Profit: {fmtBase(kpi.profitCurrent)}{boundSuffix(kpi.netSalesBoundCurrent)}</p>
         </Card>
+        )}
+        {costFiguresVisible && (
         <Card className="p-3 sm:p-4">
           <div className="flex items-center justify-between">
             <p className="text-xs text-muted-foreground">Margin %</p>
@@ -436,6 +437,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
           <p className={`text-xl sm:text-2xl font-bold mt-1 ${kpi.marginBoundCurrent === 'exact' ? '' : 'text-orange-600'}`} title={boundTitle(kpi.marginBoundCurrent)}>{kpi.marginCurrent}%{boundSuffix(kpi.marginBoundCurrent)}</p>
           <p className={`text-[11px] mt-0.5 truncate ${kpi.marginBoundComparison === 'exact' ? 'text-muted-foreground' : 'text-orange-600'}`} title={boundTitle(kpi.marginBoundComparison, true)}>Comp: {kpi.marginComparison}%{boundSuffix(kpi.marginBoundComparison)}</p>
         </Card>
+        )}
       </div>
 
       {/* 3 Charts row — stack on mobile */}
@@ -469,6 +471,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
         </Card>
 
         {/* COGS — multi-line (current + comparison) */}
+        {costFiguresVisible && (
         <Card className="p-3 sm:p-4">
           <h2 className="text-sm font-semibold mb-2">COGS</h2>
           {isNarrow === null ? renderChartPlaceholder() : isNarrow ? (
@@ -497,8 +500,10 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
               </LineChart>
           ))}
         </Card>
+        )}
 
         {/* Margin % — line (current + comparison) */}
+        {costFiguresVisible && (
         <Card className="p-3 sm:p-4">
           <h2 className="text-sm font-semibold mb-2">Margin %</h2>
           {isNarrow === null ? renderChartPlaceholder() : isNarrow ? (
@@ -527,11 +532,13 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
               </LineChart>
           ))}
         </Card>
+        )}
       </div>
 
       {/* Bottom row: Cash Bridge, Best Sellers, Incoming POs */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-3 sm:gap-4">
         {/* Cash Bridge */}
+        {costFiguresVisible && (
         <Card className="p-3 sm:p-4">
           <h2 className="text-sm font-semibold mb-2">Cash Bridge</h2>
           {isNarrow === null ? renderChartPlaceholder() : isNarrow ? (
@@ -562,6 +569,7 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
               </BarChart>
           ))}
         </Card>
+        )}
 
         {/* Best Sellers */}
         <Card className="p-3 sm:p-4">
@@ -578,10 +586,13 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
                   {/* netQty is qtySold less every credited unit. Quantity is basis-independent, so
                       it is EXACT and deliberately carries no marker. */}
                   <p className="text-[10px] text-muted-foreground">
-                    {p.netQty} sold net{p.qtyRefunded > 0 ? ` (${p.qtySold} less ${p.qtyRefunded} returned)` : ''} &middot;{' '}
-                    <span className={p.marginPctBound === 'exact' ? '' : 'text-orange-600'} title={bestSellerMarginTitle(p)}>
-                      {p.marginPct}%{boundSuffix(p.marginPctBound)} margin
-                    </span>
+                    {p.netQty} sold net{p.qtyRefunded > 0 ? ` (${p.qtySold} less ${p.qtyRefunded} returned)` : ''}
+                    {costFiguresVisible && (
+                      <> &middot;{' '}
+                      <span className={p.marginPctBound === 'exact' ? '' : 'text-orange-600'} title={bestSellerMarginTitle(p)}>
+                        {p.marginPct}%{boundSuffix(p.marginPctBound)} margin
+                      </span></>
+                    )}
                   </p>
                 </div>
                 <span
@@ -635,11 +646,13 @@ export function DashboardClient({ kpi: initKpi, chartData: initChart, topProduct
           <p className="text-lg font-bold">{kpi.openPurchaseOrders}</p>
           <p className="text-[10px] text-muted-foreground">{fmtBase(kpi.openPOValue)}</p>
         </Card>
+        {costFiguresVisible && (
         <Card className="p-3 text-center">
           <p className="text-[10px] text-muted-foreground">Inventory Value</p>
           <p className="text-lg font-bold">{fmtBase(kpi.inventoryValue)}</p>
           <p className="text-[10px] text-muted-foreground">{kpi.activeProducts} active</p>
         </Card>
+        )}
         <Card className="p-3 text-center">
           <p className="text-[10px] text-muted-foreground">Low Stock</p>
           <p className="text-lg font-bold text-orange-600">{kpi.lowStockCount}</p>

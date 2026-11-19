@@ -1,5 +1,6 @@
 'use client'
 
+import { INVOICING_STATE_LABELS, INVOICING_STATES, type InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import { useRouter, usePathname, useSearchParams } from 'next/navigation'
@@ -50,6 +51,7 @@ const STATUS_CLASS: Record<SoStatus, string> = {
   CANCELLED: 'text-destructive border-destructive/30',
 }
 
+const INVOICING_FILTERS: readonly InvoicingState[] = INVOICING_STATES
 const FILTER_STATUSES: SoStatus[] = ['DRAFT', 'PENDING_PAYMENT', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING', 'SHIPPED', 'COMPLETED', 'DELIVERED', 'CANCELLED']
 
 function timeAgo(iso: string): string {
@@ -141,6 +143,22 @@ function FulfilmentChip({ so }: { so: SoRow }) {
   )
 }
 
+/** A quote is a draft with a flag: the badges say so, and say when its validity date has passed. */
+function QuoteBadges({ so }: { so: SoRow }) {
+  return (
+    <>
+      <span className="inline-flex items-center rounded-full border border-blue-300 bg-blue-50 px-2 py-0.5 text-xs font-medium text-blue-800 dark:border-blue-800 dark:bg-blue-950 dark:text-blue-200" title={so.quoteValidUntil ? `Valid until ${so.quoteValidUntil}` : undefined}>
+        Quote
+      </span>
+      {so.quoteExpired && (
+        <span className="inline-flex items-center rounded-full border border-red-300 bg-red-50 px-2 py-0.5 text-xs font-medium text-red-800 dark:border-red-800 dark:bg-red-950 dark:text-red-200" title={`Expired on ${so.quoteValidUntil}`}>
+          Expired
+        </span>
+      )}
+    </>
+  )
+}
+
 function invoiceStatus(so: SoRow): { label: string; cls: string } {
   // Refund state is orthogonal to the lifecycle status now — read refundStatus.
   if (so.refundStatus === 'FULL') return { label: 'Refunded', cls: 'bg-red-100 text-red-800' }
@@ -188,13 +206,18 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
   const urlState: OrderListUrlState = {
     q: searchParams.get('q') ?? '',
     statuses: (searchParams.get('status') ?? '').split(',').filter(Boolean),
+    invoicing: (searchParams.get('invoicing') ?? '').split(',').filter(Boolean),
     page: list.page,
     showCompleted: searchParams.get('completed') === '1',
     includeArchived: searchParams.get('archived') === '1',
     invoiced: false,
     returned: false,
+    quotes: searchParams.get('quotes') === '1',
+    customFieldKey: list.appliedCustomField?.key,
+    customFieldValue: list.appliedCustomField?.value,
   }
   const statusFilters = new Set(urlState.statuses as SoStatus[])
+  const invoicingFilters = new Set((urlState.invoicing ?? []) as InvoicingState[])
   const [search, setSearch] = useState(urlState.q)
   const [lastPushedQ, setLastPushedQ] = useState(urlState.q)
   const [seenUrlQ, setSeenUrlQ] = useState(urlState.q)
@@ -262,6 +285,12 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
     navigate({ statuses: [...next] })
   }
 
+  function toggleInvoicing(s: InvoicingState) {
+    const next = new Set(invoicingFilters)
+    if (next.has(s)) next.delete(s); else next.add(s)
+    navigate({ invoicing: [...next] })
+  }
+
   const filtered = list.rows
 
   // Row selection for bulk actions. It is per page: ids that are no longer on the page (page change,
@@ -325,6 +354,7 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
             <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[so.status]}`}>
               {STATUS_LABELS[so.status]}
             </span>
+            {so.isQuote && <QuoteBadges so={so} />}
             <FulfilmentChip so={so} />
           </TableCell>
         )
@@ -434,6 +464,14 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
 
   return (
     <div className="space-y-3">
+      <div className="flex items-center gap-1" role="tablist" aria-label="Order type">
+        <Button role="tab" aria-selected={!urlState.quotes} variant={urlState.quotes ? 'outline' : 'default'} size="sm" className="h-8 text-xs" onClick={() => navigate({ quotes: false })}>
+          All orders
+        </Button>
+        <Button role="tab" aria-selected={urlState.quotes} variant={urlState.quotes ? 'default' : 'outline'} size="sm" className="h-8 text-xs" onClick={() => navigate({ quotes: true })}>
+          Quotes
+        </Button>
+      </div>
       <div className="flex flex-wrap items-center gap-2">
         <div className="relative flex-1 min-w-48 max-w-xs">
           <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-muted-foreground" />
@@ -458,15 +496,51 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
             ))}
           </DropdownMenuContent>
         </DropdownMenu>
+        <DropdownMenu>
+          <DropdownMenuTrigger render={<Button variant="outline" size="sm" className="h-8 text-xs" aria-label="Filter by invoicing" />}>
+            <Filter className="h-3.5 w-3.5 mr-1.5" />
+            {invoicingFilters.size === 0 ? 'Invoicing: all' : invoicingFilters.size === 1 ? INVOICING_STATE_LABELS[[...invoicingFilters][0]] : `${invoicingFilters.size} invoicing states`}
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="start">
+            {INVOICING_FILTERS.map((s) => (
+              <DropdownMenuCheckboxItem key={s} checked={invoicingFilters.has(s)} onCheckedChange={() => toggleInvoicing(s)}>
+                {INVOICING_STATE_LABELS[s]}
+              </DropdownMenuCheckboxItem>
+            ))}
+          </DropdownMenuContent>
+        </DropdownMenu>
+        {list.customFieldFilters.length > 0 && (
+          <select
+            aria-label="Filter by custom field"
+            className="h-8 rounded-md border border-input bg-background px-2 text-xs"
+            value={list.appliedCustomField ? `${list.appliedCustomField.key}:${list.appliedCustomField.value}` : ''}
+            onChange={(e) => {
+              // The key is a slug (no colon), so the first colon separates it from the chosen value.
+              const at = e.target.value.indexOf(':')
+              const key = at > 0 ? e.target.value.slice(0, at) : ''
+              const value = at > 0 ? e.target.value.slice(at + 1) : ''
+              navigate(key && value ? { customFieldKey: key, customFieldValue: value } : { customFieldKey: undefined, customFieldValue: undefined })
+            }}
+          >
+            <option value="">Any custom field</option>
+            {list.customFieldFilters.map((field) => (
+              <optgroup key={field.key} label={field.label}>
+                {field.choices.map((choice) => (
+                  <option key={`${field.key}:${choice.value}`} value={`${field.key}:${choice.value}`}>{field.label}: {choice.label}</option>
+                ))}
+              </optgroup>
+            ))}
+          </select>
+        )}
         <label
           className="flex items-center gap-1.5 text-xs"
-          title={searching || statusFilters.size > 0 ? 'A search or status pick always includes completed orders' : undefined}
+          title={searching || statusFilters.size > 0 || invoicingFilters.size > 0 ? 'A search, a status pick or an invoicing pick always includes completed orders' : undefined}
         >
           <input
             type="checkbox"
             className="accent-primary h-3.5 w-3.5"
-            checked={!urlState.showCompleted && !searching && statusFilters.size === 0}
-            disabled={searching || statusFilters.size > 0}
+            checked={!urlState.showCompleted && !searching && statusFilters.size === 0 && invoicingFilters.size === 0}
+            disabled={searching || statusFilters.size > 0 || invoicingFilters.size > 0}
             onChange={(e) => navigate({ showCompleted: !e.target.checked })}
           />
           Hide completed
@@ -492,7 +566,7 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
 
       {filtered.length === 0 ? (
         <p className="text-sm text-muted-foreground py-8 text-center">
-          {searching ? `No sales orders match "${urlState.q.trim()}" in any order, including completed and archived.` : 'No sales orders found.'}
+          {searching ? `No sales orders match "${urlState.q.trim()}" in any order, including completed and archived.` : (urlState.quotes ? 'No quotes found.' : 'No sales orders found.')}
         </p>
       ) : (
         <ResponsiveTableLayout
@@ -524,6 +598,7 @@ export function SoListClient({ list, currencySymbols = {}, currencyPositions = {
                         <span className={`inline-flex items-center rounded-full border px-2 py-0.5 text-xs font-medium ${STATUS_CLASS[so.status]}`}>
                           {STATUS_LABELS[so.status]}
                         </span>
+            {so.isQuote && <QuoteBadges so={so} />}
                         <FulfilmentChip so={so} />
                         <span className="text-sm font-semibold tabular-nums">
                           {fmtForeign(so.totalForeign, so.currency)}

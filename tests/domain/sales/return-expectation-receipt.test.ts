@@ -321,3 +321,19 @@ test('the closing arrival clears what the refund POSTED, even when the snapshot 
   const gl = queued.reduce((sum, q) => sum + ((q.payload as { lines: Array<{ debit?: number }> }).lines[0].debit ?? 0), 0)
   assert.equal(Number(gl.toFixed(2)), 1)
 })
+
+test('TRANSIT ORDERING on a BST month end: the clearing credit is dated the London day, never before the refund\'s transit debit (also London)', async () => {
+  const { receiveReturnAgainstExpectationsTx } = await mod
+  const { businessDateYmd } = await import('../../../lib/business-date')
+  queued.length = 0; subledger.length = 0; enqueueAnswer = { queued: true }
+  // refund recorded 23:10 UTC on 31 July (00:10 London 1 August): refund-service dates the transit debit businessDateYmd(now)
+  const debitDate = businessDateYmd(new Date('2026-07-31T23:10:00Z'))
+  assert.equal(debitDate, '2026-08-01')
+  // the goods are booked in at 23:40 UTC the same night: the credit must not fall back to 31 July
+  const { tx } = fakeTx(oneLine(), { transitJournalKey: 'k' })
+  await receiveReturnAgainstExpectationsTx(tx, { ...params({ connector: 'xero', syncEnabled: true }), arrivedAt: new Date('2026-07-31T23:40:00Z') })
+  const payload = queued[0].payload as { date: string }
+  assert.equal(payload.date, '2026-08-01')
+  assert.ok(payload.date >= debitDate, 'credit is not dated before the debit')
+  assert.equal(subledger[0].journalDate, payload.date, 'the sub-ledger row is on the journal day, so the reconciliation window does not split the pair')
+})

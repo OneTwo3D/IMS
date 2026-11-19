@@ -1,4 +1,4 @@
-import type { WmsAmbiguousCreateResolution, WmsMergedItemRemoval, WmsMergedSurvivorLookup, WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsExpectedOrder, WmsOrderItemRef, WmsOrderPart, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsOrderUpdateResult, WmsProductContentResult, WmsProductContentUpdate, WmsProductDeleteResult, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAmbiguousCreateResolution, WmsMergedItemRemoval, WmsMergedSurvivorLookup, WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsOrderHoldResult, WmsExpectedOrder, WmsOrderItemRef, WmsOrderPart, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsOrderUpdateResult, WmsProductContentResult, WmsProductContentUpdate, WmsProductDeleteResult, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   getMintsoftApiConfiguration,
   isMintsoftConfigured,
@@ -7,7 +7,7 @@ import {
 import { updateMintsoftProductContent } from './api/product-content'
 import { createMintsoftAsn, createMintsoftBundle, deleteMintsoftProduct, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 import { fetchMintsoftOrderList, fetchMintsoftOrderStatus, fetchMintsoftOrderParts, fetchMintsoftPartItems, probeMintsoftOrderPresence } from './api/orders'
-import { addMintsoftOrderComment, readMintsoftOrderItemRefs, cancelMintsoftOrder, findMintsoftMergedSurvivor, pushMintsoftOrder, removeMintsoftOrderItems, reconcileMintsoftAmbiguousCreate, updateMintsoftOrder, verifyMintsoftPushedOrder } from './api/order-push'
+import { addMintsoftOrderComment, readMintsoftOrderItemRefs, cancelMintsoftOrder, holdMintsoftOrderForMerge, findMintsoftMergedSurvivor, pushMintsoftOrder, removeMintsoftOrderItems, reconcileMintsoftAmbiguousCreate, probeMintsoftOrderAmendable, updateMintsoftOrder, verifyMintsoftPushedOrder } from './api/order-push'
 import { parseMintsoftPositiveId } from './settings/schema'
 import { getSettingValue } from '@/lib/settings-store'
 
@@ -179,12 +179,22 @@ export class MintsoftConnector implements WmsConnector {
     return updateMintsoftOrder(externalOrderId, input)
   }
 
+  /** A READ, the amend gate without the write: may this warehouse order still be amended? Mutates nothing. */
+  async probeOrderAmendable(externalOrderId: string, expectedOrderNumber: string | null) {
+    return probeMintsoftOrderAmendable(externalOrderId, expectedOrderNumber)
+  }
+
   async fetchOrderItemRefs(externalOrderId: string): Promise<WmsOrderItemRef[]> {
     return readMintsoftOrderItemRefs(externalOrderId)
   }
 
   async cancelOrder(externalOrderId: string, expected: WmsExpectedOrder): Promise<WmsOrderCancelResult> {
     return cancelMintsoftOrder(externalOrderId, { expectedOrderNumber: expected.orderNumber })
+  }
+
+  /** A WRITE (GET MarkAwaitingConfirmation): a merge hold. No release verb exists on purpose. */
+  async holdOrder(externalOrderId: string, expected: WmsExpectedOrder): Promise<WmsOrderHoldResult> {
+    return holdMintsoftOrderForMerge(externalOrderId, { expectedOrderNumber: expected.orderNumber })
   }
 
   async cancelMergedOrder(externalOrderId: string, expected: WmsExpectedOrder, items: WmsOrderItemRef[]): Promise<WmsOrderCancelResult> {

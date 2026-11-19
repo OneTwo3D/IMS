@@ -245,6 +245,30 @@ async function applyAlignment(
   })
 }
 
+/**
+ * Puts an ASN back to OPEN after its transfer's dispatch was cancelled.
+ *
+ * Since o3d-hqvrp.120 cancelling a dispatch closes the transfer's ASN, so the
+ * cancelled-parent GUARD in the alignment candidate query is no longer reached by
+ * the plain cancel route. It is still the only thing standing between a CANCELLED
+ * parent and a second cost layer for ASNs that were open before .120 shipped, and
+ * for an ASN reopened or raised against a cancelled transfer by any later path. This
+ * recreates exactly that world, so the guard proofs below stay non-vacuous.
+ */
+async function reopenAsn(
+  db: Awaited<ReturnType<typeof seedDispatchedTransferWithOpenAsn>>['db'],
+  asnLineMapId: string,
+) {
+  const line = await db.wmsAsnLineMap.findUniqueOrThrow({
+    where: { id: asnLineMapId },
+    select: { asnMapId: true },
+  })
+  await db.wmsAsnMap.update({
+    where: { id: line.asnMapId },
+    data: { closedAt: null, status: 'OPEN' },
+  })
+}
+
 async function landedCostDeps() {
   const costLayers = await import('@/lib/cost-layers')
   return {
@@ -290,11 +314,13 @@ async function applyLandedCostChange(sourceCostLayerId: string) {
 }
 
 test(
-  'THE PRECONDITION: cancelling a dispatch leaves the ASN OPEN and still pointing at the line (Codex r7 HIGH-1)',
+  'THE PRECONDITION: cancelling a dispatch CLOSES the transfer’s ASN locally and leaves the line untouched (o3d-hqvrp.120)',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async () => {
-    // If cancellation closed the ASN there would be no route at all, and the guard
-    // below would be guarding nothing. Read off the real rows.
+    // Read off the real rows. Before .120 the cancel left the ASN open, which was the
+    // route this file's guard exists for; now the cancel closes it. Both facts are
+    // asserted so the reopen-based guard proofs below are known to start from the
+    // state a real cancel produces.
     loadEnv()
     const { db, transfer, asnLineMapId, source } = await seedDispatchedTransferWithOpenAsn('precondition')
     const { cancelDispatchedTransfer } = await import('@/app/actions/transfers')
@@ -315,26 +341,68 @@ test(
 
     const asnLine = await db.wmsAsnLineMap.findUniqueOrThrow({
       where: { id: asnLineMapId },
-      select: { asn: { select: { closedAt: true, status: true } } },
+      select: { sourceLineId: true, qtyAccountedViaSnapshot: true, asn: { select: { closedAt: true, status: true } } },
     })
-    assert.equal(asnLine.asn.closedAt, null, 'and its ASN is STILL OPEN — this is the route')
-    assert.equal(asnLine.asn.status, 'OPEN')
+    assert.notEqual(asnLine.asn.closedAt, null, 'the ASN is CLOSED locally by the cancel (.120)')
+    assert.equal(asnLine.asn.status, 'OPEN', 'closing sets closedAt only: no status change, nothing sent to the warehouse')
+    assert.equal(asnLine.sourceLineId, transfer.lines[0]!.id, 'and the ASN line still points at the transfer line')
+    assert.equal(Number(asnLine.qtyAccountedViaSnapshot), 0, 'with no credit booked')
   },
 )
 
 test(
-  'cancel dispatch → align-up must NOT create a second layer; the reclassification posts ONCE (Codex r7 HIGH-1)',
+  'cancel dispatch → the closed ASN is not a candidate: align-up creates no second layer; the reclassification posts ONCE (.120)',
   { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
   async () => {
     loadEnv()
     const { db, transfer, sourceLayer, destination, product, binding, tag } =
+      await seedDispatchedTransferWithOpenAsn('closed')
+    const { cancelDispatchedTransfer } = await import('@/app/actions/transfers')
+
+    const cancel = await cancelDispatchedTransfer(transfer.id)
+    assert.equal(cancel.success, true, `cancel must succeed: ${JSON.stringify(cancel)}`)
+
+    const aligned = await alignUp(binding, product.id, tag)
+    assert.equal(aligned.applied, false, `a closed ASN must not absorb a delta, got ${JSON.stringify(aligned)}`)
+    assert.match(
+      aligned.reason,
+      /No open ASN line is available/,
+      `the refusal must be the no-open-ASN one, got: ${aligned.reason}`,
+    )
+
+    assert.equal(await db.costLayer.count({ where: { warehouseId: destination.id } }), 0, 'no destination layer')
+    assert.equal(
+      await db.stockLevel.count({ where: { warehouseId: destination.id, quantity: { gt: 0 } } }),
+      0,
+      'and no destination stock was booked in',
+    )
+    assert.equal(
+      await db.costLayerSourceLine.count({ where: { sourceCostLayerId: sourceLayer.id } }),
+      1,
+      'exactly ONE live layer descends from the source layer',
+    )
+    const { posted, totalInventory } = await applyLandedCostChange(sourceLayer.id)
+    assert.equal(posted.length, 1, `the reclassification must reach exactly one layer: ${JSON.stringify(posted)}`)
+    assert.equal(totalInventory.toFixed(2), (LANDED_COST_DELTA_PER_UNIT * LINE_QTY).toFixed(2))
+  },
+)
+
+test(
+  'cancel dispatch → even a REOPENED/legacy-open ASN must not create a second layer; the reclassification posts ONCE (Codex r7 HIGH-1)',
+  { skip: !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1' },
+  async () => {
+    loadEnv()
+    const { db, transfer, sourceLayer, destination, product, binding, tag, asnLineMapId } =
       await seedDispatchedTransferWithOpenAsn('sequential')
     const { cancelDispatchedTransfer } = await import('@/app/actions/transfers')
 
     const cancel = await cancelDispatchedTransfer(transfer.id)
     assert.equal(cancel.success, true, `cancel must succeed: ${JSON.stringify(cancel)}`)
 
-    // THE ALIGN-UP, against the still-open ASN of a CANCELLED transfer.
+    // The ASN a pre-.120 cancel would have left behind: open, pointing at the line.
+    await reopenAsn(db, asnLineMapId)
+
+    // THE ALIGN-UP, against the open ASN of a CANCELLED transfer.
     const aligned = await alignUp(binding, product.id, tag)
 
     assert.equal(aligned.applied, false, `alignment must refuse a cancelled parent, got ${JSON.stringify(aligned)}`)
@@ -601,8 +669,8 @@ test(
     // the cancelled row is absent from the lock set for a reason that has nothing to
     // do with racing. The locked re-read reads that absence as "committed after the
     // locks", labels the row `raced`, and round 11's terminal guard throws the WHOLE
-    // plan away — including the healthy candidate. And because nothing closes a
-    // cancelled transfer's ASN (proved by the PRECONDITION test above), the row is
+    // plan away — including the healthy candidate. And because a legacy
+    // cancelled transfer's ASN stays open (reopened below to model it), the row is
     // there again on the next sweep, and the one after: the deferral never expires.
     //
     // Both existing arms miss it. The cancelled-ONLY world returns at the FIRST
@@ -617,6 +685,9 @@ test(
 
     const cancel = await cancelDispatchedTransfer(dead.transferId)
     assert.equal(cancel.success, true, `the sibling cancel must succeed: ${JSON.stringify(cancel)}`)
+    // .120 closes the cancelled transfer's ASN; reopen it to model the pre-.120 / legacy
+    // row this proof is about (a cancelled parent whose ASN is still discoverable).
+    await reopenAsn(db, dead.asnLineMapId)
 
     // THE PRECONDITION, ASSERTED SO THIS CANNOT PASS VACUOUSLY. Both ASN rows must
     // still be discoverable — same product, same destination, both ASNs OPEN — and
@@ -737,6 +808,7 @@ test(
     const dead = await seedSiblingDispatchedTransferWithOpenAsn(base, 'dead')
     const { cancelDispatchedTransfer } = await import('@/app/actions/transfers')
     assert.equal((await cancelDispatchedTransfer(dead.transferId)).success, true)
+    await reopenAsn(db, dead.asnLineMapId) // legacy open ASN of a cancelled parent (.120 closes new ones)
 
     const aligned = await applyAlignment(binding, product.id, tag, { delta: LINE_QTY * 2, imsQty: 0 })
 

@@ -2,6 +2,9 @@
  * WooCommerce → IMS order import.
  */
 
+import { businessDateYmd } from '@/lib/business-date'
+import { readWcLineCustomsUnitValue } from './duty-tax-mirror'
+import { mirrorIossFromRegime } from './duty-tax-regime-mirror'
 import { heldOrderInvoiceObligation } from './held-order-invoice-obligation'
 import { advancePullCursor, laterCursor, statusListCovers, wcPullCursorCandidate } from './read-cursor'
 import { describeWcRateMoneyRefusal, findWcRateMoneyProblems } from '@/lib/domain/accounting/wc-rate-money-refusal'
@@ -33,8 +36,9 @@ import { accountingPostingKey } from '@/lib/accounting/posting-key'
 import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import { surfaceWcOrderEditDrift } from './order-edit-drift'
+import { drainDeferredWcOrderDivergences, rerunDeferredWcOrderDivergence, surfaceWcOrderDivergence } from './order-divergence'
 import {
-  mapWcAddress, upsertCustomer, mapWcLineItems,
+  mapWcAddress, upsertCustomer, mapWcLineItems, logWcUnmatchedLines,
   mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, collectingUnmappedWcRates, getFxRateToBase, isMissingFxRateError,
   readWcCustomerVat, resolveWcOrderLevelDiscount,
   type MappedLine,
@@ -58,6 +62,7 @@ import {
 } from './held-sales-invoice'
 import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
+import { recomputeSalesOrderInvoicingState, type InvoicingStateClient } from '@/lib/domain/sales/invoicing-state-sites'
 import { rateBinding, resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { previewTreatedSalesInvoice, treatImportedSalesInvoice, type EuVatTreatmentAccounts } from './eu-vat-invoice-treatment'
 import { regimePolicyDifference, type RegimePolicy } from '@/lib/domain/accounting/eu-vat-regime-policy'
@@ -1376,6 +1381,44 @@ export function wclcComponentColumns(wcOrder: WcFullOrder): {
   return { wclcDutyComponent: c.dutyComponent, wclcTaxComponent: c.taxComponent, wclcHandlingComponent: c.handlingComponent }
 }
 
+/**
+ * The wclc components follow WooCommerce on an update, but the fee lines and the invoice built from them are NOT rebuilt. When a delivery moves a
+ * component away from what was stored (so the split no longer matches the retained fee lines and invoice) an operator is told: one WARNING on the
+ * order's activity naming the old and new values. Nothing is changed beyond the mirrored columns. A stored value that was not read (undefined) is not compared.
+ */
+async function warnWhenWclcComponentsMoved(
+  orderId: string,
+  wcOrder: WcFullOrder,
+  stored: { wclcDutyComponent?: unknown; wclcTaxComponent?: unknown; wclcHandlingComponent?: unknown } | null,
+): Promise<void> {
+  if (!stored || !Array.isArray(wcOrder.meta_data)) return
+  const incoming = wclcComponentColumns(wcOrder)
+  const pairs: Array<[string, unknown, string | null]> = [
+    ['duty', stored.wclcDutyComponent, incoming.wclcDutyComponent],
+    ['import VAT', stored.wclcTaxComponent, incoming.wclcTaxComponent],
+    ['handling', stored.wclcHandlingComponent, incoming.wclcHandlingComponent],
+  ]
+  const text = (v: unknown) => (v === null || v === undefined ? null : String(v))
+  const moved = pairs.filter(([, before, after]) => {
+    if (before === undefined) return false
+    const b = text(before)
+    if (b === null || after === null) return b !== after
+    return !toDecimal(b).eq(toDecimal(after))
+  })
+  if (moved.length === 0) return
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: orderId,
+    action: 'wc_duty_tax_components_changed',
+    tag: 'sync',
+    level: 'WARNING',
+    description: `WooCommerce changed the duty/tax split of order ${wcOrder.number} after import (${moved.map(([name, b, a]) => `${name}: ${text(b) ?? 'none'} to ${a ?? 'none'}`).join('; ')}). `
+      + 'The components shown on the order now follow WooCommerce, but the fee lines and the sales invoice were built from the earlier split and were not rebuilt. Check them against WooCommerce.',
+    metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), moved: moved.map(([name, b, a]) => ({ name, before: text(b), after: a })) },
+    resolveUser: false,
+  })
+}
+
 export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder: WcFullOrder, receiptPaymentId?: string, retryLogId?: string, snapshotVersion?: string): Promise<PaidBlockOutcome> {
   // WOOCOMMERCE HAS ANONYMISED THIS ORDER (positive marker): mirror it FIRST, so the update below reads the erasure marker under the order lock
   // and withholds the placeholder values WooCommerce now holds. Idempotent (an erased order is a no-op); a failure throws and the delivery retries.
@@ -1393,6 +1436,8 @@ export async function updateExistingWcOrderFromPayload(orderId: string, wcOrder:
   // delivery whose total or currency disagrees with IMS already left its own durable obligation row (paid-block, retried until the two agree):
   // the total is not surfaced a second time then, so one disagreement is one row.
   await surfaceWcOrderEditDrift(orderId, wcOrder, { ignoreTotal: outcome.blocked })
+  // READ-ONLY and behind `wc_order_divergence_detection_enabled` (off by default): reports price, shipping, discount and tax differences too, net of refunds. Writes nothing to the order; never throws.
+  await surfaceWcOrderDivergence(orderId, wcOrder)
   if (transition.kind === 'blocked') throw transition.error
   // WHICHEVER BRANCH RAN (including a 'record' whose locked claim was lost to a concurrent delivery that committed the Payment but whose registration failed): every receipt this
   // path recorded for the order is proven registered before this returns, so a caller can never retire its pending row on a receipt with no obligation on record. Idempotent.
@@ -1447,6 +1492,7 @@ async function updateExistingWcOrderCore(
   const payloadHasCreditConflict = reclassified.signalProblems.length > 0
   let reviewFlagged = false
   let repopulationRefused = false
+  let storedComponents: { wclcDutyComponent?: unknown; wclcTaxComponent?: unknown; wclcHandlingComponent?: unknown } | null = null
   await db.$transaction(async (tx) => {
     // Only a payload that shows credit or any credit-evidence problem can need a review; the steady state reads nothing.
     if (payloadCredit.gt(0) || payloadHasCreditConflict) {
@@ -1473,8 +1519,23 @@ async function updateExistingWcOrderCore(
     // the very next order.updated would undo the erasure silently. Only the identity columns are withheld; the
     // rest of the update (shipping, paid state, order number) proceeds exactly as before.
     await lockSalesOrder(tx, orderId)
-    const erasure = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true } })
+    const erasure = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { erasedAt: true, editedInImsAt: true, externalUpdatedAt: true } })
+    // The stored split is read only when this delivery carries one (an order without wclc components reads nothing extra).
+    if (Array.isArray(wcOrder.meta_data) && Object.values(wclcComponentColumns(wcOrder)).some((v) => v !== null)) {
+      storedComponents = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { wclcDutyComponent: true, wclcTaxComponent: true, wclcHandlingComponent: true } })
+    }
     const erased = erasure?.erasedAt != null
+    // EDITED IN IMS (owner-ruled desync, o3d-tgt2j policy): an operator edited this order here after confirming it, so WooCommerce's copy of the fields the edit can set (addresses, notes, shipping label / courier) is the
+    // ORIGINAL and must not be written back over the edit. Paid state, the order number and the VAT number still mirror; the lines and total never did (see order-edit-drift.ts).
+    // OLDER THAN WHAT IS STORED (o3d-hqvrp.85): frozen payloads are replayed in claim order, and a retried older delivery would overwrite the address, notes and
+    // shipping method a newer one already applied (and the warehouse amendment pass would then push the reverted address). A delivery whose WooCommerce modified time
+    // is OLDER than the one stored is not applied to those fields; paid state and the order number still mirror. A missing time on either side applies, as before.
+    const incomingModifiedAt = parseWcGmtInstant(wcOrder.date_modified_gmt || wcOrder.date_modified || '')
+    const storedModifiedAt = erasure?.externalUpdatedAt ?? null
+    const staleDelivery = incomingModifiedAt !== null && !Number.isNaN(incomingModifiedAt.getTime()) && storedModifiedAt !== null && incomingModifiedAt.getTime() < storedModifiedAt.getTime()
+    const keepImsEdit = erasure?.editedInImsAt != null || staleDelivery
+    // A stale delivery must not move the wclc split or the per-line customs values either (and so reports no drift against what it did not write).
+    if (staleDelivery) storedComponents = null
     // Recorded after the transaction (below). Only a delivery that still carries real identity counts: an anonymised delivery, or one whose placeholders
     // WooCommerce wrote, is the expected steady state and says nothing.
     repopulationRefused = erased && !isWcOrderAnonymised(wcOrder) && wcPayloadCarriesIdentity(wcOrder)
@@ -1493,24 +1554,26 @@ async function updateExistingWcOrderCore(
       where: { id: orderId },
       data: {
         externalOrderNumber: wcOrder.number,
-        ...(erased ? {} : { customerVatNumber: readWcCustomerVat(wcOrder) }),
+        ...(erased || staleDelivery ? {} : { customerVatNumber: readWcCustomerVat(wcOrder) }),
         // The shipping label, method id and courier key are refreshed TOGETHER from the CURRENT first shipping line (the key
         // only while its stored label still matches the line's title, so an edited line clears it), and fill in orders imported
         // before they were kept. Stored values only: a WMS order already created is amended by the push sweep's amendment pass,
         // which decides what to send. A payload without shipping lines (empty or absent) leaves the last known values alone: an empty list is no evidence that the courier went away.
-        ...(Array.isArray(wcOrder.shipping_lines) && wcOrder.shipping_lines.length > 0
+        ...(!keepImsEdit && Array.isArray(wcOrder.shipping_lines) && wcOrder.shipping_lines.length > 0
           ? (({ shippingService, courierKey, shippingMethodId }) => ({ shippingService, courierKey, shippingMethodId }))(mapWcShipping(wcOrder))
           : {}),
-        // The wclc duty/tax/handling components are written ONLY when the order and its lines are created: they split
-        // the fee lines stored with them (and the invoice posted from those lines), and this path rebuilds no lines.
-        // Refreshing them from a later delivery would leave a split that disagrees with the lines it describes.
-        ...(erased
+        // The wclc components FOLLOW WooCommerce on every delivery (stored as reported, never recomputed, D5; not personal data, so erased and
+        // IMS-edited orders keep following them). No line or invoice is rebuilt from them (surfaceWcOrderEditDrift reports a moved split).
+        ...(!staleDelivery && Array.isArray(wcOrder.meta_data) ? wclcComponentColumns(wcOrder) : {}),
+        ...(erased || keepImsEdit
           ? {}
           : {
               billingAddress: mapWcAddress(wcOrder.billing),
               shippingAddress: mapWcAddress(wcOrder.shipping),
               notes: wcOrder.customer_note || null,
             }),
+        // The stored modified time follows the newest delivery applied (it was only ever written on create).
+        ...(!staleDelivery && incomingModifiedAt !== null && !Number.isNaN(incomingModifiedAt.getTime()) ? { externalUpdatedAt: incomingModifiedAt } : {}),
         paidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? parseWcGmtInstant(wcOrder.date_paid_gmt) : undefined,
         // o3d-psrx r2 — THE PAID FLAG'S PROVENANCE, WRITTEN BY THE SAME STATEMENT THAT SETS IT.
         //
@@ -1528,9 +1591,21 @@ async function updateExistingWcOrderCore(
         unregisteredPaidAt: wcOrder.date_paid_gmt && !paidTransitionHandledSeparately ? parseWcGmtInstant(wcOrder.date_paid_gmt) : undefined,
       },
     })
+    // The per-line customs value override follows WooCommerce too, matched on the WooCommerce line item id (the lines themselves are not rebuilt here).
+    if (!staleDelivery && Array.isArray(wcOrder.line_items)) {
+      for (const item of wcOrder.line_items) {
+        // A line item that carries no meta list says nothing about the override: leave the stored value alone.
+        if (typeof item?.id !== 'number' || !Array.isArray(item.meta_data)) continue
+        await tx.salesOrderLine.updateMany({
+          where: { orderId, externalLineItemId: item.id },
+          data: { wcCustomsUnitValue: readWcLineCustomsUnitValue(item) },
+        })
+      }
+    }
   })
 
   if (repopulationRefused) await recordRepopulationRefused(orderId, wcOrder)
+  await warnWhenWclcComponentsMoved(orderId, wcOrder, storedComponents)
 
   if (reviewFlagged) {
     await logActivity({
@@ -1640,6 +1715,8 @@ async function applyResolvedWcInvoiceNumber(
         data: { invoiceNumber: decision.to },
       })
       if (written.count !== 1) return { decision, applied: false }
+      // The incumbent's number is the evidence of the incumbent's invoice: the order is invoiced from the moment it is recorded (and a corrected number stays so).
+      await recomputeSalesOrderInvoicingState(tx as unknown as InvoicingStateClient, orderId)
     }
     return { decision, applied: true }
   })
@@ -1830,7 +1907,11 @@ type HeldReleaseOrderRef = {
 export const HELD_SALES_INVOICE_SHADOWED_MESSAGE = (invoiceNumber: string): string =>
   `Closed as a shadow: WooCommerce assigned invoice number ${invoiceNumber}, but writes to the ledger are held on this installation, so IMS recorded the sales invoice as a shadow instead of queueing it. IMS did not send it, and this does not say whether the ledger's owner has written it: check the ledger before acting.`
 
-export type HeldSalesInvoiceReleaseOutcome = 'no-hold' | 'released' | 'unreadable' | 'not-queued' | 'shadowed' | 'read-failed'
+/** The closing note of a hold whose release the enqueue answered `handled-by-hand`: a human posted the invoice, so there is nothing left to queue. */
+export const HELD_SALES_INVOICE_HANDLED_MESSAGE = (invoiceNumber: string): string =>
+  `Closed as handled by hand: WooCommerce assigned invoice number ${invoiceNumber}, and this invoice was already posted or marked handled by hand in the ledger, so IMS queued nothing.`
+
+export type HeldSalesInvoiceReleaseOutcome = 'no-hold' | 'released' | 'unreadable' | 'not-queued' | 'shadowed' | 'handled' | 'read-failed'
 
 /** Keep the hold PENDING, but stop it claiming to be waiting for a number that has already arrived. */
 async function noteHeldReleaseFailure(rowId: string, message: string): Promise<void> {
@@ -2146,7 +2227,7 @@ async function buildFreshWcSalesInvoice(p: {
     : null
   const core = {
     currency,
-    date: parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created).toISOString().slice(0, 10),
+    date: businessDateYmd(parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created)),
     currencyRateToBase: usableStoredFxRate(stored?.fxRateToBase)?.toNumber(),
     _postingMode: 'submitted',
     _paymentMethod: wcOrder.payment_method || undefined,
@@ -2245,6 +2326,9 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
 
   // A FRESH BUILD of the document from the order as it is now, by the importer's own pieces (the shared tax resolution, `reconcileWcDocumentWithOrder`, `buildWcInvoiceCore`) and, for a treated hold, the treatment's read-only preview (the order's existing stamp
   // is used only if it still agrees with the fresh decision). Nothing is written. A refusal of any of them is the hold's reason; otherwise the parked payload is compared with it on every accounting-relevant field, and that comparison is the authority.
+  // A hold parked before the invoice date moved to the London business day carries the UTC day of the order's creation: accept that day as well as the London one (see heldFreshBuildDifference).
+  const createdInstant = parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created)
+  const acceptedParkedDates = [createdInstant.toISOString().slice(0, 10), businessDateYmd(createdInstant)]
   const buildFresh = (client: Prisma.TransactionClient, withTreatment: boolean) => buildFreshWcSalesInvoice({ client, orderId, wcOrder, inputs: { currency, mappedLines, coupons, amounts, settings, accounts }, chart, withTreatment })
 
   // The whole check of a TREATED hold, reading through `client` (the caller's order-locked transaction): the parked payload against the order, and the regime re-resolved from the current facts against what was parked and the order's stamp.
@@ -2280,7 +2364,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
     // THE AUTHORITY: the parked payload against a fresh build of the same document from the order as it is now, treatment included (see buildFresh). The checks above are diagnostics for the common causes.
     const fresh = await buildFresh(client, true)
     if (!fresh.ok) return fresh.reason
-    const freshDifference = heldFreshBuildDifference(parked.accountingPayload, fresh.payload)
+    const freshDifference = heldFreshBuildDifference(parked.accountingPayload, fresh.payload, acceptedParkedDates)
     // The policy the verified decision was just made under (the fresh build's one settings read): the release records it, so the payload carries the settings in force and the poster's check passes.
     if (freshDifference === null) verifiedPolicy.value = fresh.policy
     return freshDifference
@@ -2336,7 +2420,7 @@ async function reconcileHeldWcSalesInvoice(orderId: string, wcOrder: WcFullOrder
   // The authority for an untreated hold: the parked payload against a fresh build of the document (before the treatment) from the order as it is now.
   const freshUntreated = await buildFresh(db, false)
   if (!freshUntreated.ok) return await refuse(freshUntreated.reason)
-  const freshDifference = heldFreshBuildDifference(parkedPayload, freshUntreated.payload)
+  const freshDifference = heldFreshBuildDifference(parkedPayload, freshUntreated.payload, acceptedParkedDates)
   if (freshDifference !== null) return await refuseChanged(freshDifference)
   const { [EU_VAT_TREATMENT_PAYLOAD_KEY]: _marker, ...untreated } = parkedPayload
   void _marker
@@ -2598,6 +2682,19 @@ async function releaseHeldWcSalesInvoice(
     return 'shadowed'
   }
 
+  // HANDLED BY HAND. The enqueue answered `queued: true` WITHOUT a write because a human posted this invoice (or marked its row handled).
+  // The re-read below would find no row and read that as "NOTHING will post", re-raise the refusal and leave the hold PENDING for ever,
+  // once per sweep, after the operator did exactly what the remedy asked. The hold is closed, with its own words.
+  if (enqueueOutcome.outcome?.reason === 'handled-by-hand') {
+    await db.shoppingSyncLog.update({
+      where: { id: row.id },
+      data: { errorMessage: HELD_SALES_INVOICE_HANDLED_MESSAGE(invoiceNumber), syncedAt: new Date(), status: 'SYNCED' },
+    }).catch((error) => {
+      console.error(`[wc-import] the held sales invoice for ${orderId} was handled by hand but the queue row could not be closed:`, error)
+    })
+    return 'handled'
+  }
+
   // The enqueue can no-op silently — see the note above. A row that is not there was not queued,
   // and marking the hold "released" would strand the invoice with nothing left saying so.
   let queued: { id: string } | null = null
@@ -2851,7 +2948,7 @@ export async function retryHeldWcSalesInvoiceReleases(options?: {
       { logFailure: false },
     )
     if (outcome === 'released') result.released++
-    else if (outcome === 'unreadable' || outcome === 'shadowed') result.closed++
+    else if (outcome === 'unreadable' || outcome === 'shadowed' || outcome === 'handled') result.closed++
     else if (outcome === 'read-failed') readFailures++
     else if (outcome === 'not-queued') {
       result.stillStuck++
@@ -3187,6 +3284,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       // the marker permanently (Codex review r4). An unresolved marker is recovered by
       // sweepUnresolvedDirectCreateMarkers instead, which waits out the import's grace window.
       // It also keeps this, the hot path, free of the feature entirely.
+      await mirrorIossFromRegime(heldOrderId)
       return { success: true, orderId: heldOrderId }
     }
     // THE SINGLE PIVOT (o3d-tj6v r4). This one read answers both "create or update?" and "is this
@@ -3561,6 +3659,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
         productId: l.productId,
         externalLineItemId: l.externalLineItemId,
         wclcFeeKind: l.wclcFeeKind ?? null,
+        wcCustomsUnitValue: l.wcCustomsUnitValue ?? null,
         sku: l.sku,
         description: l.description,
         qty: l.qty,
@@ -3742,6 +3841,8 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           lines: { create: lineData },
         },
         })
+        // A WooCommerce order that arrives already numbered by the invoicing incumbent (`_wcpdf_invoice_number`) is invoiced from its first row.
+        await recomputeSalesOrderInvoicingState(tx as unknown as InvoicingStateClient, created.id)
 
         // THE RECEIPT, as a local Payment row (the owner's ruling: an imported paid order has one, like any
         // other paid order). Written in the SAME transaction as the order so there is no instant at which
@@ -3798,7 +3899,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
             description: ERASURE_RECORD_DESCRIPTION,
             metadata: buildErasureRecordMetadata({
               requestId: originalErasureRequestId ?? randomUUID(), erasedAt, trigger: customerErasedDuringImport === null && !erasedByTombstone ? 'MIRRORED_FROM_STOREFRONT' : 'IMPORT_AFTER_ERASURE', customerId: customerErasedDuringImport, orderIds: [created.id],
-              counts: { customers: 0, salesOrders: 1, shipments: 0, shoppingCustomerLinks: 0, shoppingOrderLinks: 1, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, rawWebhookEventsProjected: 0, rawSyncLogsProjected: 0, rawReturnRecordsCleared: 0, storefrontIdMissing: 0, linkedFreeTextScrubbed: 0, activityRowsScrubbed: 0, accountingEventCopiesScrubbed: 0, accountingErrorsScrubbed: 0, notifications: 0 },
+              counts: { customers: 0, salesOrders: 1, shipments: 0, shoppingCustomerLinks: 0, shoppingOrderLinks: 1, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, rawWebhookEventsProjected: 0, rawSyncLogsProjected: 0, rawReturnRecordsCleared: 0, storefrontIdMissing: 0, linkedFreeTextScrubbed: 0, activityRowsScrubbed: 0, accountingEventCopiesScrubbed: 0, accountingErrorsScrubbed: 0, notifications: 0, orderAttachmentsDeleted: 0 },
             }),
             userId: null,
           })
@@ -3834,6 +3935,9 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       }
       throw error
     }
+
+    // The order now exists: only here is the unmatched-line warning logged (a refused import must not consume its dedupe key).
+    await logWcUnmatchedLines(mappedLines, { orderId: wcOrder.id, orderNumber: wcOrder.number, salesOrderId: so.id })
 
     if (customerErasedDuringImport) {
       // Recorded without any identity: the order id, the customer's surrogate id, and what was done.
@@ -3926,6 +4030,9 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           },
         })
       }
+      // The stamped regime is mirrored on EVERY successful create-path return (held invoice, non-processing, initial import), not only the
+      // fully accounted one.
+      await mirrorIossFromRegime(so.id)
       return { success: true as const, orderId: so.id }
     }
 
@@ -4043,7 +4150,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       const accountingPayload: Record<string, unknown> = {
           contactName: customerName,
           contactEmail: payloadAnonymised ? undefined : (wcOrder.billing.email || undefined),
-          date: parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created).toISOString().slice(0, 10),
+          date: businessDateYmd(parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created)),
           currency,
           // Stamp IMS's FX rate so Xero doesn't apply its own daily rate on
           // imported WC orders — keeping WC, IMS, and Xero numerically aligned.
@@ -4275,6 +4382,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       resolveUser: false,
     })
 
+    await mirrorIossFromRegime(so.id)
     return { success: true, orderId: so.id }
   } catch (e) {
     if (e instanceof WcImportErasedRetry) return { success: false, error: e.message, erasedRetry: { customerId: e.customerId } }
@@ -5111,6 +5219,7 @@ export async function syncNewWcOrders(
           // nothing here is re-driven by anything else. Recorded as an error so the cursor is HELD
           // and the next run re-reads this order from the first page (o3d-ecbj r5).
           const refundSweep = await syncRefundsForOrder(order.id)
+          await rerunDeferredWcOrderDivergence(order)
           if (!refundSweep.complete) {
             result.errors.push(
               `syncRefundsForOrder #${order.id}: incomplete refund read — ${refundSweep.error ?? 'unknown error'}`,
@@ -5143,6 +5252,9 @@ export async function syncNewWcOrders(
     ? await walkOrders(statuses, lastSync)
     : { endedOnEmptyPage: false, page: 1 }
   const { endedOnEmptyPage, page } = walked
+  // Comparisons deferred for an unrecorded refund are resolved here in EVERY mode, the ordinary poll included (it sweeps no refunds): the deferral is a durable row, so this is a retry that survives a restart,
+  // and it runs before the cursor below can advance. It never throws and never holds the cursor.
+  await drainDeferredWcOrderDivergences()
 
   // A truncated read is a fetch error by another name, so it goes in `errors` and the cursor below
   // is held (o3d-xnwu). The `break` on a fetch error above pushed its own, so this only fires on a

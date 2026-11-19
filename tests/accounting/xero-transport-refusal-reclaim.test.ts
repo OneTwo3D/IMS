@@ -481,7 +481,7 @@ test('o3d-jit6 r5/r7: BOTH runners hand back through the ONE shared hand-back, e
     assert.ok(branch.length > 0, `${name}: the notPosted branch must be found`)
 
     // Only on the reason that has a replay window running against it.
-    const guardAt = branch.indexOf("if (notPosted.reason === 'transport-refused') {")
+    const guardAt = branch.indexOf("if (notPosted.reason === 'transport-refused' || notPosted.reason === 'producer-held') {")
     assert.ok(guardAt > -1, `${name}: the hand-back is guarded on the transport refusal`)
 
     // r7: NO RUNNER OWNS THE TRANSACTION ANY MORE. r5 shared the transaction BODY and left the
@@ -576,7 +576,7 @@ test('o3d-jit6 r5: the shared body writes the evidence transactionally, and neve
     !body.includes('markXeroOutboxRetry('),
     'the unsent hand-back must not spend an outbox attempt or take the five-minute backoff floor',
   )
-  assert.match(body, /deferOutboxWithoutSpendingAnAttempt\(tx, args\.job, args\.notPosted\.message, 0\)/)
+  assert.match(body, /deferOutboxWithoutSpendingAnAttempt\(tx, args\.job, args\.notPosted\.message, handBackDelayMs\)/)
 })
 
 test('o3d-jit6 r4: the release goes through the ONE fenced release, not a hand-spelt statement', () => {

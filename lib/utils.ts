@@ -54,6 +54,23 @@ export function formatMoney(
   return `${sign}${symbol}${abs}`
 }
 
+/**
+ * `formatMoney` for a decimal STRING already rounded to its display precision (o3d-0868): the digits are printed
+ * as they are, never through a Number. Refuses nothing: the caller rounds, in its figure's own direction.
+ */
+export function formatMoneyDecimalString(
+  amount: string,
+  symbol: string,
+  position?: SymbolPos,
+): string {
+  const negative = amount.startsWith('-')
+  const abs = negative ? amount.slice(1) : amount
+  const sign = negative ? '-' : ''
+  const pos: SymbolPos = CANONICAL_POSITIONS.get(symbol) ?? position ?? (FALLBACK_POSTFIX.has(symbol) ? 'POSTFIX' : 'PREFIX')
+  if (pos === 'POSTFIX') return `${sign}${abs}${symbol}`
+  return `${sign}${symbol}${abs}`
+}
+
 type MoneyCodeOptions = {
   locale?: string
   minimumFractionDigits?: number

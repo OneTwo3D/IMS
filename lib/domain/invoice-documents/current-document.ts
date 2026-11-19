@@ -99,3 +99,51 @@ export async function loadCurrentInvoicePdf(orderId: string, options: { includeW
   await markDue(orderId)
   return null
 }
+
+/**
+ * THE CUSTOMER-FACING READER FOR A CREDIT NOTE: the refund's CURRENT stored credit note document (kind CREDIT_NOTE, tied to that refund),
+ * under the same refusals as the invoice reader and none looser: not withdrawn; the order unchanged since it was judged (the fingerprint
+ * includes the refund's credit note number); no other refund carrying the same credit note number; and the bytes must hash to the row's
+ * SHA-256. There is no legacy flat-file fallback: a credit note exists only as a stored document row, so no row means null.
+ *
+ * `refundId` MUST belong to `orderId`: a refund of another order is never read through this one.
+ */
+export async function loadCurrentCreditNotePdf(orderId: string, refundId: string): Promise<Buffer | null> {
+  const refund = await db.salesOrderRefund.findFirst({ where: { id: refundId, orderId }, select: { creditNoteNumber: true } })
+  if (!refund) return null
+  const current = await db.salesOrderInvoiceDocument.findFirst({
+    where: { orderId, refundId, kind: 'CREDIT_NOTE', supersededAt: null },
+    select: { sha256: true, documentNumber: true, withdrawnAt: true, evidenceKey: true, order: { select: ORDER_EVIDENCE_SELECT } },
+    orderBy: { fetchedAt: 'desc' },
+  })
+  if (!current) return null
+  const markCreditNoteDue = async (): Promise<void> => {
+    await db.invoiceDocumentFetchState.updateMany({
+      where: { orderId, refundId, kind: 'CREDIT_NOTE', status: { not: 'NEEDS_ATTENTION' } },
+      data: { nextAttemptAt: new Date(0) },
+    }).catch(() => { /* the integrity scan finds it too */ })
+  }
+  if (current.withdrawnAt) return null
+  // THE NUMBER MUST STILL BE THE REFUND'S.
+  if ((refund.creditNoteNumber ?? '').trim().toLowerCase() !== current.documentNumber.trim().toLowerCase()) {
+    await markCreditNoteDue()
+    return null
+  }
+  if (current.evidenceKey && current.evidenceKey !== orderEvidenceFingerprint(current.order, refund.creditNoteNumber ?? '')) {
+    await markCreditNoteDue()
+    return null
+  }
+  // NOR MAY ANOTHER REFUND HOLD THAT NUMBER.
+  const sharing = await db.salesOrderRefund.count({ where: { id: { not: refundId }, creditNoteNumber: { equals: current.documentNumber, mode: 'insensitive' } } })
+  if (sharing > 0) {
+    await db.invoiceDocumentFetchState.updateMany({
+      where: { orderId, refundId, kind: 'CREDIT_NOTE', status: { not: 'NEEDS_ATTENTION' } },
+      data: { status: 'NEEDS_ATTENTION', lastError: 'another refund carries this credit note number, so the stored document can no longer be tied to this refund' },
+    }).catch(() => { /* the next read flags it again */ })
+    return null
+  }
+  const bytes = await loadInvoiceDocumentFile(orderId, current.sha256)
+  if (bytes && createHash('sha256').update(bytes).digest('hex') === current.sha256) return bytes
+  await markCreditNoteDue()
+  return null
+}

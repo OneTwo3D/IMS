@@ -50,7 +50,7 @@ function modelsLinkedToCustomerOrOrder(): string[] {
 }
 
 /** The two tables that point at an order only by a reference id (referenceType / referenceId, an action url), so no relation finds them. */
-const LINKED_BY_REFERENCE_ID = ['EmailOutbox', 'Notification', 'EmailSuppression', 'WmsMutationEvent', 'WmsSyncLog', 'StorefrontOrderErasureObligation', 'StorefrontCustomerErasureTombstone', 'ShoppingWebhookEvent', 'ShoppingSyncLog', 'AccountingSyncLog', 'AccountingEvent', 'AccountingEventLog', 'RefusedAction']
+const LINKED_BY_REFERENCE_ID = ['EmailOutbox', 'Notification', 'EmailSuppression', 'WmsMutationEvent', 'WmsSyncLog', 'StorefrontOrderErasureObligation', 'StorefrontCustomerErasureTombstone', 'ShoppingWebhookEvent', 'ShoppingSyncLog', 'AccountingSyncLog', 'AccountingEvent', 'AccountingEventLog', 'RefusedAction', 'XeroPaymentMatch', 'SalesOrderRefundDeletion', 'WcOrderDivergence', 'WcOrderDivergenceRecheck']
 
 test('every table with a relation path to Customer or SalesOrder is classified, column by column, and a new linked table fails here', () => {
   const models = parseModels()
@@ -118,7 +118,10 @@ const IDENTIFIER_COLUMNS: Record<string, 'erased' | 'retained' | 'surrogate' | '
   'Customer.accountingContactId': 'retained',
   'SalesOrder.accountingInvoiceId': 'retained',
   'SalesOrderRefund.accountingCreditNoteId': 'retained',
+  'SalesOrderRefundDeletion.accountingCreditNoteId': 'retained',
   'PaymentRemovalReconciliation.accountingInvoiceId': 'retained',
+  'XeroPaymentMatch.accountingInvoiceId': 'retained',
+  'XeroPaymentMatch.bankAccountId': 'not-customer',
   'SalesOrder.customerId': 'surrogate',
   'ShoppingCustomerLink.customerId': 'surrogate',
   // not customer data: suppliers, products, ledger accounts, staff users, purchasing documents
@@ -137,7 +140,11 @@ const IDENTIFIER_COLUMNS: Record<string, 'erased' | 'retained' | 'surrogate' | '
   'Session.userId': 'not-customer',
   'ActivityLog.userId': 'not-customer',
   'Notification.userId': 'not-customer',
+  // the staff user who attached a supporting document to a purchase or sales order (no foreign key)
+  'OrderAttachment.uploadedByUserId': 'not-customer',
   'NotificationReadReceipt.userId': 'not-customer',
+  // the staff user (or cli:<name>) who confirmed that an incumbent writer has stopped (no foreign key)
+  'WriterAttestation.userId': 'not-customer',
 }
 
 test('every column that stores a customer / contact / account identifier is decided, and the erased ones are erased', () => {
@@ -161,4 +168,15 @@ test('the erasure deletes the storefront account link rows and does not keep the
   const src = readFileSync(new URL('../lib/domain/erasure/erase-personal-data.ts', import.meta.url), 'utf8')
   assert.match(src, /tx\.shoppingCustomerLink\.deleteMany\(\{ where: \{ customerId \} \}\)/)
   assert.match(src, /externalCustomerId: null/)
+})
+
+test('order attachments: a sales order\'s attachments are deleted by the erasure (rows and files), classified, and reached only through the sales order', () => {
+  const src = readFileSync(new URL('../lib/domain/erasure/erase-personal-data.ts', import.meta.url), 'utf8')
+  assert.match(src, /deleteSalesOrderAttachmentsInTx\(tx, ids\)/, 'the erasure core deletes the attachment rows of the erased orders')
+  assert.match(src, /drainOrderAttachmentFileDeletions\(\)/, 'and removes their files after the commit, from the durable queue the same transaction wrote')
+  assert.match(readFileSync(new URL('../lib/domain/order-attachments/index.ts', import.meta.url), 'utf8'), /tx\.orderAttachmentFileDeletion\.createMany/, 'the deletion obligation is recorded in the transaction')
+  assert.ok(ERASURE_CLASSIFICATION.OrderAttachment!.erased.includes('originalFilename'), 'a file name can carry a name')
+  const domain = readFileSync(new URL('../lib/domain/order-attachments/index.ts', import.meta.url), 'utf8')
+  assert.match(domain, /tx\.orderAttachment\.deleteMany/, 'deleted outright, soft-deleted rows included')
+  assert.doesNotMatch(domain.slice(domain.indexOf('deleteSalesOrderAttachmentsInTx')), /deletedAt:\s*null/, 'a soft-deleted attachment is erased too')
 })

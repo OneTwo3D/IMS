@@ -45,6 +45,8 @@
  * all: it advertises a branch that never runs and describes a refusal an operator will never see.
  * See the header on `slot_lost`, which was exactly that.
  */
+import { businessDateOfStamp, businessDateYmd } from '@/lib/business-date'
+
 export type FollowUpEnqueueDeclineReason =
   /** `planFollowUpEnqueue` refused: several FAILED rows for this scope under DIFFERENT tokens. */
   | 'plan_refused'
@@ -616,7 +618,8 @@ const LEDGER_DATE = /^\d{4}-\d{2}-\d{2}$/
  * are a real calendar day — `2026-13-45` parses to `NaN` and is refused rather than sent.
  */
 function payloadPaymentDate(payload: Record<string, unknown>): PayloadField<string> {
-  const today = new Date().toISOString().slice(0, 10)
+  // The business (London) day, the day the invoice it settles is dated on.
+  const today = businessDateYmd(new Date())
   if (!declaresField(payload, '_paymentDate')) return { value: today }
   const value = payload._paymentDate
   if (typeof value !== 'string') {
@@ -626,6 +629,10 @@ function payloadPaymentDate(payload: Record<string, unknown>): PayloadField<stri
   if (!LEDGER_DATE.test(day) || Number.isNaN(Date.parse(day))) {
     return unreadableField('_paymentDate', value, 'whose first ten characters are not a YYYY-MM-DD date')
   }
+  // A WooCommerce payment stamp carries a time (GMT, suffix-less): the payment is dated on the London day of that instant, as the invoice is.
+  // A bare day is taken as it is.
+  const londonDay = businessDateOfStamp(value)
+  if (londonDay !== null) return { value: londonDay }
   return { value: day }
 }
 

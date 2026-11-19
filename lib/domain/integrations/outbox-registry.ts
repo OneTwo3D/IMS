@@ -39,6 +39,13 @@ export const WcInvoiceDocumentOutboxPayloadSchema = z.object({
   documentId: nonEmptyString,
 })
 
+// The durable "ask the storefront to register this shipped order's tracking with TrackShip again" job. Carries the order id and which look
+// it is (part of the idempotency key); every attempt re-reads IMS and the re-fire state, so the payload can never describe a stale intent.
+export const WcTrackshipRefireOutboxPayloadSchema = z.object({
+  orderId: nonEmptyString,
+  attempt: z.number().int().min(1),
+})
+
 export const XeroAccountingOutboxPayloadSchema = z.object({
   accountingSyncLogId: nonEmptyString,
 })
@@ -407,6 +414,30 @@ export const INTEGRATION_OUTBOX_REGISTRY = defineOutboxRegistry({
       },
       replay: 'unsafe-to-replay',
     },
+    // The TrackShip re-fire (owner decision D10): a signed POST to the companion plugin's /order/{id}/trackship-refire route, which
+    // fires TrackShip's own `send_order_to_trackship` action for an order whose TrackShip shipment is missing. UNSAFE for the reason the other
+    // storefront writes are: the effect is a remote action nothing local can prove landed or not (it may lead TrackShip to send the customer a
+    // shipment-status e-mail), so a stale-lock reclaim is never automatic. The route is idempotent (it fires only for a tracking number TrackShip
+    // does not hold, and TrackShip upserts on order + tracking number), and the sweep re-asks on a per-order exponential back-off until the
+    // route reports the order covered, so a repeat is harmless in the common case, but a repeat is not a fence, so the verdict stays honest.
+    // A row whose worker died is surfaced, not re-driven: the drain moves a PROCESSING row past the drain lease to PERMANENT_FAILED
+    // (`parkStaleWcTrackshipRefireClaims`, compare-and-set on the dead worker's lock), and Replay on Sync > Exceptions is safe because the next
+    // attempt re-reads IMS and the storefront first. Every attempt runs under the attempt deadline and re-checks its own row, the cut-off and
+    // that the sweep is still switched on and still wants the order immediately before the POST (attempt-fence.ts).
+    'trackship.refire': {
+      name: 'trackshipRefire',
+      destination: 'woocommerce',
+      schema: WcTrackshipRefireOutboxPayloadSchema,
+      effects: {
+        keyedBy: 'effect-sequence',
+        guardedEffect: 'the signed POST to the companion plugin, which fires TrackShip only for a tracking number TrackShip holds no shipment for, behind a fresh read of the switch and the re-fire state on every attempt',
+        effectsOutsideTheGuard: [
+          'trackship_refire_states row (attempts, next look, last result)',
+          'logActivity trackship_refired / trackship_refire_retry / trackship_refire_dead_lettered / trackship_refire_stuck',
+        ],
+      },
+      replay: 'unsafe-to-replay',
+    },
   },
   xero: {
     // UNSAFE (Codex round 2, HIGH 2 — round 1 declared `remote-write-fenced-by-consumer` here, and
@@ -712,6 +743,7 @@ export type WcStockSyncOutboxPayload = z.infer<typeof WcStockSyncOutboxPayloadSc
 export type WcOrderCompletionOutboxPayload = z.infer<typeof WcOrderCompletionOutboxPayloadSchema>
 export type WcOrderStatusOutboxPayload = z.infer<typeof WcOrderStatusOutboxPayloadSchema>
 export type WcInvoiceDocumentOutboxPayload = z.infer<typeof WcInvoiceDocumentOutboxPayloadSchema>
+export type WcTrackshipRefireOutboxPayload = z.infer<typeof WcTrackshipRefireOutboxPayloadSchema>
 export type XeroAccountingOutboxPayload = z.infer<typeof XeroAccountingOutboxPayloadSchema>
 export type MintsoftBookedInOutboxPayload = z.infer<typeof MintsoftBookedInOutboxPayloadSchema>
 

@@ -3,6 +3,7 @@
  * Each entry represents one IMS transaction → one Xero API call.
  */
 
+import { businessDateYmd } from '@/lib/business-date'
 import { refusedCreditNoteError as refusedCreditNoteErrorOf } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { composeFinalBeforePost, creditNoteBeforePost, euCreditNoteSchemePostingRefusal, euSchemePostingRefusal } from './scheme-posting-check'
 import { holdInvoiceOnRegimePolicyChange, REGIME_ACCOUNT_CHANGED_REFUSAL, REGIME_POLICY_BLOCKED_REFUSAL } from '@/lib/connectors/woocommerce/sync/regime-policy-hold'
@@ -15,8 +16,8 @@ import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { isUsableImsRate } from '@/lib/domain/accounting/foreign-currency-rate-guard'
 import { isXeroForeignCurrencyRateError, xeroCurrencyRateOrRefuse } from './fx'
-import { accountingCutoffInForce, xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroNotNeverDeliverablePendingWhere, xeroProducerSeamVerdict, xeroResolveObligationAt } from '@/lib/domain/accounting/xero-producer-seam'
-import { producerHeldNotice } from '@/lib/security/producer-disposition-constants'
+import { accountingCutoffInForce, xeroBeforeCutoffRefusal, xeroCutoffFloor, xeroNotBeforeCutoffWhere, xeroNotNeverDeliverablePendingWhere, xeroProducerSeamVerdict, xeroHeldDeliveryTypes, xeroResolveObligationAt, xeroRowDeliveryHold } from '@/lib/domain/accounting/xero-producer-seam'
+import { PRODUCER_HELD_RETRY_DELAY_MS, producerHeldNotice } from '@/lib/security/producer-disposition-constants'
 import { readFile } from 'fs/promises'
 import { createHash } from 'crypto'
 import { db, POST_REMOTE_PERSIST_TX_OPTIONS } from '@/lib/db'
@@ -38,7 +39,7 @@ import {
 import { logActivity, logActivityInTransaction, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
-import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote } from './credit-notes'
+import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote, voidCreditNote } from './credit-notes'
 import { prepareManualJournal, postPreparedManualJournal } from './journals'
 import { getGrantedScopes } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
@@ -57,11 +58,14 @@ import { parsePaymentAccountMap } from '@/lib/accounting/payment-account-map'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
 import { retireSalesInvoiceForCancelledOrder } from '@/lib/domain/accounting/cancel-order-invoice-sync'
+import { lockOrderForRow, recomputeInvoicingStateForRow } from '@/lib/domain/sales/invoicing-state-sites'
 import { readClaimedSyncLogOriginRecord } from '@/lib/domain/accounting/claimed-sync-payload'
 import { CREATE_DISPATCH_REPLAY_MARGIN_MS, decideCreateDispatchRelease, describeCreateDispatchNotSent, planCreateDispatch, readCreateDispatchAge, type CreateDispatchAge, type CreateDispatchFenceWrite } from '@/lib/domain/accounting/create-dispatch-record'
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
 import { decideInvoiceNumberPost, xeroInvoiceNumberIdentity } from '@/lib/domain/accounting/invoice-number-ownership'
 import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
+import { parseXeroDeleteTarget, runXeroDocumentDelete } from './document-delete'
+import { completeAccountingDocumentDeletion, pendingDocumentDeletionRefusal, recordDeletionTargetStatus } from '@/lib/domain/accounting/document-delete-service'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
 import { purchaseDocumentTaxTypeRefusal } from '@/lib/domain/accounting/purchase-document-tax-types'
@@ -154,6 +158,8 @@ import {
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
 import {
   claimIntegrationOutboxWork,
+  wooAccountingPostJobIds,
+  accountingPostJobIdsForSyncTypes,
   INTEGRATION_OUTBOX_STATUS,
   markIntegrationOutboxPermanentFailure,
   markIntegrationOutboxRetryableFailure,
@@ -1119,6 +1125,8 @@ export async function applyMainSyncFailureRetry(
 ): Promise<{ finalFailure: boolean }> {
   const retryCount = entry.retryCount + 1
   const computedFinal = retryCount >= MAX_RETRIES
+  // Canonical lock order (order row, then sync row): a sales invoice's order is locked BEFORE its row is written. lib/domain/sales/invoicing-state.ts.
+  await lockOrderForRow(tx, entry)
   // o3d-e2mz: fenced on the claimed attempt as well as the observed retryCount. A
   // failure belongs to ONE attempt; without the revision this write reopens a row an
   // operator settled while this attempt was in flight, sending it round again as
@@ -1142,6 +1150,8 @@ export async function applyMainSyncFailureRetry(
   })
   if (updated.count > 0) {
     if (computedFinal) {
+      // A sales invoice that has failed for good (and names no document) is no longer queued or posted: the order's invoicing state follows it.
+      await recomputeInvoicingStateForRow(tx, entry)
       await updateMirroredEventForSyncLog(tx, {
         syncLogId: attempt.id,
         type: entry.type,
@@ -2915,7 +2925,7 @@ function unsentPostEvidence(
         // before they go hunting in the ledger.
         : notPosted.reason === 'transport-refused'
           ? 'xero_sync_transport_refused_before_post'
-          : notPosted.reason === 'producer-held'
+          : notPosted.reason === 'producer-held' || notPosted.reason === 'producer-shadowed'
             ? 'xero_sync_producer_held_before_post'
             : notPosted.reason === 'before-cutoff'
               ? 'xero_sync_before_cutoff_before_post'
@@ -3121,12 +3131,15 @@ export async function recordAndReleaseUnsentTransportRefusal(
   const markerReleased = args.notPosted.releaseCreateDispatch
     ? await releaseCreateDispatchMarker(tx, args.entry.id, args.lease, args.attempt)
     : null
+  // A row the PRODUCER-SIDE HOLD handed back waits a short fixed interval instead of none: there is no replay window racing it, and offering it
+  // again every tick would only re-ask a question whose answer changes when the owner records a confirmation.
+  const handBackDelayMs = args.notPosted.reason === 'producer-held' ? PRODUCER_HELD_RETRY_DELAY_MS : 0
   const released = await releaseUnsentTransportRefusal(
-    tx, args.entry.id, args.lease, args.attempt, args.notPosted.message,
+    tx, args.entry.id, args.lease, args.attempt, args.notPosted.message, new Date(Date.now() + handBackDelayMs),
   )
   // AND NOT `markXeroOutboxRetry`: that one counts the attempt against MAX_RETRIES and its first
   // backoff floor is five minutes, which would burn the replay window this is racing.
-  if (args.job) await deferOutboxWithoutSpendingAnAttempt(tx, args.job, args.notPosted.message, 0)
+  if (args.job) await deferOutboxWithoutSpendingAnAttempt(tx, args.job, args.notPosted.message, handBackDelayMs)
   // AND LAST, WHAT THE FENCED RELEASE MATCHED — see UNSENT_HANDBACK_COMMIT_ACTION. Written after the
   // release, so this row cannot exist unless the release returned; committed with everything else, so
   // it cannot exist unless the whole hand-back landed. This, not the evidence row, is what the
@@ -3843,13 +3856,27 @@ const POST_EFFECT_DOCUMENT_UPDATE = {
     + 'Xero if the change should not stand; there is nothing to void or credit-note.',
 } as const
 
+const POST_EFFECT_DOCUMENT_DELETE = {
+  effect: 'RENUMBERED an existing Xero document and then DELETED or VOIDED it',
+  remedy: 'The document was renumbered (its original number is free again) and then removed from the ledger. If it should still exist, '
+    + 'raise a replacement; a voided or deleted document cannot be restored. If only the renumber landed, the document is still live '
+    + 'under its suffixed number: retry this row to finish the delete, or restore the number by hand.',
+} as const
+const POST_EFFECT_DOCUMENT_VOID = {
+  effect: 'VOIDED a sales credit note in Xero',
+  remedy: 'The credit note named above was set to Voided because its refund was deleted in IMS. Nothing new was created. If it should still stand, re-create it in Xero by hand; there is nothing to void or reverse.',
+} as const
+
 const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }> = {
+  CREDIT_NOTE_VOID: POST_EFFECT_DOCUMENT_VOID,
   SALES_INVOICE: POST_EFFECT_LEDGER_DOCUMENT,
   PURCHASE_INVOICE: POST_EFFECT_LEDGER_DOCUMENT,
   CREDIT_NOTE: POST_EFFECT_LEDGER_DOCUMENT,
   PURCHASE_CREDIT_NOTE: POST_EFFECT_LEDGER_DOCUMENT,
   SALES_INVOICE_UPDATE: POST_EFFECT_DOCUMENT_UPDATE,
   PURCHASE_INVOICE_UPDATE: POST_EFFECT_DOCUMENT_UPDATE,
+  SALES_INVOICE_DELETE: POST_EFFECT_DOCUMENT_DELETE,
+  PURCHASE_INVOICE_DELETE: POST_EFFECT_DOCUMENT_DELETE,
   INVOICE_PAYMENT: POST_EFFECT_PAYMENT,
   BILL_PAYMENT: POST_EFFECT_PAYMENT,
   COGS_JOURNAL: POST_EFFECT_JOURNAL,
@@ -3864,6 +3891,7 @@ const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }
   DAILY_BATCH_INVENTORY_RECONCILIATION: POST_EFFECT_JOURNAL,
   DAILY_BATCH_COGS_RECONCILIATION: POST_EFFECT_JOURNAL,
   DAILY_BATCH_TRANSIT_RECONCILIATION: POST_EFFECT_JOURNAL,
+  DAILY_BATCH_GRIR_RECLASS: POST_EFFECT_JOURNAL,
   UNEARNED_REV_REVERSAL: POST_EFFECT_JOURNAL,
   // Added by the compiler, not by hand: this Record is exhaustive over AccountingSyncType on
   // purpose (o3d-e2mz r4), so a type merged since — o3d-0i5y's allocation reversal — fails the
@@ -4115,8 +4143,12 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
 
   // THE WRITER-SIDE CUT-OFF: a row created before the destination's live-from instant is not even selected, so a bounded batch of them
   // can never occupy the oldest-first window and starve every row behind it. The claim re-asserts the same floor in its own statement.
+  // Types the owner's confirmation still holds are left out of the selection too, so held rows cannot fill the bounded batch and starve the rest.
+  const heldTypes = xeroHeldDeliveryTypes()
   const pending = await db.accountingSyncLog.findMany({
-    where: claimableXeroSyncLogWhere(new Date(), staleClaimCutoff, xeroCutoffFloor()),
+    where: heldTypes.length > 0
+      ? { AND: [claimableXeroSyncLogWhere(new Date(), staleClaimCutoff, xeroCutoffFloor()), { type: { notIn: heldTypes } }] }
+      : claimableXeroSyncLogWhere(new Date(), staleClaimCutoff, xeroCutoffFloor()),
     orderBy: { createdAt: 'asc' },
     take: MAX_PER_RUN,
   })
@@ -4124,6 +4156,12 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
   const blockedUpdateEntryIds = await findInvoiceUpdatesBlockedByPendingCreate(db, pending)
 
   for (const entry of pending) {
+    // THE OWNER'S CONFIRMATION IS ASKED BEFORE ANYTHING IS CLAIMED (the selection above already leaves held types out; this is the same question
+    // asked once more at the claim boundary, for a confirmation that went away since). A held row is not claimed and not attempted: it stays PENDING.
+    if (xeroRowDeliveryHold({ type: entry.type }) !== null) {
+      result.skipped++
+      continue
+    }
     const claimedAt = new Date()
     // The claim, not the bare instant (Codex r2, medium 2). Nothing in this runner renews it, so the
     // holder answers the same instant every time — but every fence below asks the holder rather than
@@ -4305,7 +4343,9 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         // has no claim to give back — the release would match nothing, which is correct but pointless
         // — and `lease-expired` and `dispatch-unrecorded` are the outcomes o3d-xl63 and r1 settled on
         // their own terms, with no replay window running against them.
-        if (notPosted.reason === 'transport-refused') {
+        if (notPosted.reason === 'transport-refused' || notPosted.reason === 'producer-held') {
+          // `producer-held` is handed back the same way (claim released, short fixed delay in the row's next-attempt): a row left PROCESSING would
+          // wait out the stale-claim cut-off for nothing.
           // o3d-jit6 r5 (Codex HIGH): THE EVIDENCE AND THE RELEASE ARE ONE COMMIT.
           //
           // r4 established the right ORDER — log first, release second, so no worker can meet the
@@ -4595,51 +4635,68 @@ export async function completeSettledOutboxJobUnlessIncidentFiled(
   return { verdict: 'RETRACTED', evidence: filedSince }
 }
 
-async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
+/**
+ * How long one drain keeps CLAIMING new jobs (o3d-40i5e). Half the lease: a job claimed at the very end of the budget still has
+ * the larger part of its own lease for its attempt, and the next tick picks up what was left.
+ */
+export const XERO_DRAIN_CLAIM_BUDGET_MS = Math.floor(CLAIM_STALE_MS / 2)
+
+export async function processPendingXeroSyncViaOutbox(options: { now?: () => number; drainBudgetMs?: number } = {}): Promise<ProcessResult> {
   const result: ProcessResult = { processed: 0, succeeded: 0, failed: 0, skipped: 0 }
+  const clock = options.now ?? (() => Date.now())
+  const startedAt = clock()
+  const budgetMs = options.drainBudgetMs ?? XERO_DRAIN_CLAIM_BUDGET_MS
   const staleClaimCutoff = new Date(Date.now() - CLAIM_STALE_MS)
 
   await ensureXeroOutboxForPendingSyncLogs(MAX_PER_RUN, staleClaimCutoff)
-  const jobs = await claimIntegrationOutboxWork({
-    connector: XERO_OUTBOX_CONNECTOR,
-    operation: XERO_ACCOUNTING_POST_OPERATION,
-    limit: MAX_PER_RUN,
-    workerId: XERO_ACCOUNTING_WORKER_ID,
-    staleLockMs: CLAIM_STALE_MS,
-    maxAttempts: MAX_RETRIES,
-  })
 
-  const jobWork: Array<{ job: IntegrationOutboxRow; syncLogId: string }> = []
-  for (const job of jobs) {
+  // CLAIM -> ATTEMPT -> MARK, ONE JOB AT A TIME (o3d-40i5e). A batch claimed up front stamps every job with the same `lockedAt`
+  // while they are posted one after another, so a job at the back could age past the lease before its attempt began and be taken
+  // by the next drain as a dead worker's. Each job is now claimed only when its attempt is about to start, and the drain stops
+  // claiming once its wall-clock budget is spent; what it did not reach stays queued for the next tick.
+  const attempted: string[] = []
+  // ONE READ OF THE WOOCOMMERCE-WRITING JOB IDS FOR THE WHOLE DRAIN (o3d-jvup3), not one unbounded query per claim.
+  const wooAccountingJobIds = await wooAccountingPostJobIds(new Date())
+  // THE JOBS OF THE TYPES THE OWNER'S CONFIRMATION STILL HOLDS ARE LEFT OUT OF THE CANDIDATE WINDOW (as the direct runner's selection leaves the types out), so
+  // held jobs never take a slot of the bounded batch and starve the rows behind them. They are untouched, not failed: read again by every drain, so they are
+  // offered on the first drain after the hold lifts. The pre-claim ask below stays, for a hold that appeared after this read.
+  const heldJobIds = await accountingPostJobIdsForSyncTypes(xeroHeldDeliveryTypes())
+  while (attempted.length < MAX_PER_RUN) {
+    if (clock() - startedAt > budgetMs) break
+    const claimedJobs = await claimIntegrationOutboxWork({
+      connector: XERO_OUTBOX_CONNECTOR,
+      operation: XERO_ACCOUNTING_POST_OPERATION,
+      limit: MAX_PER_RUN,
+      claimLimit: 1,
+      excludeIds: heldJobIds.length > 0 ? [...attempted, ...heldJobIds] : attempted,
+      wooAccountingJobIds,
+      workerId: XERO_ACCOUNTING_WORKER_ID,
+      staleLockMs: CLAIM_STALE_MS,
+      maxAttempts: MAX_RETRIES,
+    })
+    const job = claimedJobs[0]
+    if (!job) break
+    attempted.push(job.id)
     if (!job.lockedAt) {
       result.failed++
       continue
     }
 
+    let syncLogId: string
     try {
-      jobWork.push({ job, syncLogId: parseXeroAccountingOutboxPayload(job).accountingSyncLogId })
+      syncLogId = parseXeroAccountingOutboxPayload(job).accountingSyncLogId
     } catch (error) {
       await markXeroOutboxPermanent(job, error instanceof Error ? error.message : String(error))
       result.failed++
       continue
     }
-  }
 
-  const entries = jobWork.length > 0
-    ? await db.accountingSyncLog.findMany({
-        where: { id: { in: [...new Set(jobWork.map((work) => work.syncLogId))] } },
-      })
-    : []
-  const entriesById = new Map(entries.map((entry) => [entry.id, entry]))
-  // NO BATCH READ OF THE FILED INCIDENTS (Codex r4, HIGH). One taken here answers with the world as it
-  // was before this run made a single Xero call, and the incident the doors below guard against is filed
-  // by ANOTHER worker while this one is on the wire. Each door asks at the moment it decides — see
-  // completeSettledOutboxJobUnlessIncidentFiled.
-  const blockedPaymentEntryIds = await findInvoicePaymentsBlockedByEarlierLiveLogs(db, entries)
-  const blockedUpdateEntryIds = await findInvoiceUpdatesBlockedByPendingCreate(db, entries)
+    const entry = await db.accountingSyncLog.findUnique({ where: { id: syncLogId } })
+    // NO BATCH READ OF THE FILED INCIDENTS (Codex r4, HIGH). Each door asks at the moment it decides - see
+    // completeSettledOutboxJobUnlessIncidentFiled.
+    const blockedPaymentEntryIds = entry ? await findInvoicePaymentsBlockedByEarlierLiveLogs(db, [entry]) : new Set<string>()
+    const blockedUpdateEntryIds = entry ? await findInvoiceUpdatesBlockedByPendingCreate(db, [entry]) : new Set<string>()
 
-  for (const { job, syncLogId } of jobWork) {
-    const entry = entriesById.get(syncLogId)
     if (!entry) {
       await markXeroOutboxPermanent(job, `Accounting sync log ${syncLogId} was not found`)
       result.failed++
@@ -4671,9 +4728,24 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
     // THE WRITER-SIDE CUT-OFF, FOR A JOB WHOSE ROW PREDATES IT. The row is never claimed (the claim statement would refuse it too), so
     // this job can never deliver anything: it is dead-lettered with the single-sourced sentence rather than retried for ever. A bounded
     // oldest-first batch of such jobs would otherwise be re-offered every tick and starve the jobs behind them.
-    const beforeCutoff = entry.status === 'SYNCED' || entry.status === 'CANCELLED' ? null : xeroBeforeCutoffRefusal({ createdAt: entry.createdAt, type: entry.type })
+    const rowIsSettled = entry.status === 'SYNCED' || entry.status === 'CANCELLED'
+    const beforeCutoff = rowIsSettled ? null : xeroBeforeCutoffRefusal({ createdAt: entry.createdAt, type: entry.type })
     if (beforeCutoff !== null) {
       await markXeroOutboxPermanent(job, beforeCutoff)
+      result.skipped++
+      continue
+    }
+
+    // THE OWNER'S CONFIRMATION IS ASKED BEFORE ANYTHING IS CLAIMED. A row whose operation is held (the owner has not confirmed the incumbent stopped, or
+    // the confirmation is not read yet) is neither claimed nor attempted: the sync-log row stays as it is, and the job goes back with NO attempt spent after a
+    // short fixed delay, so the work is released within a tick or so of the confirmation and never marches towards PERMANENT_FAILED.
+    const deliveryHoldBeforeClaim = rowIsSettled ? null : xeroRowDeliveryHold({ type: entry.type })
+    if (deliveryHoldBeforeClaim !== null) {
+      try {
+        await deferOutboxWithoutSpendingAnAttempt(db, job, deliveryHoldBeforeClaim.message, PRODUCER_HELD_RETRY_DELAY_MS)
+      } catch (deferError) {
+        await reportUnsentHandBackAborted(entry, { reason: 'producer-held', operation: entry.type, message: deliveryHoldBeforeClaim.message }, deferError, job.id)
+      }
       result.skipped++
       continue
     }
@@ -4911,7 +4983,10 @@ async function processPendingXeroSyncViaOutbox(): Promise<ProcessResult> {
         // so rather than letting the fence's own throw escape into the generic failure handler and
         // spend a retry on a row that was never posted.
         try {
-          if (notPosted.reason === 'transport-refused') {
+          if (notPosted.reason === 'transport-refused' || notPosted.reason === 'producer-held') {
+            // `producer-held` (the claim boundary found the row's decision not LIVE, or the owner's confirmation absent) takes the SAME hand-back: the
+            // sync-log claim is released and the job deferred WITHOUT spending an attempt. The generic arm below would count it toward MAX_RETRIES
+            // and dead-letter work that is merely waiting for the owner. (The common case never gets here: the pre-claim ask below claims nothing.)
             // o3d-jit6 r4 (Codex HIGH): ONE TRANSACTION, because on this path the row and the job are
             // two halves of one retry. A released row whose job stayed PROCESSING waits for the
             // queue's own fifteen-minute stale-lock sweep — the same fifteen minutes the release
@@ -5224,7 +5299,7 @@ type EntryResult = {
      * minted — the fence sent nothing because the transport would not. The row is handed back exactly
      * like the other three, and the marker it left behind is a known, named residual (o3d-gvzu).
      */
-    reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused' | 'producer-held' | 'before-cutoff'
+    reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused' | 'producer-held' | 'producer-shadowed' | 'before-cutoff'
     operation: string
     message: string
     /**
@@ -6171,7 +6246,19 @@ export async function processClaimedEntry(
   const held = xeroProducerSeamVerdict({ connector: XERO_CONNECTOR, type, payload, obligationAt: await xeroResolveObligationAt(db, { type, payload, connector: XERO_CONNECTOR, referenceType, referenceId }) })
   if (held.kind === 'shadow') {
     const message = producerHeldNotice({ connector: held.destination, reason: held.decision.reason, owner: held.decision.owner })
-    return { success: false, error: message, notPosted: { reason: 'producer-held', operation: type, message } }
+    // `producer-shadowed`, NOT `producer-held`: this verdict is PERMANENT for the row (its decision is not LIVE), so it keeps the terminal handling it had
+    // before the delivery hold existed (the ordinary retry accounting, which dead-letters it). Only `producer-held` below (the owner's confirmation absent or
+    // unread, which a later tick can clear) takes the no-attempt hand-back.
+    return { success: false, error: message, notPosted: { reason: 'producer-shadowed', operation: type, message } }
+  }
+
+  // THE PER-OPERATION DELIVERY GATE. The decision above said LIVE for this row, but a destination opened by an EARLIER step must not let a LATER step's
+  // row out, and a row that replaces an incumbent the owner stops by hand (step X: Qoblex's Xero posting; the invoice note) waits for the owner's
+  // confirmation. A confirmation that is absent, or not read yet after a start or a failed read, HOLDS the row (handed back unsent, no attempt spent,
+  // retried): it is never turned into a shadow, which would never be delivered.
+  const deliveryHold = xeroRowDeliveryHold({ type })
+  if (deliveryHold !== null) {
+    return { success: false, error: deliveryHold.message, notPosted: { reason: 'producer-held', operation: type, message: deliveryHold.message } }
   }
 
   // THE WRITER-SIDE CUT-OFF, AT THE LAST POINT BEFORE ANYTHING CAN BE SENT. The claim statement and the selections already exclude a row
@@ -6269,6 +6356,7 @@ export async function processClaimedEntry(
         discountTaxType: payload.discountTaxType as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
+        ...(typeof payload.orderTotal === 'number' && Number.isFinite(payload.orderTotal) ? { orderTotal: payload.orderTotal } : {}),
         // o3d-k26m.5 round 5/6: the number fence's LAST word. Handed in here, scoped around the
         // create by pushSalesInvoice, and evaluated inside the HTTP client on every attempt as the
         // last statement before the socket. Nothing is sent if it refuses.
@@ -6290,6 +6378,8 @@ export async function processClaimedEntry(
       if (!accountingInvoiceId) {
         return { success: false, error: 'Missing accountingInvoiceId for SALES_INVOICE_UPDATE' }
       }
+      const salesDeleting = await pendingDocumentDeletionRefusal(accountingInvoiceId, 'update')
+      if (salesDeleting) return { success: false, error: salesDeleting }
       // Same cancelled-order backstop as the create: don't modify an external receivable for an order
       // that has since been cancelled (retire the update instead), and fail closed on an unreadable order.
       const guard = await guardCancelledSalesOrderInvoice(attempt, referenceType, referenceId, lease)
@@ -6319,6 +6409,7 @@ export async function processClaimedEntry(
         discountTaxType: payload.discountTaxType as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
         reference: payload.reference as string | undefined,
+        ...(typeof payload.orderTotal === 'number' && Number.isFinite(payload.orderTotal) ? { orderTotal: payload.orderTotal } : {}),
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: invoiceIdempotencyKey, customerId, beforePost: composeFinalBeforePost(null, payload as Record<string, unknown>, 'update'), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) })
       return { success: invoiceResult.success, externalId: invoiceResult.invoiceId, invoiceNumber: invoiceResult.invoiceNumber, externalRevisionAt: invoiceResult.externalRevisionAt, error: invoiceResult.error }
     }
@@ -6358,6 +6449,8 @@ export async function processClaimedEntry(
       if (!accountingInvoiceId) {
         return { success: false, error: 'Missing accountingInvoiceId for PURCHASE_INVOICE_UPDATE' }
       }
+      const billDeleting = await pendingDocumentDeletionRefusal(accountingInvoiceId, 'update')
+      if (billDeleting) return { success: false, error: billDeleting }
       const supplier = referenceType === 'PurchaseOrder'
         ? await db.purchaseOrder.findUnique({
             where: { id: referenceId },
@@ -6378,6 +6471,23 @@ export async function processClaimedEntry(
         reference: payload.reference as string | undefined,
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: billIdempotencyKey, supplierId: supplier?.supplierId, supplierEmail: supplier?.supplier.email ?? undefined })
       return { success: billResult.success, externalId: billResult.invoiceId, externalRevisionAt: billResult.externalRevisionAt, error: billResult.error }
+    }
+
+    case 'SALES_INVOICE_DELETE':
+    case 'PURCHASE_INVOICE_DELETE': {
+      // o3d-ngmt.21: free the document's number, then DELETE or VOID it. Read first, so a retry after the number was already changed makes
+      // only the status write and never appends a second suffix; every write fences on the lease like every other remote mutation here.
+      const parsed = parseXeroDeleteTarget(type, payload as Record<string, unknown>)
+      if (!parsed.ok) return { success: false, error: parsed.error }
+      const deleteTarget = parsed.target
+      const run = await runXeroDocumentDelete(deleteTarget, {
+        fence: (step) => lease.fenceBeforeRemoteWrite(step),
+        idempotencyKey: (step) => buildXeroIdempotencyKey(entryId, step, payload),
+      })
+      if (run.kind === 'fenced') return run.result
+      if (run.kind === 'failed') return { success: false, error: run.error }
+      await recordDeletionTargetStatus(deleteTarget.invoiceId, run.status)
+      return { success: true, externalId: deleteTarget.invoiceId, externalRevisionAt: run.externalRevisionAt }
     }
 
     case 'INVOICE_PAYMENT': {
@@ -6761,7 +6871,35 @@ export async function processClaimedEntry(
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; noTaxKind?: SalesNoTaxLineKind }>,
         reference: payload.reference as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
+        ...(typeof payload.orderTotal === 'number' && Number.isFinite(payload.orderTotal) ? { orderTotal: payload.orderTotal } : {}),
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId, ...(creditNoteBeforePostHook ? { beforePost: creditNoteBeforePostHook } : {}), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
+    }
+
+    case 'CREDIT_NOTE_VOID': {
+      // o3d-ngmt.22: the refund this credit note was raised for was deleted in IMS (recorded in error). The row carries the ledger id the
+      // credit note was posted under; nothing here consults the refund, which no longer exists. The void READS the document first and decides
+      // from what is there (voidCreditNote), so a retry after a lost response or a partial failure converges instead of erroring.
+      const voidCreditNoteId = typeof payload.creditNoteId === 'string' ? payload.creditNoteId : ''
+      if (!voidCreditNoteId) return { success: false, error: 'Missing creditNoteId for CREDIT_NOTE_VOID' }
+      const fence = await lease.fenceBeforeRemoteWrite('credit-note-void')
+      if (!fence.ok) return fence.result
+      const voided = await voidCreditNote(
+        { creditNoteId: voidCreditNoteId, creditNoteNumber: typeof payload.creditNoteNumber === 'string' ? payload.creditNoteNumber : null },
+        { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note-void') },
+      )
+      // The id returned is the credit note's own: the void acts on a document that already stood (UPDATE_DOCUMENT).
+      if (!voided.success) return { success: false, error: voided.error }
+      // Phase 2 of a refund delete: the ledger has confirmed the void, so IMS now unwinds the refund (idempotent: an already deleted refund is a success).
+      if (referenceType === 'SalesOrderRefund') {
+        const meta = (payload as { _refundDelete?: { actorUserId?: string | null; reason?: string | null } })._refundDelete
+        const { completeRefundDeletionAfterVoid } = await import('@/lib/domain/sales/refund-delete-service')
+        const finished = await completeRefundDeletionAfterVoid(db, { refundId: referenceId, voidSyncLogId: entryId, actorUserId: meta?.actorUserId ?? null, reason: meta?.reason ?? null })
+        if (!finished.ok) return { success: false, error: finished.error }
+        if (finished.stockSyncFailed) {
+          await logActivity({ entityType: 'SALES_ORDER', entityId: referenceId, action: 'refund_delete_stock_sync_failed', tag: 'sales', level: 'WARNING', description: 'The refund was deleted, but its stock change could not be queued for the storefront. It will go with the next stock sync; push the stock from the product page if it is urgent.', metadata: { refundId: referenceId } }).catch(() => { /* the delete is done; the warning is advisory */ })
+        }
+      }
+      return { success: true, externalId: voidCreditNoteId }
     }
 
     case 'PURCHASE_CREDIT_NOTE': {
@@ -6890,6 +7028,7 @@ export async function processClaimedEntry(
     case 'DAILY_BATCH_INVENTORY_RECONCILIATION':
     case 'DAILY_BATCH_COGS_RECONCILIATION':
     case 'DAILY_BATCH_TRANSIT_RECONCILIATION':
+    case 'DAILY_BATCH_GRIR_RECLASS':
     case 'UNEARNED_REV_REVERSAL':
     // o3d-0i5y r9: the orphaned-allocation reversal. A plain manual journal like every other type
     // in this group — the amount is decided (and evidenced) at staging time, not here.
@@ -7071,6 +7210,12 @@ async function updateBackReference(
   invoiceNumber?: string,
 ): Promise<void> {
   if (!externalId) return
+  // o3d-ngmt.21: a confirmed delete is not a back-reference at all — it UNWINDS the link. The unwind is idempotent and keyed on the ledger's
+  // document id, so a failure here is retried by the same follow-up path as a failed back-reference, from the id already stored on the row.
+  if (type === 'SALES_INVOICE_DELETE' || type === 'PURCHASE_INVOICE_DELETE') {
+    await completeAccountingDocumentDeletion(externalId)
+    return
+  }
   // audit-H3: do NOT swallow failures here. The external id is already persisted
   // on the sync row (externalTransactionId) before this runs, and the caller's
   // catch marks the row for retry so the next pass re-applies the back-reference
@@ -8239,7 +8384,7 @@ async function enqueuePurchaseCreditNoteFollowUps(
     // Resolved HERE rather than left undefined for processEntry to fill from the wall
     // clock. An unset date made the allocation body differ on every execution, so a
     // retry of a pinned request was no longer the same request (Codex review, r2 #3).
-    date: (payload.date as string | undefined)?.slice(0, 10) || new Date().toISOString().slice(0, 10),
+    date: (payload.date as string | undefined)?.slice(0, 10) || businessDateYmd(new Date()),
     sourceEntryId: entryId,
   }, { from: 'postedRow', record: origin })
 }

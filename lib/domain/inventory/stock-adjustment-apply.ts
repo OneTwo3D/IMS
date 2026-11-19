@@ -1,7 +1,8 @@
 import type { Prisma } from '@/app/generated/prisma/client'
-import { queueAccountingSyncTxWithOutcome, getAccountingSettings } from '@/lib/accounting'
+import { queueAccountingSyncTxWithOutcome, getAccountingSettings, accountingPostingVerdictForChart } from '@/lib/accounting'
 import { withSavepoint } from '@/lib/db/savepoint'
-import type { PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
+import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
+import { accountingPostingKey } from '@/lib/accounting/posting-key'
 import { postingIsOwed, reportPostingNotQueued } from '@/lib/domain/accounting/enqueue-outcome'
 import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer, getAverageUnitCost, getHistoricalAverageUnitCost, lockStockLevelRow } from '@/lib/cost-layers'
 import { assertStockAdjustmentFeasible } from '@/lib/domain/inventory/stock-adjustment-edit'
@@ -10,6 +11,8 @@ import {
   buildStockMovementValueFieldsFromConsumed,
 } from '@/lib/domain/inventory/stock-movement-value'
 import { manualStockAdjustmentMovementKey } from '@/lib/domain/inventory/stock-movement-idempotency'
+import { businessDateYmd } from '@/lib/business-date'
+import { withHandPostSafety } from '@/lib/domain/accounting/hand-post-instruction'
 
 // Extracted from app/actions/stock.ts (6oyu.1) so non-action callers — the WMS
 // stock-sync align-down path runs from a cron job — can post an adjustment
@@ -61,7 +64,7 @@ export function buildInventoryAdjustmentJournal(params: {
   const totalValue = Math.round(Math.abs(totalValueBase) * 100) / 100
   if (totalValue === 0) return null
 
-  const date = new Date().toISOString().slice(0, 10)
+  const date = businessDateYmd(new Date())
   const directionLabel = qty > 0 ? 'increase' : 'decrease'
   const reference = `Adj: ${productSku} ${qty > 0 ? '+' : ''}${qty} @ ${warehouseCode}`
   const narration = [
@@ -127,6 +130,12 @@ export type ApplyStockAdjustmentInput = {
    * applies. Backed by StockMovement.idempotencyKey @unique.
    */
   idempotencyToken?: string | null
+  /**
+   * o3d-hqvrp.80: when a removal exceeds the AVAILABLE stock (it would cut into reserved units),
+   * release the newest orders' unshipped allocations first, in this transaction, instead of refusing.
+   * Off unless the caller passes it (the flag `stock_adjustment_release_reserved`, read by the action).
+   */
+  releaseReservedForRemoval?: boolean
 }
 
 export type AppliedStockAdjustment = {
@@ -147,6 +156,7 @@ export async function applyStockAdjustment({
   referenceType,
   referenceId,
   idempotencyToken,
+  releaseReservedForRemoval,
 }: ApplyStockAdjustmentInput): Promise<AppliedStockAdjustment> {
   const isAddition = qty > 0
   // 0tr0/r9y2: content-addressed key from the per-submission token + payload, so an
@@ -181,27 +191,64 @@ export async function applyStockAdjustment({
     }
   }
 
+  // The key is unique, so a plain read answers "was this already applied?" without the stock-level lock.
+  const findReplayedAdjustment = async (): Promise<AppliedStockAdjustment | null> => {
+    if (!idempotencyKey) return null
+    const existing = await tx.stockMovement.findUnique({
+      where: { idempotencyKey },
+      select: { id: true },
+    })
+    if (!existing) return null
+    const [product, warehouse] = await Promise.all([
+      tx.product.findUnique({ where: { id: productId }, select: { sku: true } }),
+      tx.warehouse.findUnique({ where: { id: warehouseId }, select: { name: true } }),
+    ])
+    return {
+      movementId: existing.id,
+      productSku: product?.sku ?? productId,
+      warehouseName: warehouse?.name ?? warehouseId,
+    }
+  }
+
+  // A replay must not release anybody's reservation: its first submission already did (or needed to),
+  // and the release would commit for an adjustment that now writes nothing.
+  //
+  // The key is CLAIMED first, under a transaction-scoped advisory lock: two concurrent submissions with the
+  // same key serialise here, so the loser only reads after the winner has committed, finds its movement and
+  // returns the replay BEFORE it can release anything. Its transaction therefore never writes a release for
+  // an adjustment that wrote nothing. (Taken before any sales_orders / stock_levels lock, and only ever
+  // contended by the same key, so it cannot join a lock cycle.)
+  if (idempotencyKey) {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`stock-adjustment-key:${idempotencyKey}`}, 0))`
+    const replay = await findReplayedAdjustment()
+    if (replay) return replay
+  }
+
+  // o3d-hqvrp.80: sales_orders are locked BEFORE stock_levels everywhere, so the release for a removal that
+  // would cut into reserved units runs before this transaction takes the stock-level lock.
+  if (releaseReservedForRemoval && qty < 0) {
+    const level = await tx.stockLevel.findUnique({
+      where: { productId_warehouseId: { productId, warehouseId } },
+      select: { quantity: true, reservedQty: true },
+    })
+    if (level && Number(level.quantity) - Number(level.reservedQty) < Math.abs(qty)) {
+      const { releaseReservationsForRemovalInTx } = await import('@/lib/fulfillment/overallocation-rebalancer')
+      await releaseReservationsForRemovalInTx(tx, { productId, warehouseId }, Math.abs(qty), {
+        source: 'stock_adjustment',
+        referenceId: productId,
+        referenceLabel: `stock adjustment (${qty})`,
+      })
+    }
+  }
+
   const locked = await lockStockLevelRow(tx, productId, warehouseId)
 
   // 0tr0: idempotency check UNDER the stock-level lock. Same-(product,warehouse)
   // re-submissions serialise here, so a duplicate carrying the same key sees the
   // first submission's committed movement and returns it instead of double-booking.
   if (idempotencyKey) {
-    const existing = await tx.stockMovement.findUnique({
-      where: { idempotencyKey },
-      select: { id: true },
-    })
-    if (existing) {
-      const [product, warehouse] = await Promise.all([
-        tx.product.findUnique({ where: { id: productId }, select: { sku: true } }),
-        tx.warehouse.findUnique({ where: { id: warehouseId }, select: { name: true } }),
-      ])
-      return {
-        movementId: existing.id,
-        productSku: product?.sku ?? productId,
-        warehouseName: warehouse?.name ?? warehouseId,
-      }
-    }
+    const replay = await findReplayedAdjustment()
+    if (replay) return replay
   }
 
   // ig58: pre-flight availability check against the locked row, before any
@@ -302,6 +349,49 @@ export async function applyStockAdjustment({
     tx.warehouse.findUnique({ where: { id: warehouseId }, select: { code: true, name: true } }),
   ])
 
+  // o3d-hqvrp.47: a valued adjustment with NO account to post against (no reason, a reason with no account,
+  // or no inventory account mapped) changed the cost layers and posted nothing, silently. Record the owed
+  // posting the way every other refused producer does, so the ledger gap shows in the exception inbox.
+  // Only when the adjustment would post (connector active, sync on, type on): otherwise nothing is owed (the `not-configured` rule). The owed row is the report; no separate activity-log row.
+  // The one identity of this movement's journal: the enqueue below and the owed-posting row both take it.
+  const journalIdentity = { type: 'INVENTORY_ADJUSTMENT' as const, referenceType: 'StockMovement', referenceId: movement.id }
+  const adjustmentValueBase = isAddition
+    ? Math.abs(qty) * (additionUnitCost ?? 0)
+    : (removalCostBase ?? 0)
+  const adjustmentHasValue = qty !== 0 && Math.round(Math.abs(adjustmentValueBase) * 100) !== 0
+  if (adjustmentHasValue) {
+    const unmappedSettings = providedSettings ?? await getAccountingSettings()
+    // Owed only when a mapped adjustment WOULD post: the same verdict the enqueue answers from (connector active,
+    // xero_sync_enabled on, the inventory-adjustment type on). `not-configured` and `no-chart` owe nothing.
+    const wouldPost = (!accountCode || !unmappedSettings.inventoryAccount) && unmappedSettings.connector
+      ? (await accountingPostingVerdictForChart(unmappedSettings.connector, 'INVENTORY_ADJUSTMENT')).verdict
+      : null
+    if (unmappedSettings.connector && (wouldPost === 'post' || wouldPost === 'chart-retired')) {
+      // No enqueue ran (there was no journal to build), so there is no answer to forward: the outstanding row is
+      // recorded directly, in the caller's transaction, under the key the journal would have been queued under.
+      const unmapped = !accountCode ? 'reason_account' : 'inventory_account'
+      const remedy = withHandPostSafety(!accountCode
+        ? 'The adjustment has no reason, or its reason has no account, so no journal was built. Inventory in the '
+          + 'ledger no longer matches IMS by the value of this adjustment. Post the journal by hand.'
+        : 'No inventory account is mapped, so no journal was built. Inventory in the ledger no longer matches IMS '
+          + 'by the value of this adjustment. Post the journal by hand.')
+      await recordAccountingPostingRefusal(
+        tx as unknown as PostingRefusalClient,
+        accountingPostingKey(journalIdentity),
+        {
+          kind: 'stock_adjustment_journal',
+          chartConnector: unmappedSettings.connector,
+          activeConnector: unmappedSettings.connector,
+          reason: `unmapped_${unmapped}`,
+          committed: 'the stock movement and its cost layers are written in IMS',
+          remedy,
+          detail: { movementId: movement.id, productId, warehouseId, unmapped },
+        },
+        { withSavepoint: <T,>(fn: () => Promise<T>) => withSavepoint(tx, fn) },
+      )
+    }
+  }
+
   if (accountCode) {
     const settings = providedSettings ?? await getAccountingSettings()
     // Value the GL journal at the value the movement/cost-layer actually booked so
@@ -330,9 +420,7 @@ export async function applyStockAdjustment({
       // outstanding posting, or a queued journal, for a stock movement that never existed. Written through
       // `tx`, the sync row and the refusal row share the movement's fate.
       const enqueued = await queueAccountingSyncTxWithOutcome(tx, {
-        type: 'INVENTORY_ADJUSTMENT',
-        referenceType: 'StockMovement',
-        referenceId: movement.id,
+        ...journalIdentity,
         payload: journal as unknown as Record<string, unknown>,
         // o3d-j625: `inventoryAccountCode` on the journal is `settings.inventoryAccount`. The window is
         // wider here than at a single call site, because `providedSettings` is read ONCE for a whole

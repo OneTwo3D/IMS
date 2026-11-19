@@ -3,11 +3,9 @@
 // ---------------------------------------------------------------------------
 
 import { Buffer } from 'node:buffer'
+import { escapeField } from '@/lib/csv-escape'
 
-// Characters that trigger formula evaluation in Excel / LibreOffice / Google Sheets
-// when they appear at the start of a cell. We neutralise by prefixing with `'`.
-const FORMULA_PREFIX = /^[=+\-@\t\r]/
-const NUMERIC_LITERAL = /^-?\d+(?:\.\d+)?$/
+export { csvFormulaGuardApplies } from '@/lib/csv-escape'
 
 /**
  * Base64url-encoded JSON object with report-level metadata for API consumers.
@@ -43,21 +41,6 @@ type CsvHeaderMetadata = CsvExportMetadata & {
 }
 
 const ESSENTIAL_METADATA_KEYS = ['generatedAt', 'asOf', 'dateFrom', 'dateTo', 'source', 'groupBy', 'valueReplayReliable']
-
-/** Escape a single value for CSV output */
-function escapeField(value: unknown): string {
-  if (value === null || value === undefined) return ''
-  let str = String(value)
-  // CSV injection mitigation — see OWASP "Formula Injection".
-  // Preserve plain numeric literals so exported quantity/currency fields
-  // remain re-importable without carrying a leading apostrophe.
-  if (FORMULA_PREFIX.test(str) && !NUMERIC_LITERAL.test(str)) str = "'" + str
-  // Quote if contains comma, quote, newline
-  if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
-    return '"' + str.replace(/"/g, '""') + '"'
-  }
-  return str
-}
 
 /** Convert an array of objects to a CSV string */
 export function toCsv(rows: Record<string, unknown>[], headers: string[]): string {

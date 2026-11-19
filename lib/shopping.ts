@@ -243,7 +243,10 @@ export async function pushProductMetadata(productId: string): Promise<PushProduc
   return { success: true }
 }
 
-export async function pushOrderDeliveryMetadata(orderId: string): Promise<PushOrderDeliveryMetadataResult> {
+export async function pushOrderDeliveryMetadata(
+  orderId: string,
+  options: { skipWcStatuses?: readonly string[] } = {},
+): Promise<PushOrderDeliveryMetadataResult> {
   const connectors = await listRunnableShoppingConnectorIds()
   if (connectors.length === 0) return { success: false, error: 'No runnable shopping connector configured' }
 
@@ -259,7 +262,7 @@ export async function pushOrderDeliveryMetadata(orderId: string): Promise<PushOr
         })
         if (!seam.proceed) return { connector, result: shadowedPush(seam) }
         const { pushImsTrackingToWc } = await import('@/lib/connectors/woocommerce/sync/tracking-sync')
-        return { connector, result: await pushImsTrackingToWc(orderId) }
+        return { connector, result: await pushImsTrackingToWc(orderId, options) }
       }
     }
   }))
@@ -275,6 +278,15 @@ export async function pushOrderDeliveryMetadata(orderId: string): Promise<PushOr
   if (shadowed) return { success: false, shadowed: true, error: 'error' in shadowed.result ? shadowed.result.error : undefined }
 
   return { success: true, skipped: results.every((entry) => 'skipped' in entry.result && !!entry.result.skipped) }
+}
+
+/**
+ * Re-push tracking that a crash between a shipment's commit and its post-commit push lost (o3d-ekujm). OFF unless
+ * `wc_tracking_reconcile_enabled` is `true`. Every write goes through `pushOrderDeliveryMetadata` and so through the outbound hold.
+ */
+export async function reconcileShoppingTrackingPushes() {
+  const { reconcileWcTrackingPushes } = await import('@/lib/connectors/woocommerce/sync/tracking-reconcile')
+  return reconcileWcTrackingPushes()
 }
 
 /**
@@ -388,7 +400,7 @@ export async function pushSalesOrderStatus(orderId: string, status: SalesOrderSt
         // Only the queue drains reach this (a job produced under a LIVE decision), so it asks the destination-level gate
         // and not a per-operation decision: a job found while the destination is held is handed back unsent, with no
         // new shadow record (the queued row is the work, and it stays as it is).
-        const hold = wooDrainHold()
+        const hold = wooDrainHold(undefined, 'order.status')
         if (hold.held) return { connector, result: { success: false, shadowed: true, error: hold.queuedNotice } }
         const { pushImsStatusToWc } = await import('@/lib/connectors/woocommerce/sync/order-status')
         const outcome = await pushImsStatusToWc(orderId, status)
@@ -465,6 +477,12 @@ export async function processShoppingOrderStatusPushes(options?: { idempotencyKe
 export async function processShoppingInvoiceDocumentPublications(options?: { idempotencyKeys?: string[]; limit?: number; now?: Date }) {
   const { processWcInvoiceDocumentPublications } = await import('@/lib/connectors/woocommerce/sync/invoice-document-jobs')
   return processWcInvoiceDocumentPublications(options)
+}
+
+/** The TrackShip re-fire sweep (off unless `trackship_refire_enabled` is `true`): register shipped orders, queue the looks that are due, drain. */
+export async function processShoppingTrackshipRefires(options?: { idempotencyKeys?: string[]; limit?: number; now?: Date }) {
+  const { processWcTrackshipRefires } = await import('@/lib/connectors/woocommerce/sync/trackship-refire-jobs')
+  return processWcTrackshipRefires(options)
 }
 
 /**

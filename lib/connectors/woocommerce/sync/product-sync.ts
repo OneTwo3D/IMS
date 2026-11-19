@@ -2,6 +2,7 @@
  * Bidirectional product sync between WooCommerce and IMS.
  */
 
+import { readWcHsCodeMirror } from './hs-code-mirror'
 import { advancePullCursor, wcPullCursorCandidate } from './read-cursor'
 import { readWcProductPushDecision } from './product-push-gate'
 import { readProductIdentifierSplitEnabled } from '@/lib/domain/products/identifier-split-flag'
@@ -10,6 +11,15 @@ import { after } from 'next/server'
 import { db } from '@/lib/db'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import { getSettingValue } from '@/lib/settings-store'
+import {
+  MAX_PERMANENT_CONFLICT_REATTEMPTS,
+  MAX_STORED_PERMANENT_CONFLICTS,
+  readPermanentConflicts,
+  recordPermanentConflictDelta,
+  selectPermanentConflictReattempts,
+  PERMANENT_CONFLICT_ATTEMPT_WARNING_THRESHOLD,
+  type PermanentConflictDelta,
+} from './product-permanent-conflicts'
 import { wcFetch, wcPut, WC_PAGINATION_UNKNOWN, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import { ensureWcCategoryTreeMirrored, resolveImsCategoryId } from './category-mirror'
 import { isPermanentProductSyncConflict, WcVariationLimitExceededError } from './product-sync-errors'
@@ -28,9 +38,9 @@ import {
 } from './product-sync-errors'
 import { WC_CREDENTIAL_SETTING_KEYS, resolveWcCredentialsFromRows } from '../credentials'
 import type { ConnectorCredentials } from '../../types'
-import { toIsoCountryCode, DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
+import { DEFAULT_COUNTRY_OF_ORIGIN } from '@/lib/countries'
 import { invalidateStaleHsProposal } from '@/lib/trade/hs-classification-trigger'
-import { clampCustomsDescription } from '@/lib/trade/customs-description'
+import { extractWcCustomsFields, type WcCustomsFields, type WcRejectedCustomsValue } from './customs-fields'
 import {
   deriveLegacyActiveFromLifecycleStatus,
   deriveLifecycleStatusFromWooStatus,
@@ -55,7 +65,10 @@ import {
   PRODUCT_TRANSFORM_BLOCKER_FREE_WHERE,
 } from '@/lib/products/type-transforms'
 import { bumpFulfillmentGraphVersions } from '@/lib/products/component-graph-edit-guard'
-import type { Prisma, ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
+import { Prisma } from '@/app/generated/prisma/client'
+import { WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { runWithWcAttemptFence } from '../attempt-fence'
+import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
 import { storeWcProductContent } from './product-content'
 
@@ -565,29 +578,118 @@ function asTrimmedString(value: unknown): string | null {
 }
 
 // Trade fields (HS code / country-of-origin / customs description) are owned upstream by
-// hs-code-woo, which writes authoritative WC pa_* attributes. Policy: WC wins when present.
+// hs-code-woo, which writes WooCommerce's native customs fields (customs_commodity_code,
+// customs_country_of_origin, customs_description; the older pa_* attributes are a per-field
+// fallback, see customs-fields.ts). Policy: WC wins when present.
 // When WC supplies a differing value we overwrite IMS (so re-classifications/corrections
-// propagate); when WC omits the attribute we preserve the existing IMS value (never null it).
+// propagate); when WC omits the field (native and every fallback) we preserve the existing IMS
+// value. The one exception is an EXPLICIT clear (the native key present with null/''), which nulls the IMS value.
 // Inputs are expected already-trimmed (see asTrimmedString / toIsoCountryCode at the call
 // site); an empty string is treated as absent via truthiness.
 export const WC_TRADE_FIELDS = ['hsCode', 'countryOfOrigin', 'customsDescription'] as const
 export type WcTradeField = (typeof WC_TRADE_FIELDS)[number]
 export type WcTradeSnapshot = Record<WcTradeField, string | null>
-export type WcTradeFieldChange = { field: WcTradeField; from: string | null; to: string }
+export type WcTradeFieldChange = { field: WcTradeField; from: string | null; to: string | null }
 
+/**
+ * `cleared` names the fields WooCommerce EXPLICITLY emptied (see extractWcCustomsFields): only those set IMS to null, and
+ * only when IMS holds a value. A field that is merely absent or unusable is in neither `incoming` nor `cleared`, so the IMS
+ * value is preserved. A usable incoming value always wins over a clear.
+ */
 export function resolveWcTradeFieldUpdates(
   existing: WcTradeSnapshot,
   incoming: WcTradeSnapshot,
+  cleared: readonly WcTradeField[] = [],
 ): WcTradeFieldChange[] {
   const changes: WcTradeFieldChange[] = []
   for (const field of WC_TRADE_FIELDS) {
     const next = incoming[field]
-    // WC value absent/empty -> preserve IMS; present and different -> overwrite.
-    if (next && next !== existing[field]) {
-      changes.push({ field, from: existing[field], to: next })
+    // WC value absent/empty -> preserve IMS; present and different -> overwrite; explicitly cleared -> null.
+    if (next) {
+      if (next !== existing[field]) changes.push({ field, from: existing[field], to: next })
+    } else if (cleared.includes(field) && existing[field]) {
+      changes.push({ field, from: existing[field], to: null })
     }
   }
   return changes
+}
+
+/**
+ * Fields a variation clears: the merged value is still empty, nothing present-but-unusable was supplied by the variation
+ * OR its parent, and EITHER the VARIATION's own native value is empty and its own cleared-fields meta lists it, OR the
+ * parent's cleared-fields meta lists it, the variation held that value by inheritance (`inherited`, what the previous
+ * import recorded) AND the variation's own native key is present and empty (`own.nativeEmpty`: WooCommerce's view of an
+ * inheriting variation shows the parent's cleared value; an absent key proves nothing). A variation with a value of its own
+ * is never touched by a parent clear.
+ */
+export function resolveVariationCleared(
+  own: { cleared: readonly WcTradeField[]; rejected: readonly WcRejectedCustomsValue[]; nativeEmpty?: readonly WcTradeField[] },
+  parent: { cleared?: readonly WcTradeField[]; rejected?: readonly WcRejectedCustomsValue[] },
+  merged: WcTradeSnapshot,
+  inherited: readonly string[] = [],
+): WcTradeField[] {
+  return WC_TRADE_FIELDS.filter(
+    (f) =>
+      merged[f] === null
+      && !own.rejected.some((r) => r.field === f)
+      && !parent.rejected?.some((r) => r.field === f)
+      && (own.cleared.includes(f) || (Boolean(parent.cleared?.includes(f)) && inherited.includes(f) && Boolean(own.nativeEmpty?.includes(f)))),
+  )
+}
+
+/**
+ * What the previous import recorded as inherited, with a fallback for a row whose record is empty (a row that predates the
+ * record, or never imported with it): a field counts as inherited only when the variation's IMS value equals the PARENT's IMS
+ * value as it stood before this import. A recorded list is used as it is.
+ */
+export function resolveInheritedHistory(
+  recorded: readonly string[],
+  variationBefore: WcTradeSnapshot,
+  parentBefore: WcTradeSnapshot | null,
+): string[] {
+  if (recorded.length > 0 || !parentBefore) return [...recorded]
+  return WC_TRADE_FIELDS.filter((f) => variationBefore[f] !== null && variationBefore[f] === parentBefore[f])
+}
+
+/**
+ * The customs fields a variation holds by inheritance after this import. WooCommerce's REST view of a variation already
+ * carries the parent's native value, so a value equal to the parent's counts as inherited (when the parent is later cleared
+ * and the variation still shows a value, it has its own, and the clear rule below never fires). A different value is the
+ * variation's own; one neither supplies keeps the previous record while the IMS value is preserved, and is dropped once
+ * the field has been cleared.
+ */
+export function resolveVariationInherited(
+  own: WcTradeSnapshot,
+  parent: WcTradeSnapshot,
+  previous: readonly string[],
+  cleared: readonly WcTradeField[],
+): WcTradeField[] {
+  return WC_TRADE_FIELDS.filter((f) => {
+    if (own[f] && own[f] !== parent[f]) return false
+    if (parent[f]) return true
+    return previous.includes(f) && !cleared.includes(f)
+  })
+}
+
+/**
+ * Operator-facing sentences for customs data WooCommerce supplied that IMS could not use, plus
+ * the new-row case where the China default had to be declared because no usable origin existed.
+ * Empty when there is nothing to say. Pure: the caller decides where it is recorded.
+ */
+export function describeWcCustomsWarnings(
+  sku: string,
+  rejected: readonly WcRejectedCustomsValue[],
+  opts: { isNewRow: boolean; resolvedOrigin: string | null },
+): string[] {
+  const warnings = rejected.map(
+    (r) => `${sku}: WooCommerce ${r.field} "${r.value}" is not usable by IMS and was ignored`,
+  )
+  if (opts.isNewRow && !opts.resolvedOrigin) {
+    warnings.push(
+      `${sku}: no usable country of origin from WooCommerce; created with the default ${DEFAULT_COUNTRY_OF_ORIGIN}. Correct the product's origin.`,
+    )
+  }
+  return warnings
 }
 
 /** Parse a WC numeric-ish value, returning null if empty/NaN. */
@@ -630,21 +732,6 @@ function normalizeAttributeOptions(options: unknown): string[] {
   return options
     .map((option) => asTrimmedString(option))
     .filter((option): option is string => Boolean(option))
-}
-
-/** Search WC product attributes array by name (case-insensitive, ignores underscores/spaces), return first option value. */
-function getWcAttribute(
-  attrs: WcFullProduct['attributes'] | undefined,
-  ...names: string[]
-): string | null {
-  if (!Array.isArray(attrs)) return null
-  const normalise = (s: string) => s.toLowerCase().replace(/[_\s]+/g, '')
-  const targets = names.map(normalise)
-  const attr = attrs.find((a) => {
-    const name = asTrimmedString(a?.name)
-    return name ? targets.includes(normalise(name)) : false
-  })
-  return attr ? normalizeAttributeOptions(attr.options)[0] ?? null : null
 }
 
 async function snapshotProductSyncContext(): Promise<{
@@ -844,16 +931,15 @@ export async function syncWcProductToIms(
     const imageUrl = getFirstImageUrl(wcProduct.images)
     const gtin = asTrimmedString(wcProduct.global_unique_id)
 
-    // Customs fields from WC attributes
-    const hsCodeAttr = asTrimmedString(getWcAttribute(wcProduct.attributes, 'hs_code', 'hs code', 'hscode'))
-    const originAttr = getWcAttribute(wcProduct.attributes, 'country_of_origin', 'Country of Origin', 'coo')
-    const originIso = toIsoCountryCode(originAttr)
-    const customsDescriptionRaw = asTrimmedString(getWcAttribute(wcProduct.attributes, 'customs_description', 'customs description', 'customsdescription'))
-    // Cap at the downstream WMS 50-char customs-description limit on the way in,
-    // so the stored value matches what we can push downstream (and never blocks
-    // a WMS product create). Preserve null/blank so "WC omitted it" semantics
-    // are unchanged.
-    const customsDescriptionAttr = customsDescriptionRaw ? clampCustomsDescription(customsDescriptionRaw) : customsDescriptionRaw
+    // Customs fields: WooCommerce native fields first, attribute / legacy-meta fallback per field.
+    // The description is clamped on the way in (null/blank preserved: "WC omitted it").
+    const customs = extractWcCustomsFields(wcProduct)
+    const hsCodeAttr = customs.hsCode
+    const originIso = customs.countryOfOrigin
+    const customsDescriptionAttr = customs.customsDescription
+    const customsWarnings: string[] = []
+
+    const hsCodeMirror = readWcHsCodeMirror(wcProduct)
 
     // Product type mapping
     const productType = wcProduct.type === 'variable' ? 'VARIABLE' : 'SIMPLE'
@@ -892,7 +978,7 @@ export async function syncWcProductToIms(
     )
 
     // --- Local writes: all of them, in ONE transaction ---
-    const { syncedProductId, syncedSku, tradeChanges, wasUpdate, structureConflicts } = await db.$transaction(
+    const { syncedProductId, syncedSku, customsWarnings: importWarnings, tradeChanges, wasUpdate, structureConflicts } = await db.$transaction(
       async (tx: Prisma.TransactionClient) => {
         // Fence step 3 (o3d-mlc7): the settings lock comes FIRST, before any per-SKU lock.
         // Both families are taken inside this transaction, so a fixed order between them is
@@ -1021,6 +1107,7 @@ export async function syncWcProductToIms(
               customsDescription: existing.customsDescription,
             },
             { hsCode: hsCodeAttr, countryOfOrigin: originIso, customsDescription: customsDescriptionAttr },
+            customs.cleared,
           )
 
           /**
@@ -1066,6 +1153,11 @@ export async function syncWcProductToIms(
 
             for (const change of changes) {
               updateData[change.field] = change.to
+            }
+
+            // The WooCommerce tariff codes (pa_us_hs_code, _dutify_hs_codes) follow WooCommerce, a removed code clears; never touches `hsCode`.
+            for (const [field, value] of Object.entries(hsCodeMirror)) {
+              updateData[field] = value === null && field === 'wcDutifyHsCodes' ? Prisma.DbNull : value
             }
 
             // Category — link to mirrored IMS category for the deepest WC category
@@ -1218,6 +1310,8 @@ export async function syncWcProductToIms(
               lifecycleStatus,
               type: productType,
               hsCode: hsCodeAttr,
+              wcUsHsCode: hsCodeMirror.wcUsHsCode ?? null,
+              ...(hsCodeMirror.wcDutifyHsCodes ? { wcDutifyHsCodes: hsCodeMirror.wcDutifyHsCodes } : {}),
               countryOfOrigin: originIso ?? DEFAULT_COUNTRY_OF_ORIGIN,
               customsDescription: customsDescriptionAttr,
               externalProductId: BigInt(wcProduct.id),
@@ -1289,7 +1383,11 @@ export async function syncWcProductToIms(
         } else if (isVariable) {
           structureConflicts.push(
             ...await applyVariations(
-              tx, variations, productId, wcProduct.name, imsCategoryId, structurallyTransformed,
+              tx, variations, productId, wcProduct.name, imsCategoryId, structurallyTransformed, customs,
+              customsWarnings,
+              existing
+                ? { hsCode: existing.hsCode ?? null, countryOfOrigin: existing.countryOfOrigin ?? null, customsDescription: existing.customsDescription ?? null }
+                : null,
             ),
           )
         }
@@ -1320,9 +1418,17 @@ export async function syncWcProductToIms(
         // LAST, so it sees as much of the concurrent world as this transaction ever can.
         await assertTransformedRowsStillTransformable(tx, structurallyTransformed)
 
+        customsWarnings.unshift(
+          ...describeWcCustomsWarnings(productSku, customs.rejected, {
+            isNewRow: !existing,
+            resolvedOrigin: originIso,
+          }),
+        )
+
         return {
           syncedProductId: productId,
           syncedSku: productSku,
+          customsWarnings,
           tradeChanges: changes,
           wasUpdate: Boolean(existing),
           structureConflicts,
@@ -1340,6 +1446,20 @@ export async function syncWcProductToIms(
       void invalidateStaleHsProposal(syncedProductId).catch((err) => console.error(err))
     }
 
+    // Customs values IMS could not use (and a defaulted origin on a new row): a durable WARNING the
+    // operator can see, never a failure of the import. logActivity swallows its own errors.
+    if (importWarnings.length > 0) {
+      await logActivity({
+        entityType: 'PRODUCT',
+        entityId: syncedProductId,
+        action: 'wc_customs_value_unusable',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `WooCommerce customs data needs attention: ${importWarnings.slice(0, 10).join('; ')}${importWarnings.length > 10 ? `; +${importWarnings.length - 10} more` : ''}`,
+        resolveUser: false,
+      })
+    }
+
     // Audit trail when hs-code-woo overwrote IMS trade fields (bhdm.2). logActivity
     // swallows its own errors, so running it after the commit cannot strand a
     // committed import behind a FAILED log.
@@ -1350,7 +1470,7 @@ export async function syncWcProductToIms(
         action: 'wc_trade_fields_updated',
         tag: 'sync',
         description: `WC trade fields updated on ${syncedSku}: ${tradeChanges
-          .map((c) => `${c.field} ${c.from ?? '∅'}→${c.to}`)
+          .map((c) => `${c.field} ${c.from ?? '∅'}→${c.to ?? '∅ (cleared in WooCommerce)'}`)
           .join(', ')}`,
       })
     }
@@ -1814,6 +1934,16 @@ async function applyVariations(
    * lands, not once the loop finishes.
    */
   structurallyTransformed: Map<string, string>,
+  /**
+   * The parent's customs fields (already extracted). A variation's own REST values inherit the
+   * parent's in view context, but a payload that omits them (older WooCommerce, an attribute-only
+   * store, a legacy-description meta that lives on the parent) falls back to these per field.
+   */
+  parentCustoms: WcCustomsFields & { cleared?: readonly WcTradeField[]; rejected?: readonly WcRejectedCustomsValue[] },
+  /** Collects customs warnings (unusable WC values, defaulted origin) for the caller to record. */
+  customsWarnings: string[],
+  /** The parent's IMS customs values BEFORE this import wrote them (null for a parent created by it): the fallback that decides what a variation with no inheritance record held. */
+  parentImsBefore: WcTradeSnapshot | null,
 ): Promise<WcProductStructureConflict[]> {
   const conflicts: WcProductStructureConflict[] = []
   const entries = variations
@@ -1879,8 +2009,30 @@ async function applyVariations(
     const heightCm = parseNum(v.dimensions?.height)
     const imageUrl = getFirstImageUrl(v.images)
     const gtin = asTrimmedString(v.global_unique_id)
+    const ownCustoms = extractWcCustomsFields(v)
+    const variantCustoms: WcTradeSnapshot = {
+      hsCode: ownCustoms.hsCode ?? parentCustoms.hsCode,
+      countryOfOrigin: ownCustoms.countryOfOrigin ?? parentCustoms.countryOfOrigin,
+      customsDescription: ownCustoms.customsDescription ?? parentCustoms.customsDescription,
+    }
 
+    // Cleared when the variation itself is explicitly emptied, or when the parent is explicitly cleared and the variation held
+    // that value by inheritance (recorded on the previous import). Nothing inherited may still fill the field, and a variation
+    // with a value of its own is never cleared by its parent.
     const existing = existingBySku.get(sku)
+    const inheritedBefore = resolveInheritedHistory(
+      existing?.customsInherited ?? [],
+      { hsCode: existing?.hsCode ?? null, countryOfOrigin: existing?.countryOfOrigin ?? null, customsDescription: existing?.customsDescription ?? null },
+      parentImsBefore,
+    )
+    const variantCleared = resolveVariationCleared(ownCustoms, parentCustoms, variantCustoms, inheritedBefore)
+    const variantInherited = resolveVariationInherited(ownCustoms, parentCustoms, inheritedBefore, variantCleared)
+    customsWarnings.push(
+      ...describeWcCustomsWarnings(sku, ownCustoms.rejected, {
+        isNewRow: !existing,
+        resolvedOrigin: variantCustoms.countryOfOrigin,
+      }),
+    )
 
     if (existing) {
       // The update below rewrites type/parentId/externalProductId, so refuse a row a
@@ -1971,6 +2123,19 @@ async function applyVariations(
       if (salesPriceBase !== null) updateData.salesPriceBase = salesPriceBase
       if (salePriceUpdate !== undefined) updateData.salePriceBase = salePriceUpdate
       if (gtin && !existing.barcode) updateData.barcode = gtin
+      // Same policy as the parent: a WC value replaces a differing IMS one, an absent one never clears it.
+      for (const change of resolveWcTradeFieldUpdates(
+        {
+          hsCode: existing.hsCode ?? null,
+          countryOfOrigin: existing.countryOfOrigin ?? null,
+          customsDescription: existing.customsDescription ?? null,
+        },
+        variantCustoms,
+        variantCleared,
+      )) {
+        updateData[change.field] = change.to
+      }
+      updateData.customsInherited = variantInherited
 
       // o3d-4kfh r7 (Codex finding 2): the VARIATION path writes a type too — `VARIANT`, over
       // whatever the IMS row was. An IMS KIT whose SKU is adopted as a WC variation is the same
@@ -2042,6 +2207,11 @@ async function applyVariations(
           parentId: imsParentId,
           ...(parentCategoryId != null ? { categoryId: parentCategoryId } : {}),
           externalProductId: BigInt(v.id),
+          hsCode: variantCustoms.hsCode,
+          // Mirrors the parent's create: the China default only when WooCommerce supplies no origin.
+          countryOfOrigin: variantCustoms.countryOfOrigin ?? DEFAULT_COUNTRY_OF_ORIGIN,
+          customsDescription: variantCustoms.customsDescription,
+          customsInherited: variantInherited,
         },
       })
       // WC can repeat a SKU across variations of one parent; keep the map authoritative
@@ -2120,9 +2290,157 @@ export function buildImsToWcProductPayload(product: {
   return updateData
 }
 
-export async function pushImsProductToWc(
+type PushImsProductToWcResult = {
+  success: boolean
+  error?: string
+  skipped?: boolean
+  warning?: string
+  /** A retry cannot help: the failure came AFTER WooCommerce accepted the PUT (a verification failure), or is a rejection or a configuration gap that repeats identically (4xx PUT, no SKU, no parent mapping). */
+  permanent?: boolean
+}
+
+/** The `recordKind` of the open record a failed IMS-to-WooCommerce product push leaves for the retry sweep. */
+export const WC_PRODUCT_PUSH_RETRY_KIND = 'product_push_retry'
+/** The `recordKind` of an open record for a push that failed AFTER a successful PUT. Visible in the sync log, never retried by the sweep. */
+export const WC_PRODUCT_PUSH_PERMANENT_KIND = 'product_push_failed'
+/** A failed push is retried for this long after it first failed; after that the FAILED row stays for an operator. */
+const WC_PRODUCT_PUSH_RETRY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000
+/** Per-product backoff: 1h after the first failure, then doubling (2h, 4h, ...), never past the retry window itself. */
+const WC_PRODUCT_PUSH_BACKOFF_BASE_MS = 60 * 60 * 1000
+/** A PUT answer that can never succeed on a retry: a 4xx rejection (not a timeout 408 or a rate limit 429). 5xx and transport errors stay retryable. */
+export function isPermanentWcPutRejection(error: string | undefined): boolean {
+  const status = /^WC API PUT error: (\d{3})\b/.exec(error ?? '')
+  if (!status) return false
+  const code = Number(status[1])
+  return code >= 400 && code < 500 && code !== 408 && code !== 429
+}
+
+/** The floor for one retry's time box, so a retry that starts at the very end of the budget is still not cut off before it can send. */
+const WC_PRODUCT_PUSH_RETRY_MIN_TIMEOUT_MS = 5_000
+
+export function nextProductPushRetryDelayMs(failures: number): number {
+  const exponent = Math.min(Math.max(failures, 1) - 1, 20)
+  return Math.min(WC_PRODUCT_PUSH_BACKOFF_BASE_MS * 2 ** exponent, WC_PRODUCT_PUSH_RETRY_WINDOW_MS)
+}
+
+type PushRetryState = { attempts: number; lastAttemptAt: string; nextDueAt: string }
+
+function readPushRetryState(payload: unknown): Partial<PushRetryState> {
+  if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) return {}
+  const raw = payload as Record<string, unknown>
+  return {
+    ...(typeof raw.attempts === 'number' ? { attempts: raw.attempts } : {}),
+    ...(typeof raw.lastAttemptAt === 'string' ? { lastAttemptAt: raw.lastAttemptAt } : {}),
+    ...(typeof raw.nextDueAt === 'string' ? { nextDueAt: raw.nextDueAt } : {}),
+  }
+}
+
+/**
+ * Push one IMS product to WooCommerce. A failure (an error answer, a timeout, a thrown error) is no longer dropped: it leaves ONE open FAILED
+ * ShoppingSyncLog row per product (recorded under a per-product lock, so concurrent failures cannot leave two). A failure BEFORE a successful
+ * PUT is picked up by `retryFailedWcProductPushes` with exponential backoff; a failure AFTER the PUT (a verification failure) is recorded as a
+ * permanent, visible row and never sent again. A later success closes the row. A push the settings or the hold skipped touches nothing.
+ */
+export async function pushImsProductToWc(productId: string): Promise<PushImsProductToWcResult> {
+  const result = await pushImsProductToWcOnce(productId)
+  if (result.skipped) return result
+  try {
+    if (result.success) {
+      await db.shoppingSyncLog.updateMany({
+        where: { connector: 'woocommerce', entityType: 'Product', entityId: productId, recordKind: { in: [WC_PRODUCT_PUSH_RETRY_KIND, WC_PRODUCT_PUSH_PERMANENT_KIND] }, status: 'FAILED' },
+        data: { status: 'SYNCED', syncedAt: new Date() },
+      })
+    } else {
+      await recordFailedProductPush(productId, result)
+    }
+  } catch (bookkeepingError) {
+    // Recording must never turn a push result into a throw for the caller.
+    console.error('[wc-product-push] could not record the push outcome', bookkeepingError)
+  }
+  return result
+}
+
+async function recordFailedProductPush(productId: string, result: PushImsProductToWcResult): Promise<void> {
+  const errorMessage = (result.error ?? 'unknown error').slice(0, 2000)
+  const recordKind = result.permanent ? WC_PRODUCT_PUSH_PERMANENT_KIND : WC_PRODUCT_PUSH_RETRY_KIND
+  await db.$transaction(async (tx) => {
+    // Two failures for one product (the save path and the sweep) take turns here, so the second sees the first's row and updates it.
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE}::int4, hashtext(${productId}))`
+    const open = await tx.shoppingSyncLog.findFirst({
+      where: { connector: 'woocommerce', entityType: 'Product', entityId: productId, recordKind: { in: [WC_PRODUCT_PUSH_RETRY_KIND, WC_PRODUCT_PUSH_PERMANENT_KIND] }, status: 'FAILED' },
+      orderBy: { createdAt: 'asc' },
+      select: { id: true, payload: true },
+    })
+    const now = Date.now()
+    const attempts = (readPushRetryState(open?.payload).attempts ?? 0) + 1
+    const state: PushRetryState = {
+      attempts,
+      lastAttemptAt: new Date(now).toISOString(),
+      nextDueAt: new Date(now + nextProductPushRetryDelayMs(attempts)).toISOString(),
+    }
+    if (open) {
+      await tx.shoppingSyncLog.update({ where: { id: open.id }, data: { errorMessage, recordKind, payload: state } })
+      return
+    }
+    await tx.shoppingSyncLog.create({
+      data: { direction: 'TO_CONNECTOR', status: 'FAILED', entityType: 'Product', entityId: productId, errorMessage, recordKind, payload: state },
+    })
+  })
+}
+
+/**
+ * Push again the products whose last push failed before a successful PUT, in the order they come due (backoff per product: 1h, 2h, 4h, ...
+ * capped at 7 days). Goes through `retry` (the caller's pushProductMetadata) so the settings gate and the producer hold apply exactly as for
+ * the first attempt. Stops starting new pushes at `deadlineAt`; the rest wait for the next pass. Returns counts only.
+ */
+export async function retryFailedWcProductPushes(
+  retry: (productId: string) => Promise<{ success: boolean; skipped?: boolean }>,
+  options?: { limit?: number; now?: number; deadlineAt?: number },
+): Promise<{ retried: number; resolved: number; remaining: number; deferred: number }> {
+  const now = options?.now ?? Date.now()
+  const since = new Date(now - WC_PRODUCT_PUSH_RETRY_WINDOW_MS)
+  const rows = await db.shoppingSyncLog.findMany({
+    where: { connector: 'woocommerce', entityType: 'Product', recordKind: WC_PRODUCT_PUSH_RETRY_KIND, status: 'FAILED', createdAt: { gte: since }, entityId: { not: null } },
+    orderBy: { createdAt: 'asc' },
+    select: { entityId: true, payload: true, createdAt: true },
+    take: 1000,
+  })
+  const due = new Map<string, number>()
+  for (const row of rows) {
+    if (row.entityId == null || due.has(row.entityId)) continue
+    const state = readPushRetryState(row.payload)
+    const dueAt = state.nextDueAt ? Date.parse(state.nextDueAt) : Number.NEGATIVE_INFINITY
+    if (!Number.isNaN(dueAt) && dueAt > now) continue
+    due.set(row.entityId, Number.isNaN(dueAt) ? Number.NEGATIVE_INFINITY : dueAt)
+  }
+  const ordered = [...due.entries()].sort((a, b) => a[1] - b[1]).map(([id]) => id)
+  const ids = ordered.slice(0, options?.limit ?? 50)
+  let resolved = 0
+  let retried = 0
+  for (const id of ids) {
+    if (options?.deadlineAt != null && Date.now() >= options.deadlineAt) break
+    retried++
+    try {
+      // Time-box the whole retry (its GET, re-read and PUT) to what is left of the budget: the ambient signal is folded into every
+      // WooCommerce request, so one slow store cannot run a single retry minutes past the budget.
+      const remaining = options?.deadlineAt != null ? options.deadlineAt - Date.now() : Number.POSITIVE_INFINITY
+      const outcome = Number.isFinite(remaining)
+        ? await runWithWcAttemptFence(
+            { signal: AbortSignal.timeout(Math.max(remaining, WC_PRODUCT_PUSH_RETRY_MIN_TIMEOUT_MS)), stillOwned: async () => true },
+            () => retry(id),
+          )
+        : await retry(id)
+      if (outcome.success && !outcome.skipped) resolved++
+    } catch (error) {
+      console.error('[wc-product-push] retry threw', error)
+    }
+  }
+  return { retried, resolved, remaining: retried - resolved, deferred: ordered.length - retried }
+}
+
+async function pushImsProductToWcOnce(
   productId: string,
-): Promise<{ success: boolean; error?: string; skipped?: boolean; warning?: string }> {
+): Promise<PushImsProductToWcResult> {
   try {
     // The writer re-checks on its own, whatever the caller did: `wc_sync_product_enabled` and
     // `wc_sync_product_direction` decide whether IMS may write to the live product at all. A read
@@ -2149,7 +2467,7 @@ export async function pushImsProductToWc(
         parent: { select: { sku: true, externalProductId: true } },
       },
     })
-    if (!product?.sku) return { success: false, error: 'Product has no SKU' }
+    if (!product?.sku) return { success: false, permanent: true, error: 'Product has no SKU' }
 
     const updateData = buildImsToWcProductPayload(product)
 
@@ -2162,7 +2480,7 @@ export async function pushImsProductToWc(
     if (product.parent?.sku) {
       const parentWcId = product.parent?.externalProductId != null ? Number(product.parent.externalProductId) : null
       if (!parentWcId || !product.parent?.sku) {
-        return { success: false, error: `Variant ${product.sku} is missing a WooCommerce parent mapping` }
+        return { success: false, permanent: true, error: `Variant ${product.sku} is missing a WooCommerce parent mapping` }
       }
 
       let variationId = product.externalProductId != null ? Number(product.externalProductId) : null
@@ -2298,15 +2616,15 @@ export async function pushImsProductToWc(
     }
 
     const { data: putData, error: putError } = await wcPut(putPath, updateData, creds)
-    if (putError) return { success: false, error: putError }
+    if (putError) return { success: false, ...(isPermanentWcPutRejection(putError) ? { permanent: true } : {}), error: putError }
     if (expectedMpn && wcResponseConfirmsMpn(putData, expectedMpn.key, expectedMpn.mpn) === false) {
       // A plugin filter can reject a meta write and still answer 200: do not call that a success.
-      return { success: false, error: `WooCommerce accepted the request but did not store the MPN under ${expectedMpn.key}` }
+      return { success: false, permanent: true, error: `WooCommerce accepted the request but did not store the MPN under ${expectedMpn.key}` }
     }
     if (expectedGuidCleared) {
       const stored = (putData as { global_unique_id?: unknown } | null)?.global_unique_id
       if (typeof stored === 'string' && stored.trim() !== '') {
-        return { success: false, error: 'WooCommerce accepted the request but did not clear the stale GTIN field' }
+        return { success: false, permanent: true, error: 'WooCommerce accepted the request but did not clear the stale GTIN field' }
       }
     }
 
@@ -2408,6 +2726,66 @@ export async function syncAllWcProducts(
 
   await reportProgress('Preparing WooCommerce product import...', 0)
 
+  // THE WAY BACK for a buried product. The walk below reads by `modified_after`, so a product buried
+  // by an earlier run is only found again if WooCommerce touches it; an IMS-side fix does not. Re-attempt a
+  // bounded number of the ids recorded as buried, fetched directly, IN ADDITION to the window. Skipped on a
+  // full import (no cursor): that walk covers every product anyway.
+  const conflictDelta: PermanentConflictDelta = { add: [], remove: [], attempted: [], failed: [] }
+  const stuckRetries: string[] = []
+  const noteRetryFailure = (entry: { id: number; sku: string; attempts?: number }, error: string) => {
+    // A failing re-attempt is recorded on its own id and NEVER held against the product cursor: the window walk is
+    // what the cursor describes, and one stuck id must not stop every later change being picked up.
+    conflictDelta.failed.push({ id: entry.id, error })
+    if ((entry.attempts ?? 0) + 1 >= PERMANENT_CONFLICT_ATTEMPT_WARNING_THRESHOLD) stuckRetries.push(`${entry.sku || `id ${entry.id}`} (${(entry.attempts ?? 0) + 1} attempts: ${error.slice(0, 100)})`)
+  }
+  const recoveredSkus: string[] = []
+  const storedConflicts = await readPermanentConflicts()
+  const storedConflictIds = new Set(storedConflicts.map((item) => item.id))
+  if (modifiedAfter && storedConflicts.length > 0) {
+    const { chosen, notAttempted } = selectPermanentConflictReattempts(storedConflicts)
+    for (const entry of chosen) {
+      const { creds: retryCreds, syncVersion: retryVersion } = await snapshotProductSyncContext()
+      const { data: fetched, error: fetchError } = await wcFetch(`/products/${entry.id}`, {}, retryCreds)
+      if (fetchError) {
+        if (/^WC API error: 404\b/.test(fetchError)) {
+          // Gone from WooCommerce: nothing left to import, so nothing left to keep re-attempting.
+          conflictDelta.remove.push({ id: entry.id, at: new Date().toISOString() })
+        } else {
+          noteRetryFailure(entry, fetchError)
+        }
+        continue
+      }
+      const fetchedProduct = fetched as WcFullProduct | null
+      if (!fetchedProduct || !fetchedProduct.sku) {
+        // A product with no SKU is skipped by the main loop too: it cannot be imported, so stop carrying it.
+        conflictDelta.remove.push({ id: entry.id, at: new Date().toISOString() })
+        continue
+      }
+      const retried = await syncWcProductToIms(fetchedProduct, retryVersion)
+      if (retried.success) {
+        result.synced++
+        conflictDelta.remove.push({ id: entry.id, at: new Date().toISOString() })
+        recoveredSkus.push(fetchedProduct.sku)
+      } else if (retried.permanent) {
+        // Still buried: already reported when it was first buried, so not re-announced every run.
+        conflictDelta.attempted.push(entry.id)
+      } else {
+        noteRetryFailure(entry, retried.error ?? 'import failed')
+      }
+    }
+    if (notAttempted.length > 0) {
+      // A bound that stays quiet reads as "covered everything".
+      await logActivity({
+        entityType: 'SYNC', action: 'wc_product_conflict_reattempt_deferred', tag: 'sync', level: 'WARNING',
+        description: `${notAttempted.length} of ${storedConflicts.length} buried WooCommerce product(s) were NOT re-attempted this run `
+          + `(at most ${MAX_PERMANENT_CONFLICT_REATTEMPTS} per run; least recently attempted go first, so later runs reach them). `
+          + `Not re-attempted: ${notAttempted.slice(0, 20).map((item) => item.sku || `id ${item.id}`).join(', ')}${notAttempted.length > 20 ? `, and ${notAttempted.length - 20} more` : ''}.`,
+        metadata: { mode, notAttemptedIds: notAttempted.slice(0, 50).map((item) => item.id), stored: storedConflicts.length },
+        resolveUser: false,
+      })
+    }
+  }
+
   // THE CEILING, NOT THE HEADER. `totalPages` is progress text from here on: a store that sends an
   // empty or absent `x-wp-totalpages` used to end this walk after page one with NO error, and the
   // cursor below advanced past every product it never asked for (o3d-xnwu).
@@ -2465,6 +2843,7 @@ export async function syncAllWcProducts(
       processedProducts++
       if (r.success) {
         result.synced++
+        if (storedConflictIds.has(product.id)) conflictDelta.remove.push({ id: product.id, at: new Date().toISOString() })
       } else if (r.permanent) {
         // The SAME classification the webhook path acts on (o3d-gtk). Re-importing this payload
         // reaches the identical conflict, so it must not hold the cursor — but it is not swallowed
@@ -2472,6 +2851,7 @@ export async function syncAllWcProducts(
         // `PERMANENT_CONFLICT:`-prefixed FAILED row in the sync log written by syncWcProductToIms.
         result.permanentErrors.push(`SKU ${product.sku}: ${r.error}`)
         permanentConflictSkus.push(product.sku)
+        conflictDelta.add.push({ id: product.id, sku: product.sku })
       } else {
         result.errors.push(`SKU ${product.sku}: ${r.error}`)
       }
@@ -2512,9 +2892,9 @@ export async function syncAllWcProducts(
       + `${result.permanentErrors.length} product(s) and never will without an operator: `
       + `${permanentConflictSkus.join(', ')}. The sync cursor was advanced past them so the rest of `
       + 'the catalogue keeps syncing. Resolve the duplicate SKU / barcode / WooCommerce id, or the '
-      + 'product-structure conflict on /sync/exceptions — then re-save the product in WooCommerce so '
-      + 'it restamps date_modified and the next poll picks it up, because a fix made only in IMS '
-      + 'leaves nothing for the cursor to find.',
+      + 'product-structure conflict on /sync/exceptions. Each later run re-fetches these products by id '
+      + '(a bounded number per run) and imports them once the conflict is gone, with no '
+      + 'change needed on the WooCommerce side.',
     metadata: { mode, skus: permanentConflictSkus, permanentErrors: result.permanentErrors },
   }
 
@@ -2527,10 +2907,9 @@ export async function syncAllWcProducts(
   // SKUs at all, and half of the remedies are IMS-side (clear the IMS product's external mapping,
   // resolve the structure conflict on /sync/exceptions) — those do not move WooCommerce's
   // `date_modified`, so the fixed product is not re-imported until WooCommerce next touches it.
-  // The ERROR line above therefore names that step explicitly. This is the same property the
-  // webhook path has had since o3d-gtk, and the automatic re-drive is filed as a follow-up; it is
-  // not a reason to keep the cursor pinned, because a pinned cursor re-reads the WHOLE catalogue
-  // every cycle for ever and still never imports the conflicted product.
+  // The bounded re-attempt list at the top of the run is the way back; the ERROR line above says so.
+  // The webhook path has the same property. It is not a reason to keep the cursor pinned, because a
+  // pinned cursor re-reads the WHOLE catalogue every cycle for ever and still never imports the conflicted product.
   // A WALK THAT NEVER ENDED IS AN ERROR, AND IT LANDS IN `errors` SO THE CURSOR IS HELD (o3d-xnwu).
   // Not in `permanentErrors`: nothing about the catalogue is established by a truncated read, so
   // nothing may be buried. `break` on a fetch error above already pushed its own error, so this
@@ -2553,6 +2932,39 @@ export async function syncAllWcProducts(
       level: 'ERROR',
       description: result.errors[result.errors.length - 1],
       metadata: { mode, cursorKey, modifiedAfter, pagesRead: page - 1, ceiling: MAX_WC_PAGE_WALK_PAGES },
+      resolveUser: false,
+    })
+  }
+
+  // Record the burials and the recoveries BEFORE the cursor moves past them, so a burial that is
+  // not on the list never has its cursor advanced (a failed write throws and the cursor stays).
+  const { rejected: unlistedConflicts } = await recordPermanentConflictDelta(conflictDelta)
+  if (unlistedConflicts.length > 0) {
+    // The list is FULL (a bound that is not expected to be reached). It never evicts, and it never holds the cursor
+    // either: holding it would re-read a growing window for ever. The overflowing products are recorded durably in
+    // `wc_product_conflict_overflow` (written with the list, under its lock) and named in this ERROR.
+    const unlistedNames = unlistedConflicts.slice(0, 20).map((item) => item.sku || `id ${item.id}`).join(', ')
+    const message = `The list of buried WooCommerce products is full (${MAX_STORED_PERMANENT_CONFLICTS}), so ${unlistedConflicts.length} new product(s) with a conflict cannot be re-attempted automatically `
+      + `(${unlistedNames}). The product sync carries on. These products stay listed until their conflicts are fixed. They are kept in the setting wc_product_conflict_overflow.`
+    await logActivity({
+      entityType: 'SYNC', action: 'wc_product_conflict_list_full', tag: 'sync', level: 'ERROR',
+      description: message,
+      metadata: { mode, unlistedIds: unlistedConflicts.slice(0, 50).map((item) => item.id) },
+      resolveUser: false,
+    })
+  }
+  if (stuckRetries.length > 0) {
+    await logActivity({
+      entityType: 'SYNC', action: 'wc_product_conflict_reattempt_stuck', tag: 'sync', level: 'WARNING',
+      description: `${stuckRetries.length} buried WooCommerce product(s) have failed their automatic re-attempt ${PERMANENT_CONFLICT_ATTEMPT_WARNING_THRESHOLD} or more times in a row for a reason that may clear by itself (a store or database error), so they are still not imported: ${stuckRetries.slice(0, 10).join('; ')}. The product sync itself is not held back by them.`,
+      metadata: { mode, count: stuckRetries.length },
+      resolveUser: false,
+    })
+  }
+  if (recoveredSkus.length > 0) {
+    await logActivity({
+      entityType: 'SYNC', action: 'wc_product_conflict_recovered', tag: 'sync', level: 'INFO',
+      description: `Imported ${recoveredSkus.length} previously buried WooCommerce product(s) on re-attempt: ${recoveredSkus.slice(0, 20).join(', ')}.`,
       resolveUser: false,
     })
   }

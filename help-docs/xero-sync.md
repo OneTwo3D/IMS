@@ -479,6 +479,7 @@ Disconnect) is ignored and re-resolved rather than used against a ledger that ne
 | Discounts Given | Revenue / Expense | Order-level discounts |
 | Purchases | Direct Cost | Default account for purchase bills |
 | Stock in Transit | Asset | Goods ordered but not yet received, and (when refund returns are held in transit) refunded goods not yet back |
+| GR/IR (goods received, not invoiced) | Liability / Current liability | Clearing account the daily batch moves goods received but not yet billed into, out of Stock in Transit. Used only while **GR/IR accrual posting** is switched on; must differ from Stock in Transit |
 | Inventory Asset | Asset | Stock on hand (available) |
 | Allocated Inventory | Asset | Stock reserved for paid orders awaiting dispatch (stock on an order that ships before it is paid goes straight from Inventory to COGS and never passes through here) |
 | Cost of Goods Sold | Direct Cost | COGS booked when goods ship |
@@ -491,6 +492,8 @@ Disconnect) is ignored and re-resolved rather than used against a ledger that ne
 | EU IOSS/VOEC VAT collected, EU DDP charges collected, EU landed-cost fees | See the EU sections below | Three roles for the EU VAT treatment. Configuration only and **not yet switched on**: leave them blank until told otherwise (see the EU sections below) |
 
 **Rounding adjustment on documents (invoices, bills, credit notes, supplier credits).** IMS keeps unit prices to six decimal places and Xero keeps four, so for a line such as 1,000 x 0.333333 Xero's own total, with its per-line tax, can differ from IMS's by a few pence, and a full payment would not settle the document. IMS predicts the whole total Xero will hold (each line rounded to the penny, tax worked out per line and rounded, for tax-exclusive and tax-inclusive documents), and when it differs adds one "Rounding adjustment" line (quantity 1, tax type No VAT) on the Rounding Difference account for exactly the difference. The document is then predicted again and must equal the IMS total. If it cannot be, nothing is sent and the sync row says why: no Rounding account is mapped, the tax rate of a line is not in the stored Xero tax-rate list (or the list is stale or the type has several components), or the difference is more than rounding can explain.
+
+**Rounding to the order total (setting `xero_round_to_order_total_enabled`, off by default).** Xero works tax out per line while IMS's order total is worked out for the whole order, so even with no four-decimal loss a sales invoice can total a penny or two differently from the order (two lines of 0.025 at 20%: the order is 0.06, Xero's document 0.08), and a full payment cannot settle it. With the setting on (`true`), a sales invoice raised from an order carries the order total and the same single "Rounding adjustment" line is sized so the document totals exactly the order total. The adjustment is limited to the sum of two allowances: the rounding allowance of the document (0.02 a line, plus a tiny extra for four-decimal prices) and the order reconciliation tolerance (0.005 a line plus 0.03, with that tolerance alone capped at 1.00). The two are added and the sum is not clamped, so on a large order the limit can be a little over 1.00; anything bigger is refused with nothing sent. A credit note takes the order total only when it is the order's single full refund or a chargeback, and only from the invoice version Xero holds (if a newer invoice update is queued, failed or of unknown outcome, the credit note is posted per line). An order reversed through two or more refunds, for example a partial refund followed by a final one, is not rounded: each credit note posts at its per-line total, so against an invoice that was rounded the last pennies (the rounding amount) stay open and are settled by hand. With the setting off nothing changes: the document is built exactly as before, and the setting never changes the posting key of a document that is already queued.
 
 ## How Sync Works — Flowchart
 
@@ -703,6 +706,10 @@ This is why it matters: if the Discount account was configured *after* an invoic
 invoice charged the full goods value. Reversing it with a discount line would credit less than was
 charged and silently leave the difference on the customer's account.
 
+**Credit note void (a refund deleted in IMS).** When a refund recorded in error is deleted in IMS (see the Refunds help page), a credit note that was already posted is voided in Xero through the normal outbox. The delete is two-phase: IMS changes nothing about the refund until this entry succeeds, and then unwinds the refund as part of the same entry (a failure in that second step leaves the entry failed; retrying it repeats the harmless void read and finishes the delete). The sync page shows it as **Credit note void** against the deleted refund. It is **off unless** the credit note sync type is on, it follows the same posting hold as every other write (nothing is sent while outbound writes are held), and it is queued by the delete itself, never sent from the delete.
+
+How it behaves when it runs: it **reads the credit note first** and decides from what is there, so a retry after a lost response, or after a partial failure, converges. A credit note already **Voided** (or deleted) is a success and nothing is sent. An *Authorised* one is set to **Voided**; a draft one is deleted. One that has been **allocated to an invoice or paid out in Xero** is refused with that reason and is never changed: reverse the allocation or payment in Xero, then retry the entry. The credit note keeps its number as its audit trail; numbers are never reused because they come from a counter that does not go back. IMS refuses to start the delete when the credit note's date is on or before the lock date it last read from Xero, because Xero does not accept a change in a locked period. A posted COGS reversal journal is countered the same way, by a new journal with its lines swapped, queued as a COGS reversal against the deleted refund; an unsent one is simply cancelled.
+
 ## Transaction Types
 
 Configure which documents are synced to Xero under **Integrations → Xero → Transaction Types**. Each type can be set to **Off**, **Draft**, or **Submitted** (AUTHORISED in Xero):
@@ -728,6 +735,8 @@ is the one already recorded on the sales order:
 | Manual / IMS-created | The order's own invoice number if one has been generated, otherwise the Invoice Prefix from Settings → Company → Document Numbering plus the order reference |
 
 Two things follow from this, and both matter.
+
+A number is minted only when none is queued: if the order's invoice is already queued or posted, **Generate invoice number** (and the on-paid and on-shipped triggers) record the number that invoice was queued under instead of minting a second one, so the number on the PDF is the number in Xero.
 
 **One order, one number.** The create is an *update-or-create on `InvoiceNumber`*, so re-posting the
 same order replaces its own document instead of adding a second one. That property only holds while
@@ -822,6 +831,10 @@ And the check costs one extra Xero API call per sales-invoice create, which coun
 > re-imported, backfilled or re-queued, and treat a refusal as the system working. Switch xeroom off
 > for the orders IMS will handle before enabling Sales Invoices against the live organisation.
 
+## Order attachments are not sent to Xero
+
+Files attached to purchase and sales orders (the **Attachments** card on the order page) are **never** pushed to Xero in this version. They stay in IMS. The existing bill-attachment follow-up (`BILL_ATTACHMENT`, which attaches a supplier invoice PDF to the bill) is unchanged and does not read order attachments. Whether supplier documents should follow the bill into Xero is an open decision for the owner; until it is made, attach the document in Xero by hand if the accountant needs it there.
+
 ## Multi-Currency FX Rates
 
 Every sales invoice, purchase bill, credit note and **payment** pushed to Xero is stamped with a `CurrencyRate` derived from IMS's own rate: a document's stored `fxRateToBase` (SalesOrder, PurchaseOrder, SalesOrderRefund), a payment's settlement rate. This stops Xero from substituting its own daily XE.com rate, which previously caused 1–3 % drift between IMS base totals and Xero base totals on the same multi-currency document. **A foreign-currency document or payment without a usable IMS rate is never sent**: it is refused (see the table below), because leaving `CurrencyRate` out is exactly what makes Xero apply its own rate.
@@ -880,6 +893,24 @@ CurrencyRate sent on Invoice / Bill / CreditNote API call
 
 **A stored receipt is never left unregistered.** A receipt (a payment recorded by hand with Add payment, a WooCommerce paid transition, an imported paid order) is committed before its INVOICE_PAYMENT is queued. If the invoice had not posted yet, the invoice post registers it. If the invoice had already posted and the queueing failed, nothing used to retry it; now the scheduled FX-rates cron run sweeps every non-refund receipt on a posted invoice that has no INVOICE_PAYMENT row and no refusal notice (receipts older than 5 minutes, up to 50 per run, oldest first, recently failed ones behind) and registers it. Registration is keyed per receipt and document, so the inline call and the sweep never register it twice. Nothing is swept when no accounting connector posts payments.
 
+### Payment matching (Sync > Payment matching)
+
+A customer receipt IMS holds but Xero does not (a manual payment recorded after the invoice posted, a receipt of a payment method that had no bank account mapped at the time, a foreign-currency receipt refused for a missing rate) used to stay unregistered until someone noticed the unsettled badge. The **payment matching pass** looks for these on every FX-rates cron run (up to 50 per run) and matches each one to the open Xero invoice of its order, **by payment method and currency**, using the same *Payment Account Mapping* as every other payment. It is a sweep, not an event, and it adds no second way of posting: a live registration goes through the same path as Add payment and the receipt sweep above.
+
+**The mode** is set on the Sync > Payment matching page (administrators only) and is **off by default**:
+
+| Mode | What happens |
+|---|---|
+| **Off** | The matching pass does nothing. It does not stop the scheduled receipt sweep described above, which registers receipts with no payment row and no refusal notice in every mode. |
+| **Shadow** | Every candidate receipt is evaluated and listed on the page: the payment, the invoice, the bank account, the amount, the amount still open on the invoice, and the reason when it cannot be matched. **The matching pass sends nothing to Xero** and queues no sync row. Only receipts the scheduled receipt sweep leaves alone (those that carry a refusal notice) are listed, because the sweep registers every other eligible receipt in every mode, so listing it as "would post" would report work already done. Use it to review what live would do. |
+| **Live** | A receipt the evaluation says would post is claimed (one durable row per receipt, so a rerun or two sweeps at once cannot register it twice) and registered through the existing path. |
+
+**What the pass never does.** It never guesses a bank account: no mapping for the payment method and currency means *Not matched*, and the page says which method and currency to map. A receipt in a different currency from its invoice is *Not matched*. It never pays more than the amount still open on the invoice, in the invoice's currency (a part payment within what is open is allowed, as for any receipt). It never moves a payment out of a locked period: a receipt dated on or before the books lock date IMS imported from Xero is *Held back* and keeps its own date. A foreign-currency receipt without its stored settlement rate is *Held back*. While the outbound write hold is on, every match is *Held back* and nothing is posted.
+
+**Reading the page.** *Would post* (shadow only) is what live would register. *Not matched* means there is no safe match until the mapping or the currency is fixed. *Held back* names the rule that stops it (locked period, outbound write hold, over the amount due, an earlier payment attempt on the invoice that must be checked in Xero first). *Failed, will retry* is a live registration that did not reach the record; it is retried each run up to five times, then left for a person. *Registered* rows leave the list; the registration then posts like any other and shows in the sync log.
+
+A receipt that already has a payment row in the sync log is never a candidate: its registration, in whatever state, belongs to the retry paths described below.
+
 **Manual overrides and push log.** Settings → Accounting → **FX Rates** shows the current rate per currency, with a source badge (`ECB (frankfurter)`, `Aelia (before markup)` or `Manual override`). Pin a manual rate via the pencil icon — the daily fetch will then skip that currency until the override is cleared (the undo icon re-fetches from frankfurter). The same panel includes a recent-pushes table (one row per fan-out attempt to a shopping connector) so you can see whether the latest push to WooCommerce succeeded.
 
 The full unified-FX rollout plan is tracked in `docs/todo/unified-fx-rates-plan.md`.
@@ -903,6 +934,23 @@ When enabled, the nightly cron job runs three groups in sequence:
 **Refunds entered before the first run.** A refund recorded before an order's first batch run (a net refund, from this release's refund writer) is netted out of that order's revenue deferral, so a partial refund no longer leaves Unearned Revenue holding the refunded value. The deferral journal itself stays at the full amount on the day the order was paid, and each such refund is posted as its own adjustment (DR Unearned Revenue / CR Sales) dated the day of the refund (never before the payment), so a refund entered in a later period never changes an earlier period's journal. Each refund records the adjustment journal that netted it, so a lost adjustment is rebuilt exactly once by the missing-batch sweep and reported by the accounting checks (`refund_deferral_adjustment_without_sync_evidence`) until it is. Refunds recorded after the deferral keep using the refund reversal journals described above. A refund from before refunds were stored net is not netted (its tax-inclusive total cannot be subtracted from a tax-exclusive deferral) and is left for the lifecycle tie-out to report.
 
 Group A1 reads each order's subtotal, shipping and discount to work out how much revenue to defer, and it reads them before it opens the transaction that writes the journal. If any of those orders changes in that window — in practice only the one-off WooCommerce coupon backfill does this — the whole group is **refused rather than posted**, because the journal it had prepared would no longer match the orders it names. Nothing is staged and no order is marked as deferred, so the next night's run simply recalculates from the corrected figures. The refusal appears in the run's errors and as an `accounting_daily_batch_stale_order_discount` entry in the activity log, naming each affected order and both amounts. The same applies to the QuickBooks daily batch.
+
+### GR/IR accrual posting (goods received, not invoiced)
+
+IMS keeps a **GR/IR sub-ledger** (see Purchasing) that accrues with every receipt, bill, bill edit, supplier return and return credit note. **Posting it to Xero is off by default.** The setting is **GR/IR accrual posting** (`grir_xero_posting_enabled`, Settings > Accounting > Xero > Sub-Ledger), and the account is **GR/IR** (`xero_grir_account`). While the switch is off the daily batch reads nothing, stages nothing and consumes nothing, and the sub-ledger and the GR/IR report keep accruing; nothing reaches Xero.
+
+IMS already posts a receipt as **DR Inventory / CR Stock in Transit** and a bill as **DR Stock in Transit / CR Accounts Payable**, and Stock in Transit already nets the two to zero. What was missing is the separation: goods received before the bill leave a **credit** hidden in Stock in Transit. Posting Inventory DR / GR/IR CR on receipt and GR/IR DR / AP CR on the bill **on top** would count the stock and the liability twice, so the switch adds a **reclass** instead. When it is on and the Daily Batch is on, each run takes every GR/IR movement not yet consumed, groups it by journal date (a date in a locked period is moved to the first open day, and the run waits while the lock reaches today, exactly like the other groups), and stages one **GR/IR reclass** journal per date for the net:
+
+- net **received not billed** rose: **DR Stock in Transit / CR GR/IR**
+- net fell (a bill, a return): **DR GR/IR / CR Stock in Transit**
+
+Together with the receipt and bill journals that is exactly Inventory DR / GR/IR CR on receipt and GR/IR DR / AP CR on the bill, and Stock in Transit is left holding only what is genuinely in transit (billed, not received) and freight. Each journal is also recorded in the transit sub-ledger (source `GRIR_RECLASS`), so the Stock in Transit reconciliation keeps tying out; the reconciliation pack's transit schedule counts it as its own leg. The movements a journal was built from are stamped with its reference in the same step, so no movement is ever posted twice, and a day that nets to nothing posts no journal.
+
+- **Freight and landed cost** are not in GR/IR; they follow the Stock in Transit path as before. **A price difference** between a bill and the order is not in GR/IR either (see Purchasing); it stays on Stock in Transit.
+- **It goes through the same write seam and hold as every Xero posting.** With the producer hold enforced, the journal is recorded as a shadow (status Cancelled, never posted by IMS), nothing is queued, and the transit sub-ledger records nothing, because the ledger did not move. The movements behind a shadowed journal are **not consumed** (unlike the sales batches), so they post on the first run after the hold is lifted.
+- If the switch is on but Stock in Transit or the GR/IR account is not mapped, the run says so in its errors and consumes nothing; the movements wait.
+- Switching it on later posts the movements accrued since the sub-ledger began (their net is the open balance), dated by the day each happened.
+- A journal Xero rejects is retried like any other daily batch journal. A journal an operator cancels is not rebuilt, as for the other batches.
 
 ### Payment Polling
 
@@ -1215,6 +1263,27 @@ If the active accounting connector is QuickBooks (not Xero), IMS records a
 `sales_invoice_update_skipped_unsupported_connector` WARNING and does not queue the update. The
 behaviour is symmetric with the purchase bill path.
 
+### Deleting a synced invoice or bill (off by default)
+
+An invoice or supplier bill that IMS itself pushed to Xero can be deleted in IMS and Xero together, with its reference number freed for a replacement. The setting **Allow deleting synced invoices and bills** (**Integrations → Xero → Deleting synced documents**) is **off by default**; while it is off no Delete button is shown and nothing described here happens.
+
+When it is on, the **Delete invoice** button (sales order page) and **Delete bill** button (purchase order page) appear for people who can already edit that document (`sales.process` for an invoice, `purchasing.invoice` for a bill). Confirming queues one `SALES_INVOICE_DELETE` or `PURCHASE_INVOICE_DELETE` entry in the normal Xero queue, so every write goes through the same outbound queue and the same outbound-write hold as every other Xero write. While writes to Xero are held, IMS tells the operator so, queues nothing, and changes nothing in IMS or Xero.
+
+**What Xero is sent, in this order:**
+
+1. The document's number (and Reference, when it has one) is changed to `<number>-DEL-<6 random characters>` (for example `INV-1001-DEL-K7M2QX`), which frees `INV-1001` for a replacement. Xero keeps the number of a voided or deleted document reserved, which is why the number is changed first.
+2. The document's status is set to **DELETED** (a draft or submitted document) or **VOIDED** (an authorised document with no payments or credit applied).
+
+The suffix is chosen once, when the delete is queued. IMS reads the document in Xero before each attempt, so a retry after the second write failed sees the number already changed and makes only the status write; it never adds a second suffix. A document already voided or deleted is treated as done.
+
+**What IMS does, when Xero has confirmed:** an invoice's order loses its invoice number, date and Xero link (so the order reads as not invoiced and no longer holds the number), the invoice's accounting events are voided, and its stored PDF copies are withdrawn (they are kept, as statutory records are). A bill and its lines are removed (a snapshot is kept on the deletion record), the purchase order's invoiced marker is cleared when no other bill remains, and the Stock in Transit sub-ledger movement the bill recorded is reversed by an equal and opposite movement. An activity-log entry is written when the delete is requested and when it completes. Until Xero confirms, IMS is unchanged, and an edit sent to the document in the meantime is refused.
+
+**When the delete is refused** (the page shows the reason in place of the button; every one of these tells the operator to remove the blocking items in the accounting system first, where that is the remedy):
+
+Payments (a receipt on the invoice, an order held as paid, a payment on the bill); credit notes (a refund or credit note on the invoice, a supplier credit note on the bill); a document dated on or before the imported Xero books lock date; a document IMS did not create (raised by another system during the parallel run, or linked by hand; for an invoice the invoice-number ownership check must also show Xero holds the number under that very document); another posting or a delete still queued for it. At the moment of the delete IMS also reads Xero: a payment, credit note or allocation IMS did not know about, a different document type or a different number changes nothing and reports why.
+
+Refund and credit-note deletion is not part of this. After a delete, a replacement invoice that is identical in content to the deleted one can still be treated as already posted by the posting dedupe; raise the replacement with a changed line or reference.
+
 ### Cancelling an order while its invoice is posting
 
 Cancelling a sales order retires any invoice work still queued for it, so the ledger never receives
@@ -1356,6 +1425,12 @@ Only record it if that is true. If one of them **is** the earlier attempt's paym
 check — settle that entry as posted instead. A recorded check is **your assertion**, not something IMS
 verified, and it is logged against your account. IMS then registers the receipt again through the same
 checks, and checks the ledger once more immediately before the payment is sent.
+
+The same hold can meet a receipt's **first** post, when no earlier IMS attempt exists: the receipt is refused
+before anything is sent (*IMS could not establish what the accounting connector already holds*), and the entry
+becomes `FAILED`. That refusal now names the same remedy. Open the listed payment in Xero and, if it is not a
+payment for this receipt, record **Checked the ledger** on that entry (choose the receipt it belongs to); the
+entry's next automatic attempt reads the check.
 
 What a check does **not** do, by design:
 
@@ -1927,6 +2002,8 @@ When a sales invoice is synced to Xero and payment is registered:
 3. A signed download link is pushed to the WooCommerce order as a customer-visible note
 4. An admin-only note with a "View in Xero" link is added to the WC order
 
+For an invoice **Xeroom** (not IMS) posted, IMS finds it in Xero read-only by its number, fetches the PDF and keeps it as the customer's one invoice; see the **Customer invoice in My Account** runbook (`docs/ops/invoice-documents-switchover-runbook.md`). Orders from before this existed are fetched on the customer's first click (queued, then fetched in the background within the shared 5,000-a-day Xero allowance, with a per-day cap), never in bulk. Credit notes are separate documents. IMS only reads from Xero for all of this; it writes nothing to Xero.
+
 Invoice PDFs are accessible via a signed URL: `/api/invoices/[orderId]?token=<hmac>`. The token is generated using HMAC-SHA256 and verified with timing-safe comparison.
 
 ## Xero Deep Links
@@ -2379,6 +2456,8 @@ to erase, and the warning is raised only for what that record names. Two consequ
 - a row that owed nothing recoverable is now **settled silently**, with no warning at all. That is
   the intended outcome, not a missing alarm: there was nothing to lose.
 
+**A compacted journal keeps its per-account net.** Retention writes each reversal-proof journal's per-account totals (codes and two numbers, no names) onto the row as it clears the payload, and the proof reads them once the lines are gone; a journal that cannot be summarised is left uncompacted and reported. A journal compacted **before this shipped** has neither, stays unprovable, and the credit is posted by hand. The refund and the daily batch treat such an unearned-revenue reversal as an **unknown amount, never zero**: the refund reverses no unearned revenue and logs a warning, and the daily batch skips that order's shipments (warning logged, nothing journaled) until the reversal is readable.
+
 A follow-up rebuilt from a tombstone also carries the organisation the original row was raised
 against — recorded in a column retention does not touch — so it can be posted. Before, it was queued
 carrying nothing and refused at the socket, which meant the PDF the table promised never actually
@@ -2410,6 +2489,10 @@ All cron endpoints require the `CRON_SECRET` bearer header in production. These 
 ### Account balance snapshots (Trial Balance)
 
 The snapshot pull reads Xero's Trial Balance and stores, per configured account, the balance at the report date: **YTD Debit minus YTD Credit**, so a credit-balance account such as Income in Advance is negative. Columns are found by **name** in the report's Header row (a blank cell is an empty string and means zero), never by position among the cells that happen to hold a number, and the period columns (Debit, Credit) are never used as a balance. A report with no Header, or with no YTD Debit / YTD Credit columns, is refused as a whole; a row with a non-money YTD cell or a different cell count from the Header is refused, and a configured account whose row is refused gets a named error (`TB_NON_MONEY_CELL`, `TB_ROW_CELL_COUNT`, `TB_NO_HEADER`, `TB_NO_YTD_COLUMNS`) and **nothing is stored for it**. **Balances stored before this fix were misread (blank cells were dropped, which shifted values into the wrong column) and must be re-pulled.** The pull upserts by connector + account + balance date + currency (`persistAccountingAccountBalanceSnapshots` in `lib/domain/accounting/account-balance-snapshots.ts`), so re-running it for a date replaces that date's row; there is no backfill, and the reconciliation pack, inventory GL reconciliation and transit reconciliation read correct figures only for dates pulled after this fix.
+
+**Inventory reconciliation: no standing residue.** A rounding sweep is posted only while the NET of the sweeps of the trailing 30 days (a debit counts plus, a credit minus, so residue that alternates in sign nets out; failed and cancelled sweeps are not counted) stays within £5. A residue that would take the net past that is not posted and is reported as a warning, "recurring small residue not swept (cap reached)", since a small amount that recurs in one direction every day is an error, not rounding. A gap larger than the per-day limit is still a critical mismatch.
+
+**Independent check of the COGS and Transit sub-ledgers.** The accounting invariant report compares each sub-ledger with the journals as they were queued (not only with Xero), for the flows that are journals on both sides, and raises a warning `cogs_subledger_queued_journal_mismatch` or `transit_subledger_queued_journal_mismatch` when they differ by more than rounding. If the check itself fails to run, it reports an info finding `cogs_subledger_queued_journal_mismatch_unavailable` or `transit_subledger_queued_journal_mismatch_unavailable` instead of staying silent. Failed and cancelled journals are reported apart (their sub-ledger rows remain), journals emptied by retention are counted as unreadable, manufacturing reclass journals queued before their sub-ledger row existed are left out, and when journals in the window carry lines for other accounts but not the configured one (the account was re-bound) the check is reported as inconclusive (an info finding) instead of a mismatch. A retrospective manufacturing-cost reclass now records its COGS leg in the COGS sub-ledger.
 
 **Year-to-date and the financial year.** The Trial Balance figure is year-to-date. For a balance-sheet account (Inventory, Allocated Inventory, Stock in Transit, Unearned Revenue) that is the lifetime balance, so closing minus opening is the period movement. For a profit-and-loss account such as COGS it restarts from zero at the start of each financial year. Each pull therefore stores the organisation's financial-year end (Xero `FinancialYearEndMonth`/`FinancialYearEndDay`, from the Organisation request the pull already makes) **on each snapshot row** (`financialYearEnd`, `MM-DD`) beside the tenant, null when the Organisation carried no valid one, so the year end in force at each pull travels with the balance and is overwritten, never carried over, by a re-pull. Every reader that subtracts two stored balances (the GL COGS reconciliation, the COGS report's GL variance) classifies the account by its **chart account type** (not by which setting holds it) and, for a profit-and-loss account, **withholds** the figure by name when the two balances do not both prove the same year end for the same organisation (`financial_year_end_unproven`: a year end that changed between the pulls, a balance pulled without one, or two organisations) or when the window crosses a financial-year start (`window_crosses_financial_year_start`): the reconciliation reports `financial_year_boundary`, the COGS report leaves the GL variance blank with a notice. An account type the chart does not know is treated as profit-and-loss. The reconciliation pack reads COGS only as the balance at the as-of date and never differences it. A row that carries a Xero account id different from the configured account's is never stored under that account (`TB_ACCOUNT_ID_CONFLICT`; the code is a fallback only for a row with no id), and a refused row that cannot be tied to any account (`TB_UNIDENTIFIED_REFUSED_ROW`) refuses the whole report, so an account Xero is assumed to have omitted is never stored as zero while an unreadable row exists.
 
@@ -2489,7 +2572,7 @@ The sync log at **Integrations → Xero** shows queued transactions for the **cu
 - **Failed** — Failed after 5 retries (shows error message)
 
 - **Cancelled** (shown as **Retired**) — the row was taken out of the queue rather than completed. Usually nothing was posted (a sales order cancelled before its invoice went out, an orphaned queue row swept up). **Sometimes something was**: when the repair sweep retires a row because the sale is not live, the Xero document it names is real and is kept on the row on purpose. No sweep re-queues a retired row.
-- **Cancelled, with the reason "Not sent by IMS: writes to Xero are held on this installation (…)"** — a *shadow*. A held WooCommerce sales invoice whose release the hold shadowed is closed (its queue row reads "Closed as a shadow") and raises no posting refusal; the daily-batch rebuild sweep blocks quietly over a shadowed batch rather than reporting it every run. The producer-side hold recorded what IMS would have queued instead of queuing it (see "Producer-side hold" in the installation guide). It has no Xero document id, was never claimable, has no outbox job and no accounting event, and carries a **shadow** badge on this page whose tooltip says IMS did not send it. It says nothing about whether the owner it names (Xeroom, Qoblex's own Xero integration, an operator working by hand) wrote the document to Xero, so it counts as **unproven**, not as absent: deleting an order, deleting a payment receipt, reversing or re-posting over a shadow is refused until Xero itself has been checked. A queued entry that already existed when the hold was switched on is not changed, but it is handed back unsent (activity `xero_sync_producer_held_before_post`) instead of being posted while the hold says it may not be. Shadows exist only on an installation that names Xero in `PRODUCER_HOLD_ENFORCED_DESTINATIONS`; the same piece of work produced again is counted on one shadow record rather than added as another row, and Retry and Retry All never touch a shadow (they only touch Failed rows). A Failed entry that the hold would now shadow is not retried either (Retry and Retry All leave it Failed and name the hold), and neither the automatic follow-up revival nor the daily-batch reset turns it back into queued work. **The shadow row expires with the sync-log retention period, the shadow record does not.** Once the row has been deleted, deleting an order, correcting a stored invoice number and editing a posted stock adjustment are still refused, from the persistent shadow record, with the same unproven wording. One gap is known and tracked: deleting a payment receipt after the shadow row has expired is not yet refused on the shadow record, because that record does not yet carry the payment it was for.
+- **Cancelled, with the reason "Not sent by IMS: writes to Xero are held on this installation (…)"** — a *shadow*. A held WooCommerce sales invoice whose release the hold shadowed is closed (its queue row reads "Closed as a shadow") and raises no posting refusal; the daily-batch rebuild sweep blocks quietly over a shadowed batch rather than reporting it every run. The producer-side hold recorded what IMS would have queued instead of queuing it (see "Producer-side hold" in the installation guide). It has no Xero document id, was never claimable, has no outbox job and no accounting event, and carries a **shadow** badge on this page whose tooltip says IMS did not send it. It says nothing about whether the owner it names (Xeroom, Qoblex's own Xero integration, an operator working by hand) wrote the document to Xero, so it counts as **unproven**, not as absent: deleting an order, deleting a payment receipt, reversing or re-posting over a shadow is refused until Xero itself has been checked. A queued entry that already existed when the hold was switched on is not changed, but it is handed back unsent (activity `xero_sync_producer_held_before_post`) instead of being posted while the hold says it may not be. An entry that is only waiting for the owner's confirmation (Qoblex has not been confirmed stopped, or the confirmation has not been read yet) is not claimed at all: it stays Pending, its queue job is offered again every minute or two with no attempt spent and its last error shows the same sentence, and it goes out once the confirmation is recorded. Shadows exist only on an installation that names Xero in `PRODUCER_HOLD_ENFORCED_DESTINATIONS`; the same piece of work produced again is counted on one shadow record rather than added as another row, and Retry and Retry All never touch a shadow (they only touch Failed rows). A Failed entry that the hold would now shadow is not retried either (Retry and Retry All leave it Failed and name the hold), and neither the automatic follow-up revival nor the daily-batch reset turns it back into queued work. **The shadow row expires with the sync-log retention period, the shadow record does not.** Once the row has been deleted, deleting an order, correcting a stored invoice number and editing a posted stock adjustment are still refused, from the persistent shadow record, with the same unproven wording. One gap is known and tracked: deleting a payment receipt after the shadow row has expired is not yet refused on the shadow record, because that record does not yet carry the payment it was for.
 
 Failed entries can be investigated via the error message and retried by resetting their status in the database.
 
@@ -2963,6 +3046,7 @@ Three things about those rows:
 | `sales_invoice_order` (SALES_INVOICE / SalesOrder) | The invoice is queued once, when the order is created or finalised, and nothing queues it again. |
 | `sales_invoice_import` (SALES_INVOICE / SalesOrder) | The invoice is queued once, when the WooCommerce order is imported, and nothing queues it again. |
 | `stock_adjustment_journal` (INVENTORY_ADJUSTMENT / StockMovement) | The journal is queued once, with the stock movement; nothing queues it again for that movement. |
+| `returns_inbox_restock_journal` (INVENTORY_ADJUSTMENT / WmsReturnsInbox) | The journal is queued once, with the restock; the returns-inbox item is then closed, so restocking again is not possible. |
 | `purchase_order_cancellation_reversal` (INVENTORY_ADJUSTMENT / PurchaseOrder) | Retired. Cancelling a part-received purchase order now closes it short and queues no reversal, so nothing raises this posting any more; the kind stays so a row already in the inbox can still be marked handled. |
 | `supplier_return_reversal` (INVENTORY_ADJUSTMENT / PurchaseReturn) | The reversal is queued once, with the return; raising the return again would be a second return. |
 | `stock_receipt_journal` (STOCK_RECEIPT / PurchaseOrder) | The journal is queued once, with the receipt; receiving again is a different receipt. |
@@ -2986,6 +3070,7 @@ Take the posting for hand posting first and hold that claim while you work: ever
 |---|---|---|
 | An invoice or bill UPDATE (SALES_INVOICE_UPDATE, PURCHASE_INVOICE_UPDATE) - whatever IMS loaded: earlier versions, retired attempts, or nothing | Hold the hand-post claim, then: check the ledger for the CURRENT version (the one this refused posting would have made, not an earlier version): if the current version is there, do not post again; if only an earlier version is there, apply the update to it (do not raise a second document); if nothing is there, post it as a new document. | Only once the CURRENT version is in the ledger. |
 | A bill PAYMENT (BILL_PAYMENT) - whatever IMS loaded | Hold the hand-post claim, then: check the ledger for the CURRENT payment (the one this refused posting would have registered, not an earlier payment; an earlier payment does NOT discharge this one): if the current payment is there, do not post again; if only an earlier payment is there, register THIS payment as a NEW payment and do NOT alter the earlier payment; if nothing is there, post it as a new payment. | Only once the CURRENT payment is in the ledger. |
+| A DELETE of a synced invoice or bill (SALES_INVOICE_DELETE, PURCHASE_INVOICE_DELETE) - the work is removing the document, not posting it | Hold the hand-post claim, then: check the ledger for the document: if it is already deleted or voided, do not repeat it; only if it still exists, first change its number (add a suffix such as -DEL-ABC123) so the original number is free, then delete it if it is a draft or submitted, or void it if it is authorised and has no payments or credit applied. | Only once the document is deleted or voided in the ledger. |
 | Any other posting (no earlier document can exist) | Hold the hand-post claim, then: check the ledger for that document first; post it ONLY if it is absent. If it exists, do not post again. | Only once the document is in the ledger (already there, or posted by you). |
 | The posting type is not known where the text is shown | Hold the hand-post claim, then: identify the posting type before any ledger work (the exception inbox names it on the row), then check the ledger for the CURRENT version of the posting: if it is there, do not post again; otherwise follow the step for that posting type. | Only once the CURRENT version of the posting is in the ledger. |
 <!-- hand-post-instruction:end -->
@@ -3115,12 +3200,14 @@ short is the defect they exist to prevent:
 
 - **Group A2** — an order whose allocated or dispatched units would be reclassified at a negative
   cost is not reclassified. The other orders in the batch are reclassified as normal, and the
-  journal is built from them alone. Note that **one negative cost layer holds back every order that
-  would take stock from it**, not only as many units as it holds: each refused order gives its units
-  back, so the next order in line reaches the same layer and is refused too, until the cost is
-  corrected. Refused orders do not hold up the orders queued behind them — the batch looks past them
-  in the same run.
-- **Group B** — an order whose shipment would be journaled at a negative cost is not journaled.
+  journal is built from them alone. Note that **one negative cost layer can hold back several
+  orders that would take stock from it**: A2 rebuilds its cost layers from the database on every
+  pass and every run (a refusal does not reduce what a layer holds), so whether a given order is
+  refused depends on its position in the queue and on the daily batch limit
+  (`XERO_DAILY_BATCH_LIMIT`), not simply on the cost being corrected. Refused orders do not hold up
+  the orders queued behind them: the batch looks past them in the same run, up to a cap of 5,000
+  refused orders per run, and the rest wait for the next run.
+- **Group B** — an order whose shipment would be journaled at a negative cost is not journaled. Its shipments no longer crowd out the others: when a pass leaves shipments unjournaled and more are waiting, the run makes another pass that skips them (same 5,000 cap), so healthy shipments behind a block of refused ones still post.
 - **Rebuilding a lost Group B journal** — only when a Group B journal is genuinely **missing**
   (never for one that is already posted or queued): a batch holding a shipment whose total COGS was
   revalued below zero is not rebuilt. This check sees each shipment's total, not the cost of each

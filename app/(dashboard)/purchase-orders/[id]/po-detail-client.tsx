@@ -20,6 +20,8 @@ import {
 import { Table, TableHeader, TableBody, TableRow, TableHead, TableCell } from '@/components/ui/table'
 import {
   advancePoStatus,
+  approvePurchaseOrder,
+  reconcileRetiredAsnCredit,
   confirmAndSendPurchaseOrder,
   sendPurchaseOrderEmail,
   updatePoTracking,
@@ -51,6 +53,8 @@ import type { ProductRow } from '@/app/actions/products'
 import type { CurrencyRow } from '@/app/actions/currencies'
 import type { TaxRateRow, PurchaseUnitRow } from '@/app/actions/settings'
 import { ProductLink } from '@/components/inventory/product-link'
+import { DeleteSyncedDocument } from '@/components/accounting/delete-synced-document'
+import type { DocumentDeleteUiState } from '@/lib/domain/accounting/document-delete-service'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { formatCalendarDate } from '@/lib/format-datetime'
@@ -59,7 +63,10 @@ import { formatMoney } from '@/lib/utils'
 import { selectablePoWarehouses } from '@/lib/domain/purchasing/po-warehouse-eligibility'
 import { PO_LINE_COLS_DEFAULT, PO_LINE_COLS_STORAGE_KEY, PO_LINE_OPTIONAL_COLS, parsePoLineCols, type PoLineOptionalCol } from '@/lib/domain/purchasing/po-line-columns'
 import { PoFormDialog } from '../po-form'
+import { MARGIN_BLOCK_ERROR_PREFIX, marginBlockMessageForDisplay } from '@/lib/domain/purchasing/margin-threshold-constants'
+import { PoLineNote } from '../po-line-note'
 import { SupplierCreditNotesCard } from './supplier-credit-notes-card'
+import { businessDateYmd } from '@/lib/business-date'
 
 type Warehouse = { id: string; code: string; name: string; availableForPurchaseOrders?: boolean }
 
@@ -83,6 +90,13 @@ type Props = {
   prepaidReconciliation: PrepaidReconciliationSummary
   /** Setting `purchase_order_email_enabled` (default off): whether Confirm & Send PO and Email PO mail the supplier. */
   poEmailEnabled: boolean
+  /** o3d-ngmt.21: per bill id, whether to offer deleting the synced bill, or why not. */
+  billDeleteStates?: Record<string, DocumentDeleteUiState>
+  /** May this user write the internal per-line notes (purchasing.create). */
+  canEditLineNotes?: boolean
+  /** The signed-in user holds `purchasing.approve` (the server re-checks it, and that they are not the order's creator). */
+  canApprove?: boolean
+  currentUserId?: string
   /** Supplier SKU per product id, from the supplier's product mapping (getSupplierLastPrices). */
   supplierSkus?: Record<string, string | null>
 }
@@ -870,7 +884,7 @@ function BillDialog({
 
   // Step 2 fields
   const [invoiceNumber, setInvoiceNumber] = useState('')
-  const [invoiceDate, setInvoiceDate] = useState(new Date().toISOString().slice(0, 10))
+  const [invoiceDate, setInvoiceDate] = useState(businessDateYmd(new Date()))
   const [dueDate, setDueDate] = useState('')
   const [notes, setNotes] = useState('')
   const [uploading, setUploading] = useState(false)
@@ -936,13 +950,14 @@ function BillDialog({
     }
   }
 
-  function handleConfirm() {
+  function handleConfirm(allowDuplicateInvoiceNumber = false) {
     setError('')
     if (!hasAnySelection) { setError('Select at least one line'); return }
     if (!invoiceDate) { setError('Invoice date is required'); return }
 
     startTransition(async () => {
       const result = await createInvoice(po.id, {
+        allowDuplicateInvoiceNumber: allowDuplicateInvoiceNumber || undefined,
         invoiceNumber: invoiceNumber || undefined,
         invoiceDate,
         dueDate: dueDate || undefined,
@@ -968,6 +983,10 @@ function BillDialog({
       if (result.success) {
         router.refresh()
         onClose()
+      } else if (result.duplicateInvoiceNumber) {
+        // A bill with this supplier invoice number already exists for the supplier: bill again only on an explicit confirmation.
+        if (window.confirm(`${result.error ?? 'Duplicate supplier invoice number.'}\n\nCreate this bill anyway?`)) handleConfirm(true)
+        else setError(result.error ?? 'Duplicate supplier invoice number')
       } else {
         setError(result.error ?? 'Failed to create bill')
       }
@@ -1219,7 +1238,7 @@ function BillDialog({
               Next
             </Button>
           ) : (
-            <Button onClick={handleConfirm} disabled={isPending}>
+            <Button onClick={() => handleConfirm()} disabled={isPending}>
               {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
               Confirm Bill
             </Button>
@@ -1524,7 +1543,7 @@ function PayBillDialog({
   const [accounts, setAccounts] = useState<AccountingBankAccount[]>([])
   const [loadingAccounts, setLoadingAccounts] = useState(true)
   const [bankAccountId, setBankAccountId] = useState('')
-  const [paymentDate, setPaymentDate] = useState(new Date().toISOString().slice(0, 10))
+  const [paymentDate, setPaymentDate] = useState(businessDateYmd(new Date()))
   const [reference, setReference] = useState(invoice.invoiceNumber ?? '')
 
   const sym = po.currency === baseCurrency.code ? baseCurrency.symbol : po.currency
@@ -1582,9 +1601,14 @@ function PayBillDialog({
               <span className="font-medium">{invoice.invoiceNumber ?? '(no number)'}</span>
             </div>
             <div className="flex justify-between mt-1">
-              <span className="text-muted-foreground">Amount</span>
-              <span className="font-mono font-medium">{money(invoice.totalForeign)}</span>
+              <span className="text-muted-foreground">Amount to pay</span>
+              <span className="font-mono font-medium" data-testid="pay-bill-net-payable">{money(invoice.netPayableForeign)}</span>
             </div>
+            {invoice.netPayableForeign < invoice.totalForeign && (
+              <div className="flex justify-between mt-1 text-xs text-muted-foreground" data-testid="pay-bill-gross">
+                <span>Bill total {money(invoice.totalForeign)}, less {money(invoice.totalForeign - invoice.netPayableForeign)} reverse-charge VAT the bill accounts for itself</span>
+              </div>
+            )}
           </div>
 
           <div>
@@ -1688,6 +1712,16 @@ function EditFreightCostsDialog({
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [error, setError] = useState('')
+  // After a successful save the dialog closes once the refreshed order arrives (its fingerprint differs from the one the dialog
+  // opened with) or after a short timeout, whichever is first, so a reopen never carries the stale lines and the dialog never sticks.
+  const [saved, setSaved] = useState(false)
+  const [openedFingerprint] = useState(() => po.freightCostLinesFingerprint)
+  useEffect(() => {
+    if (!saved) return
+    if (po.freightCostLinesFingerprint !== openedFingerprint) { onClose(); return }
+    const timer = setTimeout(onClose, 3000)
+    return () => clearTimeout(timer)
+  }, [saved, po.freightCostLinesFingerprint, openedFingerprint, onClose])
 
   const symbolMap: Record<string, string> = { [baseCurrency.code]: baseCurrency.symbol }
   const positionMap: Record<string, 'PREFIX' | 'POSTFIX'> = { [baseCurrency.code]: baseCurrency.symbolPosition }
@@ -1761,10 +1795,11 @@ function EditFreightCostsDialog({
         taxRateId === '__recorded' || taxRateId === '__unset'
           ? undefined
           : (purchaseTaxRates.find((t) => t.id === taxRateId)?.rate ?? 0),
+        openedFingerprint,
       )
       if (result.success) {
         router.refresh()
-        onClose()
+        setSaved(true)
       } else {
         setError(result.error ?? 'Failed to update costs')
       }
@@ -1868,7 +1903,7 @@ function EditFreightCostsDialog({
 
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
-          <Button onClick={handleSave} disabled={isPending}>
+          <Button onClick={handleSave} disabled={isPending || saved}>
             {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
             Update &amp; Recalculate
           </Button>
@@ -1990,6 +2025,16 @@ function RetirePoDialog({
     ? (intent === 'close' ? 'Close short' : 'Cancel the unreceived balance')
     : (intent === 'close' ? 'Close this purchase order' : 'Cancel this purchase order')
 
+  const needsReconcile = error.includes('not yet booked into this order')
+
+  function reconcile() {
+    startTransition(async () => {
+      const result = await reconcileRetiredAsnCredit(po.id)
+      if (result.success) setError(`${result.message ?? 'Reconciled.'} You can now ${intent === 'close' ? 'close' : 'cancel'} the order.`)
+      else setError(result.error ?? 'Failed')
+    })
+  }
+
   function confirm() {
     setError('')
     startTransition(async () => {
@@ -2035,6 +2080,9 @@ function RetirePoDialog({
         </div>
         <DialogFooter>
           <Button variant="outline" onClick={onClose} disabled={isPending}>Keep order open</Button>
+          {needsReconcile && (
+            <Button variant="outline" onClick={reconcile} disabled={isPending}>Reconcile warehouse receipt</Button>
+          )}
           <Button variant={intent === 'cancel' ? 'destructive' : 'default'} onClick={confirm} disabled={isPending}>
             {isPending && <Loader2 className="h-4 w-4 mr-2 animate-spin" />}
             {hasReceived && !fullyReceived ? 'Drop the balance' : (intent === 'close' ? 'Close order' : 'Cancel order')}
@@ -2049,7 +2097,7 @@ function RetirePoDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, showMargin, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled }: Props) {
+export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, showMargin, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled, canEditLineNotes = false, canApprove = false, currentUserId, billDeleteStates }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -2099,6 +2147,9 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
   const [error, setError] = useState('')
   const [notice, setNotice] = useState('')
   const [warnings, setWarnings] = useState<string[]>([])
+  // Block-mode minimum margin (o3d-hqvrp.380): set when the server refused to confirm the order, so an override note can be entered.
+  const [sendMarginBlocked, setSendMarginBlocked] = useState(false)
+  const [sendOverrideNote, setSendOverrideNote] = useState('')
   const [retireIntent, setRetireIntent] = useState<'close' | 'cancel' | null>(null)
 
   // Edit / Close / Cancel at every stage (lib/domain/workflows/purchase-order-state.ts is the server's table). Edit: Draft through
@@ -2118,7 +2169,7 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
   const hasBillableProduct = po.lines.some((l) => l.qty - l.qtyBilled > 0)
   const hasBillableCost = po.freightCostLines.some((c) => c.amountForeign - c.amountBilled > 0)
   const hasBillableItems = hasBillableProduct || hasBillableCost
-  const canBill = ['PO_SENT', 'SHIPPED', 'RFQ_SENT', 'PARTIALLY_RECEIVED', 'RECEIVED', 'PARTIALLY_RETURNED'].includes(po.status) && hasBillableItems
+  const canBill = ['PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'RECEIVED', 'PARTIALLY_RETURNED', 'CLOSED'].includes(po.status) && hasBillableItems
   const canCancel = ['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED', 'PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED', 'PARTIALLY_RETURNED'].includes(po.status)
   const receivedQtyTotal = po.lines.reduce((sum, l) => sum + l.qtyReceived, 0)
   const orderedQtyTotal = po.lines.reduce((sum, l) => sum + l.qty, 0)
@@ -2131,9 +2182,26 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
     setNotice('')
     startTransition(async () => {
       // Confirms the order first, then queues the PO PDF email; a missing supplier address or a failed enqueue leaves the order confirmed.
-      const result = await confirmAndSendPurchaseOrder(po.id)
+      const result = await confirmAndSendPurchaseOrder(po.id, sendOverrideNote.trim() ? { marginOverrideNote: sendOverrideNote.trim() } : undefined)
       if (result.success) {
+        setSendMarginBlocked(false)
+        setSendOverrideNote('')
         setNotice(result.send?.message ?? 'The order is confirmed.')
+        router.refresh()
+      } else {
+        setSendMarginBlocked(!!result.error?.startsWith(MARGIN_BLOCK_ERROR_PREFIX))
+        setError(marginBlockMessageForDisplay(result.error ?? 'Failed'))
+      }
+    })
+  }
+
+  function handleApprove() {
+    setError('')
+    setNotice('')
+    startTransition(async () => {
+      const result = await approvePurchaseOrder(po.id)
+      if (result.success) {
+        setNotice('The purchase order is approved. It can now be sent to the supplier.')
         router.refresh()
       } else setError(result.error ?? 'Failed')
     })
@@ -2192,6 +2260,19 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
         <span className={`inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium ${STATUS_CLASS[po.status]}`}>
           {STATUS_LABELS[po.status]}
         </span>
+        {po.approvalState === 'AWAITING' && (
+          <span
+            className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-amber-100 text-amber-900 dark:bg-amber-900 dark:text-amber-100 border-amber-200"
+            title="This order is at or above the approval threshold and cannot be sent to the supplier until an approver approves it."
+          >
+            Awaiting approval
+          </span>
+        )}
+        {po.approvalState === 'APPROVED' && po.approvedAt && (
+          <span className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200 border-green-200">
+            Approved{po.approvedByName ? ` by ${po.approvedByName}` : ''} on {new Date(po.approvedAt).toLocaleDateString()}
+          </span>
+        )}
         {closedShort && (
           <span
             className="inline-flex items-center rounded-full border px-3 py-1 text-sm font-medium bg-amber-100 text-amber-900 dark:bg-amber-900 dark:text-amber-100 border-amber-200"
@@ -2216,6 +2297,15 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
           </span>
         )}
         <div className="flex items-center gap-2 ml-auto">
+          {po.approvalState === 'AWAITING' && canApprove && !editing && (
+            po.createdById && po.createdById === currentUserId ? (
+              <span className="text-xs text-muted-foreground">You created this order, so another approver must approve it.</span>
+            ) : (
+              <Button size="sm" onClick={handleApprove} disabled={isPending}>
+                {isPending ? <Loader2 className="h-4 w-4 mr-1 animate-spin" /> : <CheckCircle2 className="h-4 w-4 mr-1" />}Approve
+              </Button>
+            )
+          )}
           {canEdit && !editing && (
             <Button variant="outline" size="sm" onClick={() => setEditing(true)}>
               <Pencil className="h-4 w-4 mr-1" />Edit
@@ -2311,6 +2401,16 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
       </div>
 
       {error && <p className="text-sm text-destructive">{error}</p>}
+      {sendMarginBlocked && showMargin && (
+        <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3 text-xs space-y-2 max-w-xl" data-testid="po-send-margin-override">
+          <Label htmlFor="sendOverrideNote" className="text-xs">Override note</Label>
+          <Textarea id="sendOverrideNote" value={sendOverrideNote} onChange={(e) => setSendOverrideNote(e.target.value)} rows={2} maxLength={500} placeholder="Why is this order acceptable below the minimum margin?" className="text-sm resize-none" />
+          <p className="text-muted-foreground">Recorded on the order with your name and the time. Internal only.</p>
+          <Button size="sm" disabled={isPending || sendOverrideNote.trim().length < 5} onClick={handleAdvanceToOrdered}>
+            Confirm and send with override
+          </Button>
+        </div>
+      )}
       {notice && <p className="text-sm text-emerald-700 dark:text-emerald-300">{notice}</p>}
       {/* This banner covers RETURNED billed goods (→ auto-created credit note);
           the prepaid-reconciliation banner below covers genuine NON-delivery.
@@ -2637,6 +2737,7 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
                   </TableCell>
                   <TableCell className="px-4">
                     <ProductLink productId={line.productId} sku={line.sku} name={line.productName} />
+                    <PoLineNote lineId={line.id} initial={line.notes} canEdit={canEditLineNotes} />
                   </TableCell>
                   {showBarcodeCol && <TableCell className="px-4 font-mono text-xs" data-testid="po-line-barcode">{line.barcode ?? ''}</TableCell>}
                   {showSupplierSkuCol && <TableCell className="px-4 font-mono text-xs" data-testid="po-line-supplier-sku">{supplierSkus[line.productId] ?? ''}</TableCell>}
@@ -3024,7 +3125,10 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
                     </div>
                     <div className="flex items-center gap-3 text-xs text-muted-foreground">
                       <span>{formatDateTime(inv.invoiceDate, { day: 'numeric', month: 'short', year: 'numeric' })}</span>
-                      <span className="font-mono font-medium text-foreground">{money(inv.totalForeign)}</span>
+                      <span className="font-mono font-medium text-foreground">{money(inv.netPayableForeign)}</span>
+                      {inv.netPayableForeign < inv.totalForeign && (
+                        <span title="The bill total includes reverse-charge VAT the bill accounts for itself; the net payable is what is owed to the supplier.">(gross {money(inv.totalForeign)})</span>
+                      )}
                       {inv.supplierInvoiceUrl && (
                         <a
                           href={`/api${inv.supplierInvoiceUrl}`}
@@ -3069,6 +3173,7 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
                           </Button>
                         </>
                       )}
+                      <DeleteSyncedDocument kind="PURCHASE_BILL" documentId={inv.id} state={billDeleteStates?.[inv.id]} />
                     </div>
                   </div>
                   {inv.paidAt && (

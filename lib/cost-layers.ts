@@ -28,10 +28,11 @@ import {
   type Decimal,
   type DecimalInput,
 } from '@/lib/domain/math/decimal'
+import { businessDateYmd } from '@/lib/business-date'
 
 type TxClient = Prisma.TransactionClient
 type ShipmentCogsRevaluationSyncOptions = {
-  accountingSettings?: {
+  accountingSettings?: ({
     inventoryAccount?: string | null
     cogsAccount?: string | null
     /** Needed only with `offsetCostDeltaToTransit`. */
@@ -48,7 +49,7 @@ type ShipmentCogsRevaluationSyncOptions = {
      * connector was switched on", which writes nothing.
      */
     connector: AccountingConnectorId | null
-  }
+  }) | null
   queueAccountingSync?: typeof queueAccountingSyncTx
   /**
    * LATE LANDED COST ONLY. The cost change on units ALREADY SOLD is funded from Stock in Transit (the freight
@@ -291,7 +292,7 @@ export function buildShipmentCogsRevaluationSyncPayload(input: {
     const abs = delta.abs().toNumber()
     const increase = delta.gt(0)
     return {
-      date: new Date().toISOString().slice(0, 10),
+      date: businessDateYmd(new Date()),
       reference: `Shipment COGS revaluation: ${input.shipmentId}`,
       narration: `Late landed cost on shipped units: shipment ${input.shipmentId} COGS ${oldCogs.toFixed(2)} to ${newCogs.toFixed(2)}, funded from the in-transit account`,
       lines: [
@@ -326,7 +327,7 @@ export function buildShipmentCogsRevaluationSyncPayload(input: {
   }
 
   return {
-    date: new Date().toISOString().slice(0, 10),
+    date: businessDateYmd(new Date()),
     reference: `Shipment COGS revaluation: ${input.shipmentId}`,
     narration: `Reverse and repost shipment COGS after cost-layer revaluation for shipment ${input.shipmentId}`,
     lines,
@@ -346,7 +347,8 @@ async function queueShipmentCogsRevaluationSync(
   },
   options: ShipmentCogsRevaluationSyncOptions = {},
 ): Promise<boolean> {
-  const settings = options.accountingSettings ?? await getAccountingSettings().catch(() => null)
+  // null = the caller read the chart before its transaction and could not get it: do not read it again over the pool.
+  const settings = options.accountingSettings !== undefined ? options.accountingSettings : await getAccountingSettings().catch(() => null)
   if (!settings?.inventoryAccount || !settings.cogsAccount) return false
   // No transit account configured: cannot post the offset, so say "not posted here" and the caller keeps the
   // delta in its own COGS journal (which offsets the same transit account) rather than losing it.
@@ -1296,11 +1298,10 @@ export async function getReturnedQtyForCostLayer(
  * here so the SQL and the classification cannot drift apart, and so a new
  * StockTransferStatus fails to compile until it is classified.
  *
- * The list is NOT derivable from STOCK_TRANSFER_TRANSITIONS: that map states
- * IN_TRANSIT -> RECEIVED as the only transition out of IN_TRANSIT, but
- * cancelDispatchedTransfer deliberately performs IN_TRANSIT -> CANCELLED outside
- * the machine and does NOT un-consume the original layers (it creates replacement
- * layers linked back by costLayerSourceLine). An earlier version of this query
+ * The list is NOT derivable from STOCK_TRANSFER_TRANSITIONS: reachability does not say
+ * whether the source consumption is outstanding (DRAFT -> CANCELLED consumed nothing;
+ * IN_TRANSIT -> CANCELLED, via cancelDispatchedTransfer, does NOT un-consume the original layers (it creates replacement
+ * layers linked back by costLayerSourceLine)). An earlier version of this query
  * hard-coded ('IN_TRANSIT', 'RECEIVED') on the strength of that map and so
  * re-opened 6oyu.19 for every cancelled dispatch: spurious COGS on the original
  * layer plus the propagated uplift on the replacement layer.

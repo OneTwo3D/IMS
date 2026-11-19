@@ -49,6 +49,7 @@ type OrderRow = {
   orderNumber: string
   externalOrderNumber: string | null
   status: string
+  refundStatus: string
   revenueDeferredDate: Date | null
   inventoryAllocatedDate: Date | null
   inventoryAllocatedBatchRef: string | null
@@ -73,6 +74,7 @@ function newOrder(id: string, overrides: Partial<OrderRow> = {}): OrderRow {
     orderNumber: `SO-${id}`,
     externalOrderNumber: null,
     status: 'ALLOCATED',
+    refundStatus: 'NONE',
     revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'),
     inventoryAllocatedDate: null,
     inventoryAllocatedBatchRef: null,
@@ -100,8 +102,16 @@ function reset(): void {
   state.unitCostByProduct = {}
 }
 
-/** The Group A2 window: deferred, not yet stamped, not fully refunded. */
-function inA2Window(where: { inventoryAllocatedDate?: unknown; revenueDeferredDate?: unknown } | undefined): boolean {
+type A2Where = {
+  inventoryAllocatedDate?: unknown
+  revenueDeferredDate?: unknown
+  id?: { in?: string[]; notIn?: string[] }
+  status?: { in?: string[] }
+  refundStatus?: { not?: string }
+}
+
+/** The Group A2 window: deferred, not yet stamped. Status and refund state are applied per row. */
+function inA2Window(where: A2Where | undefined): boolean {
   return !!where && where.inventoryAllocatedDate === null && where.revenueDeferredDate != null
 }
 
@@ -141,11 +151,17 @@ const tx = {
     updateMany: async () => ({ count: 0 }),
   },
   salesOrder: {
-    findMany: async (args?: { where?: { inventoryAllocatedDate?: unknown; revenueDeferredDate?: unknown; id?: { in?: string[] } }; select?: Record<string, unknown> }) => {
+    findMany: async (args?: { where?: A2Where; select?: Record<string, unknown> }) => {
       const where = args?.where
       const eligible = state.orders.filter((order) => (
         order.inventoryAllocatedDate === null
         && (where?.id?.in == null || where.id.in.includes(order.id))
+        && (where?.id?.notIn == null || !where.id.notIn.includes(order.id))
+        // o3d-2xdo: status and refundStatus are modelled PER ROW. A where that omits either
+        // predicate lets an ineligible order through, so deleting the line from A2_ELIGIBLE_ORDER
+        // fails the tests that seed such an order instead of passing unnoticed.
+        && (where?.status?.in == null || where.status.in.includes(order.status))
+        && (where?.refundStatus?.not == null || order.refundStatus !== where.refundStatus.not)
       ))
       if (!inA2Window(where)) return []
       if (!args?.select?.allocations) return eligible.map((order) => ({ id: order.id }))
@@ -604,4 +620,48 @@ test('o3d-i0o6 r6: a proved A2 debit is only ever proved on the connector it was
   assert.notEqual(onQuickBooks.kind, 'posted', 'asked about a ledger it was NOT posted in, it proves nothing')
   assert.equal(onQuickBooks.kind, 'refused')
   assert.match(onQuickBooks.reason, /xero/, 'and says which ledger actually holds the pounds')
+})
+
+// o3d-2xdo — the A2 writer's own eligibility predicates, status and refundStatus, are each load-bearing.
+// The double used to model only the window (revenueDeferredDate / inventoryAllocatedDate), so deleting
+// either predicate from A2_ELIGIBLE_ORDER failed nothing. Dropping refundStatus would re-stage A2 debits
+// on fully-refunded orders, which nothing in IMS ever relieves.
+async function a2OverSeededOrders(): Promise<void> {
+  reset()
+  state.unitCostByProduct = { 'prod-1': 10 }
+  state.orders = [
+    newOrder('order-ok'),
+    newOrder('order-partial', { refundStatus: 'PARTIAL' }),
+    newOrder('order-full', { refundStatus: 'FULL' }),
+    newOrder('order-pending', { status: 'PENDING' }),
+    newOrder('order-cancelled', { status: 'CANCELLED' }),
+  ]
+  state.allocations = state.orders.map((order) => ({
+    id: `alloc-${order.id}`, orderId: order.id, lineId: `line-${order.id}`, productId: 'prod-1',
+    warehouseId: 'wh-1', qty: 1, costLayerSnapshot: null, allocationBatchAmount: null,
+  }))
+  // Only the ALLOCATED, not-fully-refunded orders are eligible: order-ok and order-partial.
+  await runA2(2)
+}
+
+test('o3d-2xdo: A2 stages only orders in an eligible status that are not FULLY refunded', async () => {
+  await a2OverSeededOrders()
+  const stamped = state.orders.filter((order) => order.inventoryAllocatedDate !== null).map((order) => order.id)
+  assert.deepEqual(stamped.sort(), ['order-ok', 'order-partial'])
+})
+
+test('o3d-2xdo: a FULLY refunded order is never re-staged (refundStatus predicate is load-bearing)', async () => {
+  await a2OverSeededOrders()
+  const full = state.orders.find((order) => order.id === 'order-full')!
+  assert.equal(full.inventoryAllocatedDate, null)
+  assert.equal(full.allocationBatchAmount, null)
+})
+
+test('o3d-2xdo: an order in an ineligible status is never staged (status predicate is load-bearing)', async () => {
+  await a2OverSeededOrders()
+  for (const id of ['order-pending', 'order-cancelled']) {
+    const order = state.orders.find((row) => row.id === id)!
+    assert.equal(order.inventoryAllocatedDate, null, id)
+    assert.equal(order.allocationBatchAmount, null, id)
+  }
 })

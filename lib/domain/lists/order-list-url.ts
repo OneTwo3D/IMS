@@ -2,11 +2,18 @@
 export type OrderListUrlState = {
   q: string
   statuses: string[]
+  /** Sales orders only: Invoicing filter picks (NOT_INVOICED, PARTIALLY_INVOICED, FULLY_INVOICED). */
+  invoicing?: string[]
   page: number
   showCompleted: boolean
   includeArchived: boolean
   invoiced: boolean
   returned: boolean
+  /** The sales list's Quotes tab (o3d-ngmt.16). */
+  quotes?: boolean
+  /** Sales-order list only: a custom field key and the chosen value (lib/custom-fields/filter.ts). */
+  customFieldKey?: string
+  customFieldValue?: string
 }
 
 export const EMPTY_ORDER_LIST_URL_STATE: OrderListUrlState = {
@@ -17,10 +24,13 @@ export function orderListHref(pathname: string, state: OrderListUrlState): strin
   const p = new URLSearchParams()
   if (state.q) p.set('q', state.q)
   if (state.statuses.length) p.set('status', state.statuses.join(','))
+  if (state.invoicing?.length) p.set('invoicing', state.invoicing.join(','))
   if (state.showCompleted) p.set('completed', '1')
   if (state.includeArchived) p.set('archived', '1')
   if (state.invoiced) p.set('invoiced', '1')
   if (state.returned) p.set('returned', '1')
+  if (state.quotes) p.set('quotes', '1')
+  if (state.customFieldKey && state.customFieldValue) { p.set('cf', state.customFieldKey); p.set('cfv', state.customFieldValue) }
   if (state.page > 1) p.set('page', String(state.page))
   const qs = p.toString()
   return qs ? `${pathname}?${qs}` : pathname

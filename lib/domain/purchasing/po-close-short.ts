@@ -10,6 +10,8 @@ import {
   queueLandedCostAdjustmentJournals,
   recalculateDirectLandedCosts,
   type LandedCostRecalcResult,
+  type LandedCostChartRead,
+  chartOrThrow,
 } from '@/lib/domain/purchasing/landed-cost-service'
 
 /**
@@ -27,6 +29,9 @@ import {
  * writer of a line's received/landed state takes the PO row first), so the facts read here cannot move before the status write.
  * Nothing is written to a connector; nothing is posted to the ledger: an unreceived balance has no ledger footprint.
  */
+
+/** The refusal's lead-in, so the UI can offer the reconcile action beside it. */
+export const PO_UNRECONCILED_WMS_CREDIT_MARKER = 'not yet booked into this order'
 
 export type PoRetireIntent = 'close' | 'cancel'
 
@@ -128,6 +133,8 @@ export async function retirePurchaseOrderLocked(
   id: string,
   intent: PoRetireIntent,
   beforeWrite?: (facts: { keptReceivedStock: boolean }) => void,
+  /** o3d-d0gog: the chart the caller read BEFORE its transaction (see LandedCostRevaluationOptions.accountingSettings). */
+  chartRead?: LandedCostChartRead,
 ): Promise<RetireOutcome> {
   const po = await tx.purchaseOrder.findUnique({
     where: { id },
@@ -157,7 +164,7 @@ export async function retirePurchaseOrderLocked(
     const names = unreconciled.map((l) => `${l.product?.sku ?? l.id} (${landedByLine.get(l.id)!.fromUnabsorbedWmsSnapshot.toNumber()})`).join(', ')
     throw new Error(
       `Cannot ${intent === 'cancel' ? 'cancel' : 'close'} ${po.reference}: ${names} ${unreconciled.length === 1 ? 'has' : 'have'} stock the warehouse sync brought in that is not yet booked into this order, `
-      + 'so it cannot be returned to the supplier from here. Reconcile the warehouse receipt first (use Recheck booked-in on the order once the warehouse has booked the goods in), then close the order.',
+      + 'so it cannot be returned to the supplier from here. Reconcile the warehouse receipt first (use Recheck booked-in on the order once the warehouse has booked the goods in; if the ASN was already retired, use Reconcile warehouse receipt in this dialog or on the order), then close the order.',
     )
   }
 
@@ -190,6 +197,7 @@ export async function retirePurchaseOrderLocked(
       reason: 'purchase_order_closed_short',
       scheduleAdjustmentJournals: true, // durable backstop, as for every journaling revaluation
       landedQtyBasis: new Map(lineLanded.map((l) => [l.id, l.landedQty])),
+      ...(chartRead !== undefined ? { accountingSettings: chartOrThrow(chartRead) } : {}),
     })
     // The links' cost now sits on the units that landed.
     await tx.landedCostLink.updateMany({ where: { primaryPoId: id, ...CONTRIBUTING_LANDED_COST_LINK_WHERE }, data: { allocated: true } })

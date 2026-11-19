@@ -1,0 +1,201 @@
+/**
+ * COMPACTION KEEPS THE PER-ACCOUNT NET THE A2 POSTING PROOF NEEDS.
+ *
+ * The posting proof (`proveAllocationDebitPosting`, `proveJournalPosting`) asks ONE question of a
+ * journal's lines: the NET movement of ONE account code in ONE direction. Retention's compaction
+ * (`backReferenceEvidenceCompactedAt`) drops the whole payload from a journal row it keeps, so a
+ * legitimately old journal used to become permanently unprovable and the proof failed closed.
+ *
+ * The answer to that question is two numbers per account the journal touched, not the journal. So
+ * compaction now writes `AccountingSyncLog.payloadAccountNets` in the SAME statement that empties the
+ * payload, and the proof reads it when the payload is gone.
+ *
+ * Properties this module guarantees, each pinned by a test:
+ *   - the summary is derived by calling `extractPayloadNetMovement` itself, per account and per
+ *     direction, so a summary read gives the SAME NUMBER the full payload would (no second spelling of
+ *     the arithmetic to drift);
+ *   - it holds account codes and two totals each, nothing personal (the journal's descriptions and
+ *     references are not kept), which is why it may outlive the payload;
+ *   - a summary that is not exactly the shape written here is NOT READABLE (`null`), never a partial or
+ *     a zero: an unreadable row is one that cannot be checked, which the proof refuses.
+ *
+ * Rows compacted BEFORE this column existed have neither payload nor summary and stay unprovable (the
+ * proof fails closed, as before). There is no backfill: the payload they would be derived from no
+ * longer exists.
+ */
+
+/**
+ * The account's NET movement across a journal payload's own lines, in the direction the caller
+ * names. Net, never gross: a batch journal can touch one account on BOTH sides (two settings roles
+ * mapped to the same code, a reconciliation rounding line), and a gross read lets a share be
+ * "inside its batch" against a journal that moved the account a fraction of that.
+ *
+ * An empty account code is not a match — an unconfigured account would otherwise sum every line
+ * whose own accountCode is blank (o3d-o97 r2).
+ */
+export function extractPayloadNetMovement(
+  payload: unknown,
+  accountCode: string,
+  side: 'credit' | 'debit',
+): number {
+  if (!accountCode) return 0
+  const linesPayload = (payload as { lines?: Array<{ accountCode?: string; debit?: number; credit?: number }> } | null)?.lines
+  if (!Array.isArray(linesPayload)) return 0
+  return linesPayload.reduce((sum, line) => {
+    if (line.accountCode !== accountCode) return sum
+    const debit = boundaryNumber(line.debit ?? 0)
+    const credit = boundaryNumber(line.credit ?? 0)
+    return sum + (side === 'credit' ? credit - debit : debit - credit)
+  }, 0)
+}
+
+function boundaryNumber(value: unknown): number {
+  if (value === null || value === undefined) return 0
+  const parsed = typeof value === 'number' ? value : Number((value as { toString(): string }).toString())
+  return Number.isFinite(parsed) ? parsed : 0
+}
+
+/**
+ * Whether a sync row still carries readable journal lines. Compaction drops `payload` from a row it
+ * keeps, so a settled row can be present with nothing readable on it — which is an ANSWER ("finished,
+ * outcome no longer legible"), not an error.
+ */
+export function payloadLinesLegible(payload: unknown): boolean {
+  return Array.isArray((payload as { lines?: unknown } | null)?.lines)
+}
+
+/** Version of the stored summary shape. A reader refuses any other value. */
+export const ACCOUNT_NETS_VERSION = 1
+
+export type AccountNetSummary = {
+  version: typeof ACCOUNT_NETS_VERSION
+  /** Keyed by account code. An account the journal did not touch is absent (its net is 0). */
+  accounts: Record<string, { credit: number; debit: number }>
+}
+
+/**
+ * Sync-row types whose payload's per-account net is READ by a proof or by the refund relief arithmetic
+ * (`proveAllocationDebitPosting`, `proveJournalPosting`, `journalNetMovement` callers in refund-service).
+ * Compaction REQUIRES a summary for these before it drops the payload. Every other type (invoices,
+ * bills, credit notes, and journals nothing reads the net of, such as the revenue-deferral and
+ * reconciliation batches or COGS/FX journals) is compacted as before and has no summary: a reader that
+ * starts to need one adds its type here in the same change.
+ *
+ * DAILY_BATCH_INVENTORY_ALLOC is the A2 debit; DAILY_BATCH_GROUP_B the Group B relief; the three
+ * reversals are the order and refund relief journals.
+ */
+export const JOURNAL_PAYLOAD_SYNC_TYPES: readonly string[] = [
+  'DAILY_BATCH_INVENTORY_ALLOC',
+  'DAILY_BATCH_GROUP_B',
+  'ALLOCATION_REVERSAL',
+  'COGS_REVERSAL',
+  'UNEARNED_REV_REVERSAL',
+]
+
+export function isJournalPayloadSyncType(type: string): boolean {
+  return JOURNAL_PAYLOAD_SYNC_TYPES.includes(type)
+}
+
+/**
+ * The summary of a journal payload, or `null` when the payload is not a legible journal (no `lines`
+ * array, or a line that is not an object, which `extractPayloadNetMovement` could not read either).
+ * `null` is "cannot summarise", and the caller must then NOT drop the payload.
+ */
+export function summariseAccountNets(payload: unknown): AccountNetSummary | null {
+  if (!payloadLinesLegible(payload)) return null
+  const lines = (payload as { lines: unknown[] }).lines
+  const codes = new Set<string>()
+  for (const line of lines) {
+    if (line === null || typeof line !== 'object' || Array.isArray(line)) return null
+    const code = (line as { accountCode?: unknown }).accountCode
+    if (typeof code === 'string' && code !== '') codes.add(code)
+  }
+  const accounts: AccountNetSummary['accounts'] = {}
+  for (const code of codes) {
+    accounts[code] = {
+      credit: normaliseZero(extractPayloadNetMovement(payload, code, 'credit')),
+      debit: normaliseZero(extractPayloadNetMovement(payload, code, 'debit')),
+    }
+  }
+  return { version: ACCOUNT_NETS_VERSION, accounts }
+}
+
+// JSON has no negative zero; keep the in-memory value equal to what a database round trip returns.
+function normaliseZero(value: number): number {
+  return value === 0 ? 0 : value
+}
+
+/**
+ * Strictly parse a stored summary. Anything that is not exactly `{ version: 1, accounts: { code:
+ * { credit: finite, debit: finite } } }` is `null` (unreadable), so a damaged or foreign value can
+ * never be read as a smaller or a zero movement.
+ */
+export function readAccountNets(raw: unknown): AccountNetSummary | null {
+  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const candidate = raw as { version?: unknown; accounts?: unknown }
+  if (candidate.version !== ACCOUNT_NETS_VERSION) return null
+  const accounts = candidate.accounts
+  if (accounts === null || typeof accounts !== 'object' || Array.isArray(accounts)) return null
+  const out: AccountNetSummary['accounts'] = {}
+  for (const [code, entry] of Object.entries(accounts as Record<string, unknown>)) {
+    if (code === '' || entry === null || typeof entry !== 'object' || Array.isArray(entry)) return null
+    const { credit, debit } = entry as { credit?: unknown; debit?: unknown }
+    if (typeof credit !== 'number' || !Number.isFinite(credit)) return null
+    if (typeof debit !== 'number' || !Number.isFinite(debit)) return null
+    out[code] = { credit, debit }
+  }
+  return { version: ACCOUNT_NETS_VERSION, accounts: out }
+}
+
+/** A journal row as the net readers see it: the payload and, once compacted, its preserved summary. */
+export type JournalNetSource = { payload: unknown; payloadAccountNets?: unknown }
+
+/** True when the row's net movement can be read: from its own lines, or failing that its summary. */
+export function journalNetsReadable(row: JournalNetSource): boolean {
+  return payloadLinesLegible(row.payload) || readAccountNets(row.payloadAccountNets) !== null
+}
+
+/**
+ * The account's NET movement in the named direction for one journal row: from the payload's own
+ * lines while they exist, else from the preserved summary. `null` when neither is readable. With the
+ * payload gone and a valid summary the result equals what the payload gave, including 0 for an
+ * account the journal never touched.
+ */
+export function journalNetMovement(
+  row: JournalNetSource,
+  accountCode: string,
+  side: 'credit' | 'debit',
+): number | null {
+  if (payloadLinesLegible(row.payload)) return extractPayloadNetMovement(row.payload, accountCode, side)
+  const summary = readAccountNets(row.payloadAccountNets)
+  if (!summary) return null
+  if (!accountCode) return 0
+  return summary.accounts[accountCode]?.[side] ?? 0
+}
+
+/** The description every UNEARNED_REV_REVERSAL journal puts on both of its unearned-revenue lines (refund-service). */
+export const UNEARNED_REVERSAL_LINE_DESCRIPTION_PREFIX = 'Unearned revenue reversal'
+
+/**
+ * o3d-nz0e0: the unearned revenue an UNEARNED_REV_REVERSAL journal debited, IDENTIFIED BY WHAT THE LINE IS, not by today's account code.
+ *
+ * `journalNetMovement(row, <current unearned account>, 'debit')` reads zero for a reversal posted under an account the operator has since
+ * re-mapped (including the forced re-map of a Xero tenant rebind), so a later refund saw nothing already reversed and over-debited.
+ * While the payload's lines are legible the debit is read off the lines the reversal labelled as the unearned-revenue reversal, whatever
+ * account they carry. A payload with no such line (a journal written before the label, or one that only moved allocation) falls back to
+ * the current-account read, and a compacted row (no lines, only the per-account summary) can only be read by account code, as before.
+ */
+export function unearnedReversalDebit(row: JournalNetSource, currentUnearnedAccount: string): number | null {
+  if (payloadLinesLegible(row.payload)) {
+    const lines = (row.payload as { lines: Array<{ description?: unknown; debit?: unknown; credit?: unknown }> }).lines
+    const labelled = lines.filter((line) => (
+      line !== null && typeof line === 'object'
+      && typeof line.description === 'string'
+      && line.description.startsWith(UNEARNED_REVERSAL_LINE_DESCRIPTION_PREFIX)
+    ))
+    if (labelled.length > 0) {
+      return labelled.reduce((sum, line) => sum + boundaryNumber(line.debit ?? 0), 0)
+    }
+  }
+  return journalNetMovement(row, currentUnearnedAccount, 'debit')
+}

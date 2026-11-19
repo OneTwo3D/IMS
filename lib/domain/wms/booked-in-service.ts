@@ -9,6 +9,8 @@ import type { WmsAsnRef } from '@/lib/connectors/wms/types'
 import { recreateTransferCostLayersFromSnapshotSlice } from '@/lib/domain/inventory/transfer-cost-layer-recreation'
 import {
   buildBookedInDryRun,
+  bookedInDeltaIsActionable,
+  bookedInLineIsComplete,
   isTransferUsableForWmsReceipt,
   reconcileBookedInQuantities,
   resolveManualReceiptPool,
@@ -19,6 +21,8 @@ import {
 } from './asn-reconciliation'
 import { loadManualReceiptPools, requireManualReceiptPool } from '@/lib/domain/wms/manual-receipt-pool'
 import { enqueueStockSync } from '@/lib/shopping'
+import { shouldEmitWarning } from '@/lib/domain/wms/warning-throttle'
+import { isWmsLoginRefusal } from '@/lib/domain/wms/no-login-scope'
 import { classifyStockEnqueueFailure } from '@/lib/domain/integrations/stock-enqueue-failure'
 import {
   isStockMovementIdempotencyConflict,
@@ -29,7 +33,7 @@ import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromTotal,
 } from '@/lib/domain/inventory/stock-movement-value'
-import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, toDecimal } from '@/lib/domain/math/decimal'
 import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import {
   derivePurchaseOrderReceiptStatus,
@@ -59,6 +63,8 @@ import { logFlooredLandedCredit } from '@/lib/domain/purchasing/landed-cost-floo
 import type { FlooredLandedCreditEntry } from '@/lib/domain/purchasing/landed-cost-floor-text'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { receiptJournalAmount } from '@/lib/domain/accounting/receipt-journal-amount'
+import { recordGrirReceipt } from '@/lib/domain/accounting/grir-subledger-movement'
 import { withSavepoint } from '@/lib/db/savepoint'
 import {
   isTransferLineFullyLanded,
@@ -73,6 +79,7 @@ import {
   lockWmsAsnLineMaps,
   lockWmsAsnMaps,
 } from '@/lib/domain/wms/transfer-asn-lock-order'
+import { businessDateYmd } from '@/lib/business-date'
 
 // Booked-in reconciliation mutates stock levels, FIFO layers, PO lines, and sync state in one unit.
 // The longer timeout avoids false rollback on large ASNs while preserving a bounded lock window.
@@ -152,6 +159,8 @@ export type ProcessMintsoftBookedInResult =
     eventId: string
     externalAsnId: string | null
     error: string
+    /** The unattended read declined to log in (stored key expired): not a processing fault, and not counted toward dead-lettering. */
+    loginRefused?: true
   }
 
 export type ProcessMintsoftBookedInEventOptions = {
@@ -166,6 +175,27 @@ function formatReceiptReference(externalAsnId: string, poReference: string): str
 
 async function markEventFailed(eventId: string, error: string): Promise<void> {
   await scheduleWebhookRetry(eventId, 'failed', error)
+}
+
+/** How long an event waits after a no-login refusal before the sweeper tries again. */
+export const LOGIN_REFUSED_RETRY_DELAY_MS = 30 * 60 * 1000
+
+/**
+ * A scheduled read that declined to log in (username/password mode, stored key expired) learned nothing about
+ * the event, so it must not spend the event's retry budget: eight such ticks would dead-letter a receipt that is
+ * perfectly processable once a key exists. The event stays in the retry ladder at its current attempt count and
+ * is tried again later; an operator-visible warning says what to do.
+ */
+async function markEventLoginRefused(eventId: string, message: string, now = new Date()): Promise<void> {
+  await db.wmsInboundReceiptEvent.update({
+    where: { id: eventId },
+    data: {
+      processingStatus: WMS_INBOUND_EVENT_PROCESSING_STATUS.failedRetry,
+      nextRetryAt: new Date(now.getTime() + LOGIN_REFUSED_RETRY_DELAY_MS),
+      deadLetteredAt: null,
+      lastError: message,
+    },
+  })
 }
 
 async function markEventPending(eventId: string, reason: string): Promise<void> {
@@ -624,8 +654,10 @@ export async function processBookedInEvent(
           }
         })
 
+      // o3d-b8x0f: the delta must clear WMS_RECEIPT_QTY_EPSILON, the same threshold the dry run uses for
+      // wouldCreateReceipt / wouldCreateCostLayer, so apply never writes what the review image says it won't.
       const actionableLines = candidateLines
-        .filter((line) => line.currentReceivedQty > Number(line.lastProcessedReceivedQty))
+        .filter((line) => bookedInDeltaIsActionable(line.currentReceivedQty, Number(line.lastProcessedReceivedQty)))
 
       // o3d-h66s — EVERY CANDIDATE LINE, NOT JUST THE ACTIONABLE ONES: THE READ'S SCOPE MUST EQUAL
       // THE JUDGEMENT'S SCOPE.
@@ -1202,6 +1234,16 @@ export async function processBookedInEvent(
                 },
               })
 
+              // GR/IR accrual: the same units the layer above carries, at the PO goods unit cost, keyed on the stock movement's own key so a replayed
+              // book-in (which the movement's unique key already refused) records nothing. In this transaction, whether or not Xero posting is on.
+              await recordGrirReceipt(tx, {
+                poId,
+                sourceRef: lockedEvent.id,
+                keyBase: wmsPurchaseReceiptMovementKey({ asnLineMapId: receiptLine.asnLineMapId, receiptEventId: lockedEvent.id }),
+                at: now,
+                lines: [{ poLineId: poLine.id, qty: receiptLine.stockQtyToAdd }],
+              })
+
               // o3d-8f0p6: accumulated HERE, beside the layer it is the value of, and deliberately
               // NOT from `receiptLine.qtyReceived`. `qtyReceived` includes `coveredBySnapshotQty` —
               // quantity a prior WMS stock-sync snapshot already brought into stock and already
@@ -1358,14 +1400,16 @@ export async function processBookedInEvent(
         // of that clearing account are listed at transit-subledger-movement.ts:20-35 and none of them
         // is a transfer). The manual transfer receipt agrees — app/actions/transfers.ts queues no
         // accounting sync at all — so posting nothing here is parity, not a second hole.
-        if (accountingConnector && accountingSettings.syncEnabled && receiptValueBase.gt(0)) {
-          const amount = roundQuantity(receiptValueBase, 2).toNumber()
+        // Gate on the ROUNDED amount: a sub-half-penny receipt value rounds to 0.00 and owes no journal.
+        const receiptJournalValue = receiptJournalAmount(receiptValueBase)
+        if (accountingConnector && accountingSettings.syncEnabled && receiptJournalValue != null) {
+          const amount = receiptJournalValue
           // o3d-8f0p6 r2/r4: the codes come from THIS transaction, under the lock taken above, pinned
           // to the SAME connector the enqueue below is pinned to — so the mapping and the queued row
           // are one decision, and no remap can commit between this read and this transaction's COMMIT.
           const accounts = await accountsForPosting(accountingConnector)
           const payload = {
-            date: now.toISOString().slice(0, 10),
+            date: businessDateYmd(now),
             reference: `Receipt: ${po.reference}`,
             narration: `Stock receipt for PO ${po.reference} via WMS ASN ${lockedEvent.externalAsnId}`,
             lines: [
@@ -1701,7 +1745,7 @@ export async function processBookedInEvent(
           lastProcessedReceivedQty: true,
         },
       })
-      const asnClosed = refreshedLines.every((line) => Number(line.lastProcessedReceivedQty) >= Number(line.expectedQty))
+      const asnClosed = refreshedLines.every((line) => bookedInLineIsComplete(Number(line.lastProcessedReceivedQty), Number(line.expectedQty)))
       const asnStatusAfter = asnClosed ? 'BOOKED_IN' : 'PARTIALLY_BOOKED_IN'
 
       await tx.wmsAsnMap.update({
@@ -1865,6 +1909,11 @@ export async function processBookedInEvent(
 
     let stockEnqueue: 'failed' | 'held' | undefined
     if (processed.productIds.length > 0) {
+      // SO-to-PO pegging: units the book-in just landed on a purchase-order line go to the order pegged to it first.
+      // Best-effort and IMS-internal; a no-op for products nothing is pegged on. The oldest-first remainder is the sweep's, as before.
+      const { allocatePeggedOrdersForProducts } = await import('@/lib/fulfillment/peg-allocator')
+      const pegPass = await allocatePeggedOrdersForProducts(processed.productIds, { source: 'wms_booked_in', referenceId: event.id, referenceLabel: `WMS booked-in ${event.externalAsnId}` })
+      if (pegPass.errors > 0) console.error(`[peg-pass] ${pegPass.errors} pegged order(s) failed to allocate after the WMS book-in (each is in the activity log; the reallocation sweep retries)`)
       try {
         await enqueueStockSync(processed.productIds, 'IMS_CHANGE')
       } catch (error) {
@@ -1914,6 +1963,27 @@ export async function processBookedInEvent(
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Mintsoft booked-in processing failed'
+    if (isWmsLoginRefusal(error)) {
+      await markEventLoginRefused(event.id, message)
+      // One warning per event per hour: the retry is spaced, but an operator needs to see it, not a row per try.
+      if (shouldEmitWarning(`mintsoft-booked-in-key-expired:${event.id}`)) await logActivity({
+        entityType: 'SYNC',
+        entityId: event.id,
+        tag: 'sync',
+        action: 'mintsoft_booked_in_key_expired',
+        level: 'WARNING',
+        description: `Mintsoft key expired, run a manual sync to refresh it. Booked-in processing for ASN ${event.externalAsnId} is waiting and will retry; it has not been counted as a failed attempt.`,
+        metadata: { externalAsnId: event.externalAsnId },
+        resolveUser: false,
+      })
+      return {
+        status: 'failed',
+        eventId: event.id,
+        externalAsnId: event.externalAsnId,
+        error: message,
+        loginRefused: true,
+      }
+    }
     await markEventFailed(event.id, message)
     await logActivity({
       entityType: 'SYNC',

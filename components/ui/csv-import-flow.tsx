@@ -168,7 +168,7 @@ export function CsvImportFlow({ action, onDone, children }: Props) {
   const resultErrorCount = result?.errors.length ?? 0
   const resultTitle = result?.error && !result?.count
     ? 'Import Failed'
-    : resultErrorCount > 0
+    : resultErrorCount > 0 || (result?.componentsFailed ?? 0) > 0
       ? 'Import Completed With Issues'
       : 'Import Complete'
 
@@ -255,6 +255,13 @@ export function CsvImportFlow({ action, onDone, children }: Props) {
               <StatCard label="Skipped" value={result?.skipped ?? 0} tone="warning" />
               <StatCard label="Errors" value={resultErrorCount} tone="warning" />
             </div>
+
+            {result?.componentsFailed ? (
+              <div className="rounded-lg border border-border bg-muted/30 p-3 text-sm">
+                {result.componentsFailed} {result.componentsFailed === 1 ? 'row was' : 'rows were'} saved but their components or recipe
+                {' '}could not be applied (counted above as created or updated). See the messages below, fix those rows and re-import.
+              </div>
+            ) : null}
 
             {resultFileName && (
               <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/30 p-3 text-sm text-muted-foreground">

@@ -2,7 +2,8 @@ import type { Metadata } from 'next'
 import { notFound } from 'next/navigation'
 import Link from 'next/link'
 import { ChevronLeft } from 'lucide-react'
-import { getSalesOrder } from '@/app/actions/sales'
+import { getReturnExchangeOffer, getSalesOrder } from '@/app/actions/sales'
+import { getReturnReasons } from '@/app/actions/return-reasons'
 import { getWarehouses, getScopedStockLevelMap, getAvgCogsMap } from '@/app/actions/stock'
 import { getCurrencies } from '@/app/actions/currencies'
 import { getSetting, getTaxRates, getUsers } from '@/app/actions/settings'
@@ -12,15 +13,24 @@ import { getOrganisation } from '@/app/actions/company'
 import { getOrderAllocations, getOrderFulfillmentRequirements, getOrderShipments } from '@/app/actions/allocation'
 import { getRejectedAccountingDocumentUpdateWarnings } from '@/app/actions/accounting-sync'
 import { getAccountingSettings } from '@/lib/accounting'
+import { isSalesQuoteEmailEnabled } from '@/lib/sales-quote-email'
 import { DEFAULT_CARRIERS } from '@/lib/tracking'
 import { getSalesOrderAdminLinks } from '@/lib/shopping'
 import { getWmsOrderStatusForSalesOrder } from '@/app/actions/wms-order-status'
 import { getWmsOrderPushStateForSalesOrder } from '@/app/actions/wms-order-push'
-import { getMergeCandidateForSalesOrder } from '@/app/actions/wms-merge-candidates'
+import { getMergeCandidateForSalesOrder, getMergeHoldForSalesOrder } from '@/app/actions/wms-merge-candidates'
 import { getShopRefundDueForSalesOrder } from '@/app/actions/shop-refund-tasks'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { requireAuth } from '@/lib/auth/server'
+import { hasPermission } from '@/lib/permissions'
+import { documentDeleteUiStates } from '@/lib/domain/accounting/document-delete-service'
+import { getCustomFieldCardData } from '@/app/actions/custom-fields'
+import { CustomFieldsCard } from '@/components/custom-fields/custom-fields-card'
 import { shouldWarnPaidWithoutInvoice } from '@/lib/domain/sales/paid-without-invoice'
+import { buildExchangeCatalogue } from '@/lib/domain/sales/return-exchange'
+import { listOrderAttachments, canEditOrderAttachments, canViewOrderAttachments } from '@/lib/domain/order-attachments'
+import { OrderAttachmentsCard } from '@/components/orders/order-attachments-card'
+import { getSalesOrderPegs } from '@/app/actions/pegging'
 import { SoDetailClient } from './so-detail-client'
 
 export const metadata: Metadata = { title: 'Sales Order' }
@@ -29,7 +39,7 @@ type Props = { params: Promise<{ id: string }> }
 
 export default async function SalesOrderDetailPage({ params }: Props) {
   const { id } = await params
-  const [session, so, warehouses, currencies, externalOrderLinks, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable, rejectedAccountingSyncs, invoiceTrigger, wmsOrderStatus, wmsPushState, mergeCandidate, shopRefundDue] = await Promise.all([
+  const [session, so, warehouses, currencies, externalOrderLinks, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable, rejectedAccountingSyncs, invoiceTrigger, wmsOrderStatus, wmsPushState, mergeCandidate, returnReasons, shopRefundDue, mergeHold] = await Promise.all([
     requireAuth(),
     getSalesOrder(id),
     getWarehouses(),
@@ -48,12 +58,15 @@ export default async function SalesOrderDetailPage({ params }: Props) {
     getWmsOrderStatusForSalesOrder(id),
     getWmsOrderPushStateForSalesOrder(id),
     getMergeCandidateForSalesOrder(id),
+    getReturnReasons(true),
     getShopRefundDueForSalesOrder(id),
+    getMergeHoldForSalesOrder(id),
   ])
   let carriers: string[] = DEFAULT_CARRIERS
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
 
   if (!so) notFound()
+  const pegs = await getSalesOrderPegs(id)
   // audit-H2: a fully-paid order whose trigger won't auto-generate an invoice.
   const paidWithoutInvoice = shouldWarnPaidWithoutInvoice({
     becamePaid: Boolean(so.paidAt),
@@ -69,8 +82,23 @@ export default async function SalesOrderDetailPage({ params }: Props) {
     warehouseIds: stockWarehouseIds,
   })
 
+  // Supporting documents (a customer purchase order, an email): the routes re-check both permissions.
+  const attachments = canViewOrderAttachments(session.user.role, 'sales') ? await listOrderAttachments('sales', so.id) : []
+  const canEditAttachments = canEditOrderAttachments(session.user.role, 'sales')
+
   // The Edit order dialog is the new-order form pre-filled, so it needs the same catalogue; only a DRAFT can be edited, so only a draft pays for loading it.
+  // The Send quote button exists only while the Settings switch is on (default off).
+  const quoteEmailEnabled = so.isQuote ? await isSalesQuoteEmailEnabled() : false
+  const customFields = await getCustomFieldCardData('SALES_ORDER', id)
   const editForm = so.status === 'DRAFT' ? await loadEditFormData(session) : undefined
+  // o3d-ngmt.21: the Delete control for a synced invoice — shown only for a user who may process sales, with the switch on, and for a document that reached Xero.
+  const invoiceDeleteState = (await documentDeleteUiStates('SALES_INVOICE', [so.id], hasPermission(session.user.role, 'sales.process')))[so.id]
+
+  // EXCHANGES INSIDE A RETURN: the refund dialog's replacement section. Asked only of a person who may refund; the catalogue is loaded only when the section is actually offered (switched on, permitted, no gate blocks it).
+  const exchangeOffer = hasPermission(session.user.role, 'sales.refund') ? await getReturnExchangeOffer(id) : null
+  const exchangeCatalogue = exchangeOffer?.offered
+    ? buildExchangeCatalogue((await listProducts({ pageSize: 1000, type: 'ALL', active: 'true' })).products, { pricesIncludeVat: so.pricesIncludeVat, taxRatePercent: so.taxRatePercent, fxRateToBase: so.fxRateToBase })
+    : []
 
   return (
     <div className="space-y-4">
@@ -88,6 +116,8 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         wmsOrderStatus={wmsOrderStatus}
         wmsPushState={wmsPushState}
         mergeCandidate={mergeCandidate}
+        mergeHold={mergeHold}
+        returnReasons={returnReasons}
         shopRefundDue={shopRefundDue}
         stockLevels={stockLevels}
         initialAllocations={allocations}
@@ -101,8 +131,19 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         currentUserRole={session.user.role}
         rejectedAccountingSyncs={rejectedAccountingSyncs}
         paidWithoutInvoice={paidWithoutInvoice}
+        quoteEmailEnabled={quoteEmailEnabled}
         editForm={editForm}
+        exchangeOffer={exchangeOffer}
+        exchangeCatalogue={exchangeCatalogue}
+        invoiceDeleteState={invoiceDeleteState}
+        pegs={pegs}
       />
+      <CustomFieldsCard
+        key={JSON.stringify(customFields.fields.map((f) => [f.id, f.value, f.label, f.options]))}
+        data={customFields}
+        canEdit={hasPermission(session.user.role, 'sales.create')}
+      />
+      <OrderAttachmentsCard kind="sales" orderId={so.id} attachments={attachments} canEdit={canEditAttachments} />
     </div>
   )
 }

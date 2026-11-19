@@ -5,6 +5,7 @@ import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import { isMissingFxRateError, selectFxRateFromRows } from '@/lib/currencies/fx-lookup'
 import { getFxSourceRegime, type FxSourceRegime } from '@/lib/currencies/fx-source-regime'
+import { billNetPayableBase, billNetPayableForeign, type NetPayableLine } from '@/lib/domain/purchasing/bill-net-payable'
 import { multiplyMoney, roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
@@ -31,6 +32,9 @@ export type FinanceAnalyticsClient = {
   fxRate: FindManyDelegate
   /** Read for the FX source regime (lib/currencies/fx-source-regime.ts); a real client always has it. */
   setting?: FindManyDelegate
+  /** The GR/IR report's sources (a real client always has them). */
+  grirSubledgerMovement?: FindManyDelegate & { groupBy(args: unknown): Promise<unknown[]> }
+  purchaseOrder?: FindManyDelegate
 }
 
 export type FinanceAnalyticsDeps = {
@@ -101,7 +105,17 @@ export type FxGainLossReportTotals = {
   unconvertedCount: string
 }
 
+export type GrirReportTotals = {
+  receivedNotBilledBase: string
+  billedNotReceivedBase: string
+  creditNotesBase: string
+  netBase: string
+  priceVarianceBase: string
+  orderCount: string
+}
+
 export const FINANCE_ANALYTICS_EMPTY_TOTALS = {
+  grir: { receivedNotBilledBase: '0', billedNotReceivedBase: '0', creditNotesBase: '0', netBase: '0', priceVarianceBase: '0', orderCount: '0' } satisfies GrirReportTotals,
   vat: { taxableBase: '0', salesTaxBase: '0', purchaseTaxBase: '0', taxBase: '0' } satisfies VatReportTotals,
   arAging: { outstandingBase: '0', creditBalanceBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ArAgingReportTotals,
   apAging: { outstandingBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ApAgingReportTotals,
@@ -127,6 +141,8 @@ export type AgingReportRow = {
   partyName: string
   contact: string | null
   documentCount: number
+  /** AR only: orders on this row whose balance nets to zero but is indeterminate (an unplaceable credit), so something may still be owed. */
+  uncertainDocumentCount?: number
   current: string
   bucket1: string
   bucket2: string
@@ -134,6 +150,30 @@ export type AgingReportRow = {
   bucket4: string
   outstandingBase: string
   lastPaymentDate: string | null
+}
+
+/** One purchase order's open GR/IR (goods received, not invoiced) balance. Amounts are base currency; `netBase` is credit-positive (an accrual owed). */
+export type GrirReportRow = {
+  supplierId: string
+  supplierName: string
+  poId: string
+  poReference: string
+  poStatus: string
+  /** Goods received that no bill covers yet, summed over the order lines that are net received-not-billed. */
+  receivedNotBilledBase: string
+  receivedNotBilledQty: string
+  /** Goods billed ahead of receipt (a prepaid supplier) or billed and then returned and not yet credited, as a positive figure. */
+  billedNotReceivedBase: string
+  billedNotReceivedQty: string
+  /** Return-generated supplier credit notes posted against the order, at the order valuation (already inside the lines they clear; informational). */
+  creditNotesBase: string
+  /** received not billed - billed not received (credits already inside the lines). */
+  netBase: string
+  /** Bills' price difference against the PO valuation (billed - ordered value); informational, outside the balance. */
+  priceVarianceBase: string
+  /** The date of the oldest event on a line (or credit) that still has a balance, and the whole days from it to the as-of date. */
+  oldestOpenDate: string | null
+  ageDays: number
 }
 
 export type FxGainLossReportRow = {
@@ -251,9 +291,13 @@ type PurchaseInvoiceAgingRow = {
   invoiceDate: Date
   dueDate: Date | null
   paidAt: Date | null
+  totalForeign: DecimalInput
   totalBase: DecimalInput
+  /** The reverse-charge lines: what is owed to the supplier is the NET PAYABLE, not the stored total that includes self-accounted VAT. */
+  lines: ReadonlyArray<NetPayableLine>
   po: {
     supplierId: string
+    currency: string
     supplier: { name: string; email: string | null }
   }
 }
@@ -295,6 +339,7 @@ type PurchaseInvoiceFxRow = {
   totalForeign: DecimalInput
   totalBase: DecimalInput
   fxRateToBase: DecimalInput
+  lines: ReadonlyArray<NetPayableLine>
   po: {
     reference: string
     currency: string
@@ -493,7 +538,8 @@ export async function getVatReport(
         order: {
           invoicedAt: { gte: window.dateFrom, lt: window.dateToExclusive },
           status: { not: SalesOrderStatus.CANCELLED },
-          archived: false,
+          // No `archived` condition: retention archives old orders for list display only; their invoices stand, so a
+          // statutory period figure must not drop once the order is archived (see INVOICED_ORDER_WHERE).
         },
         ...(reportingCategoryFilter && {
           taxRate: { reportingCategory: { equals: reportingCategoryFilter } },
@@ -650,7 +696,7 @@ export async function getVatReport(
     purchaseTaxBase: moneyString(totals.purchaseTaxBase, baseCurrency),
     taxBase: moneyString(netTaxBase, baseCurrency),
   }, [
-    'VAT totals use SalesOrderLine.taxBase for invoiced sales and proportional PurchaseOrderLine.taxBase for purchase invoice lines in the period; taxable base subtracts tax for tax-inclusive sales orders. Cancelled and archived sales orders are excluded.',
+    'VAT totals use SalesOrderLine.taxBase for invoiced sales and proportional PurchaseOrderLine.taxBase for purchase invoice lines in the period; taxable base subtracts tax for tax-inclusive sales orders. Cancelled sales orders are excluded; archived orders are included (archiving only hides an order from operational lists).',
     'Jurisdiction uses TaxRate.countryCode when configured, otherwise the sales shipping country or supplier country.',
   ], options.paginate !== false)
 }
@@ -661,6 +707,7 @@ function agingRowsFromAccumulators(
     partyName: string
     contact: string | null
     documentIds: Set<string>
+    uncertainDocumentIds?: Set<string>
     current: Prisma.Decimal
     bucket1: Prisma.Decimal
     bucket2: Prisma.Decimal
@@ -676,6 +723,7 @@ function agingRowsFromAccumulators(
     partyName: row.partyName,
     contact: row.contact,
     documentCount: row.documentIds.size,
+    ...(row.uncertainDocumentIds ? { uncertainDocumentCount: row.uncertainDocumentIds.size } : {}),
     current: moneyString(row.current, baseCurrency),
     bucket1: moneyString(row.bucket1, baseCurrency),
     bucket2: moneyString(row.bucket2, baseCurrency),
@@ -732,6 +780,7 @@ export async function getArAgingReport(
     partyName: string
     contact: string | null
     documentIds: Set<string>
+    uncertainDocumentIds?: Set<string>
     current: Prisma.Decimal
     bucket1: Prisma.Decimal
     bucket2: Prisma.Decimal
@@ -741,6 +790,7 @@ export async function getArAgingReport(
     lastPaymentDate: Date | null
   }>()
   let unplacedCreditOrders = 0
+  let uncertainSettledOrders = 0
   const asOfInclusive = new Date(asOfExclusive.getTime() - 1)
   const balances = new Map<string, ReturnType<typeof receivableBalance>>()
   for (const order of orders) {
@@ -748,8 +798,12 @@ export async function getArAgingReport(
     const result = receivableBalance(order, asOfInclusive)
     balances.set(order.id, result)
     if (result.bound !== 'exact') unplacedCreditOrders += 1
-    if (result.status !== 'outstanding') continue
-    const outstanding = toDecimal(result.balance)
+    // A zero balance with an indeterminate bound is NOT settled: an unplaceable credit was valued at 0, so something may still be owed.
+    // Keep it as an explicitly uncertain row (and count it in the notice) instead of dropping it.
+    const uncertainSettled = result.status === 'settled' && result.bound === 'indeterminate'
+    if (result.status !== 'outstanding' && !uncertainSettled) continue
+    if (uncertainSettled) uncertainSettledOrders += 1
+    const outstanding = toDecimal(uncertainSettled ? 0 : result.balance)
     const key = order.customerId ?? order.customerEmail ?? order.customerName ?? 'unknown'
     let row = byCustomer.get(key)
     if (!row) {
@@ -758,6 +812,7 @@ export async function getArAgingReport(
         partyName: order.customerName ?? order.customerEmail ?? 'Unknown customer',
         contact: order.customerEmail,
         documentIds: new Set(),
+        uncertainDocumentIds: new Set(),
         current: new Prisma.Decimal(0),
         bucket1: new Prisma.Decimal(0),
         bucket2: new Prisma.Decimal(0),
@@ -767,6 +822,11 @@ export async function getArAgingReport(
         lastPaymentDate: null,
       }
       byCustomer.set(key, row)
+    }
+    if (uncertainSettled) {
+      row.documentIds.add(order.id)
+      row.uncertainDocumentIds!.add(order.id)
+      continue
     }
     const dueDate = order.paymentDueAt ?? invoicedPeriodDate(order)
     const bucket = bucketAmount(ageDays(asOf, dueDate), outstanding, buckets)
@@ -798,6 +858,7 @@ export async function getArAgingReport(
     `Bucket boundaries are configurable through bucket1Days/bucket2Days/bucket3Days and currently use ${buckets[0]}/${buckets[1]}/${buckets[2]} days.`,
     ...bucketResult.notices,
     ...approximateDateNotice(orders as Array<{ invoicedAt?: Date | null; paidAt?: Date | null }>),
+    ...(uncertainSettledOrders > 0 ? [`${uncertainSettledOrders} order${uncertainSettledOrders === 1 ? ' nets' : 's net'} to a zero balance only because a credit could not be placed (its value counted as 0), so something may still be owed; ${uncertainSettledOrders === 1 ? 'it is' : 'they are'} listed as uncertain documents with no aged amount rather than treated as settled.`] : []),
     ...(unplacedCreditOrders > 0 ? [`${unplacedCreditOrders} order${unplacedCreditOrders === 1 ? ' carries a credit' : 's carry credits'} whose basis or amount could not be established exactly; ${unplacedCreditOrders === 1 ? 'its' : 'their'} outstanding balance is an upper bound or only approximate.`] : []),
   ], options.paginate !== false)
 }
@@ -825,8 +886,10 @@ export async function getApAgingReport(
       invoiceDate: true,
       dueDate: true,
       paidAt: true,
+      totalForeign: true,
       totalBase: true,
-      po: { select: { supplierId: true, supplier: { select: { name: true, email: true } } } },
+      lines: { select: { totalForeign: true, taxRateValue: true, taxReverseCharge: true } },
+      po: { select: { supplierId: true, currency: true, supplier: { select: { name: true, email: true } } } },
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as PurchaseInvoiceAgingRow[]
@@ -836,6 +899,7 @@ export async function getApAgingReport(
     partyName: string
     contact: string | null
     documentIds: Set<string>
+    uncertainDocumentIds?: Set<string>
     current: Prisma.Decimal
     bucket1: Prisma.Decimal
     bucket2: Prisma.Decimal
@@ -845,7 +909,8 @@ export async function getApAgingReport(
     lastPaymentDate: Date | null
   }>()
   for (const invoice of invoices) {
-    const outstanding = toDecimal(invoice.totalBase)
+    // What is owed to the supplier: the stored total less the VAT the bill accounts for itself on reverse-charge lines (o3d-hqvrp.399).
+    const outstanding = invoice.lines?.length ? billNetPayableBase(invoice, invoice.po.currency) : toDecimal(invoice.totalBase)
     if (outstanding.lte(0)) continue
     const key = invoice.po.supplierId
     let row = bySupplier.get(key)
@@ -883,9 +948,141 @@ export async function getApAgingReport(
     bucket2Days: String(buckets[1]),
     bucket3Days: String(buckets[2]),
   }, [
-    `AP aging is as of ${dateOnly(asOf)} and treats PurchaseInvoice.totalBase as fully outstanding until PurchaseInvoice.paidAt is set because the schema does not store partial supplier payments.`,
+    `AP aging is as of ${dateOnly(asOf)} and treats the bill's net payable (PurchaseInvoice.totalBase less the VAT a reverse-charge line accounts for itself) as fully outstanding until PurchaseInvoice.paidAt is set because the schema does not store partial supplier payments.`,
     `Bucket boundaries are configurable through bucket1Days/bucket2Days/bucket3Days and currently use ${buckets[0]}/${buckets[1]}/${buckets[2]} days.`,
     ...bucketResult.notices,
+  ], options.paginate !== false)
+}
+
+type GrirGroupRow = {
+  poId: string
+  poLineId: string | null
+  sourceType: string
+  _sum: { baseDelta: DecimalInput | null; qtyDelta: DecimalInput | null }
+  _min: { occurredAt: Date | null }
+}
+
+/**
+ * THE OPEN GR/IR BALANCE BY SUPPLIER AND PURCHASE ORDER, from the GR/IR sub-ledger (lib/domain/accounting/grir-subledger-movement.ts), as of `dateTo`.
+ *
+ * Per order line the balance is the sum of its receipt, bill, bill-edit and return movements (credit-positive). A line with a positive balance is
+ * RECEIVED NOT BILLED; a negative one is BILLED NOT RECEIVED. The two are summed separately across the lines (never netted against each other: a line
+ * received and not billed does not cancel another line billed and not received), and the order's return-generated credit notes, which belong to no
+ * line, sit in their own column. The price difference between bills and the order is shown beside the balance and is not part of it. The age is the
+ * days from the oldest source event of any line or credit that still has a balance to the as-of date. `dateFrom` plays no part: a balance is cumulative.
+ * Orders whose every figure is zero are not listed.
+ */
+export async function getGrirReport(
+  filters: FinanceAnalyticsFilters = {},
+  options: { paginate?: boolean; deps?: FinanceAnalyticsDeps } = {},
+): Promise<FinanceAnalyticsReport<GrirReportRow, GrirReportTotals>> {
+  const client = clientFromDeps(options.deps)
+  const generatedAt = nowFromDeps(options.deps)
+  const baseCurrency = await baseCurrencyFromDeps(options.deps)
+  const window = period(filters, generatedAt)
+  const asOf = window.dateTo
+  const movements = client.grirSubledgerMovement
+  const orders = client.purchaseOrder
+  if (!movements || !orders) throw new Error('GR/IR report: the client carries no GR/IR sub-ledger')
+  const groups = await movements.groupBy({
+    by: ['poId', 'poLineId', 'sourceType'],
+    where: { journalDate: { lt: window.dateToExclusive } },
+    _sum: { baseDelta: true, qtyDelta: true },
+    _min: { occurredAt: true },
+    orderBy: [{ poId: 'asc' }, { poLineId: 'asc' }, { sourceType: 'asc' }],
+    take: SOURCE_ROW_LIMIT + 1,
+  }) as GrirGroupRow[]
+  assertSourceLimit(groups.length, SOURCE_ROW_LIMIT, 'GR/IR sub-ledger groups')
+
+  type PoAccumulator = {
+    lines: Map<string, { net: Prisma.Decimal; qty: Prisma.Decimal; oldest: Date | null }>
+    credits: Prisma.Decimal
+    /** Return-generated credit notes in total (informational: the per-line ones are already inside their line). */
+    creditsShown: Prisma.Decimal
+    creditOldest: Date | null
+    variance: Prisma.Decimal
+  }
+  const byPo = new Map<string, PoAccumulator>()
+  const older = (a: Date | null, b: Date | null): Date | null => (a === null ? b : b === null ? a : (b.getTime() < a.getTime() ? b : a))
+  for (const group of groups) {
+    let po = byPo.get(group.poId)
+    if (!po) {
+      po = { lines: new Map(), credits: new Prisma.Decimal(0), creditsShown: new Prisma.Decimal(0), creditOldest: null, variance: new Prisma.Decimal(0) }
+      byPo.set(group.poId, po)
+    }
+    const base = toDecimal(group._sum.baseDelta)
+    if (group.sourceType === 'BILL_PRICE_VARIANCE') {
+      po.variance = po.variance.add(base)
+      continue
+    }
+    if (group.sourceType === 'SUPPLIER_CREDIT_NOTE') po.creditsShown = po.creditsShown.add(base)
+    if (group.poLineId === null) {
+      po.credits = po.credits.add(base)
+      po.creditOldest = older(po.creditOldest, group._min.occurredAt)
+      continue
+    }
+    const line = po.lines.get(group.poLineId) ?? { net: new Prisma.Decimal(0), qty: new Prisma.Decimal(0), oldest: null }
+    line.net = line.net.add(base)
+    line.qty = line.qty.add(toDecimal(group._sum.qtyDelta))
+    line.oldest = older(line.oldest, group._min.occurredAt)
+    po.lines.set(group.poLineId, line)
+  }
+
+  const poIds = [...byPo.keys()]
+  const poRows = poIds.length === 0 ? [] : await orders.findMany({
+    where: { id: { in: poIds } },
+    select: { id: true, reference: true, status: true, supplierId: true, supplier: { select: { name: true } } },
+  }) as Array<{ id: string; reference: string; status: string; supplierId: string; supplier: { name: string } }>
+  const poById = new Map(poRows.map((row) => [row.id, row]))
+
+  const zero = new Prisma.Decimal(0)
+  const rows: GrirReportRow[] = []
+  for (const [poId, acc] of byPo) {
+    let receivedNotBilled = zero
+    let receivedNotBilledQty = zero
+    let billedNotReceived = zero
+    let billedNotReceivedQty = zero
+    let oldest: Date | null = null
+    for (const line of acc.lines.values()) {
+      if (line.net.gt(0)) { receivedNotBilled = receivedNotBilled.add(line.net); receivedNotBilledQty = receivedNotBilledQty.add(line.qty) }
+      else if (line.net.lt(0)) { billedNotReceived = billedNotReceived.add(line.net.neg()); billedNotReceivedQty = billedNotReceivedQty.add(line.qty.neg()) }
+      if (!line.net.isZero()) oldest = older(oldest, line.oldest)
+    }
+    if (!acc.credits.isZero()) oldest = older(oldest, acc.creditOldest)
+    const net = receivedNotBilled.sub(billedNotReceived).add(acc.credits)
+    if (receivedNotBilled.isZero() && billedNotReceived.isZero() && acc.credits.isZero()) continue
+    const po = poById.get(poId)
+    rows.push({
+      supplierId: po?.supplierId ?? '',
+      supplierName: po?.supplier.name ?? '(order not found)',
+      poId,
+      poReference: po?.reference ?? poId,
+      poStatus: po?.status ?? '',
+      receivedNotBilledBase: moneyString(receivedNotBilled, baseCurrency),
+      receivedNotBilledQty: qtyString(receivedNotBilledQty),
+      billedNotReceivedBase: moneyString(billedNotReceived, baseCurrency),
+      billedNotReceivedQty: qtyString(billedNotReceivedQty),
+      creditNotesBase: moneyString(acc.creditsShown, baseCurrency),
+      netBase: moneyString(net, baseCurrency),
+      priceVarianceBase: moneyString(acc.variance, baseCurrency),
+      oldestOpenDate: oldest ? dateOnly(oldest) : null,
+      ageDays: oldest ? Math.max(0, ageDays(asOf, oldest)) : 0,
+    })
+  }
+  rows.sort((a, b) => a.supplierName.localeCompare(b.supplierName) || a.poReference.localeCompare(b.poReference))
+  const sum = (pick: (row: GrirReportRow) => string) => rows.reduce((total, row) => total.add(pick(row)), zero)
+  return report(rows, filters, window, generatedAt, {
+    receivedNotBilledBase: moneyString(sum((row) => row.receivedNotBilledBase), baseCurrency),
+    billedNotReceivedBase: moneyString(sum((row) => row.billedNotReceivedBase), baseCurrency),
+    creditNotesBase: moneyString(sum((row) => row.creditNotesBase), baseCurrency),
+    netBase: moneyString(sum((row) => row.netBase), baseCurrency),
+    priceVarianceBase: moneyString(sum((row) => row.priceVarianceBase), baseCurrency),
+    orderCount: String(rows.length),
+  }, [
+    `The GR/IR balance is as of ${dateOnly(asOf)} (cumulative: the start date plays no part). It holds the GOODS value at the purchase-order valuation; freight and landed cost stay on the Stock in Transit path and are not in it.`,
+    'Received not billed and billed not received are summed per order line and never netted against each other. The credit notes column is the return-generated supplier credits at the order valuation; they are already inside the lines they clear and are shown for information.',
+    'The price difference column is the bills\' charge less the order valuation of the billed goods. It stays on Stock in Transit as before and is not part of the GR/IR balance.',
+    'The age is the days from the oldest source event on a line (or credit) that still has a balance.',
   ], options.paginate !== false)
 }
 
@@ -1125,6 +1322,7 @@ export async function getFxGainLossReport(
         totalForeign: true,
         totalBase: true,
         fxRateToBase: true,
+        lines: { select: { totalForeign: true, taxRateValue: true, taxReverseCharge: true } },
         po: { select: { reference: true, currency: true, supplier: { select: { name: true } } } },
       },
       take: SOURCE_ROW_LIMIT + 1,
@@ -1195,6 +1393,9 @@ export async function getFxGainLossReport(
   }
   for (const invoice of purchaseInvoices) {
     if (!invoice.paidAt) continue
+    // The payment IMS registers is the NET payable, so the realised FX is measured on it, not on the stored total that includes self-accounted reverse-charge VAT (o3d-hqvrp.399).
+    const netForeign = invoice.lines?.length ? billNetPayableForeign(invoice, invoice.po.currency) : toDecimal(invoice.totalForeign)
+    const netBase = invoice.lines?.length ? billNetPayableBase(invoice, invoice.po.currency) : toDecimal(invoice.totalBase)
     const settlement = settlementRateToBase(fxRates, baseCurrency, invoice.po.currency, invoice.paidAt, fxRegime, invoice.paidAtExplicitInstant)
     if (settlement.rate === null) {
       rows.push({
@@ -1205,7 +1406,7 @@ export async function getFxGainLossReport(
         partyName: invoice.po.supplier.name,
         currency: invoice.po.currency,
         paidAt: invoice.paidAt.toISOString(),
-        amountForeign: qtyString(toDecimal(invoice.totalForeign).abs()),
+        amountForeign: qtyString(netForeign.abs()),
         bookedRateToBase: qtyString(invoice.fxRateToBase),
         settlementRateToBase: '',
         bookedBase: '',
@@ -1221,12 +1422,12 @@ export async function getFxGainLossReport(
     const settlementRate = settlement.rate
     const result = computeRealisedFx({
       side: 'payable',
-      amountForeign: toDecimal(invoice.totalForeign).abs().toNumber(),
+      amountForeign: netForeign.abs().toNumber(),
       bookedRateToBase: toDecimal(invoice.fxRateToBase).toNumber(),
       settlementRateToBase: settlementRate.toNumber(),
       // The whole bill settles here, so the booked base is the stored totalBase
       // (cogs-audit scjz.55).
-      bookedBase: toDecimal(invoice.totalBase).toNumber(),
+      bookedBase: netBase.toNumber(),
     })
     rows.push({
       side: 'payable',
@@ -1236,7 +1437,7 @@ export async function getFxGainLossReport(
       partyName: invoice.po.supplier.name,
       currency: invoice.po.currency,
       paidAt: invoice.paidAt.toISOString(),
-      amountForeign: qtyString(toDecimal(invoice.totalForeign).abs()),
+      amountForeign: qtyString(netForeign.abs()),
       bookedRateToBase: qtyString(invoice.fxRateToBase),
       settlementRateToBase: qtyString(settlementRate),
       bookedBase: moneyString(result.bookedBase, baseCurrency),

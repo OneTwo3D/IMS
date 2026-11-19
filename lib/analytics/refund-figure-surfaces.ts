@@ -143,6 +143,13 @@ export const RETURNS_MIXED_BASIS_MARKER = 'Mixed basis'
 export const RETURNS_MIXED_BASIS_NOTICE =
   'Refund values are shown on their own recorded basis. Where a row or the period mixes NET (ex-VAT) and GROSS (VAT-inclusive) credits, no single total is shown — adding the two gives an amount on neither basis — and the NET, GROSS and unproven-basis columns carry the whole credit instead. Rows with no single stated value sort last.'
 
+/**
+ * Why the Returns report shows exchanges apart. A return recorded with an exchange is returned AND replaced: the replacement lines sit on the SAME order, so the order's invoiced total and every revenue figure already
+ * include them, and the credit note is not a lost sale. The report therefore counts those returns as exchanged and shows the credit that was NOT exchanged as the refund that really left.
+ */
+export const RETURNS_EXCHANGE_NOTICE =
+  'A return recorded with an exchange is shown as exchanged: its units count in Returned and in Exchanged, and the replacement items added to the same order are counted in Replacement qty. The credit of an exchanged return is shown in Exchanged refund value, and only the credit that was not exchanged is shown as Lost refund value, so a swap is not read as a lost sale. Return rate excluding exchanges leaves the exchanged units out.'
+
 // ---------------------------------------------------------------------------------------------
 // The inventory. Generated from the field-name sweep, then classified by hand, one file at a time.
 // ---------------------------------------------------------------------------------------------
@@ -185,7 +192,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/(dashboard)/analytics/cogs/page.tsx',
-    figures: ['grossMarginBase', 'grossMarginBaseBound', 'grossMarginPct', 'grossMarginPctBound', 'margin', 'marginPct', 'revenue', 'revenueBase', 'revenueBaseBound', 'revenueCapturedRows'],
+    figures: ['grossMarginBase', 'grossMarginBaseBound', 'grossMarginPct', 'grossMarginPctBound', 'margin', 'marginPct', 'revenue', 'revenueBase', 'revenueBaseBound', 'revenueCapturedRows', 'cogsBaseWithRevenue'],
     treatment: 'basis-aware',
     reason:
       'Renders getCogsReport revenue net of the net-basis credit, gross margin, margin % and the per-basis credit columns, each figure with the producer\u2019s own bound marker appended AFTER the amount renderer (o3d-la3n r3: the mark is a fact about the interval and the Unmatched branch must not be able to suppress it). Every figure arrives UNROUNDED as an ExactFigure/ExactRatio and markFigure\u2019s roundExact is its only rounding: once, toward the bound beside it, to moneyCodeFractionDigits(baseCurrency) for money (the digits the formatter prints: 0 for yen, 3 for dinars), two decimals for margin %, four for qty; formatMoneyCodeExact then pins those digits and throws rather than round again. Each piece closes a double rounding found in review: Intl rounding a \u2264 to nearest (r2), Number() before the ceiling (r3), two decimals then the currency\u2019s own (r4), and the producer\u2019s six-decimal strings plus Prisma.Decimal\u2019s twenty-digit arithmetic (r5).',
@@ -213,7 +220,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/(dashboard)/analytics/product-profitability/product-profitability-client.tsx',
-    figures: ['currentFyProfit', 'currentFyRevenue', 'previousFyProfit', 'previousFyRevenue', 'profit', 'revenue', 'unitMargin', 'unitMarginPct'],
+    figures: ['currentFyProfit', 'currentFyRevenue', 'previousFyProfit', 'previousFyRevenue', 'profit', 'profitExact', 'revenue', 'revenueExact', 'unitMargin', 'unitMarginPct'],
     treatment: 'basis-aware',
     reason:
       'Renders the FY revenue/profit figures and the unplaced-credit columns from app/actions/product-profitability.ts. o3d-la3n: the fourteen marked sites here \u2014 cells, footers, colouring, cards and the browser-built CSV\u2019s two bound columns \u2014 classify the producer\u2019s published INTERVAL through classifyLinearFigureBound and mark nothing themselves. Twelve of them derived a \u2264 from \u2026RefundBasisComplete, a boolean that cannot say indeterminate, and the CSV\u2019s two derived it from refundsGrossBasis + refundsUnknownBasis, a signed sum in which two opposite same-basis credits cancel; round 2 removed the boolean from the wire entirely. The filtered subtotal ADDS the rows\u2019 interval endpoints (sumLinearFigureBounds) and rounds once, at display, in the direction the relation allows \u2014 summing rounded rows could publish a ceiling below the truth (o3d-l4zz). Round 3: the mark is a fact about the INTERVAL and no property of the AMOUNT may suppress it \u2014 the two table cells hide a non-positive figure behind an em dash and still print the relation (\u201c\u2014 \u2265\u201d), because the amount renderer is passed INTO markFigure and the mark is appended after it, outside every branch a cell controls.',
@@ -317,6 +324,13 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'KPIs, chart buckets and (round 5) Best Sellers all bucket refunds by stamped basis, subtract only NET, and publish a bound. o3d-7jfq: every bound comes from the unplaced credit\u2019s INTERVAL, recorded as each entry\u2019s positive part, so two opposite same-basis credits can no longer cancel into a \u2264.',
   },
   {
+    file: 'lib/security/dashboard-cost-redaction.ts',
+    figures: ['compMarginPct', 'compMarginPctBound', 'marginBoundComparison', 'marginBoundCurrent', 'marginComparison', 'marginCurrent', 'marginPct', 'marginPctBound', 'netRevenue', 'netRevenueBound', 'profitCurrent'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Computes nothing: it copies the dashboard action\u2019s already-built response through an allowlist and, for roles barred from cost data, overwrites the cost-derived figures (profit, margin and their bound markers) with zero and \u2018exact\u2019. netRevenue and netRevenueBound are passed through unchanged from the basis-aware dashboard action.',
+  },
+  {
     file: 'app/actions/forecasting.ts',
     figures: ['productsByRevenue', 'revenueByProduct', 'totalRevenue'],
     treatment: 'refund-blind',
@@ -325,7 +339,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/actions/product-profitability.ts',
-    figures: ['getProductProfitability', 'profit', 'revenue', 'unitMargin', 'unitMarginPct'],
+    figures: ['getProductProfitability', 'profit', 'profitExact', 'revenue', 'revenueExact', 'unitMargin', 'unitMarginPct'],
     treatment: 'basis-aware',
     reason:
       'FY revenue/profit bucket refunds by basis and publish, per FY, the INTERVAL their complete-basis truth occupies \u2014 \u03a3 min(entry,0) to \u03a3 max(entry,0), taken at the entry, never a signed credit sum. o3d-la3n r2: the interval and not a verdict, because a browser-side filtered subtotal must ADD endpoints; and the amounts leave here UNROUNDED, because a subtotal of cent-rounded rows can breach the very relation the interval publishes (o3d-l4zz). The completeness boolean is no longer published: it was redundant with the interval and was one of the two inputs of the rule this branch removed.',
@@ -577,10 +591,10 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/inventory/inventory-costing-reports.ts',
-    figures: ['aggregateInventoryTurnoverRows', 'aggregateInventoryTurnoverTotalAverage', 'assertInventoryTurnoverSourceLimit', 'byRevenueKey', 'emptyInventoryTurnoverReportForSourceLimit', 'exactRevenueByOrderProduct', 'getInventoryTurnoverReport', 'grossMarginBase', 'grossMarginBaseBound', 'grossMarginPct', 'grossMarginPctBound', 'groupRevenue', 'isInventoryTurnoverGroupBy', 'lineRevenueByKey', 'loadRevenueByOrderProduct', 'netRevenue', 'qtyByRevenueKey', 'reportRevenueKeys', 'resolveCogsRevenueKeys', 'resolvedRevenue', 'revenue', 'revenueBase', 'revenueBaseBound', 'revenueByOrderProduct', 'revenueCaptured', 'revenueCapturedRows', 'revenueKey', 'turnover', 'turnoverGroupMetas', 'turnoverRatio', 'unkeyedRevenue'],
+    figures: ['aggregateInventoryTurnoverRows', 'aggregateInventoryTurnoverTotalAverage', 'assertInventoryTurnoverSourceLimit', 'byRevenueKey', 'emptyInventoryTurnoverReportForSourceLimit', 'exactRevenueByOrderProduct', 'getInventoryTurnoverReport', 'grossMarginBase', 'grossMarginBaseBound', 'grossMarginPct', 'grossMarginPctBound', 'groupRevenue', 'isInventoryTurnoverGroupBy', 'lineRevenueByKey', 'loadRevenueByOrderProduct', 'netRevenue', 'qtyByRevenueKey', 'reportRevenueKeys', 'resolveCogsRevenueKeys', 'resolvedRevenue', 'revenue', 'revenueBase', 'revenueBaseBound', 'revenueByOrderProduct', 'revenueCaptured', 'revenueCapturedRows', 'revenueKey', 'cogsBaseWithRevenue', 'cogsRevenueDenominatorQty', 'cogsWithRevenue', 'revenueQty', 'turnover', 'turnoverGroupMetas', 'turnoverRatio', 'unkeyedRevenue'],
     treatment: 'basis-aware',
     reason:
-      'COGS report revenue/gross margin and the turnover report. o3d-rv4a: refund lines are loaded with their parent refund’s totalsBasis and attributed through the SAME line-linked and order:product keys the revenue uses, split across groups by the same quantity share; only the NET bucket is subtracted, the gross and unproven buckets are published beside the figures, and the totals classify from the unrounded credit INTERVAL carried up from the rows rather than from their published signed, rounded columns (o3d-la3n). o3d-rv4a r2 fixed the scope and the arithmetic of that bound: EVERY refund raised in the period is loaded through the shared refundLinesRaisedInPeriodWhere (round 1 restricted it to the window’s own order ids and so published exact revenue over a period with a credit note missing from it), the report’s product filter is applied separately by cogsRefundLineInProductScope so a filtered-out sibling product cannot pollute the totals, the period AMOUNTS are summed unrounded (round 1 rebuilt them from the rows’ six-decimal strings, putting the advertised ceiling below the truth). o3d-rv4a r5 (Codex round 5 HIGH): nothing is rounded here at all. Quantity shares stay quotients and every published figure is an ExactFigure, rounded once by the page or the CSV; revenueByOrderProduct and the credit amounts (revenue, exactRevenueByOrderProduct, ExactCredit) are summed exactly, because Prisma.Decimal arithmetic rounds at twenty significant digits. The credit is held exactly too (ExactCredit, with the per-bucket positive parts), and every verdict — each row’s linear and margin-% bound and the totals’ bound — is decided from exact figures by netLinearFigureBoundExact / marginFigureBoundExact (independent review of r5, H1: a Decimal-scaled credit made an exactly-zero case-3 difference non-zero). Turnover is COGS over average inventory value and no refund line moves either input.',
+      'COGS report revenue/gross margin and the turnover report. o3d-rv4a: refund lines are loaded with their parent refund’s totalsBasis and attributed through the SAME line-linked and order:product keys the revenue uses, split across groups by the same quantity share; only the NET bucket is subtracted, the gross and unproven buckets are published beside the figures, and the totals classify from the unrounded credit INTERVAL carried up from the rows rather than from their published signed, rounded columns (o3d-la3n). o3d-rv4a r2 fixed the scope and the arithmetic of that bound: EVERY refund raised in the period is loaded through the shared refundLinesRaisedInPeriodWhere (round 1 restricted it to the window’s own order ids and so published exact revenue over a period with a credit note missing from it), the report’s product filter is applied separately by cogsRefundLineInProductScope so a filtered-out sibling product cannot pollute the totals, the period AMOUNTS are summed unrounded (round 1 rebuilt them from the rows’ six-decimal strings, putting the advertised ceiling below the truth). o3d-rv4a r5 (Codex round 5 HIGH): nothing is rounded here at all. Quantity shares stay quotients and every published figure is an ExactFigure, rounded once by the page or the CSV; revenueByOrderProduct and the credit amounts (revenue, exactRevenueByOrderProduct, ExactCredit) are summed exactly, because Prisma.Decimal arithmetic rounds at twenty significant digits. The credit is held exactly too (ExactCredit, with the per-bucket positive parts), and every verdict — each row’s linear and margin-% bound and the totals’ bound — is decided from exact figures by netLinearFigureBoundExact / marginFigureBoundExact (independent review of r5, H1: a Decimal-scaled credit made an exactly-zero case-3 difference non-zero). Turnover is COGS over average inventory value and no refund line moves either input. cogsRevenueDenominatorQty is the quantity a line\u2019s revenue is prorated over for the dispatch share (ordered less refunded, never below shipped); it is a quantity, not a money figure, and exists so a refunded-before-dispatch unit is taken off the line once (by the denominator) rather than twice, which keeps the net revenue the surface publishes correct.',
   },
   {
     file: 'lib/domain/inventory/inventory-health-reports.ts',
@@ -619,10 +633,17 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/sales/refund-service.ts',
-    figures: ['aUnitRevenue', 'assignedRevenue', 'bUnitRevenue', 'nonQtyRevenue', 'refundRevenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueRecognizedAmount', 'shippedQtyRevenue', 'shippedRevenue', 'toNetRevenue', 'unearnedRevenueAccount', 'unearnedRevenueAmount', 'unitRevenue', 'unshippedQtyRevenue', 'unshippedRevenue'],
+    figures: ['aUnitRevenue', 'assignedRevenue', 'bUnitRevenue', 'lineDrivenRevenue', 'nonQtyRevenue', 'refundRevenue', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueRecognizedAmount', 'shippedQtyRevenue', 'shippedRevenue', 'toNetRevenue', 'unearnedRevenueAccount', 'unearnedRevenueAmount', 'unitRevenue', 'unshippedQtyRevenue', 'unshippedRevenue'],
     treatment: 'not-refund-sensitive',
     reason:
       'The refund WRITER. It creates the rows the reports classify; it publishes no report figure.',
+  },
+  {
+    file: 'lib/domain/sales/refund-unearned-remainder.ts',
+    figures: ['lineDrivenRevenue'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Pure helper for the refund WRITER: it decides how much of the order\u2019s deferred (unearned) revenue one refund\u2019s UNEARNED_REV_REVERSAL journal takes out of the unearned account. `lineDrivenRevenue` is an input to that ledger amount (the refund\u2019s own unshipped-quantity and non-quantity line value), never summed, netted or rendered as a report figure; no analytics reader consumes it.',
   },
   {
     file: 'lib/domain/sales/sales-fulfillment-analytics.ts',
@@ -717,7 +738,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/(dashboard)/purchase-orders/[id]/po-detail-client.tsx',
-    figures: ['showMargin'],
+    figures: ['margin', 'marginOverrideNote', 'showMargin'],
     treatment: 'not-refund-sensitive',
     reason:
       'Passes the permission flag that shows the PO margin column. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
@@ -731,7 +752,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'app/(dashboard)/purchase-orders/po-form.tsx',
-    figures: ['marginAmount', 'marginByKey', 'marginPct', 'marginRequestKey', 'showMargin'],
+    figures: ['margin', 'marginAmount', 'marginByKey', 'marginOverrideNote', 'marginPct', 'marginRequestKey', 'showMargin'],
     treatment: 'not-refund-sensitive',
     reason:
       'Renders the PO margin column and order margin box. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
@@ -751,11 +772,60 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'Server action computing the PO margin preview. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
   },
   {
+    file: 'app/actions/po-margin-threshold.ts',
+    figures: ['getPoMarginThresholdSettings', 'listCategoriesForMarginOverride', 'margin', 'savePoMarginThresholdSettings', 'searchProductsForMarginOverride'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Settings actions that read and write the minimum margin percentages; `margin` is the word in names and comments, nothing is computed from sales. Purchase-order minimum gross margin (o3d-hqvrp.380): compares the entered cost of a purchase line with the product list price ex-VAT against a configured minimum percentage. It is a forward-looking per-unit price-versus-cost check on a purchase being placed, not a sales figure, so refunds of past sales cannot enter it.',
+  },
+  {
+    file: 'app/actions/purchase-orders.ts',
+    figures: ['amendMarginRows', 'enforceMargin', 'margin', 'marginCtx', 'marginOverride', 'marginOverrideNote', 'netTotal'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Calls the server-side guard when a purchase order is created, edited or placed and carries the override note. Also `netTotal`: the net amount of a SUPPLIER credit note under the reverse-charge plan (converted to base for the transit posting), a purchase-side ledger amount that customer refunds of past sales never enter. Purchase-order minimum gross margin (o3d-hqvrp.380): compares the entered cost of a purchase line with the product list price ex-VAT against a configured minimum percentage. It is a forward-looking per-unit price-versus-cost check on a purchase being placed, not a sales figure, so refunds of past sales cannot enter it.',
+  },
+  {
+    file: 'lib/domain/purchasing/margin-threshold-constants.ts',
+    figures: ['marginBlockMessageForDisplay'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Operator wording for the block refusal. Purchase-order minimum gross margin (o3d-hqvrp.380): compares the entered cost of a purchase line with the product list price ex-VAT against a configured minimum percentage. It is a forward-looking per-unit price-versus-cost check on a purchase being placed, not a sales figure, so refunds of past sales cannot enter it.',
+  },
+  {
+    file: 'lib/domain/purchasing/margin-threshold-guard.ts',
+    figures: ['loadMarginGuardContext', 'margin', 'marginPct', 'margin_override', 'recordMarginOverride', 'loadMarginGuardContextUnderLock'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Server-side enforcement: recomputes each line margin from the stored cost and records an accepted override on the order. Purchase-order minimum gross margin (o3d-hqvrp.380): compares the entered cost of a purchase line with the product list price ex-VAT against a configured minimum percentage. It is a forward-looking per-unit price-versus-cost check on a purchase being placed, not a sales figure, so refunds of past sales cannot enter it.',
+  },
+  {
+    file: 'lib/domain/purchasing/margin-threshold.ts',
+    figures: ['hasAnyMarginThreshold', 'margin', 'marginPct', 'normaliseMinMarginPct', 'parseMarginThresholdSettings', 'po_min_margin_threshold', 'resolveMinimumMarginPct', 'validateMarginThresholdInput'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Pure Decimal resolution of the applicable minimum (product, parent product, category, global) and the warn or block decision. Purchase-order minimum gross margin (o3d-hqvrp.380): compares the entered cost of a purchase line with the product list price ex-VAT against a configured minimum percentage. It is a forward-looking per-unit price-versus-cost check on a purchase being placed, not a sales figure, so refunds of past sales cannot enter it.',
+  },
+  {
+    file: 'components/settings/po-margin-threshold.tsx',
+    figures: ['poMarginMode'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Settings screen for the minimum margin; `poMarginMode` is a radio group name. Purchase-order minimum gross margin (o3d-hqvrp.380): compares the entered cost of a purchase line with the product list price ex-VAT against a configured minimum percentage. It is a forward-looking per-unit price-versus-cost check on a purchase being placed, not a sales figure, so refunds of past sales cannot enter it.',
+  },
+  {
     file: 'lib/domain/purchasing/line-margin.ts',
     figures: ['computeLineMargin', 'computePoMarginTotal', 'margin', 'marginAmount', 'marginPct'],
     treatment: 'not-refund-sensitive',
     reason:
       'Pure margin computation for the PO preview. Purchase-order line margin preview (o3d-ywzag): compares the product list price with the entered PO unit cost for a line being bought. It is a per-unit price-versus-cost estimate on a purchase, not a sales figure, so refunds of past sales do not enter it.',
+  },
+  {
+    file: 'lib/domain/purchasing/supplier-credit-note.ts',
+    figures: ['netTotal'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      '`netTotal` is the sum of the net lines of a supplier credit note split into reverse-charge net/VAT for the Xero posting. A purchase-side posting amount, not a sales revenue figure; no customer refund moves it.',
   },
   {
     file: 'app/(dashboard)/analytics/reorder/page.tsx',

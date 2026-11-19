@@ -10,6 +10,7 @@ import {
   requireApiAdminSession,
   requireApiAuthSession,
   requireApiFreshAdminSession,
+  requireApiFreshAuthSession,
   requireFreshAuthSession,
   requireRoleSession,
   PermissionDeniedError,
@@ -194,6 +195,10 @@ export async function getSession(): Promise<AuthSession | null> {
 
 export async function requireApiAuth(): Promise<AuthSession | NextResponse> {
   return requireApiAuthSession(await auth())
+}
+
+export async function requireApiFreshAuth(): Promise<AuthSession | NextResponse> {
+  return requireApiFreshAuthSession(await auth())
 }
 
 export async function requireApiAdmin(): Promise<AuthSession | NextResponse> {

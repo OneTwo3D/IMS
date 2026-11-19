@@ -1,3 +1,4 @@
+import { withWmsNoLogin } from '@/lib/domain/wms/no-login-scope'
 import { verifyCron } from '@/lib/cron-auth'
 import { enforceCronRateLimit } from '@/lib/cron-rate-limit'
 import { getMaintenanceModeResponse } from '@/lib/maintenance-mode'
@@ -15,6 +16,6 @@ export async function GET(request: Request) {
   const maintenance = await getMaintenanceModeResponse('cron')
   if (maintenance) return maintenance
 
-  const result = await runWmsOrderStatusSweep()
+  const result = await withWmsNoLogin(() => runWmsOrderStatusSweep())
   return cronResultResponse(result, { outcomeClass: cronOutcome('wms-order-status', result) })
 }

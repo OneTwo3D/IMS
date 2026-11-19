@@ -82,6 +82,12 @@ enum PurchaseOrderType {
   FREIGHT    // secondary PO linked to goods PO (e.g. FedEx, customs)
 }
 
+/// What a cost line IS, where it matters to a rule. Only SHIPPING today: the buyer's own shipping estimate, which a supplier-quoted shipping REPLACES
+/// (supplier_quote_shipping_landed_enabled). NULL = untagged (every line that existed before, and every other cost).
+enum FreightCostKind {
+  SHIPPING
+}
+
 enum LandedCostMethod {
   BY_VALUE
   BY_WEIGHT
@@ -110,6 +116,15 @@ enum RefundDisposition {
   NONE
   PARTIAL
   FULL
+}
+
+// Invoicing state of a sales order, orthogonal to the fulfilment lifecycle status (and to RefundDisposition): an order can
+// be SHIPPED and NOT_INVOICED, or CANCELLED and FULLY_INVOICED. Derived from the order's invoice evidence, never set by hand:
+// lib/domain/sales/invoicing-state.ts (SalesOrder.invoicingState).
+enum InvoicingState {
+  NOT_INVOICED
+  PARTIALLY_INVOICED
+  FULLY_INVOICED
 }
 
 // o3d-9te: WHAT SalesOrder.discountAmount MEANS on this row, recorded by whoever wrote it.
@@ -200,6 +215,10 @@ enum AccountingLinkSource {
 enum AccountingSyncType {
   PURCHASE_INVOICE
   PURCHASE_INVOICE_UPDATE
+  /// Delete a sales invoice IMS pushed to Xero: renumber it to free its number, then DELETE (draft/submitted) or VOID (authorised, unpaid).
+  SALES_INVOICE_DELETE
+  /// The same for a supplier bill.
+  PURCHASE_INVOICE_DELETE
   COGS_JOURNAL
   INVENTORY_ADJUSTMENT
   SALES_INVOICE
@@ -210,6 +229,8 @@ enum AccountingSyncType {
   INVOICE_EMAIL
   WC_INVOICE_NOTE
   CREDIT_NOTE
+  // A refund recorded in error was deleted in IMS: void the sales credit note it posted (ACCRECCREDIT) in the ledger.
+  CREDIT_NOTE_VOID
   // audit-g5u2: supplier (purchase) credit note — Xero ACCPAYCREDIT.
   PURCHASE_CREDIT_NOTE
   // audit-v08m: follow-up that allocates the ACCPAYCREDIT to the bill it offsets.
@@ -231,6 +252,9 @@ enum AccountingSyncType {
   // 6oyu.4 (khdw): end-of-daily-batch sweep of the STOCK_IN_TRANSIT subledger-vs-GL
   // rounding residue (same guard — sub-penny swept, material gaps flagged never swept).
   DAILY_BATCH_TRANSIT_RECONCILIATION
+  // GR/IR accrual: the daily-batch reclass journal that moves the goods received-not-billed (and billed-not-received) value
+  // between Stock in Transit and the GR/IR account. Posted only while `grir_xero_posting_enabled` is on.
+  DAILY_BATCH_GRIR_RECLASS
   UNEARNED_REV_REVERSAL
   // o3d-0i5y r9: reverses the part of a Group A2 Allocated-Inventory debit that an allocation
   // rewrite has ORPHANED — units A2 posted for that no longer sit on any allocation row, so no
@@ -458,6 +482,25 @@ model Setting {
   @@map("settings")
 }
 
+/// The numbering pattern and counter of one kind of document IMS numbers itself (sales order, purchase order, credit note, shipment). One row per kind,
+/// created the first time it is needed. The row is the lock: a number is minted with the row held FOR UPDATE inside the transaction that writes the document
+/// (lib/domain/numbering/mint.ts). A NULL `pattern` means the kind's built-in default, which reproduces the numbers IMS minted before patterns existed.
+/// Sales INVOICE numbers are not here: the incumbent owns them.
+model DocumentNumberSequence {
+  documentType String   @id @map("document_type")
+  /// The operator's pattern ({YYYY} {YY} {MM} {DD} {SEQ} {SEQ:n} {RAND:n} and plain text); NULL = the default.
+  pattern      String?
+  /// The period the counter below belongs to (the date tokens of the pattern, rendered); NULL = never used, '' = one counter for ever.
+  scopeKey     String?  @map("scope_key")
+  /// The last counter issued in that period.
+  counter      Int      @default(0)
+  updatedAt    DateTime @default(now()) @map("updated_at")
+  /// The user who last changed the pattern or the counter; NULL for the system.
+  updatedBy    String?  @map("updated_by")
+
+  @@map("document_number_sequences")
+}
+
 /// Customisable document templates for PDF generation
 model DocumentTemplate {
   id             String   @id @default(cuid())
@@ -490,6 +533,22 @@ model AdjustmentReason {
   alignDownBindings ExternalWmsBinding[] @relation("ExternalWmsBindingAlignDownReason")
 
   @@map("adjustment_reasons")
+}
+
+/// Configurable reasons a customer return / refund happened (damaged, wrong item, changed mind ...). A configured list, not an enum, because the useful
+/// categories differ by business. Reason names are business configuration, not personal data. A refund points at one by id (`SalesOrderRefund.returnReasonId`);
+/// the free-text `SalesOrderRefund.reason` is a separate field and is untouched.
+model ReturnReason {
+  id        String   @id @default(cuid())
+  name      String
+  sortOrder Int      @default(0)
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  refunds SalesOrderRefund[]
+
+  @@map("return_reasons")
 }
 
 // ---------------------------------------------------------------------------
@@ -697,7 +756,16 @@ model Product {
   barcode         String?     @unique
   mpn             String?
   hsCode          String?
+  /// MIRRORED from the WooCommerce product attribute `pa_us_hs_code` (the US tariff code). IMS never writes `hsCode` from it and
+  /// never edits this column by hand: the Woo product import owns it. Null when WooCommerce carries none.
+  wcUsHsCode      String?     @map("wc_us_hs_code")
+  /// MIRRORED from the WooCommerce product meta `_dutify_hs_codes`: destination ISO-2 country to the tariff code captured for it
+  /// ({"US": "3921905050", "CA": "..."}). Owned by the Woo product import; separate from the IMS-owned `hsCode`.
+  wcDutifyHsCodes Json?       @map("wc_dutify_hs_codes")
   countryOfOrigin String?     // 2-letter ISO code
+  /// The customs fields (IMS names: hsCode / countryOfOrigin / customsDescription) of a VARIATION whose value came from its parent at the last
+  /// WooCommerce import rather than from the variation itself. A parent whose field WooCommerce cleared clears exactly these variations.
+  customsInherited String[]   @default([])
   customsDescription String?  // free-text goods description for customs paperwork
   weight          Decimal?    @db.Decimal(10, 4) // kg, for landed cost by weight
   active          Boolean     @default(true)
@@ -761,6 +829,7 @@ model Product {
   stockLevels     StockLevel[]
   locationStockBuffers LocationStockBuffer[]
   reorderThresholdOverrides ReorderThresholdOverride[]
+  customFieldValues CustomFieldValue[]
   costLayers      CostLayer[]
   inventorySnapshots InventorySnapshot[]
   inventoryReservationSnapshots InventoryReservationSnapshot[]
@@ -796,6 +865,8 @@ model Product {
   shipmentLines    ShipmentLine[]
   stockSyncStates  StockSyncState[]
   stockSyncJobs    StockSyncJob[]
+  syncMark         ProductSyncMark?
+  customsClears    ProductCustomsClear[]
   shoppingLinks    ShoppingProductLink[]
   wmsProductLinks  WmsProductLink[]
   wmsBundleLinks   WmsBundleLink[]
@@ -936,6 +1007,9 @@ model CostLayer {
   adjustmentMovementId String? @map("adjustment_movement_id")
   productionOrderId String?  @map("production_order_id")
   isOpeningStock  Boolean   @default(false)
+  /// The RETURN_INBOUND stock movement that created this layer (a refund that restocked its returned units). NULL for every other layer and for every layer written before the column existed.
+  /// Lets a deleted refund remove exactly the layers its own return created; a refund whose layers are not tagged cannot have its return reversed and is refused.
+  returnMovementId String?  @map("return_movement_id")
 
   product         Product   @relation(fields: [productId], references: [id])
   warehouse       Warehouse @relation(fields: [warehouseId], references: [id])
@@ -950,6 +1024,7 @@ model CostLayer {
   @@index([productId, warehouseId, receivedAt])
   @@index([adjustmentMovementId])
   @@index([productionOrderId])
+  @@index([returnMovementId])
   @@map("cost_layers")
 }
 
@@ -1043,7 +1118,7 @@ model TransitSubledgerMovement {
   id             String   @id @default(cuid())
   // 'PURCHASE_BILL' | 'PURCHASE_BILL_UPDATE' | 'SUPPLIER_CREDIT_NOTE' | 'STOCK_RECEIPT'
   // | 'LANDED_COST_RECLASS' | 'LANDED_COST_CONSUMED_OFFSET' | 'PURCHASE_ORDER_CANCEL'
-  // | 'SUPPLIER_RETURN' | 'CUSTOMER_RETURN_IN_TRANSIT'
+  // | 'SUPPLIER_RETURN' | 'CUSTOMER_RETURN_IN_TRANSIT' | 'GRIR_RECLASS'
   sourceType     String   @map("source_type")
   // originating entity (purchaseOrderId / creditNoteId) for traceability
   sourceRef      String   @map("source_ref")
@@ -1055,6 +1130,43 @@ model TransitSubledgerMovement {
 
   @@index([journalDate])
   @@map("transit_subledger_movements")
+}
+
+/// Append-only sub-ledger of the GR/IR (goods received, not invoiced) accrual, one signed row per source event, written in the SAME
+/// transaction as the receipt, the supplier bill, the bill edit, the supplier return or the return-generated credit note it records.
+/// Mirrors TransitSubledgerMovement (idempotent on a unique key). Sign: CREDIT-POSITIVE, `baseDelta` > 0 raises the GR/IR liability
+/// (goods received that no bill covers yet), < 0 lowers it (a bill, a return of the received goods). The open balance is the sum of the
+/// BALANCE source types (see lib/domain/accounting/grir-subledger-movement.ts); `BILL_PRICE_VARIANCE` rows are the price difference
+/// between a bill and the PO valuation, kept as their own movement and outside the balance (it stays on Stock in Transit exactly as
+/// it did before this ledger existed). No foreign keys: a plain id snapshot, like the other sub-ledgers.
+model GrirSubledgerMovement {
+  id             String    @id @default(cuid())
+  // 'RECEIPT' | 'BILL' | 'BILL_UPDATE' | 'SUPPLIER_RETURN' | 'SUPPLIER_CREDIT_NOTE' | 'OPENING_BALANCE' | 'BILL_PRICE_VARIANCE'
+  sourceType     String    @map("source_type")
+  // the originating entity (receipt / bill / return / credit note id) for traceability
+  sourceRef      String    @map("source_ref")
+  // dedupes a retried or replayed source event: first write wins
+  idempotencyKey String    @unique @map("idempotency_key")
+  poId           String    @map("po_id")
+  // null for a credit-note row, which is valued per bill and not per order line
+  poLineId       String?   @map("po_line_id")
+  supplierId     String    @map("supplier_id")
+  // signed stock-unit quantity on the same sign as baseDelta; null where the row carries no quantity
+  qtyDelta       Decimal?  @db.Decimal(18, 6) @map("qty_delta")
+  baseDelta      Decimal   @db.Decimal(18, 6) @map("base_delta")
+  // the GL date the movement posts on (date-only, UTC)
+  journalDate    DateTime  @map("journal_date")
+  // the instant of the source event, for the age of an open balance
+  occurredAt     DateTime  @map("occurred_at")
+  // set when the daily batch put this row into a GR/IR reclass journal; null = not (yet) posted
+  xeroBatchRef   String?   @map("xero_batch_ref")
+  createdAt      DateTime  @default(now())
+
+  @@index([poId])
+  @@index([supplierId])
+  @@index([journalDate])
+  @@index([xeroBatchRef])
+  @@map("grir_subledger_movements")
 }
 
 /// Governed by additional db-native reporting guarantees from migration
@@ -1347,6 +1459,18 @@ model PurchaseOrder {
   rfqSentAt       DateTime?
   poSentAt        DateTime?
 
+  /// The user who created the order (null for imported and pre-approval-workflow orders). The approval gate refuses this user approving it.
+  createdById     String?
+  /// Purchase-order approval (setting `po_approval_threshold_base`). Plain ids, no FK, like the other createdBy columns: a deleted user leaves the
+  /// record intact and the activity log carries the name.
+  approvedById    String?
+  approvedAt      DateTime?
+  /// What was approved: the ex-VAT base total, the supplier and the currency at approval time. An approval is valid only while the order still
+  /// matches this snapshot (see lib/domain/purchasing/po-approval.ts).
+  approvedTotalBase  Decimal?          @db.Decimal(18, 4)
+  approvedSupplierId String?
+  approvedCurrency   String?
+
   archived        Boolean            @default(false)
   createdAt       DateTime           @default(now())
   updatedAt       DateTime           @updatedAt
@@ -1358,6 +1482,7 @@ model PurchaseOrder {
   invoices        PurchaseInvoice[]
   returns         PurchaseReturn[]
   supplierCreditNotes SupplierCreditNote[]
+  attachments     OrderAttachment[]
 
   // Landed cost links — this PO as primary
   landedCostLinks LandedCostLink[]   @relation("PrimaryPO")
@@ -1391,6 +1516,8 @@ model PurchaseOrderLine {
   reorderEvidence Json?
   /// Per-line estimated delivery. Null = inherit the order's expectedDelivery (lib/domain/purchasing/line-eta.ts). Receiving never writes it.
   expectedDelivery DateTime?
+  /// Internal remark on this line (colourway, substitute accepted, chase this one). Never printed on the supplier PO PDF or sent in the supplier email.
+  notes           String?
   qtyReceived     Decimal   @db.Decimal(12, 4) @default(0)
   qtyReturned     Decimal   @db.Decimal(12, 4) @default(0)
   sortOrder       Int       @default(0)
@@ -1401,6 +1528,7 @@ model PurchaseOrderLine {
   taxRate         TaxRate?         @relation(fields: [taxRateId], references: [id])
   receiptLines    PurchaseReceiptLine[]
   returnLines     PurchaseReturnLine[]
+  pegs            SalesOrderLinePeg[]
   invoiceLines    PurchaseInvoiceLine[]
   costLayers      CostLayer[]
 
@@ -1470,6 +1598,7 @@ model FreightCostLine {
   vatable            Boolean          @default(false)
   distributionMethod LandedCostMethod @default(BY_VALUE)
   sortOrder          Int              @default(0)
+  kind               FreightCostKind?
 
   po                 PurchaseOrder    @relation(fields: [poId], references: [id])
   invoiceLines       PurchaseInvoiceLine[]
@@ -1768,6 +1897,8 @@ model SalesOrder {
   // by the refund service; the legacy PARTIALLY_REFUNDED/REFUNDED `status` values are
   // being retired in favour of this field (epic: orthogonal refund status).
   refundStatus      RefundDisposition @default(NONE)
+  /// Whether an invoice exists for the order, orthogonal to `status`. Derived and maintained by lib/domain/sales/invoicing-state.ts (the only writer); a cancelled order keeps it.
+  invoicingState    InvoicingState @default(NOT_INVOICED) @map("invoicing_state")
   /// o3d-e1yb [wdraw]: set when this order is ON_HOLD because the customer filed an EU
   /// right-of-withdrawal request in the storefront. It marks the hold as
   /// withdrawal-originated, which does two things nothing else does:
@@ -1820,6 +1951,13 @@ model SalesOrder {
   wclcDutyComponent     Decimal?  @db.Decimal(18, 4) @map("wclc_duty_component")
   wclcTaxComponent      Decimal?  @db.Decimal(18, 4) @map("wclc_tax_component")
   wclcHandlingComponent Decimal?  @db.Decimal(18, 4) @map("wclc_handling_component")
+  /// The shop's own IOSS number (setting `shop_ioss_number`), stored only on an order whose EU VAT stamp (`euVatRegime`) is IOSS.
+  /// Read from the stamp, never decided here; null otherwise. Sent on the Mintsoft create push only when `mintsoft_send_ioss_number`
+  /// is on. Not personal data (the shop's own number).
+  iossNumber            String?   @map("ioss_number")
+  /// IOSS_DDP when the order's EU VAT stamp is IOSS, DDP when it is DDP, null otherwise (DDU_DAP is never inferred). Read from the
+  /// stamp, never decided here. Informational.
+  deliveryTerm          String?   @map("delivery_term")
   billingAddress    Json?
   shippingAddress   Json?
 
@@ -1850,6 +1988,15 @@ model SalesOrder {
   shipFromWarehouseId String?
   expectedDelivery  DateTime?
   salesRep          String?
+  /// o3d-ngmt.16: a QUOTATION is a DRAFT with this flag set, not a status of its own. Nothing downstream is told: every rule that already
+  /// applies to a draft (not pushed to the warehouse, not allocated, no stock reserved, no invoice queued, not mirrored to the storefront)
+  /// applies to a quote unchanged. Cleared by converting the quote to an order; the order stays a plain DRAFT until the operator confirms it.
+  /// WooCommerce imports never set it (the column default is false and no importer names it).
+  isQuote           Boolean    @default(false) @map("is_quote")
+  /// The last day the quoted prices stand (a calendar date, no time zone). NULL on every order that is not a quote, and kept after conversion as the record of what was offered.
+  quoteValidUntil   DateTime?  @map("quote_valid_until") @db.Date
+  /// When the quote was last queued to the customer by email (queued, not delivered: the outbox owns delivery). NULL: never sent from IMS.
+  quoteSentAt       DateTime?  @map("quote_sent_at")
   shippedAt         DateTime?
   trackingNumber    String?
   discountStr       String?    // order-level discount input e.g. "10%" or "5.00"
@@ -1912,6 +2059,12 @@ model SalesOrder {
   /// A value that is still set means an invoice obligation has not been recorded anywhere yet, so an existing-order import of it cannot succeed until a held invoice or a
   /// SALES_INVOICE row (any status) exists. NULL for every order imported before this column and for orders the import does not invoice.
   salesInvoiceOwedAt      DateTime?  @map("sales_invoice_owed_at")
+  /// Set when an operator edited this order in IMS after it was confirmed (lines, or addresses/notes after dispatch). While set, a later WooCommerce order.updated delivery does not write its addresses, notes, VAT number or shipping label back over the IMS edit,
+  /// and the "edited in WooCommerce after import" comparison is not raised (the order is deliberately desynced). Paid state and the order number still mirror. NULL on every order never edited this way.
+  editedInImsAt           DateTime?  @map("edited_in_ims_at")
+  /// The WooCommerce-facing state of this order's lines and total BEFORE the first IMS edit of its lines: { totalForeign, lines: [{ externalLineItemId, qty, sku }] }. Taken once, so the "edited in WooCommerce after import" comparison can keep running
+  /// after an IMS line edit, against what WooCommerce held (an IMS edit does not reach WooCommerce) instead of against the edited lines. NULL when the lines were never edited in IMS (an address or notes edit takes none), and the comparison is against the lines as usual.
+  wcLineBaseline          Json?      @map("wc_line_baseline")
   /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
   ///
   /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
@@ -2125,11 +2278,14 @@ model SalesOrder {
   customer          Customer?        @relation(fields: [customerId], references: [id])
   shipFromWarehouse Warehouse?       @relation("ShipFromWarehouse", fields: [shipFromWarehouseId], references: [id])
   lines             SalesOrderLine[]
+  customFieldValues CustomFieldValue[]
   refunds           SalesOrderRefund[]
   returnExpectations ReturnExpectation[]
   invoiceDocuments  SalesOrderInvoiceDocument[]
+  attachments       OrderAttachment[]
   invoiceDocumentFetches InvoiceDocumentFetchState[]
   invoiceStorePublication InvoiceStorePublication?
+  trackshipRefireState    TrackshipRefireState?
   payments          Payment[]
   paymentRemovals   PaymentRemovalReconciliation[]
   allocations       OrderAllocation[]
@@ -2138,6 +2294,7 @@ model SalesOrder {
   wmsReturnsInbox   WmsReturnsInbox[] @relation("WmsReturnsInboxOrder")
   wmsOrderStatus    WmsOrderStatusSnapshot?
   wmsOrderPush      WmsOrderPushLink?
+  wmsMergeHolds     WmsMergeHold[]
   wmsOperatorTasks  WmsOperatorTask[]
   wmsOrderDiscrepancies WmsOrderDiscrepancy[]
 
@@ -2159,6 +2316,9 @@ model SalesOrderLine {
   /// Null on every goods line and on any fee line that carries no wclc marker. Identifies a fee line without
   /// inferring it from an empty SKU.
   wclcFeeKind     String?    @map("wclc_fee_kind")
+  /// MIRRORED from the line item meta `_wc_label_customs_unit_value`: the operator-set per-unit customs value override, in the
+  /// ORDER currency, exactly as WooCommerce holds it. Null when the line carries none (or an unusable one). Never recomputed.
+  wcCustomsUnitValue Decimal? @db.Decimal(18, 6) @map("wc_customs_unit_value")
   description     String
   sku             String?
   qty             Decimal    @db.Decimal(12, 4)
@@ -2188,16 +2348,23 @@ model SalesOrderLine {
   /// which is the only thing allowed to parse it and refuses rather than falling back when the
   /// payload is present but unreadable.
   fulfillmentRequirements Json? @map("fulfillment_requirements")
+  /// The refund this line is the REPLACEMENT for (an exchange recorded during a return, Return exchanges). NULL on every ordinary line and on every line written before the column existed.
+  /// The line is an ordinary order line in every other respect (allocation, shipment, invoice); this link only lets the order page, the returns analytics and the refund delete rule tell a
+  /// replacement from a sale. SetNull: the link never blocks or cascades into a refund (the refund delete rule refuses a refund that has replacement lines instead).
+  exchangeForRefundId String? @map("exchange_for_refund_id")
 
   order           SalesOrder @relation(fields: [orderId], references: [id])
   product         Product?   @relation(fields: [productId], references: [id])
   taxRate         TaxRate?   @relation(fields: [taxRateId], references: [id])
+  exchangeForRefund SalesOrderRefund? @relation("RefundExchangeLines", fields: [exchangeForRefundId], references: [id], onDelete: SetNull)
   allocations     OrderAllocation[]
+  pegs            SalesOrderLinePeg[]
   shipmentLines   ShipmentLine[]
   refundLines     SalesOrderRefundLine[]
 
   @@index([orderId])
   @@index([productId])
+  @@index([exchangeForRefundId])
   @@map("sales_order_lines")
 }
 
@@ -2239,6 +2406,9 @@ model SalesOrderRefund {
   stockCorrectionQueuedAt DateTime? @map("stock_correction_queued_at")
   returnWarehouseId String?
   reason          String?
+  /// The structured reason (configured in Settings, one per refund). Optional; the free-text `reason` above is separate and unchanged. SetNull so removing a reason never touches a refund.
+  returnReasonId  String?    @map("return_reason_id")
+  returnReason    ReturnReason? @relation(fields: [returnReasonId], references: [id], onDelete: SetNull)
   totalForeign    Decimal    @db.Decimal(18, 4)
   totalBase        Decimal    @db.Decimal(18, 4)
   // What the stored totals MEAN, and which trusted writer created the refund (o3d-n8p). Set by the
@@ -2268,6 +2438,10 @@ model SalesOrderRefund {
   // terminalises. With the row gone the relief reads ZERO and the residue reverses the whole A2
   // debit a second time. Refund rows are never deleted by retention.
   allocatedReliefAmount Decimal? @db.Decimal(18, 4) @map("accounting_allocated_relief_amount")
+  // The unearned revenue THIS refund's own UNEARNED_REV_REVERSAL debits, written in the same statement as the amount above. A later refund's
+  // remainder sweep nets earlier refunds' reversals from this column because their sync rows are hard-deleted by `retention_sync_logs_months`
+  // once terminal; refund rows are never deleted by retention. NULL: written before the column existed (the figure is then unknown, never zero).
+  unearnedReversedAmount Decimal? @db.Decimal(18, 4) @map("accounting_unearned_reversed_amount")
   // o3d-o97 r3: why this refund could NOT account for the order's A2 debit, or null when it could.
   // A refusal has to leave a remedy an operator can actually perform: the un-stage below is
   // SUPPRESSED whenever this is set, so the A2 stamp survives and the standing A2 invariants keep
@@ -2346,6 +2520,8 @@ model SalesOrderRefund {
   order           SalesOrder @relation(fields: [orderId], references: [id])
   returnWarehouse Warehouse? @relation(fields: [returnWarehouseId], references: [id])
   lines           SalesOrderRefundLine[]
+  /// The replacement lines added to the order for this refund (an exchange). Empty for every refund that is not part of one.
+  exchangeLines   SalesOrderLine[] @relation("RefundExchangeLines")
   payments        Payment[]
   returnExpectation ReturnExpectation?
   invoiceDocuments  SalesOrderInvoiceDocument[]
@@ -2354,6 +2530,7 @@ model SalesOrderRefund {
   @@unique([externalRefundId])
   @@index([orderId])
   @@index([stockCorrectionRequired, stockCorrectionQueuedAt])
+  @@index([returnReasonId])
   @@map("sales_order_refunds")
 }
 
@@ -2361,6 +2538,32 @@ model SalesOrderRefund {
 /// It holds NO stock: nothing here is on hand, allocatable or pushed to a storefront. The value sits in the
 /// Stock in Transit account (the refund's COGS reversal debits it) until the units arrive or are written off.
 /// Lines carry the dispatch-cost snapshot the refund was valued at, so arrival can clear exactly that value.
+/// The record that a refund recorded in error was deleted (o3d-ngmt.22). The refund row and its lines are gone; this keeps the
+/// identity, the credit note number and the figures it carried, who deleted it and why, and what the delete reversed. It is also the
+/// idempotency anchor: one row per deleted refund id, so a retried delete finds it and reports done.
+/// Structural data only (ids, numbers, amounts, dates): no line text and no customer detail is copied in. `reason` is the operator's own text.
+model SalesOrderRefundDeletion {
+  id                      String   @id @default(cuid())
+  /// The deleted refund's own id. Unique: a delete happens once.
+  refundId                String   @unique @map("refund_id")
+  /// The order the refund belonged to. No foreign key: the record outlives a deleted order.
+  orderId                 String   @map("order_id")
+  creditNoteNumber        String?  @map("credit_note_number")
+  accountingCreditNoteId  String?  @map("accounting_credit_note_id")
+  totalBase               Decimal  @db.Decimal(18, 4) @map("total_base")
+  totalForeign            Decimal  @db.Decimal(18, 4) @map("total_foreign")
+  reason                  String?
+  deletedById             String?  @map("deleted_by_id")
+  deletedAt               DateTime @default(now()) @map("deleted_at")
+  /// The credit-note void sync row queued for the ledger (null when the credit note never reached it).
+  voidSyncLogId           String?  @map("void_sync_log_id")
+  /// What was reversed, from the recorded movements: stock out, layers removed, the COGS journal reversed, syncs retired. Amounts and ids only.
+  reversal                Json     @default("{}")
+
+  @@index([orderId])
+  @@map("sales_order_refund_deletions")
+}
+
 enum InvoiceDocumentKind {
   INVOICE
   CREDIT_NOTE
@@ -2385,6 +2588,48 @@ enum InvoiceDocumentFetchStatus {
 ///
 /// This table is the READ side only. It does not write `SalesOrder.accountingInvoiceId` (the ledger document
 /// may be one IMS did not post, and that column drives payment polling and updates).
+/// A supporting document (supplier quote, proforma, packing list, customer PO, email) attached to ONE purchase order OR ONE sales order.
+/// Exactly one of purchase_order_id / sales_order_id is set (a CHECK constraint in the migration enforces it). The bytes live in the private upload
+/// root under order-attachments/<storedName>; the row is the only thing that names the file, and every read goes by this row's id, never by a name.
+/// Soft delete (deletedAt): a deleted row is hidden and its download is refused; the file stays on disk (an operator can recover it) until an erasure or a purge removes it. A sales order's
+/// attachments can hold customer personal data, so a personal-data erasure DELETES the rows and files of the erased orders.
+/// Not pushed to Xero in v1 (the ledger's attachment path is untouched).
+model OrderAttachment {
+  id               String    @id @default(cuid())
+  purchaseOrderId  String?   @map("purchase_order_id")
+  salesOrderId     String?   @map("sales_order_id")
+  /// The name the uploader's browser sent. Shown and offered as the download name after sanitising; never used to locate the file.
+  originalFilename String    @map("original_filename")
+  /// Random, server-chosen file name inside the attachments directory (a uuid plus the extension of the verified type).
+  storedName       String    @unique @map("stored_name")
+  mimeType         String    @map("mime_type")
+  byteSize         Int       @map("byte_size")
+  sha256           String
+  /// The staff user who uploaded it. A plain id (no foreign key) so removing a user never touches the document record.
+  uploadedByUserId String    @map("uploaded_by_user_id")
+  uploadedAt       DateTime  @default(now()) @map("uploaded_at")
+  deletedAt        DateTime? @map("deleted_at")
+
+  purchaseOrder PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  salesOrder    SalesOrder?    @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+
+  @@index([purchaseOrderId, deletedAt])
+  @@index([salesOrderId, deletedAt])
+  @@map("order_attachments")
+}
+
+/// FILES OWED A DELETION: the stored names of order-attachment files whose rows were deleted (a personal-data erasure, a deleted draft order). Written in the SAME
+/// transaction as the row deletion, so a crash or a failed unlink can never leave a file with no record pointing at it; a retryable drain removes the file and then
+/// the entry. An UPLOAD reserves its file name here BEFORE the file is written, due 15 minutes ahead (queuedAt is the DUE time; the drain takes only due entries), and the
+/// row insert deletes the reservation in its own transaction: a rejected or crashed upload leaves a reservation that becomes due and is drained. A stored name is a random uuid and identifies no one.
+model OrderAttachmentFileDeletion {
+  storedName String   @id @map("stored_name")
+  queuedAt   DateTime @default(now()) @map("queued_at")
+  attempts   Int      @default(0)
+
+  @@map("order_attachment_file_deletions")
+}
+
 model SalesOrderInvoiceDocument {
   id                 String              @id @default(cuid())
   orderId            String              @map("order_id")
@@ -2463,6 +2708,9 @@ model InvoiceDocumentFetchState {
   leaseUntil    DateTime?                  @map("lease_until")
   /// Who holds the lease: a token unique to one fetch. Renewal, every state write, the promotion and the release all require it, so a holder whose lease was taken over cannot write or release the new holder's.
   leaseHolder   String?                    @map("lease_holder")
+  /// When a customer's click first QUEUED this document's fetch (an order the sweep never covered). Set once, never cleared: it is the
+  /// de-duplication key of the on-demand queue and the count behind its daily cap. NULL for a document nobody asked for.
+  customerRequestedAt DateTime?            @map("customer_requested_at")
   createdAt     DateTime                   @default(now()) @map("created_at")
   updatedAt     DateTime                   @updatedAt @map("updated_at")
 
@@ -2470,6 +2718,7 @@ model InvoiceDocumentFetchState {
   refund SalesOrderRefund? @relation(fields: [refundId], references: [id])
 
   @@index([status, nextAttemptAt])
+  @@index([customerRequestedAt])
   @@map("invoice_document_fetch_states")
 }
 
@@ -2575,6 +2824,8 @@ model SalesOrderRefundLine {
   schemeTaxRateValue Decimal? @db.Decimal(9, 6) @map("scheme_tax_rate_value")
   /// The VAT the source STATED it returned on this line (a WooCommerce refund states it per refunded line), in the order's currency. NULL when nothing was stated (a manual refund) and on every older row. Read only by the per-target refund balance, which holds a fee line's cumulative refunded VAT to the VAT the order line bore.
   chargedTaxForeign Decimal? @db.Decimal(18, 4) @map("charged_tax_foreign")
+  /// The VAT rate (a fraction, 0.2 = 20%) of the line's tax code AT THE MOMENT THE REFUND WAS CREATED, for every refund (schemeTaxRateValue above is the scheme-only freeze and marks a refund as a scheme one, so it cannot carry this). The credit-note history shows VAT and gross from this, so editing a tax mapping afterwards cannot change what a posted credit note displays. NULL when the code could not be priced then and on every older row: the display falls back to the current table and says the figure is estimated.
+  postedTaxRate Decimal? @db.Decimal(9, 6) @map("posted_tax_rate")
 
   refund          SalesOrderRefund @relation(fields: [refundId], references: [id])
   salesOrderLine  SalesOrderLine?  @relation(fields: [salesOrderLineId], references: [id], onDelete: SetNull)
@@ -3280,6 +3531,23 @@ model AccountingSyncLog {
   /// warning is noise, an under-broad one loses a payment in silence.
   followUpObligations Json? @map("follow_up_obligations")
 
+  /// o3d-oyur — THE PER-ACCOUNT NET A JOURNAL MOVED, kept when retention drops its payload.
+  ///
+  /// The A2 posting proof asks ONE question of a journal: the NET movement of one account code in one
+  /// direction. Compaction empties `payload`, which used to leave an old journal permanently unprovable
+  /// (the proof fails closed). Compaction now writes this column in the SAME statement that empties the
+  /// payload, for the journal-carrying types only, and the proof reads it once the lines are gone:
+  /// `{ "version": 1, "accounts": { "<code>": { "credit": n, "debit": n } } }`, each figure the value
+  /// `extractPayloadNetMovement` returns for that account and direction. Account codes and two totals
+  /// each: no names, references, descriptions or addresses, so it is not personal data and may outlive
+  /// the payload.
+  ///
+  /// NULL is NO RECORD, not zero: every row compacted before this column existed (the payload it would
+  /// be derived from is gone, and there is no backfill), every row that was never compacted (its payload
+  /// is still the authority) and every non-journal type. A reader treats an absent or malformed value as
+  /// unreadable and the proof fails closed.
+  payloadAccountNets Json? @map("payload_account_nets")
+
   // Polymorphic reference: use referenceType + referenceId for application-level lookups.
   // No FK constraints — referenceId may point to PurchaseOrder, SalesOrder, etc. based on referenceType.
 
@@ -3765,6 +4033,8 @@ model StockSyncState {
   lastPushedQty    Int?
   lastPushedAt     DateTime?
   lastPushedRemoteId String?
+  /// o3d-taro: the back-in-stock date last pushed as product meta ('' = cleared). Null until the feature has pushed once.
+  lastPushedEtaDate String?
   lastWebhookQty   Int?
   lastWebhookAt    DateTime?
   lastCorrectedAt  DateTime?
@@ -3775,6 +4045,47 @@ model StockSyncState {
 
   @@id([connector, productId])
   @@map("stock_sync_states")
+}
+
+/// Products edited in bulk (Edit by CSV) whose storefront and warehouse sync is still owed. Written in the SAME transaction as the
+/// edit, drained by the product-sync-marks cron in small batches, so a large edit never pushes to a vendor inside the request. A row
+/// is deleted once its sync has been handed over; a re-edit resets it. `claimedAt` is the drain's lease, `attempts` bounds retries.
+model ProductSyncMark {
+  productId         String    @id
+  storefrontPending Boolean   @default(true)
+  warehousePending  Boolean   @default(true)
+  attempts          Int       @default(0)
+  claimedAt         DateTime?
+  lastError         String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @default(now())
+
+  product           Product   @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([createdAt])
+  @@map("product_sync_marks")
+}
+
+/// A customs field (hsCode / countryOfOrigin / customsDescription) that was EMPTIED on a product (value -> nothing). Written by a database
+/// trigger on `products` so every write path records it, and removed when the field is populated again or once the warehouse copy is
+/// verified empty. This, not an unset field, is the only evidence that the warehouse copy should be cleared.
+model ProductCustomsClear {
+  productId String
+  field     String
+  createdAt DateTime @default(now())
+  /// Short compare-and-set lease around the warehouse clear request (no row lock or transaction is held across the HTTP call): the
+  /// token of the run that holds it and when it took it. A lease older than the lease length is taken over.
+  claimToken String?
+  claimedAt  DateTime?
+  /// Clear requests started for this marker. Past the cap the clear is left to the operator (an open discrepancy) instead of retried forever.
+  attempts   Int      @default(0)
+  /// Clear requests that ended with no answer or no proof (timeout, network error, failed read-back): a separate, higher cap than `attempts`, so a long outage does not hand the clear to the operator but a clear that never gets through eventually does.
+  unverifiedAttempts Int @default(0)
+
+  product   Product  @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@id([productId, field])
+  @@map("product_customs_clears")
 }
 
 model StockSyncJob {
@@ -3989,6 +4300,12 @@ model WmsOrderStatusSnapshot {
   // Last WMS status successfully pushed to the storefront (G4). Decoupled from `status`
   // so a failed storefront push isn't masked by the cached-status change gate — it retries.
   wcPushedStatus      String?
+  /// CONSECUTIVE status-sweep lookups that found the warehouse order genuinely absent (a 404 and a presence probe that agreed, for an order IMS has
+  /// pushed). Reset by any lookup that finds the order (or finds it merged or ambiguous); left alone by a lookup that failed. At the threshold the
+  /// snapshot becomes NOTFOUND and the sweep stops polling the order. A counter only: no personal data.
+  notFoundStrikes     Int      @default(0)
+  /// When the snapshot became NOTFOUND (the sweep no longer polls it). Null while the order is still polled.
+  notFoundAt          DateTime?
 
   order               SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
@@ -4117,6 +4434,9 @@ model WmsOrderPushLink {
   /// (sets both columns back to null; the clear is audited). `doublePostageDetail` is the sentence the operator reads: order numbers and amounts only.
   doublePostageAt       DateTime? @map("double_postage_at")
   doublePostageDetail   String?   @map("double_postage_detail")
+  /// The IMS warehouse the warehouse order was created for (the order's ship-from warehouse at create time). A despatch is evidence about
+  /// this warehouse only. Null on links created before this column existed (the despatch then falls back to the order's ship-from).
+  pushWarehouseId       String?   @map("push_warehouse_id")
   /// Set before IMS amends the warehouse order's lines and cleared only when a verified fresh snapshot of its line ids is stored (or the
   /// amendment provably changed nothing). While set, the recorded line ids cannot be trusted and a merged-order line removal refuses.
   lineSnapshotUnsafeAt  DateTime? @map("line_snapshot_unsafe_at")
@@ -4134,9 +4454,33 @@ model WmsOrderPushLink {
   courierTaskEpisode    DateTime? @map("courier_task_episode")
   holdNoticeCommentAt   DateTime? @map("hold_notice_comment_at")
   cancelNoticeCommentAt DateTime? @map("cancel_notice_comment_at")
+  /// MIXED-WAREHOUSE SCOPE (feature flag `wms_mixed_warehouse_push_enabled`, off by default). Null scopeMode = the link predates the flag or was
+  /// pushed with the whole order (behaviour unchanged). FULL = single-warehouse, whole order sent. MIXED = only the units allocated to the
+  /// warehouse this link serves were sent; the snapshot of what was sent is in `scopeLines` at `scopeVersion`.
+  scopeMode             WmsPushScopeMode? @map("scope_mode")
+  /// Bumped each time a different scope is sent (create or amendment). 0 = no scope recorded.
+  scopeVersion          Int       @default(0) @map("scope_version")
+  /// Hash of the scope last sent (lines, quantities and the apportioned money), so an amend pass can tell "nothing changed" from "resend".
+  scopeHash             String?   @map("scope_hash")
+  /// Set by every writer of order allocations / shipment lines (markWmsScopeDirtyInTx); the amend pass recomputes the scope and clears it.
+  scopeDirtyAt          DateTime? @map("scope_dirty_at")
+  scopeCheckedAt        DateTime? @map("scope_checked_at")
+  /// The scope changed after the warehouse order left NEW (or the change cannot be sent): nothing is amended, the link is frozen and escalated.
+  scopeFrozenAt         DateTime? @map("scope_frozen_at")
+  scopeFrozenReason     String?   @map("scope_frozen_reason")
+  /// The apportioned money (minor units of the order currency) that went out with the scope: discount, shipping and VAT.
+  scopeDiscountMinor    Int?      @map("scope_discount_minor")
+  scopeShippingMinor    Int?      @map("scope_shipping_minor")
+  scopeVatMinor         Int?      @map("scope_vat_minor")
+  /// Q2, decided ONCE when the part is first sent and frozen: whether the part carries the order's shipping (and the VAT not on a goods line). Null until a part is sent.
+  scopeShippingCarried  Boolean?  @map("scope_shipping_carried")
+  /// The warehouse's part of the order has despatched and been applied in IMS: dispatch polling stops and the order is never cancelled in the warehouse.
+  despatchSettledAt     DateTime? @map("despatch_settled_at")
   createdAt           DateTime          @default(now())
   updatedAt           DateTime          @updatedAt
 
+  scopeLines          WmsOrderPushScopeLine[]
+  despatchApplications WmsDespatchApplication[]
   items               WmsOrderPushItem[]
   order               SalesOrder        @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
@@ -4146,6 +4490,45 @@ model WmsOrderPushLink {
   @@index([connector, dispatchReconcileCheckedAt])
   @@index([connector, dispatchUnresolvedAt])
   @@map("wms_order_push_links")
+}
+
+enum WmsPushScopeMode {
+  FULL
+  MIXED
+}
+
+/// What a mixed-warehouse push sent, one row per order line and scope version (whole units: a kit is one unit, never its components).
+/// Immutable once written; a new scope is a new version.
+model WmsOrderPushScopeLine {
+  id           String   @id @default(cuid())
+  linkId       String   @map("link_id")
+  scopeVersion Int      @map("scope_version")
+  orderLineId  String   @map("order_line_id")
+  sku          String
+  quantity     Decimal  @db.Decimal(12, 4)
+  createdAt    DateTime @default(now()) @map("created_at")
+
+  link         WmsOrderPushLink @relation(fields: [linkId], references: [id], onDelete: Cascade)
+
+  @@unique([linkId, scopeVersion, orderLineId], map: "wms_scope_lines_link_version_line_key")
+  @@index([linkId])
+  @@map("wms_order_push_scope_lines")
+}
+
+/// One row per despatch applied for a link and scope version. The idempotency key makes a replayed despatch a no-op: the row is inserted in the
+/// same transaction that ships the warehouse's own shipments, so a second apply finds it and ships nothing.
+model WmsDespatchApplication {
+  id             String   @id @default(cuid())
+  linkId         String   @map("link_id")
+  scopeVersion   Int      @map("scope_version")
+  idempotencyKey String   @unique @map("idempotency_key")
+  shipmentIds    Json     @map("shipment_ids")
+  appliedAt      DateTime @default(now()) @map("applied_at")
+
+  link           WmsOrderPushLink @relation(fields: [linkId], references: [id], onDelete: Cascade)
+
+  @@index([linkId])
+  @@map("wms_despatch_applications")
 }
 
 /// The warehouse's own line ids for the order IMS pushed, read back right after the create (and after an amendment): one row per
@@ -4189,6 +4572,16 @@ enum WmsOperatorTaskReason {
   SHOP_REFUND_DUE
   /// An IMS amendment the warehouse order could not take because it was already past NEW: a person applies the change in the warehouse by hand.
   AMENDMENT_NOT_APPLIED
+  /// The status sweep found the warehouse order absent on several consecutive polls, marked it NOTFOUND and stopped polling it: a person checks it in the warehouse.
+  ORDER_NOT_FOUND
+  /// A storefront (or approved EU withdrawal) cancelled an order whose invoice is already posted to the ledger: IMS raised no credit note and a cancelled order cannot be refunded, so a person credits the invoice by hand.
+  CANCELLED_POSTED_INVOICE
+  /// Merge hold (setting wms_merge_hold_enabled): IMS held every order of a same-customer group in the warehouse so a person can merge them there. Carries the EU and FedEx warnings.
+  MERGE_HOLD
+  /// A merge hold has stood longer than MERGE_HOLD_REMIND_HOURS: a person has to merge and confirm the orders in the warehouse (IMS never releases a merge hold).
+  MERGE_HOLD_OVERDUE
+  /// A withdrawal (or an IMS cancel) reached an order that is on merge hold: IMS did not cancel or release it, a person decides in the warehouse.
+  MERGE_HOLD_WITHDRAWAL
 }
 
 enum WmsOperatorTaskStatus {
@@ -4218,6 +4611,83 @@ model WcStockDirtyOrder {
 
   @@index([syncVersion, checkedAt, releasedAt, id], map: "wc_stock_dirty_orders_refresh_idx")
   @@map("wc_stock_dirty_orders")
+}
+
+/// Per-order state of the TrackShip re-fire sweep (setting `trackship_refire_enabled`, default off). One row per shipped, tracked storefront order
+/// inside the re-fire window. `attempts` counts the re-fires asked of the storefront; `nextAttemptAt` is the exponential back-off (capped) until
+/// the next one. COVERED: the storefront reported a TrackShip shipment for every tracking number. EXPIRED: the order left the re-fire window or
+/// the storefront no longer has it, so nothing more is asked. Order and tracking facts only: no personal data.
+enum TrackshipRefireStatus {
+  ACTIVE
+  COVERED
+  EXPIRED
+}
+
+model TrackshipRefireState {
+  id            String                @id @default(cuid())
+  orderId       String                @unique @map("order_id")
+  status        TrackshipRefireStatus @default(ACTIVE)
+  attempts      Int                   @default(0)
+  nextAttemptAt DateTime              @map("next_attempt_at")
+  lastAttemptAt DateTime?             @map("last_attempt_at")
+  /// The storefront's answer to the last re-fire, in a fixed vocabulary (never remote free text).
+  lastResult    String?               @map("last_result")
+  createdAt     DateTime              @default(now()) @map("created_at")
+  updatedAt     DateTime              @updatedAt @map("updated_at")
+
+  order         SalesOrder            @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([status, nextAttemptAt], map: "trackship_refire_states_due_idx")
+  @@map("trackship_refire_states")
+}
+
+/// MERGE HOLD (setting wms_merge_hold_enabled, off by default): the IDENTITY of a hold IMS placed on a warehouse order so a person can merge it with the
+/// customer's other orders. The hold's identity lives HERE, never in warehouse text (warehouse comments are immutable and an operator's own confirm writes
+/// none), so a hold is current only while this row is HOLDING/HELD for the warehouse order it names, and it clears on an OBSERVED status change. One row per
+/// (connector, order); a re-hold after a clear starts a new episode on the same row. IMS never releases a merge hold: nothing writes MarkConfirmed.
+enum WmsMergeHoldState {
+  /// The hold request is about to be / was sent and its answer is not recorded (a crash here leaves HOLDING: treated as possibly held, never re-sent blind).
+  HOLDING
+  HELD
+  /// The request failed or its answer was lost (timeout, 5xx, no Success field): the order MAY be held. Settled by a status read (awaiting confirmation: HELD, NEW: safe to retry,
+  /// anything else: stays UNKNOWN and an operator task asks a person). Counts as held for every "do not touch" query.
+  UNKNOWN
+  /// The warehouse refused (not retried), or an unknown outcome was settled as "still NEW" (retryable): the order is NOT held (the badge says so).
+  NOT_HELD
+  /// The warehouse order left the held status or was merged: nothing is blocked any more.
+  CLEARED
+}
+
+model WmsMergeHold {
+  id                  String            @id @default(cuid())
+  connector           String
+  orderId             String            @map("order_id")
+  /// The warehouse order the hold was placed on (the identity of THIS episode).
+  externalOrderId     String            @map("external_order_id")
+  /// The merge group this hold belongs to (merge-candidate-match basis).
+  groupBasis          String            @map("group_basis")
+  state               WmsMergeHoldState
+  /// Bumped each time the order is held again after a clear.
+  episode             Int               @default(1)
+  attempts            Int               @default(0)
+  /// True when the warehouse answered and said no (not retried); false when the request failed in transport (retried).
+  refused             Boolean           @default(false)
+  lastError           String?           @map("last_error")
+  heldAt              DateTime?         @map("held_at")
+  /// Set once, when the overdue reminder has been raised (compare-and-set): the reminder fires once per episode.
+  remindedAt          DateTime?         @map("reminded_at")
+  clearedAt           DateTime?         @map("cleared_at")
+  clearReason         String?           @map("clear_reason")
+  /// The activity-log/exception text of an edit or cancel IMS did not push because of the hold was last recorded at this time.
+  blockedNoticeAt     DateTime?         @map("blocked_notice_at")
+  createdAt           DateTime          @default(now()) @map("created_at")
+  updatedAt           DateTime          @updatedAt @map("updated_at")
+
+  order               SalesOrder        @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([connector, orderId], map: "wms_merge_holds_order_key")
+  @@index([state, heldAt], map: "wms_merge_holds_state_idx")
+  @@map("wms_merge_holds")
 }
 
 model WmsOperatorTask {
@@ -4302,6 +4772,102 @@ model RefusedAction {
   @@map("refused_actions")
 }
 
+/// A WooCommerce order and the IMS order disagree (lines, prices, shipping, discount, tax or total), found READ-ONLY by the order.updated path while
+/// `wc_order_divergence_detection_enabled` is on. One row per order: it is reopened when a later delivery disagrees again and closed (resolvedAt) when a
+/// later delivery matches. Nothing is ever written to the order, WooCommerce or the warehouse because of it. Carries SKUs, quantities and amounts only.
+model WcOrderDivergence {
+  id                  String    @id @default(cuid())
+  /// The IMS sales order id (no foreign key, so the row outlives a deleted order, like RefusedAction).
+  orderId             String    @unique @map("order_id")
+  externalOrderId     String    @map("external_order_id")
+  /// The storefront order number, for display.
+  externalOrderNumber String?   @map("external_order_number")
+  /// The field-level differences: [{ field, label, sku?, woocommerce, ims }]. SKUs, quantities and amounts only; built by IMS, never copied from a payload's free text.
+  differences         Json
+  /// Hash of the differences: the same difference seen again refreshes lastSeenAt instead of rewriting the row.
+  fingerprint         String
+  seenCount           Int       @default(1) @map("seen_count")
+  firstSeenAt         DateTime  @default(now()) @map("first_seen_at")
+  lastSeenAt          DateTime  @default(now()) @map("last_seen_at")
+  /// Set when a later delivery matched the IMS order again (or the order ended). A later difference starts a new episode on the same row.
+  resolvedAt          DateTime? @map("resolved_at")
+  resolution          String?
+
+  @@index([resolvedAt, firstSeenAt], map: "wc_order_divergences_open_idx")
+  @@map("wc_order_divergences")
+}
+
+/// A divergence comparison deferred because the payload names a refund IMS has not recorded yet. One row per order; removed by any later comparison that completes, and dropped after an attempt or age cap.
+model WcOrderDivergenceRecheck {
+  id              String   @id @default(cuid())
+  /// The IMS sales order id (no foreign key, like WcOrderDivergence).
+  orderId         String   @unique @map("order_id")
+  externalOrderId String   @map("external_order_id")
+  deferredAt      DateTime @default(now()) @map("deferred_at")
+  attempts        Int      @default(0)
+  lastAttemptAt   DateTime @default(now()) @map("last_attempt_at")
+
+  @@index([lastAttemptAt], map: "wc_order_divergence_rechecks_attempt_idx")
+  @@map("wc_order_divergence_rechecks")
+}
+
+// ---------------------------------------------------------------------------
+// XERO CUSTOMER-PAYMENT MATCHING
+// ---------------------------------------------------------------------------
+// One durable row per customer receipt (payments.id) that the matching pass has looked at: what it WOULD post (shadow), why it could not (unmatched: no
+// bank-account mapping, wrong currency; blocked: locked period, outbound hold, over the amount due), and in live mode the claim that makes a rerun or a
+// concurrent sweep post it once. The row is the claim: payment_id is unique, so two sweeps share one row and only one of them can move it to CLAIMED.
+// Holds no personal data: ids, a bank-account id, an amount and a reason code in fixed wording built by IMS. No foreign key: the row outlives a deleted receipt.
+
+enum XeroPaymentMatchStatus {
+  /// Shadow: the receipt would be registered against the open invoice. Nothing was written to Xero.
+  WOULD_POST
+  /// No safe match exists (no bank-account mapping for the payment system and currency, a currency other than the invoice's, no invoice).
+  UNMATCHED
+  /// A match exists but a rule stops it (locked Xero period, outbound write hold, over the amount due, an unresolved earlier attempt).
+  BLOCKED
+  /// Live: a sweep holds the claim and is registering the receipt through the existing path.
+  CLAIMED
+  /// Live: the registration is on record (queued for the Xero payment post by the existing path).
+  REGISTERED
+  /// Live: the registration threw or did not reach the record; retried by a later sweep up to a cap.
+  FAILED
+}
+
+model XeroPaymentMatch {
+  id                  String                 @id @default(cuid())
+  /// The local receipt. Unique: this IS the idempotency key.
+  paymentId           String                 @unique @map("payment_id")
+  orderId             String                 @map("order_id")
+  status              XeroPaymentMatchStatus
+  /// The mode of the sweep that last evaluated it (shadow or live).
+  mode                String
+  /// A fixed reason code (NO_BANK_ACCOUNT, LOCKED_PERIOD, OUTBOUND_HOLD, WOULD_OVERPAY, ...); null for WOULD_POST and REGISTERED.
+  reason              String?
+  /// One fixed-wording line an operator can read. Never remote free text.
+  detail              String?
+  /// The Xero bank account the payment map resolved, when one did.
+  bankAccountId       String?                @map("bank_account_id")
+  amount              Decimal                @db.Decimal(18, 4)
+  currency            String
+  /// What is left to pay on the invoice, in the invoice currency, when it could be measured.
+  amountDue           Decimal?               @db.Decimal(18, 4) @map("amount_due")
+  /// The open Xero invoice the receipt would settle.
+  accountingInvoiceId String?                @map("accounting_invoice_id")
+  /// The date the payment would carry in Xero (the receipt's own date; never moved).
+  paymentDate         DateTime?              @map("payment_date")
+  claimToken          String?                @map("claim_token")
+  claimedAt           DateTime?              @map("claimed_at")
+  registeredAt        DateTime?              @map("registered_at")
+  attempts            Int                    @default(0)
+  firstSeenAt         DateTime               @default(now()) @map("first_seen_at")
+  lastEvaluatedAt     DateTime               @default(now()) @map("last_evaluated_at")
+
+  @@index([status, lastEvaluatedAt], map: "xero_payment_matches_status_idx")
+  @@index([orderId], map: "xero_payment_matches_order_idx")
+  @@map("xero_payment_matches")
+}
+
 // ---------------------------------------------------------------------------
 // WMS / WAREHOUSE CONNECTOR
 // ---------------------------------------------------------------------------
@@ -4360,6 +4926,9 @@ enum WmsDiscrepancyCategory {
   BARCODE_BACKFILLED_FROM_WMS
   INVALID_HS_CODE
   INVALID_COUNTRY_OF_ORIGIN
+  CUSTOMS_CLEAR_MANUAL
+  /// An IMS SKU rename the warehouse product does not yet follow: nothing is created, the operator renames it there.
+  PRODUCT_SKU_RENAMED
 }
 
 enum WmsDiscrepancyStatus {
@@ -5201,11 +5770,63 @@ model OrderAllocation {
   @@map("order_allocations")
 }
 
+/// Why a sales-order-line peg stopped applying. A peg is never deleted by IMS: it ends, with a reason, and every end is
+/// also written to the activity log. (Deleting either line cascades the row away; those removals are logged first.)
+enum SalesOrderLinePegEndReason {
+  FULLY_ALLOCATED
+  SALES_ORDER_CANCELLED
+  SALES_LINE_REMOVED
+  SALES_ORDER_ADVANCED
+  PURCHASE_ORDER_CANCELLED
+  PURCHASE_LINE_REMOVED
+  PURCHASE_LINE_RECEIVED_ELSEWHERE
+  REMOVED_BY_USER
+}
+
+/// Pegging: stock received on a purchase-order line is held for, and allocated to, one sales-order line first. IMS-internal
+/// allocation ordering only: nothing is sent to any connector. Many pegs may share a purchase-order line (one per
+/// customer order) and a sales-order line may be pegged to several purchase-order lines; one live peg per pair (partial
+/// unique index in the migration, not expressible here).
+/// `receivedQty` is the part of `qty` that has landed on the purchase-order line and been earmarked for this peg (oldest peg
+/// first); `allocatedQty` is the part of that the order has actually absorbed. `receivedQty - allocatedQty` is the hold
+/// other orders' allocation must leave alone. `seenLandedQty` is the line's landed quantity when `receivedQty` was last
+/// refreshed, so the refresh is idempotent whichever receipt path (manual, ASN alignment, WMS book-in) landed the units.
+/// `receivedByWarehouse` / `seenLandedByWarehouse` split the same two figures by the warehouse the units actually landed in
+/// (`{ "<warehouseId>": "<qty>" }`, key "" = landed with no recorded warehouse); the scalars are their sums. Holds and allocation
+/// caps are applied in the warehouse the stock is in.
+model SalesOrderLinePeg {
+  id                  String    @id @default(cuid())
+  salesOrderLineId    String
+  purchaseOrderLineId String
+  qty                 Decimal   @db.Decimal(12, 4)
+  receivedQty         Decimal   @default(0) @db.Decimal(12, 4)
+  allocatedQty        Decimal   @default(0) @db.Decimal(12, 4)
+  /// The sales-order line's allocation when the peg was made: what the order already had from other stock.
+  baselineAllocatedQty Decimal  @default(0) @db.Decimal(12, 4)
+  seenLandedQty       Decimal   @default(0) @db.Decimal(12, 4)
+  receivedByWarehouse Json      @default("{}")
+  seenLandedByWarehouse Json    @default("{}")
+  createdAt           DateTime  @default(now())
+  createdById         String?
+  endedAt             DateTime?
+  endReason           SalesOrderLinePegEndReason?
+  endedById           String?
+
+  salesOrderLine      SalesOrderLine    @relation(fields: [salesOrderLineId], references: [id], onDelete: Cascade)
+  purchaseOrderLine   PurchaseOrderLine @relation(fields: [purchaseOrderLineId], references: [id], onDelete: Cascade)
+
+  @@index([purchaseOrderLineId])
+  @@index([salesOrderLineId])
+  @@map("sales_order_line_pegs")
+}
+
 /// A shipment groups allocated lines from one warehouse
 model Shipment {
   id              String         @id @default(cuid())
   orderId         String
   warehouseId     String
+  /// The number IMS gave the shipment from the pattern set under Settings > Company > Numbering. NULL until a shipment pattern is set, and for every shipment created before one was. Unique.
+  reference       String?        @unique
   status          ShipmentStatus @default(PENDING)
   trackingNumber  String?
   shippingService String?
@@ -5437,10 +6058,141 @@ model PaymentRemovalReconciliation {
   matchedPaymentIds  Json     @default("[]") @map("matched_payment_ids")
   /// OPERATOR_DECISION while the revenue unwind is owed; NONE for a restoration.
   ledgerAction       String   @default("OPERATOR_DECISION") @map("ledger_action")
+  /// Reserved for the partial payment removal credit note (a separate, parked PR). UNUSED here: nothing reads or writes it, and it is NULL on every row. The column and its indexes
+  /// (migrations 20261118220000 and 20261119000000) were already pushed on the feature branch, so they stay in place, inert; the credit note PR will use them. A plain pointer, no foreign key.
+  refundId           String?  @map("refund_id")
   createdAt          DateTime @default(now()) @map("created_at")
 
   order SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
 
   @@index([orderId])
+  @@index([refundId])
+  @@unique([refundId])
   @@map("payment_removal_reconciliations")
+}
+
+/// A synced sales invoice or supplier bill the operator deleted in IMS and Xero together. One row per deleted document (the
+/// external document id is unique and never reused by the ledger), written in the transaction that queues the Xero delete.
+///
+/// `state` PENDING: the delete is queued or in flight and the IMS records are untouched. COMPLETED: the ledger confirmed the
+/// delete and IMS unwound its own records (the order's invoice link, or the bill) in one transaction. The Xero side is two
+/// writes, in this order: `releasedNumber` replaces the document's number (so the original is free for a replacement), then the
+/// status goes to DELETED or VOIDED. `releasedNumber` is fixed when the row is written, so a retry after the first write
+/// succeeded sees the number already changed and never appends a second suffix.
+///
+/// `snapshot` holds what IMS knew of the document (numbers, dates, totals, the bill's lines) and what the unwind did; it carries no
+/// customer or supplier personal data.
+model AccountingDocumentDeletion {
+  id                 String    @id @default(cuid())
+  /// SALES_INVOICE or PURCHASE_BILL.
+  kind               String
+  connector          String    @default("xero")
+  /// SalesOrder (referenceId = the order) or PurchaseOrder (referenceId = the order; `documentId` = the bill).
+  referenceType      String    @map("reference_type")
+  referenceId        String    @map("reference_id")
+  /// The local document: the PurchaseInvoice id for a bill; the order id again for a sales invoice.
+  documentId         String    @map("document_id")
+  /// The ledger's document id. Unique: a ledger document is deleted once.
+  externalDocumentId String    @unique @map("external_document_id")
+  originalNumber     String    @map("original_number")
+  releasedNumber     String    @map("released_number")
+  /// DELETED (DRAFT or SUBMITTED in the ledger) or VOIDED (AUTHORISED, no payments). Set when the ledger write is done.
+  targetStatus       String?   @map("target_status")
+  state              String    @default("PENDING")
+  requestedById      String?   @map("requested_by_id")
+  requestedAt        DateTime  @default(now()) @map("requested_at")
+  completedAt        DateTime? @map("completed_at")
+  snapshot           Json      @default("{}")
+
+  @@index([referenceType, referenceId])
+  @@index([state])
+  @@map("accounting_document_deletions")
+}
+
+/// Operator-defined fields for products (variants included: each variant is a Product row and carries its own values) and
+/// for sales orders. One definition model serves both entities. `key` is the immutable slug used in CSV columns
+/// (`cf:<key>`) and list filters; `namespace` groups fields on screen. `options` is a JSON array of allowed strings, used only
+/// by STRING fields (a dropdown). The type cannot change once any value exists (see lib/custom-fields/definitions.ts).
+enum CustomFieldEntity {
+  PRODUCT
+  SALES_ORDER
+}
+
+enum CustomFieldType {
+  STRING
+  NUMBER
+  DECIMAL
+  BOOLEAN
+  DATE
+  DATETIME
+  JSON
+  LINK
+}
+
+model CustomFieldDefinition {
+  id        String            @id @default(cuid())
+  entity    CustomFieldEntity
+  namespace String
+  key       String
+  label     String
+  type      CustomFieldType
+  options   Json?
+  required  Boolean           @default(false)
+  sortOrder Int               @default(0)
+  active    Boolean           @default(true)
+  createdAt DateTime          @default(now())
+  updatedAt DateTime          @updatedAt
+
+  values CustomFieldValue[]
+
+  @@unique([entity, key])
+  @@index([entity, active, sortOrder])
+  @@map("custom_field_definitions")
+}
+
+/// One typed value of one definition on one product OR one sales order (a CHECK enforces exactly one of the two). Typed columns, one
+/// filled per row (a CHECK enforces that too, and the definition's type decides which): STRING and LINK use valueText, NUMBER and
+/// DECIMAL use valueDecimal, BOOLEAN valueBoolean, DATE valueDate, DATETIME valueDateTime, JSON valueJson. A blank value has no row.
+/// Sales-order values can hold personal data (free text), so they are erased with the order (lib/domain/erasure).
+model CustomFieldValue {
+  id            String    @id @default(cuid())
+  definitionId  String
+  productId     String?
+  salesOrderId  String?
+  valueText     String?
+  valueDecimal  Decimal?  @db.Decimal(28, 10)
+  valueBoolean  Boolean?
+  valueDate     DateTime? @db.Date
+  valueDateTime DateTime?
+  valueJson     Json?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  definition CustomFieldDefinition @relation(fields: [definitionId], references: [id], onDelete: Restrict)
+  product    Product?              @relation(fields: [productId], references: [id], onDelete: Cascade)
+  salesOrder SalesOrder?           @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+
+  @@unique([definitionId, productId])
+  @@unique([definitionId, salesOrderId])
+  @@index([productId])
+  @@index([salesOrderId])
+  @@map("custom_field_values")
+}
+
+/// An owner or host confirmation that an incumbent writer has STOPPED (writers-check-constants.ts STEP_EVIDENCE, writer-attestation-constants.ts kinds).
+/// Append-only: a confirmation is never edited; the newest of a kind is the one in force. Written by `npm run writers:attest` and the ADMIN confirmation
+/// action, always with an activity-log entry. Read by `npm run writers:check` and by the setting writers that refuse to switch an IMS writer on first.
+model WriterAttestation {
+  id         String   @id @default(cuid())
+  /// A closed code (WRITER_ATTESTATION_KINDS).
+  kind       String
+  attestedAt DateTime @default(now()) @map("attested_at")
+  /// The user who confirmed (a User id, or `cli:<name>` for the command line).
+  userId     String   @map("user_id")
+  note       String   @default("")
+  /// Kind-specific evidence (a host status report, never a secret).
+  payload    Json     @default("{}")
+
+  @@index([kind, attestedAt], map: "writer_attestations_kind_attested_idx")
+  @@map("writer_attestations")
 }

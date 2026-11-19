@@ -27,6 +27,7 @@ import {
   type TransferLineLandedQty,
 } from '@/lib/domain/inventory/transfer-landed-quantity'
 import { lockWmsAsnLineMapsForTransferLines } from '@/lib/domain/wms/transfer-asn-lock-order'
+import { closeTransferAsnsForDispatchCancel, describeClosedTransferAsns, TransferAsnBlocksDispatchCancelError, type ClosedTransferAsn } from '@/lib/domain/wms/transfer-dispatch-cancel-asn'
 import { planTransferPartialReceipt } from '@/lib/domain/inventory/transfer-partial-receipt'
 import { isStockMovementIdempotencyConflict } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
@@ -1151,6 +1152,9 @@ export async function cancelTransfer(id: string): Promise<TransferResult> {
     if (!existing) return { message: 'Transfer not found.' }
     const transition = validateStockTransferStatusTransition(existing.status, 'CANCELLED')
     if (!transition.success) return { message: transition.error }
+    // The state machine also models IN_TRANSIT -> CANCELLED (cancelDispatchedTransfer), but the PLAIN cancel
+    // performs no stock movement, so it is only safe from DRAFT. That restriction belongs here, not in the map.
+    if (existing.status !== 'DRAFT') return { message: 'Only a draft transfer can be cancelled here; cancel a dispatched transfer with cancelDispatchedTransfer.' }
 
     // 7ddn: close the dispatch/cancel race. Without the lock + conditional guard, a
     // concurrent dispatchTransfer (DRAFT→IN_TRANSIT, which decrements source stock)
@@ -1209,6 +1213,7 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
     await requirePermission('stock_control.transfer')
     let restoredLineCount = 0
     let linesMissingCostLayers = 0
+    let closedAsns: ClosedTransferAsn[] = []
     await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM stock_transfers WHERE id = ${id} FOR UPDATE`
       const transfer = await tx.stockTransfer.findUnique({
@@ -1219,6 +1224,12 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
       if (transfer.status !== 'IN_TRANSIT') {
         throw new Error('Only an in-transit transfer can have its dispatch cancelled')
       }
+      const cancelTransition = validateStockTransferStatusTransition(transfer.status, 'CANCELLED')
+      if (!cancelTransition.success) throw new Error(cancelTransition.error)
+
+      // STEP 3 of the lock order, before the line locks (step 4) below. Closes the transfer's open ASN in IMS so it
+      // stops holding align-down and cannot be booked against a cancelled parent (o3d-hqvrp.120). No warehouse write.
+      closedAsns = await closeTransferAsnsForDispatchCancel(tx, { transferId: id, transferReference: transfer.reference, now: new Date() })
 
       const lines = await tx.stockTransferLine.findMany({
         where: { transferId: id },
@@ -1382,8 +1393,9 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
       tag: 'stock',
       level: 'WARNING',
       description: `Cancelled dispatch of transfer ${cancelled?.reference ?? id} — restored ${restoredLineCount} line(s) to ${cancelled?.fromWarehouse.name ?? 'source'}${linesMissingCostLayers > 0 ? ` (${linesMissingCostLayers} line(s) had no cost-layer snapshot — review reconciliation)` : ''}`,
-      metadata: { reference: cancelled?.reference ?? id, restoredLineCount, linesMissingCostLayers, fromWarehouseId: cancelled?.fromWarehouseId ?? null },
+      metadata: { reference: cancelled?.reference ?? id, restoredLineCount, linesMissingCostLayers, fromWarehouseId: cancelled?.fromWarehouseId ?? null, closedAsnIds: closedAsns.map((a) => a.externalAsnId) },
     })
+    const asnNotice = describeClosedTransferAsns(cancelled?.reference ?? id, closedAsns)
 
     const restoredProductIds = [...new Set((cancelled?.lines ?? []).map((line) => line.productId))]
     if (restoredProductIds.length > 0) {
@@ -1403,10 +1415,10 @@ export async function cancelDispatchedTransfer(id: string): Promise<TransferResu
       }
     }
 
-    return { success: true }
+    return { success: true, ...(asnNotice ? { message: asnNotice } : {}) }
   } catch (e: unknown) {
     console.error(e)
-    const msg = toInventoryConstraintMessage(e, 'Failed to cancel transfer dispatch.')
+    const msg = e instanceof TransferAsnBlocksDispatchCancelError ? e.message : toInventoryConstraintMessage(e, 'Failed to cancel transfer dispatch.')
     await logActivity({
       entityType: 'STOCK_TRANSFER',
       entityId: id,

@@ -27,7 +27,9 @@ export type RefusedActionSeverity = (typeof REFUSED_ACTION_SEVERITIES)[number]
 /** The actions and gates this record is written for. A new instance adds its pair here, so the surface can name it. */
 export const REFUSED_ACTIONS = {
   /** An amendment attempted after the warehouse order left NEW. */
-  WMS_ORDER_AMEND: { label: 'Order change not applied in the warehouse', gates: ['WMS_ORDER_NOT_NEW'] },
+  WMS_ORDER_AMEND: { label: 'Order change not applied in the warehouse', gates: ['WMS_ORDER_NOT_NEW', 'WMS_AMEND_UNBUILDABLE', 'WMS_SCOPE_UNSENDABLE', 'WMS_MERGE_HELD'] },
+  /** A warehouse despatch for a mixed-warehouse order that IMS could not apply because the part it sent no longer matches the order's allocation and shipments. */
+  WMS_DESPATCH_SCOPE: { label: 'Despatch does not match the part sent to the warehouse', gates: ['WMS_SCOPE_MISMATCH'] },
   /** A split warehouse order that can never complete in IMS because a part was cancelled. */
   WMS_SPLIT_ORDER_COMPLETE: { label: 'Split order cannot complete', gates: ['WMS_SPLIT_PART_CANCELLED'] },
 } as const
@@ -155,15 +157,15 @@ export async function recordRefusedAction(client: RawClient, input: RefusedActio
 /** Why a row was closed. */
 export type RefusedActionResolution = 'ACTION_SUCCEEDED' | 'NO_LONGER_NEEDED'
 
-/** Close every open refusal of this entity (and, when named, this action). Returns how many rows were closed. Safe to call when there is none. */
+/** Close every open refusal of this entity (and, when named, this action and gate). Returns how many rows were closed. Safe to call when there is none. */
 export async function resolveRefusedActions(
   client: Pick<Prisma.TransactionClient, 'refusedAction'>,
-  where: { entityType: string; entityId: string; action?: RefusedActionName },
+  where: { entityType: string; entityId: string; action?: RefusedActionName; gate?: string | readonly string[] },
   resolution: RefusedActionResolution,
   now: Date = new Date(),
 ): Promise<number> {
   const { count } = await client.refusedAction.updateMany({
-    where: { entityType: where.entityType, entityId: where.entityId, resolvedAt: null, ...(where.action ? { action: where.action } : {}) },
+    where: { entityType: where.entityType, entityId: where.entityId, resolvedAt: null, ...(where.action ? { action: where.action } : {}), ...(where.gate ? { gate: typeof where.gate === 'string' ? where.gate : { in: [...where.gate] } } : {}) },
     data: { resolvedAt: now, resolution },
   })
   return count

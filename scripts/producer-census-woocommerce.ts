@@ -52,14 +52,14 @@ export const WOO_SEAM_FUNCTIONS: readonly WooSeamFunction[] = [
   {
     file: 'lib/domain/integrations/outbox.ts', decl: 'enqueueIntegrationOutbox', role: 'outbox-primitive',
     mustCall: ['outboxProducerVerdict'], beforeCalls: ['create'],
-    operations: ['stock', 'order.status', 'order.invoice-document'],
-    why: 'The one outbox enqueue: a WooCommerce operation is decided here, and a shadow writes no row. Every WooCommerce stock, order-status and invoice-publication job is made by it.',
+    operations: ['stock', 'order.status', 'order.invoice-document', 'order.trackship-refire'],
+    why: 'The one outbox enqueue: a WooCommerce operation is decided here, and a shadow writes no row. Every WooCommerce stock, order-status, invoice-publication and TrackShip re-fire job is made by it.',
   },
   {
     file: 'lib/connectors/woocommerce/sync/stock-sync.ts', decl: 'pushStockToWc', role: 'producer',
     mustCall: ['wooProducerSeam'], beforeCalls: ['snapshotSyncContext'],
-    operations: ['stock'],
-    why: 'The one stock writer: the queue drain, the daily reconcile, the manual push and a webhook correction all reach WooCommerce through it, so asking here covers the paths below the enqueue.',
+    operations: ['stock', 'product.meta'],
+    why: 'The one stock writer: the queue drain, the daily reconcile, the manual push and a webhook correction all reach WooCommerce through it, so asking here covers the paths below the enqueue. With the back-in-stock date setting on it also asks for product.meta (the _oti_eta_date meta rides the same batch); a shadow there drops the meta and keeps the stock write.',
   },
   {
     file: 'lib/connectors/woocommerce/sync/stock-sync-jobs.ts', decl: 'processQueuedWcStockSyncJobs', role: 'drain',
@@ -84,6 +84,18 @@ export const WOO_SEAM_FUNCTIONS: readonly WooSeamFunction[] = [
     mustCall: ['wooDrainHold'], beforeCalls: ['claimIntegrationOutboxWork'],
     operations: [],
     why: 'Claim boundary of the invoice publication queue.',
+  },
+  {
+    file: 'lib/connectors/woocommerce/sync/trackship-refire-jobs.ts', decl: 'runWcTrackshipRefireJobs', role: 'drain',
+    mustCall: ['wooDrainHold'], beforeCalls: ['claimIntegrationOutboxWork'],
+    operations: [],
+    why: 'Claim boundary of the TrackShip re-fire queue.',
+  },
+  {
+    file: 'lib/connectors/woocommerce/sync/trackship-refire.ts', decl: 'postTrackshipRefire', role: 'transport-barrier',
+    mustCall: ['wooEgressHold'], beforeCalls: ['connectorFetch'],
+    operations: [],
+    why: 'The last barrier in front of the TrackShip re-fire POST to the helper plugin.',
   },
   {
     file: 'lib/connectors/woocommerce/api.ts', decl: 'wcPost', role: 'transport-barrier',

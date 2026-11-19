@@ -32,6 +32,8 @@ export type XeroSettings = {
   xero_allocated_inventory_account: string
   xero_unearned_revenue_account: string
   xero_transit_account: string
+  /** The GR/IR (goods received, not invoiced) clearing account the daily-batch reclass journal posts to. Used only while `grir_xero_posting_enabled` is 'true'. */
+  xero_grir_account: string
   xero_rounding_difference_account: string
   xero_eu_vat_ioss_account: string
   xero_eu_vat_ddp_account: string
@@ -43,6 +45,13 @@ export type XeroSettings = {
   xero_manufacturing_overhead_account: string
   xero_daily_batch_enabled: string
   xero_payment_polling_enabled: string
+  /** 'true' = the daily batch posts the GR/IR reclass journal (Stock in Transit <-> GR/IR). Default 'false': nothing is posted and the sub-ledger still accrues. */
+  grir_xero_posting_enabled: string
+  /**
+   * Allow an operator to delete a synced invoice or bill in IMS and Xero together (renumber, then DELETE or VOID in Xero). 'true' or 'false'; off by default.
+   * Every Xero write it makes goes through the ordinary outbox and the outbound-write hold.
+   */
+  xero_document_delete_enabled: string
   /**
    * Last LOCKED day in Xero (`YYYY-MM-DD`), IMPORTED from the Organisation endpoint (books-lock-date.ts); empty = none
    * read or none set. Read-only: deliberately not in XERO_SETTING_KEYS, so the settings save cannot write it.
@@ -66,12 +75,15 @@ export const XERO_SETTING_KEYS = [
   'xero_inventory_account', 'xero_allocated_inventory_account',
   'xero_unearned_revenue_account',
   'xero_transit_account',
+  'xero_grir_account',
   'xero_rounding_difference_account',
   'xero_eu_vat_ioss_account', 'xero_eu_vat_ddp_account', 'xero_eu_fee_account',
   'xero_accounts_receivable_account', 'xero_accounts_payable_account',
   'xero_realised_fx_gain_loss_account', 'xero_unrealised_fx_gain_loss_account',
   'xero_manufacturing_overhead_account',
   'xero_daily_batch_enabled', 'xero_payment_polling_enabled',
+  'grir_xero_posting_enabled',
+  'xero_document_delete_enabled',
 ]
 
 /** Imported from Xero, never saved from the settings form: read by getXeroSettings, absent from the save allowlist above. */
@@ -104,6 +116,7 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_allocated_inventory_account: '',
   xero_unearned_revenue_account: '',
   xero_transit_account: '',
+  xero_grir_account: '',
   xero_rounding_difference_account: '',
   xero_eu_vat_ioss_account: '',
   xero_eu_vat_ddp_account: '',
@@ -115,6 +128,8 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_manufacturing_overhead_account: '',
   xero_daily_batch_enabled: 'false',
   xero_payment_polling_enabled: 'false',
+  grir_xero_posting_enabled: 'false',
+  xero_document_delete_enabled: 'false',
   xero_books_lock_date: '',
   xero_books_lock_date_read_at: '',
 }

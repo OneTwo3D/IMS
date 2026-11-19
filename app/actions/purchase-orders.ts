@@ -1,5 +1,9 @@
 'use server'
 
+import { claimDocumentNumber, mintCommittedDocumentNumber, retryWhenNumberTaken } from '@/lib/domain/numbering/mint'
+import { businessDateYmd } from '@/lib/business-date'
+import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
+import { type MoneyLike, assertPoApprovedForSend, PoApprovalRequiredError, approvalSpendBase, CLEARED_APPROVAL, editInvalidatesApproval, evaluatePoApproval, PO_APPROVAL_FACTS_SELECT, PO_APPROVAL_SELF_MESSAGE, PO_APPROVAL_CREATOR_UNKNOWN_MESSAGE, PO_APPROVAL_STATUSES_OPEN_FOR_APPROVAL, PO_APPROVAL_THRESHOLD_SETTING_KEY, approverIsRequester, readApprovalThreshold, validateApprovalThresholdInput } from '@/lib/domain/purchasing/po-approval'
 import { effectiveLineEta, parseLineEtaInput } from '@/lib/domain/purchasing/line-eta'
 import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@/lib/domain/wms/po-receipt-asn-guard'
 import { resolveLinesTaxRates, resolveWritableTaxRateIds } from '@/lib/tax/writable-tax-rate'
@@ -10,10 +14,22 @@ import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import {
+  MarginBlockedError,
+  assessGuardLines,
+  decideGuard,
+  loadMarginGuardContext,
+  recordMarginOverride,
+  loadMarginGuardContextUnderLock,
+  type GuardLineAssessment,
+} from '@/lib/domain/purchasing/margin-threshold-guard'
+import { runPostCommit } from '@/lib/domain/post-commit'
 import { queueEmail } from '@/lib/email-outbox'
 import { getPurchaseOrderQueueData, isPurchaseOrderEmailEnabled, savePurchaseOrderEmailEnabled, PURCHASE_ORDER_EMAIL_KIND, PURCHASE_ORDER_EMAIL_REFERENCE_TYPE } from '@/lib/purchase-order-email'
 import { runPoSend, type PoSendResult } from '@/lib/domain/purchasing/po-document'
 import { requirePermission } from '@/lib/auth/server'
+import { findLiveAsnBlocks } from '@/lib/domain/wms/po-receipt-asn-guard'
+import { foldRetiredAsnCreditIntoPurchaseOrder } from '@/lib/domain/wms/retired-asn-credit-fold'
 // o3d-6nd55 r3: parent-then-children in one call, so no writer of these tables can invert the
 // order the WMS alignment relies on. See that module's census of every writer.
 import {
@@ -22,13 +38,15 @@ import {
   lockPurchaseOrders,
   lockPurchaseOrdersWithCostRows,
 } from '@/lib/domain/wms/transfer-asn-lock-order'
-import { queueAccountingSync, queueAccountingSyncTx, getAccountingSettings, getAccountingSettingsFor, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor, listAccountingBankAccounts, listAccountingBankAccountsWithChart, asRoutableAccountingConnector, accountingPostingVerdictForChart, type AccountingBankAccount } from '@/lib/accounting'
+import { lockAccountingMappingSelection } from '@/lib/integration-plugin-selection-lock'
+import { queueAccountingSync, queueAccountingSyncTx, readStockReceiptAccountsTx, getAccountingSettings, getAccountingSettingsFor, getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor, listAccountingBankAccounts, listAccountingBankAccountsWithChart, asRoutableAccountingConnector, accountingPostingVerdictForChart, type AccountingBankAccount } from '@/lib/accounting'
 import { isShadowedOutcome, postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
 import { enqueueStockSync } from '@/lib/shopping'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
+import { reconcilePegsForPoLineRewrite, recordPegsRemovedWithLines } from '@/lib/domain/sales/peg-service'
 import { releaseOverallocations } from '@/lib/fulfillment/overallocation-rebalancer'
 import { cogsEntryDataFromConsumed, consumeFifoLayersStrict, createCostLayer, getPoLineAttributableLayerQty } from '@/lib/cost-layers'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
@@ -55,8 +73,10 @@ import {
 import { getBaseCurrencyCode, resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purchase-order-action'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
-import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_MESSAGE, SupplierCreditNoteEnqueueDeclined } from '@/lib/domain/purchasing/supplier-credit-note'
+import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_INEXACT_MESSAGE, SupplierCreditNoteEnqueueDeclined, planReverseChargeSupplierCredit, billNetPayable } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { receiptJournalAmount } from '@/lib/domain/accounting/receipt-journal-amount'
+import { recordGrirBill, recordGrirBillEdit, recordGrirReceipt, recordGrirReturnCreditNote, recordGrirSupplierReturn } from '@/lib/domain/accounting/grir-subledger-movement'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
 import { readPayloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
 import {
@@ -91,6 +111,13 @@ import {
   validatePurchaseInvoiceLineLimits,
   type PurchaseInvoiceInputLine,
 } from '@/lib/domain/purchasing/purchase-invoice-edit'
+import {
+  assertNoDuplicateSupplierBill,
+  DuplicateSupplierInvoiceNumberError,
+  normalizeSupplierInvoiceNumber,
+  PurchaseBillStatusRefusal,
+  purchaseOrderBillStatusRefusal,
+} from '@/lib/domain/purchasing/bill-guards'
 import { maybeQueuePurchaseInvoiceUpdate, purchaseInvoiceUpdateIsOwed, purchaseInvoiceUpdatePostingKey } from '@/lib/domain/purchasing/purchase-invoice-update-sync'
 import {
   billChangedSinceRead,
@@ -107,18 +134,23 @@ import {
   freightPoContributesLandedCost,
   logLandedCostCreditFloorActivities,
   queueLandedCostAdjustmentJournals,
+  readLandedCostChartBeforeTx,
+  tryReadLandedCostChartBeforeTx,
   recalculateLandedCosts,
 } from '@/lib/domain/purchasing/landed-cost-service'
 import { headerDiscountFactorForPo, unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
 import {
   assertFreightTotalNotNegative,
   buildFreightCostLineRows,
+  FREIGHT_COST_KINDS,
   CreateFreightPoInputSchema,
   FREIGHT_NET_CREDIT_MESSAGE,
   FreightEditRefusedError,
   FreightNetCreditError,
   freightTotalIsNegative,
   planFreightCostLineEdit,
+  assertFreightEditNotStale,
+  freightCostLinesFingerprint,
   resolveFreightEditTaxRate,
   FreightCostLinesSchema,
   type CreateFreightPoInput as CreateFreightPoInputShape,
@@ -149,6 +181,7 @@ import {
 import { assertFinitePurchaseReceiptUnitCost } from '@/lib/domain/purchasing/purchase-receipt-cost'
 import { sumReceiptQtyByPoLine } from '@/lib/domain/purchasing/receipt-quantities'
 import { computePurchaseOrderOverBilling, type PurchaseOrderOverBillingSummary } from '@/lib/domain/purchasing/purchasing-reversal-alerts'
+import { billNetPayableBase, billNetPayableForeign } from '@/lib/domain/purchasing/bill-net-payable'
 import { computeReturnCreditNoteDraft } from '@/lib/domain/purchasing/return-credit-note'
 import { findDivergentReceiptLines } from '@/lib/domain/purchasing/receipt-warehouse-divergence'
 import { checkReceiptLocations, refuseRestrictedDestination } from '@/lib/domain/purchasing/po-warehouse-eligibility'
@@ -189,6 +222,13 @@ const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
 export type PoStatus = 'DRAFT' | 'RFQ_SENT' | 'QUOTE_RECEIVED' | 'PO_SENT' | 'SHIPPED' | 'PARTIALLY_RECEIVED' | 'RECEIVED' | 'CLOSED' | 'INVOICED' | 'PARTIALLY_RETURNED' | 'RETURNED' | 'CANCELLED'
 
+/** The internal remark on a PO line: trimmed, blank is none, capped at the length the form allows. Never sent to the supplier. */
+const PO_LINE_NOTES_MAX_LENGTH = 2000
+function normalizePoLineNotes(value: string | null | undefined): string | null {
+  const text = value?.trim()
+  return text ? text.slice(0, PO_LINE_NOTES_MAX_LENGTH) : null
+}
+
 export type PoLineRow = {
   id: string
   productId: string
@@ -198,6 +238,8 @@ export type PoLineRow = {
   /** Product.barcode; null when the variant has none (the page shows an empty cell). */
   barcode: string | null
   description: string | null
+  /** Internal per-line remark. Never printed on the supplier PO PDF or sent in the supplier email. */
+  notes: string | null
   qty: number
   unitCostForeign: number
   unitCostBase: number
@@ -272,6 +314,14 @@ export type PoRow = {
   trackingNumber: string | null
   shippingProvider: string | null
   skipPreferredSupplierUpdate: boolean
+  /** The user who created the order; null for imported and older orders. */
+  createdById: string | null
+  /** NOT_REQUIRED: no gate applies. AWAITING: needs approval before it can be sent. APPROVED: approved and still covered. */
+  approvalState: 'NOT_REQUIRED' | 'AWAITING' | 'APPROVED'
+  approvedAt: string | null
+  approvedById: string | null
+  /** Filled by the detail read only. */
+  approvedByName: string | null
 }
 
 export type PoReturn = {
@@ -325,7 +375,8 @@ export type PoDetail = PoRow & {
   returns: PoReturn[]
   invoices: InvoiceRow[]
   supplierCreditNotes: SupplierCreditNoteRow[]
-  freightCostLines: { id: string; description: string; amountForeign: number; amountBase: number; amountBilled: number; vatable: boolean; distributionMethod: string }[]
+  freightCostLinesFingerprint: string
+  freightCostLines: { id: string; description: string; amountForeign: number; amountBase: number; amountBilled: number; vatable: boolean; distributionMethod: string; kind: 'SHIPPING' | null }[]
   linkedFreightPos: {
     linkId: string
     method: string
@@ -355,6 +406,8 @@ export type PoLineInput = {
   sku: string
   productName: string
   description?: string
+  /** Internal remark on this line (never sent to the supplier). Omitted = keep the stored note on an existing line; blank clears it. */
+  notes?: string | null
   qty: number // stock units
   purchaseUnitId?: string
   purchaseUnitQty?: number // qty in purchase units
@@ -399,7 +452,7 @@ export type CreatePoInput = {
   taxRateId?: string
   taxRateName?: string
   taxRateValue?: number // e.g. 0.20 for 20%
-  additionalCosts?: { description: string; amountForeign: number; vatable: boolean; distributionMethod: string }[]
+  additionalCosts?: { description: string; amountForeign: number; vatable: boolean; distributionMethod: string; /** SHIPPING tags the buyer's shipping estimate (a supplier-quoted shipping replaces it). */ kind?: 'SHIPPING' | null }[]
   /** Original user input for the order-level discount, e.g. "10%" or "50.00". */
   orderDiscountStr?: string | null
   /**
@@ -408,6 +461,8 @@ export type CreatePoInput = {
    * `pricesIncludeVat`, else net). Applied after per-line discounts.
    */
   orderDiscountForeign?: number
+  /** Why a line below the minimum gross margin is being saved anyway. Honoured only in block mode and only for a user holding inventory.prices; recorded on the order. */
+  marginOverrideNote?: string
   lines: PoLineInput[]
 }
 
@@ -433,13 +488,19 @@ const ReceiptLineInputSchema = z.object({
 // Helpers
 // ---------------------------------------------------------------------------
 
-async function makeReference(): Promise<string> {
-  const now = new Date()
-  const ymd = now.toISOString().slice(0, 10).replace(/-/g, '')
-  const rand = Math.random().toString(36).slice(2, 6).toUpperCase()
+/**
+ * The next purchase order reference, from the purchase order pattern (Settings → Company → Numbering). Call it inside the
+ * transaction that writes the order: a counter pattern holds its row lock until that transaction ends. The configured
+ * prefix is only what the default pattern starts with.
+ */
+async function makeReference(poPrefix: string): Promise<string> {
+  return mintCommittedDocumentNumber((run) => db.$transaction(run), 'purchase_order', { fallbackPrefix: poPrefix })
+}
+
+/** The prefix the default purchase order pattern starts with. Read BEFORE a transaction opens: it takes a second connection. */
+async function readPoPrefix(): Promise<string> {
   const { getNumberingFormats } = await import('./company')
-  const { po_prefix } = await getNumberingFormats()
-  return `${po_prefix}${ymd}-${rand}`
+  return (await getNumberingFormats()).po_prefix
 }
 
 const PO_SELECT = {
@@ -473,6 +534,12 @@ const PO_SELECT = {
   notes: true,
   internalNotes: true,
   skipPreferredSupplierUpdate: true,
+  createdById: true,
+  approvedById: true,
+  approvedAt: true,
+  approvedTotalBase: true,
+  approvedSupplierId: true,
+  approvedCurrency: true,
   createdAt: true,
   updatedAt: true,
   supplier: { select: { id: true, name: true, prepaid: true } },
@@ -482,6 +549,7 @@ const PO_SELECT = {
       id: true,
       productId: true,
       description: true,
+      notes: true,
       qty: true,
       unitCostForeign: true,
       unitCostBase: true,
@@ -535,6 +603,12 @@ function mapPoRow(po: {
   notes: string | null
   internalNotes: string | null
   skipPreferredSupplierUpdate: boolean
+  createdById: string | null
+  approvedById: string | null
+  approvedAt: Date | null
+  approvedTotalBase: unknown
+  approvedSupplierId: string | null
+  approvedCurrency: string | null
   createdAt: Date
   updatedAt: Date
   trackingNumber: string | null
@@ -543,7 +617,11 @@ function mapPoRow(po: {
   destinationWarehouse: { name: string } | null
   lines: { id: string; qtyReceived: unknown; qtyReturned: unknown }[]
   _count: { invoices: number; returns: number }
-}): PoRow {
+}, approvalThreshold: Prisma.Decimal | null = null): PoRow {
+  const approval = evaluatePoApproval({
+    type: po.type, supplierId: po.supplierId, currency: po.currency, totalBase: po.totalBase as MoneyLike, taxBase: po.taxBase as MoneyLike,
+    approvedAt: po.approvedAt, approvedTotalBase: po.approvedTotalBase as MoneyLike | null, approvedSupplierId: po.approvedSupplierId, approvedCurrency: po.approvedCurrency,
+  }, approvalThreshold)
   const anyReturned = po.lines.some((l) => Number(l.qtyReturned) > 0)
   const allReturned = po.lines.length > 0 && po.lines.every(
     (l) => Number(l.qtyReceived) > 0 && Number(l.qtyReturned) >= Number(l.qtyReceived),
@@ -589,6 +667,11 @@ function mapPoRow(po: {
     trackingNumber: po.trackingNumber ?? null,
     shippingProvider: po.shippingProvider ?? null,
     skipPreferredSupplierUpdate: po.skipPreferredSupplierUpdate,
+    createdById: po.createdById,
+    approvalState: !approval.required ? 'NOT_REQUIRED' : approval.approved ? 'APPROVED' : 'AWAITING',
+    approvedAt: po.approvedAt?.toISOString() ?? null,
+    approvedById: po.approvedById,
+    approvedByName: null,
   }
 }
 
@@ -596,6 +679,7 @@ function mapLine(l: {
   id: string
   productId: string
   description: string | null
+  notes?: string | null
   qty: unknown
   unitCostForeign: unknown
   unitCostBase: unknown
@@ -625,6 +709,7 @@ function mapLine(l: {
     imageUrl: l.product.imageUrl ?? l.product.parent?.imageUrl ?? null,
     barcode: l.product.barcode ?? null,
     description: l.description,
+    notes: l.notes ?? null,
     qty,
     unitCostForeign: Number(l.unitCostForeign),
     unitCostBase: Number(l.unitCostBase),
@@ -716,7 +801,8 @@ export async function getPurchaseOrders(params: PoListParams = {}): Promise<PoLi
     skip: (page - 1) * pageSize,
     take: pageSize,
   })
-  return { ...buildListPage(page, pageSize, total), rows: pos.map(mapPoRow), hidesArchived, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q) }
+  const approvalThreshold = await readApprovalThreshold(db)
+  return { ...buildListPage(page, pageSize, total), rows: pos.map((p) => mapPoRow(p, approvalThreshold)), hidesArchived, hiddenArchivedCount, queryTooShort: isShortListQuery(filter.q) }
 }
 
 /**
@@ -868,6 +954,8 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
               unitCostForeign: true,
               totalForeign: true,
               totalBase: true,
+              taxRateValue: true,
+              taxReverseCharge: true,
               poLine: {
                 select: {
                   productId: true,
@@ -910,6 +998,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
           amountBase: true,
           vatable: true,
           distributionMethod: true,
+          kind: true,
         },
         orderBy: { sortOrder: 'asc' },
       },
@@ -1027,7 +1116,12 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
     latestBillPaymentSyncRows(po.invoices.map((inv) => inv.id), activeConnector?.id ?? null, po.currency),
   ])
 
-  const row = mapPoRow(po)
+  const approvalThreshold = await readApprovalThreshold(db)
+  const row = mapPoRow(po, approvalThreshold)
+  if (po.approvedById) {
+    const approver = await db.user.findUnique({ where: { id: po.approvedById }, select: { name: true, email: true } })
+    row.approvedByName = approver ? (approver.name || approver.email) : 'a former user'
+  }
   return {
     ...row,
     lines: mappedLines,
@@ -1074,6 +1168,8 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       taxBase: Number(inv.taxBase),
       totalForeign: Number(inv.totalForeign),
       totalBase: Number(inv.totalBase),
+      // What is owed to the supplier: the stored total less the VAT the bill accounts for itself on reverse-charge lines (equal to the total when it has none).
+      netPayableForeign: billNetPayableForeign(inv, po.currency).toNumber(),
       notes: inv.notes,
       supplierInvoiceUrl: inv.supplierInvoiceUrl,
       accountingInvoiceId: inv.accountingInvoiceId ?? null,
@@ -1089,7 +1185,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
         // o3d-4ozd: the STORED total, not a `Number` of it. `PurchaseInvoice.totalForeign` is
         // `Decimal(18, 4)`, and converting it here collapsed the very difference the band below is
         // meant to measure — an exact tolerance over two doubles that already agree decides nothing.
-        totalForeign: inv.totalForeign,
+        totalForeign: billNetPayableForeign(inv, po.currency),
         // o3d-6yho (3 of 3): the part/over settlement band is half one minor unit of the PO's own
         // currency — a bill stated in a three- or four-decimal currency was being judged against a
         // half-penny, which reads several whole minor units of shortfall as fully settled.
@@ -1132,6 +1228,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       recordedAt: cn.recordedAt.toISOString(),
       postedAt: cn.postedAt?.toISOString() ?? null,
     })),
+    freightCostLinesFingerprint: freightCostLinesFingerprint(po.freightCostLines ?? [], { taxRatePercent: po.taxRatePercent != null ? Number(po.taxRatePercent) : null, taxForeign: Number(po.taxForeign ?? 0) }),
     freightCostLines: (po.freightCostLines ?? []).map((cl) => ({
       id: cl.id,
       description: cl.description,
@@ -1140,6 +1237,7 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
       amountBilled: amountBilledByCostLine.get(cl.id) ?? 0,
       vatable: cl.vatable,
       distributionMethod: cl.distributionMethod as string,
+      kind: cl.kind ?? null,
     })),
     linkedFreightPos: freightLinks.map((fl) => ({
       linkId: fl.linkId,
@@ -1303,8 +1401,16 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
   try {
     // A system-actor context (the first-load apply runner) replaces the session check; anything that is not the real
     // capability takes the permission check, so a forged argument fails closed.
-    if (system?.systemImportToken !== SYSTEM_IMPORT) await requirePermission('purchasing.create')
+    let creatorId: string | null = null
+    // The acting user for the minimum-margin guard (null for a system import, which is not assessed): the session the permission check returns.
+    let session: Awaited<ReturnType<typeof requirePermission>> | null = null
+    if (system?.systemImportToken !== SYSTEM_IMPORT) {
+      session = await requirePermission('purchasing.create')
+      creatorId = session.user.id
+    }
     if (!input.lines.length) return { success: false, error: 'At least one line is required' }
+    const badCostKind = invalidCostLineKind(input.additionalCosts)
+    if (badCostKind) return { success: false, error: badCostKind }
     if (input.reference?.trim()) {
       const existing = await db.purchaseOrder.findUnique({
         where: { reference: input.reference.trim() },
@@ -1395,6 +1501,7 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
       return {
         productId: l.productId,
         description: l.description || null,
+        notes: normalizePoLineNotes(l.notes),
         qty: l.qty,
         purchaseUnitId: l.purchaseUnitId || null,
         purchaseUnitQty: l.purchaseUnitQty ?? null,
@@ -1475,16 +1582,36 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
         vatable: ac.vatable,
         distributionMethod: ac.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
         sortOrder: i,
+        ...(ac.kind ? { kind: ac.kind } : {}),
       }))
 
-    const poReference = input.reference || await makeReference()
-    const po = await db.$transaction(async (tx) => {
+    // Minimum gross margin (o3d-hqvrp.380), recomputed here from the costs about to be stored. A system import (historical
+    // data) is not a purchasing decision and is not assessed. No threshold configured: `ctx` is null and nothing changes.
+    let marginOverride: { note: string; below: GuardLineAssessment[] } | null = null
+    if (session) {
+      const ctx = await loadMarginGuardContext(lineData.map((l) => l.productId))
+      const outcome = decideGuard(
+        ctx,
+        ctx ? assessGuardLines(ctx, lineData.map((l) => ({ productId: l.productId, unitCostBase: l.unitCostBase }))) : [],
+        { role: session.user.role, overrideNote: input.marginOverrideNote, verb: 'save' },
+      )
+      if (outcome.kind === 'refused') return { success: false, error: outcome.message }
+      marginOverride = outcome.override
+    }
+
+    const poPrefix = input.reference ? '' : await readPoPrefix()
+    // A reference the numbering pattern gives is minted in a transaction of its own, committed first, so the numbering lock is never held across this order's transaction (a failed create leaves a gap in the sequence).
+    const po = await retryWhenNumberTaken(async () => {
+    const poReference = input.reference || await makeReference(poPrefix)
+    return db.$transaction(async (tx) => {
+    if (!input.reference) await claimDocumentNumber(tx, 'purchase_order', poReference)
     // A line's supplied rate id that a tax re-key retired is resolved to its replacement; a plainly inactive one is refused, under the row share lock the apply waits on (lib/tax/writable-tax-rate.ts).
     await resolveLinesTaxRates(tx, lineData)
-    return tx.purchaseOrder.create({
+    const created = await tx.purchaseOrder.create({
       data: {
         reference: poReference,
         type: 'GOODS',
+        createdById: creatorId,
         supplierId: input.supplierId,
         currency: input.currency,
         fxRateToBase: fxRate,
@@ -1514,6 +1641,11 @@ export async function createPurchaseOrder(input: CreatePoInput, system?: SystemI
         }),
       },
       select: PO_SELECT,
+    })
+    if (marginOverride && session) {
+      await recordMarginOverride(tx, { poId: created.id, reference: poReference, userId: session.user.id ?? null, verb: 'save', note: marginOverride.note, below: marginOverride.below })
+    }
+    return created
     })
     })
 
@@ -1626,6 +1758,12 @@ function checkAmendHeader(
   return null
 }
 
+/** The refusal for a cost line carrying a `kind` other than SHIPPING (the only tag there is), or null. */
+function invalidCostLineKind(costs: ReadonlyArray<{ kind?: unknown }> | undefined): string | null {
+  const bad = costs?.find((c) => c.kind != null && !(FREIGHT_COST_KINDS as readonly unknown[]).includes(c.kind))
+  return bad ? 'A cost line can only be tagged "Shipping" or left untagged.' : null
+}
+
 export type UpdatePoInput = Partial<Omit<CreatePoInput, 'fxRateAsOf'>> & { refreshFxRate?: boolean }
 
 export async function updatePurchaseOrder(
@@ -1634,6 +1772,8 @@ export async function updatePurchaseOrder(
 ): Promise<{ success: boolean; po?: PoRow; error?: string }> {
   try {
     const session = await requirePermission('purchasing.create')
+    const badCostKind = invalidCostLineKind(requestedEdit.additionalCosts)
+    if (badCostKind) return { success: false, error: badCostKind }
     const existing = await db.purchaseOrder.findUnique({
       where: { id },
       select: {
@@ -1649,6 +1789,10 @@ export async function updatePurchaseOrder(
     })
     if (!existing) return { success: false, error: 'PO not found' }
     if (!isPurchaseOrderEditableStatus(existing.status)) return { success: false, error: PO_EDIT_REFUSED_STATUS_MESSAGE }
+
+    // Minimum gross margin (o3d-hqvrp.380): the setting and the price facts are read HERE, before the transaction, because the
+    // price/VAT read uses the pooled client. Null when no threshold is configured, and then the save is unchanged.
+    const marginCtx = requestedEdit.lines ? await loadMarginGuardContext(requestedEdit.lines.map((l) => l.productId)) : null
 
     // ─── o3d-fgu3: THE WHOLE DRAFT EDIT IS ONE TRANSACTION, PARENT FIRST ───
     //
@@ -1670,6 +1814,7 @@ export async function updatePurchaseOrder(
       const locked = await tx.purchaseOrder.findUnique({
         where: { id },
         select: {
+          reference: true,
           status: true,
           type: true,
           supplierId: true,
@@ -1807,10 +1952,28 @@ export async function updatePurchaseOrder(
         const priorLineRates = new Set((await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { taxRateId: true } })).map((l) => l.taxRateId))
         const lineResolved = await resolvePurchaseLineTaxRates(input.lines, orderDefaultCtx, tx, priorLineRates)
         // A line whose `expectedDelivery` is ABSENT keeps its stored date (a caller that predates the field must not erase it); an explicit null or blank clears it.
-        const storedLineEta = new Map((await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { id: true, expectedDelivery: true } })).map((l) => [l.id, l.expectedDelivery]))
+        const storedLineRows = await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { id: true, expectedDelivery: true, notes: true } })
+        const storedLineEta = new Map(storedLineRows.map((l) => [l.id, l.expectedDelivery]))
+        // Same rule for the internal note: an ABSENT `notes` keeps the stored one (a caller that predates the field must not erase it); an explicit null or blank clears it.
+        const storedLineNotes = new Map(storedLineRows.map((l) => [l.id, l.notes]))
 
+        // Minimum gross margin: refuses by THROWING, which rolls this whole transaction back (a return after the line delete below
+        // would commit it). Goods orders only. An accepted override is recorded in this same transaction.
+        const enforceMargin = async (rows: Array<{ productId: string; unitCostBase: number }>) => {
+          if (!marginCtx || locked.type !== 'GOODS' || rows.length === 0) return
+          const outcome = decideGuard(marginCtx, assessGuardLines(marginCtx, rows), { role: session.user.role, overrideNote: requestedEdit.marginOverrideNote, verb: 'save' })
+          if (outcome.kind === 'refused') throw new MarginBlockedError(outcome.message)
+          if (outcome.override) await recordMarginOverride(tx, { poId: id, reference: locked.reference, userId: session.user.id ?? null, verb: 'save', note: outcome.override.note, below: outcome.override.below })
+        }
+        // A FULL edit rewrites every line, so every line is assessed (before the delete). An AMEND assesses only lines it adds or reprices (below).
+        // The cost is computed below; the full edit's check runs right after the line data is built.
         // FULL edit: delete existing lines and recreate. AMEND: lines are reconciled in place further down (ids are kept).
-        if (!amend) await tx.purchaseOrderLine.deleteMany({ where: { poId: id } })
+        // SO-to-PO pegging: lines a live peg still applies to are kept (updated in place below) so the stock promise survives
+        // the edit; every other peg is ended with a reason and an activity row before its line goes.
+        const pegKeptLineIds = !amend
+          ? await reconcilePegsForPoLineRewrite(tx, id, input.lines.map((l) => ({ poLineId: l.poLineId, productId: l.productId, qty: l.qty })), session.user.id ?? null)
+          : new Set<string>()
+        if (!amend) await tx.purchaseOrderLine.deleteMany({ where: { poId: id, ...(pegKeptLineIds.size > 0 ? { id: { notIn: [...pegKeptLineIds] } } : {}) } })
         // Also clear any pre-existing purchase-unit aggregate data on the PO
         // line level — the edit form currently operates in stock-unit terms
         // (purchaseUnitId is not edited inline), so we preserve only what
@@ -1847,6 +2010,9 @@ export async function updatePurchaseOrder(
             poId: id,
             productId: l.productId,
             description: l.description || null,
+            notes: l.notes === undefined
+              ? (l.poLineId ? storedLineNotes.get(l.poLineId) ?? null : null)
+              : normalizePoLineNotes(l.notes),
             qty: l.qty,
             purchaseUnitId: l.purchaseUnitId || null,
             purchaseUnitQty: l.purchaseUnitQty ?? null,
@@ -1866,19 +2032,31 @@ export async function updatePurchaseOrder(
           }
         })
         if (!amend) {
-          await tx.purchaseOrderLine.createMany({ data: lineData })
+          await enforceMargin(lineData)
+          const keptRequestIndexes = new Map<number, string>()
+          for (const [index, line] of input.lines.entries()) {
+            if (line.poLineId && pegKeptLineIds.has(line.poLineId) && ![...keptRequestIndexes.values()].includes(line.poLineId)) keptRequestIndexes.set(index, line.poLineId)
+          }
+          for (const [index, lineId] of keptRequestIndexes) {
+            const { poId: _poId, ...rowData } = lineData[index]!
+            await tx.purchaseOrderLine.update({ where: { id: lineId }, data: rowData })
+          }
+          await tx.purchaseOrderLine.createMany({ data: lineData.filter((_, index) => !keptRequestIndexes.has(index)) })
         } else {
           const plan = planLineAmend(editFacts, input.lines.map((l) => ({ poLineId: l.poLineId, productId: l.productId, qty: l.qty })))
           if (!plan.ok) return { refused: plan.error }
           const round4 = (n: number) => Math.round(n * 10000) / 10000
           const finalRows: Array<{ totalForeign: number; totalBase: number; taxForeign: number; taxBase: number }> = []
           const lineUpdates: Array<{ id: string; data: Record<string, unknown> }> = []
+          const amendMarginRows: Array<{ productId: string; unitCostBase: number }> = []
           for (const k of plan.keep) {
             const req = input.lines[k.requestIndex]!
             const row = lineData[k.requestIndex]!
             if (k.touched) {
               // Received, billed or returned: the cost layers and the bill carry this price, so it is not editable here.
               if (k.qtyChanged) lineMoneyChanged = true
+              // More units bought at the stored price are a new purchasing decision: a raised quantity on a received, billed or returned line is assessed too.
+              if (k.qtyChanged && req.qty > k.fact.qty) amendMarginRows.push({ productId: row.productId, unitCostBase: k.fact.unitCostBase })
               if (!unitCostMatchesStored(row.unitCostForeign, k.fact.unitCostForeign)) {
                 return { refused: `${k.fact.sku ?? k.fact.id}: the price is locked because this line has been received, billed or returned. Correct it on the supplier bill or with a credit note.` }
               }
@@ -1897,6 +2075,7 @@ export async function updatePurchaseOrder(
                   ...scaled,
                   ...(k.qtyChanged ? { purchaseUnitQty: row.purchaseUnitQty, ...scaleLineDiscountForQty(k.fact, req.qty) } : {}),
                   description: row.description,
+                  notes: row.notes,
                   sortOrder: row.sortOrder,
                   expectedDelivery: row.expectedDelivery,
                 },
@@ -1913,10 +2092,11 @@ export async function updatePurchaseOrder(
                 // Unchanged: the stored figures stand. Recomputing under the request's VAT convention can differ by rounding (and
                 // the form sends net prices), and an unchanged save must not move a stored money field.
                 const stored = { totalForeign: k.fact.totalForeign, totalBase: k.fact.totalBase, taxForeign: k.fact.taxForeign, taxBase: k.fact.taxBase }
-                lineUpdates.push({ id: k.fact.id, data: { description: row.description, sortOrder: row.sortOrder, expectedDelivery: row.expectedDelivery } })
+                lineUpdates.push({ id: k.fact.id, data: { description: row.description, notes: row.notes, sortOrder: row.sortOrder, expectedDelivery: row.expectedDelivery } })
                 finalRows.push(stored)
               } else {
                 lineMoneyChanged = true
+                amendMarginRows.push(row)
                 const { poId: _poId, ...rowData } = row
                 lineUpdates.push({ id: k.fact.id, data: rowData })
                 finalRows.push(row)
@@ -1934,7 +2114,11 @@ export async function updatePurchaseOrder(
           })
           if (discountRefusal) return { refused: discountRefusal }
           for (const index of plan.create) finalRows.push(lineData[index]!)
+          // Only lines this amend adds or reprices are assessed; a line left as it was is not held to a minimum set after it was ordered.
+          await enforceMargin([...amendMarginRows, ...plan.create.map((index) => lineData[index]!)])
           if (plan.remove.length > 0) {
+            // SO-to-PO pegging: the pegs on a removed line go with it (FK cascade); record their end first.
+            await recordPegsRemovedWithLines(tx, { purchaseOrderLineIds: plan.remove.map((l) => l.id) }, session.user.id ?? null)
             await tx.purchaseOrderLine.deleteMany({ where: { poId: id, id: { in: plan.remove.map((l) => l.id) } } })
           }
           for (const u of lineUpdates) await tx.purchaseOrderLine.update({ where: { id: u.id }, data: u.data })
@@ -2005,6 +2189,7 @@ export async function updatePurchaseOrder(
                 vatable: ac.vatable,
                 distributionMethod: ac.distributionMethod as 'BY_VALUE' | 'BY_WEIGHT' | 'BY_QUANTITY' | 'EQUAL_SPLIT',
                 sortOrder: i,
+                ...(ac.kind ? { kind: ac.kind } : {}),
               }
             })
           if (costLineData.length > 0) {
@@ -2092,10 +2277,44 @@ export async function updatePurchaseOrder(
             data: updates,
             select: PO_SELECT,
           })
-      return { po }
+      // An approved order that this edit made dearer, or moved to another supplier or currency, is no longer the order that was approved. Judged
+      // here, under the same row lock, against the total the edit started from, so an approval racing this edit either lands before it (and is
+      // cleared by it) or after it (and approves the edited order).
+      const approvalAfter = await tx.purchaseOrder.findUnique({ where: { id }, select: PO_APPROVAL_FACTS_SELECT })
+      let approvalCleared = false
+      if (approvalAfter && editInvalidatesApproval(locked, approvalAfter)) {
+        await tx.purchaseOrder.update({ where: { id }, data: CLEARED_APPROVAL })
+        approvalCleared = true
+      }
+      // An order whose creator was never recorded takes the editor as its recorded maker, which is what lets approval proceed (by someone else).
+      await tx.purchaseOrder.updateMany({ where: { id, createdById: null }, data: { createdById: session.user.id } })
+      return { po: approvalCleared ? { ...po, ...CLEARED_APPROVAL } : po, approvalCleared }
     }, STOCK_TX_OPTIONS)
     if ('refused' in edit) return { success: false, error: edit.refused }
     const po = edit.po
+    if (!['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED'].includes(existing.status)) {
+      // The supplier may already hold the earlier version (or an email for it may be in flight): say so on the order.
+      try {
+        await logActivity({
+          entityType: 'PURCHASE_ORDER', entityId: id, action: 'edited_after_send', tag: 'purchase', level: 'WARNING',
+          description: `PO ${po.reference} was edited after it was sent to the supplier (status ${existing.status}): the supplier's copy may differ from this version`,
+          metadata: { reference: po.reference, status: existing.status },
+        })
+      } catch (logError) {
+        console.error('Failed to log PO edit after send:', logError)
+      }
+    }
+    if (edit.approvalCleared) {
+      try {
+        await logActivity({
+          entityType: 'PURCHASE_ORDER', entityId: id, action: 'approval_cleared', tag: 'purchase', level: 'INFO',
+          description: `Approval of PO ${po.reference} cleared: the edit raised the total or changed the supplier or currency, so it needs approving again`,
+          metadata: { reference: po.reference },
+        })
+      } catch (logError) {
+        console.error('Failed to log PO approval clearing:', logError)
+      }
+    }
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${id}`)
@@ -2117,6 +2336,7 @@ export async function updatePurchaseOrder(
     })
     return { success: true, po: mapped }
   } catch (e) {
+    if (e instanceof MarginBlockedError) return { success: false, error: e.message }
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
@@ -2130,32 +2350,87 @@ export async function updatePurchaseOrder(
   }
 }
 
+/**
+ * Operator-side reconcile for a purchase order whose warehouse stock credit sits on an ALREADY-RETIRED ASN (o3d-98hnd). Close, cancel
+ * and the supplier-return flow all wait for that credit to be folded into the line's received quantity; for an open ASN the Recheck
+ * booked-in action does it, but a retired ASN is never re-driven. This folds the credit in (no stock, cost layer or journal is added:
+ * the alignment already did that). Refused while a live ASN exists, because a live ASN's manual-receipt pool reads `qtyReceived`.
+ */
+export async function reconcileRetiredAsnCredit(poId: string): Promise<{ success: boolean; error?: string; foldedQty?: number; message?: string }> {
+  try {
+    await requirePermission('purchasing.receive')
+    const result = await db.$transaction(async (tx) => {
+      const probe = await tx.purchaseOrder.findUnique({ where: { id: poId }, select: { type: true } })
+      if (!probe) throw new Error('PO not found')
+      if (probe.type === 'GOODS') await lockLandedCostRevaluationScope(tx, { primaryPoIds: [poId] })
+      else await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
+      const po = await tx.purchaseOrder.findUnique({ where: { id: poId }, select: { reference: true, lines: { select: { id: true } } } })
+      if (!po) throw new Error('PO not found')
+      const lineIds = po.lines.map((l) => l.id)
+      const blocks = await findLiveAsnBlocks(tx, lineIds)
+      if (blocks.length > 0) {
+        throw new Error(`${po.reference} still has an open warehouse ASN (${[...new Set(blocks.map((b) => b.externalAsnId))].join(', ')}). Use Recheck booked-in on it instead.`)
+      }
+      const folded = await foldRetiredAsnCreditIntoPurchaseOrder(tx, { poId, reference: po.reference, poLineIds: lineIds })
+      return { reference: po.reference, folded }
+    }, STOCK_TX_OPTIONS)
+    if (result.folded.lines.length > 0) {
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: poId,
+        action: 'retired_asn_credit_reconciled',
+        tag: 'purchase',
+        level: 'INFO',
+        description: `Folded ${result.folded.foldedQty} unit(s) of warehouse stock credit on retired ASN(s) into the received quantity of ${result.reference}`,
+        metadata: { reference: result.reference, foldedQty: result.folded.foldedQty, lines: result.folded.lines },
+      })
+    }
+    revalidatePath('/purchase-orders')
+    revalidatePath(`/purchase-orders/${poId}`)
+    return {
+      success: true,
+      foldedQty: result.folded.foldedQty,
+      message: result.folded.lines.length > 0
+        ? `Reconciled ${result.folded.foldedQty} unit(s) from retired warehouse ASNs into the received quantity.`
+        : 'Nothing to reconcile: no retired warehouse ASN holds unreconciled stock credit on this order.',
+    }
+  } catch (e) {
+    return { success: false, error: e instanceof Error ? e.message : String(e) }
+  }
+}
+
 export async function advancePoStatus(
   id: string,
   targetStatus: 'PO_SENT' | 'RFQ_SENT' | 'QUOTE_RECEIVED' | 'SHIPPED' | 'CLOSED',
-  payload?: { trackingNumber?: string; shippingProvider?: string },
+  payload?: { trackingNumber?: string; shippingProvider?: string; marginOverrideNote?: string },
 ): Promise<{ success: boolean; error?: string; notice?: string; warnings?: string[]; closedShort?: boolean }> {
   try {
-    await requirePermission('purchasing.create')
+    const session = await requirePermission('purchasing.create')
+    // Minimum gross margin (o3d-hqvrp.380): placing the order is the commitment, so it is checked inside the transaction below, under the
+    // PO row lock, from the stored line costs and values read through that transaction.
+    // o3d-d0gog: the close-short revaluation inside the transaction needs the chart; read it first, over the pool.
+    const closeChart = targetStatus === 'CLOSED' ? await tryReadLandedCostChartBeforeTx() : undefined
     const result = await db.$transaction(async (tx) => {
       // Closing a GOODS order may reallocate the unreceived freight share onto the received units (close-short), which revalues
       // cost layers: it takes the whole revaluation scope first, which includes the order row.
       const typeProbe = targetStatus === 'CLOSED' ? await tx.purchaseOrder.findUnique({ where: { id }, select: { type: true } }) : null
       if (typeProbe?.type === 'GOODS') await lockLandedCostRevaluationScope(tx, { primaryPoIds: [id] })
       else await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
-      const existing = await tx.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true } })
+      const existing = await tx.purchaseOrder.findUnique({ where: { id }, select: { status: true, reference: true, type: true } })
       if (!existing) throw new Error('PO not found')
       if (existing.status === targetStatus) {
         return { existing, changed: false, preferredSupplierUpdate: { productIds: [], updatedCount: 0 }, retired: null as RetireOutcome | null }
       }
       const transition = validatePurchaseOrderStatusTransition(existing.status, targetStatus)
       if (!transition.success) throw new Error(transition.error)
+      // The approval gate, under the row lock taken above: an approval, an edit or a threshold change cannot slip between this check and the status write.
+      if (targetStatus === 'PO_SENT') await assertPoApprovedForSend(tx, id)
 
       // Close: one operation at every stage. Nothing landed -> the order is retired; something landed -> close-short (the
       // received stock and its cost stay, the unreceived balance is dropped). A live warehouse ASN refuses. Read and written
       // under the row lock taken above, so a receipt cannot land between the facts and the status write.
       if (targetStatus === 'CLOSED') {
-        const retired = await retirePurchaseOrderLocked(tx, id, 'close')
+        const retired = await retirePurchaseOrderLocked(tx, id, 'close', undefined, closeChart)
         return { existing, changed: true, preferredSupplierUpdate: { productIds: [], updatedCount: 0 }, retired }
       }
 
@@ -2166,6 +2441,16 @@ export async function advancePoStatus(
       if (targetStatus === 'SHIPPED') {
         if (payload?.trackingNumber) data.trackingNumber = payload.trackingNumber
         if (payload?.shippingProvider) data.shippingProvider = payload.shippingProvider
+      }
+
+      if (targetStatus === 'PO_SENT' && existing.type === 'GOODS') {
+        const stored = await tx.purchaseOrderLine.findMany({ where: { poId: id }, select: { productId: true, unitCostBase: true } })
+        // Threshold, prices, categories and sales VAT all read through the transaction now that the PO row is locked: a price cut, a raised or removed
+        // minimum or a tax change that committed earlier is seen, and nothing from before the lock is trusted.
+        const lockedCtx = await loadMarginGuardContextUnderLock(tx, stored.map((l) => l.productId))
+        const outcome = decideGuard(lockedCtx, lockedCtx ? assessGuardLines(lockedCtx, stored) : [], { role: session.user.role, overrideNote: payload?.marginOverrideNote, verb: 'send' })
+        if (outcome.kind === 'refused') throw new MarginBlockedError(outcome.message)
+        if (outcome.override) await recordMarginOverride(tx, { poId: id, reference: existing.reference, userId: session.user.id ?? null, verb: 'send', note: outcome.override.note, below: outcome.override.below })
       }
 
       await tx.purchaseOrder.update({ where: { id }, data })
@@ -2225,6 +2510,14 @@ export async function advancePoStatus(
       ...(warnings.length > 0 ? { warnings } : {}),
     }
   } catch (e) {
+    if (e instanceof MarginBlockedError) return { success: false, error: e.message }
+    if (e instanceof PoApprovalRequiredError) {
+      await logActivity({
+        entityType: 'PURCHASE_ORDER', entityId: id, action: 'send_refused_unapproved', tag: 'purchase', level: 'WARNING',
+        description: `PO ${id} was not advanced to ${targetStatus}: it needs approval first`, metadata: { targetStatus },
+      }).catch(() => undefined)
+      return { success: false, error: e.message }
+    }
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: id,
@@ -2244,6 +2537,13 @@ export async function advancePoStatus(
  * mode, exactly as order confirmations are, so a stage with no SMTP configured keeps it queued/failed rather than mailing anyone.
  */
 async function queuePurchaseOrderEmail(id: string, reference: string, supplierEmail: string | null): Promise<PoSendResult> {
+  // Defence in depth: the one place an email is queued refuses an order that needs approval it does not have, whichever caller got here.
+  try {
+    await assertPoApprovedForSend(db, id)
+  } catch (e) {
+    if (e instanceof PoApprovalRequiredError) return { status: 'failed', message: e.message }
+    throw e
+  }
   const result = await runPoSend(supplierEmail, {
     isEnabled: isPurchaseOrderEmailEnabled,
     queue: async (to) => {
@@ -2280,14 +2580,18 @@ async function queuePurchaseOrderEmail(id: string, reference: string, supplierEm
  */
 export async function confirmAndSendPurchaseOrder(
   id: string,
+  options?: { marginOverrideNote?: string },
 ): Promise<{ success: boolean; error?: string; warnings?: string[]; send?: PoSendResult }> {
-  const advanced = await advancePoStatus(id, 'PO_SENT')
+  const advanced = await advancePoStatus(id, 'PO_SENT', options?.marginOverrideNote ? { marginOverrideNote: options.marginOverrideNote } : undefined)
   if (!advanced.success) return { success: false, error: advanced.error }
   let send: PoSendResult
   try {
+    // An order that is already PO_SENT is a no-op for the advance above, so the email half checks the gate itself.
+    await assertPoApprovedForSend(db, id)
     const po = await getPurchaseOrderQueueData(id)
     send = await queuePurchaseOrderEmail(id, po.reference, po.supplierEmail)
   } catch (e) {
+    if (e instanceof PoApprovalRequiredError) return { success: false, error: e.message }
     send = { status: 'failed', message: `The order is confirmed, but the email could not be queued (${e instanceof Error ? e.message : String(e)}). Use "Email PO" to retry.` }
   }
   return { success: true, ...(advanced.warnings ? { warnings: advanced.warnings } : {}), send }
@@ -2301,9 +2605,11 @@ export async function sendPurchaseOrderEmail(id: string): Promise<{ success: boo
     if (['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED', 'CANCELLED'].includes(po.status)) {
       return { success: false, error: 'Confirm the purchase order before emailing it to the supplier.' }
     }
+    await assertPoApprovedForSend(db, id)
     const send = await queuePurchaseOrderEmail(id, po.reference, po.supplierEmail)
     return { success: send.status === 'queued' || send.status === 'already_queued', ...(send.status === 'queued' || send.status === 'already_queued' ? {} : { error: send.message }), send }
   } catch (e) {
+    if (e instanceof PoApprovalRequiredError) return { success: false, error: e.message }
     return { success: false, error: String(e) }
   }
 }
@@ -2319,6 +2625,89 @@ export async function setPurchaseOrderEmailEnabled(enabled: boolean): Promise<{ 
     })
     revalidatePath('/settings/company')
     revalidatePath('/purchase-orders')
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+/** The Settings > Purchasing approval threshold, as the stored text ('' = no gate) with the base currency it is measured in. */
+export async function getPoApprovalThresholdSetting(): Promise<{ value: string; baseCurrency: string }> {
+  await requirePermission('settings.company')
+  const [row, baseCurrency] = await Promise.all([
+    db.setting.findUnique({ where: { key: PO_APPROVAL_THRESHOLD_SETTING_KEY }, select: { value: true } }),
+    getBaseCurrencyCode(),
+  ])
+  const threshold = await readApprovalThreshold({ setting: { findUnique: async () => row } })
+  return { value: threshold ? threshold.toFixed() : '', baseCurrency }
+}
+
+/** Set (or, blank / 0, clear) the approval threshold: goods POs at or above it, ex VAT in base currency, need approval before they are sent. */
+export async function setPoApprovalThreshold(raw: string): Promise<{ success: boolean; error?: string }> {
+  try {
+    await requirePermission('settings.company')
+    const parsed = validateApprovalThresholdInput(String(raw ?? ''))
+    if (!parsed.ok) return { success: false, error: parsed.error }
+    await db.setting.upsert({
+      where: { key: PO_APPROVAL_THRESHOLD_SETTING_KEY },
+      create: { key: PO_APPROVAL_THRESHOLD_SETTING_KEY, value: parsed.stored },
+      update: { value: parsed.stored },
+    })
+    await logActivity({
+      entityType: 'SETTING', entityId: PO_APPROVAL_THRESHOLD_SETTING_KEY, action: 'setting_changed', tag: 'settings', level: 'INFO',
+      description: parsed.stored === '' ? 'Purchase order approval switched OFF (no threshold)' : `Purchase order approval threshold set to ${parsed.stored} (base currency, ex VAT)`,
+    })
+    revalidatePath('/settings/company')
+    revalidatePath('/purchase-orders')
+    return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+/**
+ * Approve a purchase order that needs approval (goods, ex-VAT base total at or above the threshold). Needs `purchasing.approve`, and the
+ * approver must not be the order's creator. Done under the order's row lock so it serialises with an edit and with the send paths: it
+ * snapshots the total, supplier and currency it is approving, and an edit that lands later and raises the total clears it.
+ */
+export async function approvePurchaseOrder(id: string): Promise<{ success: boolean; error?: string; alreadyApproved?: boolean }> {
+  try {
+    const session = await requirePermission('purchasing.approve')
+    const outcome = await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
+      const po = await tx.purchaseOrder.findUnique({ where: { id }, select: { ...PO_APPROVAL_FACTS_SELECT, status: true, reference: true, createdById: true } })
+      if (!po) return { refused: 'PO not found' }
+      if (po.type !== 'GOODS') return { refused: 'Only goods purchase orders are approved.' }
+      if (!PO_APPROVAL_STATUSES_OPEN_FOR_APPROVAL.includes(po.status)) return { refused: `A ${po.status} purchase order cannot be approved.` }
+      const threshold = await readApprovalThreshold(tx)
+      const state = evaluatePoApproval(po, threshold)
+      if (!state.required) return { refused: 'This purchase order does not need approval.' }
+      if (state.approved) return { alreadyApproved: true as const, reference: po.reference }
+      // An order with no stored creator (imported, or created before the column existed) is attributed from the activity log's create entry. If the
+      // creator still cannot be established, self-approval cannot be ruled out, so the order is refused until someone re-saves it (see below).
+      const creatorId = po.createdById ?? (await tx.activityLog.findFirst({ where: { entityType: 'PURCHASE_ORDER', entityId: id, action: 'created', userId: { not: null } }, orderBy: { createdAt: 'asc' }, select: { userId: true } }))?.userId ?? null
+      if (!creatorId) return { refused: PO_APPROVAL_CREATOR_UNKNOWN_MESSAGE }
+      if (approverIsRequester(creatorId, session.user.id)) return { refused: PO_APPROVAL_SELF_MESSAGE }
+      const approvedTotalBase = approvalSpendBase(po)
+      await tx.purchaseOrder.update({
+        where: { id },
+        data: { approvedById: session.user.id, approvedAt: new Date(), approvedTotalBase, approvedSupplierId: po.supplierId, approvedCurrency: po.currency },
+      })
+      return { approved: true as const, reference: po.reference, approvedTotalBase: approvedTotalBase.toFixed(4) }
+    }, STOCK_TX_OPTIONS)
+    if ('refused' in outcome) return { success: false, error: outcome.refused }
+    if ('alreadyApproved' in outcome) return { success: true, alreadyApproved: true }
+    try {
+      await logActivity({
+        entityType: 'PURCHASE_ORDER', entityId: id, action: 'approved', tag: 'purchase', level: 'INFO',
+        description: `Approved PO ${outcome.reference} (${outcome.approvedTotalBase} base, ex VAT)`,
+        metadata: { reference: outcome.reference, approvedTotalBase: outcome.approvedTotalBase, approvedById: session.user.id },
+      })
+    } catch (logError) {
+      console.error('Failed to log PO approval:', logError)
+    }
+    revalidatePath('/purchase-orders')
+    revalidatePath(`/purchase-orders/${id}`)
     return { success: true }
   } catch (e) {
     return { success: false, error: String(e) }
@@ -2353,6 +2742,39 @@ export async function updatePoTracking(
       metadata: { reference: existing.reference, ...payload },
     })
     return { success: true }
+  } catch (e) {
+    return { success: false, error: String(e) }
+  }
+}
+
+/**
+ * Save the internal note on one PO line, on any order status (it is a remark, not a money or stock field, so it does not wait for a draft).
+ * The note is never printed on the supplier PO PDF or sent in the supplier email. Blank clears it.
+ */
+export async function updatePoLineNote(
+  poLineId: string,
+  notes: string | null,
+): Promise<{ success: boolean; notes?: string | null; error?: string }> {
+  try {
+    await requirePermission('purchasing.create')
+    const line = await db.purchaseOrderLine.findUnique({ where: { id: poLineId }, select: { id: true, poId: true, po: { select: { reference: true } } } })
+    if (!line) return { success: false, error: 'PO line not found' }
+    const saved = normalizePoLineNotes(notes)
+    await db.purchaseOrderLine.update({ where: { id: poLineId }, data: { notes: saved } })
+    const postCommit = await runPostCommit(async () => {
+      revalidatePath(`/purchase-orders/${line.poId}`)
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: line.poId,
+        action: 'line_note_updated',
+        tag: 'purchase',
+        level: 'INFO',
+        description: `${saved ? 'Updated' : 'Cleared'} the internal note on a line of PO ${line.po.reference}`,
+        metadata: { reference: line.po.reference, poLineId },
+      })
+    }, 'Failed to record the line note change')
+    void postCommit // the note is saved either way; a failed audit entry must not report it as unsaved
+    return { success: true, notes: saved }
   } catch (e) {
     return { success: false, error: String(e) }
   }
@@ -2634,7 +3056,8 @@ export async function receivePurchaseOrder(
         }
       }
 
-      await tx.purchaseReceipt.create({
+      const createdReceipt = await tx.purchaseReceipt.create({
+        select: { id: true },
         data: {
           poId: id,
           reference: receiptRef,
@@ -2648,6 +3071,9 @@ export async function receivePurchaseOrder(
           },
         },
       })
+      // GR/IR accrual: the goods quantity this receipt lays (the same rounded quantity the layer, the movement and the stock level take), valued at
+      // the PO goods unit cost. Recorded below with the stock, in this transaction, whether or not the Xero posting is on.
+      const grirReceiptLines: Array<{ poLineId: string; qty: Prisma.Decimal }> = []
 
       // Accumulate the receipt value in Decimal so the STOCK_RECEIPT journal
       // debit equals the sum of the cost-layer values (qty * Decimal unitCostBase)
@@ -2705,15 +3131,10 @@ export async function receivePurchaseOrder(
           },
         })
 
-        await createCostLayer(tx, {
-          productId: poLine.productId,
-          warehouseId: rl.warehouseId,
-          qty: qtyReceived,
-          unitCostBase,
-          poLineId: poLine.id,
-          isOpeningStock: false,
-        })
-
+        // o3d-chs1h: the stock row is taken BEFORE the cost layer is written, the same direction the supplier return
+        // (stock_levels, then cost_layers) and the WMS alignment take them in, so a receipt of one PO and a return of
+        // another for the same product and warehouse cannot cycle. The reporting-evidence trigger checks at COMMIT, so
+        // the order inside the transaction does not matter to it.
         await tx.stockLevel.upsert({
           where: {
             productId_warehouseId: {
@@ -2732,11 +3153,22 @@ export async function receivePurchaseOrder(
           },
         })
 
+        await createCostLayer(tx, {
+          productId: poLine.productId,
+          warehouseId: rl.warehouseId,
+          qty: qtyReceived,
+          unitCostBase,
+          poLineId: poLine.id,
+          isOpeningStock: false,
+        })
+
         await tx.purchaseOrderLine.update({
           where: { id: rl.poLineId },
           data: { qtyReceived: { increment: qtyReceivedStr } },
         })
+        grirReceiptLines.push({ poLineId: poLine.id, qty: qtyReceived })
       }
+      await recordGrirReceipt(tx, { poId: id, sourceRef: createdReceipt.id, keyBase: createdReceipt.id, at: new Date(), lines: grirReceiptLines })
 
       const updatedLines = await tx.purchaseOrderLine.findMany({
         where: { poId: id },
@@ -2807,15 +3239,30 @@ export async function receivePurchaseOrder(
         }
       }
 
-      if (accountingSettings.syncEnabled && totalReceiptValue.gt(0)) {
-        const amount = roundQuantity(totalReceiptValue, 2).toNumber()
+      // Gate on the ROUNDED amount: a sub-half-penny receipt value rounds to 0.00 and owes no journal.
+      const receiptJournalValue = receiptJournalAmount(totalReceiptValue)
+      if (accountingSettings.syncEnabled && receiptJournalValue != null) {
+        const amount = receiptJournalValue
+        // o3d-nne7i: the two account codes are read HERE, inside the transaction, under the accounting mapping lock (the
+        // same lock and reader the WMS book-in uses), not from the pooled read above. A remap committed after that read
+        // is therefore posted on the NEW codes, and one that arrives later waits for this commit. Owner decision Q12:
+        // re-read in the transaction rather than refuse; the operator's intent is "receive these goods". The connector
+        // stays the one `accountingSettings` resolved, which is also the enqueue's chart pin below.
+        let inventoryAccount = accountingSettings.inventoryAccount
+        let transitAccount = accountingSettings.transitAccount
+        if (accountingSettings.connector) {
+          await lockAccountingMappingSelection(tx, accountingSettings.connector)
+          const lockedAccounts = await readStockReceiptAccountsTx(tx, accountingSettings.connector)
+          inventoryAccount = lockedAccounts.inventoryAccount
+          transitAccount = lockedAccounts.transitAccount
+        }
         const payload = {
-          date: new Date().toISOString().slice(0, 10),
+          date: businessDateYmd(new Date()),
           reference: `Receipt: ${po.reference}`,
           narration: `Stock receipt for PO ${po.reference} — ${linesWithQty.length} lines into ${warehouseNamesList}`,
           lines: [
-            { accountCode: accountingSettings.inventoryAccount, description: `Stock receipt: ${po.reference}`, debit: amount },
-            { accountCode: accountingSettings.transitAccount, description: `Stock receipt: ${po.reference}`, credit: amount },
+            { accountCode: inventoryAccount, description: `Stock receipt: ${po.reference}`, debit: amount },
+            { accountCode: transitAccount, description: `Stock receipt: ${po.reference}`, credit: amount },
           ],
         }
         const receiptIdempotencyKey = accountingPayloadKey(`purchase-receipt:${id}:${receiptRef}`, payload)
@@ -3297,6 +3744,13 @@ export async function returnPurchaseOrder(
           data: { qtyReturned: { increment: rl.qtyReturned } },
         })
       }
+      // GR/IR accrual: a return reverses the receipt portion, the returned quantity at the PO goods unit cost (same transaction, always recorded).
+      await recordGrirSupplierReturn(tx, {
+        poId: id,
+        returnId: purchaseReturn.id,
+        at: new Date(),
+        lines: linesWithQty.map((rl) => ({ poLineId: rl.poLineId, qty: rl.qtyReturned })),
+      })
       const updatedLines = await tx.purchaseOrderLine.findMany({
         where: { poId: id },
         select: { id: true, qty: true, qtyReceived: true, qtyReturned: true },
@@ -3334,7 +3788,7 @@ export async function returnPurchaseOrder(
         select: {
           id: true, invoiceNumber: true, totalBase: true,
           subtotalForeign: true, totalForeign: true, fxRateToBase: true, createdAt: true,
-          lines: { select: { poLineId: true, qtyBilled: true, totalBase: true, totalForeign: true } },
+          lines: { select: { poLineId: true, qtyBilled: true, totalBase: true, totalForeign: true, taxRateValue: true, taxReverseCharge: true } },
         },
       })
       const overBillingComputed = computePurchaseOrderOverBilling({
@@ -3374,6 +3828,8 @@ export async function returnPurchaseOrder(
             invoiceId: inv.id,
             subtotalForeign: inv.subtotalForeign,
             totalForeign: inv.totalForeign,
+            // What is owed to the supplier: the credit's ceiling and gross-up (a reverse-charge bill's stored total includes VAT it accounts for itself).
+            netPayableForeign: billNetPayableForeign(inv, po.currency),
             fxRateToBase: inv.fxRateToBase,
             alreadyCreditedForeign: allCreditedByInvoice.get(inv.id) ?? 0,
             alreadyReturnCreditedForeign: returnCreditedByInvoice.get(inv.id) ?? 0,
@@ -3406,18 +3862,27 @@ export async function returnPurchaseOrder(
 
       if (accountingSettings.syncEnabled && totalReturnedCostBase.gt(0.000001)) {
         const amount = roundQuantity(totalReturnedCostBase, 2).toNumber()
+        // o3d-nne7i: same as the receipt - the two codes come from the locked in-transaction read, not the pooled one.
+        let returnTransitAccount = accountingSettings.transitAccount
+        let returnInventoryAccount = accountingSettings.inventoryAccount
+        if (accountingSettings.connector) {
+          await lockAccountingMappingSelection(tx, accountingSettings.connector)
+          const lockedAccounts = await readStockReceiptAccountsTx(tx, accountingSettings.connector)
+          returnTransitAccount = lockedAccounts.transitAccount
+          returnInventoryAccount = lockedAccounts.inventoryAccount
+        }
         const payload = {
-          date: new Date().toISOString().slice(0, 10),
+          date: businessDateYmd(new Date()),
           reference: returnRef,
           narration: `Supplier return for PO ${po.reference}`,
           lines: [
             {
-              accountCode: accountingSettings.transitAccount,
+              accountCode: returnTransitAccount,
               description: `Reverse supplier return ${returnRef}`,
               debit: amount,
             },
             {
-              accountCode: accountingSettings.inventoryAccount,
+              accountCode: returnInventoryAccount,
               description: `Reduce inventory for supplier return ${returnRef}`,
               credit: amount,
             },
@@ -3617,6 +4082,8 @@ export type CreateInvoiceInput = {
   notes?: string
   supplierInvoiceUrl?: string
   lines: InvoiceLineInput[]
+  /** Bill again although this supplier already has a bill under the same supplier invoice number. */
+  allowDuplicateInvoiceNumber?: boolean
 }
 
 export type UpdateInvoiceLineInput = {
@@ -3647,6 +4114,8 @@ export type InvoiceRow = {
   taxBase: number
   totalForeign: number
   totalBase: number
+  /** What is owed to the supplier: the stored total less the VAT a reverse-charge line accounts for itself (equal to `totalForeign` when none does). The figure markBillPaid registers; `totalForeign` is the gross, shown as secondary. */
+  netPayableForeign: number
   notes: string | null
   supplierInvoiceUrl: string | null
   accountingInvoiceId: string | null
@@ -3726,7 +4195,7 @@ async function billTaxCodeRefusal(lineTaxRates: ReadonlyArray<{ description: str
 export async function createInvoice(
   poId: string,
   input: CreateInvoiceInput,
-): Promise<{ success: boolean; error?: string }> {
+): Promise<{ success: boolean; error?: string; duplicateInvoiceNumber?: boolean }> {
   try {
     await requirePermission('purchasing.invoice')
     const po = await db.purchaseOrder.findUnique({
@@ -3776,6 +4245,9 @@ export async function createInvoice(
       },
     })
     if (!po) return { success: false, error: 'PO not found' }
+    // Only an order that has been placed and not cancelled is billed (CLOSED stays billable: a late supplier invoice for goods received before the close).
+    const statusRefusal = purchaseOrderBillStatusRefusal(po.status, po.reference)
+    if (statusRefusal) return { success: false, error: statusRefusal }
 
     // Split inputs into product vs cost lines.
     const productInputs = input.lines.filter(
@@ -3910,6 +4382,9 @@ export async function createInvoice(
       const lockedPo = await tx.purchaseOrder.findUniqueOrThrow({
         where: { id: poId },
         select: {
+          status: true,
+          reference: true,
+          supplierId: true,
           fxRateToBase: true,
           type: true,
           taxRatePercent: true,
@@ -3929,6 +4404,14 @@ export async function createInvoice(
             select: { id: true, description: true, amountForeign: true, vatable: true },
           },
         },
+      })
+      // The status was read before the lock: a cancel that committed in between must refuse the bill too.
+      const lockedStatusRefusal = purchaseOrderBillStatusRefusal(lockedPo.status, lockedPo.reference)
+      if (lockedStatusRefusal) throw new PurchaseBillStatusRefusal(lockedStatusRefusal)
+      await assertNoDuplicateSupplierBill(tx, {
+        supplierId: lockedPo.supplierId,
+        invoiceNumber: normalizeSupplierInvoiceNumber(input.invoiceNumber),
+        override: input.allowDuplicateInvoiceNumber === true,
       })
       // The tax and the accounting payload above were computed BEFORE this lock from the order and its cost lines as
       // they were then. A freight edit that committed in between keeps the cost-line ids, so the id checks alone pass
@@ -3963,7 +4446,7 @@ export async function createInvoice(
         select: { id: true },
         data: {
           poId,
-          invoiceNumber: input.invoiceNumber || null,
+          invoiceNumber: normalizeSupplierInvoiceNumber(input.invoiceNumber),
           invoiceDate,
           dueDate: input.dueDate ? new Date(input.dueDate) : null,
           subtotalForeign: invoiceCalculation.subtotalForeign,
@@ -3988,6 +4471,18 @@ export async function createInvoice(
             })),
           },
         },
+      })
+
+      // GR/IR accrual: the goods lines of this bill debit GR/IR at the PO goods unit cost; the price difference is its own movement. In this transaction,
+      // whether or not the Xero posting is on. A freight cost line has no order line and stays on the transit path.
+      await recordGrirBill(tx, {
+        poId,
+        invoiceId: createdInvoice.id,
+        invoiceDate: input.invoiceDate,
+        at: invoiceDate,
+        lines: invoiceCalculation.lineData.flatMap((line) => (
+          line.poLineId ? [{ poLineId: line.poLineId, qtyBilled: line.qtyBilled, billedBase: line.totalBase }] : []
+        )),
       })
 
       // Mark invoicedAt (don't change primary status — it's shown as a secondary badge)
@@ -4110,6 +4605,8 @@ export async function createInvoice(
 
     return { success: true }
   } catch (e) {
+    if (e instanceof PurchaseBillStatusRefusal) return { success: false, error: e.message }
+    if (e instanceof DuplicateSupplierInvoiceNumberError) return { success: false, error: e.message, duplicateInvoiceNumber: true }
     await logActivity({
       entityType: 'PURCHASE_ORDER',
       entityId: poId,
@@ -4225,6 +4722,9 @@ export async function updateInvoice(
       },
     })
     if (!invoice) return { success: false, error: 'Bill not found' }
+    // o3d-ngmt.21: no edit of a bill whose delete is pending.
+    const deletePendingForEdit = await pendingDeletionError(invoice.id)
+    if (deletePendingForEdit) return { success: false, error: deletePendingForEdit }
     try {
       assertPurchaseInvoiceEditable(invoice)
     } catch (error) {
@@ -4413,7 +4913,7 @@ export async function updateInvoice(
           // The id the edit's payload was built against, re-read under the lock: a first posting that was written back since the unlocked read
           // makes a payload built without it the wrong kind (a refresh of a create that no longer exists, rather than an update).
           accountingInvoiceId: true,
-          lines: { select: { id: true, poLineId: true, qtyBilled: true, description: true, unitCostForeign: true, totalForeign: true } },
+          lines: { select: { id: true, poLineId: true, qtyBilled: true, description: true, unitCostForeign: true, totalForeign: true, totalBase: true } },
         },
       })
       if (!lockedInvoice) throw new Error('Bill not found')
@@ -4553,6 +5053,24 @@ export async function updateInvoice(
           },
         })
       }
+
+      // GR/IR accrual: the signed delta of each goods line against the bill as it stood under the lock (a freight cost line is the transit path's).
+      await recordGrirBillEdit(tx, {
+        poId: invoice.poId,
+        invoiceId: invoice.id,
+        editId: randomUUID(),
+        at: new Date(),
+        lines: lineUpdates.flatMap((line) => {
+          if (!line.poLineId) return []
+          const before = lockedInvoice.lines.find((existing) => existing.id === line.id)
+          if (!before) return []
+          return [{
+            poLineId: line.poLineId,
+            qtyBilledDelta: toDecimal(line.qtyBilled).sub(toDecimal(before.qtyBilled)),
+            billedBaseDelta: toDecimal(line.totalBase).sub(toDecimal(before.totalBase)),
+          }]
+        }),
+      })
 
       // A bill that has no ledger document yet has nothing to update: its first posting is still to go out (or has gone out and is not linked
       // back), so the edit has to ride on that posting instead of being dropped. See purchase-invoice-pending-create-refresh.ts.
@@ -4757,6 +5275,8 @@ export async function markBillPaid(
         fxRateToBase: true,
         paidAt: true,
         accountingInvoiceId: true,
+        // The reverse-charge lines decide the NET PAYABLE (lib/domain/purchasing/bill-net-payable.ts): the stored total carries VAT the bill accounts for itself.
+        lines: { select: { totalForeign: true, taxRateValue: true, taxReverseCharge: true } },
         // o3d-j625 r3 (Codex HIGH 2): AND WHOSE BILL THAT ID IS. The id survives a connector switch and
         // carries no provenance of its own, so the bank account's chart cannot speak for it.
         accountingInvoiceConnector: true,
@@ -4764,6 +5284,9 @@ export async function markBillPaid(
       },
     })
     if (!invoice) return { success: false, error: 'Bill not found' }
+    // o3d-ngmt.21: no payment against a bill whose delete is pending.
+    const deletePendingForPayment = await pendingDeletionError(invoice.id)
+    if (deletePendingForPayment) return { success: false, error: deletePendingForPayment }
     if (invoice.paidAt) return { success: false, error: 'Bill is already marked as paid' }
     if (!input.bankAccountId) return { success: false, error: 'Select a bank account' }
     if (!input.paymentDate) return { success: false, error: 'Payment date is required' }
@@ -4777,7 +5300,10 @@ export async function markBillPaid(
     const account = accounts.find((a) => a.id === input.bankAccountId)
     if (!account) return { success: false, error: 'Unknown bank account' }
 
-    const paymentAmount = input.amountForeign ?? Number(invoice.totalForeign)
+    // A full payment is what is OWED to the supplier (the net payable), not the stored total, which includes any reverse-charge VAT the bill accounts for itself.
+    const netPayableForeign = billNetPayableForeign(invoice, invoice.po.currency)
+    const netPayableBase = billNetPayableBase(invoice, invoice.po.currency)
+    const paymentAmount = input.amountForeign ?? netPayableForeign.toNumber()
     const paymentDate = new Date(input.paymentDate)
     const baseCurrency = await getBaseCurrencyCode()
     // o3d-q0x56.4 / .16 - THE SETTLEMENT RATE IS RESOLVED BEFORE THE FIRST WRITE, AND A MISSING ONE REFUSES.
@@ -5087,8 +5613,8 @@ export async function markBillPaid(
           // Booked base for the settled portion = stored totalBase prorated by the
           // settled foreign share, so realised FX measures against the real AP
           // carrying value rather than a re-derived figure (cogs-audit scjz.55).
-          bookedBase: Number(invoice.totalForeign) > 0
-            ? multiplyMoney(invoice.totalBase, paymentAmount).div(toDecimal(invoice.totalForeign)).toNumber()
+          bookedBase: netPayableForeign.gt(0)
+            ? multiplyMoney(netPayableBase, paymentAmount).div(netPayableForeign).toNumber()
             : undefined,
         })
         const lines = buildRealisedFxJournal({
@@ -5104,7 +5630,7 @@ export async function markBillPaid(
             referenceType: 'PurchaseInvoice',
             referenceId: invoice.id,
             payload: {
-              date: paymentDate.toISOString().slice(0, 10),
+              date: businessDateYmd(paymentDate),
               reference: invoice.invoiceNumber ?? invoice.po.reference,
               narration: `Realised FX ${realised.outcome} on supplier payment ${invoice.invoiceNumber ?? invoice.po.reference}`,
               lines,
@@ -5197,7 +5723,7 @@ export async function recordSupplierFreightCreditNote(input: {
         currency: true,
         fxRateToBase: true,
         supplierId: true,
-        invoices: { select: { id: true, fxRateToBase: true, totalForeign: true }, orderBy: { createdAt: 'desc' } },
+        invoices: { select: { id: true, fxRateToBase: true, totalForeign: true, lines: { select: { totalForeign: true, taxRateValue: true, taxReverseCharge: true } } }, orderBy: { createdAt: 'desc' } },
       },
     })
     if (!po) return { success: false, error: 'Purchase order not found' }
@@ -5205,6 +5731,12 @@ export async function recordSupplierFreightCreditNote(input: {
     const selectedInvoice = input.purchaseInvoiceId
       ? po.invoices.find((inv) => inv.id === input.purchaseInvoiceId) ?? null
       : po.invoices[0] ?? null
+
+    // o3d-ngmt.21: no supplier credit note against a bill whose delete is pending.
+    if (selectedInvoice) {
+      const deletePendingForRecord = await pendingDeletionError(selectedInvoice.id)
+      if (deletePendingForRecord) return { success: false, error: deletePendingForRecord }
+    }
 
     // Remaining creditable = the bill's total minus credit notes already recorded
     // against it, so a PO can't be over-credited (Codex review).
@@ -5214,7 +5746,13 @@ export async function recordSupplierFreightCreditNote(input: {
         where: { purchaseInvoiceId: selectedInvoice.id },
         _sum: { amountForeign: true },
       })
-      remainingCreditableForeign = Number(selectedInvoice.totalForeign) - Number(existing._sum.amountForeign ?? 0)
+      // A bill with reverse-charge lines stores a total that includes the VAT it accounts for itself, which is not owed to the supplier: its credits are capped at the NET PAYABLE
+      // (reverse-charge lines at their net, the rest at net plus VAT). Lines booked before the treatment was recorded carry no flag and count at the stored total.
+      const hasReverseChargeLine = selectedInvoice.lines.some((l) => l.taxReverseCharge === true)
+      const creditableCeiling = hasReverseChargeLine
+        ? billNetPayable(selectedInvoice.lines.map((l) => ({ taxType: undefined, rate: Number(l.taxRateValue ?? 0), reverseCharge: l.taxReverseCharge === true, net: Number(l.totalForeign) })), po.currency)
+        : Number(selectedInvoice.totalForeign)
+      remainingCreditableForeign = creditableCeiling - Number(existing._sum.amountForeign ?? 0)
     }
 
     const validationError = validateRecordSupplierCreditNote({
@@ -5289,8 +5827,8 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     const cn = await db.supplierCreditNote.findUnique({
       where: { id },
       select: {
-        id: true, poId: true, supplierId: true, currency: true, fxRateToBase: true,
-        amountForeign: true, creditNoteNumber: true, reference: true, reason: true, status: true,
+        id: true, poId: true, supplierId: true, currency: true, fxRateToBase: true, purchaseInvoiceId: true,
+        amountForeign: true, creditNoteNumber: true, reference: true, reason: true, status: true, isReturnGenerated: true,
         // audit-oy5p: the offset bill's tax + supplier tax type, to mirror the bill's tax treatment.
         // audit-v08m: + the bill's external (Xero) id, to allocate the credit to it.
         // o3d-j625 r3 (Codex HIGH 2): `accountingInvoiceId` goes into the payload as
@@ -5325,6 +5863,11 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     })
     if (!cn) return { success: false, error: 'Credit note not found' }
     if (cn.status !== 'DRAFT') return { success: false, error: 'Credit note is already posted' }
+    // o3d-ngmt.21: no supplier credit note against a bill whose delete is pending.
+    if (cn.purchaseInvoiceId) {
+      const deletePendingForCredit = await pendingDeletionError(cn.purchaseInvoiceId)
+      if (deletePendingForCredit) return { success: false, error: deletePendingForCredit }
+    }
 
     // Resolve connector/settings BEFORE the transaction (Codex review: a lookup
     // failure must not occur after the row is already POSTED).
@@ -5413,9 +5956,9 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     // poster for QuickBooks, so no posting is ever coming — so it is not an inbox row; it is a WARNING that
     // says plainly what the ledger will not receive.
     // One credit amount cannot mirror a bill that mixes VAT treatments: refused BEFORE anything is claimed (the credit stays a draft). Per-line credits are a follow-up.
-    // A Xero-bound credit against a bill with ANY reverse-charge line is refused before anything is claimed (its figures cannot agree yet); the credit stays a draft. Local-only credits are unaffected.
-    if (shouldQueueXero && billTreatments.some((t) => t.reverseCharge)) return { success: false, error: SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_MESSAGE }
-    if (shouldQueueXero && creditNoteTreatment.mixed) return { success: false, error: SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE }
+    // A bill with a reverse-charge line is credited by its own lines against its NET PAYABLE (below), so mixing reverse-charge with standard lines is supported there; any other mix is still refused.
+    const billHasReverseCharge = billTreatments.some((t) => t.reverseCharge)
+    if (shouldQueueXero && creditNoteTreatment.mixed && !billHasReverseCharge) return { success: false, error: SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE }
     // A credit that would be sent to the ledger is not priced on an inactive rate, and not on a treatment that cannot be told: refused before anything is claimed.
     if (shouldQueueXero) {
       if (legacyTreatmentsAmbiguous) return { success: false, error: LEGACY_BILL_TAX_AMBIGUOUS_MESSAGE }
@@ -5425,10 +5968,27 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       const disagreement = await billTaxCodeRefusal(billTreatments.map((t, i) => ({ description: `bill line ${i + 1}`, taxType: t.taxType, rate: t.rate, checkable: !t.reverseCharge })), 'credit note')
       if (disagreement) return { success: false, error: disagreement }
     }
+    // REVERSE-CHARGE BILL: the credit is an amount against the bill's NET PAYABLE (what is owed to the supplier, without the VAT the bill accounts for itself), capped there together with
+    // the credits already against the bill. That ONE amount is split across the bill's lines and is the Xero credit lines (exclusive net, each line's booked code, so Xero self-accounts the
+    // VAT the way the bill did), the allocation to the bill and the transit movement. Local-only credits are not Xero figures and are left alone.
+    let reverseChargePlan: Exclude<ReturnType<typeof planReverseChargeSupplierCredit>, string> | null = null
+    if (shouldQueueXero && billHasReverseCharge) {
+      const payableForeign = billNetPayable(billTreatments, cn.currency)
+      const others = cn.purchaseInvoiceId
+        ? await db.supplierCreditNote.aggregate({ where: { purchaseInvoiceId: cn.purchaseInvoiceId, id: { not: cn.id } }, _sum: { amountForeign: true } })
+        : null
+      const availableForeign = Math.max(0, payableForeign - Number(others?._sum.amountForeign ?? 0))
+      const creditForeign = Number(cn.amountForeign)
+      if (creditForeign > availableForeign + 0.0001) return { success: false, error: SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE(payableForeign.toFixed(2), availableForeign.toFixed(2)) }
+      const planned = planReverseChargeSupplierCredit({ amount: creditForeign, lines: billTreatments, currency: cn.currency })
+      if (planned === 'exceeds') return { success: false, error: SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE(payableForeign.toFixed(2), availableForeign.toFixed(2)) }
+      if (planned === 'inexact') return { success: false, error: SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_INEXACT_MESSAGE }
+      reverseChargePlan = planned
+    }
     // The credit's payload is built BEFORE the claim so an undecided tax type is refused while the credit is still a DRAFT: claiming first would leave it POSTED, refused by the poster with
     // no Xero credit and no way back (posting requires DRAFT). A legacy bill line can reconstruct the right VAT and still have no mapped tax type.
     // Single date for both the journal and its subledger row (they must share the GL date dimension the reconciliation windows on).
-    const creditNoteDate = new Date().toISOString().slice(0, 10)
+    const creditNoteDate = businessDateYmd(new Date())
     const creditNotePayload = shouldQueueXero ? buildSupplierCreditNoteSyncPayload({
       creditNoteId: cn.id,
       creditNoteNumber: cn.creditNoteNumber,
@@ -5453,7 +6013,9 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       // audit-v08m: allocate the credit to the bill once both have posted to
       // Xero. Skipped when the bill has no external id yet (allocation needs it).
       allocateToInvoiceId: cn.purchaseInvoice?.accountingInvoiceId ?? null,
-      allocateAmount: Number(cn.amountForeign),
+      // The allocation is what Xero will hold the credit as, so it can never exceed the bill's outstanding amount.
+      allocateAmount: reverseChargePlan ? reverseChargePlan.xeroTotal : Number(cn.amountForeign),
+      reverseChargePlan: reverseChargePlan ?? undefined,
     }) : null
     if (shouldQueueXero && creditNotePayload) {
       const undecidedType = purchaseDocumentTaxTypeRefusal(`Supplier credit note ${cn.creditNoteNumber ?? cn.id}`, creditNotePayload as { lines?: ReadonlyArray<{ taxType?: unknown }> })
@@ -5496,6 +6058,24 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         data: { status: 'POSTED', postedAt: new Date() },
       })
       if (claimed.count === 0) return false
+      // GR/IR accrual: a return-generated credit note is the supplier crediting back goods that were billed and then returned, which lifts the
+      // debit the return left on GR/IR. Its NET is the figure its transit row carries. Recorded with the claim, whether or not the Xero posting is on.
+      // The credit's NET in base currency: ONE computation, the figure the transit row below carries as well as the GR/IR row.
+      const creditNetBase = reverseChargePlan ? supplierCreditNoteAmountBase(reverseChargePlan.netTotal, cn.fxRateToBase).toNumber() : resolveSupplierCreditNoteTransitBase({
+        grossBase: supplierCreditNoteAmountBase(cn.amountForeign, cn.fxRateToBase).toNumber(),
+        billSubtotalForeign: Number(cn.purchaseInvoice?.subtotalForeign ?? 0),
+        billTaxForeign: Number(cn.purchaseInvoice?.taxForeign ?? 0),
+      })
+      if (cn.isReturnGenerated) {
+        await recordGrirReturnCreditNote(tx, {
+          poId: cn.poId,
+          supplierId: cn.supplierId,
+          creditNoteId: cn.id,
+          netBase: creditNetBase,
+          journalDate: creditNoteDate,
+          at: new Date(),
+        })
+      }
       if (shouldQueueXero) {
         const queued = await queueAccountingSyncTx(tx, {
           type: 'PURCHASE_CREDIT_NOTE',
@@ -5525,11 +6105,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         // keyed the same, only when actually queued (record on the queue's OWN
         // decision, bcz9.4). Net is derived from the offset bill's VAT ratio.
         if (queued) {
-          const transitNetBase = resolveSupplierCreditNoteTransitBase({
-            grossBase: supplierCreditNoteAmountBase(cn.amountForeign, cn.fxRateToBase).toNumber(),
-            billSubtotalForeign: Number(cn.purchaseInvoice?.subtotalForeign ?? 0),
-            billTaxForeign: Number(cn.purchaseInvoice?.taxForeign ?? 0),
-          })
+          const transitNetBase = creditNetBase
           await recordTransitSubledgerMovement(tx, {
             sourceType: 'SUPPLIER_CREDIT_NOTE',
             sourceRef: cn.id,
@@ -5632,14 +6208,20 @@ export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{
     const { subtotalForeign, taxForeign, subtotalBase, taxBase, totalForeign, totalBase } = built
     const costLineData = built.rows
 
-    const freightReference = await makeReference()
     // Create the freight PO + landed-cost links AND run the initial recalc in ONE
     // transaction: if the recalc fails (e.g. a linked primary is CLOSED ->
     // throws, or a lock timeout), the freight PO and its LandedCostLinks roll back
     // too, so we never leave 'linked but unapplied' freight with no retry path
     // (scjz.15). The cancellation path already recalcs in-tx; this matches it.
-    const { po, landedResult } = await db.$transaction(
+    const freightPrefix = await readPoPrefix()
+    // o3d-d0gog: the chart for the revaluation inside the transaction, read before any transaction connection is held.
+    const landedChart = await readLandedCostChartBeforeTx()
+    // The reference is minted in a transaction of its own, committed first, so the numbering lock is never held across the landed-cost recalculation below (a failed create leaves a gap in the sequence).
+    const { po, landedResult } = await retryWhenNumberTaken(async () => {
+    const freightReference = await makeReference(freightPrefix)
+    return db.$transaction(
       async (tx) => {
+        await claimDocumentNumber(tx, 'purchase_order', freightReference)
         // o3d-nrl4 PR A (closes o3d-t3mbr for this caller): this transaction used to lock NOTHING before
         // `recalculateLandedCosts` rewrote the primaries' lines, their cost layers and every snapshot
         // naming them. Lock the scope FIRST — before the freight order and its links are inserted, so
@@ -5678,11 +6260,13 @@ export async function createFreightPo(rawInput: CreateFreightPoInput): Promise<{
           triggeredById: session.user.id,
           reason: 'freight_purchase_order_created',
           scheduleAdjustmentJournals: true, // audit-grob durable backstop
+          accountingSettings: landedChart,
         })
         return { po, landedResult }
       },
       STOCK_TX_OPTIONS,
     )
+    })
 
     // Revalidate linked primary POs
     for (const pid of landedResult.revalidatePoIds) {
@@ -5816,7 +6400,8 @@ export async function updateFreightPoCosts(
   freightPoId: string,
   rawCostLines: FreightCostLineInput[],
   rawTaxRateValue?: number,
-): Promise<{ success: boolean; error?: string }> {
+  expectedCostLinesFingerprint?: string,
+): Promise<{ success: boolean; error?: string; /** The fingerprint of the lines and VAT as now stored, for the dialog's next save. */ costLinesFingerprint?: string }> {
   try {
     const session = await requirePermission('purchasing.create')
     // The same boundary createFreightPo applies (shape, finiteness, the four methods, the net-subtotal
@@ -5831,7 +6416,9 @@ export async function updateFreightPoCosts(
     }
     const costLines = parsedLines.data
     const taxRateValue = taxRateParse.data
-    const { reference, landedResult } = await db.$transaction(async (tx) => {
+    // o3d-d0gog: the chart for the revaluation inside the transaction, read before any transaction connection is held.
+    const landedChart = await readLandedCostChartBeforeTx()
+    const { reference, landedResult, costLinesFingerprint } = await db.$transaction(async (tx) => {
       // ─── o3d-6nd55 r3 (Codex round-3 HIGH): THE PARENT ORDERS BEFORE THEIR COST ROWS ───
       //
       // THE DEADLOCK THIS CLOSES. This transaction used to delete `freight_cost_lines` and only THEN
@@ -5872,6 +6459,9 @@ export async function updateFreightPoCosts(
           invoiceLines: { select: { id: true }, take: 1 },
         },
       })
+      // o3d-aks9m: a dialog opened before another operator's edit would replace their lines. The lines read here are
+      // under the order lock, so comparing them with what the dialog loaded is race-free.
+      assertFreightEditNotStale(storedLines, { taxRatePercent: po.taxRatePercent, taxForeign: po.taxForeign }, expectedCostLinesFingerprint)
       // THE TAX RATE (a fraction, 0.2). Not passing one means KEEP the stored rate, never zero it. An order that
       // never recorded a rate is NOT inferred from what was charged: if it was charged VAT the caller must say
       // the rate (see resolveFreightEditTaxRate).
@@ -5944,8 +6534,17 @@ export async function updateFreightPoCosts(
         triggeredById: session.user.id,
         reason: 'freight_purchase_order_costs_updated',
         scheduleAdjustmentJournals: true, // audit-grob durable backstop
+        accountingSettings: landedChart,
       })
-      return { reference: po.reference, landedResult }
+      const finalLines = await tx.freightCostLine.findMany({
+        where: { poId: freightPoId },
+        select: { id: true, description: true, amountForeign: true, vatable: true, distributionMethod: true },
+      })
+      const costLinesFingerprint = freightCostLinesFingerprint(finalLines, {
+        taxRatePercent: effectiveRate.gt(0) ? effectiveRate : null,
+        taxForeign,
+      })
+      return { reference: po.reference, landedResult, costLinesFingerprint }
     }, STOCK_TX_OPTIONS)
 
     revalidatePath('/purchase-orders')
@@ -5980,7 +6579,7 @@ export async function updateFreightPoCosts(
       })
     }
 
-    return { success: true }
+    return { success: true, costLinesFingerprint }
   } catch (e) {
     await logActivity({
       entityType: 'PURCHASE_ORDER',

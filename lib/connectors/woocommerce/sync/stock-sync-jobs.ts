@@ -23,8 +23,10 @@ import {
 } from '@/lib/domain/integrations/outbox'
 import { INTEGRATION_OUTBOX_OPERATIONS } from '@/lib/domain/integrations/outbox-registry'
 import { wooDrainHold } from '../producer-egress'
+import { PRODUCER_HELD_RETRY_DELAY_MS } from '@/lib/security/producer-disposition-constants'
 import { runWithWcAttemptFence } from '../attempt-fence'
 import { createWriteLedger, runInWriteLedger } from '@/lib/security/write-ledger'
+import { WC_DRAIN_CLAIM_BUDGET_MS, WC_DRAIN_SCAN_WINDOW } from './order-status-claim-gate'
 
 const WEBHOOK_ECHO_WINDOW_MS = 10 * 60 * 1000
 const WC_STOCK_SYNC_CONNECTOR = 'woocommerce'
@@ -38,16 +40,32 @@ function nextTick(): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, 0))
 }
 
-async function expandDependentKitIds(productIds: string[]): Promise<string[]> {
+const MAX_DEPENDENT_KIT_DEPTH = 10
+
+/**
+ * Every KIT that contains one of `productIds` as a component, at any nesting depth (a gift box holding a kit that holds the
+ * changed component is stale too). Breadth-first and bounded: a kit cycle adds nothing new and the depth is capped.
+ */
+export async function expandDependentKitIds(productIds: string[]): Promise<string[]> {
   if (productIds.length === 0) return []
-  const rows = await db.productComponent.findMany({
-    where: {
-      componentId: { in: productIds },
-      product: { lifecycleStatus: { in: COMPONENT_PRODUCT_STATUSES }, type: 'KIT' },
-    },
-    select: { productId: true },
-  })
-  return rows.map((row) => row.productId)
+  const found = new Set<string>()
+  let frontier = [...new Set(productIds)]
+  for (let depth = 0; depth < MAX_DEPENDENT_KIT_DEPTH && frontier.length > 0; depth++) {
+    const rows = await db.productComponent.findMany({
+      where: {
+        componentId: { in: frontier },
+        product: { lifecycleStatus: { in: COMPONENT_PRODUCT_STATUSES }, type: 'KIT' },
+      },
+      select: { productId: true },
+    })
+    frontier = []
+    for (const row of rows) {
+      if (found.has(row.productId)) continue
+      found.add(row.productId)
+      frontier.push(row.productId)
+    }
+  }
+  return [...found]
 }
 
 async function expandProductScope(productIds: string[]): Promise<string[]> {
@@ -348,6 +366,9 @@ export async function processQueuedWcStockSyncJobs(options?: {
   productIds?: string[]
   limit?: number
   migrateLegacy?: boolean
+  /** Test seams: the clock the drain budget and the claims read, and the budget itself. */
+  clock?: () => Date
+  drainBudgetMs?: number
 }): Promise<{ processed: number; synced: number; failed: number; errors: string[]; held?: true }> {
   const limit = options?.limit ?? 25
   const productIds = options?.productIds !== undefined ? [...new Set(options.productIds)] : undefined
@@ -356,22 +377,35 @@ export async function processQueuedWcStockSyncJobs(options?: {
 
   // The claim boundary of the producer-side hold: while WooCommerce is held, claim nothing and migrate nothing. A job queued
   // before the hold was switched on stays exactly as it is (no claim, no attempt spent) and is never sent while the hold stands.
-  if (wooDrainHold().held) return { ...summary, held: true }
+  if (wooDrainHold(undefined, 'stock').held) return { ...summary, held: true }
 
   if (options?.migrateLegacy !== false) {
     await migrateLegacyWcStockSyncJobs(productIds, limit)
   }
 
-  const jobs = await claimIntegrationOutboxWork({
-    connector: WC_STOCK_SYNC_CONNECTOR,
-    operation: WC_STOCK_SYNC_OPERATION,
-    idempotencyKeys: productIds?.map(wcStockSyncIdempotencyKey),
-    limit,
-    workerId: WC_STOCK_SYNC_WORKER_ID,
-    maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
-  })
+  // CLAIM -> ATTEMPT -> MARK, ONE JOB AT A TIME (same shape as the order-status drains): each job is claimed only when its attempt is
+  // about to start, so a job at the back of a 25-row drain cannot age past the lease while it waits, and the drain stops claiming once
+  // its wall-clock budget is spent.
+  const clock = options?.clock ?? (() => new Date())
+  const startedAt = clock().getTime()
+  const budgetMs = options?.drainBudgetMs ?? WC_DRAIN_CLAIM_BUDGET_MS
+  const attempted: string[] = []
 
-  for (const job of jobs) {
+  while (attempted.length < limit) {
+    if (clock().getTime() - startedAt > budgetMs) break
+    const [job] = await claimIntegrationOutboxWork({
+      connector: WC_STOCK_SYNC_CONNECTOR,
+      operation: WC_STOCK_SYNC_OPERATION,
+      idempotencyKeys: productIds?.map(wcStockSyncIdempotencyKey),
+      limit: WC_DRAIN_SCAN_WINDOW,
+      claimLimit: 1,
+      excludeIds: attempted,
+      workerId: WC_STOCK_SYNC_WORKER_ID,
+      maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
+      now: clock(),
+    })
+    if (!job) break
+    attempted.push(job.id)
     summary.processed++
     if (!job.lockedAt) {
       summary.failed++
@@ -416,6 +450,25 @@ export async function processQueuedWcStockSyncJobs(options?: {
           source: payload.reason,
         }),
       ))
+
+      // A push the producer-side hold refused AFTER this job was claimed (the confirmation went away between the drain's ask and the push) is handed
+      // back unsent, with NO attempt spent: a hold is the installation's decision, not a failure of the work, and must never march the job to PERMANENT_FAILED.
+      if (result.held === true) {
+        await markIntegrationOutboxRetryableFailure({
+          id: job.id,
+          workerId: WC_STOCK_SYNC_WORKER_ID,
+          lockedAt: job.lockedAt,
+          error: result.errors.join(' | ') || result.message || 'WooCommerce stock sync held',
+          attemptsBeforeFailure: job.attempts,
+          maxAttempts: WC_STOCK_SYNC_MAX_ATTEMPTS,
+          noWriteSent: ledger.writes === 0,
+          heldWithoutAttempt: true,
+          retryDelayMs: PRODUCER_HELD_RETRY_DELAY_MS,
+        })
+        summary.failed++
+        summary.errors.push(...(result.errors.length > 0 ? result.errors : [result.message || `Product ${payload.productId}: stock held`]))
+        continue
+      }
 
       if (shouldRetainJob(result, payload)) {
         await markIntegrationOutboxRetryableFailure({

@@ -1,8 +1,10 @@
 'use server'
 
+import { claimDocumentNumber, mintCommittedDocumentNumber, retryWhenNumberTaken } from '@/lib/domain/numbering/mint'
 import { INVOICED_ORDER_WHERE } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
+import { assertOverviewAnalyticsAccess } from '@/lib/security/overview-analytics-access'
 import { logActivity } from '@/lib/activity-log'
 import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
@@ -128,7 +130,7 @@ const DEFAULT_SETTINGS: ForecastSettings = {
 }
 
 export async function getForecastSettings(): Promise<ForecastSettings> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const [row, retentionRow] = await Promise.all([
     db.setting.findUnique({ where: { key: 'forecast_settings' } }),
     db.setting.findUnique({ where: { key: 'forecast_retention_months' } }),
@@ -144,7 +146,10 @@ export async function getForecastSettings(): Promise<ForecastSettings> {
 }
 
 export async function saveForecastSettings(settings: ForecastSettings): Promise<void> {
-  await requirePermission('analytics')
+  // A write, and retentionMonths drives the demand-history purge: reading analytics is not enough
+  // (READONLY holds `analytics`). Same bar as creating a purchase order, the decision these settings feed.
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
+  await requirePermission('purchasing.create')
   await db.$transaction([
     db.setting.upsert({
       where: { key: 'forecast_settings' },
@@ -199,7 +204,7 @@ function exponentialSmoothing(data: number[], alpha = 0.3): number {
 // ---------------------------------------------------------------------------
 
 export async function generateForecasts(options: GenerateForecastOptions = {}): Promise<ProductForecast[]> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const settings = await getForecastSettings()
   const now = new Date()
   const reviewStart = new Date(now.getTime() - settings.reviewPeriodDays * 86400000)
@@ -424,7 +429,8 @@ export async function createReorderPOs(
   productIds: string[],
   options: { filters?: ReorderActionFilters; supplierOverrides?: Record<string, string> } = {},
 ): Promise<{ success: boolean; poCount: number; skippedSupplierCount?: number; skippedProducts?: ReorderPoSkip[]; error?: string }> {
-  await requirePermission('purchasing.create')
+  const session = await requirePermission('purchasing.create')
+  const creatorId = session.user.id
   try {
     const generatedAt = new Date().toISOString()
     const actionFilters = sanitizeReorderActionFilters(options.filters)
@@ -484,8 +490,6 @@ export async function createReorderPOs(
       })
       const priceMap = new Map(lastPrices.map((lp) => [lp.productId, Number(lp.lastUnitCost)]))
 
-      const ref = `PO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
-
       const now = new Date()
       let subtotal = 0
       const lineDates: Array<Date | null> = []
@@ -541,10 +545,16 @@ export async function createReorderPOs(
       })
       const subtotalBase = Math.round((subtotal / fxRate) * 10000) / 10000
 
-      await db.purchaseOrder.create({
+      // The reference comes from the purchase order pattern, minted in a transaction of its own, committed first (a failed create leaves a gap). A reorder order has always started from "PO-" whatever the configured prefix, so the default keeps doing that.
+      await retryWhenNumberTaken(async () => {
+      const reference = await mintCommittedDocumentNumber((run) => db.$transaction(run), 'purchase_order', { fallbackPrefix: 'PO-' })
+      return db.$transaction(async (tx) => {
+      await claimDocumentNumber(tx, 'purchase_order', reference)
+      return tx.purchaseOrder.create({
         data: {
-          reference: ref,
+          reference,
           type: 'GOODS',
+          createdById: creatorId,
           supplierId,
           currency,
           fxRateToBase: fxRate,
@@ -560,6 +570,8 @@ export async function createReorderPOs(
           expectedDelivery: earliestLineDelivery(lineDates),
           lines: { create: lineData },
         },
+      })
+      })
       })
       poCount++
     }

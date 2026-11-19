@@ -538,11 +538,19 @@ export function validatePurchaseInvoiceLineLimits(params: {
     }
   }
 
+  // The same PO line (or cost line) repeated inside ONE request counts cumulatively: each entry is checked against what earlier
+  // bills AND earlier entries of this request already take, or two entries that each fit would together bill past the cap.
+  const requestProductByLine = new Map<string, number>()
+  const requestCostByLine = new Map<string, number>()
+
   for (const line of params.lineData) {
     if (line.poLineId) {
       const poLine = params.poLineById.get(line.poLineId)
       if (!poLine) throw new Error(`Unknown PO line ${line.poLineId}`)
-      const already = alreadyProductByLine.get(line.poLineId) ?? 0
+      const alreadyBilled = alreadyProductByLine.get(line.poLineId) ?? 0
+      const earlierInRequest = requestProductByLine.get(line.poLineId) ?? 0
+      const already = alreadyBilled + earlierInRequest
+      requestProductByLine.set(line.poLineId, earlierInRequest + Number(line.qtyBilled))
       const orderedQty = Number(poLine.qty)
       // Three-way match: cap at the NET received quantity (received − returned)
       // unless the supplier is prepaid (allowBillBeforeReceipt). Goods returned
@@ -563,7 +571,7 @@ export function validatePurchaseInvoiceLineLimits(params: {
       // grandfathered quantity have to satisfy today's policy cap. Never
       // above the ordered quantity.
       const grandfathered = params.grandfatheredQtyByPoLineId?.get(line.poLineId) ?? 0
-      const effectiveCap = Math.min(orderedQty, Math.max(policyCap, already + grandfathered))
+      const effectiveCap = Math.min(orderedQty, Math.max(policyCap, alreadyBilled + grandfathered))
       if (already + line.qtyBilled > effectiveCap + 1e-6) {
         const billedSoFar = already > 0 ? ` (${already} already billed)` : ''
         const reason = (!params.allowBillBeforeReceipt && receivedKnown && effectiveCap < orderedQty)
@@ -575,7 +583,9 @@ export function validatePurchaseInvoiceLineLimits(params: {
     if (line.costLineId) {
       const costLine = params.costLineById.get(line.costLineId)
       if (!costLine) throw new Error(`Unknown cost line ${line.costLineId}`)
-      const already = alreadyCostByLine.get(line.costLineId) ?? 0
+      const earlierInRequest = requestCostByLine.get(line.costLineId) ?? 0
+      const already = (alreadyCostByLine.get(line.costLineId) ?? 0) + earlierInRequest
+      requestCostByLine.set(line.costLineId, earlierInRequest + Number(line.totalForeign))
       if (already + line.totalForeign > Number(costLine.amountForeign) + 1e-4) {
         throw new Error(`Cost line "${costLine.description}" exceeds remaining amount`)
       }

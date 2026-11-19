@@ -292,6 +292,39 @@ own_service_subdir() {
 }
 
 # ---------------------------------------------------------------------------
+# THE RECURSIVE OWNERSHIP CHANGE OVER THE APPLICATION ROOT, AIMED AT A DESCRIPTOR (o3d-kg9v)
+#
+#   chown_app_root_tree <root> <owner> <what>
+#
+# `chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"` DEREFERENCES ITS OPERAND: a link at the name
+# hands the whole of what it points at to the service account, recursively. ${LOG_DIR} and
+# ${DATA_DIR} were moved off that shape (o3d-secops r7, o3d-n8xx); the application root, which the
+# clone paths finish with, was not. There is nothing to prune in this tree, so the answer is the
+# short one: refuse a root that is not a real directory, step INTO it, prove the directory this
+# process is standing in is the entry the name had (type and dev:ino, from an lstat-style `stat`),
+# and make the change of `.` with `-h`. coreutils' chown then walks with fts and fchownat relative to
+# descriptors it holds, so no pathname below the root is resolved a second time, and the operand
+# is `.`, which cannot be a link.
+#
+# IN A SUBSHELL, because it moves the working directory; the caller's is untouched. Returns non-zero
+# (after a warning) rather than dying, so the caller states what has and has not been changed.
+chown_app_root_tree() {
+  local root="$1" owner="$2" what="$3"
+  (
+    set -e
+    entry="$(LC_ALL=C stat -c '%F|%d:%i' "${root}" 2>/dev/null)" || {
+      echo "${root} — ${what} — could not be examined, so its ownership was not changed." >&2; exit 1; }
+    [[ "${entry%%|*}" == "directory" ]] || {
+      echo "${root} — ${what} — is a ${entry%%|*}, not a directory, so its ownership was not changed: a recursive chown through it would re-own whatever it points at." >&2; exit 1; }
+    cd -P "${root}" 2>/dev/null || {
+      echo "${root} — ${what} — could not be entered, so its ownership was not changed." >&2; exit 1; }
+    [[ "$(LC_ALL=C stat -c '%d:%i' . 2>/dev/null || true)" == "${entry#*|}" ]] || {
+      echo "${root} — ${what} — is not the directory this run had just examined: it was replaced between the check and the step into it, so its ownership was not changed." >&2; exit 1; }
+    chown -Rh "${owner}:${owner}" .
+  )
+}
+
+# ---------------------------------------------------------------------------
 # A DIRECTORY A PRIVILEGED RUN MAY DUMP THE DATABASE INTO — THE WHOLE ANCESTRY, OR A REFUSAL
 # (o3d-noka, and it closes o3d-ov60 site 5)
 #

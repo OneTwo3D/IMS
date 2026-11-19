@@ -2,7 +2,7 @@ import { logActivity } from '@/lib/activity-log'
 import { db } from '@/lib/db'
 import { WC_SETTINGS_VERSION_KEY, WC_SYNC_ADVISORY_LOCK_KEY } from '../sync-lock'
 import { isWcOrderWebhookPrimaryActive, retryHeldWcSalesInvoiceReleases, runWcCancellationBackstop, syncNewWcOrders } from './order-import'
-import { isWcProductWebhookPrimaryActive, syncAllWcProducts } from './product-sync'
+import { isWcProductWebhookPrimaryActive, retryFailedWcProductPushes, syncAllWcProducts } from './product-sync'
 import { processQueuedWcStockSyncJobs } from './stock-sync-jobs'
 import { queueRefundStockCorrections } from './refund-stock-correction'
 import { pushStockToWc } from './stock-sync'
@@ -10,11 +10,26 @@ import { pushStockToWc } from './stock-sync'
 const ORDER_RECONCILE_INTERVAL_MS = 24 * 60 * 60 * 1000
 const PRODUCT_RECONCILE_INTERVAL_MS = 24 * 60 * 60 * 1000
 const STOCK_RECONCILE_INTERVAL_MS = 24 * 60 * 60 * 1000
+/**
+ * A daily cron fires at the same time each day, but the stamp it compares against is written a little BEFORE (the order and product
+ * cursors are the read-start less an overlap) or AFTER (the stock stamp is the end of the pass) the previous run's start. Compared
+ * against an exact 24 hours, a run that started seconds to minutes short of a day after the last stamp was "not due", and the next
+ * chance was a day later: an effective cadence of up to 48 hours. A run within this slack of the interval is due.
+ */
+export const RECONCILE_DUE_TOLERANCE_MS = 60 * 60 * 1000
+
+/** Whether a reconcile with this stamp (an ISO time, or nothing) is due at `nowMs`; a missing or unreadable stamp is due. */
+export function isReconcileDue(lastStamp: string | null | undefined, nowMs: number, intervalMs: number): boolean {
+  const lastTs = lastStamp ? Date.parse(lastStamp) : Number.NaN
+  return !Number.isFinite(lastTs) || (nowMs - lastTs) >= intervalMs - RECONCILE_DUE_TOLERANCE_MS
+}
 // The forceAll stock reconcile reads WooCommerce for every candidate, about 0.13 s each on the stage catalogue, while the proxy
 // in front of the app cuts a cron request at 60 s. It therefore works through the catalogue in id-ordered windows, saves the
 // cursor after each, and stops starting windows once the request has used this much of its time. The next run continues.
 const STOCK_RECONCILE_CHUNK_SIZE = 150
 const STOCK_RECONCILE_REQUEST_BUDGET_MS = 20_000
+/** The slice of that budget kept back for the product-push retry sweep: stock windows stop starting once only this much is left, so the sweep runs on every pass, including the ones that continue a multi-run reconcile. */
+const PRODUCT_PUSH_RETRY_RESERVE_MS = 3_000
 export const STOCK_RECONCILE_CURSOR_KEY = 'wc_stock_daily_reconcile_cursor'
 
 function formatCursor(afterId: string, version: string): string {
@@ -42,6 +57,10 @@ export type WcReconcileResult = {
   heldSalesInvoices?: Awaited<ReturnType<typeof retryHeldWcSalesInvoiceReleases>>
   products?: Awaited<ReturnType<typeof syncAllWcProducts>> | WcReconcileSkipped
   refundStockCorrections?: { error: string }
+  /** IMS-to-WooCommerce product pushes that failed earlier and were pushed again this pass. */
+  productPushRetries?: { retried: number; resolved: number; remaining: number; deferred: number }
+  /** The product-push retry sweep itself threw (its queue read or the shopping import), so no retry outcome is known this pass. */
+  productPushRetrySweep?: { error: string }
   stock?: {
     queued: Awaited<ReturnType<typeof processQueuedWcStockSyncJobs>>
     sync?: Awaited<ReturnType<typeof pushStockToWc>>
@@ -58,6 +77,30 @@ export type WcReconcileResult = {
   }
 }
 
+/**
+ * o3d-hqvrp.106: product pushes IMS sent WooCommerce that failed before a successful write (an error answer, a timeout) are pushed again, but
+ * only AFTER the stock queue and the stock reconcile, and only inside what is left of the request budget, so a slow store cannot starve the
+ * stock backstop or run the request past the proxy cut-off. Each retry goes through the same gate and hold as the first push.
+ */
+/** Every exit of the run goes through here, so the product-push retry sweep runs after all the stock work, whichever way that ended. */
+async function finishReconcile(results: WcReconcileResult, startedAt: number): Promise<WcReconcileResult> {
+  await retryProductPushesWithinBudget(results, startedAt)
+  return results
+}
+
+async function retryProductPushesWithinBudget(results: WcReconcileResult, startedAt: number): Promise<void> {
+  const deadlineAt = startedAt + STOCK_RECONCILE_REQUEST_BUDGET_MS
+  if (Date.now() >= deadlineAt) return
+  try {
+    const { pushProductMetadata } = await import('@/lib/shopping')
+    const retries = await retryFailedWcProductPushes(pushProductMetadata, { deadlineAt })
+    if (retries.retried > 0 || retries.deferred > 0) results.productPushRetries = retries
+  } catch (error) {
+    console.error('[wc-reconcile] retrying failed product pushes failed', error)
+    results.productPushRetrySweep = { error: error instanceof Error ? error.message : String(error) }
+  }
+}
+
 export async function runWcReconcile(): Promise<WcReconcileResult> {
   const startedAt = Date.now()
   const results: WcReconcileResult = {}
@@ -67,8 +110,7 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
     results.orders = await syncNewWcOrders({ mode: 'poll' })
   } else {
     const lastReconcile = await db.setting.findUnique({ where: { key: 'last_wc_order_reconcile_at' } })
-    const lastReconcileTs = lastReconcile?.value ? Date.parse(lastReconcile.value) : Number.NaN
-    const reconcileDue = !Number.isFinite(lastReconcileTs) || (Date.now() - lastReconcileTs) >= ORDER_RECONCILE_INTERVAL_MS
+    const reconcileDue = isReconcileDue(lastReconcile?.value, Date.now(), ORDER_RECONCILE_INTERVAL_MS)
 
     results.orders = reconcileDue
       ? await syncNewWcOrders({ mode: 'reconcile' })
@@ -107,8 +149,7 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
         results.products = await syncAllWcProducts({ mode: 'poll' })
       } else {
         const lastReconcile = await db.setting.findUnique({ where: { key: 'last_wc_product_reconcile_at' } })
-        const lastReconcileTs = lastReconcile?.value ? Date.parse(lastReconcile.value) : Number.NaN
-        const reconcileDue = !Number.isFinite(lastReconcileTs) || (Date.now() - lastReconcileTs) >= PRODUCT_RECONCILE_INTERVAL_MS
+        const reconcileDue = isReconcileDue(lastReconcile?.value, Date.now(), PRODUCT_RECONCILE_INTERVAL_MS)
 
         results.products = reconcileDue
           ? await syncAllWcProducts({ mode: 'reconcile' })
@@ -138,8 +179,7 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
     }
     const queued = await processQueuedWcStockSyncJobs({ limit: 100 })
     const lastReconcile = await db.setting.findUnique({ where: { key: 'last_wc_stock_daily_reconcile_at' } })
-    const lastReconcileTs = lastReconcile?.value ? Date.parse(lastReconcile.value) : Number.NaN
-    const reconcileDue = !Number.isFinite(lastReconcileTs) || (Date.now() - lastReconcileTs) >= STOCK_RECONCILE_INTERVAL_MS
+    const reconcileDue = isReconcileDue(lastReconcile?.value, Date.now(), STOCK_RECONCILE_INTERVAL_MS)
 
     // A pass that was cut short by the request budget carries on from its cursor on the next run, whether or not 24 hours have
     // passed: the daily stamp is only written when the pass reaches the end of the catalogue.
@@ -175,7 +215,7 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
             reconciliationDue: true,
             lastReconciledAt: lastReconcile?.value ?? null,
           }
-          return results
+          return finishReconcile(results, startedAt)
         }
         chunks++
         pushed += stock.synced
@@ -190,7 +230,7 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
               create: { key: STOCK_RECONCILE_CURSOR_KEY, value: formatCursor(cursor, settingsVersion) },
               update: { value: formatCursor(cursor, settingsVersion) },
             })
-            if (Date.now() - startedAt < STOCK_RECONCILE_REQUEST_BUDGET_MS) continue
+            if (Date.now() - startedAt < STOCK_RECONCILE_REQUEST_BUDGET_MS - PRODUCT_PUSH_RETRY_RESERVE_MS) continue
             results.stock = {
               queued,
               sync: stock,
@@ -203,7 +243,7 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
               resumeAfter: cursor,
               lastReconciledAt: lastReconcile?.value ?? null,
             }
-            return results
+            return finishReconcile(results, startedAt)
           }
         } else if (stock.aborted === true && cursor == null) {
           // Refused before any window was handled (the setting, the credentials or the warehouses). Nothing was reconciled, so
@@ -216,12 +256,12 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
             reconciliationDue: true,
             lastReconciledAt: lastReconcile?.value ?? null,
           }
-          return results
+          return finishReconcile(results, startedAt)
         } else {
           // The window was not handled: an outage or a credentials rebind cut it short, or a candidate in it did not complete
           // (a failed lookup, preflight page or push entry, a mapping that could not be saved, a duplicate external id, a kit
           // availability error). The pass is unfinished: keep the cursor, leave the stamp, and retry this window on the next
-          // run. A product that keeps failing therefore holds the pass here, so every such run says so in the activity log
+          // run. A product whose failure may clear (a failed lookup or push) therefore holds the pass here (permanent catalogue errors do not: see isPermanentWindowError), so every such run says so in the activity log
           // instead of retrying silently; the manual push remains available.
           await logActivity({
             entityType: 'SYNC', action: 'stock_reconcile_window', tag: 'sync', level: 'WARNING',
@@ -239,7 +279,7 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
             resumeAfter: cursor,
             lastReconciledAt: lastReconcile?.value ?? null,
           }
-          return results
+          return finishReconcile(results, startedAt)
         }
         // The last window handled: the pass is over. Clearing the cursor and writing the stamp are ONE commit, and only while the
         // WooCommerce settings version is still the one this pass ran against. A credentials rebind or cache reset after the last
@@ -267,7 +307,7 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
             reconciliationDue: true,
             lastReconciledAt: lastReconcile?.value ?? null,
           }
-          return results
+          return finishReconcile(results, startedAt)
         }
         results.stock = {
           queued,
@@ -288,5 +328,5 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
     }
   }
 
-  return results
+  return finishReconcile(results, startedAt)
 }

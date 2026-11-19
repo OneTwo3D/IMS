@@ -15,6 +15,16 @@
 // slice-1c conversion entry remains); o3d-2by1 owns the re-settleability authority question.
 
 export const DECLARATIONS = [
+  { key: "lib/domain/accounting/document-delete-service.ts::lateActivityOn::where-admits-synced#1", class: "GUARD",
+    reason: "o3d-ngmt.21: the unwind's re-check under the document's lock: a bill payment queued, running or synced since the delete was requested stops the unwind (the bill is paid in the ledger sense); a cancelled row is not a payment." },
+  { key: "lib/domain/accounting/document-delete-service.ts::loadDocumentDeleteCandidate::where-admits-synced#1", class: "GUARD",
+    reason: "o3d-ngmt.21: the ownership proof for a sales invoice delete. A delete is offered only when a SYNCED create row with no settlement basis (a connector confirmation, never an operator assertion) names the very document id; a shadow or asserted row proves nothing about who created the document and refuses the delete." },
+  { key: "lib/domain/accounting/document-delete-service.ts::loadDocumentDeleteCandidate::where-admits-synced#2", class: "GUARD",
+    reason: "o3d-ngmt.21: refuses a supplier bill delete when any bill payment row is queued, running or synced for the bill; a payment IMS sent (or is sending) blocks the delete, and a cancelled row is not a payment." },
+  { key: "lib/domain/accounting/document-delete-service.ts::loadDocumentDeleteCandidate::where-admits-synced#3", class: "GUARD",
+    reason: "o3d-ngmt.21: the ownership proof for a supplier bill delete, as for a sales invoice: a connector-confirmed SYNCED create row naming the bill's document id." },
+  { key: "lib/domain/accounting/document-delete-service.ts::voidDocumentEvents::ae-posted-query#1", class: "GUARD",
+    reason: "o3d-ngmt.21: voids the mirrored events that posted the deleted document, matched on the ledger's document id; every POSTED basis is voided alike because the document itself is gone, so the post basis is not read." },
   { key: "app/api/credit-note/[id]/route.ts::GET::where-excludes-cancelled#1", class: "DISPLAY",
     reason: "Chooses which credit-note sync row's PAYLOAD the credit-note PDF prints: the latest row that is not CANCELLED (a CANCELLED row, a shadow included, was never sent). It reads the payload as queued; it makes no claim about whether the ledger holds the document and sends nothing." },
   { key: "app/api/credit-note/[id]/route.ts::GET::where-admits-synced#1", class: "DISPLAY",
@@ -143,7 +153,7 @@ export const DECLARATIONS = [
     reason: "o3d-1e7sl (D9): worst-first reduction of several payment rows to the one the verdict is derived from. It carries the BASIS through (an asserted leg makes the whole aggregate asserted) and reports the missing-id case as unverifiable; the aggregate is an input to a display, not a decision about the ledger." },
   { key: "lib/domain/accounting/settlement-status.ts::aggregatePaymentSyncRows::id-read#1", class: "DISPLAY",
     reason: "o3d-1e7sl (D9): worst-first reduction of several payment rows to the one the verdict is derived from. It carries the BASIS through (an asserted leg makes the whole aggregate asserted) and reports the missing-id case as unverifiable; the aggregate is an input to a display, not a decision about the ledger." },
-  { key: "lib/domain/accounting/sync-log-attempt.ts::applyFencedAttemptDecision::where-admits-synced#1", class: "GUARD",
+  { key: "lib/domain/accounting/sync-log-attempt-decision.ts::applyFencedAttemptDecision::where-admits-synced#1", class: "GUARD",
     reason: "The attempt fence: a compare-and-swap on the status the caller OBSERVED (`status: expectedStatus`). A fence on an observed value, not a reading of what the status means." },
   { key: "lib/domain/accounting/sync-row-settlement.ts::refuseSettlement::cmp-cancelled#1", class: "PENDING_CONVERSION:o3d-2by1",
     reason: "G12: `TERMINAL_ACCOUNTING_SYNC_STATUSES.has(row.status)` is a RE-SETTLEABILITY precondition, not a ledger verdict; an orphan-swept row is \"already terminal\" too, so the row whose id nothing accounted for is also the one no operator can settle. That is an authority question recorded on o3d-2by1 and not changed here." },
@@ -163,6 +173,12 @@ export const DECLARATIONS = [
     reason: "Operator CLI: refuses to release another record's claim unless the row names an id and is in a repairable status; the dry run reads settlementBasis and refuses an operator-asserted row, and the transaction re-reads it." },
   { key: "scripts/release-accounting-external-id-claim.ts::main::cmp-synced#1", class: "GUARD",
     reason: "Operator CLI: refuses to release another record's claim unless the row names an id and is in a repairable status; the dry run reads settlementBasis and refuses an operator-asserted row, and the transaction re-reads it." },
+  { key: "lib/domain/accounting/inventory-gl-reconciliation.ts::trailingInventorySweptNet::where-admits-synced#1", class: "GUARD",
+    reason: "Sums the NET inventory rounding sweep of the trailing 30 days so a one-directional residue that recurs daily is reported as a gap instead of swept again. A FAILED or CANCELLED sweep journal never reached the ledger and is not counted; a queued, running or synced one is (it may post). It only ever withholds a further sweep; it posts nothing and changes no balance." },
+  { key: "lib/domain/accounting/subledger-journal-cross-check.ts::crossCheckSubledgerAgainstQueuedJournals::where-admits-synced#1", class: "DISPLAY",
+    reason: "Report-only diagnostic: sums the journals queued, running or synced for an account over a GL window to compare with the sub-ledger; it raises a warning finding and changes no posting or balance." },
+  { key: "lib/domain/accounting/subledger-journal-cross-check.ts::crossCheckSubledgerAgainstQueuedJournals::cmp-synced#1", class: "DISPLAY",
+    reason: "Report-only diagnostic: separates the journals that are live (queued, running or synced) from FAILED or CANCELLED ones, which it reports apart because their sub-ledger rows remain; it raises a finding and changes no posting or balance." },
 ]
 
 // The durable-shadow census (scripts/check-ledger-standing-readers.mjs, producer-side hold S3). Every use of a "may have reached the

@@ -41,6 +41,7 @@ Dates printed on PDF documents and in the emails sent with them (order date, inv
 - **The reference is the order number** you see on the order page, never an internal code. An invoice shows its **invoice number**, with the order number beside it.
 - **An invoice with no invoice number yet** is titled **Pro-forma Invoice**: it is not a VAT invoice. Once the accounting system has numbered the invoice, the stored invoice is what is served.
 - **Amounts add up.** Lines, shipping and discount are all shown on the same basis (the column headings say "incl. VAT" or "excl. VAT"), the VAT is shown, and the Total is the sum of the printed parts. The emailed PDFs use the same figures as the downloaded ones.
+- **VAT rate on every invoice line.** The IMS-rendered invoice (downloaded or emailed) has a **VAT rate** column per line. A line whose tax rate is flagged reverse charge prints "Reverse charge" there, and the invoice carries the reverse-charge wording under the totals.
 - **Names and notes in any Latin, Greek or Cyrillic script** (for example Mueller with an umlaut, a Polish name, an em dash in a note) print correctly. Chinese, Japanese, Korean and emoji are not supported and may print as empty boxes.
 - **Credit notes**: each recorded refund on the order page has a **PDF** link. Once the credit note has been sent to (or queued for) your accounting system, the PDF shows exactly the lines that were posted, and does not change if tax settings are edited later. A refund that has not been queued yet is recalculated and titled **Draft Credit Note**. Figures use the currency's own decimals (three or four for currencies such as KWD or CLF). Any rounding difference between the lines and the total is shown as its own **Rounding** row. Each line's VAT is the rate of the tax code the line was queued under, rounded per line as your accounting system does, at the four-decimal unit prices it keeps; the untaxed **Rounding adjustment** line posted with the credit note, when there is one, is its own row. A credit note queued before IMS recorded that rate (or whose tax code maps to no single rate), so its PDF is not printed: IMS says so rather than guess a VAT rate, and the credit note in your accounting system is the document of record. It works without an accounting connection; the number shows "Not yet numbered" until one is assigned.
 
@@ -63,9 +64,11 @@ A token issued on one network cannot be replayed from another, and tokens cannot
 Once invoice publication is switched on (see below), WooCommerce customers can download their invoice PDF from their Order page in the WC storefront. The flow is:
 
 1. The customer clicks "Download Invoice" on the WC order page.
-2. The WordPress helper plugin (`wc-invoice-handoff`) calls IMS with a customer-scoped token.
+2. The WordPress helper plugin (**onetwoInventory Helper**) calls IMS with a customer-scoped token.
 3. IMS verifies the WC order maps to a real IMS invoice and that the requesting customer owns it.
 4. The PDF is streamed back to the customer through the WC storefront.
+
+The **invoice e-mail** follows the same switch as My Account (`wc_invoice_document_enabled`): while it is off the e-mail attaches the invoice IMS renders itself, as it always did; once it is on, the e-mail attaches the Xero PDF IMS stored, the one the customer downloads, and an order whose stored invoice IMS cannot serve right now holds the e-mail back instead of sending a different rendering. Credit notes have their own download for the customer (never the invoice).
 
 Showing the stored invoice in the customer's **My Account** page is **not yet switched on**. The customer's Invoice button appears only on orders IMS has published, so while publication is off customers do not see it; email the invoice instead. See [WooCommerce](woocommerce.md#invoice-note-rules).
 
@@ -122,6 +125,8 @@ When you email a document (e.g. sending a purchase order to a supplier or an inv
 ### SMTP Sending
 
 Emails are sent server-side using nodemailer via your configured SMTP settings (see **Settings > Company > Email/SMTP**) rather than by opening a mailto link in your browser. The email buttons on sales orders and invoices do **not** reach SMTP themselves — they add the email to the outbox described under [The Email Queue](#the-email-queue) below, and the background job is what connects to your SMTP server. The following email functions are available:
+
+The saved SMTP password is shown masked and is only ever used with the server it was saved for. If you change the SMTP host, port, user or security, re-enter the password before sending a test email or saving.
 
 - **sendSalesOrderEmail** — queues the sales order PDF for delivery to the customer
 - **sendInvoiceEmail** — queues the invoice PDF for delivery to the customer

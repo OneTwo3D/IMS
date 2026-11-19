@@ -14,12 +14,15 @@ import {
 } from '@/lib/domain/purchasing/po-close-short'
 import {
   recalculateLandedCosts,
+  tryReadLandedCostChartBeforeTx,
+  chartOrThrow,
   queueLandedCostAdjustmentJournals,
   logLandedCostCreditFloorActivities,
   type LandedCostRecalcResult,
 } from '@/lib/domain/purchasing/landed-cost-service'
 import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import { lockLandedCostRevaluationScope } from '@/lib/domain/wms/transfer-asn-lock-order'
+import { billNetPayableBase } from '@/lib/domain/purchasing/bill-net-payable'
 import { supplierCreditNoteAmountBase } from '@/lib/domain/purchasing/supplier-credit-note-amount'
 
 const PURCHASE_ORDER_CANCELLATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -57,6 +60,8 @@ export type CancelPurchaseOrderServiceDeps = {
   queueLandedCostAdjustmentJournals: typeof queueLandedCostAdjustmentJournals
   /** o3d-nrl4 PR A: the freight-cancellation scope lock. Optional so a fake-tx unit test need not name it. */
   lockLandedCostRevaluationScope?: typeof lockLandedCostRevaluationScope
+  /** o3d-d0gog: the chart, read BEFORE the transaction (a pooled read inside it is the nested-pool shape). */
+  readAccountingChart?: typeof tryReadLandedCostChartBeforeTx
 }
 
 // Production dependencies are captured at module load; tests that need
@@ -72,6 +77,7 @@ const defaultCancelPurchaseOrderServiceDeps: CancelPurchaseOrderServiceDeps = {
   recalculateLandedCosts,
   queueLandedCostAdjustmentJournals,
   lockLandedCostRevaluationScope,
+  readAccountingChart: tryReadLandedCostChartBeforeTx,
 }
 
 async function logPurchaseOrderCancellationNoop(
@@ -116,6 +122,9 @@ export async function cancelPurchaseOrderService(
       return { success: true }
     }
 
+    // Read here, over the pool, while no transaction connection is held: the revaluation inside the transaction must not.
+    // A read failure is carried, not thrown: only the branches that revalue need the chart (see chartOrThrow).
+    const chartRead = deps.readAccountingChart ? await deps.readAccountingChart() : undefined
     const cancellation = await deps.transaction(async (tx) => {
       // audit-g5u2.4 (Codex review): lock the PO before reading the invoice/credit
       // gate state so a concurrent bill create/credit-note post can't change the
@@ -148,7 +157,9 @@ export async function cancelPurchaseOrderService(
           type: true,
           // Base-currency totals are the GL predicate; per-bill credit attribution
           // prevents a credit for one bill satisfying another (Codex review).
-          invoices: { select: { id: true, totalBase: true } },
+          currency: true,
+          // The reverse-charge lines give the NET PAYABLE the credit gate offsets against (the stored total carries VAT the bill accounts for itself).
+          invoices: { select: { id: true, totalBase: true, totalForeign: true, lines: { select: { totalForeign: true, taxRateValue: true, taxReverseCharge: true } } } },
           supplierCreditNotes: { where: { status: 'POSTED' }, select: { purchaseInvoiceId: true, amountBase: true, amountForeign: true, fxRateToBase: true } },
         },
       })
@@ -173,7 +184,7 @@ export async function cancelPurchaseOrderService(
         const invoiceGate = evaluatePurchaseOrderCancellationInvoiceGate({
           isFreight: existing.type === 'FREIGHT',
           invoices: existing.invoices.map((inv) => ({
-            totalBase: Number(inv.totalBase),
+            totalBase: billNetPayableBase(inv, existing.currency).toNumber(),
             creditedBase: creditedBaseByInvoice.get(inv.id) ?? 0,
           })),
         })
@@ -187,7 +198,7 @@ export async function cancelPurchaseOrderService(
         // apply. A live warehouse ASN refuses either way.
         const retired = await deps.retirePurchaseOrderLocked(tx, id, 'cancel', ({ keptReceivedStock }) => {
           if (!keptReceivedStock) runInvoiceGate()
-        })
+        }, chartRead)
         return { alreadyCancelled: false as const, existing, retired, landedCostRecalc: null as LandedCostRecalcResult | null }
       }
 
@@ -206,6 +217,7 @@ export async function cancelPurchaseOrderService(
         triggeredById: null,
         reason: 'freight_purchase_order_cancelled',
         scheduleAdjustmentJournals: true, // audit-grob durable backstop
+        ...(chartRead !== undefined ? { accountingSettings: chartOrThrow(chartRead) } : {}),
       })
       return { alreadyCancelled: false as const, existing, retired: null as RetireOutcome | null, landedCostRecalc }
     }, PURCHASE_ORDER_CANCELLATION_TX_OPTIONS)

@@ -53,7 +53,8 @@ test('the edit writers in customers.ts are conditional updateMany calls, never a
  */
 const ORDER_CENSUS: Record<string, { writers: number; verdict: string }> = {
   'app/actions/allocation.ts': { writers: 2, verdict: 'refuses (updateShipmentTracking: shipment + order tracking, one transaction under the order lock)' },
-  'app/actions/sales.ts': { writers: 2, verdict: 'refuses (updateSalesOrderNotes) / despatch (status transition to SHIPPED with a tracking number)' },
+  'app/actions/sales.ts': { writers: 3, verdict: 'refuses (updateSalesOrderNotes, updateSalesOrderAddressesAndNotes: both read erasedAt under the order lock) / despatch (status transition to SHIPPED with a tracking number)' },
+  'app/actions/sales-quotes.ts': { writers: 1, verdict: 'refuses (convertQuoteToOrder: reads erasedAt under the order lock before it appends the expired-quote note to the internal notes)' },
   'lib/connectors/woocommerce/sync/order-import.ts': { writers: 2, verdict: 'marker-guard (update path) / payment note row, not customer data' },
   'lib/domain/erasure/erase-personal-data.ts': { writers: 2, verdict: 'erasure' },
   'lib/domain/sales/shipment-service.ts': { writers: 3, verdict: 'despatch' },
@@ -91,14 +92,15 @@ const SYNC_LOG_CENSUS: Record<string, { writers: number; verdict: string }> = {
   'app/actions/sync-exceptions.ts': { writers: 5, verdict: 'no-identity (operator resolution: status updateMany)' },
   'lib/domain/sales/shop-refund-confirm.ts': { writers: 1, verdict: 'no-identity (marks the parked WooCommerce refund row SYNCED after an operator confirms it settles an IMS refund: status and ids only; no name, address or contact)' },
   'lib/connectors/woocommerce/sync/completion-refusal.ts': { writers: 5, verdict: 'no-identity (completion refusal record: WooCommerce order id, status, refusal kind and the fulfilment refusal message; no address, name or contact)' },
-  'lib/connectors/woocommerce/sync/order-admission.ts': { writers: 4, verdict: 'raw-woo (the refusal queue parks the raw order)' },
+  'lib/connectors/woocommerce/sync/order-admission.ts': { writers: 6, verdict: 'raw-woo (the refusal queue parks the raw order)' },
   'lib/connectors/woocommerce/sync/order-edit-drift.ts': { writers: 2, verdict: 'no-identity (WooCommerce line ids, SKUs, quantities and totals only; no address, name or contact)' },
-  'lib/connectors/woocommerce/sync/order-import.ts': { writers: 24, verdict: 'scrubbed (held sales invoice: the EU treatment and order-changed rewrites keep the parked payload as is and the release scrubs it under the order lock) / raw-woo (pending-FX queue and paid-block rows) / no-identity (status writes)' },
+  'lib/connectors/woocommerce/sync/order-import.ts': { writers: 25, verdict: 'scrubbed (held sales invoice: the EU treatment and order-changed rewrites keep the parked payload as is and the release scrubs it under the order lock) / raw-woo (pending-FX queue and paid-block rows) / no-identity (status writes, incl. the handled-by-hand close of a held release)' },
   'lib/connectors/woocommerce/sync/regime-policy-hold.ts': { writers: 2, verdict: 'scrubbed (a queued invoice parked back as a held sales invoice: the contact is scrubbed under the order lock when the order is erased)' },
   'lib/connectors/woocommerce/sync/order-status.ts': { writers: 1, verdict: 'no-identity (status push record)' },
-  'lib/connectors/woocommerce/sync/product-sync.ts': { writers: 4, verdict: 'no-identity (products)' },
+  'lib/connectors/woocommerce/sync/product-sync.ts': { writers: 7, verdict: 'no-identity (products: the product-push failure rows (product_push_retry / product_push_failed) hold only the product id, a truncated error text and retry counters and timestamps; no name, address or contact)' },
   'lib/connectors/woocommerce/sync/refund-sync.ts': { writers: 6, verdict: 'raw-woo (refund parks carry the raw refund and its free-text reason)' },
   'lib/connectors/woocommerce/sync/stock-sync.ts': { writers: 2, verdict: 'no-identity (stock)' },
+  'lib/connectors/woocommerce/sync/tracking-reconcile.ts': { writers: 1, verdict: 'raw-woo (verification mark: reconcileTrackingItems carries the order tracking numbers; same family as the outbound tracking items, same unmet raw-payload scrub obligation)' },
   'lib/connectors/woocommerce/sync/tracking-sync.ts': { writers: 4, verdict: 'raw-woo (outbound tracking items carry tracking numbers)' },
   'lib/domain/sales/refund-service.ts': { writers: 1, verdict: 'no-identity (status updateMany)' },
 }
@@ -119,7 +121,7 @@ test('every writer of shopping_sync_logs is in the census', () => {
  *   unlinks     the storefront importer, which has no operator: creates the order unlinked and records it
  *
  * There is no quote, B2B or CSV order import in this codebase: the only order creators are the three below, and the only update that
- * assigns a customer is updateSalesOrder (a DRAFT edit), which takes the same customer lock and refusal as create.
+ * assigns a customer is updateSalesOrder (a draft or confirmed-order edit), which takes the same customer lock and refusal as create.
  */
 const CUSTOMER_LINK_CENSUS: Record<string, { writers: number; verdict: string }> = {
   'app/actions/sales.ts': { writers: 3, verdict: 'refuses (createSalesOrder, updateSalesOrder, cloneSalesOrder)' },

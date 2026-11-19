@@ -1,6 +1,7 @@
 import { hasPermission, type Permission } from '@/lib/permissions'
 import { canAccessFinanceAnalytics, FINANCE_ANALYTICS_LINKS } from '@/lib/security/finance-analytics-access'
 import { canAccessManufacturingAnalytics, MANUFACTURING_ANALYTICS_LINKS } from '@/lib/security/manufacturing-analytics-access'
+import { canAccessOverviewAnalytics } from '@/lib/security/overview-analytics-access'
 import { canAccessPurchasingAnalytics, PURCHASING_ANALYTICS_LINKS } from '@/lib/security/purchasing-analytics-access'
 import { canAccessReplenishmentReports, REPLENISHMENT_REPORT_LINKS } from '@/lib/security/replenishment-report-access'
 import { canAccessSalesAnalytics, SALES_ANALYTICS_LINKS } from '@/lib/security/sales-analytics-access'
@@ -58,7 +59,7 @@ export function uniqueLinks(links: readonly SidebarLink[]): SidebarLink[] {
 export function getSidebarAnalyticsChildren(userRole: string): SidebarItem[] {
   const can = (p: Permission) => hasPermission(userRole, p)
   const sections: Array<{ heading: string; links: readonly SidebarLink[] }> = [
-    { heading: 'Overview', links: can('analytics') ? BASE_ANALYTICS_LINKS : [] },
+    { heading: 'Overview', links: can('analytics') && canAccessOverviewAnalytics(userRole) ? BASE_ANALYTICS_LINKS : [] },
     { heading: 'Stock Position', links: canAccessStockPositionReports(userRole) ? STOCK_POSITION_REPORT_LINKS : [] },
     { heading: 'Inventory Ledger', links: can('analytics.inventory_ledger') ? INVENTORY_LEDGER_REPORT_LINKS : [] },
     { heading: 'Inventory Costing', links: can('analytics.inventory_costing') ? INVENTORY_COSTING_REPORT_LINKS : [] },

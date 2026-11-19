@@ -28,7 +28,7 @@ The main purchasing page shows purchase orders in a searchable table, 50 per pag
 
 ### Line margin (internal)
 
-When you hold the **inventory.prices** permission (Admin, Manager, Finance), the PO create/edit form shows a **Margin (internal)** column and an **Order margin** summary under the lines. It is read-only: it shows you what the entered price would earn so you can reconsider the price or the sales price; it does not block, warn-and-stop or require approval, and it cannot change a sales price.
+When you hold the **inventory.prices** permission (Admin, Manager, Finance), the PO create/edit form shows a **Margin (internal)** column and an **Order margin** summary under the lines. It shows you what the entered price would earn so you can reconsider the price or the sales price. On its own it does not block anything; a minimum margin (below) can warn or block, and the sales price can be edited from the column.
 
 - **Sales price used:** the product's default list price (not the sale price), ex-VAT, in the base currency. A price stored VAT-inclusive has VAT removed using the product's sales VAT rate for the company's home country. If none is configured the line shows "—" instead of guessing.
 - **Cost used:** the unit price you entered, ex-VAT, after the line discount, per stock unit (purchase units are converted), converted to the base currency at the order's exchange rate. It is the **plain unit price, not landed cost**: freight, duty and other additional costs are not included.
@@ -36,6 +36,27 @@ When you hold the **inventory.prices** permission (Admin, Manager, Finance), the
 - **Lines without a number:** a line with no sales price, no quantity or price yet, or no exchange rate (it shows "Rate unavailable", never a rate of 1) shows "—" with the reason and is left out of the order total.
 - **Order margin:** the total margin % and amount over the lines that have a sales price, and how many lines were left out.
 - **Internal only:** the margin is never shown in the supplier portal, a quote request (RFQ) view, the PO PDF or a supplier email, and users without the permission do not see the column.
+
+### Minimum margin (warn or block)
+
+An administrator can set a minimum gross margin in **Settings > Purchasing > Minimum Margin** (see Settings). Until one is set, nothing changes. When one is set:
+
+- **Which minimum applies:** the most specific one: the product's own, then its parent product's (for a variation), then its category's (the nearest category up the tree that has one), then the global minimum.
+- **Warn mode:** a line below its minimum shows an amber "Below the N% minimum (warning)" under its margin. Saving and sending are not affected.
+- **Block mode:** the line shows a red "blocked without an override note" and the form asks for an **override note**. The server refuses to **save** the order, or to **confirm and send** it, while any line is below its minimum, unless a note of at least 5 characters is entered. The refusal names the SKUs. On a draft that is already saved, press **Confirm and send**; if it is refused a note box appears and **Confirm and send with override** places the order.
+- **The override is recorded:** an accepted override is written to the order's activity (action "margin_override") with the note, the lines and their margins, who entered it and when, in the same step as the save or send, so it cannot be saved without the record. Only someone holding **inventory.prices** can override.
+- **Unknown is never blocked:** a line whose margin is unavailable (no sales price, no price entered, no exchange rate) shows "Margin unknown: not checked" and is never warned or blocked.
+- **What is checked:** the server recomputes each line from the cost it is about to store (the same plain unit price, ex-VAT, after discount, in base currency) against the product's list price ex-VAT. It does not trust the figures on screen. A line left as it was on an order that has been received against is not re-checked; lines you add or reprice are. Imported historical orders are not assessed.
+- **Equal passes:** a margin exactly at the minimum is fine; only a lower margin is below it.
+
+### Adjusting the sales price from the margin column
+
+With **inventory.prices**, each line's margin cell has **Edit sales price**. Enter the new **ex-VAT** list price (the "sells" figure) and save:
+
+- It changes that product's default list price through the normal product update, and the activity log records the old and new price and who changed it. The shop (WooCommerce) and the warehouse (Mintsoft) only receive it through the normal product sync, never directly from this screen; if that sync is not ready the price is still saved and the sync retries.
+- A product that stores its price VAT-inclusive keeps doing so: the ex-VAT price you enter is converted with the product's sales VAT rate. If no rate is configured the edit is refused.
+- A variation is priced on its own; the parent and the other variations are not touched. A variable parent product has no price of its own, so it cannot be edited here: set the price on its variations.
+- The margin is recomputed from the new price straight away.
 
 ### FX rate
 
@@ -68,7 +89,7 @@ Purchase orders use the canonical purchase workflow documented in `docs/workflow
 | **Draft** | The PO has been created but not yet sent. Everything can still be edited. |
 | **RFQ Sent** | A request for quotation has been sent to the supplier. |
 | **Quote Received** | A supplier quote has been received and can be converted to a purchase order. |
-| **PO Sent** | The purchase order has been confirmed. When emailing POs is switched on (off by default), **Confirm & Send PO** also queues an email with the PO PDF to the supplier's email address (see [PO PDF](#po-pdf)). |
+| **PO Sent** | The purchase order has been confirmed (an order at or above the approval threshold must first be [approved](#purchase-order-approval)). When emailing POs is switched on (off by default), **Confirm & Send PO** also queues an email with the PO PDF to the supplier's email address (see [PO PDF](#po-pdf)). |
 | **Shipped** | The supplier has shipped the goods. |
 | **Partially Received** | Some lines have been received but the PO is not yet complete. |
 | **Received** | Every line has landed in stock. A line counts as **landed** when its goods have arrived by any route: a manual receipt, a warehouse (WMS) book-in, or a warehouse stock-sync alignment that raised stock without a receipt on the line. An order the warehouse accounted for entirely therefore becomes Received without a manual receipt. |
@@ -79,6 +100,19 @@ Purchase orders use the canonical purchase workflow documented in `docs/workflow
 | **Cancelled** | The PO was cancelled before anything was received. |
 
 
+## Purchase Order Approval
+
+An optional gate on large orders. It is **off by default**: until an administrator sets a threshold, nothing about sending a purchase order changes.
+
+- **Turning it on.** Set **Settings > Company > Documents > Purchase order approval threshold** to an amount in your base currency. Blank or 0 means no approval is ever needed.
+- **Which orders.** A **goods** purchase order whose total, **excluding VAT** and in base currency, is **at or above** the threshold. An order exactly at the threshold needs approval. Freight orders are not gated.
+- **What it blocks.** Until the order is approved it cannot be moved to **PO Sent** (including **Confirm & Send PO**), and the PO email cannot be sent or re-sent (**Email PO**). The page says "This purchase order needs approval before it can be sent to the supplier." Drafts, RFQs and quotes are not blocked.
+- **Awaiting approval.** An order that needs approval and does not have it shows an **Awaiting approval** badge on the list and on the order.
+- **Approving.** A user with the **purchase approval** permission (`purchasing.approve`: **Administrators** and **Managers** by default) sees an **Approve** button on the order. Approving is a separate action from sending. **You cannot approve an order you created**; another approver has to. (An order whose creator is not recorded, such as one imported before this feature, is refused with "The creator of this purchase order is not recorded": open it, **Edit** and **Save** once, which records you as its maker, and then another approver can approve it.) The order shows who approved it and when, and the activity log records the approval.
+- **Finance, Warehouse and Read-only users** do not hold the permission: they can still create and edit orders, but cannot approve them.
+- **When an approval stops counting.** Editing an approved order so that its total (ex VAT, base currency) **rises**, or changing its **supplier** or **currency**, clears the approval and the order is **Awaiting approval** again. A new quote entered by the supplier in the supplier portal does the same. Lowering the total keeps the approval. Approval is checked again at the moment of sending, so an order that no longer matches what was approved is refused even if something else changed it.
+- **Already-sent orders.** Lowering the threshold or raising an order's total after it was sent does not recall the order, but **Email PO** on it is refused until it is approved.
+
 ## Delivery dates per line
 
 An order has one **Expected Delivery** date, but a supplier sometimes ships one order in two or three batches. Each line can carry its **own** expected delivery date, so you do not have to split the order.
@@ -88,8 +122,17 @@ An order has one **Expected Delivery** date, but a supplier sometimes ships one 
 - Receiving goods, in full or in part, never changes a line's date.
 - The **Reorder** report's inbound arrival date uses the effective date, so a product arriving in a later batch is no longer shown as arriving with the earliest line of the order. The **Open purchase orders** report shows the earliest effective date of the lines still to come.
 - The **PO PDF** (and so the emailed PO) adds a **Delivery** column when at least one line's date differs from the order's. Lines that follow the order's date show a dash there.
+- **Storefront back-in-stock date.** When the WooCommerce setting *Include estimated back-in-stock date* is on, an out-of-stock product's customer-facing date is the earliest of these dates over its sent, shipped or part-received orders, with an open warehouse ASN's expected arrival taking the place of the order date where it has one. A date that is already in the past is never shown to customers, so a supplier who has slipped makes the product show no date until the expected delivery (or the ASN eta) is updated to a future day: keep the Expected dates current. An order with no date shows none. See the WooCommerce help.
 - The purchase order CSV export and import have a **lineExpectedDelivery** column (YYYY-MM-DD, blank = follows the order's date), so a round trip keeps the line dates.
 - A line's date can be changed on any order that can still be edited, including one that has been part-received.
+
+## Notes on lines
+
+Each purchase order line can carry a short **internal note** (colourway, substitute accepted, chase this one). On the PO form click the notepad icon under the product to open a text field; the note is saved with the order. On the PO page the note shows under the product, and with the Purchasing permission the notepad opens the same field and **Save note** stores it, on any status, including a part-received order.
+
+- **Notes are internal: they are never printed on the PO PDF and never sent in the supplier email**, and they do not appear in the supplier portal. The order's own **Notes** field is the one that goes to the supplier. To tell the supplier something about one line, put it in the order Notes or in the line's **Description**, which does print on the PO.
+- A note is up to 2,000 characters. Clearing the text removes it.
+- Editing an order from an older screen that does not send notes keeps the stored notes.
 
 ### Barcode and Supplier SKU on the order lines
 
@@ -138,6 +181,17 @@ The **PO PDF** button on any purchase order opens the priced purchase order: sup
 - **A PO email is never sent twice automatically.** If the mail server had already been handed the message when the connection dropped or the 60-second send limit ran out, nobody can tell whether the supplier received it. The email ends **Failed** in the email queue with "Outcome unknown", and the order's activity shows a warning. Nothing is retried: check with the supplier, then click **Email PO** to send it again if needed. A failure before the message was handed over (the mail server could not be reached, or login failed) is retried automatically as before.
 
 
+## Attachments
+
+Every purchase order page has an **Attachments** card under the order, for the supporting documents that belong to it: supplier quotes, proformas, packing lists, delivery notes, certificates and emails. They live against the order instead of in someone's inbox.
+
+- **Upload** -- Anyone who can create or receive purchase orders (administrators, managers, finance and warehouse users) sees an **Upload** button. Accepted: PDF, images (PNG, JPEG, GIF, WebP), CSV, Excel (.xlsx), Word (.docx) and email (.eml, .msg), up to **20 MB** each. IMS checks what is *inside* the file, not just its name: a file whose content does not match its type, an executable, a web page or an SVG is refused with the reason.
+- **Download** -- Anyone who can view purchase orders (read-only users included) sees the list with each file's size, date and uploader, and a **Download** button. A file always downloads; it is never opened in the browser.
+- **Delete** -- The **Delete** button asks you to confirm. A deleted attachment disappears from the list and can no longer be downloaded. The file is kept on the server and the row is only marked deleted, so an administrator can still recover it; it is not shown again in IMS.
+- Attachments belong to one order. They are **not** copied to a supplier's bill in Xero: the accounting connector never sends them (see [Xero Accounting Sync](xero-sync.md)). Supplier logins do not see them.
+- Uploading and deleting are recorded in the order's activity log (who and when, never the file name).
+- **Backups:** the files are stored in the server's upload folder (`UPLOAD_STORAGE_DIR`, under `order-attachments`), **not** in the database. A database backup does not contain them. Make sure that folder is in your file backup, restored together with the database. See [Backup & Restore](backup-restore.md).
+
 ## Receiving a Purchase Order
 
 When goods arrive, open the PO and click **Receive Goods**. You can receive all lines at once or partially receive individual lines. You cannot receive more than the line's ordered quantity less what has already landed (including anything the warehouse has booked in or aligned).
@@ -158,6 +212,10 @@ When stock is received:
 
 The unit cost is validated as finite and non-negative before stock movements are written. A landed-cost recalculation that produces a NaN or infinite cost is rejected at the receipt boundary, before any stock or cost layer is created.
 
+
+### Sales orders pegged to this purchase order
+
+When a sales order line has been **pegged** to a line of this purchase order (from the sales order page, see **Pegging an order to a purchase order** in the Sales Orders guide), a **Pegged sales orders** panel on the purchase order lists each pegged order, its customer, the pegged quantity, and how much of it has been received and allocated so far. When stock is received on the line, by hand, by a warehouse ASN alignment or by a warehouse book-in, it is allocated to the pegged orders first (oldest peg first); any remainder is allocated to the oldest waiting order as usual. Receiving needs no extra step. Cancelling or closing the purchase order, or receiving the line without covering a peg, ends the peg and records why in the activity log; removing a line from an amended order records the same. Saving a purchase order that has not been received or billed keeps the pegs on the lines you keep (same product, quantity still covering the peg); a peg on a line you remove or cut below the pegged quantity ends and is recorded. Pegs are IMS-internal and send nothing anywhere.
 
 ## Closing and Cancelling a Purchase Order
 
@@ -186,6 +244,8 @@ If the supplier was billed for more than was received (a prepaid supplier), clos
 ### Warehouse ASNs
 
 An order whose lines have an **open warehouse ASN** (being created, open, partly booked in, or booked in but not yet reconciled) cannot be closed or cancelled. The message names the SKUs and ASN numbers. Book the goods in through the ASN (**Recheck booked-in**) or retire the ASN first, then close the order. This keeps the warehouse from receiving goods against an order that no longer expects them. Warehouse (Mintsoft) ASN handling is described in [Warehouse (Mintsoft)](warehouse.md).
+
+If the close or cancel is refused because stock the warehouse sync brought in is "not yet booked into this order" and the ASN has already been retired, **Recheck booked-in** has nothing to re-drive. Press **Reconcile warehouse receipt** in the close dialog: it folds that stock into the order's received quantity so it can be returned and the order closed. It adds no stock, cost or accounting entry (the warehouse sync already did), and is refused while the order still has an open ASN.
 
 ### Idempotent cancellation
 
@@ -229,6 +289,36 @@ quantity remains a hard cap either way.
 Note: if a prepaid PO is later received short (paid 100, received 90), the over-paid delta is not
 yet flagged automatically — reconcile manually until the prepaid reconciliation alert ships.
 
+### Which orders can be billed
+
+A bill can be created against an order that has been placed with the supplier: **PO Sent**, **Shipped**,
+**Partially Received**, **Received**, **Invoiced**, **Partially Returned**, **Returned** and **Closed**.
+A **Draft**, **RFQ Sent** or **Quote Received** order has not been placed, and a **Cancelled** order has been
+retired, so none of them can be billed (the server refuses it, not only the button). **Closed** stays billable
+on purpose: closing a part-received order keeps the goods that arrived, and the supplier's invoice for them often
+arrives after the close. The received-quantity cap still applies, so only received, un-returned, not-yet-billed
+goods and unbilled cost lines can be billed.
+
+Repeating the same line twice in one bill counts both entries against the cap, the same as two separate bills.
+
+### Duplicate supplier invoice numbers
+
+A bill is refused when the same supplier already has a bill with the same **Invoice number** (compared
+ignoring case and surrounding spaces, across all of that supplier's orders). The message names the order the
+existing bill is on. If it really is a second bill under that number, confirm the prompt to create it anyway.
+A bill with no invoice number is never checked. Editing an existing bill's number is not checked.
+
+### GR/IR: goods received, not yet billed
+
+Every receipt, bill, bill edit, supplier return and return-generated supplier credit note also writes a row in IMS's **GR/IR sub-ledger**, in the same step as the event itself, so a receipt is never recorded without its accrual and a failed receipt leaves none:
+
+- **Receiving goods** raises GR/IR by the received quantity at the purchase order's unit cost (the goods part of the value the stock layer carries; freight is not included).
+- **Billing** lowers it by the billed quantity at the **same purchase-order unit cost**. If the supplier charges a different price, the difference is recorded as its own **price difference** and never touches the GR/IR balance; it stays on Stock in Transit as it always has, and is shown per order in **Analytics > GR/IR**.
+- **Editing a bill** moves it by the change in the billed quantity.
+- **A supplier return** lowers it by the returned quantity at the order's unit cost. If those goods were already billed, the order shows as billed-not-received until the return-generated supplier credit note is posted. The credit note clears it at the same order unit cost as the return (per line, for the quantity billed and returned), so a returned-and-credited line nets to zero whatever price the bill carried; the difference between the credit and that value is a price-difference reversal, not GR/IR.
+
+Receiving and billing the same quantity nets to zero whichever comes first. Nothing here is posted to Xero unless **GR/IR accrual posting** is switched on (Settings > Accounting > Xero; see Xero Accounting Sync). Stage can load an opening balance for goods received before the sub-ledger existed (it fills the gap between what the order lines say and what the sub-ledger already holds, so a line billed after deployment is completed too) with `npm run grir:opening-balance -- --dry-run` (then without `--dry-run`); production gets none.
+
 ### Editing an unpaid bill
 
 Unpaid bills can be edited from the PO detail page. Headers (number, dates, notes, supplier
@@ -261,6 +351,10 @@ message. See the Xero sync docs for retry semantics.
 Paid bills cannot be edited. Reverse the payment first if a correction is required.
 
 
+### Deleting a bill that has synced to Xero
+
+When the setting **Allow deleting synced invoices and bills** is on (**Integrations → Xero**; it is off by default), a bill that IMS itself created in Xero shows a **Delete bill** button on the purchase order page for people who can edit bills. It renames the Xero bill with a random `-DEL-` suffix so the original supplier number is free, then deletes (draft or submitted) or voids (authorised, unpaid) it. When Xero confirms, the bill and its lines are removed from IMS, the purchase order is no longer marked as invoiced if no other bill remains, and the Stock in Transit movement the bill recorded is reversed. A paid bill, a bill with supplier credit notes, one dated in a locked period, or one created by another system (for example Qoblex) is refused with the reason shown. See [Xero sync](xero-sync.md) for the full rules.
+
 ### Supplier credit notes
 
 The **Supplier credit notes** card at the bottom of a PO that has a bill lists every credit note recorded against the order, each marked **DRAFT** or **POSTED**.
@@ -268,6 +362,7 @@ The **Supplier credit notes** card at the bottom of a PO that has a bill lists e
 - **Automatic draft on a return.** Returning goods that were already billed (**Return Items**) raises a **DRAFT** supplier credit note for the over-billed value. Repeated returns top the credit up to the over-billed total; they never credit the same goods twice. A banner at the top of the PO says how many units are billed but were returned and reminds you to review the draft.
 - **Record one by hand.** Click **Record credit note** (shown once the order has a bill), enter the amount in the order's currency, optionally the supplier's credit note number and a reason, and click **Record (draft)**. The amount cannot exceed what is left to credit on the bill.
 - **Post it.** Click **Post** on a draft. When the accounting connector is Xero and syncing is on, the credit note is queued to Xero as a supplier credit note and allocated against the bill it offsets; it is converted to your base currency at the bill's exchange rate (see the credit-note conversion note under [Landed Cost Distribution](#landed-cost-distribution)). If the accounting connector has changed since the credit note was prepared, it stays a draft with an explanation and you post it again once the connector selection has settled. Posting needs the invoicing permission.
+- **Bills with reverse-charge lines.** A reverse-charge line is shown on the bill with the VAT the bill accounts for itself, so the bill total (for example 120 for a line of 100 at 20%) is more than you owe the supplier (100). A credit against such a bill is limited to what is owed to the supplier, counting credit notes already recorded against it; a larger amount is refused when you record it, or when you post an older draft, with the figure that is still creditable. Posting sends Xero one net line per bill line, each on the same VAT code the bill used (so Xero accounts for the VAT in the same way), allocates that same amount to the bill, and takes the same net out of the stock-in-transit clearing account. This also works for a bill that mixes reverse-charge and standard lines: the amount is shared across the lines in proportion to what each owes the supplier, and crediting the full amount reproduces every line of the bill. A bill that mixes other VAT treatments (for example taxable and exempt lines) is still refused for a single credit. **Net payable.** IMS keeps the bill's stored VAT and total (the VAT return needs them), and works out beside them a *net payable*: the stored total less the VAT of the reverse-charge lines (100 on the example above). Everything that asks how much is owed on the bill uses the net payable, not the stored total: the amount Mark as paid offers by default (the Mark Bill as Paid dialog and the bill row show the net payable as the amount, with the bill total as secondary text), the AP aging report and the FX gain/loss report, the bill's paid or part-paid status against the ledger payment, the open supplier balance used by the unrealised exchange-rate revaluation, the check on cancelling a freight order whose bills must be offset by credit notes, and the draft credit note raised for goods returned to a supplier (grossed up to, and limited to, the net payable). A bill with no reverse-charge line has a net payable equal to its total.
 - A posted credit note that fully offsets the bill is what lets you cancel an invoiced freight PO.
 
 A supplier return on a part-received order does not change the order's status while quantity is still due (see [Purchase Returns](#purchase-returns)).
@@ -424,6 +519,14 @@ From **Analytics > Reorder Planning** (the standalone Reorder Forecast page has 
 
 Lifecycle exclusions apply: only Draft and Active products are planned. EOL and Archived products are skipped.
 
+
+### Tagging your shipping estimate
+
+On a purchase order's **Additional costs**, each cost line has a **Shipping** tick. Tick it on the line that is your own estimate of the shipping. It changes nothing on its own: the line is distributed as landed cost like any other, and lines that existed before the tick was added stay untagged.
+
+A setting for supplier-quoted shipping (**supplier_quote_shipping_landed_enabled**) is **off by default**, so by default a supplier's quote does not touch your cost lines. Once an administrator turns it on, shipping the supplier quotes on a requote becomes a **Supplier quoted shipping** cost line (it is landed and can be billed), and it **replaces** the line you ticked as Shipping, so shipping is counted once. Lines you did not tick are never replaced, whatever they are called. A later requote replaces the previous supplier-quoted line. If you ticked no line, the supplier's shipping is added.
+
+If your Shipping line has **already been billed**, or goods have **already been received** against the order, it is not replaced. Both lines stay on the order and a warning, "supplier_quote_shipping_replace_refused", is written to the order's activity log explaining why, so you can correct one by hand.
 
 ## Supplier Portal
 

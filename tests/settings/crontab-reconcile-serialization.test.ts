@@ -2380,6 +2380,26 @@ test('[o3d-batch-ret] the openability decision is not made from mode BITS, on ei
     'NO)  return 1 ;;',
     '*)   return 2 ;;',
   ], `the probe's decisions must be exactly these: ${decisions.join(' / ')}`)
+  // THE DECISION HAS TWO HALVES (o3d-1q31y): app_user_can_open ASKS; ensure_app_user_can_open_lock
+  // INTERPRETS, repairs and re-asks. The same absence rules are applied to the second half, because
+  // a bits shortcut inserted there reintroduces the round-2 HIGH past the probe's rules. A third
+  // function added to the decision must be added to DECISION_FUNCTIONS, and the roster below pins it.
+  const DECISION_FUNCTIONS = ['app_user_can_open', 'ensure_app_user_can_open_lock']
+  const definedHere = CRONTAB_LOCK_LIB_SRC.split('\n').map((l) => l.trim())
+    .filter((l) => /^\w*can_open\w*\(\) \{$/.test(l))
+    .map((l) => l.replace('() {', '')).sort()
+  assert.deepEqual(definedHere, [...DECISION_FUNCTIONS].sort(),
+    'every *can_open* function in the library is part of the openability decision and must be covered')
+  const interpreter = withoutCommentsOrMessages(installerPreparer('ensure_app_user_can_open_lock'))
+  assert.doesNotMatch(interpreter, /\bstat\b/,
+    'the interpreting half must not decide openability from a mode either (o3d-1q31y)')
+  assert.doesNotMatch(interpreter, /8#/, 'nor from octal arithmetic')
+  const interpDecisions = interpreter.split('\n').map((l) => l.trim())
+    .filter((l) => /return 0|return 1/.test(l))
+  assert.deepEqual(interpDecisions, ['return 0', 'return 1', 'return 1', 'return 0', 'return 1'],
+    `the interpreting half's decisions must be exactly these: ${interpDecisions.join(' / ')}`)
+  assert.match(`${interpreter}\nbits="$(stat -c '%a' "${'${path}'}")"`, /\bstat\b/,
+    'the stat rule must still catch the mutant the reviewer reintroduced')
   // NOT VACUOUS, both ways: the stat rule fires on the bits form appended to the same body, and the
   // roster fires on a route added beside the two that are allowed.
   assert.match(`${probe}\nfile_mode="$(LC_ALL=C stat -c '%a' "${'${path}'}")"`, /\bstat\b/,

@@ -195,11 +195,6 @@ const ALLOWED: Array<{ file: string; match: string; reason: string }> = [
     match: '--password "${PASSWORD}"',
     reason: '`pct create --password` has no stdin/env form; it runs on the Proxmox host (an operator-run tenant provisioning tool, not the installer) inside an ssh script whose only readers are that host\'s own administrators. Not changed.',
   },
-  {
-    file: 'scripts/backup.sh',
-    match: 'pg_dump "${DATABASE_URL}"',
-    reason: 'unwired legacy helper (docs/installation.md: "scripts/backup.sh is NOT covered by any of this"; nothing schedules it; a regression pins its paths). Wiring it needs its own rule first; the argv form is recorded here so that wiring it re-opens this entry.',
-  },
 ]
 
 test('[o3d-kb3dq] CENSUS: every shell script under scripts/ -- no secret reaches a command line except the listed sites', () => {

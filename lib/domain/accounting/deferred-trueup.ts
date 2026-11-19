@@ -32,6 +32,7 @@ import {
   workSlotStanding,
   type LedgerStandingRow,
 } from '@/lib/domain/accounting/ledger-standing'
+import { journalNetsReadable, unearnedReversalDebit } from '@/lib/domain/accounting/journal-account-nets'
 import type { Prisma } from '@/app/generated/prisma/client'
 
 function round2(value: number): number {
@@ -49,20 +50,61 @@ function round2(value: number): number {
  * the credit note actually took out of unearned revenue).
  */
 export function sumPostedUnearnedReversal(
-  reversalSyncs: Array<{ payload: unknown }>,
+  reversalSyncs: Array<{ payload: unknown; payloadAccountNets?: unknown }>,
   unearnedRevenueAccount: string,
 ): number {
   let total = 0
   for (const sync of reversalSyncs) {
-    const lines = (sync.payload as { lines?: Array<{ accountCode?: string; debit?: number }> } | null)?.lines
-    if (!Array.isArray(lines)) continue
-    for (const line of lines) {
-      if (line.accountCode === unearnedRevenueAccount) {
-        total += Number(line.debit ?? 0)
-      }
-    }
+    // o3d-oyur (Codex r2 HIGH): the lines, or once compaction dropped them the preserved per-account net. A row with neither is
+    // UNKNOWN, not zero: it adds nothing here and the caller MUST withhold the true-up (see `unreadableUnearnedReversalRows`).
+    const debit = unearnedReversalDebit(sync, unearnedRevenueAccount)
+    if (debit != null) total += debit
   }
   return round2(total)
+}
+
+/**
+ * o3d-fk9py: the unearned revenue earlier refunds took that the readable sync rows no longer show.
+ *
+ * `sumPostedUnearnedReversal` rests on sync rows that `retention_sync_logs_months` hard-deletes. Each refund also stores the
+ * figure durably (`SalesOrderRefund.unearnedReversedAmount`, never deleted). For every refund that recorded one, this returns
+ * how much MORE the column says than that refund's still-readable rows sum to (never negative), so
+ * `sumPostedUnearnedReversal + durableUnearnedReversalTopUp` is the larger of the two sources per refund and a row that is still
+ * readable is never counted twice. A NULL column (written before it existed) adds nothing: the figure is unknown, not zero.
+ * Mirrors the remainder sweep in refund-service.
+ */
+export function durableUnearnedReversalTopUp(
+  reversalSyncs: Array<{ payload: unknown; payloadAccountNets?: unknown; refundId?: string | null }>,
+  refunds: Array<{ id: string; unearnedReversedAmount: unknown; accountingRetryRequired?: boolean | null; shadowed?: boolean }>,
+  unearnedRevenueAccount: string,
+): number {
+  let total = 0
+  for (const refund of refunds) {
+    if (refund.unearnedReversedAmount == null) continue
+    // A column is a STAGING figure: it is written before anything is queued. With no counted row for the refund it is proved only by
+    // retention having erased the row, which is not the case while the refund still owes its accounting (nothing was queued) or its
+    // journal was only shadowed (never sent). Counting it there would net a reversal that never reaches Xero (refund-service refuses
+    // the same two states on its relief path).
+    const hasRows = reversalSyncs.some((sync) => sync.refundId === refund.id)
+    if (!hasRows && (refund.accountingRetryRequired || refund.shadowed)) continue
+    const durable = Number(refund.unearnedReversedAmount)
+    if (!Number.isFinite(durable)) continue
+    const rowsTotal = sumPostedUnearnedReversal(
+      reversalSyncs.filter((sync) => sync.refundId === refund.id),
+      unearnedRevenueAccount,
+    )
+    total += Math.max(0, durable - rowsTotal)
+  }
+  return round2(total)
+}
+
+/**
+ * The counted reversal rows whose unearned-revenue movement cannot be read (no `lines` and no valid compaction summary: a legacy
+ * compacted row). `sumPostedUnearnedReversal` cannot net them, so a true-up that recognises the remaining deferral must not run while
+ * any exist, or it debits Unearned Revenue for an amount a refund already reversed.
+ */
+export function unreadableUnearnedReversalRows<T extends { payload: unknown; payloadAccountNets?: unknown }>(reversalSyncs: T[]): T[] {
+  return reversalSyncs.filter((sync) => !journalNetsReadable(sync))
 }
 
 /**
@@ -146,6 +188,7 @@ export type UnearnedReversalSyncRow = LedgerStandingRow & {
   referenceType: string
   referenceId: string
   payload: unknown
+  payloadAccountNets?: unknown
 }
 
 /** The rows the netting COUNTS: exactly the PENDING / PROCESSING / SYNCED set it always summed. */

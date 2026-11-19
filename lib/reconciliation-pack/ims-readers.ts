@@ -210,7 +210,7 @@ export const TRANSIT_SOURCE_DOCUMENTS: ReadonlyArray<{ kind: string; sourceTypes
   { kind: 'subledger-rows', sourceTypes: 'every type (the ledger itself)', sql: `SELECT count(*)::text AS n FROM transit_subledger_movements WHERE journal_date < $1::date` },
   { kind: 'sync-log-reversals', sourceTypes: 'CUSTOMER_RETURN_IN_TRANSIT (additional signal; the table is pruned by retention)', sql: `SELECT count(*)::text AS n FROM accounting_sync_logs WHERE type::text = 'COGS_REVERSAL' AND payload->>'_returnInTransit' = 'true' AND "createdAt" < ($1::date + 1)` },
 ]
-export type ImsTransitSchedule = { asOf: string; coverageStart: string | null; preWatermark: TransitPreWatermark; net: TransitNetRow[]; customerReturns: string; orders: TransitOrderRow[]; openOrders: TransitOrderRow[] }
+export type ImsTransitSchedule = { asOf: string; coverageStart: string | null; preWatermark: TransitPreWatermark; net: TransitNetRow[]; customerReturns: string; /** The GR/IR reclass leg (GRIR_RECLASS): the daily batch's journals between Stock in Transit and GR/IR, which belong to no order. '0' while GR/IR posting is off. */ grirReclass: string; orders: TransitOrderRow[]; openOrders: TransitOrderRow[] }
 
 /**
  * R16, the IMS side of "what did IMS post": every connector-confirmed Xero create (SYNCED, a Xero document id, no operator assertion standing in for the
@@ -714,15 +714,21 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     }
     const known = TRANSIT_SOURCE_TYPES.map((entry) => entry.type)
     // Each row's order by its recorded source (see ImsTransitSchedule). A row with no order that is not the refund leg stays null and is refused below.
-    const grouped = await readCapped(tx, `SELECT g.po_id, g.source_type, SUM(g.base_delta)::text AS net FROM (SELECT m.source_type, m.base_delta, CASE m.source_type WHEN 'SUPPLIER_RETURN' THEN (SELECT r."poId" FROM purchase_returns r WHERE r.id = m.source_ref) WHEN 'SUPPLIER_CREDIT_NOTE' THEN (SELECT c."poId" FROM supplier_credit_notes c WHERE c.id = m.source_ref) WHEN 'CUSTOMER_RETURN_IN_TRANSIT' THEN NULL ELSE m.source_ref END AS po_id FROM transit_subledger_movements m WHERE m.journal_date <= $1::date) g GROUP BY g.po_id, g.source_type ORDER BY g.po_id NULLS FIRST, g.source_type`, [asOf])
+    const grouped = await readCapped(tx, `SELECT g.po_id, g.source_type, SUM(g.base_delta)::text AS net FROM (SELECT m.source_type, m.base_delta, CASE m.source_type WHEN 'SUPPLIER_RETURN' THEN (SELECT r."poId" FROM purchase_returns r WHERE r.id = m.source_ref) WHEN 'SUPPLIER_CREDIT_NOTE' THEN (SELECT c."poId" FROM supplier_credit_notes c WHERE c.id = m.source_ref) WHEN 'CUSTOMER_RETURN_IN_TRANSIT' THEN NULL WHEN 'GRIR_RECLASS' THEN NULL ELSE m.source_ref END AS po_id FROM transit_subledger_movements m WHERE m.journal_date <= $1::date) g GROUP BY g.po_id, g.source_type ORDER BY g.po_id NULLS FIRST, g.source_type`, [asOf])
     const net: TransitNetRow[] = []
     let customerReturns = '0'
+    let grirReclass = '0'
     for (const row of grouped) {
       const sourceType = oneOf(row.source_type, known)
       const amount = decimal(row.net)
       if (sourceType === 'CUSTOMER_RETURN_IN_TRANSIT') {
         if (row.po_id !== null) throw new Unreadable('SOURCE_UNREADABLE')
         customerReturns = amount
+        continue
+      }
+      if (sourceType === 'GRIR_RECLASS') {
+        if (row.po_id !== null) throw new Unreadable('SOURCE_UNREADABLE')
+        grirReclass = amount
         continue
       }
       if (row.po_id === null) throw new Unreadable('BAD_KEY')
@@ -745,7 +751,7 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     }
     const preWatermark: TransitPreWatermark = {}
     for (const document of TRANSIT_SOURCE_DOCUMENTS) preWatermark[document.kind] = await pre(document.sql)
-    return { asOf, coverageStart, preWatermark, net, customerReturns, orders, openOrders }
+    return { asOf, coverageStart, preWatermark, net, customerReturns, grirReclass, orders, openOrders }
   },
 }
 
@@ -753,6 +759,7 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
 export const TRANSIT_SOURCE_TYPES: ReadonlyArray<{ type: string }> = [
   { type: 'PURCHASE_BILL' }, { type: 'PURCHASE_BILL_UPDATE' }, { type: 'SUPPLIER_CREDIT_NOTE' }, { type: 'STOCK_RECEIPT' }, { type: 'LANDED_COST_RECLASS' },
   { type: 'LANDED_COST_CONSUMED_OFFSET' }, { type: 'PURCHASE_ORDER_CANCEL' }, { type: 'SUPPLIER_RETURN' }, { type: 'CUSTOMER_RETURN_IN_TRANSIT' },
+  { type: 'GRIR_RECLASS' },
 ]
 
 /**

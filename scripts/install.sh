@@ -2510,9 +2510,9 @@ compose_database_url() {
 #
 # THE SET, MEASURED AND NOT LOOKED UP. `process.env` was replaced with a recording Proxy and a
 # ConnectionParameters built from exactly the URL compose_database_url() emits, against the
-# installed pg 8.20.0 and pg-connection-string 2.12.0. The driver consults these and no others:
+# installed pg 8.23.1 (pg-connection-string reads no variables itself). The driver consults these and no others:
 #
-#   PGSSLMODE                                       the SSL layer
+#   PGSSLMODE  PGSSLNEGOTIATION                     the SSL layer
 #   PGREPLICATION  PGOPTIONS                        the startup packet
 #   PGAPPNAME  PGBINARY  PGCLIENT_ENCODING  PGCONNECT_TIMEOUT
 #   NODE_PG_FORCE_NATIVE                            read at module load, `pg/lib/index.js:41`
@@ -2536,6 +2536,15 @@ compose_database_url() {
 #
 # The rest are read AFTER the record has been matched and move nothing: PGOPTIONS, PGAPPNAME,
 # PGBINARY, PGCLIENT_ENCODING, PGCONNECT_TIMEOUT. They are named here and deliberately not refused.
+#
+# PGSSLNEGOTIATION (new in pg 8.23, `connection-parameters.js:104`) is classified with them, and
+# the reason is read from the driver and not assumed: it only chooses HOW the TLS handshake starts
+# ('postgres' = SSLRequest then TLS, 'direct' = TLS from the first byte). Any other value throws,
+# and 'direct' with SSL not enabled by the URL throws too ("requires SSL to be enabled"), so it
+# can neither turn TLS on where the URL turned it off nor turn it off. A hostssl record answers
+# either way. It can only make a connection FAIL (direct TLS against a pre-17 server), loudly and
+# before any credential is sent, which is not a way to authenticate against a different record.
+# Named, deliberately not refused. If a later pg lets it imply or lift SSL, move it to the list.
 #
 # AND THE ANSWER IS STILL REFUSE RATHER THAN DERIVE — BUT THE REFUSAL NOW HAS A WAY OUT (r45,
 # Codex MEDIUM). Deriving would mean reproducing node-postgres's TLS semantics for every value of
@@ -8251,7 +8260,7 @@ header "Pre-flight checks"
 #   migrate_uploads                                     moves the uploads into ${DATA_DIR}
 #   find "${DATA_DIR}" ... -exec chown -h               the recursive chown of the state root
 #   the ownership change under ${LOG_DIR}               made of `.` inside a re-proved root
-#   prepare_crontab_lock                                the root-owned lock under ${DATA_DIR}
+#   prepare_crontab_lock                                the root-owned lock under /etc/ims-cutover-state
 #   mkdir_service_subdir "${DATA_DIR}" 077 …            the deploy key directory
 #   git clone / git fetch / rsync -a --delete           into ${APP_DIR}
 #   copy_tree_into_new_dir … "${APP_DIR}/.git"          and its git metadata
@@ -9329,7 +9338,7 @@ fi
 
 # THE CRONTAB RECONCILIATION LOCK, prepared here and defined in scripts/lib/crontab-lock.sh.
 #
-# Root-owned file inside a root-owned directory inside the service's StateDirectory, created with
+# Root-owned file inside a root-owned directory beneath /etc/ims-cutover-state (not the service's StateDirectory since o3d-txoe), created with
 # primitives that cannot follow a symlink (Codex r24 CRITICAL). It moved into the library in
 # o3d-p9dq: deploy.sh and update.sh need the identical preparation, because they now take the
 # identical lock, and a rule about a root-side write into a directory the service user owns cannot
@@ -9455,7 +9464,7 @@ if [[ "$INSTALL_FROM_GIT" == "y" ]]; then
     privileged_spare_running_tree "${APP_DIR}/.git" "the application git directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
     copy_tree_into_new_dir "${TMP_CLONE_WORKTREE}/.git" "${APP_DIR}/.git"
     privileged_spare_running_tree "${APP_DIR}" "the application directory" || { rm -rf "${TMP_CLONE_DIR}"; die "${IMS_DRIVER_OVERLAP_REASON}"; }
-    chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
+    chown_app_root_tree "${APP_DIR}" "${APP_USER}" "the application directory" || die "The ownership of ${APP_DIR} could not be set; the reason is above."
     rm -rf "${TMP_CLONE_DIR}"
     success "Repository synced into existing directory."
   else
@@ -9482,7 +9491,7 @@ else
     "${LOCAL_SOURCE_DIR%/}/" "${APP_DIR}/"
   rm -f "${APP_DIR}/.env.local"
   privileged_spare_running_tree "${APP_DIR}" "the application directory" || die "${IMS_DRIVER_OVERLAP_REASON}"
-  chown -R "${APP_USER}:${APP_USER}" "${APP_DIR}"
+  chown_app_root_tree "${APP_DIR}" "${APP_USER}" "the application directory" || die "The ownership of ${APP_DIR} could not be set; the reason is above."
   success "Files copied."
 
   if [[ "${GIT_DEPLOY_KEY_ENABLED:-n}" == "y" && -n "${GIT_REPO_URL:-}" ]]; then
@@ -10220,6 +10229,8 @@ if [[ -n "${DEFAULT_ADMIN_EMAIL}" || -n "${SMTP_HOST}" || -n "${SMTP_FROM_EMAIL}
     export WC_STORE_URL="${WC_STORE_URL}"
     export WC_CONSUMER_KEY="${WC_CONSUMER_KEY}"
     export WC_CONSUMER_SECRET="${WC_CONSUMER_SECRET}"
+    # o3d-djqf1: lets the seed write email_smtp_pass as ciphertext.
+    export SETTINGS_ENCRYPTION_KEY="${SETTINGS_ENCRYPTION_KEY}"
     "$@"
   )
   }

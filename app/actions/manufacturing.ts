@@ -71,6 +71,8 @@ import {
   describeBomRecipeRefusal,
   syncBomRecipeFromProductComponents,
 } from '@/lib/products/bom-recipe'
+import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
+import { businessDateYmd } from '@/lib/business-date'
 
 type JournalLine = { accountCode: string; description: string; debit?: number; credit?: number }
 
@@ -1087,7 +1089,7 @@ export async function updateManufacturingOrderStatus(
                   lines,
                 })}`,
                 payload: {
-                  date: now.toISOString().slice(0, 10),
+                  date: businessDateYmd(now),
                   reference,
                   narration,
                   lines,
@@ -2027,7 +2029,9 @@ export async function updateManufacturingCostLines(
               inventoryDeltaBase,
               recalcRunId,
             })}`
-            await queueAccountingSyncTx(tx, {
+            // ONE date for the journal and its COGS sub-ledger row: two clock reads could straddle London midnight and date them a day apart.
+            const reclassDate = businessDateYmd(new Date())
+            const reclassQueued = await queueAccountingSyncTx(tx, {
               type: 'MANUFACTURING_RECLASS',
               referenceType: 'ProductionOrder',
               referenceId: productionOrderId,
@@ -2044,7 +2048,7 @@ export async function updateManufacturingCostLines(
               chartConnector: settings?.connector ?? null,
               idempotencyKey: reclassIdempotencyKey,
               payload: {
-                date: new Date().toISOString().slice(0, 10),
+                date: reclassDate,
                 reference: `MFG-RECLASS: ${po.reference}`,
                 narration: `Reclass for retro manufacturing-cost change on ${po.reference} — overhead ${oldTotal.toFixed(2)} → ${newTotal.toFixed(2)}, total delta ${totalDeltaBase >= 0 ? '+' : ''}${totalDeltaBase.toFixed(4)} (COGS ${cogsDeltaBase.toFixed(4)} / Inventory ${inventoryDeltaBase.toFixed(4)})`,
                 lines: journalLines,
@@ -2054,6 +2058,23 @@ export async function updateManufacturingCostLines(
               // the cost lines had been updated.
               reportOutcome: (outcome) => { reclassOutcome.outcome = outcome },
             })
+            // The reclass journal's COGS leg moves the GL COGS account, so it gets its own COGS sub-ledger row, written in the
+            // same transaction and ONLY when the journal was actually queued (a declined or shadowed enqueue must not be
+            // mirrored). The amount is the signed COGS leg exactly as posted (`cogsRounded`, 2dp: a DR on a positive delta),
+            // keyed by the journal's own key, so a retry records once. No posting key changes.
+            const cogsAccountCode = settings?.cogsAccount
+            if (reclassQueued && cogsAccountCode && journalLines.some((line) => line.accountCode === cogsAccountCode)) {
+              const cogsLegSigned = journalLines
+                .filter((line) => line.accountCode === cogsAccountCode)
+                .reduce((sum, line) => sum + (line.debit ?? 0) - (line.credit ?? 0), 0)
+              await recordCogsSubledgerMovement(tx, {
+                sourceType: 'MANUFACTURING_RECLASS',
+                sourceRef: productionOrderId,
+                idempotencyKey: reclassIdempotencyKey,
+                baseDelta: roundCurrency(cogsLegSigned),
+                journalDate: reclassDate,
+              })
+            }
           }
         }
       }

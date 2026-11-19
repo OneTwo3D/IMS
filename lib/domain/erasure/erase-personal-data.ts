@@ -11,6 +11,7 @@ import { loadRawPayloadSubject, scrubRawPayloadsInTx, type RawPayloadCounts } fr
 import { summariseWarehouseOrdersInTx, decideSystemVerdicts, recordOpenWarehouseOrdersNoticeInTx } from './warehouse-obligations'
 import { scrubAccountingDerivedCopiesInTx, type DerivedCopyCounts } from './derived-copies'
 import { SYSTEM_PAYMENT_NOTES, orderIsErasedInTx } from './order-state'
+import { deleteSalesOrderAttachmentsInTx, drainOrderAttachmentFileDeletions } from '@/lib/domain/order-attachments'
 export { orderIsErasedInTx }
 import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import { ERASED_ACTIVITY_DESCRIPTION, IDENTITY_BEARING_ENTITY_TYPES, redactIdentityKeys } from './activity-identity'
@@ -37,7 +38,7 @@ import {
  * tests/erasure-schema-classification.test.ts fails when a new personal-data column is not classified.
  * What is deliberately RETAINED is the accounting record: order totals, tax, lines, currency, order numbers,
  * the ledger and Xero ids, the issued invoice PDF (a statutory record, kept for six years) and the refund
- * reason text. Nothing here deletes a row; every table is updated in place, and the Customer row is kept so
+ * reason text. Every table is updated in place (the storefront account link and the attachment rows of the erased orders are the rows that are deleted), and the Customer row is kept so
  * the erasure record's surrogate still points at something.
  *
  * ORDERING AND LOCKS. The customer row is claimed first with a conditional update (it is the row concurrent
@@ -79,8 +80,10 @@ export async function eraseOrdersPersonalDataInTx(
   tx: Prisma.TransactionClient,
   orderIds: string[],
   erasedAt: Date,
+  /** Receives the stored names of the attachment files whose rows were deleted: the caller removes the files AFTER the transaction commits (a file cannot be rolled back). */
+  attachmentStoredNames: string[] = [],
 ): Promise<Omit<ErasureCounts, 'customers' | 'shoppingCustomerLinks' | 'activityRowsScrubbed' | 'linkedFreeTextScrubbed' | keyof RawPayloadCounts | keyof DerivedCopyCounts>> {
-  const counts = { salesOrders: 0, shipments: 0, shoppingOrderLinks: 0, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, notifications: 0 }
+  const counts = { salesOrders: 0, shipments: 0, shoppingOrderLinks: 0, wmsStatusSnapshots: 0, outboxRowsErased: 0, outboxRowsClaimedFenced: 0, accountingPayloadsScrubbed: 0, heldInvoicePayloadsScrubbed: 0, paymentNotesErased: 0, bounceRecordsDeleted: 0, notifications: 0, orderAttachmentsDeleted: 0 }
   for (const ids of chunks(orderIds)) {
     counts.salesOrders += (await tx.salesOrder.updateMany({
       where: { id: { in: ids } },
@@ -96,6 +99,9 @@ export async function eraseOrdersPersonalDataInTx(
         erasedAt,
       },
     })).count
+    // CUSTOM FIELD VALUES on these orders: operator-entered free text can name or describe the person, so every value is deleted with the order's
+    // personal data (the field definitions are not personal and stay). An erased order refuses new values (values-service.ts, under the order lock).
+    await tx.customFieldValue.deleteMany({ where: { salesOrderId: { in: ids } } })
     counts.shipments += (await tx.shipment.updateMany({ where: { orderId: { in: ids }, trackingNumber: { not: null } }, data: { trackingNumber: null } })).count
     counts.shoppingOrderLinks += (await tx.shoppingOrderLink.updateMany({ where: { orderId: { in: ids } }, data: { metadata: Prisma.JsonNull } })).count
     counts.wmsStatusSnapshots += (await tx.wmsOrderStatusSnapshot.updateMany({
@@ -142,6 +148,12 @@ export async function eraseOrdersPersonalDataInTx(
       where: { orderId: { in: ids }, notes: { not: null }, AND: [{ notes: { notIn: [...SYSTEM_PAYMENT_NOTES] } }] },
       data: { notes: null },
     })).count
+
+    // SUPPORTING DOCUMENTS attached to the order (a customer's purchase order, an email, a proof of address) can hold the subject's personal data in their
+    // CONTENT, which cannot be redacted: the rows are deleted (live and soft-deleted) and the files removed after commit by the caller.
+    const attachmentNames = await deleteSalesOrderAttachmentsInTx(tx, ids)
+    attachmentStoredNames.push(...attachmentNames)
+    counts.orderAttachmentsDeleted += attachmentNames.length
 
     // Notifications are linked to an order only by the URL they point at.
     counts.notifications += (await tx.notification.updateMany({
@@ -359,6 +371,8 @@ export async function scrubLinkedFreeText(tx: Prisma.TransactionClient, orderIds
     }
     // The status snapshot's last error (the sweep writes the connector's exception text there) and the refund's accounting warning.
     changed += (await tx.wmsOrderStatusSnapshot.updateMany({ where: { orderId: { in: ids }, lastError: { not: null }, NOT: { lastError: marker } }, data: { lastError: marker } })).count
+    // The merge hold's last error (the connector's refusal or exception text).
+    changed += (await tx.wmsMergeHold.updateMany({ where: { orderId: { in: ids }, lastError: { not: null }, NOT: { lastError: marker } }, data: { lastError: marker } })).count
     changed += (await tx.salesOrderRefund.updateMany({ where: { orderId: { in: ids }, accountingWarning: { not: null }, NOT: { accountingWarning: marker } }, data: { accountingWarning: marker } })).count
     changed += (await tx.wmsOrderDiscrepancy.updateMany({ where: { orderId: { in: ids }, detail: { not: null }, NOT: { detail: marker } }, data: { detail: marker } })).count
     for (const field of ['reason', 'resolutionNote'] as const) {
@@ -380,6 +394,36 @@ export async function scrubLinkedFreeText(tx: Prisma.TransactionClient, orderIds
   return changed
 }
 
+/** What an erasure transaction reports to its caller: the warehouse verdicts, and the attachment files to remove once the transaction has committed. */
+type ErasureOutcome = { warehouse: ErasureWarehouseSummary; attachmentStoredNames: string[] }
+
+const emptyOutcome = (): ErasureOutcome => ({ warehouse: { ...EMPTY_WAREHOUSE_SUMMARY, openOrders: [], ambiguousOrders: [] }, attachmentStoredNames: [] })
+
+/**
+ * REMOVE THE FILES OF THE ATTACHMENT ROWS AN ERASURE DELETED. Runs after the commit: a file cannot be rolled back, so deleting it inside the
+ * transaction could destroy a document for an erasure that then failed. A file that cannot be removed (a permission problem, say) is NOT silent:
+ * an ERROR activity row names the stored file names (random uuids, no person). The obligation is DURABLE: the names were queued in order_attachment_file_deletions in the erasure transaction, so a failed or interrupted removal is retried by the next drain (the daily activity-cleanup cron).
+ */
+async function removeErasedAttachmentFiles(storedNames: string[], requestId: string, userId: string | null): Promise<void> {
+  if (storedNames.length === 0) return
+  let failed: string[]
+  try {
+    failed = (await drainOrderAttachmentFileDeletions()).failed
+  } catch {
+    failed = storedNames
+  }
+  if (failed.length === 0) return
+  await logActivity({
+    entityType: 'SYSTEM',
+    tag: 'sales',
+    action: 'erasure_attachment_files_not_removed',
+    level: 'ERROR',
+    description: 'An erasure deleted order attachment records but could not remove some of their files yet; they stay queued and are retried by the daily cleanup',
+    metadata: { requestId, storedNames: failed },
+    userId,
+  })
+}
+
 export type EraseCustomerResult =
   | { success: true; requestId: string; warehouse: ErasureWarehouseSummary }
   | { success: false; error: string }
@@ -392,7 +436,7 @@ export type EraseCustomerResult =
  */
 async function eraseUnderLocksInTx(
   tx: Prisma.TransactionClient,
-  input: { customerId: string | null; eraseCustomer: boolean; targetOrderIds: string[]; requestId: string; erasedAt: Date; trigger: ErasureTrigger; userId: string | null; outcome: { warehouse: ErasureWarehouseSummary } },
+  input: { customerId: string | null; eraseCustomer: boolean; targetOrderIds: string[]; requestId: string; erasedAt: Date; trigger: ErasureTrigger; userId: string | null; outcome: ErasureOutcome },
 ): Promise<string | null> {
   const { customerId, eraseCustomer, targetOrderIds: orderIds, erasedAt } = input
   // Every value that identifies the subject (the tokens that remove it from activity rows) is read only AFTER the caller's locks, so an edit
@@ -423,7 +467,8 @@ async function eraseUnderLocksInTx(
     })
     if (claimed.count === 0) return 'Customer already anonymised'
   }
-  const orderCounts = await eraseOrdersPersonalDataInTx(tx, orderIds, erasedAt)
+  input.outcome.attachmentStoredNames = []
+  const orderCounts = await eraseOrdersPersonalDataInTx(tx, orderIds, erasedAt, input.outcome.attachmentStoredNames)
   // A customer who REMAINS LIVE (it keeps another live order) must not go on listing an order that was erased: the customer's name, email and
   // link would keep the erased order attributable to them (getCustomerDetail lists a customer's orders). So the order is UNLINKED in the same
   // transaction, which is what WooCommerce does to the anonymised order (customer_id 0). Only the link goes: totals, tax, lines, ledger ids and
@@ -495,7 +540,7 @@ export async function eraseCustomerPersonalData(
   const erasedAt = new Date()
   try {
     let refusal: string | null = null
-    const outcome = { warehouse: { ...EMPTY_WAREHOUSE_SUMMARY, openOrders: [], ambiguousOrders: [] } as ErasureWarehouseSummary }
+    const outcome = emptyOutcome()
     for (let attempt = 1; ; attempt += 1) {
       try {
         refusal = await db.$transaction(async (tx): Promise<string | null> => {
@@ -518,6 +563,7 @@ export async function eraseCustomerPersonalData(
       }
     }
     if (refusal) return { success: false, error: refusal }
+    await removeErasedAttachmentFiles(outcome.attachmentStoredNames, requestId, options.userId)
     return { success: true, requestId, warehouse: outcome.warehouse }
   } catch (e) {
     // The exception text is NOT logged and NOT returned verbatim: a driver error can echo the values it was
@@ -562,6 +608,7 @@ export async function eraseOrderPersonalData(
 ): Promise<EraseOrderResult> {
   const requestId = randomUUID()
   const erasedAt = new Date()
+  let attachmentStoredNames: string[] = []
   try {
     for (let attempt = 1; attempt <= ORDER_ERASURE_ATTEMPTS; attempt += 1) {
       try {
@@ -589,11 +636,13 @@ export async function eraseOrderPersonalData(
             ? await tx.salesOrder.count({ where: { customerId: peek.customerId, id: { not: orderId }, erasedAt: null } })
             : 1
           const eraseCustomer = Boolean(peek.customerId) && customerLive && liveOthers === 0
-          const outcome = { warehouse: { ...EMPTY_WAREHOUSE_SUMMARY, openOrders: [], ambiguousOrders: [] } as ErasureWarehouseSummary }
+          const outcome = emptyOutcome()
           const refusal = await eraseUnderLocksInTx(tx, { customerId: peek.customerId, eraseCustomer, targetOrderIds: [orderId], requestId, erasedAt, trigger: options.trigger, userId: options.userId, outcome })
           if (refusal) return { success: false, error: refusal }
+          attachmentStoredNames = outcome.attachmentStoredNames
           return { success: true, already: false, requestId, customerErased: eraseCustomer, warehouse: outcome.warehouse }
         }, ERASURE_TRANSACTION_OPTIONS)
+        if (result.success && !result.already) await removeErasedAttachmentFiles(attachmentStoredNames, requestId, options.userId)
         return result
       } catch (e) {
         if ((e instanceof OrderRelinkedDuringErasure || e instanceof CustomerKeysChanged) && attempt < ORDER_ERASURE_ATTEMPTS) continue

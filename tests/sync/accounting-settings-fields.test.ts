@@ -60,7 +60,24 @@ test('Xero payload uses xero_ prefix and includes both Xero-only account keys', 
   assert.equal(payload.xero_sales_account, '200')
   assert.equal(payload.xero_inventory_revaluation_account, '310')
   assert.equal(payload.xero_rounding_difference_account, '860')
-  assert.ok(Object.keys(payload).every((k) => k.startsWith('xero_')), 'all keys xero_-prefixed')
+  assert.ok(Object.keys(payload).every((k) => k.startsWith('xero_') || k === 'grir_xero_posting_enabled'), 'all keys xero_-prefixed, except the one unprefixed GR/IR posting switch')
+})
+
+// [mutation: drop the GR/IR account field, its Xero-only restriction, or the posting switch from the save payload]
+test('the GR/IR account is a Xero-only field, the posting switch is saved for Xero only and defaults to cleared, and the GR/IR account may not share Stock in Transit\'s code', () => {
+  const grir = ACCOUNT_FIELDS.find((f) => f.suffix === 'grir_account')!
+  assert.ok(grir, 'the field exists')
+  assert.equal(isFieldAvailableForConnector(grir, 'xero'), true)
+  assert.equal(isFieldAvailableForConnector(grir, OTHER_CONNECTOR), false)
+  const payload = buildAccountingSettingsPayload('xero', { xero_grir_account: '632', grir_xero_posting_enabled: 'true' })
+  assert.equal(payload.xero_grir_account, '632')
+  assert.equal(payload.grir_xero_posting_enabled, 'true')
+  assert.equal(buildAccountingSettingsPayload('xero', {}).grir_xero_posting_enabled, '')
+  assert.equal('grir_xero_posting_enabled' in buildAccountingSettingsPayload(OTHER_CONNECTOR, { grir_xero_posting_enabled: 'true' }), false, 'not another connector\'s setting')
+  const errors = validateAccountingAccountMapping({ xero_transit_account: '631', xero_grir_account: '631' })
+  assert.equal(errors.length, 1)
+  assert.match(errors[0]!.message, /GR\/IR/)
+  assert.deepEqual(validateAccountingAccountMapping({ xero_transit_account: '631', xero_grir_account: '632' }), [])
 })
 
 test('missing settings default to empty string (cleared mapping, not undefined)', () => {

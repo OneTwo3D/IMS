@@ -1,6 +1,7 @@
 import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { randomUUID } from 'node:crypto'
+import { markWmsScopeDirtyInTx } from '@/lib/domain/wms/scope-dirty'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
@@ -50,15 +51,22 @@ import { proveAllocationDebitPosting } from '@/lib/domain/accounting/allocation-
 import {
   assertNoSalesInvoicePostingInFlight,
   cancelPendingSalesInvoiceSyncForOrder,
+  cancelWithPostedInvoiceMessage,
+  cancelledWithPostedInvoiceTaskText,
+  findPostedSalesInvoiceSync,
 } from '@/lib/domain/accounting/cancel-order-invoice-sync'
+import { raiseWmsOperatorTask } from '@/lib/domain/wms/operator-tasks'
 import { PermanentStatusTransitionError, STATUS_GUARD_REFUSAL_PREFIX } from '@/lib/domain/sales/status-transition-errors'
 import {
   validateManualSalesOrderStatusTransition,
   validateSalesOrderStatusTransition,
 } from '@/lib/domain/workflows/action-guards'
 import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
+import { applyPegCapsToStockMap, applyPegHoldsToStockMap, evaluateOrderPegsInTx, loadPegContext } from '@/lib/domain/sales/peg-service'
 import { LEDGER_STANDING_SELECT, isShadowedObligation, workSlotStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { addMoney, roundQuantity, subtractMoney, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { withSavepoint } from '@/lib/db/savepoint'
+import { loadNettedRefundLines } from '@/lib/domain/sales/refund-demand-netting'
 import {
   accountedAllocationQty,
   parseCostLayerSnapshot,
@@ -70,6 +78,7 @@ import {
   type CostLayerSnapshotEntry,
   type SerializedCostLayerSnapshotEntry,
 } from '@/lib/cost-layer-snapshots'
+import { businessDateYmd } from '@/lib/business-date'
 
 export const ALLOCATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -190,6 +199,12 @@ export type AllocateSalesOrderInput = {
    * have no user, and inventing one would be worse than recording none.
    */
   userId?: string | null
+  /**
+   * SO-to-PO pegging: the receipt's peg pass. A pegged line may grow only by the stock that has landed for its pegs (on top of
+   * what it already holds), so a pegged order cannot take free stock an older order is owed just because it is allocated first.
+   * Leave unset for every other caller: they allocate the line's whole demand from what other orders' pegs leave free.
+   */
+  capPeggedLines?: boolean
 }
 
 export type AllocateSalesOrderResult = {
@@ -1319,7 +1334,7 @@ export async function reverseOrphanedAllocationPosting(
     referenceId: orderId,
     payload: {
       _reversalToken: reversalToken,
-      date: new Date().toISOString().slice(0, 10),
+      date: businessDateYmd(new Date()),
       reference: `Allocation reversal: ${orderRef}`,
       narration:
         `Allocation reversal — re-allocation of order ${orderRef} removed `
@@ -2029,6 +2044,7 @@ export async function releaseOrderAllocationsInTx(
   // The allocation rows are deleted FIRST so the shared helper reads the true post-teardown state
   // (zero open quantity everywhere) rather than being told what to conclude.
   await tx.orderAllocation.deleteMany({ where: { orderId } })
+  await markWmsScopeDirtyInTx(tx, orderId)
   // o3d-kouj: the rows are gone, so any pin on a line that holds nothing else is now dormant — a
   // recipe no reader should still be answering from. Retired here, under the same lock, in the same
   // transaction as the release that made it dormant.
@@ -2245,7 +2261,7 @@ export async function updateSalesOrderStatusUnderLock(
       previousStatus: string
     }) => Promise<void>
   },
-): Promise<{ previousStatus: string }> {
+): Promise<{ previousStatus: string; releasedProductIds: string[] }> {
   await lockSalesOrder(tx, input.orderId)
   const lockedOrder = await tx.salesOrder.findUnique({
     where: { id: input.orderId },
@@ -2265,8 +2281,33 @@ export async function updateSalesOrderStatusUnderLock(
     where: { id: input.orderId },
     data: { ...(input.data ?? {}), status: input.targetStatus },
   })
-  return { previousStatus: lockedOrder.status }
+
+  // o3d-hqvrp.79: closing an order as SHIPPED / COMPLETED / DELIVERED ends its demand, but nothing
+  // gave back the unshipped part of its allocation: the sweep and the backorder allocator skip such
+  // orders, deallocate and cancel refuse them, so the excess stayed reserved for ever (and the stock
+  // invariant counts it as legitimate). Trim every allocation row down to what committed shipments
+  // cover. Best effort inside a savepoint: a reservation that cannot be released (drift) must not
+  // block the status change a storefront or operator is reporting, so it is left as it was today.
+  let releasedProductIds: string[] = []
+  let releaseFailure: unknown = null
+  if (POST_DISPATCH_ORDER_STATUSES.has(input.targetStatus) && !POST_DISPATCH_ORDER_STATUSES.has(lockedOrder.status)) {
+    try {
+      const trimmed = await withSavepoint(tx, () => trimUnshippedAllocationsForRefundTx(tx, {
+        orderId: input.orderId,
+        noDemand: true,
+        userId: null,
+        cause: `the order being closed as ${input.targetStatus}`,
+      }))
+      releasedProductIds = trimmed.syncProductIds
+    } catch (error) {
+      releaseFailure = error
+      console.warn(`[allocation-service] could not release the unshipped allocation of order ${input.orderId} on closing it as ${input.targetStatus}`, releaseFailure)
+    }
+  }
+  return { previousStatus: lockedOrder.status, releasedProductIds }
 }
+
+const POST_DISPATCH_ORDER_STATUSES: ReadonlySet<string> = new Set(['SHIPPED', 'COMPLETED', 'DELIVERED'])
 
 /**
  * Give back the UNSHIPPED reservation of the units a refund removed from an order that already has a shipment.
@@ -2281,7 +2322,7 @@ export async function updateSalesOrderStatusUnderLock(
  */
 export async function trimUnshippedAllocationsForRefundTx(
   tx: Prisma.TransactionClient,
-  params: { orderId: string; noDemand: boolean; userId: string | null },
+  params: { orderId: string; noDemand: boolean; userId: string | null; cause?: string },
 ): Promise<{ trimmed: number; syncProductIds: string[]; retiredPendingShipments: RetiredPendingShipment[] }> {
   const rows = await tx.orderAllocation.findMany({
     where: { orderId: params.orderId },
@@ -2302,10 +2343,7 @@ export async function trimUnshippedAllocationsForRefundTx(
       graph,
     ),
   }))
-  const refundLines = await tx.salesOrderRefundLine.findMany({
-    where: { refund: { orderId: params.orderId } },
-    select: { salesOrderLineId: true, qty: true },
-  })
+  const refundLines = await loadNettedRefundLines(tx, { refund: { orderId: params.orderId } })
   const refundedByLine = new Map<string, Prisma.Decimal>()
   for (const refundLine of refundLines) {
     if (!refundLine.salesOrderLineId) continue
@@ -2338,8 +2376,9 @@ export async function trimUnshippedAllocationsForRefundTx(
     }
     await applyAllocationReservationDelta(tx, [{ productId: step.productId, warehouseId: step.warehouseId, qty: step.qty }], 'release', params.orderId)
   }
+  await markWmsScopeDirtyInTx(tx, params.orderId)
   const reconciliation = await reconcilePendingShipments(tx, params.orderId, {
-    cause: 'a refund releasing the unshipped reservation of its units',
+    cause: params.cause ?? 'a refund releasing the unshipped reservation of its units',
     userId: params.userId,
   })
   return {
@@ -2483,7 +2522,14 @@ export async function cancelSalesOrderFulfillmentState(
   input: {
     orderId: string
     data?: Prisma.SalesOrderUpdateInput
+    /** Skips the lifecycle state machine (a storefront force-sync). */
     bypass?: boolean
+    /**
+     * The cancel is driven by an automated source of truth (the storefront's own cancel, an approved EU withdrawal), not by an operator
+     * choosing to cancel. Such a cancel cannot be refused for a posted invoice without dead-lettering it: it lands and is flagged with a
+     * durable operator task. Only a manual operator cancel (neither flag) is refused. Implied by `bypass`.
+     */
+    automated?: boolean
   },
 ): Promise<{
   previousStatus: string
@@ -2497,9 +2543,22 @@ export async function cancelSalesOrderFulfillmentState(
   await lockSalesOrder(tx, input.orderId)
   const lockedOrder = await tx.salesOrder.findUnique({
     where: { id: input.orderId },
-    select: { status: true },
+    select: { status: true, refundStatus: true },
   })
   if (!lockedOrder) throw new Error('Order not found')
+
+  // o3d-hqvrp.41: an invoice that already reached the ledger is not voided or credited by a cancellation,
+  // and the deferral and allocation journals behind it stay too. A manual cancel is refused until the order
+  // has been refunded in full (the credit note is the accounting reversal). A cancel driven by the storefront
+  // (`bypass`) or by an approved withdrawal (`automated`) is the source of truth and cannot be refused without
+  // dead-lettering, so it proceeds and raises a durable operator task for the credit note.
+  let postedInvoiceAtCancel: Awaited<ReturnType<typeof findPostedSalesInvoiceSync>> = null
+  if (lockedOrder.refundStatus !== 'FULL') {
+    postedInvoiceAtCancel = await findPostedSalesInvoiceSync(tx, input.orderId)
+    if (postedInvoiceAtCancel && !input.bypass && !input.automated) {
+      throw new PermanentStatusTransitionError(cancelWithPostedInvoiceMessage(postedInvoiceAtCancel))
+    }
+  }
 
   // o3d-7o0: REFUSE WHILE AN INVOICE POST IS ON THE WIRE, under the row lock just taken and BEFORE any
   // write. The processor's PROCESSING claim is the posting intent, and `guardCancelledSalesOrderInvoice`
@@ -2610,6 +2669,7 @@ export async function cancelSalesOrderFulfillmentState(
       status: { in: ['PENDING', 'PICKING', 'PACKED'] },
     },
   })
+  await markWmsScopeDirtyInTx(tx, input.orderId)
   // o3d-kouj: same rule as the release path — a pin with nothing in flight behind it is dormant.
   // AFTER the shipment delete, not before: the picked/packed shipments this cancel destroys are
   // exactly what would otherwise still make their lines look untouchable, and a line whose only
@@ -2632,6 +2692,36 @@ export async function cancelSalesOrderFulfillmentState(
   // Retire any still-pending SALES_INVOICE accounting work in the SAME transaction, so the real-time
   // sync drain cannot post an ACCREC invoice for this now-cancelled, never-shipped order (o3d-5rs).
   await cancelPendingSalesInvoiceSyncForOrder(tx, input.orderId, new Date())
+
+  if (postedInvoiceAtCancel) {
+    const orderRow = await tx.salesOrder.findUnique({
+      where: { id: input.orderId },
+      select: { orderNumber: true, externalOrderNumber: true },
+    })
+    const orderLabel = orderRow?.orderNumber ?? orderRow?.externalOrderNumber ?? input.orderId
+    // A DURABLE task on the order, not just an activity row: a cancelled order drops out of the standing invariants, so nothing else would
+    // ever say that a receivable is still open. One task per (order, invoice): a repeated cancel does not raise a second.
+    await raiseWmsOperatorTask(tx, {
+      connector: postedInvoiceAtCancel.connector,
+      orderId: input.orderId,
+      externalOrderId: postedInvoiceAtCancel.id,
+      reason: 'CANCELLED_POSTED_INVOICE',
+      queryText: cancelledWithPostedInvoiceTaskText(postedInvoiceAtCancel, orderLabel),
+      dedupeBasis: `cancelled-posted-invoice:${input.orderId}:${postedInvoiceAtCancel.id}`,
+      payload: { orderNumber: orderRow?.orderNumber ?? null, externalOrderNumber: postedInvoiceAtCancel.id },
+    })
+    await tx.activityLog.create({
+      data: {
+        entityType: 'SALES_ORDER',
+        entityId: input.orderId,
+        action: 'cancelled_with_posted_invoice',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: cancelledWithPostedInvoiceTaskText(postedInvoiceAtCancel, orderLabel),
+        metadata: { syncLogId: postedInvoiceAtCancel.id, invoiceConnector: postedInvoiceAtCancel.connector },
+      },
+    })
+  }
 
   return {
     previousStatus: lockedOrder.status,
@@ -3593,6 +3683,17 @@ export async function allocateSalesOrder(
       buildAvailableStockMapIncludingOwnReservations(stockLevels, ownReservationRows),
     )
 
+    // SO-to-PO pegging. Other orders' pegs hold back the stock that has landed for them and not yet been absorbed, so this order
+    // (the sweep, the backorder pass, a poller re-run: all of them) cannot take it. This order's OWN pegs are not held back from
+    // it. Taken after the stock locks, like every read here, and the peg rows are locked last (the allocation lock order).
+    const pegContext = await loadPegContext(tx, orderId, leafProductIds)
+    if (pegContext) applyPegHoldsToStockMap(stockMap, pegContext.holds)
+    // The receipt's peg pass may add only what landed for the pegs, in the warehouse it landed in (the per-line quantity cap below
+    // limits the total; this limits where it may come from, so a receipt into B cannot pull existing stock in A to the order).
+    if (pegContext && input.capPeggedLines) {
+      applyPegCapsToStockMap(stockMap, pegContext.ownExtraByProductWarehouse, ownReservationRows.map((row) => ({ productId: row.productId, warehouseId: row.warehouseId, qty: toDecimal(row.qty) })))
+    }
+
     const committedByLine = calculateDecimalCoverageByLine(
       requirementsByLine,
       activeShipmentLines,
@@ -3601,10 +3702,7 @@ export async function allocateSalesOrder(
     // Refunded quantities are no longer outstanding demand — a refund on a not-yet-
     // shipped order removes those units from what needs allocating. Only ever reduces
     // demand, so it is safe for every status (already-shipped lines clamp to 0).
-    const refundLines = await tx.salesOrderRefundLine.findMany({
-      where: { refund: { orderId } },
-      select: { salesOrderLineId: true, qty: true },
-    })
+    const refundLines = await loadNettedRefundLines(tx, { refund: { orderId } })
     const refundedByLine = new Map<string, Prisma.Decimal>()
     for (const refundLine of refundLines) {
       if (!refundLine.salesOrderLineId) continue
@@ -3624,6 +3722,42 @@ export async function allocateSalesOrder(
         qty: Prisma.Decimal.max(new Prisma.Decimal(0), toDecimal(line.qty).sub(committed).sub(refunded)),
       }
     }).filter((line) => line.qty.gt(0))
+
+    if (input.capPeggedLines && pegContext) {
+      for (const line of lines) {
+        const extra = pegContext.ownExtraByLine.get(line.id)
+        if (extra === undefined) {
+          // An UNPEGGED line takes nothing new in the peg pass: it keeps what it already holds and waits for the oldest-first
+          // pass, so it cannot reserve newly received stock ahead of an older order. The cap is in line units, over the line's
+          // resolved requirement set, so a kit line keeps its component reservations too.
+          const perUnit = scaleFulfillmentRequirements(requirementsByLine.get(line.id) ?? [], new Prisma.Decimal(1))
+          let heldUnits: Prisma.Decimal | null = null
+          for (const [productId, qtyPerUnit] of perUnit) {
+            if (!toDecimal(qtyPerUnit).gt(0)) continue
+            const heldQty = ownAllocations
+              .filter((row) => row.lineId === line.id && row.productId === productId)
+              .reduce((sum, row) => sum.add(toDecimal(row.qty)), new Prisma.Decimal(0))
+            const units = heldQty.div(toDecimal(qtyPerUnit))
+            heldUnits = heldUnits === null ? units : Prisma.Decimal.min(heldUnits, units)
+          }
+          const kept = Prisma.Decimal.max(new Prisma.Decimal(0), (heldUnits ?? new Prisma.Decimal(0)).sub(committedByLine.get(line.id) ?? new Prisma.Decimal(0)))
+          line.qty = Prisma.Decimal.min(line.qty, kept)
+          continue
+        }
+        const held = ownAllocations
+          .filter((row) => row.lineId === line.id && row.productId === line.productId)
+          .reduce((sum, row) => sum.add(toDecimal(row.qty)), new Prisma.Decimal(0))
+        const inFlight = Prisma.Decimal.max(new Prisma.Decimal(0), held.sub(committedByLine.get(line.id) ?? new Prisma.Decimal(0)))
+        line.qty = Prisma.Decimal.min(line.qty, inFlight.add(extra))
+      }
+    }
+
+    // SO-to-PO pegging: a pegged line is served before the order's other lines, so an unpegged line for the same product can not
+    // consume the stock that landed for the peg (stable: otherwise the order of the lines is unchanged).
+    if (pegContext && pegContext.own.length > 0) {
+      const peggedLineIds = new Set(pegContext.own.map((peg) => peg.salesOrderLineId))
+      lines.sort((a, b) => Number(peggedLineIds.has(b.id)) - Number(peggedLineIds.has(a.id)))
+    }
 
     // o3d-kouj: FEASIBILITY AND EXPANSION NOW COME FROM ONE SOURCE — the line's RESOLVED requirement
     // set, which is its pinned snapshot when it has one and the current graph when it does not.
@@ -3974,6 +4108,9 @@ export async function allocateSalesOrder(
         })
       }
 
+      // The allocation set changed (this branch only runs for a changed set): the warehouse's part of the order must be re-derived.
+      await markWmsScopeDirtyInTx(tx, orderId)
+
       // -------------------------------------------------------------------------------------
       // o3d-kouj: PIN THE RECIPE ONTO EVERY LINE THIS RUN JUST PUT IN FLIGHT.
       //
@@ -4200,6 +4337,9 @@ export async function allocateSalesOrder(
     // NOTE: the storefront stock-sync (enqueueStockSync in autoAllocateOrder) still runs POST-commit and remains
     // best-effort — a crash after commit can lose it. That is a pre-existing, cross-cutting stock-sync durability
     // gap (all allocation flows, non-Woo connectors), tracked separately in o3d-jhq, not resolved here.
+    // SO-to-PO pegging: settle this order's pegs against the allocation just written, ending those that are done or void.
+    await evaluateOrderPegsInTx(tx, orderId)
+
     await input.onReconciledInTx?.(tx)
 
     return {

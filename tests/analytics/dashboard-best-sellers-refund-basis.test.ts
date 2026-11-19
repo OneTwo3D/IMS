@@ -19,7 +19,7 @@ import { mountClientComponent } from '@/tests/fixtures/render-client-component'
  * plausible wrong number rather than an exception.
  */
 
-mock.module('@/lib/auth/server', { namedExports: { requirePermission: async () => ({ user: { id: 'u1' } }) } })
+mock.module('@/lib/auth/server', { namedExports: { requirePermission: async () => ({ user: { id: 'u1', role: 'ADMIN' } }) } })
 mock.module('@/app/actions/settings', { namedExports: { getSetting: async () => '04-06' } })
 mock.module('@/lib/display-timezone', { namedExports: { getDisplayTimeZone: async () => 'UTC' } })
 mock.module('@/components/providers/base-currency-provider', {
@@ -91,7 +91,7 @@ async function renderDashboard(data: Awaited<ReturnType<typeof dashboard>>) {
   return mountClientComponent(DashboardClient as unknown as (props: unknown) => unknown, {
     kpi: data.kpi, chartData: data.chartData, topProducts: data.topProducts,
     recentOrders: data.recentOrders, incomingPOs: data.incomingPOs,
-    periodLabel: 'Today', compLabel: 'Yesterday', initialPeriod: 'today', initialCompare: 'previous_period',
+    periodLabel: 'Today', compLabel: 'Yesterday', initialPeriod: 'today', initialCompare: 'previous_period', costFiguresVisible: true,
   }).render().html
 }
 

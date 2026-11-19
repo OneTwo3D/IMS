@@ -160,6 +160,7 @@ test('H1: a parked create the warehouse already holds under THIS order\'s refere
   assert.equal(updates[0].data.state, 'PENDING_VERIFY', 'bound as an UNVERIFIED id: the verify pass proves it before anything acts on it')
   assert.equal(updates[0].data.externalOrderId, '555')
   assert.equal(updates[0].data.attempts, 0)
+  assert.equal(updates[0].data.pushWarehouseId, 'wh-1', 'the warehouse the create candidate was sent to is recorded on adoption')
   assert.ok(updates[0].data.pushedAt)
   assert.equal(events.filter((e) => e.action === 'order_create' && e.outcome === 'SUCCEEDED').length, 1)
 })

@@ -1,6 +1,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from '@/lib/domain/accounting/money-attempt-provenance'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
+import { invoicingOrderIdsForRows, lockOrdersFirst, recomputeInvoicingStateForOrders } from '@/lib/domain/sales/invoicing-state-sites'
 
 /**
  * o3d-f709 (Codex round 2 HIGH 1) - THE CROSS-CONNECTOR ORPHAN SWEEP'S CANCELLING UPDATES, and the one
@@ -26,6 +27,10 @@ export async function cancelOrphanedPendingRows(
   scope: Prisma.AccountingSyncLogWhereInput,
   reason: string,
 ): Promise<number> {
+  // An abandoned sales invoice is no longer an invoice: the orders whose invoice rows are about to be retired are re-derived afterwards.
+  const affectedOrders = await invoicingOrderIdsForRows(tx, { AND: [scope, { status: 'PENDING' }] })
+  // Canonical lock order: the orders are locked (in id order) before any of their rows is written.
+  await lockOrdersFirst(tx, affectedOrders)
   // audit-46ry: CANCELLED (not FAILED) so these abandoned rows are excluded from FAILED-scanning
   // reconciliation/backfill sweeps and error dashboards.
   const neverClaimed = await tx.accountingSyncLog.updateMany({
@@ -46,5 +51,6 @@ export async function cancelOrphanedPendingRows(
     where: { AND: [scope, { status: 'PENDING' }] },
     data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null },
   })
+  await recomputeInvoicingStateForOrders(tx, affectedOrders)
   return neverClaimed.count + claimedOrPosted.count
 }

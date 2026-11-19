@@ -83,16 +83,16 @@ export const apiRouteAuthPolicy = {
     reason: 'Mintsoft receipt review inspection and approval require requireApiFreshAdmin; approval also requires a same-origin mutation header and is logged.',
   },
   '/api/backup/create': {
-    access: 'admin',
-    reason: 'Backup creation is restricted through requireApiAdmin.',
+    access: 'admin-fresh',
+    reason: 'Backup creation (a full database dump) is restricted through requireApiFreshAdmin.',
   },
   '/api/backup/restore': {
     access: 'admin-fresh',
     reason: 'Backup restore is restricted through requireApiFreshAdmin plus restore confirmation checks.',
   },
   '/api/backup/upload-remote': {
-    access: 'admin',
-    reason: 'Remote backup upload is restricted through requireApiAdmin.',
+    access: 'admin-fresh',
+    reason: 'Remote backup upload is restricted through requireApiFreshAdmin.',
   },
   '/api/cron/accounting-daily-batch': {
     access: 'cron-secret',
@@ -141,6 +141,10 @@ export const apiRouteAuthPolicy = {
   '/api/cron/wc-withdrawal-sweep': {
     access: 'cron-secret',
     reason: 'o3d-d82p: durable drain of WooCommerce withdrawal suppressions; guarded by verifyCron.',
+  },
+  '/api/cron/product-sync-marks': {
+    access: 'cron-secret',
+    reason: 'Paced drain of the storefront and warehouse sync owed by products edited by CSV; guarded by verifyCron.',
   },
   '/api/cron/refund-reservation-release': {
     access: 'cron-secret',
@@ -347,6 +351,14 @@ export const apiRouteAuthPolicy = {
     access: 'authenticated',
     reason: 'Requires an authenticated user with sync permission.',
   },
+  '/api/products/csv-edit/download': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated user with inventory.edit permission (price columns also need inventory.prices).',
+  },
+  '/api/products/csv-edit/upload': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated user with inventory.edit permission (price columns also need inventory.prices).',
+  },
   '/api/credit-note/[id]': {
     access: 'authenticated',
     reason: 'Requires an authenticated user with sales permission.',
@@ -363,6 +375,10 @@ export const apiRouteAuthPolicy = {
     access: 'public-webhook',
     reason: 'Public shopping customer invoice PDF handoff; requires connector plugin enablement plus a short-lived connector HMAC request from the shopping platform.',
   },
+  '/api/shopping/[connector]/credit-note-pdf': {
+    access: 'public-webhook',
+    reason: 'Public shopping customer credit note PDF handoff; requires connector plugin enablement plus a short-lived connector HMAC request from the shopping platform, and the refund must belong to the proved order.',
+  },
   '/api/manufacturing-order/[id]': {
     access: 'authenticated',
     reason: 'Requires an authenticated user with manufacturing permission.',
@@ -378,6 +394,14 @@ export const apiRouteAuthPolicy = {
   '/api/packing-slips': {
     access: 'authenticated',
     reason: 'Requires an authenticated user with sales permission; prints only the orders named in the request (capped).',
+  },
+  '/api/order-attachments/[kind]/[orderId]': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated session holding the edit permission for the order type (purchasing for purchase orders, sales for sales orders) before accepting a supporting document; type and size are validated from the bytes.',
+  },
+  '/api/order-attachments/[kind]/[orderId]/[id]': {
+    access: 'authenticated',
+    reason: 'Requires an authenticated session holding the view permission (download) or edit permission (delete) for the order type; the file is found by attachment id within its own order, never by name, and served as a nosniff attachment.',
   },
   '/api/preview/document': {
     access: 'authenticated',

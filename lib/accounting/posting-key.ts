@@ -130,8 +130,20 @@ const SCOPE_RULES: Record<AccountingSyncType, ScopeRule> = {
     const bill = payloadString(params, 'accountingInvoiceId')
     return bill ? `bill:${bill}` : ''
   },
+  // One delete per LEDGER document: the order (or bill) can later carry a replacement document, which has its own id and its own
+  // delete, so the document id in the payload is the discriminator. A retry of one delete carries the same id, so it cannot diverge.
+  SALES_INVOICE_DELETE: (params) => {
+    const document = payloadString(params, 'accountingInvoiceId')
+    return document ? `document:${document}` : ''
+  },
+  PURCHASE_INVOICE_DELETE: (params) => {
+    const document = payloadString(params, 'accountingInvoiceId')
+    return document ? `document:${document}` : ''
+  },
   // One refund per SalesOrderRefund / one supplier credit note per SupplierCreditNote.
   CREDIT_NOTE: DOCUMENT,
+  // o3d-ngmt.22: one void per deleted refund (the row is referenced by the deleted refund's id); a repeat is the same obligation.
+  CREDIT_NOTE_VOID: DOCUMENT,
   PURCHASE_CREDIT_NOTE: DOCUMENT,
   // One allocation per supplier credit note (the sweep enqueues at most one per note, against its bill).
   PURCHASE_CREDIT_NOTE_ALLOCATION: DOCUMENT,
@@ -196,6 +208,7 @@ const SCOPE_RULES: Record<AccountingSyncType, ScopeRule> = {
   DAILY_BATCH_INVENTORY_RECONCILIATION: DOCUMENT,
   DAILY_BATCH_COGS_RECONCILIATION: DOCUMENT,
   DAILY_BATCH_TRANSIT_RECONCILIATION: DOCUMENT,
+  DAILY_BATCH_GRIR_RECLASS: DOCUMENT,
   // Not enqueued anywhere in this build.
   STOCK_ALLOCATION: DOCUMENT,
 }

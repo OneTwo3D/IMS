@@ -162,6 +162,8 @@ export async function loadTransitGlReconciliation(options?: {
     available: true,
     balanceDate: balanceDateString(closingDate),
     glProvenance: { opening: glLegProvenance(movement.opening), closing: glLegProvenance(movement.closing) },
+    accountCode: transitAccount,
+    windowOpening: balanceDateString(movement.opening.balanceDate),
     ...evaluateAccountGlReconciliation({
       subledgerValue,
       glBalance,

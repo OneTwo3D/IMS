@@ -7,8 +7,10 @@ daily reserved/available evidence for the same stock-on-hand reports.
 ## Daily Cron
 
 The `/api/cron/inventory-snapshot` route is guarded by `CRON_SECRET`. It writes
-yesterday's UTC snapshot at `00:00 UTC`, immediately after the prior UTC day has
-closed. The midnight schedule is part of the reporting contract: downstream
+the snapshot of the business day (Europe/London) that has just ended, run at
+`00:00` host time (London). The label is the London day, not the UTC day: a BST
+run at 23:00 UTC is labelled with that same London day, and `cutoffAt` on the
+daily run rows is London midnight (23:00 UTC in BST, 00:00 UTC in GMT). The midnight schedule is part of the reporting contract: downstream
 as-of helpers treat each `snapshotDate` as an end-of-day UTC position. The cron
 is disabled by default for new installs; enable it only after the migration has
 been deployed.

@@ -1,5 +1,7 @@
 'use server'
 
+import { netUnpricedReturnRowsAgainstRefunds, priceUnpricedReturnRows, queueReturnRestockValueJournal } from '@/lib/domain/sales/return-restock-cost'
+import { parseShopIossNumber, SHOP_IOSS_NUMBER_SETTING } from '@/lib/domain/accounting/shop-ioss-number'
 import { randomUUID } from 'node:crypto'
 
 import { revalidatePath } from 'next/cache'
@@ -12,7 +14,7 @@ import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { recordWmsMutationEvent } from '@/lib/domain/wms/mutation-audit'
-import { alignmentDryRunEvidenceQuery } from '@/lib/domain/wms/alignment-dry-run'
+import { alignmentConfirmationSurvivesSave, alignmentDryRunEvidenceQuery } from '@/lib/domain/wms/alignment-dry-run'
 import { lockMintsoftCourierServiceMap, lockMintsoftDispatchSettings } from '@/lib/connectors/mintsoft/settings/dispatch-settings-lock'
 import { resetWmsDeltaCursors } from '@/lib/domain/wms/dispatch-sweep'
 import { wmsDeltaCursorKeys } from '@/lib/domain/wms/delta-cursor-generation'
@@ -680,6 +682,8 @@ const MintsoftExternalAsnIdSchema = z.string().trim().min(1, 'ASN ID is required
 const MintsoftReturnRestockInputSchema = z.object({
   id: z.string().min(1, 'Return inbox item ID is required.'),
   warehouseId: z.string().min(1, 'Warehouse is required.'),
+  /** The adjustment reason whose GL account is credited for the value of units no refund covers. */
+  adjustmentReasonId: z.string().min(1).nullable().optional(),
 })
 const MintsoftCreatePurchaseOrderAsnInputSchema = z.object({
   packagingType: z.enum(['PARCEL', 'PALLET', 'CONTAINER']).nullable().optional(),
@@ -1040,6 +1044,81 @@ export async function saveMintsoftCourierServiceMap(rawJson: unknown): Promise<{
     },
   })
 
+  revalidatePath('/sync')
+  return { success: true }
+}
+
+/**
+ * Whether the Mintsoft order CREATE push carries `IOSSNumber` (the shop's own IOSS number WooCommerce applied to the order, mirrored onto
+ * the IMS order; sent only when the order has one). Default OFF: with it off the push payload is unchanged. Mintsoft is live, so this is
+ * an explicit operator opt-in, recorded in the activity log.
+ */
+export async function getMintsoftSendIossNumber(): Promise<boolean> {
+  await requireMintsoftReadAccess()
+  return (await getMintsoftSettings()).mintsoft_send_ioss_number === 'true'
+}
+
+export async function saveMintsoftSendIossNumber(enabled: unknown): Promise<{ success: boolean; error?: string }> {
+  await requireMintsoftWriteAccess()
+  if (typeof enabled !== 'boolean') return { success: false, error: 'Choose on or off.' }
+  const value = serializeSettingValue('mintsoft_send_ioss_number', enabled ? 'true' : 'false')
+  const previous = await db.$transaction(async (tx) => {
+    const row = await tx.setting.findUnique({ where: { key: 'mintsoft_send_ioss_number' } })
+    await tx.setting.upsert({
+      where: { key: 'mintsoft_send_ioss_number' },
+      create: { key: 'mintsoft_send_ioss_number', value },
+      update: { value },
+    })
+    return row?.value === 'true'
+  })
+  if (previous !== enabled) {
+    await logActivity({
+      entityType: 'SYNC',
+      tag: 'sync',
+      action: 'mintsoft_send_ioss_number_updated',
+      level: 'INFO',
+      description: `Mintsoft order push ${enabled ? 'now sends' : 'no longer sends'} IOSSNumber (the IOSS number mirrored from WooCommerce, when the order has one).`,
+      metadata: { before: previous, after: enabled },
+    })
+  }
+  revalidatePath('/sync')
+  return { success: true }
+}
+
+/**
+ * The shop's own IOSS number (setting `shop_ioss_number`, one value for the whole shop). Orders the EU VAT stamp puts under IOSS store it
+ * (never decided again here) and Mintsoft receives it only with `mintsoft_send_ioss_number` on. Blank clears it. Admin-only, audited.
+ */
+export async function getShopIossNumber(): Promise<string> {
+  await requireMintsoftReadAccess()
+  const row = await db.setting.findUnique({ where: { key: SHOP_IOSS_NUMBER_SETTING } })
+  return row?.value ?? ''
+}
+
+export async function saveShopIossNumber(raw: unknown): Promise<{ success: boolean; error?: string }> {
+  await requireMintsoftWriteAccess()
+  const text = typeof raw === 'string' ? raw.trim() : ''
+  const parsed = text ? parseShopIossNumber(text) : ''
+  if (parsed === null) return { success: false, error: 'An IOSS number is IM followed by ten digits, for example IM1234567890, or blank to clear it.' }
+  const previous = await db.$transaction(async (tx) => {
+    const row = await tx.setting.findUnique({ where: { key: SHOP_IOSS_NUMBER_SETTING } })
+    await tx.setting.upsert({
+      where: { key: SHOP_IOSS_NUMBER_SETTING },
+      create: { key: SHOP_IOSS_NUMBER_SETTING, value: parsed },
+      update: { value: parsed },
+    })
+    return row?.value ?? ''
+  })
+  if (previous !== parsed) {
+    await logActivity({
+      entityType: 'SYNC',
+      tag: 'sync',
+      action: 'shop_ioss_number_updated',
+      level: 'INFO',
+      description: parsed ? `Shop IOSS number ${previous ? `changed from ${previous} to ${parsed}` : `set to ${parsed}`}.` : `Shop IOSS number cleared (was ${previous}).`,
+      metadata: { before: previous, after: parsed },
+    })
+  }
   revalidatePath('/sync')
   return { success: true }
 }
@@ -2434,12 +2513,14 @@ export async function saveMintsoftBinding(
           data: {
             ...bindingData,
             ...(pointsAtSameTarget ? {} : { pairingChangedAt: new Date() }),
-            alignmentConfirmedAt: bindingData.stockSyncMode === 'ALIGN_TO_WMS'
-              ? (
-                  existingBinding.stockSyncMode === 'ALIGN_TO_WMS' && pointsAtSameTarget
-                    ? existingBinding.alignmentConfirmedAt
-                    : null
-                )
+            alignmentConfirmedAt: alignmentConfirmationSurvivesSave({
+              wasAlignToWms: existingBinding.stockSyncMode === 'ALIGN_TO_WMS',
+              willBeAlignToWms: bindingData.stockSyncMode === 'ALIGN_TO_WMS',
+              pointsAtSameTarget,
+              previousThresholds: existingBinding.discrepancyThresholds,
+              nextThresholds: discrepancyThresholds,
+            })
+              ? existingBinding.alignmentConfirmedAt
               : null,
           },
         })
@@ -3951,6 +4032,8 @@ export async function createMintsoftPurchaseOrderAsn(
           // the post-maintenance recheck sweep. Setting it on the strength of the warehouse's status,
           // before any receipt has been applied, would close the very populations that would otherwise
           // catch the missing stock. The booked-in service sets it, from the quantities it really booked in.
+          // INVARIANT: BOOKED_IN written here means "the warehouse says so", NOT "IMS has the receipt". It stays
+          // in the incoming-stock arm while closedAt is null (lib/domain/wms/asn-awaiting-units.ts); keep it null.
           closedAt: null,
         },
       })
@@ -4149,6 +4232,16 @@ export async function createMintsoftPurchaseOrderAsn(
       }
     }
 
+    // o3d-gwh4: an `existing` row left BOOKED_IN with closedAt still NULL is the state a failed booked-in reconciliation leaves (the row is
+    // kept mapped on purpose so no duplicate goes out). Pressing create again must RETRY that reconciliation, not report "already exists".
+    // This never creates an ASN: it re-reads the ASN IMS already holds and re-drives the booked-in recheck for it.
+    if (outcome.kind === 'existing' && outcome.status === 'BOOKED_IN') {
+      replayWarning = await reconcileMintsoftAsnReceiptAfterMapping(
+        { ...outcome, remoteStatusName: 'booked in' },
+        { poId: parsedId.data },
+      )
+    }
+
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${parsedId.data}`)
     revalidatePath('/sync')
@@ -4158,7 +4251,7 @@ export async function createMintsoftPurchaseOrderAsn(
       externalAsnId: outcome.externalAsnId,
       message:
         outcome.kind === 'existing'
-          ? `Mintsoft ASN ${outcome.externalAsnId} already exists for this purchase order.`
+          ? `Mintsoft ASN ${outcome.externalAsnId} already exists for this purchase order.${replayWarning ? ` ${replayWarning}` : ''}`
           : outcome.kind === 'recovered'
             ? `Recovered Mintsoft ASN ${outcome.externalAsnId}.${replayWarning ? ` ${replayWarning}` : ''}`
             : `Created Mintsoft ASN ${outcome.externalAsnId}.${replayWarning ? ` ${replayWarning}` : ''}`,
@@ -5160,6 +5253,8 @@ export async function createMintsoftTransferAsn(
           // the post-maintenance recheck sweep. Setting it on the strength of the warehouse's status,
           // before any receipt has been applied, would close the very populations that would otherwise
           // catch the missing stock. The booked-in service sets it, from the quantities it really booked in.
+          // INVARIANT: BOOKED_IN written here means "the warehouse says so", NOT "IMS has the receipt". It stays
+          // in the incoming-stock arm while closedAt is null (lib/domain/wms/asn-awaiting-units.ts); keep it null.
           closedAt: null,
         },
       })
@@ -5350,6 +5445,16 @@ export async function createMintsoftTransferAsn(
       }
     }
 
+    // o3d-gwh4: an `existing` row left BOOKED_IN with closedAt still NULL is the state a failed booked-in reconciliation leaves (the row is
+    // kept mapped on purpose so no duplicate goes out). Pressing create again must RETRY that reconciliation, not report "already exists".
+    // This never creates an ASN: it re-reads the ASN IMS already holds and re-drives the booked-in recheck for it.
+    if (outcome.kind === 'existing' && outcome.status === 'BOOKED_IN') {
+      replayWarning = await reconcileMintsoftAsnReceiptAfterMapping(
+        { ...outcome, remoteStatusName: 'booked in' },
+        { transferId: parsedId.data },
+      )
+    }
+
     revalidatePath('/stock-control/transfers')
     revalidatePath('/sync')
 
@@ -5358,7 +5463,7 @@ export async function createMintsoftTransferAsn(
       externalAsnId: outcome.externalAsnId,
       message:
         outcome.kind === 'existing'
-          ? `Mintsoft ASN ${outcome.externalAsnId} already exists for this transfer.`
+          ? `Mintsoft ASN ${outcome.externalAsnId} already exists for this transfer.${replayWarning ? ` ${replayWarning}` : ''}`
           : outcome.kind === 'recovered'
             ? `Recovered Mintsoft ASN ${outcome.externalAsnId}.${replayWarning ? ` ${replayWarning}` : ''}`
             : `Created Mintsoft ASN ${outcome.externalAsnId}.${replayWarning ? ` ${replayWarning}` : ''}`,
@@ -5469,8 +5574,11 @@ export async function updateMintsoftReturnInboxStatus(
   const isResolvedStatus = ['QUARANTINED', 'REFUNDED_ONLY', 'REPLACED', 'INSPECT', 'DISMISSED']
     .includes(parsedStatus.data)
 
-  await db.wmsReturnsInbox.update({
-    where: { id: item.id },
+  // Compare-and-set: a restock that committed after the read above left the row RESTOCKED, and an
+  // unconditional update by id would overwrite that and let a second restock through. Postgres re-checks
+  // this predicate after waiting on the restock's row lock, so the loser matches nothing.
+  const written = await db.wmsReturnsInbox.updateMany({
+    where: { id: item.id, connector: 'mintsoft', status: { not: 'RESTOCKED' } },
     data: {
       status: parsedStatus.data,
       resolvedAt: isResolvedStatus ? new Date() : null,
@@ -5479,6 +5587,9 @@ export async function updateMintsoftReturnInboxStatus(
         : `Marked ${parsedStatus.data.toLowerCase().replace(/_/g, ' ')} from Mintsoft sync dashboard`,
     },
   })
+  if (written.count === 0) {
+    return { success: false, error: 'This Mintsoft return has already been restocked.' }
+  }
 
   await logActivity({
     entityType: 'SYNC',
@@ -5510,6 +5621,7 @@ export async function restockMintsoftReturnInboxItem(
   let returnedProductIds: string[] = []
   let successMessage = 'Mintsoft return restocked.'
   let activityMetadata: MintsoftReturnRestockActivityMetadata | null = null
+  let partlyCoveredQty = 0
 
   // Pool read before the transaction: the ledger an arrival that clears a refund's Stock in Transit would post to.
   const receiptAccounting = await readReceiptAccounting()
@@ -5547,6 +5659,7 @@ export async function restockMintsoftReturnInboxItem(
           select: {
             id: true,
             code: true,
+            name: true,
             active: true,
           },
         }),
@@ -5594,13 +5707,42 @@ export async function restockMintsoftReturnInboxItem(
         if (receipt.expectationIds.length > 0) rows = receipt.rows
       }
 
+      // Units a refund already restocked (or whose expectation covers them) are not restocked or journalled again: the
+      // refund's own COGS reversal already credited them. Only the uncovered remainder is valued below.
+      if (item.orderId) {
+        const netted = await netUnpricedReturnRowsAgainstRefunds(tx, { inboxId: item.id, orderId: item.orderId, rows })
+        if (netted.coveredQty > 0) {
+          if (netted.rows.length === 0) {
+            throw new Error(
+              `These ${netted.coveredQty} unit${netted.coveredQty === 1 ? ' was' : 's were'} already restocked by the refund on this order. Mark the item Refunded only; it was not restocked again and nothing was valued or journalled.`,
+            )
+          }
+          partlyCoveredQty = netted.coveredQty
+        }
+        rows = netted.rows
+      }
+      // A row no expectation priced has no unit cost; give it one so the units enter with a cost layer.
+      const pricedRows = await priceUnpricedReturnRows(tx, warehouse.id, rows)
+      const alreadyBooked = await tx.stockMovement.count({
+        where: { type: 'RETURN_INBOUND', referenceType: 'WmsReturnsInbox', referenceId: item.id, toWarehouseId: warehouse.id },
+      })
       const returnedRows = await applyReturnInboundStockTx(tx, {
         referenceType: 'WmsReturnsInbox',
         referenceId: item.id,
         warehouseId: warehouse.id,
-        rows,
+        rows: pricedRows,
         note: 'Mintsoft return restock',
       })
+      // The value that pricing added is journalled in this transaction (Dr Inventory / Cr COGS), so the GL ties to the layers.
+      if (alreadyBooked === 0) {
+        await queueReturnRestockValueJournal(tx, {
+          inboxId: item.id,
+          warehouse: { id: warehouse.id, code: warehouse.code, name: warehouse.name },
+          originalRows: rows,
+          pricedRows,
+          adjustmentReasonId: data.adjustmentReasonId ?? null,
+        })
+      }
 
       await tx.wmsReturnsInbox.update({
         where: { id: item.id },
@@ -5608,12 +5750,12 @@ export async function restockMintsoftReturnInboxItem(
           status: 'RESTOCKED',
           warehouseId: warehouse.id,
           resolvedAt: new Date(),
-          resolutionNote: `Restocked ${qty} unit${qty === 1 ? '' : 's'} to ${warehouse.code}`,
+          resolutionNote: `Restocked ${qty - partlyCoveredQty} unit${qty - partlyCoveredQty === 1 ? '' : 's'} to ${warehouse.code}${partlyCoveredQty > 0 ? `; ${partlyCoveredQty} already restocked by the refund` : ''}`,
         },
       })
 
       returnedProductIds = returnedRows.map((row) => row.productId)
-      successMessage = `Restocked ${qty} unit${qty === 1 ? '' : 's'} of ${item.sku ?? 'the product'} to ${warehouse.code}.`
+      successMessage = `Restocked ${qty - partlyCoveredQty} unit${qty - partlyCoveredQty === 1 ? '' : 's'} of ${item.sku ?? 'the product'} to ${warehouse.code}.${partlyCoveredQty > 0 ? ` ${partlyCoveredQty} unit${partlyCoveredQty === 1 ? ' was' : 's were'} already covered by the refund's restock, so only the remainder was valued.` : ''}`
       activityMetadata = {
         inboxId: item.id,
         externalReturnId: item.externalReturnId,

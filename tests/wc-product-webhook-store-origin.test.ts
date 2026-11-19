@@ -113,7 +113,7 @@ function reset() {
   state.syncResult = { success: true }
   state.stockSyncCalls = []
   state.activity = []
-  state.settings = new Map([['wc_sync_enabled', 'true'], ['wc_url', STORE_A]])
+  state.settings = new Map([['wc_sync_enabled', 'true'], ['wc_url', STORE_A], ['wc_sync_product_enabled', 'true'], ['wc_sync_product_direction', 'from_wc']])
   state.settingReads = []
 }
 
@@ -164,7 +164,8 @@ test('receipt records the store the delivery names, from the delivery itself', a
   const persisted = await receive(body, { 'x-wc-webhook-source': `${STORE_A}/` })
 
   assert.equal(persisted.length, 1)
-  assert.equal(persisted[0].originAttestation, 'store:store-a.example.com')
+  // o3d-h5b79: header-only evidence is recorded as UNSIGNED, not as the plain `store:` encoding.
+  assert.equal(persisted[0].originAttestation, 'store-header:store-a.example.com')
   // NOT smuggled into the body: idempotency is the sha256 of the exact signed bytes, so
   // touching the payload would break redelivery dedupe.
   assert.deepEqual(persisted[0].payload, PRODUCT_PAYLOAD)
@@ -181,7 +182,7 @@ test('a delivery ALREADY IN FLIGHT when the rebind lands is recorded as the OLD 
 
   const persisted = await receive(body, { 'x-wc-webhook-source': `${STORE_A}/` })
 
-  assert.equal(persisted[0].originAttestation, 'store:store-a.example.com')
+  assert.equal(persisted[0].originAttestation, 'store-header:store-a.example.com')
 })
 
 test('the signed body is asked FIRST, and outranks a contradictory source header', async () => {
@@ -217,6 +218,23 @@ test('a delivery that names no store records THAT, positively, rather than a bla
 
   assert.equal(persisted[0].originAttestation, 'unproven:not-stated')
 })
+
+// --- o3d-h5b79: a header outside the signature is not proof of the store -------------------------
+
+for (const header of ['store-header:store-a.example.com', 'store-header:store-b.example.com']) {
+  test(`header-only evidence "${header}" is HELD (503): nothing imported, no stock correction`, async () => {
+    reset()
+    const response = await dispatchProduct(header)
+
+    assert.equal(response.status, 503)
+    assert.deepEqual(state.syncCalls, [])
+    assert.deepEqual(state.stockSyncCalls, [])
+    const held = state.activity.find((entry) => entry.action === 'wc_product_webhook_held')
+    assert.ok(held)
+    assert.equal((held.metadata as Row).originScope, 'header')
+    assert.equal(refusal(), undefined, 'held, not acknowledged as foreign')
+  })
+}
 
 // --- retry: the recorded origin is replayed, never re-derived ------------------------------
 

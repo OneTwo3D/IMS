@@ -1,4 +1,6 @@
+import { businessDateYmd } from '@/lib/business-date'
 import { shareLockOrderTaxRates } from '@/lib/tax/writable-tax-rate'
+import { mintRequiredDocumentNumber } from '@/lib/domain/numbering/mint'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { Prisma, type AccountingSyncType } from '@/app/generated/prisma/client'
@@ -23,6 +25,7 @@ import { priorRefundedTax } from '@/lib/domain/sales/refund-182-prior-tax'
 import { addMoney, currencyMinorUnits, multiplyMoney, roundQuantity, subtractMoney, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { isFullRefundAmount } from '@/lib/domain/sales/refund-thresholds'
+import { resolveUnearnedReversal } from '@/lib/domain/sales/refund-unearned-remainder'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
 import {
   REVERSAL_STAGING_NOT_STAGED,
@@ -45,6 +48,7 @@ import {
   postedCreditNoteTotalCheck,
   priceRefundTaxIdentity,
   priceSnapshottedTaxIdentity,
+  orderDiscountReversalRateRefusal,
   type PostedCreditNoteLeg,
 } from '@/lib/domain/sales/refund-posted-tax-identity'
 import { scheduleRefundReservationReleaseOutbox, scheduleRefundUnmatchedWarningOutbox, isRefundReleaseEligible, hasUnmatchedSaleRefund } from '@/lib/domain/sales/refund-reservation-release-outbox'
@@ -70,14 +74,13 @@ import {
   assertedJournalRemedy,
   cappedAllocationCredit,
   describeJournalRowState,
-  extractPayloadNetMovement,
   isAssertedJournalRefusal,
   journalRowProvesAmount,
-  payloadLinesLegible,
   proveAllocationDebitPosting,
   proveJournalPosting,
   unprovedJournalClause,
 } from '@/lib/domain/accounting/allocation-debit-posting-proof'
+import { journalNetMovement, journalNetsReadable, unearnedReversalDebit } from '@/lib/domain/accounting/journal-account-nets'
 import { LEDGER_STANDING_SELECT, ledgerStanding, workSlotStanding } from '@/lib/domain/accounting/ledger-standing'
 import { findDurableShadowRecords, shadowRecordNamesSyncLog } from '@/lib/domain/outbound-shadow/durable-evidence'
 import { withSavepoint } from '@/lib/db/savepoint'
@@ -89,6 +92,7 @@ import { REFUND_ACCOUNTING_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
 import { raiseWmsOperatorTask, refundNoteQuery, warehouseOrderRef } from '@/lib/domain/wms/operator-tasks'
 import { SHOP_REFUND_CONNECTOR, raiseShopRefundTask } from '@/lib/domain/sales/shop-refund-tasks'
+import { returnExchangeRefusals } from '@/lib/domain/sales/return-exchange'
 
 /**
  * Deliberate call-site boundary for this number-shaped refund service contract.
@@ -429,6 +433,27 @@ export type RefundAccountingSyncRequest = {
  */
 export type RefundCreationConflict = 'prior-refund' | 'prior-chargeback'
 
+/**
+ * THE EXCHANGE HOOK OF A REFUND (Return exchanges). The refund transaction calls it twice, both under the order's row lock:
+ *   check  - before anything is written: whether replacement lines may be added to the order now (null) or the operator-wording refusal (nothing is created).
+ *   apply  - once the refund row exists: add the replacement lines linked to it, move the order's totals, queue the posted invoice's update. It returns the NET (ex-VAT) value it added to the order in the BASE currency,
+ *            because the refund is classified full or partial against the order total AFTER the replacement lines are on it: a return that is refunded in full but replaced is a partial refund of a larger order,
+ *            which keeps the order's demand, allocation and shipping alive (a fully refunded order holds none).
+ * A throw from either rolls the whole refund back.
+ */
+export type ReturnExchangeHook = {
+  check(tx: Prisma.TransactionClient): Promise<string | null>
+  apply(tx: Prisma.TransactionClient, context: { refundId: string; creditNoteNumber: string }): Promise<{ addedNetBase: number }>
+}
+
+/** Thrown inside the refund transaction to roll it back with an operator-wording message (the exchange would leave the order fully refunded). */
+class ReturnExchangeRefusedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ReturnExchangeRefusedError'
+  }
+}
+
 export type CreateSalesOrderRefundResult =
   | { success: false; error: string; conflict?: RefundCreationConflict; quarantine?: true }
   | {
@@ -641,47 +666,6 @@ export function reconcileStagedAndFallbackReturnRows(
   return { rows: [...stagedRows, ...added], split: splitOf(added) }
 }
 
-async function getExistingCreditNoteNumberMax(
-  tx: Prisma.TransactionClient,
-  prefix: string,
-): Promise<number> {
-  const parseSuffix = (value: string | null): number => {
-    if (!value?.startsWith(prefix)) return 0
-    const suffix = value.slice(prefix.length)
-    return /^\d+$/.test(suffix) ? Number.parseInt(suffix, 10) : 0
-  }
-  const rows = await tx.salesOrderRefund.findMany({
-    where: { creditNoteNumber: { startsWith: prefix } },
-    select: { creditNoteNumber: true },
-  })
-  return rows.reduce((max, row) => Math.max(max, parseSuffix(row.creditNoteNumber)), 0)
-}
-
-async function nextCreditNoteNumber(
-  tx: Prisma.TransactionClient,
-  params: { prefix: string; date?: Date },
-): Promise<string> {
-  const date = params.date ?? new Date()
-  const year = date.getFullYear()
-  const counterKey = `document_counter:credit_note:${year}`
-  await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${counterKey}))`
-  const row = await tx.setting.findUnique({
-    where: { key: counterKey },
-    select: { value: true },
-  })
-  const prefix = `${params.prefix}${year}-`
-  const current = row?.value
-    ? Number.parseInt(row.value, 10)
-    : await getExistingCreditNoteNumberMax(tx, prefix)
-  const next = Number.isFinite(current) && current >= 0 ? current + 1 : 1
-  await tx.setting.upsert({
-    where: { key: counterKey },
-    create: { key: counterKey, value: String(next) },
-    update: { value: String(next) },
-  })
-  return `${params.prefix}${year}-${String(next).padStart(5, '0')}`
-}
-
 /**
  * 6oyu.5: composite key for the ORIGINALLY-POSTED per-layer COGS of a shipment
  * line. Keyed by shipment line AND cost layer because the same cost layer can be
@@ -805,7 +789,7 @@ async function getShipmentLineCostSnapshot(
  * This function does not decide WHEN shipped units come back; it only never invents units that did not
  * ship. Nothing here is read outside the order lock: callers build rows inside the refund transaction.
  */
-async function buildRefundFallbackReturnRows(
+export async function buildRefundFallbackReturnRows(
   client: RefundServiceClient,
   orderId: string,
   lines: Array<RefundRequestLine | CreatedRefundLine>,
@@ -869,6 +853,9 @@ async function buildRefundFallbackReturnRows(
           lines: {
             select: { id: true, productId: true, description: true, qty: true, totalBase: true, unitPriceBase: true, salesOrderLineId: true },
           },
+          // o3d-lqcjv: an in-transit refund writes no RETURN_INBOUND movement until its goods arrive; its return document is the record
+          // of what it expects back, per refund line and component product.
+          returnExpectation: { select: { lines: { select: { refundLineId: true, productId: true, qty: true } } } },
         },
       },
     },
@@ -996,19 +983,23 @@ async function buildRefundFallbackReturnRows(
     // configured AND a part-shipped kit AND successive refunds; non-kit lines are unaffected because
     // their estimate is exact. The durable fix is to persist returned component quantities per refund
     // line outside retention.
-    const movements = await client.stockMovement.findMany({
-      where: { type: 'RETURN_INBOUND', referenceType: 'SalesOrderRefund', referenceId: refund.id },
-      select: { productId: true, qty: true, idempotencyKey: true },
-    })
+    // o3d-lqcjv: an IN-TRANSIT refund's record is its return document (arrivals book against it, so its quantity already includes what
+    // came in): read it instead of the movements, or a later partial refund of a part-shipped kit builds a second expectation for
+    // components already on the first document.
+    const recordRows: Array<{ refundLineId: string | undefined; productId: string; qty: number }> = refund.returnExpectation
+      ? refund.returnExpectation.lines.map((l) => ({ refundLineId: l.refundLineId, productId: l.productId, qty: refundBoundaryNumber(l.qty) }))
+      : (await client.stockMovement.findMany({
+          where: { type: 'RETURN_INBOUND', referenceType: 'SalesOrderRefund', referenceId: refund.id },
+          select: { productId: true, qty: true, idempotencyKey: true },
+        })).map((m) => ({ refundLineId: m.idempotencyKey?.match(REFUND_MOVEMENT_LINE)?.[1], productId: m.productId, qty: refundBoundaryNumber(m.qty) }))
     const attributedLineIds = new Set<string>()
-    for (const movement of movements) {
-      const refundLineId = movement.idempotencyKey?.match(REFUND_MOVEMENT_LINE)?.[1]
-      const refundLine = refundLineId ? refundLineById.get(refundLineId) : undefined
+    for (const movement of recordRows) {
+      const refundLine = movement.refundLineId ? refundLineById.get(movement.refundLineId) : undefined
       if (!refundLine || !refundLine.productId) continue
       debitAcross(
         sortedCandidatesFor({ ...refundLine, lineId: refundLine.salesOrderLineId, productId: refundLine.productId }),
         movement.productId,
-        refundBoundaryNumber(movement.qty),
+        movement.qty,
       )
       attributedLineIds.add(refundLine.id)
     }
@@ -1361,10 +1352,12 @@ async function createReturnInboundMovementAndCostLayersTx(
     idempotencyKey?: string
   },
 ): Promise<'created' | 'duplicate'> {
+  let createdMovement: { id: string } | undefined
   try {
     // o3d-slrn: returning 'duplicate' leaves the CALLER continuing on this same tx, so the
     // failing insert must be savepointed or everything after it hits a 25P02.
-    await withSavepoint(tx, () => tx.stockMovement.create({
+    createdMovement = await withSavepoint(tx, () => tx.stockMovement.create({
+      select: { id: true },
       data: {
         type: 'RETURN_INBOUND',
         productId: params.movementRow.productId,
@@ -1413,6 +1406,8 @@ async function createReturnInboundMovementAndCostLayersTx(
         remainingQty: row.qty,
         unitCostBase: unitCostBase.toFixed(6),
         poLineId: row.poLineId ?? null,
+        // o3d-ngmt.22: which movement created this layer, so deleting the refund removes exactly the layers its own return made.
+        returnMovementId: createdMovement?.id ?? null,
       },
       select: { id: true },
     })
@@ -1502,6 +1497,10 @@ function allocateRefundQtyAcrossLines<T extends { id: string }>(
   return taken
 }
 
+function hasRecordedReturn(value: unknown): boolean {
+  return Array.isArray(value) ? value.length > 0 : value != null
+}
+
 function consumeRefundLineQuantity(
   lineStates: Array<{
     id: string
@@ -1520,6 +1519,12 @@ function consumeRefundLineQuantity(
     totalBase: number
     unitPriceBase?: number | null
   },
+  /**
+   * Take unshipped units BEFORE shipped ones. Only the "is anything still to ship" test uses it, for a refund that
+   * brought no stock back: such a refund cannot have been a return of shipped goods, so a line of 3 with 2 shipped
+   * and 1 refunded has had its never-to-ship unit refunded, not a shipped one.
+   */
+  preferUnshipped = false,
 ): {
   shippedRevenue: number
   unshippedRevenue: number
@@ -1549,26 +1554,36 @@ function consumeRefundLineQuantity(
     if (remainingQty <= 0 || line.qty <= 0) break
 
     const unitRevenue = line.totalBase / line.qty
-    const shippedQtyAvailable = remainingShipped.get(line.id) ?? 0
-    const shippedTake = Math.min(remainingQty, shippedQtyAvailable)
-    if (shippedTake > 0) {
-      const shippedValue = unitRevenue * shippedTake
-      shippedRevenue += shippedValue
-      assignedRevenue += shippedValue
-      remainingQty -= shippedTake
-      remainingShipped.set(line.id, shippedQtyAvailable - shippedTake)
-      lineAllocations.push({ lineId: line.id, shippedQty: shippedTake, unshippedQty: 0 })
+    const takeShipped = (): void => {
+      const shippedQtyAvailable = remainingShipped.get(line.id) ?? 0
+      const shippedTake = Math.min(remainingQty, shippedQtyAvailable)
+      if (shippedTake > 0) {
+        const shippedValue = unitRevenue * shippedTake
+        shippedRevenue += shippedValue
+        assignedRevenue += shippedValue
+        remainingQty -= shippedTake
+        remainingShipped.set(line.id, shippedQtyAvailable - shippedTake)
+        lineAllocations.push({ lineId: line.id, shippedQty: shippedTake, unshippedQty: 0 })
+      }
     }
-
-    const unshippedQtyAvailable = remainingUnshipped.get(line.id) ?? 0
-    const unshippedTake = Math.min(remainingQty, unshippedQtyAvailable)
-    if (unshippedTake > 0) {
-      const unshippedValue = unitRevenue * unshippedTake
-      unshippedRevenue += unshippedValue
-      assignedRevenue += unshippedValue
-      remainingQty -= unshippedTake
-      remainingUnshipped.set(line.id, unshippedQtyAvailable - unshippedTake)
-      lineAllocations.push({ lineId: line.id, shippedQty: 0, unshippedQty: unshippedTake })
+    const takeUnshipped = (): void => {
+      const unshippedQtyAvailable = remainingUnshipped.get(line.id) ?? 0
+      const unshippedTake = Math.min(remainingQty, unshippedQtyAvailable)
+      if (unshippedTake > 0) {
+        const unshippedValue = unitRevenue * unshippedTake
+        unshippedRevenue += unshippedValue
+        assignedRevenue += unshippedValue
+        remainingQty -= unshippedTake
+        remainingUnshipped.set(line.id, unshippedQtyAvailable - unshippedTake)
+        lineAllocations.push({ lineId: line.id, shippedQty: 0, unshippedQty: unshippedTake })
+      }
+    }
+    if (preferUnshipped) {
+      takeUnshipped()
+      takeShipped()
+    } else {
+      takeShipped()
+      takeUnshipped()
     }
   }
 
@@ -1623,6 +1638,11 @@ async function stageRefundAccountingReversals(
   const refundRevenue = Math.round(params.refundLines.reduce((sum, line) => sum + toNetRevenue(line.totalBase), 0) * 100) / 100
 
   const reversalAmounts = await runInTransaction(client, async (tx) => {
+    // The order row lock Group B takes on every order it journals (lockSalesOrders in daily-sync). Staging reads
+    // shipment recognition and writes an unearned reversal that can sweep the WHOLE remaining deferral; without a
+    // shared lock Group B could be recognising that same deferral in an uncommitted transaction, and both would
+    // debit Unearned for it. Taken first, before any cost-layer lock, like every other writer in this domain.
+    await lockSalesOrder(tx, params.orderId)
     const orderAccounting = await tx.salesOrder.findUnique({
       where: { id: params.orderId },
       select: {
@@ -1706,6 +1726,14 @@ async function stageRefundAccountingReversals(
             // at staging, BEFORE any enqueue; while the flag stands, the journal it describes may never
             // have been queued, and an absent journal must not be read as "retention deleted it".
             accountingRetryRequired: true,
+            // The unearned this earlier refund's reversal debited (durable; its sync row is not) and the
+            // witness that says whether it staged at all: the remainder sweep nets them.
+            unearnedReversedAmount: true,
+            reversalStagingState: true,
+            // Whether it brought stock back. A refund that did not cannot have been a return of shipped goods.
+            returnShipmentQty: true,
+            returnCostSplit: true,
+            chargeback: true,
             lines: {
               select: {
                 id: true,
@@ -1755,6 +1783,7 @@ async function stageRefundAccountingReversals(
         referenceType: true,
         referenceId: true,
         payload: true,
+        payloadAccountNets: true,
         ...LEDGER_STANDING_SELECT,
       },
     })
@@ -2037,8 +2066,32 @@ async function stageRefundAccountingReversals(
 
     const priorUnearnedReversedRows = livePriorReversals
       .filter((row) => row.type === 'UNEARNED_REV_REVERSAL')
+    // o3d-oyur (Codex r1 HIGH): a reversal whose lines are gone AND whose compaction summary is missing
+    // (a legacy compacted row, no backfill) moved an UNKNOWN amount, which is not a zero one. Counting it as
+    // zero raised the open unearned balance by whatever that reversal took and let this refund debit
+    // Unearned Revenue again. Unknown withholds this refund's unearned reversal altogether (the safe
+    // direction: it can only under-reverse, leaving a visible liability) and the refund says so.
+    const unreadableUnearnedReversalRows = priorUnearnedReversedRows
+      .filter((row) => unearnedReversalDebit(row, settings.unearnedRevenueAccount) == null)
     const priorUnearnedReversed = priorUnearnedReversedRows
-      .reduce((sum, row) => sum + extractPayloadNetMovement(row.payload, settings.unearnedRevenueAccount, 'debit'), 0)
+      .reduce((sum, row) => sum + (unearnedReversalDebit(row, settings.unearnedRevenueAccount) ?? 0), 0)
+    if (unreadableUnearnedReversalRows.length > 0) {
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SALES_ORDER',
+          entityId: params.orderId,
+          action: 'refund_unearned_reversal_withheld_unreadable_prior',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: `${unreadableUnearnedReversalRows.length} earlier UNEARNED_REV_REVERSAL journal(s) for this order have no readable lines and no preserved account summary (compacted before summaries existed), so how much unearned revenue they already reversed cannot be established. This refund reversed NO unearned revenue rather than risk reversing it twice: the unearned revenue account for this order needs reviewing.`,
+          metadata: {
+            orderId: params.orderId,
+            refundId: params.refundId,
+            unreadableReversalCount: unreadableUnearnedReversalRows.length,
+          },
+        },
+      })
+    }
     // o3d-3la07 (M7, REPORT-ONLY - the arithmetic above is unchanged). An UNEARNED_REV_REVERSAL that an
     // operator settled as posted still reduces the unearned revenue this refund may reverse (the
     // reversal is claimed to exist, so counting it errs towards under-reversing), but its figure is the
@@ -2212,7 +2265,7 @@ async function stageRefundAccountingReversals(
       }
       const journal = await tx.accountingSyncLog.findUnique({
         where: { id: record.syncLogId },
-        select: { connector: true, payload: true, ...LEDGER_STANDING_SELECT },
+        select: { connector: true, payload: true, payloadAccountNets: true, ...LEDGER_STANDING_SELECT },
       })
       // Deleted by retention once terminal: read as the recorded amount, the least destructive of
       // the two readings left — but ASSUMED, not proved (o3d-o97 r6). Retention deletes SYNCED and
@@ -2313,7 +2366,13 @@ async function stageRefundAccountingReversals(
         priorRefundReliefUnresolved = `an order-level Allocated Inventory reversal journal was settled as posted by an OPERATOR typing in a document id (${describeJournalRowState(row)}) - IMS did not verify it against the ledger, and its lines are what was queued, so how much it credited Allocated Inventory cannot be established`
         continue
       }
-      priorRefundAllocationRelief += extractPayloadNetMovement(row.payload, settings.allocatedInventoryAccount, 'credit')
+      // o3d-oyur (Codex r1 HIGH): null is UNKNOWN (lines compacted away, no summary), never zero relief.
+      const orderLevelRelief = journalNetMovement(row, settings.allocatedInventoryAccount, 'credit')
+      if (orderLevelRelief == null) {
+        priorRefundReliefUnresolved = `an order-level Allocated Inventory reversal journal (${describeJournalRowState(row)}) has no readable lines and no preserved account summary, so how much it already credited Allocated Inventory cannot be established`
+        continue
+      }
+      priorRefundAllocationRelief += orderLevelRelief
     }
     for (const priorRefund of orderAccounting?.refunds ?? []) {
       // (1) THE RECORD the refund wrote when it decided its own reversal — RESOLVED, not trusted.
@@ -2496,7 +2555,7 @@ async function stageRefundAccountingReversals(
       const unsettled = reversalRows.filter((row) => !journalRowProvesAmount(row))
       // Read only when `unsettled` is empty (below), i.e. when EVERY row proves an amount, so no further
       // settled-ness filter is needed (one would be unobservable, and a second spelling of the rule).
-      const legible = reversalRows.filter((row) => payloadLinesLegible(row.payload))
+      const legible = reversalRows.filter((row) => journalNetsReadable(row))
       if (unsettled.length > 0) {
         // Deliberately BEFORE the arithmetic, and a refusal rather than a partial figure: an
         // in-flight or abandoned reversal is pounds that may or may not have moved, and either
@@ -2671,20 +2730,39 @@ async function stageRefundAccountingReversals(
       remainingUnshippedQtyByLine.set(line.id, unshippedQty)
     }
 
+    // "Is anything still to ship" is decided from a SECOND pair of maps: shipped coverage, ordered qty and refunded
+    // qty per line. The pair above books a refund against shipped units first (right for COGS and revenue), which
+    // reads a refund of a never-to-ship unit on a part-shipped line as a refund of a shipped one and leaves that
+    // unit "outstanding" for ever. A refund that brought no stock back is booked against unshipped units first
+    // here, because it cannot have been a return of goods that left.
+    const toShipShippedQtyByLine = new Map(remainingShippedQtyByLine)
+    const toShipUnshippedQtyByLine = new Map(remainingUnshippedQtyByLine)
+
     for (const priorRefund of orderAccounting?.refunds ?? []) {
+      // A chargeback takes the money back for goods the customer keeps: shipped units first, like the booking.
+      const priorNothingCameBack = !priorRefund.chargeback
+        && !hasRecordedReturn(priorRefund.returnShipmentQty) && priorRefund.returnCostSplit == null
       for (const priorRefundLine of priorRefund.lines) {
+        const consumed = {
+          lineId: priorRefundLine.salesOrderLineId,
+          productId: priorRefundLine.productId,
+          description: priorRefundLine.description,
+          qty: refundBoundaryNumber(priorRefundLine.qty),
+          totalBase: refundBoundaryNumber(priorRefundLine.totalBase),
+          unitPriceBase: refundBoundaryNumber(priorRefundLine.unitPriceBase),
+        }
         consumeRefundLineQuantity(
           lineContexts,
           remainingShippedQtyByLine,
           remainingUnshippedQtyByLine,
-          {
-            lineId: priorRefundLine.salesOrderLineId,
-            productId: priorRefundLine.productId,
-            description: priorRefundLine.description,
-            qty: refundBoundaryNumber(priorRefundLine.qty),
-            totalBase: refundBoundaryNumber(priorRefundLine.totalBase),
-            unitPriceBase: refundBoundaryNumber(priorRefundLine.unitPriceBase),
-          },
+          consumed,
+        )
+        consumeRefundLineQuantity(
+          lineContexts,
+          toShipShippedQtyByLine,
+          toShipUnshippedQtyByLine,
+          consumed,
+          priorNothingCameBack,
         )
       }
     }
@@ -2882,6 +2960,13 @@ async function stageRefundAccountingReversals(
       )
       shippedQtyRevenue += allocation.shippedRevenue
       unshippedQtyRevenue += allocation.unshippedRevenue
+      consumeRefundLineQuantity(
+        lineContexts,
+        toShipShippedQtyByLine,
+        toShipUnshippedQtyByLine,
+        refundLine,
+        !stockReturned && !params.chargeback,
+      )
 
       const costSnapshot: CostLayerSnapshotEntry[] = []
       for (const lineAllocation of allocation.lineAllocations) {
@@ -2944,10 +3029,76 @@ async function stageRefundAccountingReversals(
       ))
     }
 
-    const remainingUnearned = Math.round(Math.max(
-      0,
-      refundBoundaryNumber(params.so.unearnedRevenueAmount) - totalRecognized - priorUnearnedReversed,
-    ) * 100) / 100
+    // THE REMAINDER SWEEP RESTS ON DURABLE FACTS ONLY. `priorUnearnedReversed` sums sync rows that
+    // `retention_sync_logs_months` hard-deletes, so on its own it under-counts what earlier refunds already took and
+    // the sweep would debit Unearned below zero. The sweep's prior-reversal figure therefore comes from each earlier
+    // refund's own `unearnedReversedAmount` (refund rows are never deleted); a refund written before the column (NULL)
+    // counts only through a sync row that is still readable, or the witness that it never staged. Any earlier refund
+    // that is none of those makes the figure unprovable, and then the sweep does not run at all.
+    let sweepPriorReversed = 0
+    const sweepUnprovenRefundIds: string[] = []
+    for (const row of priorUnearnedReversedRows) {
+      if (row.referenceType === 'SalesOrderRefund') continue
+      sweepPriorReversed += unearnedReversalDebit(row, settings.unearnedRevenueAccount) ?? 0
+    }
+    for (const priorRefund of orderAccounting?.refunds ?? []) {
+      const rowsTotal = priorUnearnedReversedRows
+        .filter((row) => row.referenceType === 'SalesOrderRefund' && row.referenceId === priorRefund.id)
+        .reduce((sum, row) => sum + (unearnedReversalDebit(row, settings.unearnedRevenueAccount) ?? 0), 0)
+      const rowCount = priorUnearnedReversedRows
+        .filter((row) => row.referenceType === 'SalesOrderRefund' && row.referenceId === priorRefund.id).length
+      if (priorRefund.unearnedReversedAmount != null) {
+        sweepPriorReversed += Math.max(refundBoundaryNumber(priorRefund.unearnedReversedAmount), rowsTotal)
+      } else if (rowCount > 0) {
+        sweepPriorReversed += rowsTotal
+      } else if (priorRefund.reversalStagingState === REVERSAL_STAGING_NOT_STAGED) {
+        // never staged: owes and took nothing
+      } else {
+        sweepUnprovenRefundIds.push(priorRefund.id)
+      }
+    }
+    // Open deferral after shipment recognition and every reversal known to have been taken: the larger of what the
+    // readable journals say and what the refunds recorded durably, because retention only ever erodes the former.
+    // It caps the line-driven reversal too, so a compacted journal cannot make an ordinary refund debit Unearned
+    // below zero either.
+    const remainingUnearned = unreadableUnearnedReversalRows.length > 0
+      ? 0
+      : Math.round(Math.max(
+        0,
+        refundBoundaryNumber(params.so.unearnedRevenueAmount) - totalRecognized
+          - Math.max(sweepPriorReversed, priorUnearnedReversed),
+      ) * 100) / 100
+    const sweepTrusted = unreadableUnearnedReversalRows.length === 0 && sweepUnprovenRefundIds.length === 0
+    // Never more than the deferral stamped on the order less the recognition stamped on its shipments less every
+    // reversal known to have been taken; and nothing at all when an earlier refund's reversal cannot be established.
+    const sweepableUnearned = sweepTrusted ? remainingUnearned : 0
+
+    // Shipped coverage, ordered and refunded qty per line, over lines that actually ship. A line that never ships
+    // (no product, or a NON_INVENTORY product: a service or fee line) has nothing to wait for.
+    // With no shippable line at all nothing proves the order is done shipping, so that stays outstanding.
+    const shippableLines = lineContexts.filter((line) => (
+      !!line.productId && fulfillmentGraph.get(line.productId)?.type !== 'NON_INVENTORY'
+    ))
+    const hasOutstandingUnshippedQty = shippableLines.length === 0
+      || shippableLines.some((line) => (toShipUnshippedQtyByLine.get(line.id) ?? 0) > 0.0000001)
+    const sweepWouldApply = params.newStatus === 'REFUNDED' || !hasOutstandingUnshippedQty
+    if (sweepWouldApply && !sweepTrusted && unreadableUnearnedReversalRows.length === 0) {
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SALES_ORDER',
+          entityId: params.orderId,
+          action: 'refund_unearned_sweep_withheld_unproven_prior',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: `Refund ${params.refundId} did not sweep the order's remaining unearned revenue: ${sweepUnprovenRefundIds.length} earlier refund(s) have no recorded unearned reversal and no readable journal (retention deletes them), so how much of the deferral is still open cannot be established. Only the refund's own line value was reversed. Check the unearned revenue account for this order.`,
+          metadata: {
+            orderId: params.orderId,
+            refundId: params.refundId,
+            unprovenRefundIds: sweepUnprovenRefundIds,
+          },
+        },
+      })
+    }
     // 6oyu.5: shipment-source entries are valued at the ORIGINALLY-POSTED COGS
     // (applyPostedShipmentUnitCosts), so both the COGS reversal below and the
     // returned-stock new inventory layer (snapshotReturnRows, shipment-source only)
@@ -3390,9 +3541,18 @@ async function stageRefundAccountingReversals(
     //    order, naming which record was missing and how many pounds are still sitting in the
     //    account. Surfaced by `sales_order_refund_allocation_basis_unresolved` in the accounting
     //    invariants.
+    const unearnedReversal = resolveUnearnedReversal({
+      remainingUnearned,
+      sweepableUnearned,
+      lineDrivenRevenue: unshippedQtyRevenue + nonQtyRevenue,
+      isFullRefund: params.newStatus === 'REFUNDED',
+      hasOutstandingUnshippedQty,
+    })
     await tx.salesOrderRefund.update({
       where: { id: params.refundId },
       data: {
+        // Durable, so a later refund's remainder sweep can net it after retention deletes this refund's journal.
+        unearnedReversedAmount: unearnedReversal,
         allocatedReliefAmount: allocationReversal,
         allocationBasisUnresolved: unresolvedNote,
         // o3d-2sm1 (Codex r1): THE WITNESS. Written here — one statement before the un-stage below,
@@ -3434,10 +3594,9 @@ async function stageRefundAccountingReversals(
       // COGS reconciliation has an independent subledger source (the GL gets the 2dp
       // value above; the 6dp-vs-2dp residue is what the reconciliation sweeps).
       cogsReversalBase: roundQuantity(sumCostLayerSnapshot(shipmentRefundSnapshot), 6).toNumber(),
-      unearnedReversal: Math.min(
-        remainingUnearned,
-        Math.round((unshippedQtyRevenue + nonQtyRevenue) * 100) / 100,
-      ),
+      // o3d-hqvrp.37/.38: sweep the remainder no later posting can recognise (a 99.9% FULL refund, or the
+      // shipping/discount share once the unshipped remainder has been refunded).
+      unearnedReversal,
       // o3d-o97: the lines' own allocation cost, capped by the open balance, PLUS — on a full
       // refund — the part of that balance no line reached. On a resolved full refund the two sum
       // to exactly the open balance.
@@ -3468,7 +3627,7 @@ async function stageRefundAccountingReversals(
   // khdw: capture the COGS reversal's GL posting date once so it both drives the
   // journal payload and is persisted on the refund for the daily-batch reconciliation.
   if (reversalAmounts.cogsReversal > 0 && !params.chargeback) {
-    const cogsReversalJournalDate = new Date().toISOString().slice(0, 10)
+    const cogsReversalJournalDate = businessDateYmd(new Date())
     // Goods in transit are not in Inventory: the debit goes to Stock in Transit until they arrive (the inventory
     // sub-ledger is cost layers, and none exists for units that are not back). Only a refund that actually
     // returns stock is in transit (`returnWarehouseId`). A refund with nothing to return has no shipped cost
@@ -3590,7 +3749,7 @@ async function stageRefundAccountingReversals(
       // it and previously had nothing at all naming its chart.
       chartConnector: settings.connector,
       payload: {
-        date: new Date().toISOString().slice(0, 10),
+        date: businessDateYmd(new Date()),
         reference: hasUnearnedReversal
           ? `Unearned reversal: ${params.orderRef}`
           : `Allocation reversal: ${params.orderRef}`,
@@ -3878,12 +4037,38 @@ function stagedAReversal(syncs: RefundAccountingSyncRequest[]): boolean {
   return syncs.some((sync) => sync.type === 'COGS_REVERSAL' || sync.type === 'UNEARNED_REV_REVERSAL')
 }
 
+/**
+ * An operator-typed refund needs a booked sale. A DRAFT never has one. A PENDING_PAYMENT order is refused only while it carries no recorded payment, receipt (`paidAt`) or invoice:
+ * `addPayment` never moves an order's status, so a confirmed order can hold real money while still PENDING_PAYMENT, and that money must stay refundable (cancelling it would be terminal and unrefundable).
+ */
+export function manualRefundStatusRefusal(
+  status: string,
+  booked: { hasPayment: boolean; hasInvoice?: boolean; paidAt?: Date | null } = { hasPayment: false },
+): string | null {
+  if (status === 'DRAFT') return 'A draft order has not been booked, so it cannot be refunded. Delete the draft instead.'
+  if (status === 'PENDING_PAYMENT' && !booked.hasPayment && !booked.hasInvoice && !booked.paidAt) {
+    return 'This order is still waiting for payment and has no recorded payment or receipt, so there is nothing to refund. Delete the order if it was created in error; if a payment has been received, record it first.'
+  }
+  return null
+}
+
+/** The first refund line whose order-line id is not one of the order's own lines, or null. */
+export function refundLinesNotOnOrder<T extends { lineId?: string | null; description?: string | null }>(
+  refundLines: ReadonlyArray<T>,
+  orderLines: ReadonlyArray<{ id: string }>,
+): T | null {
+  const ids = new Set(orderLines.map((l) => l.id))
+  return refundLines.find((l) => l.lineId != null && !ids.has(l.lineId)) ?? null
+}
+
 export async function createSalesOrderRefund(
   client: RefundServiceClient,
   input: {
     orderId: string
     lines: RefundRequestLine[]
     reason: string
+    /** The structured reason (a configured ReturnReason id), validated by the caller. Optional; the free-text `reason` above is separate. */
+    returnReasonId?: string | null
     returnWarehouseId?: string
     externalRefundId?: number
     creditNotePrefix: string
@@ -3951,6 +4136,8 @@ export async function createSalesOrderRefund(
     statedGrossForeign?: number
     /** IOSS credit notes, rate 182: the tax the WooCommerce refund states across ALL its rate ids, set only when the refund carried tax on the EAS plugin's rate 182. Honoured only with `euVatSchemeSnapshot`, and only from an internal caller. */
     eas182StatedTaxForeign?: number
+    /** An exchange recorded with this return: replacement lines added to the SAME order, in this transaction, linked to this refund. Set only by the operator's refund action (never by an internal caller). */
+    exchange?: ReturnExchangeHook
   },
 ): Promise<CreateSalesOrderRefundResult> {
   // THE ROW-SHAPE CHECKS RUN ON THE REQUEST AS SENT, before any filtering: a row the filter below would drop (a negative quantity with no money)
@@ -4037,6 +4224,8 @@ export async function createSalesOrderRefund(
         externalOrderNumber: true,
         orderNumber: true,
         status: true,
+        paidAt: true,
+        invoiceNumber: true,
         refundStatus: true,
         fxRateToBase: true,
         totalBase: true,
@@ -4087,6 +4276,16 @@ export async function createSalesOrderRefund(
     })
     if (!so) return { error: 'Order not found' } as const
 
+    // Every refund line that names an order line must name one of THIS order's lines: a foreign id would be stored as-is and pollute per-line refunded quantities. Pure tightening for every caller.
+    const foreignLine = refundLinesNotOnOrder(refundLines, so.lines)
+    if (foreignLine) return { error: `Refund line "${foreignLine.description ?? foreignLine.lineId}" names an order line that does not belong to this order.` } as const
+    // An operator-typed (manual) refund needs a booked sale: a draft or an order still waiting for payment has nothing to return and no invoice to credit. Internal callers (storefront, chargeback) are unchanged.
+    if (input.deriveSaleLineNetsFromStoredBalance) {
+      const paymentRows = await tx.payment.count({ where: { orderId: input.orderId, refundId: null } })
+      const stateRefusal = manualRefundStatusRefusal(so.status, { hasPayment: paymentRows > 0, hasInvoice: !!so.invoiceNumber, paidAt: so.paidAt })
+      if (stateRefusal) return { error: stateRefusal } as const
+    }
+
     // o3d-q0x56.8 - THE ORDER'S BOOKED RATE, OR A REFUSAL. Never 1 for a missing one: a foreign order with no usable
     // stored rate would have had every refund line converted one-for-one. A credit note reverses what was booked, so
     // no table rate is looked up in its place either. A base-currency order is 1 because `currency === base`.
@@ -4105,6 +4304,12 @@ export async function createSalesOrderRefund(
         return { error: `Refund not created: ${error.message}`, quarantine: true as const }
       }
       throw error
+    }
+
+    // AN EXCHANGE IS CHECKED BEFORE ANYTHING IS WRITTEN: under the order lock, the replacement lines may be added now, or the whole refund is refused (nothing created).
+    if (input.exchange) {
+      const refusal = await input.exchange.check(tx)
+      if (refusal) return { error: refusal } as const
     }
 
     // The itemised sale lines are cut from what each order line has LEFT, here, under the order lock (see deriveSaleLineNetsFromStoredBalance).
@@ -4160,7 +4365,7 @@ export async function createSalesOrderRefund(
           // check cannot tell two lines of one product apart, so a line is never refunded above its own units.
           const remainingQty = qty - (takenQty.get(id) ?? 0)
           if (refundLine.qty > remainingQty + 1e-9) {
-            return { error: `Refund qty ${refundLine.qty} for "${orderLine.description}" exceeds the ${Math.max(0, remainingQty)} still refundable on that line.` } as const
+            return { error: `Refund qty ${refundLine.qty} for "${orderLine.description}" exceeds the ${Math.max(0, remainingQty)} still refundable on that line.`, quarantine: true as const } as const
           }
           const foreign = refundableNet({
             line: { qty, net: refundBoundaryNumber(orderLine.totalForeign) },
@@ -4691,7 +4896,7 @@ export async function createSalesOrderRefund(
     // fixed rounding epsilon (not a 0.1% relative slack, which on a large order
     // is pounds of headroom) so N partial refunds can't creep over.
     if (refundWouldExceedOrderTotal(totalBase, previouslyRefunded, netOrderTotal)) {
-      return { error: 'Refund total would exceed order total' } as const
+      return { error: 'Refund total would exceed order total', quarantine: true as const } as const
     }
 
     const existingRefundLines = await tx.salesOrderRefundLine.findMany({
@@ -4708,7 +4913,7 @@ export async function createSalesOrderRefund(
       const priorNetForeign = existingRefundLines.reduce((sum, line) => sum + refundBoundaryNumber(line.totalForeign), 0)
       const newNetForeign = refundLines.reduce((sum, line) => sum + storedForeign(line), 0)
       if (priorNetForeign + newNetForeign > netPaidForeign + 0.005) {
-        return { error: 'Refund total would exceed what the order was paid in its own currency.' } as const
+        return { error: 'Refund total would exceed what the order was paid in its own currency.', quarantine: true as const } as const
       }
       // Earlier refunds are valued line by line at the rate each was posted at. A line whose rate cannot be established is valued conservatively:
       // a positive credit at the HIGHER of the blended rate and the order's highest line rate, a reversal (negative) at no VAT at all.
@@ -4727,7 +4932,7 @@ export async function createSalesOrderRefund(
       }, 0)
       const newGrossForeign = refundLines.reduce((sum, line) => sum + storedForeign(line) * (1 + publicGrossRateOf!(line.lineId ?? null, storedForeign(line))), 0)
       if (priorGrossForeign + newGrossForeign > paidForeign + 0.005) {
-        return { error: `The credit note, including VAT, would exceed what the order was paid in its own currency.${usedFallbackRate ? ' (An earlier refund\'s VAT rate could not be established, so it was counted at the highest rate on the order.)' : ''}` } as const
+        return { error: `The credit note, including VAT, would exceed what the order was paid in its own currency.${usedFallbackRate ? ' (An earlier refund\'s VAT rate could not be established, so it was counted at the highest rate on the order.)' : ''}`, quarantine: true as const } as const
       }
     }
 
@@ -4803,7 +5008,7 @@ export async function createSalesOrderRefund(
       const alreadyRefunded = refundedQtyByProduct.get(refundLine.productId) ?? 0
       const remainingRefundable = originalQty - alreadyRefunded
       if (refundLine.qty > remainingRefundable + 0.001) {
-        return { error: `Refund qty ${refundLine.qty} for product ${refundLine.productId} exceeds remaining refundable qty ${remainingRefundable.toFixed(2)}` } as const
+        return { error: `Refund qty ${refundLine.qty} for product ${refundLine.productId} exceeds remaining refundable qty ${remainingRefundable.toFixed(2)}`, quarantine: true as const } as const
       }
     }
 
@@ -4980,7 +5185,19 @@ export async function createSalesOrderRefund(
         // netted into the same order total the shipping residue is read out of — so it cannot be
         // checked one leg at a time. On a chargeback it is checked together with shipping below
         // (Codex r8 #5), which is the one shape where IMS holds the pair's combined VAT.
-        if (lineKind === 'discount') continue
+        if (lineKind === 'discount') {
+          // o3d-hqvrp.323: the server-derived order-discount reversal of a PUBLIC refund (priced as 'shipping': both post under the order default's code; never caller-supplied, and not the chargeback pair, which is checked together with shipping below): its posting rate must be the rate the order's discount was charged at.
+          if (input.deriveSaleLineNetsFromStoredBalance && !input.chargeback && !creditsNothing(refundLine)) {
+            const discountLabel = 'The order discount reversal'
+            const pricedDiscount = priceRefundTaxIdentity({ kind: 'shipping', orderDefaultTaxType, reverseChargeSalesTaxType, rateByTaxType: postingRates, label: discountLabel })
+            // A default code that cannot be priced is not refused here: the leg is left to the cumulative ceiling and the post-time refusal, as before.
+            if (pricedDiscount.ok) {
+              const rateRefusal = orderDiscountReversalRateRefusal({ postedRate: pricedDiscount.vatRate, chargedRate: so.taxRatePercent, label: discountLabel })
+              if (rateRefusal) return refuse(rateRefusal)
+            }
+          }
+          continue
+        }
         const linkedLine = refundLine.lineId ? salesLineMoneyById.get(refundLine.lineId) : undefined
         // The net THIS money came off, in the order's currency — the same figure the refund line is
         // stored at, so a stated VAT is priced against the amount it was stated for.
@@ -5133,8 +5350,9 @@ export async function createSalesOrderRefund(
       0,
     ))
     const headerTotalBase = round4Sum(refundLines.reduce((sum, line) => sum + round4Sum(line.totalBase), 0))
-    const creditNoteNumber = await nextCreditNoteNumber(tx, {
-      prefix: input.creditNotePrefix,
+    // The credit note pattern (Settings → Company → Numbering) decides the number; the prefix passed in is only what the default pattern starts with. The value minted here is stored on the refund and is the one the accounting payload carries.
+    const creditNoteNumber = await mintRequiredDocumentNumber(tx, 'credit_note', {
+      fallbackPrefix: input.creditNotePrefix,
     })
 
     // o3d-n8p: the WRITER stamps what the stored totals mean and where the refund came from — derived from
@@ -5181,6 +5399,19 @@ export async function createSalesOrderRefund(
       if (input.statedGrossForeign != null && Number.isFinite(input.statedGrossForeign)) frozenGross = input.statedGrossForeign
       else if (complete) frozenGross = gross.toDecimalPlaces(currencyMinorUnits(so.currency), 4).toNumber()
     }
+    // o3d-hqvrp.321: EVERY refund records the rate of each line's tax code as of now (the scheme freeze above is the same figure where it ran), so the credit-note history never re-prices a posted line from a tax table edited since.
+    // The rate each line's tax code carries now. A line whose code cannot be priced stores none (the history then says estimated); the table read itself is allowed to fail normally, as every other read in this transaction.
+    let postedLineRates: Array<string | null>
+    if (frozenRates !== null) postedLineRates = frozenRates
+    else {
+      const postedIndex = buildTaxTypeRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))
+      postedLineRates = refundLines.map((refundLine) => {
+        const kind: 'sale' | 'shipping' | 'discount' = refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale'
+        const code = resolveRefundLineTaxIdentity(refundLine.lineId, kind).accountingTaxType
+        const priced = code ? priceSnapshottedTaxIdentity({ accountingTaxType: code, rateByTaxType: postedIndex, label: 'refund line' }) : null
+        return priced !== null && priced.ok ? priced.rate.toString() : null
+      })
+    }
     const createdRefund = await tx.salesOrderRefund.create({
       data: {
         orderId: input.orderId,
@@ -5191,6 +5422,7 @@ export async function createSalesOrderRefund(
         // by lib/connectors/woocommerce/sync/refund-stock-correction.ts once the stock job is durably recorded.
         stockCorrectionRequired: storefrontRefund && refundLines.some((line) => line.qty > 0 && Boolean(line.productId)),
         reason: input.reason || null,
+        returnReasonId: input.returnReasonId ?? null,
         totalForeign,
         totalBase: headerTotalBase,
         totalsBasis: 'NET',
@@ -5273,6 +5505,7 @@ export async function createSalesOrderRefund(
           accountingTaxType: taxIdentity.accountingTaxType,
           reverseCharge: taxIdentity.reverseCharge,
           lineKind,
+          postedTaxRate: postedLineRates[refundLineIndex] ?? null,
           ...(refundLine.chargedTaxForeign != null && Number.isFinite(refundLine.chargedTaxForeign) ? { chargedTaxForeign: Math.round(Math.abs(refundLine.chargedTaxForeign) * 10000) / 10000 } : {}),
           ...(schemeSnapshot?.scheme === true ? { postingTaxType: schemeSnapshot.postingTaxType, schemeTaxRateValue: frozenRates?.[refundLineIndex] ?? null } : {}),
         },
@@ -5306,6 +5539,12 @@ export async function createSalesOrderRefund(
       })
     }
 
+    // THE REPLACEMENT LINES GO ON THE ORDER NOW, before the refund is classified: a return that is replaced is a refund of a LARGER order. They are added (and the posted invoice's update queued) in this
+    // transaction, so the refund, its credit note and the exchange commit together or not at all.
+    const exchangeApplied = input.exchange
+      ? await input.exchange.apply(tx, { refundId: createdRefund.id, creditNoteNumber })
+      : null
+
     const totalRefundedNow = previouslyRefunded + totalBase
     // Chargebacks unwind recognised revenue on the NET (ex-VAT) basis: the refund
     // lines are stored net and the credit note grosses them back up via taxType to
@@ -5320,7 +5559,7 @@ export async function createSalesOrderRefund(
     // 0, so this is identical to the gross basis for them. Safe to use the net total unconditionally here:
     // an order with any legacy/unknown-basis refund was already blocked above (o3d-n8p), so at this point
     // every refund on the order is NET-basis.
-    const orderTotal = netOrderTotal
+    const orderTotal = netOrderTotal + (exchangeApplied?.addedNetBase ?? 0)
     // `newStatus` is the refund *classification* (drives the accounting reversal
     // treatment), NOT the order's lifecycle status — refund state is now the
     // orthogonal refundStatus dimension.
@@ -5330,7 +5569,12 @@ export async function createSalesOrderRefund(
     // A cancelled order has nothing to refund — preserve the prior reject (the old
     // status machine blocked CANCELLED → REFUNDED/PARTIALLY_REFUNDED).
     if (so.status === 'CANCELLED') {
+      if (exchangeApplied) throw new ReturnExchangeRefusedError('Cannot refund a cancelled order')
       return { error: 'Cannot refund a cancelled order' } as const
+    }
+    // A replaced return that STILL refunds the whole order (replacement worth nothing) would leave the order fully refunded: it would hold no demand and the replacement lines could not be shipped.
+    if (exchangeApplied && newStatus === 'REFUNDED') {
+      throw new ReturnExchangeRefusedError(returnExchangeRefusals.wouldFullyRefund)
     }
     // The lifecycle status is left untouched; only the refund disposition is written,
     // so an order can be e.g. Delivered + Fully refunded and keep flowing through
@@ -5497,6 +5741,7 @@ export async function createSalesOrderRefund(
     if (isRefundReturnSourceError(error)) {
       return { error: refundReturnSourceErrorMessage(error) } as const
     }
+    if (error instanceof ReturnExchangeRefusedError) return { error: error.message } as const
     throw error
   })
 

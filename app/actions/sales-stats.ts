@@ -3,6 +3,7 @@
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
+import { assertOverviewAnalyticsAccess } from '@/lib/security/overview-analytics-access'
 import { logActivity } from '@/lib/activity-log'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { REFUND_TURNOVER_SELECT, type TurnoverBound } from '@/lib/domain/sales/customer-turnover'
@@ -110,7 +111,7 @@ export type SalesStatSummary = {
 }
 
 export async function getProductSalesStats(dateFrom?: string, dateTo?: string): Promise<{ rows: SalesStatRow[]; summary: SalesStatSummary }> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -341,7 +342,7 @@ export type ShipmentRow = {
 }
 
 export async function getShipments(dateFrom?: string, dateTo?: string): Promise<ShipmentRow[]> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -396,7 +397,7 @@ export type DetailRow = {
 }
 
 export async function getDetails(dateFrom?: string, dateTo?: string): Promise<DetailRow[]> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -454,7 +455,7 @@ export type InvoiceRow = {
 }
 
 export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promise<InvoiceRow[]> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -532,7 +533,7 @@ export type RefundRow = {
 }
 
 export async function getRefundStats(dateFrom?: string, dateTo?: string): Promise<RefundRow[]> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const dateFilter: Record<string, unknown> = {}
   if (dateFrom) dateFilter.gte = new Date(dateFrom)
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
@@ -614,7 +615,7 @@ export type CustomerAgingRow = {
 }
 
 export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
-  await requirePermission('analytics')
+  assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
   const orders = await db.salesOrder.findMany({
     // Paid orders are not excluded in the query: receivableBalance (one arithmetic shared with AR Aging and the
     // Invoices tab) decides what is still owed, including orders held as paid with no Payment row.
@@ -658,7 +659,8 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
       overdue0_30: Math.round(o0 * 100) / 100, overdue31_60: Math.round(o31 * 100) / 100,
       overdue61_90: Math.round(o61 * 100) / 100, overdue91plus: Math.round(o91 * 100) / 100,
     }
-  }).filter((row) => row.dueAmount > 0.01)
+  // An indeterminate zero balance (an unplaceable credit valued at 0) is possibly owed, not settled: keep it, flagged by dueBound.
+  }).filter((row) => row.dueAmount > 0.01 || row.dueBound === 'indeterminate')
 }
 
 // ---------------------------------------------------------------------------
@@ -681,7 +683,9 @@ export async function getSavedViews(): Promise<SavedView[]> {
 }
 
 export async function saveView(view: SavedView): Promise<void> {
+  // Saved views are shared by everyone; a write needs more than the read-only `analytics` permission.
   await requirePermission('analytics')
+  await requirePermission('purchasing.create')
   const views = await getSavedViews()
   const existing = views.findIndex((v) => v.id === view.id)
   if (existing >= 0) views[existing] = view; else views.push(view)
@@ -696,7 +700,9 @@ export async function saveView(view: SavedView): Promise<void> {
 }
 
 export async function deleteView(viewId: string): Promise<void> {
+  // Saved views are shared by everyone; a write needs more than the read-only `analytics` permission.
   await requirePermission('analytics')
+  await requirePermission('purchasing.create')
   const views = await getSavedViews()
   const deleted = views.find((v) => v.id === viewId)
   await db.setting.upsert({ where: { key: 'sales_stats_views' }, create: { key: 'sales_stats_views', value: JSON.stringify(views.filter((v) => v.id !== viewId)) }, update: { value: JSON.stringify(views.filter((v) => v.id !== viewId)) } })

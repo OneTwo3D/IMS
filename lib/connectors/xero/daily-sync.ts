@@ -83,6 +83,9 @@ import {
   type ForeignJournalState,
 } from '@/lib/domain/accounting/allocation-debit-passes'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
+import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
+import { GRIR_BALANCE_SOURCE_TYPES } from '@/lib/domain/accounting/grir-subledger-movement'
+import { buildGrirReclassJournal, buildGrirReclassReferenceId, netGrirMovements } from '@/lib/domain/accounting/grir-reclass-journal'
 import { loadUnjournaledReturnCredits, unjournaledReturnKey } from '@/lib/domain/accounting/unjournaled-return-cogs'
 import { clampRecreateWindowToCutoff, recreateRetentionWindow } from '@/lib/domain/accounting/daily-batch-retention'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
@@ -102,6 +105,8 @@ import {
   countedUnearnedReversalRows,
   describeUnearnedReversalReport,
   sumPostedUnearnedReversal,
+  durableUnearnedReversalTopUp,
+  unreadableUnearnedReversalRows,
   isFullyShippedNetOfRefunds,
   batchContainsFinalUnjournaledShipment,
   unearnedReversalStandingReport,
@@ -129,11 +134,23 @@ type AccountingMirrorClient = Pick<Prisma.TransactionClient, 'accountingSyncLog'
 
 import { XERO_DAILY_BATCH_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { refreshXeroBooksLockDate } from '@/lib/connectors/xero/books-lock-date'
-import { groupByPostingDate, isOnOrBeforeLock, laterDay, lockBlocksRun, lockBlocksRunMessage, lockedJournalSkipMessage, lockedPeriodNarration, parseBatchDay, utcDay } from '@/lib/domain/accounting/daily-batch-event-date'
+import { businessDateYmd } from '@/lib/business-date'
+import { groupByPostingDate, isOnOrBeforeLock, laterDay, lockBlocksRun, lockBlocksRunMessage, lockedJournalSkipMessage, lockedPeriodNarration, parseBatchDay, businessDay } from '@/lib/domain/accounting/daily-batch-event-date'
 import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
+import { findDurableShadowRecords } from '@/lib/domain/outbound-shadow/durable-evidence'
 const XERO_CONNECTOR = 'xero'
 export const XERO_DAILY_BATCH_DEFAULT_LIMIT = 1_000
 export const XERO_DAILY_BATCH_MAX_LIMIT = 5_000
+/** Cap on ids a multi-pass group excludes from its window in one run (Prisma `notIn` fails above ~32,767 binds). */
+export const DAILY_BATCH_MAX_EXCLUDED_IDS = 5_000
+/**
+ * Most passes one Group B mode makes per run. Every pass is its own transaction under the session
+ * accounting lock (refund creation waits on it), so a refused backlog must not be walked one shipment
+ * per pass: the bound is on passes, not just on the exclusion list.
+ */
+export const DAILY_BATCH_MAX_GROUP_B_PASSES = 5
+/** Group B row-locks up to a whole batch window of orders and cost layers; Prisma's 5 s default would roll it back on one busy order. */
+export const GROUP_B_TX_OPTIONS = { maxWait: 10_000, timeout: 120_000 }
 const DAILY_BATCH_TYPES = [
   'DAILY_BATCH_REVENUE_DEFERRAL',
   'DAILY_BATCH_INVENTORY_ALLOC',
@@ -141,6 +158,7 @@ const DAILY_BATCH_TYPES = [
   'DAILY_BATCH_INVENTORY_RECONCILIATION',
   'DAILY_BATCH_COGS_RECONCILIATION',
   'DAILY_BATCH_TRANSIT_RECONCILIATION',
+  'DAILY_BATCH_GRIR_RECLASS',
 ] as const
 
 // GL postings round to the canonical GL precision (cogs-audit scjz.60); these
@@ -434,14 +452,18 @@ function returnSnapshotLayers(
   }
 }
 
+type PendingSyncLogParams = {
+  type: 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B' | 'DAILY_BATCH_INVENTORY_RECONCILIATION' | 'DAILY_BATCH_COGS_RECONCILIATION' | 'DAILY_BATCH_TRANSIT_RECONCILIATION' | 'DAILY_BATCH_GRIR_RECLASS'
+  referenceId: string
+  payload: Record<string, unknown>
+  currency: string
+}
+
 async function createPendingSyncLog(
   tx: AccountingMirrorClient,
-  params: {
-    type: 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B' | 'DAILY_BATCH_INVENTORY_RECONCILIATION' | 'DAILY_BATCH_COGS_RECONCILIATION' | 'DAILY_BATCH_TRANSIT_RECONCILIATION'
-    referenceId: string
-    payload: Record<string, unknown>
-    currency: string
-  },
+  params: PendingSyncLogParams,
+  /** Optional: set to whether the journal was QUEUED (false = the producer hold recorded a shadow and nothing was queued). */
+  outcome?: { queued: boolean },
 ): Promise<string> {
   // o3d-19gy: the connection this batch was composed against. A daily-batch journal carries no external
   // document id, but every account code and tax type in it was resolved from the chart of accounts of
@@ -492,7 +514,9 @@ async function createPendingSyncLog(
   // The producer-side hold said SHADOW: the journal is recorded as a shadow and NOTHING is queued - no outbox job and no
   // accounting event. The shadow row's own id is returned (status CANCELLED, never posted by IMS), so the batch stamps
   // the rows it was built from with an id whose status says what happened to it, exactly as for a queued journal.
+  if (outcome) outcome.queued = false
   if (created.shadowed) return created.shadowed.id
+  if (outcome) outcome.queued = true
   const log = created.row
   await scheduleXeroAccountingOutbox(tx, {
     accountingSyncLogId: log.id,
@@ -731,6 +755,10 @@ export type XeroDailyBatchResult = {
   cogsReconciliationSwept?: number | null
   // 6oyu.4 (khdw): same, for the STOCK_IN_TRANSIT subledger-vs-GL rounding sweep.
   transitReconciliationSwept?: number | null
+  /** GR/IR accrual: how many reclass journals this run staged (0 while `grir_xero_posting_enabled` is off, which is the default). */
+  grirReclassJournals?: number
+  /** GR/IR reclass journals the producer hold recorded as shadows this run (their source rows stay unconsumed). */
+  grirReclassShadowed?: number
 }
 
 export function resolveXeroDailyBatchLimit(value = process.env.XERO_DAILY_BATCH_LIMIT): number {
@@ -1487,7 +1515,7 @@ function refuseNegativeBasisShipmentCogs(
 }
 
 /** The lock reaches today, so a group stages nothing this run: say so, actionably, in the activity log. */
-async function reportLockBlocksRun(group: 'A1' | 'A2' | 'B', lockDate: string | null): Promise<void> {
+async function reportLockBlocksRun(group: 'A1' | 'A2' | 'B' | 'GR/IR', lockDate: string | null): Promise<void> {
   if (!lockDate) return
   await logActivity({
     entityType: 'SYSTEM',
@@ -1506,7 +1534,7 @@ async function reportLockBlocksRun(group: 'A1' | 'A2' | 'B', lockDate: string | 
  * log write must never change what the batch did.
  */
 async function reportLockedPeriodMoves(
-  group: 'A1' | 'A2' | 'B',
+  group: 'A1' | 'A2' | 'B' | 'GR/IR',
   journalDate: string,
   movedFromLockedDays: readonly string[],
   lockDate: string | null,
@@ -1545,6 +1573,105 @@ async function reportNegativeBasisRefusals(
   }
 }
 
+/**
+ * GR/IR ACCRUAL: stage the daily reclass journal(s) of the GR/IR sub-ledger, only while `grir_xero_posting_enabled` is 'true'.
+ *
+ * OFF (the default) is the whole of the first line: nothing is read, staged or stamped, and the sub-ledger keeps accruing from the receipts and bills
+ * that write it. ON, every sub-ledger row not yet consumed (`xeroBatchRef` null) is grouped by its resolved posting day (the same lock-date rule
+ * every group follows: an event in a locked period is dated the first open day, and waits while the lock reaches today), netted per day, and staged as
+ * one DAILY_BATCH_GRIR_RECLASS journal through the SAME producer seam as every other batch journal, so the hold applies: a SHADOW is recorded and
+ * nothing is queued. The rows a day's journal was built from are stamped with its reference in the same transaction, so they are never consumed twice,
+ * and, when the journal was actually queued, the transit sub-ledger records the Stock in Transit movement the journal makes (a shadow moves nothing in
+ * the ledger, so it records nothing there). A failure never aborts the batch: the postings above already committed.
+ */
+async function stageGrirReclassJournals(
+  settings: Awaited<ReturnType<typeof getXeroSettings>>,
+  baseCurrency: string,
+  context: { today: string; lockDate: string | null },
+  batchLimit: number,
+  result: XeroDailyBatchResult,
+): Promise<void> {
+  result.grirReclassJournals = 0
+  if (settings.grir_xero_posting_enabled !== 'true') return
+  try {
+    const transitAccount = settings.xero_transit_account?.trim() ?? ''
+    const grirAccount = settings.xero_grir_account?.trim() ?? ''
+    if (!transitAccount || !grirAccount) {
+      result.errors.push('GR/IR posting is switched on but the Stock in Transit account or the GR/IR account (setting xero_grir_account) is not mapped, so no GR/IR reclass journal was staged. Map both accounts, or switch GR/IR posting off.')
+      return
+    }
+    if (lockBlocksRun(context)) {
+      await reportLockBlocksRun('GR/IR', context.lockDate)
+      return
+    }
+    const moves: Array<{ date: string; movedFromLockedDays: string[] }> = []
+    await db.$transaction(async (tx) => {
+      const window = takeDailyBatchWindow(await tx.grirSubledgerMovement.findMany({
+        where: { sourceType: { in: [...GRIR_BALANCE_SOURCE_TYPES] }, xeroBatchRef: null },
+        select: { id: true, baseDelta: true, journalDate: true },
+        orderBy: [{ journalDate: 'asc' }, { id: 'asc' }],
+        take: batchLimit + 1,
+      }), batchLimit)
+      if (window.rows.length === 0) return
+      const dated = groupByPostingDate(window.rows, (row) => businessDay(row.journalDate), context)
+      for (const group of dated.groups) {
+        const referenceId = buildGrirReclassReferenceId(group.date, group.rows.map((row) => row.id))
+        const journal = buildGrirReclassJournal({
+          net: netGrirMovements(group.rows),
+          rowCount: group.rows.length,
+          transitAccount,
+          grirAccount,
+          lockedPeriodNote: lockedPeriodNarration(group.movedFromLockedDays, context.lockDate),
+        })
+        if (journal) {
+          const staged = { queued: false }
+          await createPendingSyncLog(tx, {
+            type: 'DAILY_BATCH_GRIR_RECLASS',
+            referenceId,
+            currency: baseCurrency,
+            payload: {
+              date: group.date,
+              reference: `GR/IR reclass ${group.date} ${referenceId.slice(-8)}`,
+              narration: journal.narration,
+              lines: journal.lines,
+              batchReferenceId: referenceId,
+              batchDate: group.date,
+              batchGroup: 'GRIR_RECLASS',
+              batchEntityCount: group.rows.length,
+              _postingMode: 'submitted',
+            },
+          }, staged)
+          // A shadow is never posted by IMS: the ledger did not move, so the transit sub-ledger must not claim it did, and the rows the journal was
+          // built from are NOT consumed. Unlike A2 and Group B (which stamp their source rows with the shadow's id), a GR/IR movement is the only
+          // record of its accrual: nothing re-derives it, so consuming it into a shadow would lose it for good when the hold is lifted. The shadow is
+          // recorded again (same batch reference while the rows are unchanged) and the rows post on the first run after the hold is lifted.
+          if (!staged.queued) {
+            result.grirReclassShadowed = (result.grirReclassShadowed ?? 0) + 1
+            continue
+          }
+          await recordTransitSubledgerMovement(tx, {
+            sourceType: 'GRIR_RECLASS',
+            sourceRef: referenceId,
+            idempotencyKey: `grir-reclass:${referenceId}`,
+            baseDelta: journal.transitDelta,
+            journalDate: group.date,
+          })
+          result.grirReclassJournals = (result.grirReclassJournals ?? 0) + 1
+        }
+        await tx.grirSubledgerMovement.updateMany({
+          where: { id: { in: group.rows.map((row) => row.id) }, xeroBatchRef: null },
+          data: { xeroBatchRef: referenceId },
+        })
+        moves.push({ date: group.date, movedFromLockedDays: group.movedFromLockedDays })
+      }
+    })
+    // Reported only AFTER the transaction committed, so a rolled-back run does not report a move that never happened.
+    for (const move of moves) await reportLockedPeriodMoves('GR/IR', move.date, move.movedFromLockedDays, context.lockDate)
+  } catch (e) {
+    result.errors.push(`GR/IR reclass error: ${String(e)}`)
+  }
+}
+
 export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
   const batchLimit = resolveXeroDailyBatchLimit()
   const result: XeroDailyBatchResult = {
@@ -1570,7 +1697,8 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
   try {
     const settings = await getXeroSettings()
     const baseCurrency = await getBaseCurrencyCode()
-    const today = new Date().toISOString().slice(0, 10)
+    // The run's day is the BUSINESS day, like the paid days it is compared with (an event day after the run's date is clamped to it).
+    const today = businessDateYmd(new Date())
     // ACC-H11: journals are dated by their EVENT, not by the run. `lockDate` is the operator-declared last
     // locked day in Xero (empty = none); an event on or before it is dated the first open day instead of
     // being back-dated into the locked period. See lib/domain/accounting/daily-batch-event-date.ts.
@@ -1603,6 +1731,28 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
   // says what the order's state was when the goods left. A2 and A1 then see the marker and skip or net the costed units,
   // and Allocated Inventory nets to zero. The ordinary pass (paid, deferred, allocated) stays after A2 as before.
   const runGroupB = async (mode: 'direct' | 'paid'): Promise<void> => {
+  // o3d-f3a8 M-1 — SHIPMENTS A PASS COULD NOT JOURNAL MUST NOT STARVE THE WINDOW.
+  //
+  // The window is `createdAt asc`, `batchLimit` shipments, and a shipment refused for a negative cost
+  // basis (or skipped by any older per-order rule) stays eligible. `batchLimit` or more of them would
+  // therefore sit at the front of the window every run and Group B would journal nothing else. A pass
+  // that left shipments unjournaled with more candidates behind them is followed by another pass that
+  // EXCLUDES every shipment skipped so far and has only the slots this run has not spent, the shape
+  // Group A2 uses. The first pass is the old query unchanged, so nothing already queued changes key;
+  // later passes only reach shipments the old query never reached.
+  const excludedShipmentIds = new Set<string>()
+  // An order that failed or was refused in an earlier pass is skipped AS A UNIT: its later shipments
+  // must not be journaled past its stuck earlier one (the old single window failed whole orders).
+  const excludedOrderIds = new Set<string>()
+  const groupBStartedAt = Date.now()
+  let bPasses = 0
+  const hasMoreBeforeThisGroup = result.hasMore.groupB
+  let bAccepted = 0
+  for (;;) {
+  const passLimit = batchLimit - bAccepted
+  if (passLimit <= 0) break
+  let nextPass = false
+  bPasses++
   groupBSkip: try {
     // o3d-4ajo: Postgres frees a session lock the instant its connection dies,
     // so from that moment another batch — or a refund, which shares this domain
@@ -1613,6 +1763,9 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       break groupBSkip
     }
     const bPostedGroups: Array<{ date: string; movedFromLockedDays: string[] }> = []
+    let passWindowHasMore = false
+    let passSkippedShipmentIds: string[] = []
+    let passSkippedOrderIds: string[] = []
     const groupBCount = await db.$transaction(async (tx) => {
       // o3d-c08y r2 (Codex HIGH): PROBE -> LOCK -> READ. This window's ids are read first, every cost
       // layer their data references is locked, and only then is the data itself read — under those
@@ -1621,17 +1774,31 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       // lib/domain/accounting/daily-batch-group-b-lock.ts). The same read also REVALIDATES status: a
       // shipment that stopped qualifying while we waited for the lock is simply not returned.
       const candidateWindow = takeDailyBatchWindow(await tx.shipment.findMany({
-        where: groupBShipmentWhere(mode),
+        where: excludedShipmentIds.size > 0
+          ? { AND: [groupBShipmentWhere(mode), { id: { notIn: [...excludedShipmentIds] } }, { orderId: { notIn: [...excludedOrderIds] } }] }
+          : groupBShipmentWhere(mode),
         select: { id: true, orderId: true, createdAt: true, shippedAt: true, order: { select: { revenueDeferredDate: true, paidAt: true } }, lines: { select: { costLayerSnapshot: true } } },
         orderBy: { createdAt: 'asc' },
-        take: batchLimit + 1,
-      }), batchLimit)
-      result.hasMore.groupB = result.hasMore.groupB || candidateWindow.hasMore
+        take: passLimit + 1,
+      }), passLimit)
+      result.hasMore.groupB = hasMoreBeforeThisGroup || candidateWindow.hasMore
+      passWindowHasMore = candidateWindow.hasMore
+      const windowShipmentIds = candidateWindow.rows.map((row) => row.id)
       // The where-clause already splits the passes by the order's deferral stamp; restating it on the probe rows means a pass
       // with nothing of its own takes no lock and reads nothing (the stamp is only written by Group A1, under this lock).
       candidateWindow.rows = candidateWindow.rows.filter((row) => groupBShipmentBelongsToPass(mode, row))
-      if (candidateWindow.rows.length === 0) return 0
+      if (candidateWindow.rows.length === 0) {
+        passSkippedShipmentIds = windowShipmentIds
+        passSkippedOrderIds = [...new Set(candidateWindow.rows.map((row) => row.orderId))]
+        return 0
+      }
       const candidateShipmentIds = candidateWindow.rows.map((row) => row.id)
+      // Row-lock every order this window journals, in id order and BEFORE the cost-layer locks (the order every other
+      // writer in this domain uses, so no cycle). A refund stages its unearned reversal, which can sweep the whole
+      // remaining deferral, under the same lock; without it the two could each read the other's uncommitted state and
+      // both debit Unearned for the same remainder. Everything below (shipments, refunds, reversal rows) is read after
+      // the lock, so a refund that committed first is seen and one that comes later waits for this transaction.
+      await lockSalesOrders(tx, [...new Set(candidateWindow.rows.map((row) => row.orderId))].sort())
       const lockedCostLayerIds = await lockCostLayersForGroupBWindow(tx, { candidates: candidateWindow.rows })
 
       const shipmentRows = await tx.shipment.findMany({
@@ -1709,6 +1876,8 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       const shipments = shipmentRows.filter((shipment) => groupBShipmentBelongsToPass(mode, shipment))
 
       if (shipments.length === 0) {
+        passSkippedShipmentIds = windowShipmentIds
+        passSkippedOrderIds = [...new Set(candidateWindow.rows.map((row) => row.orderId))]
         return 0
       }
 
@@ -1787,8 +1956,14 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
       const refunds = await tx.salesOrderRefund.findMany({
         where: { orderId: { in: orderIds } },
-        select: { id: true, orderId: true },
+        select: { id: true, orderId: true, unearnedReversedAmount: true, accountingRetryRequired: true },
       })
+      // o3d-fk9py: a refund whose journal was only shadowed (never sent) is not proof the reversal reached the ledger.
+      const shadowedRefundIds = new Set(
+        refunds.length === 0 ? [] : (await findDurableShadowRecords(tx, 'xero', [{ subjectType: 'SalesOrderRefund', exactIds: refunds.map((refund) => refund.id), operations: ['inventory.journals'] }])).map((record) => record.subjectId),
+      )
+      const refundsByOrder = new Map<string, Array<(typeof refunds)[number] & { shadowed: boolean }>>()
+      for (const refund of refunds) refundsByOrder.set(refund.orderId, [...(refundsByOrder.get(refund.orderId) ?? []), { ...refund, shadowed: shadowedRefundIds.has(refund.id) }])
       const refundIdToOrderId = new Map(refunds.map((refund) => [refund.id, refund.orderId]))
       // o3d-3la07 (M5, D3: REPORT-ONLY). The netting below still sums exactly the PENDING / PROCESSING /
       // SYNCED rows it always did (`countedUnearnedReversalRows`); the read is widened by the CANCELLED
@@ -1806,9 +1981,9 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             },
           ],
         },
-        select: { id: true, referenceType: true, referenceId: true, payload: true, ...LEDGER_STANDING_SELECT },
+        select: { id: true, referenceType: true, referenceId: true, payload: true, payloadAccountNets: true, ...LEDGER_STANDING_SELECT },
       })
-      const reversalSyncsByOrder = new Map<string, Array<{ payload: unknown }>>()
+      const reversalSyncsByOrder = new Map<string, Array<{ payload: unknown; payloadAccountNets?: unknown; refundId?: string | null }>>()
       const reversalStandingRowsByOrder = new Map<string, UnearnedReversalSyncRow[]>()
       for (const sync of reversalSyncs) {
         const targetOrderId = sync.referenceType === 'SalesOrder'
@@ -1822,7 +1997,11 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       for (const [targetOrderId, allRows] of reversalStandingRowsByOrder) {
         reversalSyncsByOrder.set(
           targetOrderId,
-          countedUnearnedReversalRows(allRows).map((sync) => ({ payload: sync.payload })),
+          countedUnearnedReversalRows(allRows).map((sync) => ({
+            payload: sync.payload,
+            payloadAccountNets: sync.payloadAccountNets,
+            refundId: sync.referenceType === 'SalesOrderRefund' ? sync.referenceId : null,
+          })),
         )
       }
 
@@ -1933,10 +2112,26 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         ), 0)
         // scjz.68: subtract deferred revenue a refund credit note already reversed
         // out of the unearned account so the true-up never re-recognizes it.
-        const postedUnearnedReversal = sumPostedUnearnedReversal(
-          reversalSyncsByOrder.get(orderId) ?? [],
-          settings.xero_unearned_revenue_account,
+        // o3d-fk9py: plus what earlier refunds durably recorded that retention has since erased from the sync rows.
+        const postedUnearnedReversal = round2(
+          sumPostedUnearnedReversal(reversalSyncsByOrder.get(orderId) ?? [], settings.xero_unearned_revenue_account)
+          + durableUnearnedReversalTopUp(reversalSyncsByOrder.get(orderId) ?? [], refundsByOrder.get(orderId) ?? [], settings.xero_unearned_revenue_account),
         )
+        // o3d-oyur (Codex r2 HIGH): a counted reversal with no readable lines and no compaction summary moved an UNKNOWN amount.
+        // The true-up (which recognises the whole remaining deferral) is withheld rather than risk debiting it twice.
+        const unreadableUnearnedReversals = unreadableUnearnedReversalRows(reversalSyncsByOrder.get(orderId) ?? [])
+        if (unreadableUnearnedReversals.length > 0) {
+          await logActivity({
+            entityType: 'SALES_ORDER',
+            entityId: orderId,
+            action: 'daily_batch_trueup_withheld_unreadable_unearned_reversal',
+            tag: 'sync',
+            level: 'WARNING',
+            description: `Order ${firstShipment.order.orderNumber ?? firstShipment.order.externalOrderNumber ?? orderId.slice(0, 8)}: ${unreadableUnearnedReversals.length} UNEARNED_REV_REVERSAL row(s) have no readable lines and no preserved account summary, so how much unearned revenue a refund already reversed cannot be established. Its shipments were NOT journaled this run (no revenue, no COGS, no stamp) and will be retried once the reversal is readable; check the unearned revenue account.`,
+            metadata: { orderId, unreadableCount: unreadableUnearnedReversals.length },
+            resolveUser: false,
+          }).catch(() => { /* a report that cannot be written must not change what the batch posts */ })
+        }
         // o3d-3la07 (M5, D3): say which rows the netting rests on that are not ledger facts.
         const unearnedStanding = unearnedReversalStandingReport(reversalStandingRowsByOrder.get(orderId) ?? [])
         const unearnedReport = describeUnearnedReversalReport(
@@ -1955,6 +2150,11 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             resolveUser: false,
           }).catch(() => { /* a report that cannot be written must not change what the batch posts */ })
         }
+        // o3d-oyur (Codex r3): an unreadable counted reversal means the figure is unknown, so this order's shipments are NOT processed at
+        // all this run: no revenue, no COGS, no stamp. Nothing is published for them (results, snapshots and layer decrements are only
+        // recorded further down), so shipmentJournalDate stays null and a later run picks them up once the reversal is readable, exactly
+        // once. Recognising 0 and stamping the shipment journaled would strand the deferral for good.
+        if (unreadableUnearnedReversals.length > 0) continue
         const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
         let runningRevenue = 0
 
@@ -2136,6 +2336,8 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       }
 
       const processedShipmentCount = shipmentResults.size
+      passSkippedShipmentIds = windowShipmentIds.filter((id) => !shipmentResults.has(id))
+      passSkippedOrderIds = [...new Set(candidateWindow.rows.filter((row) => !shipmentResults.has(row.id)).map((row) => row.orderId))]
 
       // ACC-H11: ONE JOURNAL PER EVENT DATE. A shipment is dated the later of the day it shipped and the
       // day its order was paid (Group B waits for the deferral, and cannot recognise revenue before the
@@ -2143,8 +2345,8 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       // that date. Each date is its own journal with its own reference, the identity the stamps carry.
       const processedShipments = shipments.filter((shipment) => shipmentResults.has(shipment.id))
       const groupBDay = (shipment: (typeof shipments)[number]): string | null => laterDay(
-        utcDay(shipment.shippedAt ?? shipment.createdAt),
-        utcDay(shipment.order.paidAt),
+        businessDay(shipment.shippedAt ?? shipment.createdAt),
+        businessDay(shipment.order.paidAt),
       )
       // ACC-H12: a shipment of an order that is not deferred yet is costed on its own journal, dated the day the
       // goods left (there is no payment to wait for), so its group never mixes with the ordinary ones.
@@ -2152,7 +2354,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       const bDated = groupByPostingDate(processedShipments.filter((shipment) => !isCostedOnShipment(shipment)), groupBDay, dateContext)
       const bDatedDirect = groupByPostingDate(
         processedShipments.filter(isCostedOnShipment),
-        (shipment) => utcDay(shipment.shippedAt ?? shipment.createdAt),
+        (shipment) => businessDay(shipment.shippedAt ?? shipment.createdAt),
         dateContext,
       )
       if (bDated.deferred.length > 0 || bDatedDirect.deferred.length > 0) throw new Error('Group B: a shipment has no open posting day although the lock-blocks-run check passed')
@@ -2358,13 +2560,39 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       }
 
       return processedShipmentCount
-    })
+    }, GROUP_B_TX_OPTIONS)
     if (groupBCount > 0) {
       result.groupB += groupBCount
     }
+    bAccepted += groupBCount
     for (const journal of bPostedGroups) await reportLockedPeriodMoves('B', journal.date, journal.movedFromLockedDays, lockDate)
+    // Another pass only when this one skipped something AND more candidates sit behind the window
+    // (otherwise the window already held everything), and only while the exclusion list stays under
+    // the cap (o3d-f3a8 L-2: Prisma's notIn fails above ~32,767 bind values).
+    for (const id of passSkippedShipmentIds) excludedShipmentIds.add(id)
+    for (const id of passSkippedOrderIds) excludedOrderIds.add(id)
+    const wantsMore = passSkippedShipmentIds.length > 0 && passWindowHasMore
+    // Stop when the pass skipped nothing new (nothing left to walk past), when the pass bound or the
+    // exclusion cap is reached, or when the run budget is spent (loop head). A first pass that journaled
+    // nothing still continues: that is exactly the starved-window case.
+    nextPass = wantsMore && bPasses < DAILY_BATCH_MAX_GROUP_B_PASSES
+      && excludedShipmentIds.size + excludedOrderIds.size < DAILY_BATCH_MAX_EXCLUDED_IDS
+    if (wantsMore && !nextPass) {
+      const heldMs = Date.now() - groupBStartedAt
+      console.warn(`Group B (${mode}) stopped after ${bPasses} pass(es), ${heldMs} ms under the accounting lock; ${excludedShipmentIds.size} shipment(s) skipped this run, candidates remain for the next run`)
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'daily_batch_group_b_pass_bound_reached',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `Daily batch Group B (${mode}) made ${bPasses} pass(es) holding the accounting lock for ${heldMs} ms and stopped with candidates remaining (${excludedShipmentIds.size} shipment(s) skipped). The rest wait for the next run.`,
+        metadata: { mode, passes: bPasses, lockHeldMs: heldMs, skippedShipments: excludedShipmentIds.size, skippedOrders: excludedOrderIds.size, journaled: bAccepted },
+      })
+    }
   } catch (e) {
     result.errors.push(`Group B error: ${String(e)}`)
+  }
+  if (!nextPass) break
   }
   }
 
@@ -2467,7 +2695,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       const orderById = new Map(orders.map((order) => [order.id, order]))
       const a1Dated = groupByPostingDate(
         orderDeferrals,
-        (deferral) => utcDay(orderById.get(deferral.orderId)?.paidAt),
+        (deferral) => businessDay(orderById.get(deferral.orderId)?.paidAt),
         dateContext,
       )
       if (a1Dated.deferred.length > 0) throw new Error('A1: an order has no open posting day although the lock-blocks-run check passed')
@@ -2501,7 +2729,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       type RefundAdjustmentRow = { orderId: string; refundId: string | null; amount: number; day: string | null }
       const adjustmentRows: RefundAdjustmentRow[] = []
       for (const order of orders) {
-        const paidDay = utcDay(order.paidAt)
+        const paidDay = businessDay(order.paidAt)
         for (const adjustment of preBatchRefundDeferredParts(order.refunds, revenueDeferralGrossAmount(order), shippedRevenueOf(order))) {
           // ACC-H12: only the part of a refund that came out of deferred revenue is adjusted against Unearned.
           if (!(adjustment.deferredPart > 0)) continue
@@ -2509,7 +2737,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             orderId: order.id,
             refundId: adjustment.refundId,
             amount: adjustment.deferredPart,
-            day: laterDay(utcDay(adjustment.refundedAt), paidDay),
+            day: laterDay(businessDay(adjustment.refundedAt), paidDay),
           })
         }
       }
@@ -2669,6 +2897,8 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     for (;;) {
       const passLimit = batchLimit - a2Accepted
       if (passLimit <= 0) break
+      // o3d-f3a8 L-3: passes 2..N open new journal transactions, so the lock is re-checked per pass.
+      batchLock.assertHeld('Group A2 (inventory reclassification)')
       const passRefusals: NegativeCostBasisRefusal[] = []
       const groupA2 = await db.$transaction(async (tx) => {
         const candidateWindow = takeDailyBatchWindow(await tx.salesOrder.findMany({
@@ -2936,10 +3166,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         // allocated weeks after payment lands on the day the stock arrived. Each date is its own journal with
         // its own reference; each order is stamped with the journal that carries ITS pounds.
         const a2OrderDay = (order: (typeof accepted)[number]): string | null => laterDay(
-          utcDay(order.paidAt),
+          businessDay(order.paidAt),
           ...order.allocations
             .filter((alloc) => allocationSnapshots.has(alloc.id))
-            .map((alloc) => utcDay(alloc.createdAt)),
+            .map((alloc) => businessDay(alloc.createdAt)),
         )
         const a2Dated = groupByPostingDate(accepted, a2OrderDay, dateContext)
         if (a2Dated.deferred.length > 0) throw new Error('A2: an order has no open posting day although the lock-blocks-run check passed')
@@ -2979,7 +3209,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
                 batchDate: group.date,
                 batchGroup: 'A2',
                 batchEntityCount: group.rows.length,
-                splitBatch: result.hasMore.groupA2,
+                splitBatch: candidateWindow.hasMore, // o3d-f3a8 L-4: this pass's own window, not the previous pass's
                 _postingMode: 'submitted',
               },
             })
@@ -3118,6 +3348,10 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       result.groupA2 = a2Accepted
       result.hasMore.groupA2 = a2HasMore
       if (passRefusals.length === 0 || !groupA2.hasMore) break
+      // o3d-f3a8 L-2: bound the exclusion list. Refused orders do not spend batch slots, so without a
+      // cap a large blocked backlog is walked in full every run and `notIn` eventually exceeds
+      // Prisma's bind-parameter limit, failing every later pass. The remainder waits for the next run.
+      if (refusedA2OrderIds.size >= DAILY_BATCH_MAX_EXCLUDED_IDS) break
     }
   } catch (e) {
     result.errors.push(`Group A2 error: ${String(e)}`)
@@ -3267,6 +3501,8 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     } catch (e) {
       result.errors.push(`Transit reconciliation sweep error: ${String(e)}`)
     }
+
+    await stageGrirReclassJournals(settings, baseCurrency, dateContext, batchLimit, result)
 
     await reportNegativeBasisRefusals(result, negativeBasisRefusals)
 

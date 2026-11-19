@@ -152,11 +152,50 @@ export type WmsProductDto = {
   raw?: Record<string, unknown> | null
 }
 
+/**
+ * The customs fields an IMS-side clear may erase in a WMS. Deliberately has NO barcode / EAN / UPC member: identifiers are
+ * never cleared, so no caller can even express it.
+ */
+export type WmsClearableProductField = 'customsDescription' | 'commodityCode' | 'countryOfManufacture'
+
+/** What happened to the explicit clears of an UPDATE. A rejected clear never fails the update that carried it. */
+export type WmsProductClearOutcome = {
+  cleared: WmsClearableProductField[]
+  /**
+   * `answered`: Mintsoft RESPONDED and the clear did not take (Success:false, an HTTP error status, or a read-back showing the value) - counts toward the retry cap.
+   * `unverifiable`: no answer or no proof (timeout, network error, failed read-back) - counts toward a separate, higher cap.
+   * Neither: nothing reached Mintsoft (the outbound hold refused it) - spends nothing.
+   */
+  rejected: { field: WmsClearableProductField; message: string; answered?: boolean; unverifiable?: boolean }[]
+  /**
+   * Not sent: the lease taken immediately before the request was refused. Not a failure. Nothing is retried unless `retry` is
+   * set (another run holds the lease: the clear is still wanted and the next run must offer it again).
+   */
+  skipped: { field: WmsClearableProductField; reason: string; retry?: boolean }[]
+  /** Sent, but the clear stopped being wanted while the request was in flight (the field was refilled): the warehouse may now hold the emptied value, so the next run must send the refilled one. */
+  superseded: { field: WmsClearableProductField; reason: string }[]
+  /** Not sent: the WMS has no API way to clear this field. Never retried; an operator clears it by hand. */
+  unsupported: WmsClearableProductField[]
+}
+
+/**
+ * Taken around each clear request: runs `send` only while the caller can still stand behind the clear. The claim is a short
+ * durable lease (no lock, no transaction is held across the request). `claimed: false` means the clear was not wanted (or is
+ * owned by another run) and nothing was sent. `superseded` on a claimed result means the clear stopped being wanted while the
+ * request was in flight: the request went out, but its result must not be treated as applied.
+ */
+export type WmsClearClaim = <T>(
+  field: WmsClearableProductField,
+  send: () => Promise<T>,
+) => Promise<{ claimed: true; value: T; superseded?: string } | { claimed: false; reason: string; retry?: boolean }>
+
 export type WmsProductRef = {
   externalId: string
   sku: string
   barcode: string | null
   raw: Record<string, unknown> | null
+  /** Present only when the upsert asked for clears (see WmsUpsertProductOptions.clearFields). */
+  clearOutcome?: WmsProductClearOutcome
 }
 
 export type WmsReturnRecord = {
@@ -275,6 +314,16 @@ export type WmsUpsertProductOptions = {
   omitBarcode?: boolean
   /** Leave the WMS's UPC (MPN) field out of the write. Only meaningful, and only sent, when the identifier split is on. */
   omitMpn?: boolean
+  /**
+   * Customs fields to ERASE in the WMS, each sent as its own follow-up request after the update so a WMS refusal of one
+   * clear cannot fail the update or the other clears. UPDATE only: ignored without an externalProductId (a create has
+   * nothing to clear). Barcode/EAN/UPC are not clearable.
+   */
+  clearFields?: WmsClearableProductField[]
+  /** Wraps each clear request so a clear planned earlier is re-verified immediately before it is sent. Absent: every clear is sent as planned. */
+  clearClaim?: WmsClearClaim
+  /** Read inside the claim, just before a clear request is built: the product's CURRENT payload, so the request never carries a stale planning snapshot. */
+  freshProduct?: () => Promise<WmsProductDto>
 }
 
 /**
@@ -425,6 +474,14 @@ export type WmsOrderPushInput = {
   phone: string | null
   /** Customer VAT/IOSS number for customs declarations; null when not provided. */
   vatNumber: string | null
+  /**
+   * TRUE ONLY WHEN the order's EU VAT stamp is IOSS (absent otherwise). The IOSS number itself is NOT carried here: it is the shop's one
+   * number, resolved from the CURRENT `shop_ioss_number` setting at create time, so a change or clear never leaves a queued order with a
+   * stale copy. Whether a connector sends it is the connector's own setting (Mintsoft: `mintsoft_send_ioss_number`, default off).
+   */
+  iossStamped?: boolean
+  /** Set by the connector at create time from the current shop setting (never by the sweep). Absent unless the connector decided to send it. */
+  iossNumber?: string | null
   comments: string | null
   /** Carrier/service name passed through for the WMS to resolve; null = WMS default. */
   courierService: string | null
@@ -546,6 +603,18 @@ export type WmsOrderCancelResult = {
   mergedSurvivorNumber?: string
   // Status IDENTITY_MISMATCH / IDENTITY_UNVERIFIABLE (also carried in `mergedSurvivorNumber` as the number seen): the warehouse order could not be
   // proved to be this order, so NOTHING was written.
+}
+
+/**
+ * The answer to a MERGE HOLD request (see `holdOrder`). Only `held: true` means the warehouse now holds the order awaiting a person's confirmation.
+ * A request that FAILED (transport, timeout, an unreadable answer) is not an answer: `holdOrder` THROWS, so a caller can never read it as a refusal.
+ */
+export type WmsOrderHoldResult = {
+  held: boolean
+  /** HELD; or why nothing was held: NOT_FOUND, IDENTITY_MISMATCH / IDENTITY_UNVERIFIABLE (the order cannot be proved to be this order), MERGED_SURVIVOR (already merged), ALREADY_CANCELLED, NOT_HOLDABLE (past NEW), REFUSED (the warehouse said no; see `message`). */
+  status: 'HELD' | 'NOT_FOUND' | 'IDENTITY_MISMATCH' | 'IDENTITY_UNVERIFIABLE' | 'MERGED_SURVIVOR' | 'ALREADY_CANCELLED' | 'NOT_HOLDABLE' | 'REFUSED'
+  mergedSurvivorNumber?: string
+  message?: string
 }
 
 export type WmsOrderUpdateResult = {
@@ -724,10 +793,21 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
    * recorded line id of the order) before a link is re-pointed at it.
    */
   fetchOrderItemRefs?(externalOrderId: string): Promise<WmsOrderItemRef[]>
+  /**
+   * READ-ONLY. The amend gate without the amendment: can this warehouse order still be amended (it exists, is this order, is not merged, is still NEW)? Used before IMS commits a change the warehouse order would have to take.
+   * Throws when the warehouse cannot be read; the caller treats that as unknown, never as amendable.
+   */
+  probeOrderAmendable?(externalOrderId: string, expectedOrderNumber: string | null): Promise<{ amendable: true } | { amendable: false; status: string }>
   /** Amend an already-pushed WMS order; a no-op (updated=false) if past NEW. */
   updateOrder?(externalOrderId: string, input: WmsOrderPushInput, clearance: WmsWriteClearance<'order.amend'>): Promise<WmsOrderUpdateResult>
   /** Cancel a WMS order by its external id; a no-op (success) if past NEW. */
   cancelOrder?(externalOrderId: string, expected: WmsExpectedOrder, clearance: WmsWriteClearance<'order.cancel' | 'order.hold'>): Promise<WmsOrderCancelResult>
+  /**
+   * Hold a warehouse order for a person to MERGE it (awaiting confirmation), keeping it alive. Only for merge holds; the withdrawal hold is the cancel-based
+   * `cancelOrder` and is unchanged. There is deliberately NO release counterpart: a merge hold is confirmed by a person in the warehouse's own system.
+   * Throws when the outcome is unknown (transport failure); answers `held: false` only for a definite refusal or a gate that proved the hold wrong.
+   */
+  holdOrder?(externalOrderId: string, expected: WmsExpectedOrder, clearance: WmsWriteClearance<'order.hold'>): Promise<WmsOrderHoldResult>
   /**
    * Cancel a MERGED order, but only while it still holds EXACTLY `items` (the lines of the order being cancelled; the connector re-reads
    * them immediately before the cancel and answers status MERGED_LINES_CHANGED, cancelling nothing, when they differ). `cancelOrder` refuses a merged order (status MERGED_SURVIVOR) because it holds other orders' goods.

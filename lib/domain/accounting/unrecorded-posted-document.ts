@@ -910,6 +910,11 @@ export const OPERATION_SEMANTIC_BY_TYPE =
     // returns the id OF THAT DOCUMENT. There is no duplicate and nothing to void.
     SALES_INVOICE_UPDATE: 'UPDATE_DOCUMENT',
     PURCHASE_INVOICE_UPDATE: 'UPDATE_DOCUMENT',
+    // Renumbers and then deletes or voids a document that already stood in the ledger: the id returned is that document's.
+    SALES_INVOICE_DELETE: 'UPDATE_DOCUMENT',
+    PURCHASE_INVOICE_DELETE: 'UPDATE_DOCUMENT',
+    // o3d-ngmt.22: the void writes the status of a credit note that already stood and returns the id OF THAT DOCUMENT; nothing is created.
+    CREDIT_NOTE_VOID: 'UPDATE_DOCUMENT',
     // A PAYMENT id, applied against a document nobody created here.
     INVOICE_PAYMENT: 'APPLY_PAYMENT',
     BILL_PAYMENT: 'APPLY_PAYMENT',
@@ -927,6 +932,7 @@ export const OPERATION_SEMANTIC_BY_TYPE =
     DAILY_BATCH_INVENTORY_RECONCILIATION: 'POST_JOURNAL',
     DAILY_BATCH_COGS_RECONCILIATION: 'POST_JOURNAL',
     DAILY_BATCH_TRANSIT_RECONCILIATION: 'POST_JOURNAL',
+    DAILY_BATCH_GRIR_RECLASS: 'POST_JOURNAL',
     UNEARNED_REV_REVERSAL: 'POST_JOURNAL',
     ALLOCATION_REVERSAL: 'POST_JOURNAL',
     REALISED_FX_JOURNAL: 'POST_JOURNAL',

@@ -103,7 +103,19 @@ type State = {
   orders: Order[]
   lines: OrderLine[]
   allocations: Allocation[]
-  refundLines?: Array<{ orderId: string; salesOrderLineId: string | null; productId: string | null; qty: number }>
+  refundLines?: Array<{
+    orderId: string
+    salesOrderLineId: string | null
+    productId: string | null
+    qty: number
+    /** o3d-hqvrp.77: which refund, and what it says about the goods (a restock names its return warehouse). */
+    refundId?: string
+    returnWarehouseId?: string | null
+    chargeback?: boolean
+    accountingRetryRequired?: boolean
+  }>
+  /** o3d-hqvrp.77: RETURN_INBOUND movements that measure what a restocking refund brought back. */
+  returnMovements?: Array<{ referenceId: string; productId: string; qty: number }>
   /**
    * o3d-2k5r r7: the order's REFUNDS (not their lines), and the refund-reservation-release backstop
    * rows keyed off them. These are what `countUnfinishedRefundReservationReleases` reads, and they
@@ -286,6 +298,7 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
         }
       }),
     },
+    wmsOrderPushLink: { updateMany: async () => ({ count: 0 }) },
     orderAllocation: {
       // `lineId: { in: [...] }` is a real predicate the scoped integrity/coverage checks pass;
       // ignoring it would hand them the whole order's rows and let a check that should have been
@@ -341,11 +354,22 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
           ? where.status.in.includes(row.status)
           : row.status !== where.status.not))
       )).length,
+      // The unknown-status read (`status: { notIn }`) selects rows whose status this binary cannot name.
+      findMany: async ({ where }: { where: { idempotencyKey?: { in: string[] }; status?: { notIn: string[] } } }) => (state.releaseOutbox ?? []).filter((row) => (
+        (where.idempotencyKey === undefined || where.idempotencyKey.in.includes(row.idempotencyKey))
+        && (where.status === undefined || !where.status.notIn.includes(row.status))
+      )).map((row) => ({ status: row.status })),
     },
     salesOrderRefundLine: {
       findMany: async ({ where }: { where: { refund: { orderId: string } } }) => (state.refundLines ?? [])
         .filter((refundLine) => refundLine.orderId === where.refund.orderId)
-        .map((refundLine) => ({ salesOrderLineId: refundLine.salesOrderLineId, productId: refundLine.productId, qty: refundLine.qty })),
+        .map((refundLine) => ({
+          salesOrderLineId: refundLine.salesOrderLineId,
+          productId: refundLine.productId,
+          qty: refundLine.qty,
+          refundId: refundLine.refundId ?? 'refund-x',
+          refund: { returnWarehouseId: refundLine.returnWarehouseId ?? null, chargeback: refundLine.chargeback ?? false, accountingRetryRequired: refundLine.accountingRetryRequired ?? false },
+        })),
     },
     shipment: {
       // o3d-4kfh r6: the `{ status: { in: [...] } }` shape is real — `discardCancelledOrderShipmentsInTx`
@@ -532,6 +556,8 @@ function createClient(state: State, options: ClientOptions = {}): ShipmentServic
       },
     },
     stockMovement: {
+      findMany: async ({ where }: { where: { referenceId?: { in: string[] } } }) => (state.returnMovements ?? [])
+        .filter((movement) => where.referenceId?.in == null || where.referenceId.in.includes(movement.referenceId)),
       createMany: async ({ data, skipDuplicates }: { data: Array<{ productId: string; qty: number; idempotencyKey?: string | null }>; skipDuplicates?: boolean }) => {
         let count = 0
         for (const entry of data) {
@@ -2906,6 +2932,9 @@ test('o3d-2k5r r9: a backstop row carrying a status THIS BINARY DOES NOT KNOW st
 
   assert.equal(result.success, false)
   assert.match((result as { error: string }).error, /repack recovery/)
+  // The refusal names the unrecognised status and the rollback remedy rather than only a control that is not rendered.
+  assert.match((result as { error: string }).error, /does not recognise: QUARANTINED_BY_NEWER_RELEASE/)
+  assert.match((result as { error: string }).error, /Deploy the version that recognises/)
   assert.equal(state.shipments[1].status, 'PACKED')
   assert.equal(state.movements.length, 0)
 })
@@ -2917,7 +2946,7 @@ type OutboxWhere = {
   connector?: string
   operation?: string
   idempotencyKey?: { in?: string[] }
-  status?: string | { in?: string[]; not?: string }
+  status?: string | { in?: string[]; not?: string; notIn?: string[] }
   attempts?: { lt?: number; gte?: number }
   lockedAt?: Date | null | { lt?: Date }
   lockedBy?: string
@@ -2937,6 +2966,7 @@ function outboxRowMatches(row: IntegrationOutboxRow, where: OutboxWhere | undefi
   if (typeof where.status === 'string' && row.status !== where.status) return false
   if (typeof where.status === 'object' && where.status.in && !where.status.in.includes(row.status)) return false
   if (typeof where.status === 'object' && where.status.not !== undefined && row.status === where.status.not) return false
+  if (typeof where.status === 'object' && where.status.notIn && where.status.notIn.includes(row.status)) return false
   if (where.attempts?.lt !== undefined && row.attempts >= where.attempts.lt) return false
   if (where.attempts?.gte !== undefined && row.attempts < where.attempts.gte) return false
   if (where.lockedBy !== undefined && row.lockedBy !== where.lockedBy) return false
@@ -3306,4 +3336,193 @@ test('SHP-H2: a stock-tracked line that has not shipped still holds the order sh
   assert.equal(shortfall?.length, 1)
   assert.equal(shortfall?.[0].label, 'SKU-1', 'only the stock line is outstanding, not the delivery charge')
   assert.equal(shortfall?.[0].outstandingQty, 3)
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-hqvrp.76 — a hold stops fulfilment, and creating shipments never lifts it
+// ---------------------------------------------------------------------------------------------
+
+test('confirmSalesOrderShipments refuses an ON_HOLD order and leaves the hold in place (o3d-hqvrp.76)', async () => {
+  const state = baseState({
+    orders: [{
+      id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ON_HOLD',
+      withdrawalHoldAt: new Date('2026-11-01T09:00:00.000Z'),
+    }],
+  })
+
+  await assert.rejects(
+    () => confirmSalesOrderShipments(createClient(state), 'order-1'),
+    /on hold/,
+  )
+  assert.equal(state.orders[0].status, 'ON_HOLD', 'the hold was not silently lifted to ALLOCATED')
+  assert.equal(state.shipments.length, 0, 'no shipment was built for a held order')
+})
+
+test('an ON_HOLD order\'s shipment does not advance in-app, but a warehouse progress report is still recorded (o3d-hqvrp.76)', async () => {
+  const build = () => baseState({
+    orders: [{ id: 'order-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ON_HOLD' }],
+    shipments: [{ id: 'shipment-1', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PENDING', trackingNumber: null, shippingService: null }],
+    shipmentLines: [{ id: 'shipment-line-1', shipmentId: 'shipment-1', lineId: 'line-1', productId: 'product-1', qty: 2 }],
+  })
+
+  const held = build()
+  await assert.rejects(
+    () => transitionShipmentStatus(createClient(held), { shipmentId: 'shipment-1', targetStatus: 'PICKING' }),
+    /on hold/,
+  )
+  assert.equal(held.shipments[0].status, 'PENDING')
+
+  // The warehouse owns the physical state: its report is recorded, exactly as its dispatch is.
+  const reported = build()
+  const result = await transitionShipmentStatus(createClient(reported), {
+    shipmentId: 'shipment-1',
+    targetStatus: 'PICKING',
+    allowRecordWhenNotReady: true,
+  })
+  assert.equal(result.success, true)
+  assert.equal(reported.shipments[0].status, 'PICKING')
+})
+
+// ---------------------------------------------------------------------------------------------
+// o3d-hqvrp.77 — returning goods that already shipped must not cancel the unshipped remainder
+// ---------------------------------------------------------------------------------------------
+
+function partlyShippedWithReturn(refund: { returnWarehouseId: string | null; withMovement: boolean }) {
+  // Ordered 10. A (8) dispatched, B (2, the rest of the line) PACKED. 2 of A's units come back.
+  return baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 10, sku: 'SKU-1', description: 'Product 1' }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10 }],
+    shipments: [
+      { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: null, shippingService: null },
+      { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'sl-a', shipmentId: 'shipment-a', lineId: 'line-1', productId: 'product-1', qty: 8 },
+      { id: 'sl-b', shipmentId: 'shipment-b', lineId: 'line-1', productId: 'product-1', qty: 2 },
+    ],
+    refundLines: [{
+      orderId: 'order-1', salesOrderLineId: 'line-1', productId: 'product-1', qty: 2,
+      refundId: 'refund-1', returnWarehouseId: refund.returnWarehouseId,
+    }],
+    returnMovements: refund.withMovement ? [{ referenceId: 'refund-1', productId: 'product-1', qty: 2 }] : [],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 4, reservedQty: 2 }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 4, unitCostBase: 5 }],
+  })
+}
+
+test('a return of already-shipped units does not cancel the still-packed remainder (o3d-hqvrp.77)', async () => {
+  const state = partlyShippedWithReturn({ returnWarehouseId: 'warehouse-1', withMovement: true })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-b',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, true, result.success ? '' : String(result.error))
+  assert.equal(state.shipments[1].status, 'SHIPPED')
+})
+
+test('a refund with NO return evidence still nets as a cancellation (o3d-hqvrp.77 control)', async () => {
+  // Same quantities, but nothing says the goods came back: the 2 refunded units are a cancellation of
+  // the unshipped remainder, so B (2) is over what remains (10 - 2 - 8 = 0) and is refused, as before.
+  const state = partlyShippedWithReturn({ returnWarehouseId: null, withMovement: false })
+
+  const result = await transitionShipmentStatus(createClient(state), {
+    shipmentId: 'shipment-b',
+    targetStatus: 'SHIPPED',
+  })
+
+  assert.equal(result.success, false)
+  assert.match(result.success ? '' : String(result.error), /packed before the refund/)
+})
+
+test('findOrderShipmentShortfall still owes the unshipped units after a return of shipped goods (o3d-hqvrp.77)', async () => {
+  const state = partlyShippedWithReturn({ returnWarehouseId: 'warehouse-1', withMovement: true })
+  state.shipments = state.shipments.filter((shipment) => shipment.id === 'shipment-a')
+  state.shipmentLines = state.shipmentLines.filter((line) => line.shipmentId === 'shipment-a')
+
+  const shortfall = await findOrderShipmentShortfall(createClient(state), 'order-1')
+
+  assert.ok(shortfall, 'the order is not complete: 2 units were never sent')
+  assert.equal(shortfall[0].outstandingQty, 2)
+})
+
+// ---------------------------------------------------------------------------------------------
+// PR 1017 review round 1: the "returned" part of a refund is measured and capped at what shipped
+// ---------------------------------------------------------------------------------------------
+
+function orderTenWithShipped(shippedQty: number, packedQty: number, refund: {
+  qty: number
+  returnWarehouseId?: string | null
+  chargeback?: boolean
+  accountingRetryRequired?: boolean
+  movementQty?: number
+}) {
+  return baseState({
+    lines: [{ id: 'line-1', orderId: 'order-1', productId: 'product-1', qty: 10, sku: 'SKU-1', description: 'Product 1' }],
+    allocations: [{ orderId: 'order-1', lineId: 'line-1', productId: 'product-1', warehouseId: 'warehouse-1', qty: 10 }],
+    shipments: [
+      { id: 'shipment-a', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'SHIPPED', trackingNumber: null, shippingService: null },
+      { id: 'shipment-b', orderId: 'order-1', warehouseId: 'warehouse-1', status: 'PACKED', trackingNumber: null, shippingService: null },
+    ],
+    shipmentLines: [
+      { id: 'sl-a', shipmentId: 'shipment-a', lineId: 'line-1', productId: 'product-1', qty: shippedQty },
+      { id: 'sl-b', shipmentId: 'shipment-b', lineId: 'line-1', productId: 'product-1', qty: packedQty },
+    ],
+    refundLines: [{
+      orderId: 'order-1', salesOrderLineId: 'line-1', productId: 'product-1', qty: refund.qty, refundId: 'refund-1',
+      returnWarehouseId: refund.returnWarehouseId ?? null, chargeback: refund.chargeback, accountingRetryRequired: refund.accountingRetryRequired,
+    }],
+    returnMovements: refund.movementQty ? [{ referenceId: 'refund-1', productId: 'product-1', qty: refund.movementQty }] : [],
+    stockLevels: [{ productId: 'product-1', warehouseId: 'warehouse-1', quantity: 12, reservedQty: packedQty }],
+    costLayers: [{ id: 'layer-1', productId: 'product-1', warehouseId: 'warehouse-1', remainingQty: 12, unitCostBase: 5 }],
+  })
+}
+
+test('a return movement larger than what shipped only offsets the shipped units; the rest still cancels (PR 1017 r1 HIGH 1)', async () => {
+  // 10 ordered, 4 shipped, 6 packed. Refund of 6 with a restock of 6: at most the 4 shipped units came
+  // back, so 2 are a cancellation and only 4 units remain to ship; the packed 6 is over that.
+  const state = orderTenWithShipped(4, 6, { qty: 6, returnWarehouseId: 'warehouse-1', movementQty: 6 })
+
+  const result = await transitionShipmentStatus(createClient(state), { shipmentId: 'shipment-b', targetStatus: 'SHIPPED' })
+
+  assert.equal(result.success, false)
+  assert.match(result.success ? '' : String(result.error), /packed before the refund/)
+})
+
+test('a full chargeback still stops a packed shipment being dispatched (PR 1017 r1 HIGH 2)', async () => {
+  // 10 ordered, 8 shipped, 2 packed; the chargeback refunds all 10. The customer kept nothing back
+  // to net, so the whole 10 cancels demand and the packed 2 must not go out.
+  const state = orderTenWithShipped(8, 2, { qty: 10, chargeback: true })
+
+  const result = await transitionShipmentStatus(createClient(state), { shipmentId: 'shipment-b', targetStatus: 'SHIPPED' })
+
+  assert.equal(result.success, false)
+  assert.match(result.success ? '' : String(result.error), /packed before the refund/)
+})
+
+test('a restock still awaiting its accounting retry returns nothing yet, so its units cancel demand (PR 1017 r1 MEDIUM 1)', async () => {
+  // One refund of 5 (2 shipped units back + 3 never shipped); staging failed, so no RETURN_INBOUND has
+  // committed. Only committed movements count as returned, so the whole 5 cancels: 10 - 5 - 2 = 3 left,
+  // and the packed 8 is refused.
+  const state = orderTenWithShipped(2, 8, { qty: 5, returnWarehouseId: 'warehouse-1', accountingRetryRequired: true })
+
+  const result = await transitionShipmentStatus(createClient(state), { shipmentId: 'shipment-b', targetStatus: 'SHIPPED' })
+
+  assert.equal(result.success, false)
+  assert.match(result.success ? '' : String(result.error), /packed before the refund/)
+})
+
+test('every demand reader loads refund lines through the ONE shared netting (PR 1017 r1 HIGH 2)', async () => {
+  const { readFileSync } = await import('node:fs')
+  for (const file of [
+    'lib/domain/sales/shipment-service.ts',
+    'lib/domain/sales/allocation-service.ts',
+    'lib/fulfillment/order-allocation-coverage.ts',
+  ]) {
+    const source = readFileSync(file, 'utf8')
+    assert.ok(!source.includes('netRefundLinesForDemand'), `${file} must not net refund lines itself`)
+    assert.ok(!/salesOrderRefundLine\.findMany/.test(source), `${file} must load refund lines via loadNettedRefundLines`)
+    assert.ok(source.includes('loadNettedRefundLines('), `${file} must use loadNettedRefundLines`)
+  }
 })

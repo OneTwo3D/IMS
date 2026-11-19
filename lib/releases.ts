@@ -14,6 +14,75 @@ export type AppRelease = {
 
 export const RELEASES: AppRelease[] = [
   {
+    version: '5.1.0',
+    date: '2026-11-18',
+    title: 'Sales quotations, purchase order approval and minimum margin, GR/IR accrual, typed custom fields, document numbering, exchanges, Edit by CSV, and a security and audit-fix pass',
+    summary: 'Release with operator actions: set TRUSTED_PROXY_IPS before deploying (login throttling reads the client address only from configured proxies), and check where the reverse proxy runs before deploying the stage unit file, which now binds 127.0.0.1. Migrations (all additive) apply automatically on deploy. New and changed: sales quotations, purchase order approval above a threshold and a minimum margin on purchase order lines, a GR/IR accrual sub-ledger and report, typed custom fields on products and sales orders, document numbering patterns, order attachments, sales-order to purchase-order pegging, exchanges inside a return, Edit by CSV on the Inventory list, WooCommerce native customs fields and duty and tax mirrored from the store, a Delete invoice and Delete bill action in Xero, and a large batch of security, accounting, WooCommerce and Mintsoft audit fixes. Built, switched off: refund delete, Xero document delete, WooCommerce order divergence reporting, TrackShip re-fire, the warehouse not-found strike count, the tracking reconcile sweep, lazy invoice fetch, and three new settings (mintsoft_align_up_requires_receipt_evidence, supplier_quote_shipping_landed_enabled, stock_adjustment_release_reserved).',
+    userMessage: 'IMS 5.1 adds sales quotations, purchase order approval and minimum margin, typed custom fields, document numbering patterns, order attachments, exchanges inside a return and Edit by CSV on the Inventory list. Administrators: set TRUSTED_PROXY_IPS before deploying.',
+    userHighlights: [
+      'Sales: quotations with a PDF (emailing them is built, switched off), exchanges recorded inside a return, order attachments on sales and purchase orders, and pegging a sales order line to a purchase order line so received stock is allocated to it first.',
+      'Purchasing: purchase orders above a threshold need approval before they are sent, a minimum gross margin per purchase order line can warn or block, and the sales price can be edited from the margin column.',
+      'Inventory: Edit by CSV on the Inventory list gives a pre-filled download and a per-product diff before anything is applied; typed custom fields on products, variants and sales orders are managed under Settings > Custom fields.',
+      'Settings: number patterns and counters for sales orders, purchase orders, credit notes and shipments, under Settings > Company > Numbering.',
+      'Accounting: a GR/IR report under Analytics shows goods received and not invoiced, and billed and not received, by supplier and purchase order. Posting it to Xero is built, switched off.',
+      'Xero: an invoice or bill that IMS pushed can be deleted in IMS and Xero together, freeing its number. Built, switched off.',
+      'WooCommerce: native customs fields, the IOSS number, delivery term and duty and tax components are mirrored read-only onto the order; webhook secret rotation keeps the previous secret valid for 48 hours, with a Revoke previous secret button.',
+      'Security: sign-in, two-factor, backup and settings-secret hardening, with optional backup encryption before upload.',
+    ],
+    technicalHighlights: [
+      'Migrations (all additive): wc_order_divergences; so_po_pegging columns and table; mirror_woo_duty_tax columns; accounting document delete sync types and the accounting_document_deletions table; order_attachments and order_attachment_file_deletions; custom_field_definitions and custom_field_values; product_sync_marks; product_customs_clears and product_customs_inherited; sales_quotations; purchase_orders approval columns (six nullable); sales_order_lines exchange_for_refund link; new operator-task reason wms_not_found; the TrackShip re-fire state table and two columns with constant defaults on the order status snapshot table; the GR/IR sub-ledger tables; document numbering counters; customs clear lease and manual discrepancy columns; wms_discrepancy sku renamed; the push warehouse column on wms_order_push_links.',
+      'Security: forwarded client address headers are trusted only for TRUSTED_PROXY_IPS / TRUSTED_PROXY_CIDRS; a password reset removes passkeys; getSetting returns sensitive values masked; backup target settings sit behind step-up; cost and margin data, cross-site request and CSV formula fixes; authorization fixes on stock adjustment edits, product prices and forecast settings.',
+      'Accounting: GR/IR movements are written in the same transaction as the event, idempotent on the source event; refunds without a stock return no longer reverse COGS into Inventory; order-level purchase discounts reach the cost layer; supplier returns consume the returned order layers; a snapshot-day, short-close freight and supplier-quoted shipping pass; unrealised FX; sub-ledger reconciliations in the invariant report.',
+      'WooCommerce: reconcile cadence and buried product recovery, stale delivery handling, inbound import fixes, failed product pushes recorded and retried, and the product.updated webhook following the product sync settings.',
+      'Mintsoft: customs data cleared in IMS now clears in Mintsoft without holding a lock across the call; ASN, align and returns fixes; the IOSS number is sent only with mintsoft_send_ioss_number on (default off).',
+      'Built, switched off: refund_delete_enabled, xero_document_delete_enabled, wc_order_divergence_detection_enabled, trackship_refire_enabled (needs helper plugin 1.4.0), wms_not_found_after_strikes_enabled, wc_tracking_reconcile_enabled, invoice_documents_lazy_fetch_enabled, grir_xero_posting_enabled, sales_quote_email_enabled, return_exchange_enabled, mintsoft_send_ioss_number, mintsoft_align_up_requires_receipt_evidence, supplier_quote_shipping_landed_enabled and stock_adjustment_release_reserved. With each off, payloads and reports are unchanged.',
+    ],
+    operatorActions: [
+      'Set TRUSTED_PROXY_IPS (or TRUSTED_PROXY_CIDRS) in the server environment before deploying: the client address from X-Forwarded-For and X-Real-IP is trusted only for configured proxies, and without it login throttling sees every client as unknown (#1007).',
+      'Optional: set BACKUP_ENCRYPTION_KEY in the server environment to make the Encrypt backups before upload option available (Settings > Backup & Restore > Storage, off by default); the key lives apart from the backups, which cannot be decrypted without it (#1003).',
+      'Three new settings default off and stay off unless the owner decides otherwise: mintsoft_align_up_requires_receipt_evidence (#1025), supplier_quote_shipping_landed_enabled (#1028) and stock_adjustment_release_reserved (#1017).',
+      'Keep these flags off: refund_delete_enabled, xero_document_delete_enabled, wc_order_divergence_detection_enabled, trackship_refire_enabled, wms_not_found_after_strikes_enabled, invoice_documents_lazy_fetch_enabled and wc_tracking_reconcile_enabled.',
+      'The repository stage systemd unit now binds 127.0.0.1: check where the reverse proxy runs before deploying the unit file, because a proxy on another host cannot reach an app bound to 127.0.0.1.',
+      'Webhook secret rotation has a 48-hour grace window: the previous WooCommerce webhook secret stays valid for 48 hours after a new one is saved, and the Revoke previous secret button ends the window early (#1026).',
+    ],
+  },
+  {
+    version: '5.0.0',
+    date: '2026-11-17',
+    title: 'Xero rounding account required, Mintsoft operator tasks instead of order comments, purchase order PDF, prepared stocktakes, reorder planning dates',
+    summary: 'Breaking release: one Xero setting must be mapped before the first Xero push after deploy (the Rounding account, setting xero_rounding_difference_account), and warehouse cases that used to be Mintsoft order comments are now operator tasks on Sync > Exceptions. Migrations (all additive) apply automatically on deploy. New and changed: a priced purchase order PDF and per-line expected delivery dates, prepared stocktakes, Reorder Planning latest PO date, required receipt, coverage weeks, demand chart and richer draft POs, sales-order list bulk actions, a Needs attention dashboard card and bell, Xero journals dated by event with the Xero lock date respected, COGS booked when goods ship, and many WooCommerce, Mintsoft and accounting audit fixes. Built, switched off: purchase order emailing (purchase_order_email_enabled), the GTIN / MPN identifier split (product_identifier_split_enabled) and Mintsoft merge-candidate flagging (wms_merge_candidate_mode).',
+    userMessage: 'IMS 5.0 adds a purchase order PDF, prepared stocktakes, reorder planning dates and charts, bulk actions on the sales-order list and a Needs attention card. Administrators: map the Xero Rounding account in Settings > Accounting.',
+    userHighlights: [
+      'Purchase orders: a priced PO PDF, an expected delivery date per line, and a profit margin per line for users who may see prices. Emailing the PO to the supplier is built, switched off.',
+      'Stock Control: prepared stocktakes, where you choose the products to count and can add or remove them while the count is open.',
+      'Reorder Planning: Latest PO date, Required receipt, Order qty and Coverage weeks on every row, a per-product demand chart, optional per-warehouse reorder points and safety stock, an Ignore stockouts option, forecast sales and margin with a growth factor, and draft POs that carry a destination warehouse, line delivery dates and a per-row supplier choice.',
+      'Sales orders: tick orders on the list to allocate, advance status or print packing slips together; the status badge shows picking, packing and partial dispatch; each shipment has its own packing slip.',
+      'Documents: order references, VAT and company numbers, non-Latin characters and a new credit note PDF are corrected on customer PDFs.',
+      'A Needs attention card on the dashboard and bell notifications bring failed pushes, parked refunds, failed accounting rows and paused receipts into one view.',
+      'Sales orders can be edited: drafts freely, confirmed orders after a WooCommerce-desync warning, addresses and notes after dispatch. Refunds can carry a return reason, PO lines carry internal notes, and a per-warehouse channel buffer can hold units back from WooCommerce.',
+      'Warehouse (Mintsoft): IMS no longer writes order comments. Cases the warehouse must act on appear as tasks under Sync > Exceptions > Raise a warehouse query. Merge-candidate flagging for same-customer orders is built, switched off.',
+    ],
+    technicalHighlights: [
+      'Migrations (all additive): wms_operator_tasks table and enums; needs_attention_announcements table; stock_counts.prepared and a unique index on stock_count_lines (countId, productId); PurchaseOrderLine.expectedDelivery; wms_order_push_links columns courier_task_service, courier_task_episode, double_postage_at and double_postage_detail; shipments accounting_cogs_relieved_from_inventory_at, _amount and _sync_log_id; deferral_adjustment_ref; sales_order_refunds return_cost_split and return_shipment_qty; the wc_stock_dirty_orders table; the reorder_threshold_overrides table; the per-warehouse channel buffer column on stock_levels; refused_actions table; xero_payment_matches table; sales_orders payment_removed_foreign, payment_removed_at, edited_in_ims_at and wc_line_baseline; the payment_removal_reconciliations table; return_reasons table and sales_order_refunds.return_reason_id; purchase_order_lines.notes; warehouses availableForPurchaseOrders; stock_sync_states.lastPushedEtaDate; payload_account_nets on accounting_sync_logs; invoice-document customer request columns; the refund delete table and sync type; sales_orders.invoicing_state; new values on the operator-task reason enum.',
+      'Xero: every document write carries unitdp=4; the lost penny is posted as an untaxed Rounding adjustment line sized from the predicted whole-document total, tax included, and the write is refused unless the prediction equals the IMS total. The daily batch dates journals by event, imports and respects the Xero books lock date, nets pre-batch refunds, and books COGS when goods ship, paid or not.',
+      'WooCommerce: the stock push subtracts orders IMS has not reserved under a completeness proof and records deleted or released orders; a resumable cancellation backstop runs on every reconcile pass; a status can no longer move a shipped order backwards; edits after import are surfaced on Sync > Exceptions.',
+      'Mintsoft: systemic-failure circuit breaker on the order push and dispatch sweeps; WMS-cancelled orders, refused completions and possible double postage are surfaced; align-down is held for units already despatched; an approved over-receipt books the full quantity; a partly delivered ASN can be closed short.',
+      'Built, switched off: purchase_order_email_enabled, product_identifier_split_enabled, wms_merge_candidate_mode (flag mode only; IMS never merges), mintsoft_product_parity_enabled, mintsoft_parent_sku_delete_enabled, xero_payment_matching_mode (off, shadow or live), wc_ast_provider_mapping_enabled and wc_back_in_stock_date_enabled, refund_delete_enabled (keep off until its open defect is fixed) and wc_invoice_document_enabled, invoice_documents_credit_notes_enabled and invoice_documents_lazy_fetch_enabled; the Reorder Planning Ignore stockouts box is off by default. With each off, payloads and reports are unchanged.',
+      'Also: a sales order Invoicing state (Not, Partially or Fully invoiced), retention compaction that keeps the account nets the Allocated Inventory proof needs, and refused or stalled actions are recorded, aged and escalated; a partial payment removal in Xero is measured and recorded on the order; IMS-initiated refunds on WooCommerce orders raise a Refund in WooCommerce task; supplier credits against reverse-charge bills carry the net payable.',
+      'New read-only tools: npm run crm:identity-report and scripts/report-identifier-reclassification.ts write nothing.',
+    ],
+    operatorActions: [
+      'Map the Xero Rounding account (Settings > Accounting > Xero, setting xero_rounding_difference_account, for example account 860). Without it, a Xero document whose 4-decimal unit prices leave a rounding gap is refused and nothing is sent.',
+      'Keep the stored Xero tax-rate list fresh (sync the chart of accounts and tax rates before the first batch after deploy); a line whose tax rate is missing from it, or a stale list, refuses the Xero write.',
+      'Work the new warehouse queries: IMS no longer writes Mintsoft order comments, so each case the warehouse must act on is a task under Sync > Exceptions > Raise a warehouse query (copy the text into a Mintsoft query, then press Done).',
+      'After deploying, run npm run sales:invoicing-state:recompute once (add -- --dry-run first to report without writing); the migration marks existing invoiced orders as Fully invoiced and the recompute refines partly invoiced ones.',
+      'Keep refund delete switched off: refund_delete_enabled ships off by default and stays off until the open defect on it is fixed.',
+      'Keep the wms-order-status cron on: the new align-down gate holds a stock write-off for orders pushed to Mintsoft and not yet shipped in IMS unless their cached Mintsoft status is fresh.',
+      'Work the new refund and payment follow-up tasks: a refund recorded in IMS on a WooCommerce order raises a Refund in WooCommerce task (IMS writes nothing to the store; confirm a later parked WooCommerce refund against the IMS refund so no second credit note is raised), and an order whose payment was partly removed in Xero reads Part paid until the owner credits or writes it off.',
+      'Watch the new Sync > Exceptions sections (refused WooCommerce completions, possible double postage on merged orders, orders cancelled in Mintsoft, WMS connector-wide failure); IMS changes nothing on its own for these.',
+    ],
+  },
+  {
     version: '4.4.1',
     date: '2026-11-15',
     title: 'Warehouse note for removed merged-order lines is no longer lost; order push runs one at a time',
@@ -437,7 +506,7 @@ export async function ensureCurrentReleaseNotificationInStore(
   const release = CURRENT_RELEASE
   const id = getReleaseNotificationId(release.version)
   const title = `What's New in ${release.version}`
-  const actionUrl = '/settings/system?tab=releases'
+  const actionUrl = '/help/releases'
   const desired = {
     id,
     userId: null,

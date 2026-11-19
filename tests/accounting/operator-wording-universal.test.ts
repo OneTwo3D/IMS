@@ -255,8 +255,10 @@ test('[o3d-1e7sl Codex r10] the drift guard: the reused-key types the instructio
 })
 
 test('[o3d-1e7sl Codex r10] per posting type: every state variation renders the SAME action and the SAME Mark-as-handled condition on every surface', () => {
-  const TYPES: Array<[string | undefined, 'update' | 'payment' | 'conditional' | 'untyped']> = [
+  const TYPES: Array<[string | undefined, 'update' | 'payment' | 'delete' | 'conditional' | 'untyped']> = [
     ['SALES_INVOICE_UPDATE', 'update'], ['PURCHASE_INVOICE_UPDATE', 'update'], ['BILL_PAYMENT', 'payment'],
+    // o3d-ngmt.21: removing a document is its own flow; "post it if absent" would be the opposite of the step.
+    ['SALES_INVOICE_DELETE', 'delete'], ['PURCHASE_INVOICE_DELETE', 'delete'],
     ['SALES_INVOICE', 'conditional'], ['STOCK_RECEIPT', 'conditional'], [undefined, 'untyped'],
   ]
   const PLAIN = /post it in the ledger now|Then post it,|only once it is posted/i
@@ -306,6 +308,7 @@ test('[o3d-1e7sl Codex r10] per posting type: every state variation renders the 
           if (name === 'claim dialog' || name.endsWith('row')) assert.match(text, /identify the posting type before any ledger work/i, `${where}: ${name}`)
         }
         if (flow === 'conditional') assert.doesNotMatch(text, /CURRENT payment|apply the update|register THIS/, `${where}: ${name}`)
+        if (flow === 'delete') assert.doesNotMatch(text, /CURRENT payment|apply the update|register THIS|post it ONLY if it is absent/, `${where}: ${name}: a delete is never told to post the document`)
         if (flow === 'update' || flow === 'payment') {
           for (const clause of text.split(/(?<=[.;])\s+/).filter((c) => /do not post again/i.test(c))) assert.match(clause, /if the current (version|payment) is there/i, `${where}: ${name}: "do not post again" only under the CURRENT condition: ${clause}`)
         }
@@ -400,7 +403,9 @@ test('[o3d-1e7sl Codex r14] the help doc carries the generated blocks exactly on
     const a = doc.indexOf(begin)
     assert.equal(doc.slice(a, doc.indexOf(end, a) + end.length), text, 'the help doc disagrees with the generator - regenerate it')
   }
-  assert.ok(doc.split('\n').length < 3200, 'the help doc has not been duplicated')
+  // A duplicated regen would roughly double the page (and the begin markers above are counted exactly once).
+  // The ceiling sits well above the page's real size so ordinary growth does not trip it.
+  assert.ok(doc.split('\n').length < 5000, 'the help doc has not been duplicated')
   const walkAll = (dir: string): string[] => readdirSync(path.join(ROOT, dir)).flatMap((name) => {
     const rel = path.join(dir, name)
     if (name === 'generated' || name === 'node_modules' || name === '.next') return []
@@ -535,10 +540,11 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/domain/wms/order-push-sweep.ts', prefix: 'Apply the change in the WMS by hand.', verdict: 'NON_ACCOUNTING', why: 'warehouse-side manual step for a change IMS did not send to a merged order; no ledger effect', count: 2 },
   { file: 'lib/domain/wms/push-recovery-affordance.ts', prefix: 'Check whether the warehouse order was merged or renamed and apply the change there by hand, then acknowledge it here.', verdict: 'NON_ACCOUNTING', why: 'Exceptions-row guidance for a warehouse-side manual step; acknowledging clears only the inbox row, no ledger effect' },
   { file: 'lib/domain/wms/push-recovery-affordance.ts', prefix: 'Apply the change in the warehouse by hand, then acknowledge it here.', verdict: 'NON_ACCOUNTING', why: 'Exceptions-row guidance for a warehouse-side manual step; acknowledging clears only the inbox row, no ledger effect' },
+  { file: 'lib/domain/wms/merge-hold.ts', prefix: 'These orders are for the same customer and delivery address.', verdict: 'NON_ACCOUNTING', why: 'warehouse-side manual step (merge two held orders and confirm the merged order in the WMS); IMS never releases the hold; no ledger effect' },
+  { file: 'lib/domain/wms/operator-tasks.ts', prefix: 'Orders on merge hold in the warehouse: merge them there and confirm the merged order yourself', verdict: 'NON_ACCOUNTING', why: 'operator-task title for the same warehouse-side merge step; no ledger effect' },
   { file: 'lib/accounting.ts', prefix: 'It was answered as "this connector does not post this type"', verdict: 'DESCRIPTION', why: 'states what the queue answered; nothing to follow' },
   { file: 'lib/connectors/accounting-settlement-probe.ts', prefix: 'This entry will retry once that attempt is readable', verdict: 'DESCRIPTION', why: 'states IMS own retry behaviour' },
   { file: 'lib/connectors/woocommerce/sync/order-completion-jobs.ts', prefix: 'Replay it: the retry re-reads the order first', verdict: 'NON_ACCOUNTING', why: 'WooCommerce order-completion write-back, no ledger posting' },
-  { file: 'lib/connectors/woocommerce/sync/product-sync.ts', prefix: 'Resolve the duplicate SKU / barcode', verdict: 'NON_ACCOUNTING', why: 'WooCommerce product-structure conflict' },
   { file: 'lib/connectors/xero/daily-sync.ts', prefix: 'Daily batch DAILY_BATCH_GROUP_B not recreated', verdict: 'DESCRIPTION', why: 'states why the rebuild was refused' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'There is nothing that would stop a re-post.', verdict: 'DESCRIPTION', why: 'states a hazard; the instruction beside it is CHECK XERO first' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'CHECK XERO before re-queueing', verdict: 'CHECKS_FIRST', why: 'is itself the ledger check, before any re-queue' },
@@ -572,7 +578,10 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts', prefix: 'credit note(s) {} in the ledger', verdict: 'DESCRIPTION', why: 'states which credit notes the ledger holds' },
   { file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts', prefix: 'no credit note of theirs recorded in the ledger', verdict: 'DESCRIPTION', why: 'states a fact about the ledger' },
   { file: 'lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff.ts', prefix: 'IMS records refund(s) {}', verdict: 'DESCRIPTION', why: 'states what IMS holds' },
+  { file: 'lib/domain/sales/refund-delete-service.ts', prefix: 'credit note closed in the accounting system', verdict: 'DESCRIPTION', why: 'activity text stating what the delete did' },
+  { file: 'lib/domain/sales/refund-delete-service.ts', prefix: 'The credit note is closed in the accounting system, but', verdict: 'DESCRIPTION', why: 'states why phase 2 of the delete stopped' },
   { file: 'lib/connectors/xero/credit-notes.ts', prefix: 'Credit note not found in Xero for allocation', verdict: 'DESCRIPTION', why: 'error label' },
+  { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'VOIDED a sales credit note in Xero', verdict: 'DESCRIPTION', why: 'states what the void posting did (the effect label of the post-effect table)' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the activity row for the lost claim could not be written', verdict: 'DESCRIPTION', why: 'states where the only record is', count: 1 },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the single-statement fallback write failed', verdict: 'DESCRIPTION', why: 'states where the only record is', count: 1 },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'created a DRAFT manual journal in Xero', verdict: 'DESCRIPTION', why: 'states what IMS did', count: 1 },
@@ -581,6 +590,7 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/domain/accounting/posting-refusal-kinds.ts', prefix: 'The FX revaluation raises this journal only', verdict: 'DESCRIPTION', why: 'describes what the Retry button does for this kind' },
   { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: '{} are NOT accounting documents', verdict: 'DESCRIPTION', why: 'states what the listed items are' },
   { file: 'lib/domain/purchasing/supplier-credit-note.ts', prefix: 'IMS could not establish whether credit note', verdict: 'DESCRIPTION', why: 'states why IMS refused' },
+  { file: 'lib/domain/purchasing/supplier-credit-note.ts', prefix: 'Check them in Xero first; once you have confirmed', verdict: 'CHECKS_FIRST', why: 'the refusal states the ledger HOLDS the duplicates, so the generic act-only-if-absent preamble would contradict the repair; the check comes first and the void is conditional on the duplicate being confirmed' },
   { file: 'lib/domain/purchasing/supplier-credit-note.ts', prefix: 'Credit note {} is already in the ledger as', verdict: 'DESCRIPTION', why: 'states a ledger fact' },
   { file: 'lib/domain/sales/refund-manual-resolution.ts', prefix: 'To clear it: open Sync → Exceptions', verdict: 'CHECKS_FIRST', why: 'directs to the IMS inbox action "Record manually", which posts the credit note through the queue (idempotent, claim-aware); the operator posts nothing by hand. Kept unwrapped because the WMS connector-boundary guard must evaluate this constant statically' },
   { file: 'app/(dashboard)/sync/exceptions/exceptions-client.tsx', prefix: 'Refund recorded manually', verdict: 'DESCRIPTION', why: 'toast stating the outcome of the completed operator action' },

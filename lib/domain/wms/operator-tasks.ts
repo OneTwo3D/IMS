@@ -15,7 +15,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * new task.
  */
 
-export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE', 'SHOP_REFUND_DUE', 'AMENDMENT_NOT_APPLIED'] as const
+export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE', 'SHOP_REFUND_DUE', 'AMENDMENT_NOT_APPLIED', 'ORDER_NOT_FOUND', 'CANCELLED_POSTED_INVOICE', 'MERGE_HOLD', 'MERGE_HOLD_OVERDUE', 'MERGE_HOLD_WITHDRAWAL'] as const
 export type WmsOperatorTaskReasonValue = (typeof WMS_OPERATOR_TASK_REASONS)[number]
 
 /** What an operator reads for each reason (the exceptions section). */
@@ -29,6 +29,11 @@ export const WMS_OPERATOR_TASK_REASON_LABELS: Record<WmsOperatorTaskReasonValue,
   MERGE_CANDIDATE: 'Same-customer orders still NEW: check them in the warehouse system and merge there if appropriate',
   SHOP_REFUND_DUE: 'Refund in WooCommerce: IMS recorded this refund, the shop still has to pay it back',
   AMENDMENT_NOT_APPLIED: 'Order change not applied: the warehouse order is already past NEW',
+  ORDER_NOT_FOUND: 'Warehouse order not found on repeated checks: IMS stopped checking its status',
+  CANCELLED_POSTED_INVOICE: 'Cancelled order with a posted invoice: the invoice is still uncredited in the ledger',
+  MERGE_HOLD: 'Orders on merge hold in the warehouse: merge them there and confirm the merged order yourself',
+  MERGE_HOLD_OVERDUE: 'Merge hold overdue: merge and confirm the order in the warehouse',
+  MERGE_HOLD_WITHDRAWAL: 'Withdrawal or cancel on an order on merge hold: act in the warehouse',
 }
 
 export type WmsOperatorTaskInput = {
@@ -55,6 +60,10 @@ export type WmsOperatorTaskPayload = {
   items?: WmsOperatorTaskLine[]
   /** Merge candidate: the orders of the group (IMS and warehouse numbers only). */
   members?: Array<{ orderId: string; orderNumber: string | null; externalOrderNumber: string }>
+  /** Merge hold: the group this task is about (so a later retry can re-word it), its warnings, and for an unsettled-hold task which case it is. */
+  groupBasis?: string
+  warnings?: string[]
+  kind?: string
   /** Refund in WooCommerce (SHOP_REFUND_DUE): the IMS refund the task is about and the figures the operator refunds. IMS figures and ids only. */
   shopRefund?: {
     refundId: string
@@ -142,6 +151,15 @@ export function amendmentNotAppliedQuery(wmsOrder: string, imsOrder: string, lin
   const wanted = lines.length > 0 ? lines.map((line) => `${line.quantity} x ${line.sku}`).join(', ') : 'no lines'
   return `IMS order ${imsOrder} was changed after warehouse order ${wmsOrder} left NEW (warehouse status ${wmsStatus}), so IMS could not amend it and has changed nothing there. `
     + `IMS now holds this order as: ${wanted}. Please check the warehouse order against these lines and, if it is not yet despatched, make the change there.`
+}
+
+/**
+ * The query for a warehouse order the status sweep asked about several times in a row and the warehouse said does not exist. IMS has marked the
+ * order NOTFOUND and stopped polling it; it has changed nothing in the warehouse or the storefront. Order numbers only.
+ */
+export function orderNotFoundQuery(wmsOrder: string, imsOrder: string, checks: number): string {
+  return `IMS sent order ${imsOrder} to the warehouse as order ${wmsOrder}, but the warehouse answered that it does not exist on ${checks} status checks in a row, so IMS has stopped checking its status. `
+    + `Please look the order up in the warehouse's own system. If it was cancelled, merged or renamed there, nothing more is needed. If it should still exist, raise a query with the warehouse to find out what happened to it before it is despatched. IMS has changed nothing.`
 }
 
 export function refundNoteQuery(wmsOrder: string, imsOrder: string, creditNote: string | null | undefined, full: boolean): string {

@@ -298,7 +298,7 @@ test('daily inventory snapshot upserts by date/product/warehouse and returns dri
       snapshotCount: 1,
       source: 'cron',
       checkMethod: 'daily_current_state_v1',
-      cutoffAt: new Date('2026-05-29T00:00:00.000Z'),
+      cutoffAt: new Date('2026-05-28T23:00:00.000Z'),
     },
   )
   assert.equal(client.reservationRunUpserts.length, 1)
@@ -327,7 +327,7 @@ test('daily inventory snapshot upserts by date/product/warehouse and returns dri
     reservationSnapshotCount: 1,
     source: 'cron',
     checkMethod: 'daily_current_state_v1',
-    cutoffAt: new Date('2026-05-29T00:00:00.000Z'),
+    cutoffAt: new Date('2026-05-28T23:00:00.000Z'),
     reservationSourceCount: 1,
   })
 })
