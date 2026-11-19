@@ -1,0 +1,4 @@
+### Audited command line for system-managed switches (ops)
+- **`npm run settings:get -- --key <k>`** (read only) prints a switch's stored value, effective value, default, and the last audit entry with who wrote it.
+- **`npm run settings:set -- --key <k> --value <v> --by <name> --reason "<text>" [--yes]`** replaces the raw SQL method for switches with no settings screen. Dry run by default; with `--yes` it upserts the `settings` row, writes an activity-log entry (who, why, old, new) and reads the value back in one transaction.
+- Allowlist of 11 switches that exist today, validated as their readers read them (exact `true`/`false`, or `off`/`flag` for `wms_merge_candidate_mode`). Credential settings and unlisted keys are refused. `mintsoft_parent_sku_delete_enabled` needs product parity on, and `wms_merge_hold_enabled` needs flag mode.
