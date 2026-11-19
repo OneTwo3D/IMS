@@ -38,6 +38,11 @@ export type ReturnCreditNoteBill = {
   subtotalForeign: DecimalInput
   /** Bill GROSS total (incl-VAT), foreign. The over-credit ceiling. */
   totalForeign: DecimalInput
+  /**
+   * What is OWED to the supplier on the bill (lib/domain/purchasing/bill-net-payable.ts): the stored gross total less the VAT of its reverse-charge lines, which the bill accounts
+   * for itself. The credit is grossed up to, and capped at, this figure, not the stored total. Omitted = the stored total (a bill with no reverse-charge line).
+   */
+  netPayableForeign?: DecimalInput
   fxRateToBase: DecimalInput
   /**
    * Sum of amountForeign of ALL credit notes recorded against this bill (manual +
@@ -152,7 +157,7 @@ export function computeReturnCreditNoteDraft(input: {
   // credit is tax-inclusive like the bill it offsets. A zero net subtotal (no
   // VAT, or a degenerate bill) falls back to a 1:1 ratio.
   const subtotal = toDecimal(targetBill.subtotalForeign)
-  const grossTotal = toDecimal(targetBill.totalForeign)
+  const grossTotal = targetBill.netPayableForeign === undefined ? toDecimal(targetBill.totalForeign) : toDecimal(targetBill.netPayableForeign)
   const grossUpRatio = subtotal.gt(0) ? grossTotal.div(subtotal) : toDecimal(1)
   const overBilledGrossForeign = multiplyMoney(overBilledNetForeign, grossUpRatio)
 
