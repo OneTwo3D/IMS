@@ -1399,6 +1399,7 @@ export async function reopenShipmentForRepackAction(
 
       // Read inside the transaction, and before the allocation call: the resolve runs inside
       // `runAllocation`, which takes the order lock, so this read must not be made from there.
+      // Includes soft-deleted refunds on purpose: resolving a release job is harmless and must reach a deleted refund's too.
       const refunds = await tx.salesOrderRefund.findMany({ where: { orderId }, select: { id: true } })
 
       const realloc = await allocateSalesOrder(tx, {

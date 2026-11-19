@@ -206,6 +206,19 @@ test('createMintsoftAsn PUTs a NewASN, requires Success and ID, then verifies th
   )
 })
 
+test('SUPPLIER ON THE WIRE: a null or absent externalSupplierId leaves the body byte-identical; only a mapped id adds ProductSupplierId', async () => {
+  reset()
+  await (await client()).createMintsoftAsn(INPUT)
+  const baseline = JSON.stringify(bodies[0])
+  reset()
+  await (await client()).createMintsoftAsn({ ...INPUT, externalSupplierId: null })
+  assert.equal(JSON.stringify(bodies[0]), baseline, 'null supplier: byte-identical')
+  reset()
+  await (await client()).createMintsoftAsn({ ...INPUT, externalSupplierId: '42' })
+  assert.deepEqual({ ...(bodies[0] as object), ProductSupplierId: undefined }, { ...JSON.parse(baseline), ProductSupplierId: undefined })
+  assert.equal((bodies[0] as Record<string, unknown>).ProductSupplierId, 42)
+})
+
 test('an HTTP 200 carrying Success: false creates nothing, is never read back, and says why', async () => {
   reset()
   // A rejected create is an HTTP 200 with ID 0, so a client that trusts the status code records a phantom

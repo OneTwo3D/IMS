@@ -380,7 +380,7 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
     })
     if (!stored) return
     const refundRows = await db.salesOrderRefund.findMany({
-      where: { orderId },
+      where: { orderId, deletedAt: null },
       select: { externalRefundId: true, lines: { select: { salesOrderLineId: true, qty: true } } },
     })
     const refundedQtyByLineId = new Map<string, Decimal>()

@@ -153,6 +153,23 @@ const EMAIL_CLAIM_STALE_MS = 15 * 60 * 1000
  * per-install value would make that claim unknowable from the code.
  */
 export const EMAIL_MAX_STALE_RECLAIMS = 1
+/**
+ * Owner decision 2026-11-18, "never send a customer email twice": the kinds whose stale PROCESSING row MAY still be reclaimed once. Only the
+ * purchase order, which carries its own delivery-boundary guard and a 60 s send deadline. EVERY OTHER KIND (every customer email) has a reclaim
+ * cap of ZERO: a worker that died or was restarted after the DATA command was accepted but before it settled the row leaves it PROCESSING, and a
+ * reclaim would send again. A stale row of such a kind is PARKED (PARKED_SEND_CAP) instead, for an operator to check the mail log and release or
+ * cancel it. Parking is the "outcome unknown" state: the row is not re-sent and is not silently dropped.
+ */
+const RECLAIMABLE_EMAIL_KINDS: ReadonlySet<string> = new Set(['PURCHASE_ORDER'])
+export function staleReclaimCapForKind(kind: string): number {
+  return RECLAIMABLE_EMAIL_KINDS.has(kind) ? EMAIL_MAX_STALE_RECLAIMS : 0
+}
+/**
+ * The send deadline every kind without its own gets, so a send can never outlast the stale window: at the deadline the transport is closed and the
+ * answer is the terminal "outcome unknown" failure. It must stay well under EMAIL_CLAIM_STALE_MS (asserted in tests), or a second worker could
+ * find the row stale while the first is still sending.
+ */
+export const EMAIL_DEFAULT_SEND_DEADLINE_MS = 5 * 60 * 1000
 /** The status a row at the reclaim cap is moved to. The sweep never selects it. */
 export const EMAIL_OUTBOX_PARKED_STATUS = 'PARKED_SEND_CAP'
 const EMAIL_BACKOFF_BASE_MS = 60_000
@@ -220,6 +237,8 @@ export type EmailOutboxRow = {
   lockedBy: string | null
   /** o3d-hpeg: elapsed-time reclaims this row has had. See EMAIL_MAX_STALE_RECLAIMS. */
   staleReclaimCount: number
+  /** When the drain entered the sender for this claim, or null when it never did. */
+  sendEnteredAt?: Date | null
 }
 
 /**
@@ -1934,8 +1953,9 @@ function refuseSweptRowsFromOutsideTheStore(swept: EmailOutboxRow[], rows: () =>
 async function claimEmailRow(
   client: EmailOutboxClient,
   id: string,
-  claim: { claimedAt: Date; staleCutoff: Date; token: string },
+  claim: { claimedAt: Date; staleCutoff: Date; token: string; kind: string },
 ): Promise<'claimed' | 'parked' | 'none'> {
+  const reclaimCap = staleReclaimCapForKind(claim.kind)
   const first = await client.emailOutbox.updateMany({
     where: {
       id,
@@ -1947,9 +1967,53 @@ async function claimEmailRow(
       status: 'PROCESSING',
       processingStartedAt: claim.claimedAt,
       lockedBy: claim.token,
+      sendEnteredAt: null,
     },
   })
   if (first.count > 0) return 'claimed'
+
+  // A STALE PROCESSING ROW WHOSE WORKER NEVER ENTERED THE SENDER (it died while preparing: PDF build, recipient confirm) sent nothing. It is put back
+  // to PENDING and claimed in the ordinary way, for every kind. Conditional on the stale claim and on the sender never having been entered, so a worker
+  // that entered it a moment ago is not requeued. EACH REQUEUE COUNTS AS AN ATTEMPT (not a stale reclaim: no send happened), so a row whose
+  // preparation crashes or hangs the worker cannot loop for ever: at the last attempt it is parked instead (below).
+  const requeued = await client.emailOutbox.updateMany({
+    where: {
+      id,
+      attempts: { lt: EMAIL_MAX_ATTEMPTS - 1 },
+      status: 'PROCESSING',
+      processingStartedAt: { lt: claim.staleCutoff },
+      sendEnteredAt: null,
+    },
+    data: { status: 'PENDING', processingStartedAt: null, lockedBy: null, attempts: { increment: 1 } },
+  })
+  if (requeued.count > 0) {
+    const again = await client.emailOutbox.updateMany({
+      where: { id, attempts: { lt: EMAIL_MAX_ATTEMPTS }, status: 'PENDING' },
+      data: { status: 'PROCESSING', processingStartedAt: claim.claimedAt, lockedBy: claim.token, sendEnteredAt: null },
+    })
+    if (again.count > 0) return 'claimed'
+    return 'none'
+  }
+
+  // The same stale, never-entered row with no attempts left to requeue on: its preparation has now stalled EMAIL_MAX_ATTEMPTS - 1 times. Nothing was
+  // ever sent, so say that (not "may have reached the recipient"); an operator releases or cancels it.
+  const preparationStalled = await client.emailOutbox.updateMany({
+    where: {
+      id,
+      attempts: { gte: EMAIL_MAX_ATTEMPTS - 1 },
+      status: 'PROCESSING',
+      processingStartedAt: { lt: claim.staleCutoff },
+      sendEnteredAt: null,
+    },
+    data: {
+      status: EMAIL_OUTBOX_PARKED_STATUS,
+      processingStartedAt: null,
+      lockedBy: null,
+      lastError: 'Preparation never completed: the worker stopped or stalled while preparing this email (before it was handed to the mail server) '
+        + `${EMAIL_MAX_ATTEMPTS - 1} times in a row, so it was parked instead of being retried again. Nothing was sent. Check the document it builds, then release or cancel it.`,
+    },
+  })
+  if (preparationStalled.count > 0) return 'parked'
 
   const reclaim = await client.emailOutbox.updateMany({
     where: {
@@ -1957,13 +2021,14 @@ async function claimEmailRow(
       attempts: { lt: EMAIL_MAX_ATTEMPTS },
       status: 'PROCESSING',
       processingStartedAt: { lt: claim.staleCutoff },
-      staleReclaimCount: { lt: EMAIL_MAX_STALE_RECLAIMS },
+      staleReclaimCount: { lt: reclaimCap },
     },
     data: {
       status: 'PROCESSING',
       processingStartedAt: claim.claimedAt,
       lockedBy: claim.token,
       staleReclaimCount: { increment: 1 },
+      sendEnteredAt: null,
     },
   })
   if (reclaim.count > 0) return 'claimed'
@@ -1973,14 +2038,17 @@ async function claimEmailRow(
       id,
       status: 'PROCESSING',
       processingStartedAt: { lt: claim.staleCutoff },
-      staleReclaimCount: { gte: EMAIL_MAX_STALE_RECLAIMS },
+      staleReclaimCount: { gte: reclaimCap },
     },
     data: {
       status: EMAIL_OUTBOX_PARKED_STATUS,
       processingStartedAt: null,
       lockedBy: null,
-      lastError: `Parked at the send cap: already reclaimed ${EMAIL_MAX_STALE_RECLAIMS} time(s), and the holder `
-        + 'went stale again. Not retried automatically; an operator must release or cancel it (o3d-hpeg).',
+      lastError: reclaimCap === 0
+        ? 'Outcome unknown: the worker that claimed this email stopped (a crash, restart or stall) before recording the result, so the message may or may not have '
+          + 'reached the recipient. It was not re-sent, to avoid a duplicate. Check the mail server log, then release or cancel it (o3d-hpeg).'
+        : `Parked at the send cap: already reclaimed ${reclaimCap} time(s), and the holder `
+          + 'went stale again. Not retried automatically; an operator must release or cancel it (o3d-hpeg).',
     },
   })
   return parked.count > 0 ? 'parked' : 'none'
@@ -2064,6 +2132,14 @@ export async function processPendingEmailOutbox(
       /** Read-only by construction: the only writer is the wrapper below. */
       get attempted(): boolean {
         return sendEntered
+      },
+      /** The sender ANSWERED, and the answer was success: the message was delivered. */
+      get deliveredByAnswer(): boolean {
+        return sendReturned && delivered
+      },
+      /** The sender was entered and never answered (it threw): the message may or may not be on the wire. */
+      get senderLeftUnanswered(): boolean {
+        return sendEntered && !sendReturned
       },
       send: async (...args: Parameters<typeof sendOverSmtp>) => {
         sendEntered = true
@@ -2414,27 +2490,26 @@ export async function processPendingEmailOutbox(
     email: { id: string; kind: string; referenceType: string | null; referenceId: string | null },
     reason: string,
   ): Promise<void> => {
-    if (!email.referenceId) return
-    // A STOREFRONT CUSTOMER E-MAIL (o3d-zvec.24, the only SalesOrder kind prepared as a single send) is a single send: its unknown outcome is shown ON THE ORDER, at WARNING, so an operator checks with the
-    // customer before re-sending it by hand (the automatic path never queues the same e-mail again).
-    if (email.referenceType === 'SalesOrder') {
+    if (email.referenceType !== 'PurchaseOrder' || !email.referenceId) {
+      // CUSTOMER (non-PO) kinds are single-send too (owner decision: never duplicate a customer email). The operator is told, on the order
+      // when there is one, that the mail MAY NOT HAVE BEEN DELIVERED and was not retried. Best effort, after the settlement.
       try {
+        const onOrder = email.referenceType === 'SalesOrder' && !!email.referenceId
         await log({
-          entityType: 'SALES_ORDER',
-          entityId: email.referenceId,
+          entityType: onOrder ? 'SALES_ORDER' : 'SYSTEM',
+          ...(onOrder ? { entityId: email.referenceId as string } : {}),
           action: 'email_outcome_unknown',
-          tag: 'sales',
+          tag: onOrder ? 'sales' : 'system',
           level: 'WARNING',
-          description: `Customer e-mail (${email.kind}): ${reason} It was not retried. Check with the customer before sending it again.`,
+          description: `Email (${email.kind}) may not have been delivered: ${reason} It was not retried, to avoid sending the customer a duplicate. Check with the customer, then re-send it manually if needed.`,
           metadata: { emailOutboxId: email.id, kind: email.kind },
           resolveUser: false,
         })
       } catch (logError) {
-        console.error('[email-outbox] failed to record an unknown outcome on the sales order:', logError)
+        console.error('[email-outbox] failed to record an unknown outcome:', logError)
       }
       return
     }
-    if (email.referenceType !== 'PurchaseOrder') return
     try {
       await log({
         entityType: 'PURCHASE_ORDER',
@@ -2457,17 +2532,22 @@ export async function processPendingEmailOutbox(
     let unknownOutcomeReason: string | null = null
     const claimedAt = now()
     const token = randomUUID()
-    const verdict = await claimEmailRow(client, email.id, { claimedAt, staleCutoff, token })
+    const verdict = await claimEmailRow(client, email.id, { claimedAt, staleCutoff, token, kind: email.kind })
     if (verdict === 'parked') {
       // o3d-hpeg: this row had already been reclaimed EMAIL_MAX_STALE_RECLAIMS times and its latest
       // holder has gone stale too. It is NOT reclaimed a further time; it is parked, and the drain
       // never selects it again. Said loudly, because nothing will move it on but an operator.
       result.parked++
       const reference = email.referenceType && email.referenceId ? ` for ${email.referenceType} ${email.referenceId}` : ''
-      const message = `Email outbox row ${email.id} (${email.kind}${reference}, to ${email.toEmail}) was PARKED at the `
-        + `send cap: it had already been reclaimed ${EMAIL_MAX_STALE_RECLAIMS} time(s) and its holder has gone stale `
-        + 'again, so the sender has been entered at least twice for it and a copy may already have reached the '
-        + 'customer. It will not be sent automatically. Check the mail server or provider log, then release it '
+      const cap = staleReclaimCapForKind(email.kind)
+      // A swept row that never entered the sender is parked by the preparation-stalled step: nothing can have been sent.
+      const preparationStalled = !email.sendEnteredAt
+      const message = `Email outbox row ${email.id} (${email.kind}${reference}, to ${email.toEmail}) was PARKED: ` + (preparationStalled
+        ? `preparing it stalled or crashed the worker ${EMAIL_MAX_ATTEMPTS - 1} times before it was ever handed to the mail server, so nothing was sent. Check the document it builds. `
+        : cap === 0
+        ? 'the worker that claimed it stopped before recording the result, so the message may or may not have reached the recipient (outcome unknown). It was not re-sent, to avoid a duplicate. '
+        : `it had already been reclaimed ${cap} time(s) and its holder has gone stale again, so the sender has been entered at least twice for it and a copy may already have reached the customer. `)
+        + 'It will not be sent automatically. Check the mail server or provider log, then release it '
         + `(tsx scripts/email-outbox-parked.ts --row ${email.id} --release --apply) or cancel it (--cancel --apply) (o3d-hpeg).`
       console.error(`[email-outbox] ${message}`)
       await log({
@@ -2483,7 +2563,7 @@ export async function processPendingEmailOutbox(
           referenceType: email.referenceType,
           referenceId: email.referenceId,
           staleReclaimCount: email.staleReclaimCount,
-          cap: EMAIL_MAX_STALE_RECLAIMS,
+          cap,
         },
         resolveUser: false,
       })
@@ -2585,7 +2665,8 @@ export async function processPendingEmailOutbox(
       // and the row is refused.
       const confirmed = await client.emailOutbox.updateMany({
         where: { id: claim.id, status: 'PROCESSING', lockedBy: claim.token, processingStartedAt: claim.claimedAt, toEmail: email.toEmail },
-        data: { status: 'PROCESSING' },
+        // `sendEnteredAt` is the durable "the sender is about to be entered" mark: a worker that dies after this may have sent; one that dies before provably did not.
+        data: { status: 'PROCESSING', sendEnteredAt: now() },
       })
       if (confirmed.count === 0) {
         await refuseRecipient(EMAIL_RECIPIENT_ERASED_REASON)
@@ -2597,13 +2678,15 @@ export async function processPendingEmailOutbox(
         subject: prepared?.subject ?? email.subject,
         html: prepared?.html ?? email.html,
         attachments,
-        ...(prepared?.sendDeadlineMs ? { deadlineMs: prepared.sendDeadlineMs } : {}),
-        ...(prepared?.singleSend ? { singleSend: true } : {}),
+        deadlineMs: prepared?.sendDeadlineMs ?? EMAIL_DEFAULT_SEND_DEADLINE_MS,
+        // EVERY kind is single-send (owner decision 2026-11-18): a lost final SMTP response ends FAILED with an operator notice rather than
+        // requeueing, so a customer is never sent a duplicate. Possibly-undelivered mail is the accepted trade.
+        singleSend: true,
       }
       let sendResult: Awaited<ReturnType<typeof smtp.send>>
       if (prepared?.sendGuard) {
         // The kind's own delivery-boundary check, held across the send (see PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE). A refusal sent nothing.
-        const guarded = await prepared.sendGuard(() => smtp.send(outgoing))
+        const guarded = await prepared.sendGuard((signal) => smtp.send({ ...outgoing, signal }))
         if (guarded.refused !== undefined) {
           await refuseRecipient(guarded.refused, { keepAddress: true })
           continue
@@ -2688,16 +2771,45 @@ export async function processPendingEmailOutbox(
       else await recordConflict(claim, 'a failed send', smtp)
       if (sendResult.unknownOutcome) await recordUnknownOutcomeOnReference(email, sendError ?? 'Outcome unknown')
     } catch (error) {
+      // OWNER DECISION o3d-hqvrp.388: a customer email is NEVER sent twice. Once the sender was entered, nothing here may settle the row to PENDING
+      // on the strength of a database error: (a) the sender reported SUCCESS and a later write threw -> the message WAS delivered, settle SENT;
+      // (b) the sender itself threw -> delivery is unknown, settle FAILED with the unknown-outcome notice. Both are the same for every kind,
+      // PO included (a PO whose row is SENT or FAILED is never reclaimed). The settle is retried a few times because it is the one write that
+      // keeps the row out of the PO's single stale reclaim; if the database stays down for all of them the error escapes and the row is left to that reclaim.
+      if (smtp.attempted && smtp.senderLeftUnanswered && unknownOutcomeReason === null) {
+        unknownOutcomeReason = `Outcome unknown: the mail sender failed before reporting a result (${String(error)}), so the message may or may not have been delivered.`
+      }
+      const deliveredByAnswer = smtp.deliveredByAnswer
       const attempts = email.attempts + 1
       const permanentFailure = attempts >= EMAIL_MAX_ATTEMPTS || unknownOutcomeReason !== null
-      const settled = await settleClaimedEmail(client, claim, {
-        status: permanentFailure ? 'FAILED' : 'PENDING',
-        attempts,
-        lastError: unknownOutcomeReason ?? String(error),
-        availableAt: permanentFailure ? email.availableAt : new Date(now().getTime() + getBackoffMs(email.attempts)),
-        processingStartedAt: null,
-      })
-      if (settled) result.failed++
+      const settleData = deliveredByAnswer
+        ? { status: 'SENT', sentAt: now(), lastError: null, processingStartedAt: null }
+        : {
+          status: permanentFailure ? 'FAILED' : 'PENDING',
+          attempts,
+          lastError: unknownOutcomeReason ?? String(error),
+          availableAt: permanentFailure ? email.availableAt : new Date(now().getTime() + getBackoffMs(email.attempts)),
+          processingStartedAt: null,
+        }
+      let settled: boolean
+      if (smtp.attempted) {
+        let lastFailure: unknown
+        settled = false
+        for (let tryNo = 0; tryNo < 3; tryNo++) {
+          try {
+            settled = await settleClaimedEmail(client, claim, settleData)
+            lastFailure = undefined
+            break
+          } catch (settleError) {
+            lastFailure = settleError
+            if (tryNo < 2) await new Promise((resolve) => setTimeout(resolve, 200 * (tryNo + 1)))
+          }
+        }
+        if (lastFailure !== undefined) throw lastFailure
+      } else {
+        settled = await settleClaimedEmail(client, claim, settleData)
+      }
+      if (settled) { if (deliveredByAnswer) result.sent++; else result.failed++ }
       // THE PHASE IS DERIVED TOO, for the same reason the flag is — AND IT IS DERIVED FROM THE WHOLE
       // OF THE ROW'S PROGRESS, not from one flag (r22, Codex LOW). This `catch` covers the
       // preparation and the attachment decode BEFORE the sender, and the suppression upsert and the

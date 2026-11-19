@@ -63,6 +63,8 @@ async function resetMintsoftPersistence() {
   await db.wmsProductLink.deleteMany({ where: { connector: 'mintsoft' } })
   await db.wmsStockSnapshot.deleteMany({ where: { connector: 'mintsoft' } })
   await db.wmsStockDiscrepancy.deleteMany({ where: { connector: 'mintsoft' } })
+  // Refund adoptions reference the inbox row (RESTRICT): scoped to this connector's inbox rows, and first.
+  await db.salesOrderRefundInboxAdoption.deleteMany({ where: { inbox: { connector: 'mintsoft' } } })
   await db.wmsReturnsInbox.deleteMany({ where: { connector: 'mintsoft' } })
   await db.wmsInboundReceiptEvent.deleteMany({ where: { connector: 'mintsoft' } })
   await db.wmsAsnLineMap.deleteMany({ where: { asn: { connector: 'mintsoft' } } })

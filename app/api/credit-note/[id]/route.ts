@@ -33,6 +33,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
   if (!hasPermission(session.user.role, 'sales')) return NextResponse.json({ error: 'Forbidden' }, { status: 403 })
 
   const { id } = await params
+  // soft-delete exception: the credit-note document of a deleted refund stays retrievable for audit.
   const refund = await db.salesOrderRefund.findUnique({
     where: { id },
     include: {

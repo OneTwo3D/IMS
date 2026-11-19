@@ -206,12 +206,22 @@ export function readWcCountHeader(raw: string | null, whenAbsent: number): numbe
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : WC_PAGINATION_UNKNOWN
 }
 
+/** `Retry-After` as milliseconds: delta-seconds or an HTTP date; undefined when absent or unreadable. */
+export function parseRetryAfterMs(raw: string | null, now: number = Date.now()): number | undefined {
+  if (raw === null) return undefined
+  const text = raw.trim()
+  if (/^[0-9]{1,7}$/.test(text)) return Number(text) * 1000
+  if (!/^[A-Za-z]{3},/.test(text)) return undefined
+  const at = Date.parse(text)
+  return Number.isNaN(at) ? undefined : Math.max(0, at - now)
+}
+
 export async function wcFetch(
   path: string,
   params: Record<string, string> = {},
   creds?: ConnectorCredentials | null,
   readOptions: { refuseRedirects?: boolean } = {},
-): Promise<{ data: unknown; totalPages: number; totalItems: number; /** True only when the store actually sent an X-WP-Total header (an absent one reads as 0 in `totalItems`). */ totalItemsPresent?: boolean; error?: string }> {
+): Promise<{ data: unknown; totalPages: number; totalItems: number; /** True only when the store actually sent an X-WP-Total header (an absent one reads as 0 in `totalItems`). */ totalItemsPresent?: boolean; error?: string; /** The store's `Retry-After` on a failed response, in milliseconds (absent when it sent none or an unreadable one). */ retryAfterMs?: number }> {
   const credentials = creds === undefined ? await getWcCredentials() : creds
   if (!credentials) {
     logMissingWooCommerceCredentials()
@@ -243,7 +253,7 @@ export async function wcFetch(
 
   if (!res.ok) {
     const detail = await readErrorDetails(res)
-    return { data: null, totalPages: 0, totalItems: 0, error: `WC API error: ${res.status} ${detail}` }
+    return { data: null, totalPages: 0, totalItems: 0, error: `WC API error: ${res.status} ${detail}`, retryAfterMs: parseRetryAfterMs(res.headers.get('retry-after')) }
   }
 
   const contentType = res.headers.get('content-type') ?? ''

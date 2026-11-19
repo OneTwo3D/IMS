@@ -141,6 +141,7 @@ screen you are on. That job runs on whatever schedule your cron daemon calls it 
 expected cadence is in the cron table under **Settings > System** — so a queued email goes out on
 the job's next run, not immediately.
 
+- **Never a duplicate customer email.** Customer emails (order confirmation, invoice, dispatch, quotation) are sent once. If the mail server may have accepted the message but its final reply was lost, the email is marked failed and **not retried**, and the order's activity log shows a warning that the email *may not have been delivered*. Check with the customer and re-send manually if needed. A failure before any message data was sent (for example, the server could not be reached) is still retried.
 - **One undelivered copy per document.** If you press the email button again while the first
   copy is still waiting to go out, the system does **not** queue a second one — the activity log
   records "already queued and undelivered — not duplicated". Once the email has actually been

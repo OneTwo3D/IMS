@@ -102,6 +102,10 @@ export const POSTING_REFUSAL_KINDS = {
     type: 'INVENTORY_ADJUSTMENT', referenceType: 'WmsReturnsInbox', clearing: 'manual',
     how: 'The journal is queued once, with the restock; the returns-inbox item is then closed, so restocking again is not possible.',
   },
+  refund_adoption_reclass_journal: {
+    type: 'INVENTORY_ADJUSTMENT', referenceType: 'SalesOrderRefund', clearing: 'manual',
+    how: 'IMS queues no journal for this: a refund that adopts an already restocked arrival raises this owed-posting record once, and it stays in the inbox until it is marked handled. Deleting the refund closes the record.',
+  },
   purchase_order_cancellation_reversal: {
     type: 'INVENTORY_ADJUSTMENT', referenceType: 'PurchaseOrder', clearing: 'manual',
     how: 'Retired. Cancelling a part-received purchase order now closes it short and queues no reversal, so nothing raises this posting any more; the kind stays so a row already in the inbox can still be marked handled.',
@@ -185,3 +189,6 @@ export function postingRefusalMarkable(kind: string | null | undefined): boolean
 
 /** The longest note an operator may attach when marking a row handled (e.g. a ledger journal number). */
 export const POSTING_REFUSAL_NOTE_MAX_LENGTH = 500
+
+/** The scope of the owed-posting record an adopting refund raises (one per refund); the refund delete closes it by this key. */
+export const ADOPTION_RECLASS_POSTING_SCOPE = 'adoption-reclass'

@@ -769,7 +769,7 @@ export async function getArAgingReport(
       totalForeign: true,
       currency: true,
       payments: { select: { amount: true, currency: true, paidAt: true, refundId: true, settlementRateToBase: true } },
-      refunds: { where: { refundedAt: { lt: asOfExclusive } }, select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
+      refunds: { where: { deletedAt: null, refundedAt: { lt: asOfExclusive } }, select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
     },
     take: SOURCE_ROW_LIMIT + 1,
   }) as SalesOrderAgingRow[]
@@ -1110,7 +1110,7 @@ export async function getCurrencySummaryReport(
         paidAt: true,
         paymentRemovals: { select: { kind: true, amountForeign: true, createdAt: true } },
         payments: { select: { amount: true, currency: true, paidAt: true, refundId: true, settlementRateToBase: true } },
-        refunds: { where: { refundedAt: { lt: window.dateToExclusive } }, select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
+        refunds: { where: { deletedAt: null, refundedAt: { lt: window.dateToExclusive } }, select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
       },
       take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<SalesOrderCurrencyRow[]>,

@@ -66,7 +66,7 @@ export async function decideRefund182Hold<T extends HeldRowEnqueue>(refundId: st
     if (rows.length === 0) throw new Error('the refund to hold could not be found')
     return rows[0]!.held
   }
-  const placeOf = async (client: Pick<typeof db, '$queryRaw'>): Promise<number> => Number((await client.$queryRaw<Array<{ n: bigint }>>`SELECT COUNT(*) AS n FROM sales_order_refunds WHERE eas182_held_at IS NOT NULL AND eas182_held_at <= (SELECT eas182_held_at FROM sales_order_refunds WHERE id = ${refundId})`)[0]?.n ?? 0)
+  const placeOf = async (client: Pick<typeof db, '$queryRaw'>): Promise<number> => Number((await client.$queryRaw<Array<{ n: bigint }>>`SELECT COUNT(*) AS n FROM sales_order_refunds WHERE deleted_at IS NULL AND eas182_held_at IS NOT NULL AND eas182_held_at <= (SELECT eas182_held_at FROM sales_order_refunds WHERE id = ${refundId})`)[0]?.n ?? 0)
   const thresholdOf = async (client: typeof db): Promise<number | null> => refundHoldThreshold((await client.setting.findUnique({ where: { key: EU_VAT_REFUND_HOLD_THRESHOLD_SETTING }, select: { value: true } }))?.value)
 
   // Already held: held again, never counted again, and the (idempotent) refused row is enqueued again in case the first attempt never got it queued.
@@ -103,7 +103,7 @@ export async function decideRefund182Hold<T extends HeldRowEnqueue>(refundId: st
         if (threshold === 0) return { held: false as const }
         if (countable && held >= threshold) return { held: false as const }
       }
-      const heldNumber = countable ? held + 1 : (await tx.$queryRaw<Array<{ n: bigint }>>`SELECT COUNT(*) + 1 AS n FROM sales_order_refunds WHERE eas182_held_at IS NOT NULL`).map((row) => Number(row.n))[0] ?? 1
+      const heldNumber = countable ? held + 1 : (await tx.$queryRaw<Array<{ n: bigint }>>`SELECT COUNT(*) + 1 AS n FROM sales_order_refunds WHERE deleted_at IS NULL AND eas182_held_at IS NOT NULL`).map((row) => Number(row.n))[0] ?? 1
       const outcome = await enqueueHeldRow({ heldNumber, threshold: countable ? threshold : null })
       if (!outcome.queued) throw new RowNotQueued(outcome)
       // REQUIRE the refused row (this refund's key) to exist before anything is stamped or counted.

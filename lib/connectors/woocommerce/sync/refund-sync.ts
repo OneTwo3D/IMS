@@ -495,6 +495,7 @@ async function upsertRefundPark(
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`wc_refund:${input.externalId}`}))`
     // Under that lock, re-read whether the refund has now LANDED (on any order). If a SalesOrderRefund exists
     // for this external id, a park (which asserts the refund is unresolved) would be contradictory — skip it.
+    // soft-delete exception (identity check): includes a soft-deleted refund on purpose, so a redelivered external refund is recognised and never re-created (the row still holds the unique external id).
     const landed = await tx.salesOrderRefund.findFirst({ where: { externalRefundId: Number(input.externalId) }, select: { id: true } })
     if (landed) return
 
@@ -738,6 +739,7 @@ export async function syncWcRefund(
     // Check if already processed. externalRefundId is GLOBALLY unique, so a matching refund may belong to
     // ANOTHER order — o3d-7yf: verify ownership. Same order => idempotent success; different order => fail
     // closed rather than silently reporting "handled" and leaving THIS order without its refund.
+    // soft-delete exception (identity check): includes a soft-deleted refund on purpose, so a redelivered external refund is recognised and never re-created (the row still holds the unique external id).
     const existing = await client.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id }, select: { orderId: true } })
     if (existing) {
       if (existing.orderId === so.id) {
@@ -824,6 +826,7 @@ export async function syncWcRefund(
       type Decision = { kind: 'landed-here' } | { kind: 'park'; message: string } | { kind: 'none' }
       const decision = await client.$transaction(async (tx): Promise<Decision> => {
         await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${`wc_refund:${wcRefund.id}`}))`
+        // soft-delete exception (identity check): includes a soft-deleted refund on purpose, so a redelivered external refund is recognised and never re-created (the row still holds the unique external id).
         const landed = await tx.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id }, select: { orderId: true } })
         if (landed) return landed.orderId === so.id ? { kind: 'landed-here' } : { kind: 'none' }
         const open = await findOpenShopRefunds(tx, so.id)
@@ -1208,6 +1211,7 @@ export async function syncWcRefund(
       // o3d-7yf: the unique violation may be a CROSS-ORDER race — the refund that won the externalRefundId
       // could belong to another order. Verify ownership before recording a SYNCED dedup log for THIS order;
       // otherwise the loser is falsely marked synced while its refund lives on a different order.
+      // soft-delete exception (identity check): includes a soft-deleted refund on purpose, so a redelivered external refund is recognised and never re-created (the row still holds the unique external id).
       const winner = await client.salesOrderRefund.findFirst({ where: { externalRefundId: wcRefund.id }, select: { orderId: true } })
       if (winner && winner.orderId !== so.id) {
         return { outcome: 'permanent-failure', error: `WooCommerce refund ${wcRefund.id} was concurrently created on a different order (${winner.orderId}); refusing to mark it synced here.` }

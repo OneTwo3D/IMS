@@ -499,6 +499,7 @@ async function getExistingDocumentNumberMax(
     return rows.reduce((max, row) => Math.max(max, parseSuffix(row.invoiceNumber)), 0)
   }
   if (key === 'credit_note') {
+    // Numbering: deliberately includes soft-deleted refunds, so a deleted credit note's number is never reused.
     const rows = await tx.salesOrderRefund.findMany({
       where: { creditNoteNumber: { startsWith: prefix } },
       select: { creditNoteNumber: true },
@@ -1027,6 +1028,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
         },
       },
       refunds: {
+        where: { deletedAt: null },
         select: {
           id: true, creditNoteNumber: true, reason: true, returnReason: { select: { name: true } }, totalForeign: true, totalBase: true, refundedAt: true,
           accountingRetryRequired: true,
@@ -1612,6 +1614,8 @@ const EDIT_GUARD_SELECT = {
   unregisteredPaidAt: true,
   storeCreditForeign: true,
   invoiceNumber: true,
+  // DELIBERATE EXCEPTION to the soft-delete filter (o3d-ngmt.22): `refunds` here counts a deleted refund too, so an order that ever carried a refund stays
+  // locked against edits, the conservative direction (a deleted refund's credit note and journals have reached the ledger and are still referenced).
   _count: { select: { allocations: true, shipments: true, shoppingLinks: true, lines: true, refunds: true, returnExpectations: true, payments: true, invoiceDocuments: true } },
   wmsOrderPush: { select: { id: true, externalOrderId: true } },
   wcLineBaseline: true,
@@ -2813,8 +2817,9 @@ async function markRefundAccountingRetryRequired(
   refundId: string,
   warning: string,
 ): Promise<void> {
-  await db.salesOrderRefund.update({
-    where: { id: refundId },
+  // updateMany + deletedAt: null: a soft-deleted refund must not be re-armed for an accounting retry.
+  await db.salesOrderRefund.updateMany({
+    where: { id: refundId, deletedAt: null },
     data: {
       accountingRetryRequired: true,
       accountingWarning: warning,
@@ -3122,6 +3127,7 @@ async function loadRefundAccountingQueueInput(
   refundId: string,
   accountingSyncs: RefundAccountingSyncRequest[],
 ): Promise<Parameters<typeof queueRefundAccountingActions>[0]> {
+  // Queue input for a refund's credit note: only reached from the create / retry paths, which refuse a soft-deleted refund first.
   const refund = await db.salesOrderRefund.findUnique({
     where: { id: refundId },
     select: {
@@ -3212,6 +3218,7 @@ async function refundOrderIsErasedOrUnknown(orderId: string | null): Promise<boo
 async function loadRefundAuditContext(
   refundId: string,
 ): Promise<{ orderId: string; refundOrderRef: string } | null> {
+  // AUDIT read: deliberately includes a soft-deleted refund (the activity row still names its order).
   const refund = await db.salesOrderRefund.findUnique({
     where: { id: refundId },
     select: {
@@ -3930,6 +3937,7 @@ export async function createRefund(
       // o3d-7yf: externalRefundId is globally unique, so this conflict may be a CROSS-ORDER race — the
       // winning refund could belong to a different order. Only report idempotent success when the existing
       // refund is on THIS order; otherwise the loser would be marked synced while its refund lives elsewhere.
+      // soft-delete exception (identity check): includes a soft-deleted refund on purpose, so a redelivered external refund is recognised and never re-created (the row still holds the unique external id).
       const winner = await db.salesOrderRefund.findFirst({ where: { externalRefundId: options.externalRefundId }, select: { orderId: true } })
       if (winner && winner.orderId !== orderId) {
         return { success: false, error: `A refund with external id ${options.externalRefundId} already exists on a different order; refusing to dedupe it here.` }
@@ -3993,7 +4001,7 @@ export async function raiseChargebackForReversedOrder(
   // sweep re-queues the credit note; once it succeeds the flag clears and a later
   // poll returns the benign "already exists".
   const existingChargeback = await db.salesOrderRefund.findFirst({
-    where: { orderId, chargeback: true },
+    where: { orderId, chargeback: true, deletedAt: null }, // a soft-deleted chargeback is not the order's chargeback
     select: { id: true, accountingRetryRequired: true },
   })
   if (existingChargeback) {
@@ -4023,7 +4031,7 @@ export async function raiseChargebackForReversedOrder(
       externalOrderNumber: true,
       lines: { select: { id: true, productId: true, description: true, qty: true, totalBase: true } },
       shipments: { select: { status: true, shipmentJournalDate: true } },
-      refunds: { select: { id: true } },
+      refunds: { where: { deletedAt: null }, select: { id: true } }, // a soft-deleted refund is not a prior refund
     },
   })
   if (!order) return { raised: false, error: 'Order not found' }
@@ -4436,8 +4444,8 @@ export async function retryRefundAccounting(
     return { success: true }
   } catch (e) {
     const auditContext = await loadRefundAuditContext(refundId).catch(() => null)
-    await db.salesOrderRefund.update({
-      where: { id: refundId },
+    await db.salesOrderRefund.updateMany({
+      where: { id: refundId, deletedAt: null }, // a soft-deleted refund is not re-armed for retry
       data: {
         accountingRetryRequired: true,
         accountingWarning: String(e),
@@ -4611,6 +4619,8 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
           // by. An order can sit in several A2 batches; one column names one of them.
           allocationBatchPasses: true,
           lines: { select: { productId: true, qty: true } },
+          // DELIBERATE EXCEPTION to the soft-delete filter (o3d-ngmt.22): a deleted refund still counts. The refund row (soft-deleted, not removed) keeps its foreign key to the
+          // order, so the order cannot be deleted while one exists, and an order that was refunded and had it deleted is still not one to throw away.
           _count: { select: { refunds: true, payments: true } },
         },
       })
@@ -5027,7 +5037,7 @@ export async function addPayment(input: {
       let payableTotal = toDecimal(so.totalForeign)
       if (refundId) {
         const refund = await tx.salesOrderRefund.findFirst({
-          where: { id: refundId, orderId: input.orderId },
+          where: { id: refundId, orderId: input.orderId, deletedAt: null }, // a soft-deleted refund takes no payment
           select: { totalForeign: true },
         })
         if (!refund) return { error: 'Refund not found for this order' }
@@ -5377,7 +5387,7 @@ export async function addPayment(input: {
  * their own typed refusal at the boundary.
  */
 class PaymentTransactionRefusal extends Error {
-  constructor(readonly code: string, message: string) {
+  constructor(readonly code: string, message: string, readonly assertableRegistrationIds?: string[]) {
     super(message)
     this.name = 'PaymentTransactionRefusal'
   }
@@ -5519,7 +5529,8 @@ async function removePaymentAndSettlePaidAt(
   return becameUnpaid
 }
 
-export type DeletePaymentResult = { success: boolean; error?: string; code?: PaymentDeleteRefusalCode }
+/** `assertableRegistrationIds`: retired registrations an ADMIN may assert never existed in the ledger (o3d-5fx28); set only on the undecided refusal. */
+export type DeletePaymentResult = { success: boolean; error?: string; code?: PaymentDeleteRefusalCode; assertableRegistrationIds?: string[] }
 
 /**
  * Delete a locally-recorded receipt — and REFUSE while the accounting system still holds a payment
@@ -5583,7 +5594,7 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
         // posted, and this is the delete that used to go through on exactly that assumption.
         if (undecided.length > 0) {
           const refusal = describeAttemptUndecidedRefusal(undecided, getSalesOrderReference(so))
-          throw new PaymentTransactionRefusal(refusal.code, refusal.message)
+          throw new PaymentTransactionRefusal(refusal.code, refusal.message, undecided.filter((row) => row.status === 'CANCELLED' && !hasPostEvidence(row) && (row.settlementBasis ?? null) === null && row.abandonedBeforeRemoteCall !== true).map((row) => row.id))
         }
         if (retirable.length > 0) {
           // CANCELLED rather than deleted, because that is the retirement the processor already
@@ -5640,7 +5651,7 @@ export async function deletePayment(paymentId: string, orderId: string): Promise
   } catch (e) {
     // A refusal is a decision, not a fault: it must not be logged as an ERROR and must keep its code.
     if (e instanceof PaymentTransactionRefusal) {
-      return { success: false, error: e.message, code: e.code as PaymentDeleteRefusalCode }
+      return { success: false, error: e.message, code: e.code as PaymentDeleteRefusalCode, ...(e.assertableRegistrationIds && e.assertableRegistrationIds.length > 0 ? { assertableRegistrationIds: e.assertableRegistrationIds } : {}) }
     }
     await logActivity({
       entityType: 'SALES_ORDER',
