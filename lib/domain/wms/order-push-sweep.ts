@@ -27,7 +27,7 @@ import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, wmsCreateEligibleOrderWhere, wmsPaidB
 import { withOrderPushSweepLockOrSkip } from './dispatch-sweep-lock'
 import { removalNoteKey, REMOVAL_NOTE_KEY_PREFIX, parseRemovalNote, serializeRemovalNote, type WmsRemovalNoteObligation, type RemovalNoteItem } from './removal-note-obligation'
 import { scrubWmsError } from './error-scrub'
-import { skuRenameHoldReason, withSkuRenameHolds } from '@/lib/domain/wms/sku-rename-hold'
+import { SKU_RENAME_HOLD_REASON_PREFIX, skuRenameHoldReason, withSkuRenameHolds } from '@/lib/domain/wms/sku-rename-hold'
 import { amendmentSeverity, classifyAmendmentLineChange, recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER, type AmendmentLineChange, type RefusedActionInput } from '@/lib/domain/refused-actions'
 import { raiseRefundRemainderTasks } from './refund-remainder'
 import { amendmentNotAppliedQuery, courierFallbackQuery, describeTaskLines, identityCheckQuery, INVESTIGATE_NOTICE_PREFIX, mergedLinesRemovedQuery, noticeQuery, partialRemovalCheckQuery, raiseWmsOperatorTask, warehouseOrderRef, type WmsOperatorTaskInput } from './operator-tasks'
@@ -457,8 +457,8 @@ type OrderForPush = {
   discountModel?: string | null
   totalForeign: unknown
   lines: CandidateLine[]
-  /** Product ids on this order whose SKU rename the warehouse does not have yet (set by the port; see sku-rename-hold.ts). Absent = none known. */
-  skuRenameHeldProductIds?: ReadonlyArray<string>
+  /** The new IMS SKUs on this order that the warehouse does not have yet (set by the port; see sku-rename-hold.ts). Absent = none known. */
+  skuRenameHeldSkus?: ReadonlyArray<string>
   refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }>
   /** The business-event time of the order (paid, else created): the producer-side hold's obligation time. Read-only evidence; absent in a hand-built port. */
   paidAt?: Date | null
@@ -627,13 +627,9 @@ type CandidateLine = {
  */
 export const NO_GOODS_TO_PUSH_REASON = 'Sales order has only fee lines (no goods to fulfil); cannot push to WMS'
 
-export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, number>, skuRenameHeldProductIds?: ReadonlyArray<string>): WmsOrderPushLine[] {
+export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, number>, skuRenameHeldSkus?: ReadonlyArray<string>): WmsOrderPushLine[] {
   const pushLines: WmsOrderPushLine[] = []
-  // A line whose SKU was renamed in IMS but not yet in the warehouse: the whole order is held (see sku-rename-hold.ts), never sent with a SKU the warehouse does not know.
-  if (skuRenameHeldProductIds && skuRenameHeldProductIds.length > 0) {
-    const heldSkus = lines.flatMap((line) => (line.productId && line.sku && skuRenameHeldProductIds.includes(line.productId) ? [line.sku] : []))
-    if (heldSkus.length > 0) throw new Error(skuRenameHoldReason(heldSkus))
-  }
+  const heldSkus: string[] = []
   for (const line of lines) {
     // A mirrored WooCommerce FEE line is not goods: never an order item (see mirrored-fee-line.ts). Skipped BEFORE the
     // SKU check, which would otherwise fail the whole order on it.
@@ -651,6 +647,8 @@ export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, 
     const refunded = (line.id && refundedByLine?.get(line.id)) || 0
     const quantity = Math.max(0, orderedQty - refunded)
     if (quantity <= 0) continue
+    // A line that WILL be sent with a new IMS SKU the warehouse does not have yet holds the whole order (see sku-rename-hold.ts). Fee lines and fully refunded lines are skipped above.
+    if (skuRenameHeldSkus?.includes(line.sku)) heldSkus.push(line.sku)
     // IMS stores SalesOrderLine.totalForeign as NET (ex-VAT) in both tax-inclusive
     // and tax-exclusive cases; taxForeign is the line VAT. Unit prices are per the
     // ORIGINAL qty so they stay correct when the shipped quantity is reduced.
@@ -664,6 +662,7 @@ export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, 
       description: line.description || null,
     })
   }
+  if (heldSkus.length > 0) throw new Error(skuRenameHoldReason(heldSkus))
   // Fee lines are skipped above, so a stored order made ONLY of them leaves nothing to send. (An order whose goods were all
   // refunded is a different, pre-existing case and keeps its behaviour: it still has goods lines.)
   if (pushLines.length === 0 && lines.length > 0 && lines.every((line) => isMirroredFeeLine(line))) {
@@ -688,6 +687,7 @@ export const ORDER_PUSH_SELECT = {
   shippingService: true,
   courierKey: true,
   shippingMethodId: true,
+  shipFromWarehouseId: true,
   subtotalForeign: true,
   shippingForeign: true,
   taxForeign: true,
@@ -803,7 +803,7 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string,
     ...(shippingVatDerived > 0 ? { shippingVatDerived } : {}),
     discountExVat: num(order.discountAmount),
     discountVat: 0,
-    lines: buildLines(order.lines, refundedQtyByLine(order), order.skuRenameHeldProductIds),
+    lines: buildLines(order.lines, refundedQtyByLine(order), order.skuRenameHeldSkus),
   }
   if (scope?.mode !== 'MIXED') return input
   const minorFactor = 10 ** currencyMinorUnits(order.currency)
@@ -1532,8 +1532,10 @@ export async function runWmsOrderPushSweepCore(
     if (!port.recordRefusedAction) return
     try {
       const message = error instanceof Error ? error.message : ''
-      let severity: 'HIGH' | 'LOW' = 'HIGH'
-      if (message !== NO_DELIVERY_STREET_REASON) {
+      let severity: 'HIGH' | 'MEDIUM' | 'LOW' = 'HIGH'
+      // A SKU-rename hold is a known, self-clearing wait (the warehouse product has to be renamed), not a change the warehouse is picking stale lines for: MEDIUM.
+      if (message.startsWith(SKU_RENAME_HOLD_REASON_PREFIX)) severity = 'MEDIUM'
+      else if (message !== NO_DELIVERY_STREET_REASON) {
         let lineChange: AmendmentLineChange = 'UNKNOWN'
         try {
           const wanted = buildLines(order.lines, refundedQtyByLine(order)).map((line) => ({ sku: line.sku, quantity: Number(line.quantity) }))

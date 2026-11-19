@@ -700,6 +700,14 @@ async function upsertProductDiscrepancy(params: {
 }) {
   const now = new Date()
   for (const scope of params.scopes) {
+    // An operator ignored this exact rename (same IMS SKU, same Mintsoft SKU): the sync does not reopen it (o3d-zz37l).
+    if (params.category === 'PRODUCT_SKU_RENAMED') {
+      const ignored = await db.wmsStockDiscrepancy.findFirst({
+        where: { connector: 'mintsoft', warehouseId: scope.warehouseId, productId: params.productId, category: params.category, status: 'IGNORED', imsValue: params.imsValue, wmsValue: params.wmsValue },
+        select: { id: true },
+      })
+      if (ignored) continue
+    }
     const updated = await db.wmsStockDiscrepancy.updateMany({
       where: {
         connector: 'mintsoft',
@@ -996,6 +1004,8 @@ export async function syncOneMintsoftProduct(
   if (!isMintsoftProductEligible(context.product)) {
     // Nothing is synced (or cleared) for it any more: a manual-clear discrepancy left open would never resolve otherwise.
     await resolveProductDiscrepancy(context.scopes, context.product.id, 'CUSTOMS_CLEAR_MANUAL')
+    // A product that no longer syncs can never close its rename discrepancy by syncing, and that discrepancy holds order push (o3d-zz37l).
+    await resolveProductDiscrepancy(context.scopes, context.product.id, 'PRODUCT_SKU_RENAMED')
     return {
       sku: context.product.sku,
       productId: context.product.id,

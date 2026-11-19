@@ -1,6 +1,7 @@
 'use server'
 
 import { db } from '@/lib/db'
+import { logActivity } from '@/lib/activity-log'
 import { revalidatePath } from 'next/cache'
 import { freshAuthFailureResult, requireFreshPermission, requirePermission } from '@/lib/auth/server'
 import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
@@ -83,11 +84,24 @@ export type ConfirmAsnCancelRequestResult = { success: boolean; error?: string }
  */
 export async function confirmAsnCancelRequestAction(refusedActionId: string): Promise<ConfirmAsnCancelRequestResult> {
   try {
-    await requireFreshPermission('sync')
+    const session = await requireFreshPermission('sync')
     if (typeof refusedActionId !== 'string' || refusedActionId === '') return { success: false, error: 'No request was named.' }
-    const row = await db.refusedAction.findUnique({ where: { id: refusedActionId }, select: { entityId: true, action: true } })
+    const row = await db.refusedAction.findUnique({ where: { id: refusedActionId }, select: { entityId: true, action: true, resolvedAt: true, intent: true } })
     if (!row || row.action !== 'WMS_ASN_CANCEL_REQUEST') return { success: false, error: 'That is not an open request to cancel an ASN.' }
-    await resolveAsnCancelRequest(db, row.entityId)
+    if (row.resolvedAt) return { success: false, error: 'That request was already marked done.' }
+    if (await resolveAsnCancelRequest(db, row.entityId)) {
+      const intent = row.intent && typeof row.intent === 'object' && !Array.isArray(row.intent) ? row.intent as { transferId?: unknown; externalAsnId?: unknown; orderNumber?: unknown } : {}
+      // Who said the warehouse was asked: the row holds only the resolution, so the actor goes in the activity log.
+      await logActivity({
+        entityType: 'STOCK_TRANSFER',
+        entityId: typeof intent.transferId === 'string' ? intent.transferId : row.entityId,
+        action: 'asn_cancel_request_confirmed',
+        tag: 'stock',
+        userId: session.user.id,
+        description: `Confirmed the warehouse was asked to cancel ASN ${typeof intent.externalAsnId === 'string' ? intent.externalAsnId : row.entityId} for transfer ${typeof intent.orderNumber === 'string' ? intent.orderNumber : ''}`.trim(),
+        metadata: { asnMapId: row.entityId, refusedActionId },
+      })
+    }
     revalidatePath('/sync/exceptions')
     return { success: true }
   } catch (error) {

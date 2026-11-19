@@ -34,7 +34,7 @@ export const REFUSED_ACTIONS = {
   WMS_SPLIT_ORDER_COMPLETE: { label: 'Split order cannot complete', gates: ['WMS_SPLIT_PART_CANCELLED'] },
   /** An ASN create refused because the purchase order's (or the transfer's) supplier has no warehouse supplier mapped. An operator maps it on the connector's supplier mapping screen. */
   WMS_ASN_SUPPLIER: { label: 'ASN not created: supplier not mapped in the warehouse', gates: ['WMS_SUPPLIER_UNMAPPED'] },
-  /** A transfer's dispatch was cancelled in IMS and its warehouse ASN closed here: a person must ask the warehouse to cancel it (IMS writes nothing to the warehouse). Closes when an operator confirms the request or the ASN is resolved. */
+  /** A transfer's dispatch was cancelled in IMS and its warehouse ASN closed here: a person must ask the warehouse to cancel it (IMS writes nothing to the warehouse). Closes only when an operator presses Done (nothing in IMS can see the warehouse's ASN state). */
   WMS_ASN_CANCEL_REQUEST: { label: 'Ask the warehouse to cancel an ASN', gates: ['WMS_ASN_CANCEL_NOT_CONFIRMED'] },
 } as const
 export type RefusedActionName = keyof typeof REFUSED_ACTIONS

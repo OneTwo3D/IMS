@@ -26,7 +26,7 @@ import { WMS_INBOUND_EVENT_PROCESSING_STATUS } from '@/lib/domain/wms/inbound-ev
  *
  * THE REQUEST TO THE WAREHOUSE IS A DURABLE TASK (o3d-zz37l). For every closed ASN that reached the warehouse, the same transaction records one
  * refused-action row (WMS_ASN_CANCEL_REQUEST, entity = the ASN map) with the copy-ready text. It is idempotent per ASN, stays on Sync > Exceptions
- * until an operator confirms the warehouse was asked (or the ASN is otherwise resolved), and ages into an alert like any other. The banner is kept.
+ * until an operator confirms the warehouse was asked (Done is the only way it closes), and ages into an alert like any other. The banner is kept.
  *
  * LOCKING. Step 3 of the global order (transfer-asn-lock-order.ts): the caller already holds the transfer row, and
  * must call this BEFORE taking the ASN line locks (step 4).
@@ -129,7 +129,7 @@ export function describeClosedTransferAsns(transferReference: string, closed: re
 }
 
 /**
- * Close the cancel request of one ASN: an operator confirmed the warehouse was asked, or the ASN is otherwise resolved. Idempotent; true when an open
+ * Close the cancel request of one ASN: an operator confirmed the warehouse was asked. Idempotent; true when an open
  * request was closed.
  */
 export async function resolveAsnCancelRequest(
