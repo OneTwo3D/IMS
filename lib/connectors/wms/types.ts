@@ -544,6 +544,11 @@ export type WmsOrderPushInput = {
    * sends it as `shippingVat` only behind its own setting (Mintsoft: `mintsoft_send_shipping_vat`, default off), so `shippingVat` stays 0 until then.
    */
   shippingVatDerived?: number
+  /**
+   * Set by a connector's `resolvePushInput`: the connector's settings have been applied to this input (Mintsoft: the shipping VAT), so the send MUST use it
+   * as it stands and not read the settings again. One resolution feeds the total guard, the audit and the wire, so they cannot diverge.
+   */
+  settingsResolved?: true
   discountExVat: number
   discountVat: number
   lines: WmsOrderPushLine[]

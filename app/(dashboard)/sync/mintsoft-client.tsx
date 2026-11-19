@@ -9,6 +9,7 @@ import {
   confirmMintsoftAlignmentMode,
   deleteMintsoftBinding,
   ignoreMintsoftSkuRenameHoldAction,
+  resetMintsoftContentRefusalAction,
   listMintsoftKeptBundleClaims,
   resolveMintsoftKeptBundleClaim,
   restockMintsoftReturnInboxItem,
@@ -478,6 +479,18 @@ export function MintsoftClient({ data, configured }: Props) {
     })
   }
 
+  function handleResetContentRefusal(productId: string) {
+    if (!window.confirm('Offer this content to Mintsoft again on the next product sync? Do this when the cause was on the Mintsoft side (for example the image host was down). If Mintsoft refuses it again IMS starts counting from one.')) return
+    setError('')
+    startTransition(async () => {
+      let result: MaybeFreshAuthFailure & { success?: boolean; error?: string; message?: string } = await resetMintsoftContentRefusalAction(productId)
+      if (isFreshAuthFailure(result) && (await promptReauth())) result = await resetMintsoftContentRefusalAction(productId)
+      if (isFreshAuthFailure(result)) return setError('A fresh sign-in is needed to reset the refusal.')
+      if (result.success !== true) return setError(result.error ?? 'The refusal was not reset.')
+      router.refresh()
+    })
+  }
+
   function handleRunReturnsSync() {
     setError('')
     startTransition(async () => {
@@ -837,6 +850,9 @@ export function MintsoftClient({ data, configured }: Props) {
                     ) : null}
                     {discrepancy.category === 'PRODUCT_SKU_RENAMED' ? (
                       <Button size="sm" variant="outline" className="mt-1" disabled={isPending} onClick={() => handleIgnoreSkuRenameHold(discrepancy.id)}>Ignore: end the order hold</Button>
+                    ) : null}
+                    {discrepancy.category === 'PRODUCT_CONTENT_REFUSED' && discrepancy.productId ? (
+                      <Button size="sm" variant="outline" className="mt-1" disabled={isPending} onClick={() => handleResetContentRefusal(discrepancy.productId!)}>Reset: offer the content again</Button>
                     ) : null}
                   </TableCell>
                   <TableCell>{discrepancy.imsValue ?? '—'}</TableCell>

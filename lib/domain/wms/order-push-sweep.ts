@@ -1358,11 +1358,12 @@ export interface WmsOrderPushPort {
 /**
  * The push input as the connector will actually send it: a connector that derives a figure from its own settings (Mintsoft's shipping VAT) resolves it
  * HERE, before the total guard and the audit intent read the input, so what is checked and recorded is what goes on the wire. A connector with no such
- * step, or one whose settings cannot be read now (the send then reads them itself and fails or succeeds on its own terms), leaves the input as built.
+ * step, leaves the input as built. A resolver that THROWS is NOT swallowed: the send would otherwise read the settings again and could put a figure on the wire that the
+ * guard and the audit never saw, so the caller refuses the push for that order (nothing is sent) and it is retried on a later sweep.
  */
 async function resolveConnectorPushInput(connector: { resolvePushInput?: (input: WmsOrderPushInput) => Promise<WmsOrderPushInput> }, input: WmsOrderPushInput): Promise<WmsOrderPushInput> {
   if (typeof connector.resolvePushInput !== 'function') return input
-  try { return await connector.resolvePushInput(input) } catch { return input }
+  return connector.resolvePushInput(input)
 }
 
 /** PII-free projection of a push input for the audit timeline: what IMS asked the WMS to hold. */
@@ -2958,7 +2959,17 @@ export async function runWmsOrderPushSweepCore(
       }
 
       // The connector's own settings apply HERE, so the total guard, the audit timeline and the wire all see the same figures (shipping VAT included).
-      input = await resolveConnectorPushInput(connector, input)
+      try {
+        input = await resolveConnectorPushInput(connector, input)
+      } catch {
+        result.failed += 1
+        await port.updateLinkIfCreateClaimOwned?.(order.id, ts, {
+          state: 'PENDING_CREATE', attempts: order.pushAttempts,
+          lastError: 'Not sent by IMS: the warehouse connector\'s settings could not be read, so the payload could not be settled. It is retried on the next sweep.',
+          lastAttemptAt: null,
+        }).catch(() => false)
+        continue
+      }
       const beforeCreate = { state: order.pushAttempts > 0 ? 'PENDING_CREATE' : null, attempts: order.pushAttempts }
       // `push` is hoisted so the catch can tell "remote create failed" from "remote
       // create SUCCEEDED but recording the link failed" (Codex r1) — the audit
