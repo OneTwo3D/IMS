@@ -155,6 +155,8 @@ export async function runMergeCandidateDetection(port: MergeCandidatePort = pris
         holds = await port.placeHolds(env, keptGroups)
       } catch (error) {
         console.warn(`[wms-merge-candidates] merge holds failed: ${error instanceof Error ? error.message : String(error)}`)
+        // Reported, not swallowed: the placement threw, so every group it was to hold counts as failed (the sweep's note and the cron outcome read it).
+        holds = { held: 0, refused: 0, failed: Math.max(1, keptGroups.length), shadowed: 0, skipped: 0 }
       }
     }
     return { mode: 'flag', groups: keptGroups, created, reopened, resolved, ...(holds ? { holds } : {}) }
@@ -178,11 +180,12 @@ export async function runMergeCandidateDetection(port: MergeCandidatePort = pris
 }
 
 /** What a sweep records of a detection pass: only a failure or a skip is worth a field. Off, or a pass that ran, is nothing. */
-export type MergeCandidateNote = { detection: 'did-not-complete' | 'skipped'; reason: string }
+export type MergeCandidateNote = { detection: 'did-not-complete' | 'skipped' | 'holds-failed'; reason: string }
 
 export function mergeCandidateNote(run: MergeCandidateRun | { error: string }): MergeCandidateNote | undefined {
   if ('error' in run) return { detection: 'did-not-complete', reason: run.error }
   if ('skipped' in run) return { detection: 'skipped', reason: run.skipped }
+  if ('holds' in run && run.holds && run.holds.failed > 0) return { detection: 'holds-failed', reason: `${run.holds.failed} merge hold(s) could not be placed (retried on the next sweep)` }
   return undefined
 }
 

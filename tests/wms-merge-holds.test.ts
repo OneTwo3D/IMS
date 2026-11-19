@@ -5,7 +5,9 @@ import test from 'node:test'
 import type { WmsOrderHoldResult } from '../lib/connectors/wms/types.ts'
 import type { MergeGroup } from '../lib/domain/wms/merge-candidate-match.ts'
 import { MERGE_WARNING_EU, MERGE_WARNING_FEDEX } from '../lib/domain/wms/merge-candidate-match.ts'
-import { runMergeCandidateDetection, type MergeCandidatePort } from '../lib/domain/wms/merge-candidates.ts'
+import { mergeCandidateNote, runMergeCandidateDetection, type MergeCandidatePort } from '../lib/domain/wms/merge-candidates.ts'
+import { mergeHoldMaintenanceNote } from '../lib/domain/wms/merge-hold-port.ts'
+import { cronOutcome } from '../lib/ops/cron-outcomes.ts'
 import {
   mergeHoldActInWarehouse,
   MERGE_HOLD_MAX_ATTEMPTS,
@@ -527,11 +529,20 @@ test('detection: without placeHolds (or with the setting off) the run has no `ho
   assert.equal('holds' in (await runMergeCandidateDetection(detectionPort(async () => null))), false)
 })
 
-test('detection: a failing hold pass never fails the detection', async () => {
+test('detection: a failing hold pass never fails the detection, but it is REPORTED (counted failed, a note, a failed cron outcome)', async () => {
   const result = await runMergeCandidateDetection(detectionPort(async () => { throw new Error('boom') }))
   assert.equal(result.mode, 'flag')
-  assert.equal('holds' in result, false)
+  assert.ok(((result as { holds?: { failed: number } }).holds?.failed ?? 0) >= 1)
+  const note = mergeCandidateNote(result)
+  assert.equal(note?.detection, 'holds-failed')
+  assert.equal(cronOutcome('wms-order-status', { scanned: 0, updated: 0, failed: 0, mergeCandidateDetection: note } as never), 'failed')
+  assert.equal(cronOutcome('wms-order-status', { scanned: 0, updated: 0, failed: 0, ...mergeHoldMaintenanceNoteFixture() } as never), 'failed')
+  assert.equal(cronOutcome('wms-order-status', { scanned: 0, updated: 0, failed: 0 } as never), 'ok')
 })
+
+function mergeHoldMaintenanceNoteFixture() {
+  return { mergeHoldMaintenance: mergeHoldMaintenanceNote({ error: 'db down' }) }
+}
 
 test('detection: the hold pass result is reported when holds ran', async () => {
   const result = await runMergeCandidateDetection(detectionPort(async () => ({ held: 2, refused: 0, failed: 0, shadowed: 0, skipped: 0 })))

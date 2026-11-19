@@ -1,4 +1,4 @@
-import { runMergeHoldMaintenanceSafe } from '@/lib/domain/wms/merge-hold-port'
+import { mergeHoldMaintenanceNote, runMergeHoldMaintenanceSafe, type MergeHoldMaintenanceNote } from '@/lib/domain/wms/merge-hold-port'
 import { mergeCandidateNote, runMergeCandidateDetectionSafe, type MergeCandidateNote } from '@/lib/domain/wms/merge-candidates'
 import { randomUUID } from 'node:crypto'
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
@@ -329,6 +329,8 @@ function noteOutboundHeld(result: { outboundHeld?: number }, error: unknown): vo
 export type WmsOrderPushSweepResult = {
   /** PRESENT ONLY WHEN the merge-candidate pass (flag mode) failed or skipped: best-effort, never changes this sweep's outcome. */
   mergeCandidateDetection?: MergeCandidateNote
+  /** PRESENT ONLY WHEN the merge-hold maintenance threw: counted as a failure by the cron mapping. */
+  mergeHoldMaintenance?: MergeHoldMaintenanceNote
   skipped?: string
   created: number
   /** o3d-bjc.8: links promoted from PENDING_VERIFY to SYNCED this sweep. */
@@ -4794,7 +4796,8 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
           despatchSettledAt: null,
           externalOrderId: { not: null },
           // ...and never cancelled while on merge hold (see the hold pass).
-          order: { AND: [WMS_CANCELLABLE_ORDER_WHERE, { wmsMergeHolds: { none: { state: { in: ['HOLDING', 'HELD', 'UNKNOWN'] } } } }] },
+          AND: [{ order: { wmsMergeHolds: { none: { state: { in: ['HOLDING', 'HELD', 'UNKNOWN'] } } } } }],
+          order: WMS_CANCELLABLE_ORDER_WHERE,
         },
         select: { id: true, orderId: true, externalOrderId: true, externalOrderNumber: true, attempts: true, state: true, order: { select: { orderNumber: true } } },
         take: limit,
@@ -5137,13 +5140,13 @@ export async function runWmsOrderPushSweep(
   // and it never throws: a detection failure cannot affect the push.
   if (locked.created > 0) {
     const mergeCandidateDetection = mergeCandidateNote(await runMergeCandidateDetectionSafe('the order push'))
-    // Maintenance always runs, with or without a detection note.
-    await runMergeHoldMaintenanceSafe('the order push')
-    if (mergeCandidateDetection) return { ...locked, mergeCandidateDetection }
-    return locked
+    // Maintenance always runs, with or without a detection note. A maintenance that threw is folded into the result (and the cron mapping), never dropped.
+    const mergeHoldMaintenance = mergeHoldMaintenanceNote(await runMergeHoldMaintenanceSafe('the order push'))
+    return { ...locked, ...(mergeCandidateDetection ? { mergeCandidateDetection } : {}), ...(mergeHoldMaintenance ? { mergeHoldMaintenance } : {}) }
   }
   // Merge holds: the sweep withholds the cancel / edit / withdrawal hold of an order with an active hold row, so settle those rows or raise the escalation task
   // now (database only, never throws, returns at once with no active row), not only on the next status sweep.
-  await runMergeHoldMaintenanceSafe('the order push')
+  const mergeHoldMaintenance = mergeHoldMaintenanceNote(await runMergeHoldMaintenanceSafe('the order push'))
+  if (mergeHoldMaintenance) return { ...locked, mergeHoldMaintenance }
   return locked
 }

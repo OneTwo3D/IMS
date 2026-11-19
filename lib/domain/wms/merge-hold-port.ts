@@ -432,6 +432,13 @@ async function anyActiveHold(): Promise<boolean> {
   return (await db.wmsMergeHold.findFirst({ where: { state: { in: [...ACTIVE] } }, select: { id: true } })) !== null
 }
 
+/** What a sweep records of the maintenance: only a failure is worth a field (a clean run, or no hold standing, is nothing). */
+export type MergeHoldMaintenanceNote = { maintenance: 'did-not-complete'; reason: string }
+
+export function mergeHoldMaintenanceNote(run: MergeHoldMaintenance | { error: string } | null): MergeHoldMaintenanceNote | undefined {
+  return run !== null && 'error' in run ? { maintenance: 'did-not-complete', reason: run.error } : undefined
+}
+
 /** For the sweeps: never throws; null when there is nothing to do. */
 export async function runMergeHoldMaintenanceSafe(trigger: string, port: MergeHoldPort = prismaMergeHoldPort): Promise<MergeHoldMaintenance | { error: string } | null> {
   try {

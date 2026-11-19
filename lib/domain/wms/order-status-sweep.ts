@@ -11,7 +11,7 @@ import { getWmsConnector, getWmsConnectorDef } from '@/lib/connectors/wms/regist
 import { resolveWmsOrderLookupConnector } from '@/lib/connectors/wms/order-lookup'
 import { shoppingOrderLookupSkipReason } from '@/lib/fulfillment/shopping-order-lookup'
 import { WMS_ORDER_STATUS_LAST_SUCCESS_SETTING } from '@/lib/ops/read-sync-liveness-constants'
-import { runMergeHoldMaintenanceSafe } from '@/lib/domain/wms/merge-hold-port'
+import { mergeHoldMaintenanceNote, runMergeHoldMaintenanceSafe, type MergeHoldMaintenanceNote } from '@/lib/domain/wms/merge-hold-port'
 import { mergeCandidateNote, runMergeCandidateDetectionSafe, type MergeCandidateNote } from '@/lib/domain/wms/merge-candidates'
 
 /**
@@ -73,6 +73,8 @@ export type WmsOrderStatusSweepResult = {
   probeFailures?: number
   /** PRESENT ONLY WHEN the merge-candidate pass (flag mode) failed or skipped: best-effort, never changes this sweep's outcome. */
   mergeCandidateDetection?: MergeCandidateNote
+  /** PRESENT ONLY WHEN the merge-hold maintenance threw: counted as a failure by the cron mapping. */
+  mergeHoldMaintenance?: MergeHoldMaintenanceNote
 }
 
 /**
@@ -549,7 +551,7 @@ export async function runWmsOrderStatusSweep(
   const mergeCandidateDetection = mergeCandidateNote(await runMergeCandidateDetectionSafe('the status sweep'))
   // Merge holds (setting wms_merge_hold_enabled, off by default): clear a hold on an observed status change, fire the overdue reminder once, report a blocked change.
   // Reads IMS tables only; with no hold standing it returns without writing. Never throws.
-  await runMergeHoldMaintenanceSafe('the status sweep')
+  const mergeHoldMaintenance = mergeHoldMaintenanceNote(await runMergeHoldMaintenanceSafe('the status sweep'))
 
-  return { scanned: orders.length, updated, failed, ...(pushErrors.length > 0 ? { errors: pushErrors.slice(0, PUSH_ERRORS_DISPLAY_CAP) } : {}), ...(pushSkipped > 0 ? { pushSkipped } : {}), ...(pushFailures > 0 ? { pushFailures } : {}), ...(pushHeld > 0 ? { pushHeld } : {}), ...(probeFailures > 0 ? { probeFailures } : {}), ...(mergeCandidateDetection ? { mergeCandidateDetection } : {}) }
+  return { scanned: orders.length, updated, failed, ...(pushErrors.length > 0 ? { errors: pushErrors.slice(0, PUSH_ERRORS_DISPLAY_CAP) } : {}), ...(pushSkipped > 0 ? { pushSkipped } : {}), ...(pushFailures > 0 ? { pushFailures } : {}), ...(pushHeld > 0 ? { pushHeld } : {}), ...(probeFailures > 0 ? { probeFailures } : {}), ...(mergeCandidateDetection ? { mergeCandidateDetection } : {}), ...(mergeHoldMaintenance ? { mergeHoldMaintenance } : {}) }
 }
