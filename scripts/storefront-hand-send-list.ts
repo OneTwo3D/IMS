@@ -1,8 +1,10 @@
 /**
  * `npm run storefront:hand-send -- [--natives-off-at <ISO>] [--paid-since <ISO>] [--switch-on-at <ISO>]` — read-only lists for runbook step W (see
  * lib/ops/storefront-held-orders-at-w.ts for what each row means and whether to send). Without `--switch-on-at` the stored switch-on instant is used (no
- * stamp = nothing is listed). Held-unpaid is always listed; `--natives-off-at` adds the paid orders of the gap; `--paid-since` adds the pre-switch-on orders
- * that were paid since. Nothing here confirms an unpaid order and nothing duplicates an IMS send.
+ * stamp = nothing is listed). `--paid-since` is the instant WooCommerce's native e-mails went off: orders whose store-reported PAID time is on or after it.
+ *
+ * `npm run storefront:hand-send -- --mark-sent <order number>... --by <name> --yes` records that a confirmation was sent by hand (audited, idempotent; refuses
+ * an unpaid order and one IMS already confirmed), so the lists stop showing it. Without --yes it shows what it would do and writes nothing.
  */
 import { config } from 'dotenv'
 
@@ -24,7 +26,21 @@ function instant(name: string): Date | null {
 async function main() {
   const { db } = await import('../lib/db')
   const { readStorefrontCustomerEmailEnabledAt } = await import('../lib/domain/storefront-customer-email/switch')
-  const { listStorefrontHandSendOrders, renderHandSendList } = await import('../lib/ops/storefront-held-orders-at-w')
+  const { listStorefrontHandSendOrders, renderHandSendList, markStorefrontHandSent } = await import('../lib/ops/storefront-held-orders-at-w')
+  const markAt = process.argv.indexOf('--mark-sent')
+  if (markAt >= 0) {
+    const refs = process.argv.slice(markAt + 1).filter((a) => !a.startsWith('--') && process.argv[process.argv.indexOf(a) - 1] !== '--by')
+    const by = arg('by')
+    if (refs.length === 0) throw new Error('--mark-sent needs at least one order number')
+    if (!by || by.trim() === '' || by.startsWith('--')) throw new Error('--mark-sent needs --by <name> (the actor recorded on the audit row)')
+    if (!process.argv.includes('--yes')) {
+      console.log(`Would mark ${refs.length} order(s) as confirmed by hand by ${by}: ${refs.join(', ')}. Re-run with --yes to record it.`)
+    } else {
+      for (const r of await markStorefrontHandSent(refs, by.trim())) console.log(`${r.reference}: ${r.outcome}${r.reason ? ` (${r.reason})` : ''}`)
+    }
+    await db.$disconnect()
+    return
+  }
   const nativesOffAt = instant('natives-off-at')
   const paidSince = instant('paid-since')
   const switchOnAt = instant('switch-on-at') ?? await readStorefrontCustomerEmailEnabledAt()

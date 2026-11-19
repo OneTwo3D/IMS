@@ -173,27 +173,36 @@ export async function claimAndQueueConfirmationOnReleaseInTx(
 ): Promise<ReleaseClaimResult> {
   const claim = await tx.salesOrder.updateMany({ where: { id: orderId, confirmationOnReleasePendingAt: { not: null } }, data: { confirmationOnReleasePendingAt: null } })
   if (claim.count !== 1) return { claimed: false, queued: false, reason: 'no_marker', afterCommit: null }
+  // A refusal of the release is recorded durably, in this transaction, for the step W hand-send lists (`npm run storefront:hand-send`):
+  //   before_switch_on  the order predates the switch-on: WooCommerce confirmed it, or owed it and no longer sends it.
+  //   disabled          the switch was still off at the release (before the switch-on, so possibly after natives-off): recorded always; the lists tell a payment
+  //                     WooCommerce confirmed natively (before natives-off) from one nobody confirmed by the recorded PAID time.
+  // `paidObserved` is true only when the store reported the paid time (the full-bypass sync path); an IMS-side release carries none and is NEVER listed as paid.
+  // `too_old` is deliberately not recorded: an order placed after the switch-on and released in IMS long after its placement is IMS's own to confirm and it
+  // chooses not to (runbook step W); nothing is hand-sent for it.
+  const record = async (reason: string) => {
+    await logActivityInTransaction(tx, {
+      userId: null,
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: RELEASE_NOT_SENT_ACTION,
+      tag: 'sales',
+      level: 'INFO',
+      description: `The order confirmation was not queued on release (${reason}); ${options?.releasedAt ? 'the store reported it paid' : 'no payment was reported by the store'}.`,
+      metadata: { reason, paidObserved: options?.releasedAt !== undefined, ...(options?.releasedAt ? { releasedAt: options.releasedAt.toISOString() } : {}) },
+    })
+  }
   const switchRow = await tx.setting.findUnique({ where: { key: STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY }, select: { value: true } })
-  if (switchRow?.value !== 'true') return { claimed: true, queued: false, reason: 'disabled', afterCommit: null }
+  if (switchRow?.value !== 'true') {
+    await record('disabled')
+    return { claimed: true, queued: false, reason: 'disabled', afterCommit: null }
+  }
   const stampRow = await tx.setting.findUnique({ where: { key: STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY }, select: { value: true } })
   const outcome = await decideAndQueueUnderLock(tx, {
     name: 'confirmation', kind: STOREFRONT_CONFIRMATION_KIND, orderId, ...(options?.releasedAt ? { releasedAt: options.releasedAt } : {}),
   }, { enabledAt: parseStorefrontEmailEnabledAt(stampRow?.value), skipDuplicates: true })
   if (!outcome.queued) {
-    // A confirmation refused because the order predates the switch-on (or is too old) is a hand-send candidate once it is paid: record it durably, in this
-    // transaction, so `npm run storefront:hand-send -- --paid-since <W>` can list it. (A release with the switch off is not recorded: nothing is owed then.)
-    if (outcome.reason === 'before_switch_on' || outcome.reason === 'too_old') {
-      await logActivityInTransaction(tx, {
-        userId: null,
-        entityType: 'SALES_ORDER',
-        entityId: orderId,
-        action: RELEASE_NOT_SENT_ACTION,
-        tag: 'sales',
-        level: 'INFO',
-        description: `The order confirmation was not queued on release (${outcome.reason}); if the customer has none from WooCommerce it is sent by hand.`,
-        metadata: { reason: outcome.reason, ...(options?.releasedAt ? { releasedAt: options.releasedAt.toISOString() } : {}) },
-      })
-    }
+    if (outcome.reason === 'before_switch_on') await record('before_switch_on')
     return { claimed: true, queued: false, reason: outcome.reason, afterCommit: null }
   }
   return { claimed: true, queued: true, afterCommit: () => recordQueued('confirmation', STOREFRONT_CONFIRMATION_KIND, orderId, outcome.ref).catch(() => undefined) }

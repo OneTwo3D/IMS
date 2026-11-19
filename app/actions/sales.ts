@@ -2701,9 +2701,9 @@ export async function applySalesOrderStatusTransition(
           releaseConfirmationAfterCommit = claim.afterCommit
         } else if (
           targetStatus === 'ON_HOLD'
-          // An IMS-side (operator) hold only: a hold WooCommerce itself reports (gateway review, bank transfer on-hold) arrives through the full bypass and
-          // keeps the marker armed, so the payment that follows (processing, with its paid time) still confirms.
-          && !bypassPermission
+          // An operator hold only (no internal token): a hold WooCommerce itself reports (gateway review, bank transfer on-hold: full bypass) or an
+          // EU-withdrawal hold (AUTH_ONLY) keeps the marker armed, so the payment that follows (processing, with its paid time) still confirms.
+          && !bypassPermission && !authOnly
           && (moved.previousStatus === 'PROCESSING' || moved.previousStatus === 'ALLOCATED' || moved.previousStatus === 'PICKING' || moved.previousStatus === 'PACKING')
         ) {
           await tx.salesOrder.updateMany({ where: { id, confirmationOnReleasePendingAt: { not: null } }, data: { confirmationOnReleasePendingAt: null } })
