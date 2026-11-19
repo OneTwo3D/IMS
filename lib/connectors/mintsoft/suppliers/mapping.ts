@@ -1,6 +1,8 @@
 import { db } from '@/lib/db'
 import { logActivityInTransaction } from '@/lib/activity-log'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
+import { WMS_SUPPLIER_LIST_SYNC_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
 import { mintsoftProducerSeam } from '../producer-seam'
 import { ASN_SUPPLIER_ACTION } from './asn-supplier'
 import { DUPLICATE_GUARD_MIN_SCORE, scoreSupplierPair, suggestMintsoftSuppliers, type SupplierSuggestion } from './match'
@@ -14,7 +16,7 @@ import { MINTSOFT_ASN_SEND_SUPPLIER_SETTING, MINTSOFT_ASN_SUPPLIER_REQUIRED_SETT
  *   confirm   the operator accepts a suggestion (source OPERATOR_CONFIRMED_SUGGESTION) or picks any cached Mintsoft supplier (OPERATOR_PICKED).
  *   create    "create in Mintsoft": a REAL write. With `mintsoft_supplier_create_enabled` off it is recorded as CREATE_PENDING and nothing is sent.
  *             With it on it passes the producer seam (shadow = nothing sent) and the outbound hold, REQUIRES a cached list read within the last N minutes
- *             (config), and refuses when any cached supplier scores at DUPLICATE_GUARD_MIN_SCORE or more against the name (or shares an e-mail / VAT /
+ *             (config), and refuses when any cached supplier scores at DUPLICATE_GUARD_MIN_SCORE (the suggestion floor, 55) or more against the name (or shares an e-mail / VAT /
  *             code) unless the operator confirms "create anyway" with a reason. Creating beside an existing supplier is how duplicates are made.
  *   unmap     removes the decision; ASNs for that supplier are refused again while `mintsoft_asn_supplier_required` is on. Refused on a CREATING row.
  *   resolve   the ONLY way out of CREATING (an unknown outcome): an administrator records the Mintsoft id found by hand, or marks it not created.
@@ -49,6 +51,8 @@ async function refusal(actor: MappingActor, supplierId: string, supplierName: st
 }
 
 const REASON_MIN = 5
+/** "Resolve unknown outcome" is refused until the create attempt is at least this old: a slow request may still be in flight (and would land after a NOT_CREATED). */
+export const RESOLVE_UNKNOWN_MIN_WAIT_MINUTES = 2
 const cleanReason = (value: unknown): string => (typeof value === 'string' ? value.trim().slice(0, 500) : '')
 
 /** Lets any open "ASN not created: supplier not mapped" task for this supplier close once it is mapped. */
@@ -132,6 +136,8 @@ export async function resolveUnknownSupplierCreate(input: { supplierId: string; 
     if (!supplier) return { success: false as const, error: 'That IMS supplier no longer exists.' }
     const claim = await tx.mintsoftSupplierLink.findUnique({ where: { supplierId: supplier.id }, select: { state: true, decidedAt: true } })
     if (!claim || claim.state !== 'CREATING') return { success: false as const, error: 'This supplier is not waiting on an unknown create outcome. Reload.' }
+    const waitedMs = Date.now() - claim.decidedAt.getTime()
+    if (waitedMs < RESOLVE_UNKNOWN_MIN_WAIT_MINUTES * 60_000) return { success: false as const, error: `The create attempt is only ${Math.max(0, Math.round(waitedMs / 1000))} seconds old and its request may still be running. Wait at least ${RESOLVE_UNKNOWN_MIN_WAIT_MINUTES} minutes after the attempt, refresh the list, then resolve.` }
     if (!lastSync || lastSync < claim.decidedAt) return { success: false as const, error: 'Refresh the Mintsoft supplier list first, so the list you check is newer than the create attempt.' }
     if (input.outcome.kind === 'NOT_CREATED') {
       const removed = await tx.mintsoftSupplierLink.deleteMany({ where: { supplierId: supplier.id, state: 'CREATING', decidedAt: claim.decidedAt } })
@@ -159,7 +165,7 @@ export async function resolveUnknownSupplierCreate(input: { supplierId: string; 
   })
 }
 
-/** The cached suppliers (not missing) that look like `supplier`: a name score at DUPLICATE_GUARD_MIN_SCORE or more, or a shared e-mail / VAT / code. */
+/** The cached suppliers (not missing) that look like `supplier`: a name score at DUPLICATE_GUARD_MIN_SCORE (55) or more, or a shared e-mail / VAT / code. */
 export function findDuplicateCandidates(supplier: { id: string; name: string; email: string | null; vatNumber: string | null; accountNumber: string | null }, cached: ReadonlyArray<{ externalId: string; name: string; code: string | null; email: string | null; vatNumber: string | null; active: boolean }>): DuplicateCandidate[] {
   return cached
     .map((row) => ({ row, pair: scoreSupplierPair(supplier, row) }))
@@ -194,6 +200,22 @@ export async function createMintsoftSupplierForImsSupplier(input: { supplierId: 
     return { success: true, message: `Recorded as pending. Nothing was sent to Mintsoft: creating suppliers there is switched off.` }
   }
 
+  // ONE LOCK FOR THE LIST READ AND EVERY CREATE. A create never overlaps a refresh (whose sweep could mark the new supplier missing and hide it from the
+  // duplicate guard), and two creates never overlap each other, so two similar IMS suppliers cannot both pass the guard before either is cached.
+  // A refusal here is a refusal to start: nothing was sent.
+  const lock = await acquirePinnedAdvisoryLockOrNull(0, WMS_SUPPLIER_LIST_SYNC_LOCK_NAMESPACE)
+  if (!lock) return refusal(input.actor, supplier.id, supplier.name, 'a Mintsoft supplier refresh or another create is running', 'A Mintsoft supplier refresh or another create is running. Wait for it to finish, then reload and try again. Nothing was sent.')
+  try {
+    return await createLockedMintsoftSupplier(input, supplier)
+  } finally {
+    await lock.release()
+  }
+}
+
+type ImsSupplierForCreate = { id: string; name: string; email: string | null; contactName: string | null; phone: string | null; vatNumber: string | null; accountNumber: string | null }
+
+/** The create from the duplicate guard on, run under the list-sync lock. */
+async function createLockedMintsoftSupplier(input: { supplierId: string; actor: MappingActor; createAnyway?: { reason: string } }, supplier: ImsSupplierForCreate): Promise<MappingResult> {
   // THE DUPLICATE GUARD. A create is only as safe as the list it was checked against.
   const maxAge = await readMintsoftSupplierCacheMaxAgeMinutes()
   const lastSync = await readMintsoftSupplierLastSyncAt()
@@ -265,7 +287,7 @@ export async function createMintsoftSupplierForImsSupplier(input: { supplierId: 
       // Cached honestly: never read by a sync (epoch lastSeenAt), but stamped with a run id so the next full read can mark it missing.
       await tx.mintsoftSupplier.upsert({
         where: { externalId },
-        create: { externalId, name: supplier.name, email: supplier.email, active: true, lastSeenRunId: 'ims-create', lastSeenAt: new Date(0) },
+        create: { externalId, name: supplier.name, email: supplier.email, active: true, lastSeenRunId: 'ims-create', lastSeenAt: new Date(0), createdAt: new Date() },
         update: {},
       })
       const done = await tx.mintsoftSupplierLink.updateMany({ where: claimWhere, data: { state: 'MAPPED', externalSupplierId: externalId, decidedAt: new Date() } })

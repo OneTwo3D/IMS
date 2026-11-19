@@ -1,7 +1,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { recordRefusedAction, resolveRefusedActions } from '@/lib/domain/refused-actions'
-import { readMintsoftAsnSendSupplierEnabled, readMintsoftAsnSupplierRequired, readMintsoftTransferSupplierId } from './settings'
+import { readMintsoftAsnSendSupplierEnabled, readMintsoftAsnSupplierCacheMaxAgeHours, readMintsoftAsnSupplierRequired, readMintsoftSupplierLastSyncAt, readMintsoftTransferSupplierId } from './settings'
 
 /**
  * WHICH MINTSOFT SUPPLIER AN ASN CARRIES, AND WHEN IT IS REFUSED FOR LACKING ONE.
@@ -12,6 +12,8 @@ import { readMintsoftAsnSendSupplierEnabled, readMintsoftAsnSupplierRequired, re
  *                                                supplier-less ASN under "required", never an unverified field.
  *   send ON, mapped, supplier present AND active in the cache -> send its Mintsoft id.
  *   send ON, mapped, supplier missing from the cache / missing since the latest sync / inactive -> REFUSE with an operator task. Never sent.
+ *   send ON, mapped, but the list was last read longer ago than `mintsoft_asn_supplier_cache_max_age_hours` (default 24) or never -> REFUSE with an
+ *                                                operator task: "present and active" is only as true as the last read, and the read is manual (see docs/mintsoft.md).
  *   send ON, not mapped, `mintsoft_asn_supplier_required` OFF -> create the ASN as before, no supplier field.
  *   send ON, not mapped, required ON                          -> REFUSE with an operator task.
  *
@@ -35,9 +37,12 @@ type Client = Pick<Prisma.TransactionClient, 'purchaseOrder' | 'stockTransfer' |
 
 const ENTITY_TYPE = { PurchaseOrder: 'PURCHASE_ORDER', Transfer: 'STOCK_TRANSFER' } as const
 
-export function unmappedSupplierText(supplierName: string | null, why: 'unmapped' | 'missing-in-mintsoft' | 'inactive-in-mintsoft' | 'send-disabled' | 'no-transfer-supplier'): string {
+export function unmappedSupplierText(supplierName: string | null, why: 'unmapped' | 'missing-in-mintsoft' | 'inactive-in-mintsoft' | 'send-disabled' | 'no-transfer-supplier' | 'cache-stale'): string {
   if (why === 'no-transfer-supplier') {
     return 'No supplier is chosen for transfer ASNs. Choose it in Settings > Mintsoft suppliers, map it to its Mintsoft supplier, then retry. Nothing was sent.'
+  }
+  if (why === 'cache-stale') {
+    return `The Mintsoft supplier list has not been read recently enough to vouch for the supplier mapped to "${supplierName}" (it may have been deleted or deactivated in Mintsoft since). Refresh the list in Settings > Mintsoft suppliers, then retry. Nothing was sent.`
   }
   if (why === 'send-disabled') {
     return 'An ASN needs a Mintsoft supplier (mintsoft_asn_supplier_required is on) but sending the supplier on an ASN (mintsoft_asn_send_supplier_enabled) is off. An administrator must turn the send switch on in Settings > Mintsoft suppliers, after controlled-run step 2. Nothing was sent.'
@@ -96,6 +101,10 @@ export async function resolveAsnSupplier(subject: AsnSupplierSubject, client: Cl
   const cached = await client.mintsoftSupplier.findUnique({ where: { externalId: link.externalSupplierId }, select: { missingSince: true, active: true } })
   if (!cached || cached.missingSince) return refuse(name, 'missing-in-mintsoft')
   if (!cached.active) return refuse(name, 'inactive-in-mintsoft')
+
+  // The cache vouches only as far as its last full read: a supplier deleted or deactivated in Mintsoft since is still "present and active" here.
+  const [lastRead, maxAgeHours] = await Promise.all([readMintsoftSupplierLastSyncAt(client), readMintsoftAsnSupplierCacheMaxAgeHours(client)])
+  if (!lastRead || Date.now() - lastRead.getTime() > maxAgeHours * 3_600_000) return refuse(name, 'cache-stale')
 
   await resolveRefusedActions(client, { entityType: ENTITY_TYPE[subject.kind], entityId: subject.id, action: ASN_SUPPLIER_ACTION }, 'ACTION_SUCCEEDED')
   return { kind: 'send', externalSupplierId: link.externalSupplierId, supplierName: name ?? '' }
