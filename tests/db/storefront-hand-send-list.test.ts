@@ -48,6 +48,11 @@ test('hand-send list: held orders and the natives-off gap without a confirmation
   const gapPaid = await seed('gappaid', 'PROCESSING', new Date(base - 30 * HOUR), { refused: { reason: 'disabled', releasedAt: new Date(base + HOUR) } })
   // an IMS user released it, no payment reported: never PAID
   const imsRelease = await seed('imsrelease', 'PROCESSING', new Date(base - 3 * HOUR), { refused: { reason: 'before_switch_on' } })
+  // THE HOLE: an IMS user released it BEFORE natives-off (no paid time); the customer may have paid after it, and nobody confirmed that: list it to be checked
+  const imsReleaseEarly = await seed('imsearly', 'PROCESSING', new Date(base - 30 * HOUR), { refused: { reason: 'disabled' } })
+  // placed AFTER the switch-on, paid while the switch was turned off again (rollback): IMS's own order, never listed (neither as paid nor as released-in-ims)
+  await seed('rollbackpaid', 'PROCESSING', new Date(base + 3 * HOUR), { refused: { reason: 'disabled', releasedAt: new Date(base + 4 * HOUR) } })
+  await seed('rollbackims', 'PROCESSING', new Date(base + 3 * HOUR), { refused: { reason: 'disabled' } })
   // none of these may be listed:
   await seed('paidbefore', 'PROCESSING', new Date(base - 30 * HOUR), { refused: { reason: 'disabled', releasedAt: new Date(base - HOUR) } }) // paid before natives-off: WooCommerce confirmed it
   await seed('afterstamp-held', 'ON_HOLD', new Date(base + 3 * HOUR), { marker: true }) // IMS confirms it on payment
@@ -66,7 +71,7 @@ test('hand-send list: held orders and the natives-off gap without a confirmation
   assert.deepEqual(at(await mine({ switchOnAt: switchOn })), held.sort())
   assert.deepEqual(at(await mine({ switchOnAt: switchOn, nativesOffAt: natives })), [...held, [gap, 'gap-paid']].sort())
   const full = await mine({ switchOnAt: switchOn, nativesOffAt: natives, paidSince: natives })
-  assert.deepEqual(at(full), [...held, [gap, 'gap-paid'], [paid, 'paid'], [gapPaid, 'paid'], [imsRelease, 'released-in-ims']].sort())
+  assert.deepEqual(at(full), [...held, [gap, 'gap-paid'], [paid, 'paid'], [gapPaid, 'paid'], [imsRelease, 'released-in-ims'], [imsReleaseEarly, 'released-in-ims']].sort())
   assert.deepEqual(await mine({ switchOnAt: null, nativesOffAt: natives, paidSince: natives }), [], 'no stamp, nothing can be judged')
   assert.match(renderHandSendList(full), /UNPAID - send nothing now/)
   assert.match(renderHandSendList(full), /CHECK - released in IMS/)
@@ -84,4 +89,43 @@ test('hand-send list: held orders and the natives-off gap without a confirmation
   assert.match(refused[0].reason!, /unpaid/)
   const confirmedRef = await seed('confirmedpaid', 'PROCESSING', new Date(base - 3 * HOUR), { confirmed: true })
   assert.match((await markStorefrontHandSent([confirmedRef], 'Jan'))[0].reason!, /already queued/)
+
+  // Mark-sent refusals (o3d-qzu8z). An allocated-while-unpaid import (release marker armed) is not paid: refused even though ALLOCATED is not a held status.
+  const armed = await markStorefrontHandSent([heldAllocated], 'Jan')
+  assert.equal(armed[0].outcome, 'refused')
+  assert.match(armed[0].reason!, /marker is still armed/)
+  assert.equal(armed[0].order?.status, 'ALLOCATED')
+  // An ambiguous number (orderNumber of one order = externalOrderNumber of another) marks nothing.
+  const dupRef = `HS-dup-${randomUUID().slice(0, 8)}`
+  for (const [label, field] of [['dupa', 'orderNumber'], ['dupb', 'externalOrderNumber']] as const) {
+    const ref = await seed(label, 'PROCESSING', new Date(base - 3 * HOUR))
+    await db.salesOrder.updateMany({ where: { orderNumber: ref }, data: { [field]: dupRef } })
+  }
+  const dup = await markStorefrontHandSent([dupRef], 'Jan')
+  assert.equal(dup[0].outcome, 'refused')
+  assert.match(dup[0].reason!, /matches 2 orders/)
+  assert.equal(await db.activityLog.count({ where: { action: 'storefront_confirmation_hand_sent', entityId: { in: ids } } }), 1, 'nothing was marked for the ambiguous number')
+  // The dry run judges the same way, shows the matched order and writes nothing.
+  const dryRef = await seed('dry', 'PROCESSING', new Date(base - 3 * HOUR))
+  const dry = await markStorefrontHandSent([dryRef, heldAllocated], 'Jan', db, { dryRun: true })
+  assert.equal(dry[0].outcome, 'would-mark')
+  assert.equal(dry[0].order?.number, dryRef)
+  assert.equal(dry[0].order?.status, 'PROCESSING')
+  assert.ok(dry[0].order?.placedAt instanceof Date && dry[0].order.id)
+  assert.equal(dry[1].outcome, 'refused')
+  assert.equal(await db.activityLog.count({ where: { action: 'storefront_confirmation_hand_sent', entityId: { in: ids } } }), 1, 'a dry run writes nothing')
+  // The free-text actor is validated: no e-mail address, token or control characters reach the audit row.
+  for (const bad of ['jan@example.test', 'token=abc123', '', '   ', 'x'.repeat(61), 'Jan\nSmith;']) {
+    await assert.rejects(markStorefrontHandSent([dryRef], bad), /--by must be a name/, `rejects ${JSON.stringify(bad)}`)
+  }
+  assert.deepEqual((await markStorefrontHandSent([dryRef], "  Jan   O'Neil-Smith  ")).map((r) => r.outcome), ['marked'])
+  const row = await db.activityLog.findFirst({ where: { action: 'storefront_confirmation_hand_sent', description: { contains: "O'Neil" } } })
+  assert.equal((row!.metadata as { by: string }).by, "Jan O'Neil-Smith", 'whitespace normalised')
+})
+
+test('hand-send: the mark row is written through the activity log (redaction and sanitising), not a raw insert', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const src = await readFile(new URL('../../lib/ops/storefront-held-orders-at-w.ts', import.meta.url), 'utf8')
+  assert.match(src, /logActivityInTransaction\(/)
+  assert.doesNotMatch(src, /activityLog\.create\(/)
 })
