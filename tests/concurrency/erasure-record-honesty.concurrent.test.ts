@@ -158,7 +158,7 @@ test('[erasure record] anonymiseCustomer returns the count and a warning for ope
   t.after(async () => { await db.wmsOrderPushLink.deleteMany({ where: { orderId: { in: [order.id, completed.id] } } }); await db.activityLog.deleteMany({ where: { entityId: { in: [order.id, completed.id, customer.id] } } }); await db.salesOrder.deleteMany({ where: { id: { in: [order.id, completed.id] } } }); await db.customer.deleteMany({ where: { id: customer.id } }) })
   const before = await db.notification.count({ where: { title: 'Personal data remains in the warehouse' } })
   const second = await anonymiseCustomer(customer.id)
-  assert.deepEqual(second, { success: true })
+  assert.deepEqual(second, { success: true, erasedRecords: 1 })
   const control = await proof(db, customer.id)
   assert.equal(control.systems.warehouse, 'not-technically-possible', 'despatched only: the warehouse cannot be made to erase it')
   assert.equal(control.warehouse.despatched, 2, 'DELIVERED and COMPLETED are both despatched')
