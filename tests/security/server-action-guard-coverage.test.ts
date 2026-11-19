@@ -42,7 +42,7 @@ const graph = createRepoGraph(ROOT, SCAN_ROOTS)
 
 // Identifiers that establish an auth/authorization boundary.
 const GUARD_IDENTIFIERS = new Set([
-  'requireAuth', 'requireRole', 'requireAdmin', 'requireFreshAuth', 'requireFreshAdmin',
+  'requireAuth', 'requireRole', 'requireAdmin', 'requireFreshAuth', 'requireFreshAdmin', 'requireFreshRole',
   'requirePermission', 'requireFreshPermission', 'requireApiAuth', 'requireApiAdmin',
   'requireApiFreshAdmin', 'requireSupplier', 'assertSupplierOwnsResource',
   'requireMintsoftReadAccess', 'requireMintsoftWriteAccess', 'requireFreshMintsoftWriteAccess',

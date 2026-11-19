@@ -48,6 +48,7 @@
     "readiness:gate": "tsx scripts/readiness-gate.ts",
     "reconcile:pack": "tsx scripts/reconciliation-pack.ts",
     "crm:identity-report": "tsx scripts/report-customer-identity.ts",
+    "crm:backfill-order-customer-id": "tsx scripts/crm-backfill-order-customer-id.ts",
     "vat:diff": "tsx scripts/vat-difference-report.ts",
     "tax:rekey": "tsx scripts/tax-rekey.ts",
     "eu-vat:preflight": "tsx scripts/eu-vat-preflight.ts",

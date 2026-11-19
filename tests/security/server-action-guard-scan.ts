@@ -268,6 +268,7 @@ export const BASE_GUARD_DECLARATIONS: Record<string, Record<string, GuardKind>> 
     requireRole: 'authorization',
     requireAdmin: 'authorization',
     requireFreshAdmin: 'authorization',
+    requireFreshRole: 'authorization',
     requirePermission: 'authorization',
     requireFreshPermission: 'authorization',
     requireInternalUser: 'authorization',
