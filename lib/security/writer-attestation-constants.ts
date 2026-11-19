@@ -6,6 +6,8 @@
  * Sync screen, always with an activity-log entry. Pure and import-light: the settings writers, the check and the screen all import it.
  */
 
+import type { LiveWriterStep } from './writer-ownership-map'
+
 export const WRITER_ATTESTATION_KINDS = ['qoblex-stock-push-stopped', 'qoblex-xero-stopped'] as const
 export type WriterAttestationKind = (typeof WRITER_ATTESTATION_KINDS)[number]
 
@@ -38,7 +40,7 @@ export const ATTESTATION_GUARDED_SETTINGS: Readonly<Record<string, WriterAttesta
  * The confirmation a step's WRITES need before the producer decision may call them LIVE (the writers:check phase needs the same one). Step X moves Xero posting from
  * Qoblex to IMS, so IMS stays held until the owner has said Qoblex stopped. `xero_sync_enabled` itself is NOT guarded: P1 reads from Xero with it on.
  */
-export const STEP_LIVE_ATTESTATION: Readonly<Partial<Record<'mintsoft' | 'woocommerce' | 'xero', WriterAttestationKind>>> = {
+export const STEP_LIVE_ATTESTATION: Readonly<Partial<Record<LiveWriterStep, WriterAttestationKind>>> = {
   xero: 'qoblex-xero-stopped',
 }
 
