@@ -15246,3 +15246,41 @@ for (const entry of FENCE_HARNESS) {
     }
   })
 }
+
+// ---------------------------------------------------------------------------
+// o3d-g00dw: install.sh takes the SHARED CUTOVER LOCK before it changes any cutover state.
+// update.sh and deploy.sh have this ordering pinned above; install.sh had no test of its own.
+// ---------------------------------------------------------------------------
+
+/** The orderings the install entrypoint must keep, asked of any copy of its lines. */
+function installLockFirstViolations(lines: string[]): string[] {
+  const problems: string[] = []
+  const cutover = codeLine(lines, /^if upgrade_in_place; then$/)
+  const lock = codeLine(lines, /^\s*acquire_cutover_lock$/, cutover)
+  if (cutover === -1 || lock === -1) return ['the fenced path must still take acquire_cutover_lock']
+  // Every step that reads, imports, adopts, writes or arms cutover state, as a CALL (indented code).
+  const stateful = [
+    'import_legacy_cutover_state', 'adopt_existing_fence', 'import_relocated_fence_marker',
+    'write_cutover_marker', 'write_fence_marker', 'install_reboot_fence', 'fence_cron', 'fence_db_connections',
+  ]
+  for (const name of stateful) {
+    for (let i = cutover; i < lock; i += 1) {
+      if (isCode(lines[i]) && new RegExp(`^\\s+${name}\\b`).test(lines[i])) {
+        problems.push(`${name} (line ${i + 1}) runs before acquire_cutover_lock (line ${lock + 1})`)
+      }
+    }
+  }
+  const adopt = codeLine(lines, /^\s*adopt_existing_fence$/, cutover)
+  const imp = codeLine(lines, /^\s*import_legacy_cutover_state$/, cutover)
+  if (!(lock < imp && imp < adopt)) problems.push('the order must be lock, then legacy import, then adoption')
+  return problems
+}
+
+test('[o3d-g00dw] install.sh takes the shared cutover lock before it imports or adopts cutover state', () => {
+  assert.deepEqual(installLockFirstViolations(INSTALL_LINES), [])
+  // NOT VACUOUS: the same rule, run over a copy with the lock moved below the adoption, must object.
+  const mutant = INSTALL_LINES.filter((l) => !/^\s*acquire_cutover_lock$/.test(l) || false)
+  const at = mutant.findIndex((l) => /^\s*adopt_existing_fence$/.test(l))
+  mutant.splice(at + 1, 0, '  acquire_cutover_lock')
+  assert.notDeepEqual(installLockFirstViolations(mutant), [], 'a lock taken after the adoption must be reported')
+})

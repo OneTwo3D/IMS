@@ -27,6 +27,7 @@ import type { TaxRateRow } from '@/app/actions/settings'
 import type { WarehouseRow } from '@/app/actions/settings'
 import type { IntegrationPluginState } from '@/lib/integration-plugins'
 import { WMS_CONNECTOR_IDS } from '@/lib/connectors/wms/types'
+import { isIntegrationsStepReady } from '@/lib/domain/onboarding/integrations-step-readiness'
 import type { ShoppingConnectorCredentials } from '@/app/actions/shopping-sync'
 import type { AccountingConnectionStatus, AccountingConnectorSettingsMasked } from '@/app/actions/accounting-sync'
 import type { WmsOnboardingConnectionData } from '@/app/actions/wms-onboarding'
@@ -104,7 +105,6 @@ export function OnboardingClient({
   const [pluginDraft, setPluginDraft] = useState<{ base: IntegrationPluginState; value: IntegrationPluginState } | null>(null)
   const [companyConfiguredOverride, setCompanyConfiguredOverride] = useState<{ base: boolean; value: boolean } | null>(null)
   const [currencyConfiguredOverride, setCurrencyConfiguredOverride] = useState<{ base: boolean; value: boolean } | null>(null)
-  const [integrationsReadyOverride, setIntegrationsReadyOverride] = useState<boolean | null>(null)
   const [integrationConnectedOverride, setIntegrationConnectedOverride] = useState<{
     wc: boolean | null
     accounting: boolean | null
@@ -150,7 +150,6 @@ export function OnboardingClient({
   const activeAccountingLabel = enabledAccountingConnector?.label ?? 'accounting'
   const wmsConnected = integrationConnectedOverride.wms ?? wmsConnection.configured
   const hasTaxRates = taxRates.some((rate) => rate.active)
-  const anyIntegrationsEnabled = plugins.woocommerce || accountingEnabled || wmsEnabled
   const hasAdditionalWarehouses = warehouses.length > 1
 
   function isStepReady(index: number) {
@@ -159,12 +158,9 @@ export function OnboardingClient({
     if (key === 'currency') return currencyConfigured
     if (key === 'tax') return hasTaxRates || taxTouched
     if (key === 'integrations') {
-      if (integrationsReadyOverride != null) return integrationsReadyOverride
-      if (!anyIntegrationsEnabled) return false
-      if (plugins.woocommerce && !wcConnected) return false
-      if (accountingEnabled && !accountingConnected) return false
-      if (wmsEnabled && !wmsConnected) return false
-      return true
+      // THE ONE RULE (lib/domain/onboarding/integrations-step-readiness.ts), fed from props and the connection overrides the step reports
+      // up: no second copy of it here, and no child-reported override that is still null on the first render and on SSR.
+      return isIntegrationsStepReady(plugins, { woocommerce: wcConnected, accounting: accountingConnected, wms: wmsConnected })
     }
     if (key === 'warehouses') return hasAdditionalWarehouses || warehousesTouched
     if (key === 'products') return productsImported
@@ -375,7 +371,6 @@ export function OnboardingClient({
                 publicAppUrlInfo={publicAppUrlInfo}
                 onPluginStateChange={handlePluginStateChange}
                 onConnectionStateChange={handleIntegrationConnectionStateChange}
-                onReadyChange={setIntegrationsReadyOverride}
               />
             )}
 

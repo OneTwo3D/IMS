@@ -44,3 +44,35 @@ export const EXTERNAL_INVOICE_NUMBER_CONNECTORS: readonly string[] = ['woocommer
 export function invoiceNumberIsExternallySupplied(connectors: readonly string[]): boolean {
   return connectors.some((c) => EXTERNAL_INVOICE_NUMBER_CONNECTORS.includes(c))
 }
+
+/**
+ * o3d-hqvrp.69: which number `generateInvoiceNumber` records on an order that has none yet.
+ *
+ * An order finalised from the IMS side queues its SALES_INVOICE at creation, and that payload already carries the number Xero will be posted under
+ * (the persisted number, else `inv_prefix` + the order reference). Minting a SECOND, sequential number for the same order made the customer's PDF
+ * carry a number that the accounting back-reference then overwrote with the queued one: the number printed on the PDF vanished and the counter
+ * kept a gap. So while a sales invoice is queued or posted for the order, THAT number is the order's number and nothing is minted. With nothing
+ * queued (sync off, or the invoice not raised yet) the sequential number is minted as before, and the later enqueue then posts under it.
+ */
+export function resolveInvoiceNumberToRecord(params: {
+  /** The order's current `accountingInvoiceId` (null before the back-reference of a post, and after a delete/void has cleared it). */
+  orderAccountingInvoiceId: string | null | undefined
+  /** Ledger document ids of this order's completed or pending document deletions (`AccountingDocumentDeletion.externalDocumentId`). */
+  deletedExternalIds: readonly string[]
+  /** This order's SALES_INVOICE rows that occupy the work slot, newest first, reduced to the number they were queued under and the document id they posted as. */
+  queuedInvoices: readonly { invoiceNumber: string | null | undefined; externalId: string | null | undefined }[]
+}): { action: 'adopt-queued'; invoiceNumber: string } | { action: 'mint' } {
+  const deleted = new Set(params.deletedExternalIds)
+  for (const row of params.queuedInvoices) {
+    const number = row.invoiceNumber?.trim()
+    if (!number) continue
+    if (row.externalId) {
+      // A deleted or voided invoice: its number was freed in the ledger.
+      if (deleted.has(row.externalId)) continue
+      // The order points at a different document now. (An order with NO link yet and a row that has posted is "posted, not yet back-referenced": adopted.)
+      if (params.orderAccountingInvoiceId && row.externalId !== params.orderAccountingInvoiceId) continue
+    }
+    return { action: 'adopt-queued', invoiceNumber: number }
+  }
+  return { action: 'mint' }
+}

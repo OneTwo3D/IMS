@@ -261,7 +261,7 @@ export async function runWcReconcile(): Promise<WcReconcileResult> {
           // The window was not handled: an outage or a credentials rebind cut it short, or a candidate in it did not complete
           // (a failed lookup, preflight page or push entry, a mapping that could not be saved, a duplicate external id, a kit
           // availability error). The pass is unfinished: keep the cursor, leave the stamp, and retry this window on the next
-          // run. A product that keeps failing therefore holds the pass here, so every such run says so in the activity log
+          // run. A product whose failure may clear (a failed lookup or push) therefore holds the pass here (permanent catalogue errors do not: see isPermanentWindowError), so every such run says so in the activity log
           // instead of retrying silently; the manual push remains available.
           await logActivity({
             entityType: 'SYNC', action: 'stock_reconcile_window', tag: 'sync', level: 'WARNING',

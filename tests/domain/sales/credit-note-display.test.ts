@@ -44,3 +44,32 @@ test('each fact keeps the order line its refund line belongs to', () => {
   })
   assert.deepEqual(facts.map((f) => f.salesOrderLineId), ['l1', null])
 })
+
+// o3d-hqvrp.321 [mutation: ignore postedTaxRate and price from the table]
+test('a stored rate wins over the current tax table: editing the mapping after posting does not change the shown VAT', () => {
+  const editedTable = [{ accountingTaxType: 'OUTPUT2', rate: 0.25 }]
+  const [fact] = creditNoteLineFacts({
+    orderCurrency: 'GBP', baseCurrency: 'GBP', orderLines, taxRates: editedTable,
+    refundLines: [{ salesOrderLineId: 'l1', accountingTaxType: 'OUTPUT2', postedTaxRate: '0.2', totalForeign: 10, totalBase: 10 }],
+  })
+  assert.equal(fact.vatRate, 0.2)
+  assert.equal(fact.vatRateEstimated, false)
+})
+
+test('a stored 0% rate is a rate, not an absence', () => {
+  const [fact] = creditNoteLineFacts({
+    orderCurrency: 'GBP', baseCurrency: 'GBP', orderLines, taxRates,
+    refundLines: [{ salesOrderLineId: 'l1', accountingTaxType: 'OUTPUT2', postedTaxRate: 0, totalForeign: 10, totalBase: 10 }],
+  })
+  assert.equal(fact.vatRate, 0)
+  assert.equal(fact.vatRateEstimated, false)
+})
+
+test('a line with no stored rate is priced from the table and marked estimated', () => {
+  const [fact] = creditNoteLineFacts({
+    orderCurrency: 'GBP', baseCurrency: 'GBP', orderLines, taxRates,
+    refundLines: [{ salesOrderLineId: 'l1', accountingTaxType: 'OUTPUT2', postedTaxRate: null, totalForeign: 10, totalBase: 10 }],
+  })
+  assert.equal(fact.vatRate, 0.2)
+  assert.equal(fact.vatRateEstimated, true)
+})

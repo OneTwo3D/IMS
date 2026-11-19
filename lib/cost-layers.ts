@@ -1298,11 +1298,10 @@ export async function getReturnedQtyForCostLayer(
  * here so the SQL and the classification cannot drift apart, and so a new
  * StockTransferStatus fails to compile until it is classified.
  *
- * The list is NOT derivable from STOCK_TRANSFER_TRANSITIONS: that map states
- * IN_TRANSIT -> RECEIVED as the only transition out of IN_TRANSIT, but
- * cancelDispatchedTransfer deliberately performs IN_TRANSIT -> CANCELLED outside
- * the machine and does NOT un-consume the original layers (it creates replacement
- * layers linked back by costLayerSourceLine). An earlier version of this query
+ * The list is NOT derivable from STOCK_TRANSFER_TRANSITIONS: reachability does not say
+ * whether the source consumption is outstanding (DRAFT -> CANCELLED consumed nothing;
+ * IN_TRANSIT -> CANCELLED, via cancelDispatchedTransfer, does NOT un-consume the original layers (it creates replacement
+ * layers linked back by costLayerSourceLine)). An earlier version of this query
  * hard-coded ('IN_TRANSIT', 'RECEIVED') on the strength of that map and so
  * re-opened 6oyu.19 for every cancelled dispatch: spurious COGS on the original
  * layer plus the propagated uplift on the replacement layer.

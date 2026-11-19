@@ -205,6 +205,7 @@ async function persistMappingIfVersionMatches(
   | { ok: true }
   | { ok: false; reason: 'version_changed' }
   | { ok: false; reason: 'mapping_changed' }
+  | { ok: false; reason: 'collision'; error: string }
   | { ok: false; reason: 'error'; error: string }
 > {
   try {
@@ -232,8 +233,17 @@ async function persistMappingIfVersionMatches(
       return { ok: true as const }
     })
   } catch (e) {
-    return { ok: false as const, reason: 'error' as const, error: String(e) }
+    return classifyMappingPersistError(e)
   }
+}
+
+/**
+ * Only a real unique-constraint violation (Prisma P2002: another product already holds this externalProductId) is a collision, and so
+ * permanent. A pool timeout, dropped connection, deadlock or statement timeout is transient: it keeps its own message and holds the window.
+ */
+export function classifyMappingPersistError(e: unknown): { ok: false; reason: 'collision' | 'error'; error: string } {
+  const code = e && typeof e === 'object' ? (e as { code?: unknown }).code : undefined
+  return { ok: false, reason: code === 'P2002' ? 'collision' : 'error', error: String(e) }
 }
 
 type MappingInvalidationLog = {
@@ -619,6 +629,18 @@ async function pushBatchWithFence(
   })
 }
 
+/**
+ * o3d-hqvrp.101: errors that retrying the window can never clear, because they describe the catalogue and not a failed call: a variant
+ * whose parent has no SKU in IMS, an ambiguous SKU (the catalogue must be deduplicated), a kit cycle, an externalProductId collision.
+ * They stay in `errors` (reported, logged) but do not withhold the window's completion: otherwise one such product would hold the daily
+ * reconcile at its window for ever and every product after it would never be reconciled. Transient errors (a failed lookup, a rebind,
+ * a failed push) still hold the window.
+ */
+const PERMANENT_WINDOW_ERROR = /^(KIT cycle detected|externalProductId collision|lookup failure for SKU .+?: (variant has no parent SKU in IMS|ambiguous))/
+export function isPermanentWindowError(message: string): boolean {
+  return PERMANENT_WINDOW_ERROR.test(message)
+}
+
 // A gate-refusal result: the run was refused before any work started. Marked
 // `aborted` so a manual push surfaces it as an error and the job queue
 // retains the job for retry (see shouldRetainJob) instead of treating it as
@@ -877,7 +899,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   // (failed SKU lookup, preflight page, mapping that could not be saved or cleared, duplicate external id, kit availability
   // error, failed or rejected push entry, credentials rebound) appends to `result.errors`, so any error withholds `chunk` and
   // the caller retries the window instead of moving past it. A product with no WooCommerce match is not an error.
-  const windowHandled = (): boolean => result.errors.length === 0
+  const windowHandled = (): boolean => result.errors.every(isPermanentWindowError)
   const chunkOutcome = (): StockSyncResult['chunk'] =>
     chunkWindow ? { nextCursor: chunkNextCursor, totalCandidates: allCandidates.length } : undefined
 
@@ -1165,9 +1187,14 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         result.errors.push(
           `WooCommerce mapping for ${p.sku} (IMS ${p.id}) was claimed by another sync while resolving it; left as-is`,
         )
-      } else {
+      } else if (outcome.reason === 'collision') {
         result.errors.push(
           `externalProductId collision: could not persist ${target.externalId} for IMS product ${p.id} (SKU ${p.sku}): ${outcome.error}`,
+        )
+      } else {
+        // A transient failure (timeout, connection, deadlock): its own message, so it holds the reconcile window and is retried.
+        result.errors.push(
+          `mapping persist failed: could not persist ${target.externalId} for IMS product ${p.id} (SKU ${p.sku}): ${outcome.error}`,
         )
       }
     }
@@ -1525,9 +1552,10 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     })
     if (batchOutcome.status === 'version_changed') {
       const remaining = pushEntries.length - i
-      result.errors.push(
-        `WooCommerce credentials were rebound mid-run — aborted ${remaining} remaining push(es) to avoid pushing to a disconnected store`,
-      )
+      const abortNotice = `WooCommerce credentials were rebound mid-run — aborted ${remaining} remaining push(es) to avoid pushing to a disconnected store`
+      result.errors.push(abortNotice)
+      result.abortedRemaining = (result.abortedRemaining ?? 0) + remaining
+      result.abortNotice = abortNotice
       await logActivity({
         entityType: 'SYNC', action: 'stock_sync', tag: 'sync', level: 'WARNING',
         description: `Stock sync aborted mid-push: WC settings version changed (${syncVersion} → ${batchOutcome.currentVersion})`,
@@ -1584,9 +1612,10 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
         })
         if (outcome.status === 'version_changed') {
           const remaining = variantPushEntries.length - processedVariantEntries
-          result.errors.push(
-            `WooCommerce credentials were rebound mid-run — aborted ${remaining} remaining variation push(es) to avoid pushing to a disconnected store`,
-          )
+          const abortNotice = `WooCommerce credentials were rebound mid-run — aborted ${remaining} remaining variation push(es) to avoid pushing to a disconnected store`
+          result.errors.push(abortNotice)
+          result.abortedRemaining = (result.abortedRemaining ?? 0) + remaining
+          result.abortNotice = result.abortNotice ? `${result.abortNotice}; ${abortNotice}` : abortNotice
           await logActivity({
             entityType: 'SYNC', action: 'stock_sync', tag: 'sync', level: 'WARNING',
             description: `Stock sync aborted mid-variation-push: WC settings version changed (${syncVersion} → ${outcome.currentVersion})`,
@@ -2684,6 +2713,13 @@ export async function startManualWcStockSync(): Promise<void> {
   })
 }
 
+/** The errors the manual sync screen shows (first 20): a mid-run rebind abort is listed FIRST so per-item errors cannot push it out. */
+export function manualProgressErrors(result: { errors: string[]; abortedRemaining?: number; abortNotice?: string }): string[] {
+  if (!result.abortedRemaining || !result.abortNotice) return result.errors.slice(0, 20)
+  const notice = result.abortNotice
+  return [notice, ...result.errors.filter((e) => !notice.includes(e)).slice(0, 19)]
+}
+
 async function runManualWcStockPush(progress: ManualStockSyncProgress): Promise<void> {
   const result = await pushStockToWc({
     forceAll: true,
@@ -2712,9 +2748,11 @@ async function runManualWcStockPush(progress: ManualStockSyncProgress): Promise<
   progress.status = result.errors.length > 0 || result.aborted === true ? 'error' : 'done'
   progress.synced = result.synced
   progress.total = Math.max(progress.total, result.synced)
-  progress.errors = result.errors.slice(0, 20)
+  progress.errors = manualProgressErrors(result)
   progress.message = result.aborted === true
     ? `${result.message?.trim() || 'Stock push refused'} — nothing was pushed`
+    : result.abortedRemaining
+      ? `Stock push aborted part-way: WooCommerce credentials were rebound mid-run, ${result.abortedRemaining} push(es) were never attempted — ${result.synced} synced`
     : result.message?.trim()
       ? result.message.trim()
       : result.errors.length > 0

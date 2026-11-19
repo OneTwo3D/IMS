@@ -13,8 +13,8 @@ import { OUTBOUND_GRANT_ENV } from '@/lib/security/outbound-write-hold-constants
 const ORIGIN = 'https://shop.example.com'
 const settings = new Map<string, string>()
 let candidates: Array<Record<string, unknown>> = []
-let updateManyMode: number | 'throw' = 1
-async function withUpdateCount<T>(mode: number | 'throw', fn: () => Promise<T>): Promise<T> {
+let updateManyMode: number | 'throw' | 'throw-transient' = 1
+async function withUpdateCount<T>(mode: number | 'throw' | 'throw-transient', fn: () => Promise<T>): Promise<T> {
   updateManyMode = mode
   try { return await fn() } finally { updateManyMode = 1 }
 }
@@ -48,7 +48,8 @@ function modelProxy(name: string) {
       }
       if (name === 'product' && method === 'findMany') return candidates
       if (name === 'product' && method === 'updateMany') {
-        if (updateManyMode === 'throw') throw new Error('unique constraint')
+        if (updateManyMode === 'throw') throw Object.assign(new Error('unique constraint'), { code: 'P2002' })
+        if (updateManyMode === 'throw-transient') throw new Error('connection reset')
         return { count: updateManyMode }
       }
       if (name === 'product' && method === 'findUnique') {
@@ -305,12 +306,22 @@ test('mapping persistence: a mapping claimed by another sync while resolving, or
   assert.ok(changed.errors.some((e) => e.includes('claimed by another sync')))
   assert.equal(changed.chunk, undefined)
 
-  // Unsaveable mapping: the write throws (a unique-constraint collision in the database).
+  // Unsaveable mapping: the write throws a unique-constraint violation (Prisma P2002). Only that is a collision.
   reset([product('a', 'S1', null)])
   fetchImpl = lookup
   const failed = await withUpdateCount('throw', () => run())
   assert.ok(failed.errors.some((e) => e.includes('externalProductId collision')))
-  assert.equal(failed.chunk, undefined)
+  // A collision describes the catalogue, not a failed call: retrying the window can never clear it, so it is a PERMANENT window error
+  // (isPermanentWindowError) and does not hold the window. Only a transient failure, below, does.
+  assert.ok(failed.chunk, 'a real unique violation is permanent and the window completes')
+
+  // Any other failure (timeout, connection, deadlock) is transient: its own message, never a collision, and the window stays unhandled.
+  reset([product('a', 'S1', null)])
+  fetchImpl = lookup
+  const transient = await withUpdateCount('throw-transient', () => run())
+  assert.ok(transient.errors.some((e) => e.includes('mapping persist failed')))
+  assert.ok(!transient.errors.some((e) => e.includes('externalProductId collision')))
+  assert.equal(transient.chunk, undefined)
 })
 
 test('kit cycle: a kit that contains itself is reported as an error, so the window is unhandled', async () => {

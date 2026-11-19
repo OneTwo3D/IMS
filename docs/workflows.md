@@ -69,7 +69,7 @@ rules.
 |---|---|---|
 | `CANCELLED` | None | Terminal. |
 | `DRAFT` | `IN_TRANSIT`, `CANCELLED` | - |
-| `IN_TRANSIT` | `RECEIVED` | - |
+| `IN_TRANSIT` | `RECEIVED`, `CANCELLED` | - |
 | `RECEIVED` | None | Terminal. |
 
 <!-- END:generated-workflow-status-tables -->
