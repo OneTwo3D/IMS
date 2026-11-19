@@ -135,8 +135,9 @@ const SIGNAL_BONUS: Record<SupplierSignal, number> = { email: 25, vat: 30, code:
 /** A pair is offered when its score reaches this, or when it shares any hard signal. */
 export const SUGGESTION_MIN_SCORE = 55
 export const SUGGESTION_LIMIT = 3
-/** A cached Mintsoft supplier whose pair score reaches this blocks "create in Mintsoft" unless the operator confirms "create anyway" with a reason. */
-export const DUPLICATE_GUARD_MIN_SCORE = 80
+/** A cached Mintsoft supplier whose pair score reaches this blocks "create in Mintsoft" unless the operator confirms "create anyway" with a reason.
+ * The same as the suggestion floor: whatever IMS would SUGGEST as a match is also a reason not to create beside it ("Polymaker" vs "Polymaker Europe B.V." scores ~73). */
+export const DUPLICATE_GUARD_MIN_SCORE = SUGGESTION_MIN_SCORE
 
 export function scoreSupplierPair(ims: ImsSupplierForMatch, remote: MintsoftSupplierForMatch): SupplierSuggestion {
   const nameScore = Math.round(supplierNameSimilarity(ims.name, remote.name) * 100)
