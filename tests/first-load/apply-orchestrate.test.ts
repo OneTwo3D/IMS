@@ -599,4 +599,12 @@ test('run lease: a resume of a RUNNING record while another runner holds the run
   assert.equal(resumed.exit, 'OK', resumed.problems.join('; '))
   const lost = await runLoad(prepared, db.ports({ withRunLease: async (body) => { await body(); throw new StepLockError('lost') } }), options({ resume: true }))
   assert.notEqual(lost.exit, 'OK', 'a lease that was lost during the run is never reported as a success')
+  // A lease lost AFTER the record was written (a fresh run that completes, then the lease fails): the step results and the persisted record are reported, with the lost lease as a problem.
+  const fresh = setup()
+  const lateLoss = await runLoad(fresh.prepared, fresh.db.ports({ withRunLease: async (body) => { await body(); throw new StepLockError('lost') } }), fresh.options())
+  assert.equal(lateLoss.exit, 'STEP_FAILED', 'still never a success')
+  assert.ok(lateLoss.steps.length > 0, 'the run\'s step results are not dropped')
+  assert.equal(lateLoss.record?.status, (fresh.db.journalRecord as RunRecord).status, 'the record is the persisted one, not the pre-run record')
+  assert.equal(lateLoss.record?.status, 'VERIFIED')
+  assert.match(lateLoss.problems[0], /lease was lost at the very end/)
 })

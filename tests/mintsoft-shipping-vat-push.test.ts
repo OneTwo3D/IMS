@@ -90,9 +90,28 @@ test('setting ON: the derived shipping VAT is sent as ShippingTotalVat and nothi
 
 test('deriveShippingVat: the order tax minus the tax of every line, never negative, 2dp', async () => {
   const { deriveShippingVat } = await import('@/lib/domain/wms/push-shipping-vat')
-  assert.equal(deriveShippingVat({ taxForeign: 3, lines: [{ taxForeign: 2 }] }), 1)
-  assert.equal(deriveShippingVat({ taxForeign: '3.01', lines: [{ taxForeign: '1.00' }, { taxForeign: '1.00' }] }), 1.01)
-  assert.equal(deriveShippingVat({ taxForeign: 2, lines: [{ taxForeign: 2 }] }), 0, 'no shipping VAT')
-  assert.equal(deriveShippingVat({ taxForeign: 1, lines: [{ taxForeign: 2 }] }), 0, 'never negative')
+  assert.equal(deriveShippingVat({ taxForeign: 3, shippingForeign: 5, lines: [{ taxForeign: 2 }] }), 1)
+  assert.equal(deriveShippingVat({ taxForeign: '3.01', shippingForeign: 5, lines: [{ taxForeign: '1.00' }, { taxForeign: '1.00' }] }), 1.01)
+  assert.equal(deriveShippingVat({ taxForeign: 2, shippingForeign: 5, lines: [{ taxForeign: 2 }] }), 0, 'no shipping VAT')
+  assert.equal(deriveShippingVat({ taxForeign: 1, shippingForeign: 5, lines: [{ taxForeign: 2 }] }), 0, 'never negative')
   assert.equal(deriveShippingVat({ taxForeign: 0, lines: [] }), 0)
+})
+
+test('deriveShippingVat: no shipping charge means no shipping VAT, whatever the remainder (a 1p leftover is not VAT on shipping)', async () => {
+  const { deriveShippingVat } = await import('@/lib/domain/wms/push-shipping-vat')
+  assert.equal(deriveShippingVat({ taxForeign: 3.01, shippingForeign: 0, lines: [{ taxForeign: 3 }] }), 0)
+  assert.equal(deriveShippingVat({ taxForeign: 3.01, shippingForeign: '0.00', lines: [{ taxForeign: 3 }] }), 0)
+  assert.equal(deriveShippingVat({ taxForeign: 3.01, lines: [{ taxForeign: 3 }] }), 0, 'shipping unknown is no shipping')
+  assert.equal(deriveShippingVat({ taxForeign: 3.01, shippingForeign: 5, lines: [{ taxForeign: 3 }] }), 0.01, 'with a charge the remainder stands')
+})
+
+test('with the setting ON the wire never carries ShippingTotalVat for an order with no shipping charge, and the resolved input is what the sweep audits', async () => {
+  const noShipping = { ...WITH_DERIVED, shippingExVat: 0 }
+  assert.equal((await push(noShipping, 'true')).ShippingTotalVat, 0)
+  const { resolveMintsoftPushInput } = await import('@/lib/connectors/mintsoft/api/order-push')
+  sendSetting = 'true'
+  assert.equal((await resolveMintsoftPushInput(WITH_DERIVED)).shippingVat, 1, 'the sweep sees the figure that goes on the wire')
+  assert.equal((await resolveMintsoftPushInput(noShipping)).shippingVat, 0)
+  sendSetting = ''
+  assert.equal((await resolveMintsoftPushInput(WITH_DERIVED)).shippingVat, 0, 'flag off: unchanged')
 })

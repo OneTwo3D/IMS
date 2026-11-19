@@ -409,10 +409,17 @@ export function legacyCourierRetry(
  * Behind `mintsoft_send_shipping_vat` (default OFF): the derived shipping VAT is sent as ShippingTotalVat. Off, or with nothing derived, the input is
  * returned as it was, so the payload is byte-identical to the one sent before the setting existed.
  */
-function withShippingVat(input: WmsOrderPushInput, settings: { mintsoft_send_shipping_vat?: string }): WmsOrderPushInput {
+export function withShippingVat(input: WmsOrderPushInput, settings: { mintsoft_send_shipping_vat?: string }): WmsOrderPushInput {
   if (settings.mintsoft_send_shipping_vat !== 'true') return input
   if (input.shippingVat !== 0 || !(typeof input.shippingVatDerived === 'number' && input.shippingVatDerived > 0)) return input
+  // Never VAT on a shipping charge that is not there (a 1p remainder on a free-shipping order is dropped by Mintsoft and contradicts ShippingTotalExVat 0).
+  if (!(input.shippingExVat > 0)) return input
   return { ...input, shippingVat: input.shippingVatDerived }
+}
+
+/** The input as `pushMintsoftOrder` / `updateMintsoftOrder` will send it, for the sweep's total guard and audit (see resolveConnectorPushInput). */
+export async function resolveMintsoftPushInput(input: WmsOrderPushInput): Promise<WmsOrderPushInput> {
+  return withShippingVat(input, await getMintsoftSettings())
 }
 
 export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {
