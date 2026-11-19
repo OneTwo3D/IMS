@@ -14,7 +14,7 @@ import { NATIVE_EMAIL_VIOLATION, readStepEvidence, STEP_EVIDENCE_READERS } from 
 
 /** The two readers under test never use the shared probe; the reader context just requires one. */
 const noProbe = async () => ({ ok: false as const, reason: 'unreachable' as const, message: 'unused' })
-import { bridgePayloadFromReport, bridgeStatusFreshnessError, bridgeUnitViolations, parseBridgeStatusOutput, readBridgePayload } from '../../lib/domain/writer-attestation/bridge-status'
+import { bridgeLastTriggerReadable, bridgePayloadFromReport, bridgeStatusFreshnessError, bridgeUnitViolations, parseBridgeStatusOutput, readBridgePayload } from '../../lib/domain/writer-attestation/bridge-status'
 import { STEP_EVIDENCE_KINDS, type StepEvidenceKind, type StepEvidenceReading } from '../../lib/security/writers-check-constants'
 
 /**
@@ -30,7 +30,7 @@ const SETTINGS_ON = new Map<string, string>([['trackship_refire_enabled', 'true'
 function clean(): Record<StepEvidenceKind, StepEvidenceReading> {
   const out = {} as Record<StepEvidenceKind, StepEvidenceReading>
   for (const kind of STEP_EVIDENCE_KINDS) {
-    out[kind] = kind === 'BRIDGE_ATTESTATION' ? { state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt: '2026-11-30T23:55:00.000Z' }
+    out[kind] = kind === 'BRIDGE_ATTESTATION' ? { state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt: '2026-11-30T23:55:00.000Z', generatedAt: '2026-12-02T00:00:00.000Z' }
       : kind.startsWith('QOBLEX') ? { state: 'present', at: '2026-11-01T00:00:00.000Z' }
       : kind === 'BRIDGE_PROBE' || kind === 'NATIVE_EMAIL_EXCLUSIVE' ? { state: 'probed', violations: [] }
       : { state: 'counted', counted: 0, floor: M_AT }
@@ -96,7 +96,7 @@ test('the reader: no attestation is absent (not not-built); a clean report is pr
   const dbWith = (row: { attestedAt: Date; payload: unknown } | null) => ({ writerAttestation: { findFirst: async () => row } }) as never
   assert.deepEqual(await STEP_EVIDENCE_READERS.BRIDGE_ATTESTATION({ db: dbWith(null), now: NOW, probeOnce: noProbe }), { state: 'absent' })
   assert.deepEqual(await STEP_EVIDENCE_READERS.BRIDGE_ATTESTATION({ db: dbWith({ attestedAt: new Date('2026-12-02T00:00:00Z'), payload }), now: NOW, probeOnce: noProbe }), {
-    state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt: '2026-11-30T23:55:01.000Z',
+    state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt: '2026-11-30T23:55:01.000Z', generatedAt: '2026-12-20T11:55:00.000Z',
   })
   const bad = parseBridgeStatusOutput(sampleReport({ units: { 'wc-mintsoft-webhook.service': 'LoadState=loaded ActiveState=active UnitFileState=enabled' } }))
   assert.ok(bad.ok)
@@ -132,7 +132,7 @@ test('P2-M: a clean report with the last trigger before S passes; absent fails; 
 })
 
 test('P2-M: a trigger AT or AFTER S fails, one before S passes, "never" passes (MUTATION: compare with > instead of >= or drop the comparison => red)', () => {
-  const at = (lastTriggerAt: string | null) => evaluateWritersCheck(inputs(STEP_M, { ...clean(), BRIDGE_ATTESTATION: { state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt } }))
+  const at = (lastTriggerAt: string | null) => evaluateWritersCheck(inputs(STEP_M, { ...clean(), BRIDGE_ATTESTATION: { state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt, generatedAt: '2026-12-02T00:00:00.000Z' } }))
   assert.deepEqual(bridgeFindings(at('2026-11-30T23:59:59.000Z')), [])
   assert.deepEqual(bridgeFindings(at(null)), [])
   for (const late of ['2026-12-01T00:00:00.000Z', '2026-12-01T00:00:01.000Z', '2026-12-10T00:00:00.000Z']) {
@@ -151,7 +151,7 @@ test('P2-M: an unmasked or active unit fails, and so does a reading that carries
 })
 
 test('the report is NOT required to be recorded before S (the runbook takes it after S): a report recorded after S with a clean state passes', () => {
-  const report = evaluateWritersCheck(inputs(STEP_M, { ...clean(), BRIDGE_ATTESTATION: { state: 'present', at: '2026-12-19T00:00:00.000Z', violations: [], lastTriggerAt: '2026-11-30T00:00:00.000Z' } }))
+  const report = evaluateWritersCheck(inputs(STEP_M, { ...clean(), BRIDGE_ATTESTATION: { state: 'present', at: '2026-12-19T00:00:00.000Z', violations: [], lastTriggerAt: '2026-11-30T00:00:00.000Z', generatedAt: '2026-12-19T00:00:00.000Z' } }))
   assert.deepEqual(bridgeFindings(report), [])
 })
 
@@ -162,13 +162,23 @@ test('NATIVE_EMAIL_EXCLUSIVE reader: not read from the store before step W; both
   let reads = 0
   const read = (state: unknown) => async () => { reads += 1; return state as never }
   const reader = STEP_EVIDENCE_READERS.NATIVE_EMAIL_EXCLUSIVE
-  assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, probeOnce: noProbe, env: {}, readNativeEmail: read(on) }), { state: 'absent' })
+  assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, probeOnce: noProbe, env: {}, readNativeEmail: read(on) }), { state: 'probed', violations: [NATIVE_EMAIL_VIOLATION.imsOnBeforeStepW] })
   assert.equal(reads, 0, 'no WC_WRITES_LIVE_FROM: the store is not asked')
   const env = { WC_WRITES_LIVE_FROM: '2026-12-08T00:00:00Z' }
-  assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, probeOnce: noProbe, env, readNativeEmail: read(on) }), { state: 'probed', violations: [NATIVE_EMAIL_VIOLATION.bothOn] })
-  assert.deepEqual(await reader({ db: dbWith(null), now: NOW, probeOnce: noProbe, env, readNativeEmail: read(off) }), { state: 'probed', violations: [NATIVE_EMAIL_VIOLATION.bothOff] })
+  assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, probeOnce: noProbe, env, readNativeEmail: read(on) }), { state: 'probed', violations: [`${NATIVE_EMAIL_VIOLATION.bothOn}:customer_processing_order`] })
+  assert.deepEqual(await reader({ db: dbWith(null), now: NOW, probeOnce: noProbe, env, readNativeEmail: read(off) }), { state: 'probed', violations: [`${NATIVE_EMAIL_VIOLATION.bothOff}:customer_processing_order`, `${NATIVE_EMAIL_VIOLATION.bothOff}:customer_completed_order`] })
   assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, probeOnce: noProbe, env, readNativeEmail: read(off) }), { state: 'probed', violations: [] })
-  assert.deepEqual(await reader({ db: dbWith('false'), now: NOW, probeOnce: noProbe, env, readNativeEmail: read(on) }), { state: 'probed', violations: [] })
+  assert.deepEqual(await reader({ db: dbWith('false'), now: NOW, probeOnce: noProbe, env, readNativeEmail: read({ ok: true, enabled: { customer_processing_order: true, customer_completed_order: true } }) }), { state: 'probed', violations: [] })
+  // JUDGED PER E-MAIL (MUTATION: "either native on counts as sending" => red): IMS off with processing OFF and completed ON leaves the confirmation with NO sender.
+  assert.deepEqual(await reader({ db: dbWith('false'), now: NOW, probeOnce: noProbe, env, readNativeEmail: read({ ok: true, enabled: { customer_processing_order: false, customer_completed_order: true } }) }), { state: 'probed', violations: [`${NATIVE_EMAIL_VIOLATION.bothOff}:customer_processing_order`] })
+  assert.deepEqual(await reader({ db: dbWith('false'), now: NOW, probeOnce: noProbe, env, readNativeEmail: read(on) }), { state: 'probed', violations: [`${NATIVE_EMAIL_VIOLATION.bothOff}:customer_completed_order`] })
+  // BEFORE STEP W the store is not asked, but the IMS switch being ON is itself a violation (unset, unreadable and future live-from alike).
+  reads = 0
+  for (const early of [{}, { WC_WRITES_LIVE_FROM: 'soon' }, { WC_WRITES_LIVE_FROM: '2027-01-01T00:00:00Z' }]) {
+    assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, probeOnce: noProbe, env: early, readNativeEmail: read(off) }), { state: 'probed', violations: [NATIVE_EMAIL_VIOLATION.imsOnBeforeStepW] })
+    assert.deepEqual(await reader({ db: dbWith('false'), now: NOW, probeOnce: noProbe, env: early, readNativeEmail: read(off) }), { state: 'absent' })
+  }
+  assert.equal(reads, 0)
   assert.deepEqual(await reader({ db: dbWith('true'), now: NOW, probeOnce: noProbe, env, readNativeEmail: read({ ok: false }) }), { state: 'unreadable' })
   const thrown = await readStepEvidence({ db: dbWith('true'), now: NOW, env, readNativeEmail: async () => { throw new Error('network') } })
   assert.deepEqual(thrown.NATIVE_EMAIL_EXCLUSIVE, { state: 'unreadable' })
@@ -178,7 +188,7 @@ test('P2-W: both-on and an unreadable native state FAIL the check; before W the 
   const W = { ...STEP_M, WC_WRITES_LIVE_FROM: '2026-12-08T00:00:00Z' }
   const find = (report: ReturnType<typeof evaluateWritersCheck>) => report.findings.filter((f) => f.subject === 'NATIVE_EMAIL_EXCLUSIVE')
   assert.deepEqual(find(evaluateWritersCheck(inputs(W, clean()))), [])
-  const both = find(evaluateWritersCheck(inputs(W, { ...clean(), NATIVE_EMAIL_EXCLUSIVE: { state: 'probed', violations: [NATIVE_EMAIL_VIOLATION.bothOn] } })))
+  const both = find(evaluateWritersCheck(inputs(W, { ...clean(), NATIVE_EMAIL_EXCLUSIVE: { state: 'probed', violations: [`${NATIVE_EMAIL_VIOLATION.bothOn}:customer_processing_order`] } })))
   assert.ok(both.some((f) => f.code === 'step-evidence-violation' && f.severity === 'fail'))
   const unreadable = find(evaluateWritersCheck(inputs(W, { ...clean(), NATIVE_EMAIL_EXCLUSIVE: { state: 'unreadable' } })))
   assert.ok(unreadable.some((f) => f.code === 'unreadable' && f.severity === 'fail'), 'fail closed')
@@ -208,6 +218,7 @@ test('the real script, run against a fake systemctl, prints exactly what the par
     assert.ok(parsed.ok, out)
     if (!parsed.ok) return
     assert.equal(parsed.report.lastTriggerAt, '2026-11-30T23:55:02.000Z', 'the latest of the timer trigger and the service start')
+    assert.equal(parsed.report.journalExit, 1, 'the journalctl exit status is reported (here the fake journal fails)')
     assert.equal(parsed.report.units['wc-mintsoft-webhook.service'].activeState, 'active')
     assert.equal(parsed.report.units['wc-mintsoft-webhook.service'].unitFileState, 'none', 'a blank UnitFileState is reported as none')
     assert.deepEqual(bridgeUnitViolations(parsed.report), ['bridge-unit-not-masked:wc-mintsoft-webhook.service', 'bridge-unit-not-inactive:wc-mintsoft-webhook.service'])
@@ -219,4 +230,103 @@ test('the real script, run against a fake systemctl, prints exactly what the par
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------
+// o3d-pdnzu items 1 to 3 (and the forgery note).
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------
+
+const reading = (over: Record<string, unknown>) => ({ state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt: '2026-11-30T23:55:00.000Z', generatedAt: '2026-12-02T00:00:00.000Z', ...over }) as StepEvidenceReading
+
+test('ITEM 1: a report generated, or recorded, before S is not evidence about the host after S (MUTATION: drop the >= S comparison on either time => red)', () => {
+  const generatedBefore = bridgeFindings(evaluateWritersCheck(inputs(STEP_M, { ...clean(), BRIDGE_ATTESTATION: reading({ generatedAt: '2026-11-30T23:59:59.000Z' }) })))
+  assert.ok(generatedBefore.some((f) => f.code === 'attestation-missing' && /generated before MINTSOFT_WRITES_LIVE_FROM/.test(f.message)), JSON.stringify(generatedBefore))
+  const recordedBefore = bridgeFindings(evaluateWritersCheck(inputs(STEP_M, { ...clean(), BRIDGE_ATTESTATION: reading({ at: '2026-11-30T23:59:59.000Z' }) })))
+  assert.ok(recordedBefore.some((f) => f.code === 'attestation-missing' && /recorded before/.test(f.message)), JSON.stringify(recordedBefore))
+  // exactly at S passes (>=), as does later
+  assert.deepEqual(bridgeFindings(evaluateWritersCheck(inputs(STEP_M, { ...clean(), BRIDGE_ATTESTATION: reading({ generatedAt: M_AT, at: M_AT }) }))), [])
+  // no generation time on the reading: no facts, not a pass
+  assert.ok(bridgeFindings(evaluateWritersCheck(inputs(STEP_M, { ...clean(), BRIDGE_ATTESTATION: reading({ generatedAt: undefined }) }))).some((f) => f.code === 'unreadable'))
+  // the reader hands the report's own generation time to the evaluator
+  assert.notEqual(evaluateWritersCheck(inputs(STEP_M, { ...clean(), BRIDGE_ATTESTATION: reading({ generatedAt: '2026-11-30T23:59:59.000Z' }) })).exitCode, 0)
+})
+
+test('ITEM 2: UnitFileState must be exactly `masked`: masked-runtime (lost at reboot) and anything else is a violation naming the unit (MUTATION: ignore UnitFileState => red)', () => {
+  const report = (state: string) => { const p = parseBridgeStatusOutput(sampleReport({ units: { 'wc-mintsoft-webhook.service': `LoadState=masked ActiveState=inactive UnitFileState=${state}` } })); assert.ok(p.ok); return p.ok ? p.report : null! }
+  assert.deepEqual(bridgeUnitViolations(report('masked')), [])
+  assert.deepEqual(bridgeUnitViolations(report('masked-runtime')), ['bridge-unit-not-persistently-masked:wc-mintsoft-webhook.service'])
+  assert.deepEqual(bridgeUnitViolations(report('enabled')), ['bridge-unit-not-persistently-masked:wc-mintsoft-webhook.service'])
+  assert.deepEqual(bridgeUnitViolations(report('none')), ['bridge-unit-not-persistently-masked:wc-mintsoft-webhook.service'])
+})
+
+test('ITEM 3: `never` is believed only with journal_exit: 0; `unknown`, a `never` without the journal proof and a failed journal read are UNREADABLE (MUTATION: accept never outright => red)', async () => {
+  const parsed = (options: Parameters<typeof sampleReport>[0]) => { const p = parseBridgeStatusOutput(sampleReport(options)); assert.ok(p.ok, JSON.stringify(options)); return p.ok ? p.report : null! }
+  assert.equal(bridgeLastTriggerReadable(parsed({ lastTrigger: 'never', journalExit: 0 })), true)
+  assert.equal(bridgeLastTriggerReadable(parsed({ lastTrigger: 'never', journalExit: 1 })), false)
+  assert.equal(bridgeLastTriggerReadable(parsed({ lastTrigger: 'never', journalExit: null })), false, 'a report from the older script has no proof')
+  assert.equal(bridgeLastTriggerReadable(parsed({ lastTrigger: 'unknown' })), false)
+  assert.equal(bridgeLastTriggerReadable(parsed({ lastTrigger: '2026-11-30T23:55:01Z', journalExit: 1 })), true, 'a time is a time')
+  assert.equal(parsed({ lastTrigger: 'unknown' }).lastTriggerAt, null)
+  assert.equal(parseBridgeStatusOutput(`${sampleReport()}journal_exit: 0\n`).ok, false, 'journal_exit twice is refused')
+  assert.equal(parseBridgeStatusOutput(sampleReport().replace('journal_exit: 0', 'journal_exit: x')).ok, false)
+  const dbWith = (report: ReturnType<typeof parsed>) => ({ writerAttestation: { findFirst: async () => ({ attestedAt: new Date('2026-12-02T00:00:00Z'), payload: bridgePayloadFromReport(report, '') }) } }) as never
+  const read = (options: Parameters<typeof sampleReport>[0]) => STEP_EVIDENCE_READERS.BRIDGE_ATTESTATION({ db: dbWith(parsed(options)), now: NOW, probeOnce: noProbe })
+  assert.deepEqual(await read({ lastTrigger: 'never', journalExit: 0 }), { state: 'present', at: '2026-12-02T00:00:00.000Z', violations: [], lastTriggerAt: null, generatedAt: '2026-12-20T11:55:00.000Z' })
+  for (const bad of [{ lastTrigger: 'unknown' }, { lastTrigger: 'never', journalExit: null }, { lastTrigger: 'never', journalExit: 2 }]) assert.deepEqual(await read(bad), { state: 'unreadable' }, JSON.stringify(bad))
+  // A payload stored before the two fields existed: a time still reads, a `never` is unproven.
+  const old = (lastTriggerAt: string | null) => ({ schema: 1, host: 'h', generatedAt: '2026-12-02T00:00:00.000Z', lastTriggerAt, units: Object.fromEntries(['wc-mintsoft-order-sweep.timer', 'wc-mintsoft-order-sweep.service', 'wc-mintsoft-webhook.service'].map((u) => [u, { loadState: 'masked', activeState: 'inactive', unitFileState: 'masked' }])) })
+  assert.equal(bridgeLastTriggerReadable(readBridgePayload(old('2026-11-30T00:00:00.000Z'))!), true)
+  assert.equal(bridgeLastTriggerReadable(readBridgePayload(old(null))!), false)
+})
+
+test('ITEM 3: the real script reports the journalctl exit status, folds the webhook service\'s timestamps into last_trigger, and writes `unknown` (never `never`) when the times were lost and the journal could not be read', { skip: process.platform === 'win32' }, () => {
+  const dir = mkdtempSync(join(tmpdir(), 'bridge-status-'))
+  try {
+    const script = join(process.cwd(), 'scripts/bridge/bridge_writers_status.py')
+    const systemctl = (webhookTimes: string) => {
+      const path = join(dir, `systemctl-${webhookTimes.length}`)
+      writeFileSync(path, [
+        '#!/bin/sh',
+        'for last; do unit="$last"; done',
+        'case "$unit" in',
+        '  wc-mintsoft-order-sweep.timer) printf "LoadState=masked\\nActiveState=inactive\\nUnitFileState=masked\\nLastTriggerUSec=n/a\\n";;',
+        '  wc-mintsoft-order-sweep.service) printf "LoadState=masked\\nActiveState=inactive\\nUnitFileState=masked\\nExecMainStartTimestamp=n/a\\nInactiveExitTimestamp=n/a\\n";;',
+        `  *) printf "LoadState=masked\\nActiveState=inactive\\nUnitFileState=masked\\n${webhookTimes}";;`,
+        'esac',
+      ].join('\n'))
+      chmodSync(path, 0o755)
+      return path
+    }
+    const journal = (body: string) => { const path = join(dir, `journal-${body.length}`); writeFileSync(path, `#!/bin/sh\n${body}\n`); chmodSync(path, 0o755); return path }
+    const run = (sys: string, jrn: string) => execFileSync('python3', ['-I', script, '--systemctl', sys, '--journalctl', jrn], { encoding: 'utf8' })
+    // 1. times lost (a reboot) and the journal unreadable: `unknown`, with the exit status printed
+    const lost = run(systemctl(''), journal('exit 1'))
+    assert.match(lost, /^journal_exit: 1$/m)
+    assert.match(lost, /^last_trigger: unknown$/m)
+    assert.doesNotMatch(lost, /last_trigger: never/)
+    // 2. nothing found and every journal read succeeded: the one case in which `never` is proven
+    const never = run(systemctl(''), journal('exit 0'))
+    assert.match(never, /^journal_exit: 0$/m)
+    assert.match(never, /^last_trigger: never$/m)
+    // 3. the WEBHOOK service's own timestamps count (it had no time property before)
+    const webhook = run(systemctl('ExecMainStartTimestamp=Wed 2026-12-02 08:00:00 UTC\\nInactiveExitTimestamp=n/a\\n'), journal('exit 0'))
+    assert.match(webhook, /^last_trigger: 2026-12-02T08:00:00Z$/m)
+    // every output is accepted by the parser; `unknown` and a proven `never` read as the evaluator will judge them
+    const parsedLost = parseBridgeStatusOutput(lost)
+    assert.ok(parsedLost.ok && !bridgeLastTriggerReadable(parsedLost.report))
+    const parsedNever = parseBridgeStatusOutput(never)
+    assert.ok(parsedNever.ok && bridgeLastTriggerReadable(parsedNever.report))
+    // a journal entry of the webhook unit after S counts too
+    const withEntry = run(systemctl(''), journal('printf \'{"__REALTIME_TIMESTAMP":"1796198400000000"}\\n\''))
+    assert.match(withEntry, /^last_trigger: 2026-12-02T08:00:00Z$/m)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('FORGERY NOTE: the check\'s own "cannot see" list and the script say the pasted report is the owner\'s word plus a transcript, not host evidence', async () => {
+  const { WRITERS_CHECK_CANNOT_SEE } = await import('../../lib/security/writers-check-constants')
+  assert.ok(WRITERS_CHECK_CANNOT_SEE.some((line) => /plain pasted text/.test(line) && /not evidence signed by the host/i.test(line) && /forgery/.test(line)))
+  const { readFileSync } = await import('node:fs')
+  assert.match(readFileSync('scripts/bridge/bridge_writers_status.py', 'utf8'), /not evidence signed by this host/)
 })

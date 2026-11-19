@@ -6,12 +6,14 @@ as scripts/bridge_writers_status.py) by ops and run there; the bridge repository
 
 It changes nothing: it runs `systemctl show` (and `journalctl -n 1`) and prints a small report. An administrator pastes the output into
 `npm run writers:attest -- --kind bridge-units-masked --output-file -` or the Sync > Writer confirmations screen; IMS parses it strictly and
-`writers:check` (phase P2-M and later) requires all three units masked (LoadState=masked) and inactive (ActiveState=inactive), and the last
-trigger BEFORE the Mintsoft step's live-from instant. Run it AFTER the units are masked, and run it again whenever in doubt: IMS only ever sees the
+`writers:check` (phase P2-M and later) requires all three units masked (LoadState=masked AND UnitFileState=masked: a runtime mask is lost at reboot) and
+inactive (ActiveState=inactive), and the last trigger BEFORE the Mintsoft step's live-from instant. Run it AFTER the units are masked, and run it again whenever in doubt: IMS only ever sees the
 newest report, which is a snapshot, not a watch.
 
 Usage:  bridge_writers_status.py [--systemctl PATH] [--journalctl PATH]
 Exit:   0 the report was printed (whatever the units' state: judging it is IMS's job); 2 a unit could not be read (nothing is printed on stdout).
+
+LIMIT: the output is plain text that an administrator pastes into IMS. It is the owner's word plus a transcript, not evidence signed by this host.
 
 Output format (version 1, kept in step with lib/domain/writer-attestation/bridge-status.ts in IMS):
 
@@ -21,10 +23,17 @@ Output format (version 1, kept in step with lib/domain/writer-attestation/bridge
   unit: wc-mintsoft-order-sweep.timer LoadState=masked ActiveState=inactive UnitFileState=masked
   unit: wc-mintsoft-order-sweep.service LoadState=masked ActiveState=inactive UnitFileState=masked
   unit: wc-mintsoft-webhook.service LoadState=masked ActiveState=inactive UnitFileState=masked
-  last_trigger: 2026-12-30T23:55:01Z        (or: never)
+  journal_exit: 0
+  last_trigger: 2026-12-30T23:55:01Z        (or: never, or: unknown)
 
-`last_trigger` is the LATEST of: the sweep timer's LastTriggerUSec, the sweep service's ExecMainStartTimestamp / InactiveExitTimestamp, and the time of the
-sweep service's newest journal entry, so a sweep started by hand (without the timer) counts too.
+`last_trigger` is the LATEST of: the sweep timer's LastTriggerUSec, the ExecMainStartTimestamp / InactiveExitTimestamp / InactiveEnterTimestamp of the sweep
+service AND of the webhook service, and the time of the newest journal entry of each of the three units, so a sweep started by hand (without the timer)
+and a webhook delivered after the live-from instant both count.
+
+`journal_exit` is the worst exit status of the journalctl reads (0 = all three succeeded). systemd keeps unit timestamps in memory only, so they are LOST by
+a reboot or a daemon-reload that garbage-collects an inactive masked unit. `never` is therefore printed only when every journal read succeeded and found
+nothing; when no time could be found AND a journal read failed, the script prints `unknown`, and IMS reads `unknown` (and a `never` without
+`journal_exit: 0`) as unreadable, never as clean.
 """
 import argparse
 import datetime
@@ -44,8 +53,9 @@ STATE_PROPS = ("LoadState", "ActiveState", "UnitFileState")
 # Properties that carry a time. `systemctl show` prints them as microseconds since the epoch (the *USec ones) or as a human date; both are handled.
 TIME_PROPS = {
     "wc-mintsoft-order-sweep.timer": ("LastTriggerUSec", "LastTriggerUSecMonotonic"),
-    "wc-mintsoft-order-sweep.service": ("ExecMainStartTimestamp", "InactiveExitTimestamp"),
-    "wc-mintsoft-webhook.service": (),
+    "wc-mintsoft-order-sweep.service": ("ExecMainStartTimestamp", "InactiveExitTimestamp", "InactiveEnterTimestamp"),
+    # The webhook service had NO time property before: a webhook processed after the live-from instant (then stopped and masked) was invisible.
+    "wc-mintsoft-webhook.service": ("ExecMainStartTimestamp", "InactiveExitTimestamp", "InactiveEnterTimestamp"),
 }
 SAFE = re.compile(r"^[A-Za-z0-9_.:-]{1,40}$")
 
@@ -111,10 +121,10 @@ def parse_time(text):
 
 
 def journal_last(journalctl, unit):
-    """The newest journal entry of `unit`, or None. A host with no journal access reads as 'no entry': the unit properties still count."""
+    """(newest journal entry of `unit` or None, journalctl exit status). A non-zero status means the journal could not be read, which is NOT the same as 'no entry'."""
     done = run([journalctl, "--no-pager", "-n", "1", "-o", "json", "-u", unit])
     if done.returncode != 0:
-        return None
+        return None, done.returncode
     for line in reversed(done.stdout.splitlines()):
         line = line.strip()
         if not line:
@@ -122,9 +132,9 @@ def journal_last(journalctl, unit):
         try:
             stamp = json.loads(line).get("__REALTIME_TIMESTAMP")
         except ValueError:
-            return None
-        return parse_time(str(stamp)) if stamp else None
-    return None
+            return None, 1
+        return (parse_time(str(stamp)) if stamp else None), 0
+    return None, 0
 
 
 def build(systemctl, journalctl, now):
@@ -148,10 +158,22 @@ def build(systemctl, journalctl, now):
             moment = parse_time(props.get(prop, ""))
             if moment is not None and (latest is None or moment > latest):
                 latest = moment
-    entry = journal_last(journalctl, "wc-mintsoft-order-sweep.service")
-    if entry is not None and (latest is None or entry > latest):
-        latest = entry
-    lines.append("last_trigger: %s" % (latest.strftime("%Y-%m-%dT%H:%M:%SZ") if latest else "never"))
+    journal_exit = 0
+    for unit in UNITS:
+        entry, status = journal_last(journalctl, unit)
+        journal_exit = max(journal_exit, status)
+        if entry is not None and (latest is None or entry > latest):
+            latest = entry
+    lines.append("journal_exit: %d" % journal_exit)
+    if latest is not None:
+        last = latest.strftime("%Y-%m-%dT%H:%M:%SZ")
+    elif journal_exit == 0:
+        # Every journal read succeeded and nothing was found: the only case in which `never` is a proven answer.
+        last = "never"
+    else:
+        # No time anywhere (lost with a reboot or a garbage-collected unit) and the journal could not be read: nothing can be said.
+        last = "unknown"
+    lines.append("last_trigger: %s" % last)
     return "\n".join(lines) + "\n"
 
 

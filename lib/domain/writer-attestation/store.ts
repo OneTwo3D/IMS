@@ -56,7 +56,7 @@ export async function recordWriterAttestation(db: AttestationDb, input: RecordAt
     const stale = bridgeStatusFreshnessError(parsed.report, input.now ?? new Date())
     if (stale !== null) return { ok: false, error: stale }
     payload = bridgePayloadFromReport(parsed.report, input.output ?? '')
-    reportSummary = { host: parsed.report.host, generatedAt: parsed.report.generatedAt, lastTriggerAt: parsed.report.lastTriggerAt }
+    reportSummary = { host: parsed.report.host, generatedAt: parsed.report.generatedAt, lastTriggerAt: parsed.report.lastTriggerAt, lastTriggerState: parsed.report.lastTriggerState, journalExit: parsed.report.journalExit }
   } else if (input.output !== undefined) {
     return { ok: false, error: 'This confirmation does not take a pasted report.' }
   }

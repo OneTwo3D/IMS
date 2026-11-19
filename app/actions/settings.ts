@@ -26,6 +26,7 @@ import { validateBackupScheduleInput, type BackupScheduleInput } from '@/lib/dom
 import { toIsoCountryCode } from '@/lib/countries'
 import { getSettingValue, maskSettingSecret, serializeSettingValue, SENSITIVE_SETTING_KEYS } from '@/lib/settings-store'
 import { isMaskedSecret } from '@/lib/security/secret-mask'
+import { STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY, STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY } from '@/lib/domain/storefront-customer-email/constants'
 import { refreshMutableDocumentTaxSnapshotsForRate } from '@/lib/tax/document-tax-snapshot-refresh'
 import { maybeQueueTaxRateSync } from '@/lib/accounting/tax-rate-sync-trigger'
 import {
@@ -1057,7 +1058,25 @@ export async function setSettings(values: Record<string, string>): Promise<Setti
   // transaction, so nothing is committed.
   assertWritableSettingKeys(entries.map(([key]) => key))
 
+  // CUSTOMER E-MAIL FOR STOREFRONT ORDERS: turning it ON is a transition that is REFUSED until step W is live and WooCommerce's native e-mails are off
+  // (interlock), and it records WHEN it was turned on in the same transaction (the anchor of every history guard). Turning it off, or saving it unchanged, is neither.
+  const storefrontEmailEntry = entries.find(([key]) => key === STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY)
+  let stampStorefrontEmailOn = false
+  if (storefrontEmailEntry && storefrontEmailEntry[1] === 'true') {
+    const current = await db.setting.findUnique({ where: { key: STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY }, select: { value: true } })
+    if (current?.value !== 'true') {
+      const { storefrontEmailSwitchOnRefusal } = await import('@/lib/domain/storefront-customer-email/switch-on-interlock')
+      const refusal = await storefrontEmailSwitchOnRefusal()
+      if (refusal) return { status: 'refused', error: refusal }
+      stampStorefrontEmailOn = true
+    }
+  }
+
   await db.$transaction(async (tx) => {
+    if (stampStorefrontEmailOn) {
+      const at = new Date().toISOString()
+      await tx.setting.upsert({ where: { key: STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY }, create: { key: STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY, value: at }, update: { value: at } })
+    }
     for (const [key, value] of entries) {
       await tx.setting.upsert({
         where: { key },

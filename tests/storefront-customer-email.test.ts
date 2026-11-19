@@ -51,7 +51,11 @@ function reset(): void {
   state.outbox = []
   state.logged = []
 }
-const ON = () => state.settings.set('storefront_customer_email_enabled', 'true')
+// The switch is on, and was turned on an hour ago: everything the tests make happens after it unless a test says otherwise.
+const ON = (enabledAt: Date | null = new Date(Date.now() - 3_600_000)) => {
+  state.settings.set('storefront_customer_email_enabled', 'true')
+  if (enabledAt) state.settings.set('storefront_customer_email_enabled_at', enabledAt.toISOString())
+}
 
 const load = async () => ({
   queue: await import('../lib/storefront-customer-email'),
@@ -62,7 +66,7 @@ const load = async () => ({
 })
 
 const NOW = new Date('2026-12-20T12:00:00Z')
-const base = { settingValue: 'true', now: NOW, orderId: 'so-1', alreadyQueued: false }
+const base = { settingValue: 'true', enabledAt: new Date('2026-12-20T00:00:00Z'), now: NOW, orderId: 'so-1', alreadyQueued: false }
 const order = (over: Record<string, unknown> = {}) => ({ status: 'PROCESSING', isQuote: false, customerEmail: 'a@b.test', shoppingLinkCount: 1, placedAt: new Date('2026-12-20T10:00:00Z'), shippedAt: null, ...over })
 
 test('DEFAULT OFF: with the switch off or absent nothing is queued, for every kind (MUTATION: default on => red)', async () => {
@@ -91,7 +95,7 @@ test('confirmation: queued once for a recent storefront order; never twice (even
   for (const [name, over, reason] of [
     ['direct order', { _count: { shoppingLinks: 0 } }, 'not_storefront_order'],
     ['quote', { isQuote: true }, 'quote'],
-    ['old import', { externalCreatedAt: new Date('2026-01-01T00:00:00Z') }, 'too_old'],
+    ['old import', { externalCreatedAt: new Date('2026-01-01T00:00:00Z') }, 'before_switch_on'],
     ['unpaid', { status: 'PENDING_PAYMENT' }, 'wrong_status'],
     ['no address', { customerEmail: null }, 'no_customer_email'],
     ['erased', { erasedAt: new Date() }, 'recipient_erased'],
@@ -123,8 +127,8 @@ test('delivered: only for DELIVERED, once, and not for an order despatched long 
   state.order = { ...BASE_ORDER, status: 'DELIVERED', shippedAt: new Date() }
   assert.deepEqual(await queue.queueStorefrontDeliveredEmailIfEligible('so-1'), { queued: true })
   assert.deepEqual(await queue.queueStorefrontDeliveredEmailIfEligible('so-1'), { queued: false, reason: 'already_queued' })
-  reset(); ON(); state.order = { ...BASE_ORDER, status: 'DELIVERED', shippedAt: new Date('2026-01-05T00:00:00Z'), externalCreatedAt: new Date('2026-01-01T00:00:00Z') }
-  assert.deepEqual(await queue.queueStorefrontDeliveredEmailIfEligible('so-1'), { queued: false, reason: 'too_old' })
+  reset(); ON(new Date('2025-12-01T00:00:00Z')); state.order = { ...BASE_ORDER, status: 'DELIVERED', shippedAt: new Date('2026-01-05T00:00:00Z'), externalCreatedAt: new Date('2026-01-01T00:00:00Z') }
+  assert.deepEqual(await queue.queueStorefrontDeliveredEmailIfEligible('so-1'), { queued: false, reason: 'too_old' }, 'inside the switch-on window but older than the age bound')
 })
 
 test('a queue failure never throws into the caller and is recorded at WARNING on the order, for confirmation, partial shipment and delivered (MUTATION: console-only => red)', async () => {
@@ -157,6 +161,7 @@ test('pure eligibility: every refusal reason, in the order the contract states t
   assert.deepEqual(e('confirmation'), { eligible: true })
   assert.deepEqual(e('confirmation', { settingValue: null }), { eligible: false, reason: 'disabled' })
   assert.deepEqual(e('confirmation', { order: null }), { eligible: false, reason: 'order_not_found' })
+  assert.deepEqual(e('confirmation', { enabledAt: null }), { eligible: false, reason: 'switch_time_unknown' }, 'a switch with no recorded switch-on time sends nothing (fail closed)')
   assert.deepEqual(e('confirmation', {}, { placedAt: null }), { eligible: false, reason: 'too_old' })
   assert.deepEqual(e('partial', {}, {}, { status: 'PENDING', shippedAt: null, orderId: 'so-1' }), { eligible: false, reason: 'shipment_not_shipped' })
   assert.deepEqual(e('partial', {}, {}, { status: 'SHIPPED', shippedAt: new Date('2026-12-20T09:00:00Z'), orderId: 'other' }), { eligible: false, reason: 'shipment_not_shipped' })
@@ -171,10 +176,12 @@ test('the dispatch e-mail: a storefront order is skipped while the storefront sw
   const e = dispatch.evaluateDispatchEmailEligibility
   assert.deepEqual(e({ settingValue: 'true', order: { ...shipped, shoppingLinkCount: 1 }, alreadyQueued: false }), { eligible: false, reason: 'storefront_order' })
   assert.deepEqual(e({ settingValue: 'true', storefrontSettingValue: 'false', order: { ...shipped, shoppingLinkCount: 1 }, alreadyQueued: false }), { eligible: false, reason: 'storefront_order' })
-  assert.deepEqual(e({ settingValue: 'false', storefrontSettingValue: 'true', order: { ...shipped, shoppingLinkCount: 1 }, alreadyQueued: false }), { eligible: true })
+  const sf = { storefrontEnabledAt: new Date('2026-12-20T00:00:00Z'), now: NOW }
+  const justShipped = { shippedAt: new Date('2026-12-20T09:00:00Z') }
+  assert.deepEqual(e({ settingValue: 'false', storefrontSettingValue: 'true', ...sf, order: { ...shipped, ...justShipped, shoppingLinkCount: 1 }, alreadyQueued: false }), { eligible: true })
   assert.deepEqual(e({ settingValue: 'false', storefrontSettingValue: 'true', order: { ...shipped, shoppingLinkCount: 0 }, alreadyQueued: false }), { eligible: false, reason: 'disabled' })
-  assert.deepEqual(e({ settingValue: 'true', storefrontSettingValue: 'true', order: { ...shipped, shoppingLinkCount: 1 }, alreadyQueued: true }), { eligible: false, reason: 'already_queued' })
-  assert.deepEqual(e({ settingValue: 'true', storefrontSettingValue: 'true', order: { ...shipped, status: 'COMPLETED', shoppingLinkCount: 1 }, alreadyQueued: false }), { eligible: false, reason: 'order_not_shipped' })
+  assert.deepEqual(e({ settingValue: 'true', storefrontSettingValue: 'true', ...sf, order: { ...shipped, ...justShipped, shoppingLinkCount: 1 }, alreadyQueued: true }), { eligible: false, reason: 'already_queued' })
+  assert.deepEqual(e({ settingValue: 'true', storefrontSettingValue: 'true', ...sf, order: { ...shipped, ...justShipped, status: 'COMPLETED', shoppingLinkCount: 1 }, alreadyQueued: false }), { eligible: false, reason: 'order_not_shipped' })
 })
 
 test('the builders: switch off at SEND time => the row ends FAILED with the reason (EmailKindDisabledError); on => a SINGLE SEND with a deadline; a direct order is refused for a storefront kind', async () => {
@@ -220,4 +227,130 @@ test('native e-mail state: yes/no per e-mail; a store that errors, throws or ans
   const paths: string[] = []
   await native.readWooNativeCustomerEmailState(async (p) => { paths.push(p); return { data: [{ id: 'enabled', value: 'no' }] } })
   assert.deepEqual(paths, ['/settings/email_customer_processing_order', '/settings/email_customer_completed_order'])
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------
+// o3d-pdnzu: the history guards are tied to the switch-on instant; a batch of shipments is judged once; a held order that is released is confirmed once.
+// ---------------------------------------------------------------------------------------------------------------------------------------------------------
+
+test('SWITCH-ON ANCHOR: an order placed before the switch came on gets no confirmation even when its import is retried after (WooCommerce sent it); one placed after does (MUTATION: drop the anchor => red)', async () => {
+  const { queue } = await load()
+  reset(); ON(new Date())
+  state.order = { ...BASE_ORDER, externalCreatedAt: new Date(Date.now() - 2 * 3_600_000) } // inside the 48 h window, before the switch
+  assert.deepEqual(await queue.queueStorefrontConfirmationIfEligible('so-1'), { queued: false, reason: 'before_switch_on' })
+  assert.equal(state.outbox.length, 0)
+  reset(); ON(new Date(Date.now() - 3_600_000))
+  state.order = { ...BASE_ORDER, externalCreatedAt: new Date() }
+  assert.deepEqual(await queue.queueStorefrontConfirmationIfEligible('so-1'), { queued: true })
+  reset(); ON(null) // switch on, no switch-on instant recorded: nothing is sent
+  assert.deepEqual(await queue.queueStorefrontConfirmationIfEligible('so-1'), { queued: false, reason: 'switch_time_unknown' })
+})
+
+test('SWITCH-ON ANCHOR: delivered and partial are only for a shipment dispatched after the switch-on instant (MUTATION: drop the anchor => red)', async () => {
+  const { queue } = await load()
+  const before = new Date(Date.now() - 2 * 3_600_000)
+  reset(); ON(new Date())
+  state.order = { ...BASE_ORDER, status: 'DELIVERED', shippedAt: before }
+  assert.deepEqual(await queue.queueStorefrontDeliveredEmailIfEligible('so-1'), { queued: false, reason: 'before_switch_on' })
+  reset(); ON(new Date())
+  state.shipment = { status: 'SHIPPED', shippedAt: before, orderId: 'so-1' }
+  assert.deepEqual(await queue.queueStorefrontPartialShipmentEmailIfEligible('sh-1'), { queued: false, reason: 'before_switch_on' })
+  assert.equal(state.outbox.length, 0)
+})
+
+test('DISPATCHED e-mail: a SHIPPED storefront order despatched before the switch-on instant, or long ago, or with no despatch time, gets nothing on a later status call (MUTATION: drop either bound => red)', async () => {
+  const { dispatch } = await load()
+  const e = dispatch.evaluateDispatchEmailEligibility
+  const at = new Date('2026-12-20T00:00:00Z')
+  const now = new Date('2026-12-20T12:00:00Z')
+  const shipped = (shippedAt: Date | null) => ({ settingValue: null, storefrontSettingValue: 'true', storefrontEnabledAt: at, now, alreadyQueued: false, order: { status: 'SHIPPED', customerEmail: 'a@b.test', shoppingLinkCount: 1, shippedAt } })
+  assert.deepEqual(e(shipped(new Date('2026-12-20T09:00:00Z'))), { eligible: true })
+  assert.deepEqual(e(shipped(new Date('2026-12-19T23:59:59Z'))), { eligible: false, reason: 'storefront_before_switch_on' })
+  assert.deepEqual(e(shipped(null)), { eligible: false, reason: 'storefront_before_switch_on' })
+  assert.deepEqual(e({ ...shipped(new Date('2026-12-20T09:00:00Z')), storefrontEnabledAt: null }), { eligible: false, reason: 'storefront_before_switch_on' })
+  // the age bound, with the switch long on
+  const old = { ...shipped(new Date('2026-11-01T00:00:00Z')), storefrontEnabledAt: new Date('2026-10-01T00:00:00Z') }
+  assert.deepEqual(e(old), { eligible: false, reason: 'storefront_too_old' })
+  // a direct order is not touched by any of this
+  assert.deepEqual(e({ settingValue: 'true', order: { status: 'SHIPPED', customerEmail: 'a@b.test', shoppingLinkCount: 0 }, alreadyQueued: false }), { eligible: true })
+})
+
+test('DISPATCHED e-mail, through the queue: a pre-switch SHIPPED order re-run after the switch is not e-mailed; one shipped after is, once', async () => {
+  const { dispatch } = await load()
+  reset(); ON(new Date())
+  state.order = { ...BASE_ORDER, status: 'SHIPPED', shippedAt: new Date(Date.now() - 3_600_000) }
+  assert.deepEqual(await dispatch.queueDispatchEmailIfEligible('so-1'), { queued: false, reason: 'storefront_before_switch_on' })
+  reset(); ON(new Date(Date.now() - 3_600_000))
+  state.order = { ...BASE_ORDER, status: 'SHIPPED', shippedAt: new Date() }
+  assert.deepEqual(await dispatch.queueDispatchEmailIfEligible('so-1'), { queued: true })
+  assert.deepEqual(await dispatch.queueDispatchEmailIfEligible('so-1'), { queued: false, reason: 'already_queued' })
+})
+
+test('BATCH: partial e-mails of one external dispatch are judged AFTER the whole batch; an order that reached SHIPPED in the batch gets no partial e-mail, one still owing does (MUTATION: judge shipment by shipment => the first shipment is mailed a false "rest will follow" => red)', async () => {
+  const { queue } = await load()
+  // Shipment by shipment: after shipment 1 the order is still PROCESSING, so the (old) per-shipment hook queues a partial e-mail that is false once shipment 2 ships.
+  reset(); ON()
+  state.shipment = { status: 'SHIPPED', shippedAt: new Date(), orderId: 'so-1' }
+  // The batch has finished and the order reached SHIPPED: the batch hook queues NO partial e-mail for either shipment.
+  state.order = { ...BASE_ORDER, status: 'SHIPPED' }
+  await queue.queueStorefrontPartialShipmentEmailsAfterBatch(['sh-1', 'sh-2'])
+  assert.equal(state.outbox.length, 0)
+  // The batch finished and the order still owes (a mixed-warehouse part): each shipment of the batch is mailed once.
+  state.order = { ...BASE_ORDER, status: 'ALLOCATED' }
+  await queue.queueStorefrontPartialShipmentEmailsAfterBatch(['sh-1', 'sh-2'])
+  assert.equal(state.outbox.length, 2)
+})
+
+test('BATCH wiring: applyExternalFulfillmentUpdate defers the per-shipment partial hook and flushes it once after the loop (source pin for both loops)', async () => {
+  const { readFileSync } = await import('node:fs')
+  const source = readFileSync('lib/fulfillment/external-fulfillment.ts', 'utf8')
+  assert.equal((source.match(/deferStorefrontPartialEmail: true/g) ?? []).length, 2, 'both external loops defer the per-shipment hook')
+  assert.equal((source.match(/await flushPartialEmails\(\)/g) ?? []).length, 4, 'each loop flushes on failure and after the loop')
+  const allocation = readFileSync('app/actions/allocation.ts', 'utf8')
+  assert.match(allocation, /options\?\.deferStorefrontPartialEmail !== true/)
+})
+
+test('RELEASE: an order imported held (so the import queued nothing) and later moved to processing is confirmed ONCE, judged on the release, with the same dedupe (MUTATION: no release hook => red)', async () => {
+  const { queue } = await load()
+  reset(); ON(new Date(Date.now() - 3_600_000))
+  // Placed (and held) long before the switch came on: the placement time says "history", the release time says "now".
+  state.order = { ...BASE_ORDER, status: 'PROCESSING', externalCreatedAt: new Date(Date.now() - 5 * 24 * 3_600_000) }
+  assert.deepEqual(await queue.queueStorefrontConfirmationIfEligible('so-1'), { queued: false, reason: 'before_switch_on' }, 'without a release it is history')
+  assert.deepEqual(await queue.queueStorefrontConfirmationIfEligible('so-1', { releasedAt: new Date() }), { queued: true })
+  assert.deepEqual(await queue.queueStorefrontConfirmationIfEligible('so-1', { releasedAt: new Date() }), { queued: false, reason: 'already_queued' }, 'once only')
+  // A release the store made BEFORE the switch came on was confirmed by WooCommerce: not again.
+  reset(); ON(new Date())
+  state.order = { ...BASE_ORDER, status: 'PROCESSING', externalCreatedAt: new Date(Date.now() - 5 * 24 * 3_600_000) }
+  assert.deepEqual(await queue.queueStorefrontConfirmationIfEligible('so-1', { releasedAt: new Date(Date.now() - 2 * 3_600_000) }), { queued: false, reason: 'before_switch_on' })
+  // A still-held order is not confirmed by a release hook either.
+  reset(); ON()
+  state.order = { ...BASE_ORDER, status: 'ON_HOLD' }
+  assert.deepEqual(await queue.queueStorefrontConfirmationIfEligible('so-1', { releasedAt: new Date() }), { queued: false, reason: 'wrong_status' })
+})
+
+test('RELEASE wiring: the status transition queues the confirmation for a move out of PENDING_PAYMENT / ON_HOLD into a despatch-pending status, with the store\'s paid time as the release (source pin)', async () => {
+  const { readFileSync } = await import('node:fs')
+  const sales = readFileSync('app/actions/sales.ts', 'utf8')
+  assert.match(sales, /previousStatusForLog === 'PENDING_PAYMENT' \|\| previousStatusForLog === 'ON_HOLD'/)
+  assert.match(sales, /queueStorefrontConfirmationIfEligible\(id, \{ releasedAt \}\)/)
+  const sync = readFileSync('lib/connectors/woocommerce/sync/order-status.ts', 'utf8')
+  assert.match(sync, /releasedAt/)
+})
+
+test('INTERLOCK: turning the storefront switch on is refused before step W, with step W in the future, or while a native e-mail is on or unreadable; allowed only with step W live and both native e-mails off (MUTATION: drop any arm => red)', async () => {
+  const { storefrontEmailSwitchOnRefusal } = await import('../lib/domain/storefront-customer-email/switch-on-interlock')
+  const now = new Date('2026-12-20T12:00:00Z')
+  const live = { WC_WRITES_LIVE_FROM: '2026-12-08T00:00:00Z' }
+  const store = (processing: boolean, completed: boolean) => async () => ({ ok: true as const, enabled: { customer_processing_order: processing, customer_completed_order: completed } })
+  let reads = 0
+  const counting = (inner: ReturnType<typeof store>) => async () => { reads += 1; return inner() }
+  assert.match(String(await storefrontEmailSwitchOnRefusal({ env: {}, now, readNativeEmail: counting(store(false, false)) })), /not set/)
+  assert.match(String(await storefrontEmailSwitchOnRefusal({ env: { WC_WRITES_LIVE_FROM: 'tomorrow' }, now, readNativeEmail: counting(store(false, false)) })), /not readable/)
+  assert.match(String(await storefrontEmailSwitchOnRefusal({ env: { WC_WRITES_LIVE_FROM: '2027-01-01T00:00:00Z' }, now, readNativeEmail: counting(store(false, false)) })), /not live yet/)
+  assert.equal(reads, 0, 'the store is not asked before step W is live')
+  assert.match(String(await storefrontEmailSwitchOnRefusal({ env: live, now, readNativeEmail: store(true, false) })), /customer_processing_order/)
+  assert.match(String(await storefrontEmailSwitchOnRefusal({ env: live, now, readNativeEmail: store(false, true) })), /customer_completed_order/)
+  assert.match(String(await storefrontEmailSwitchOnRefusal({ env: live, now, readNativeEmail: async () => ({ ok: false as const }) })), /could not be read/)
+  assert.match(String(await storefrontEmailSwitchOnRefusal({ env: live, now, readNativeEmail: async () => { throw new Error('network') } })), /could not be read/)
+  assert.equal(await storefrontEmailSwitchOnRefusal({ env: live, now, readNativeEmail: store(false, false) }), null)
 })

@@ -24,7 +24,12 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { isUndeliveredEmailCollision } from '@/lib/email-outbox'
-import { STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY } from '@/lib/domain/storefront-customer-email/constants'
+import {
+  STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY,
+  STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY,
+  STOREFRONT_DISPATCHED_MAX_AGE_MS,
+  parseStorefrontEmailEnabledAt,
+} from '@/lib/domain/storefront-customer-email/constants'
 
 export const DISPATCH_EMAIL_SETTING_KEY = 'dispatch_email_enabled'
 export const DISPATCH_EMAIL_KIND = 'SHIPMENT_DISPATCHED'
@@ -33,13 +38,17 @@ export type DispatchEmailEligibilityInput = {
   settingValue: string | null
   /** `storefront_customer_email_enabled`: the switch for a storefront-linked order. Absent reads as off. */
   storefrontSettingValue?: string | null
-  order: { status: string; customerEmail: string | null; shoppingLinkCount: number } | null
+  /** `storefront_customer_email_enabled_at`: when the storefront switch was turned on. Null/absent = unknown: a storefront order is not e-mailed. */
+  storefrontEnabledAt?: Date | null
+  now?: Date
+  /** `shippedAt`: when the order was despatched; read for a storefront order only (the history guards). */
+  order: { status: string; customerEmail: string | null; shoppingLinkCount: number; shippedAt?: Date | null } | null
   alreadyQueued: boolean
 }
 
 export type DispatchEmailEligibility =
   | { eligible: true }
-  | { eligible: false; reason: 'disabled' | 'order_not_found' | 'order_not_shipped' | 'storefront_order' | 'no_customer_email' | 'already_queued' }
+  | { eligible: false; reason: 'disabled' | 'order_not_found' | 'order_not_shipped' | 'storefront_order' | 'storefront_before_switch_on' | 'storefront_too_old' | 'no_customer_email' | 'already_queued' }
 
 /**
  * Pure decision: should a dispatch email be queued for this order?
@@ -57,6 +66,14 @@ export function evaluateDispatchEmailEligibility(input: DispatchEmailEligibility
   if (!input.order) return { eligible: false, reason: 'order_not_found' }
   if (input.order.status !== 'SHIPPED') return { eligible: false, reason: 'order_not_shipped' }
   if (!input.order.customerEmail) return { eligible: false, reason: 'no_customer_email' }
+  if (storefront) {
+    // HISTORY IS NOT RE-ANNOUNCED for a storefront order: WooCommerce's "completed" e-mail went out for anything despatched before IMS took over, and a SHIPPED
+    // order is re-run by any later status call. The despatch must be AFTER the switch-on instant and recent.
+    const shippedAt = input.order.shippedAt ?? null
+    const enabledAt = input.storefrontEnabledAt ?? null
+    if (shippedAt === null || enabledAt === null || shippedAt.getTime() < enabledAt.getTime()) return { eligible: false, reason: 'storefront_before_switch_on' }
+    if ((input.now ?? new Date()).getTime() - shippedAt.getTime() > STOREFRONT_DISPATCHED_MAX_AGE_MS) return { eligible: false, reason: 'storefront_too_old' }
+  }
   if (input.alreadyQueued) return { eligible: false, reason: 'already_queued' }
   return { eligible: true }
 }
@@ -72,9 +89,10 @@ export function evaluateDispatchEmailEligibility(input: DispatchEmailEligibility
  */
 export async function queueDispatchEmailIfEligible(orderId: string): Promise<{ queued: boolean; reason?: string }> {
   try {
-    const settings = await db.setting.findMany({ where: { key: { in: [DISPATCH_EMAIL_SETTING_KEY, STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY] } }, select: { key: true, value: true } })
+    const settings = await db.setting.findMany({ where: { key: { in: [DISPATCH_EMAIL_SETTING_KEY, STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY, STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY] } }, select: { key: true, value: true } })
     const settingValue = settings.find((row) => row.key === DISPATCH_EMAIL_SETTING_KEY)?.value ?? null
     const storefrontSettingValue = settings.find((row) => row.key === STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY)?.value ?? null
+    const storefrontEnabledAt = parseStorefrontEmailEnabledAt(settings.find((row) => row.key === STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY)?.value)
     if (settingValue !== 'true' && storefrontSettingValue !== 'true') return { queued: false, reason: 'disabled' }
 
     const outcome = await db.$transaction(async (tx) => {
@@ -88,6 +106,7 @@ export async function queueDispatchEmailIfEligible(orderId: string): Promise<{ q
           customerEmail: true,
           orderNumber: true,
           externalOrderNumber: true,
+          shippedAt: true,
           _count: { select: { shoppingLinks: true } },
         },
       })
@@ -101,8 +120,10 @@ export async function queueDispatchEmailIfEligible(orderId: string): Promise<{ q
       const eligibility = evaluateDispatchEmailEligibility({
         settingValue,
         storefrontSettingValue,
+        storefrontEnabledAt,
+        now: new Date(),
         order: order
-          ? { status: order.status, customerEmail: order.customerEmail, shoppingLinkCount: order._count.shoppingLinks }
+          ? { status: order.status, customerEmail: order.customerEmail, shoppingLinkCount: order._count.shoppingLinks, shippedAt: order.shippedAt }
           : null,
         alreadyQueued: existing !== null,
       })

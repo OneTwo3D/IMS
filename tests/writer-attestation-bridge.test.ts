@@ -82,7 +82,7 @@ test('the command: without --yes it summarises and records nothing; with --yes i
   })
   assert.equal(await run(['--kind', 'bridge-units-masked', '--by', 'jan', '--output-file', '-']), 0)
   assert.equal(rows.length, 0)
-  assert.match(out.join('\n'), /all three units masked and inactive/)
+  assert.match(out.join('\n'), /all three units persistently masked and inactive/)
   assert.equal(await run(['--kind', 'bridge-units-masked', '--by', 'jan', '--output-file', '-', '--yes']), 0)
   assert.equal(rows.length, 1)
   assert.equal(rows[0]!.userId, 'cli:jan')

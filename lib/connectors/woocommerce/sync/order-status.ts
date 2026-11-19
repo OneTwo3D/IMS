@@ -2,6 +2,7 @@
  * Bidirectional order status sync between WooCommerce and IMS.
  */
 
+import { parseWcGmtInstant } from './receipt-settlement-rate'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_STATUS_TRANSITION_BYPASS } from '@/lib/sales/status-transition-bypass'
@@ -162,6 +163,8 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{
     }
 
     // Standard status update
+    const paidInstant = wcOrder.date_paid_gmt ? parseWcGmtInstant(wcOrder.date_paid_gmt) : null
+    const releasedAt = paidInstant && Number.isFinite(paidInstant.getTime()) ? paidInstant : null
     const { applySalesOrderStatusTransition } = await import('@/app/actions/sales')
     const result = await applySalesOrderStatusTransition(so.id, targetStatus as never, undefined, {
       pushStatusToWooCommerce: false,
@@ -169,6 +172,8 @@ export async function syncWcOrderStatus(wcOrder: WcFullOrder): Promise<{
       // The refusal above read the status BEFORE this write, and the write skips the state machine: a dispatch that
       // committed in between would be overwritten. Asked again against the current status under the order lock.
       guardUnderLock: (current) => wcStatusSyncRefusal(current, targetStatus),
+      // When the store moved the order to a paid status (WooCommerce stamps its paid time on that move): the confirmation of an order imported held is judged on it.
+      ...(releasedAt ? { releasedAt } : {}),
     })
 
     if (!result.success && result.permanent && String(result.error ?? '').startsWith(STATUS_GUARD_REFUSAL_PREFIX)) {

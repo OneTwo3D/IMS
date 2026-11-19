@@ -35,6 +35,8 @@ export type SettingsCliOptions = {
   stdout?: Pick<Logger, 'log'>
   stderr?: Pick<Logger, 'error'>
   disconnect?: () => Promise<void>
+  /** Test seam for the storefront e-mail turn-on interlock (environment, clock, the store's native e-mail read). Absent = the live ones. */
+  interlock?: import('@/lib/domain/storefront-customer-email/switch-on-interlock').InterlockDeps
 }
 
 export async function runSettingsCli(options: SettingsCliOptions): Promise<number> {
@@ -95,6 +97,12 @@ export async function runSettingsCli(options: SettingsCliOptions): Promise<numbe
 
     const refusal = await crossKeyRefusal(db, def, proposed)
     if (refusal) { stderr.error(refusal); return 3 }
+    if (def.turnOnInterlock === 'storefront-customer-email' && proposed === 'true' && current.stored !== 'true') {
+      // Turning customer e-mail for storefront orders ON: refused unless step W is live and WooCommerce's native e-mails are off (the same rule as the screen).
+      const { storefrontEmailSwitchOnRefusal } = await import('@/lib/domain/storefront-customer-email/switch-on-interlock')
+      const interlock = await storefrontEmailSwitchOnRefusal(options.interlock)
+      if (interlock) { stderr.error(interlock); return 3 }
+    }
     if (def.adminOnly && yes && !confirmAdmin) { stderr.error(adminRefusal(def)); return 3 }
     if (!yes) {
       if (def.adminOnly) stdout.log(`${def.key} is an ADMIN switch in the screen; writing it needs --yes --confirm-admin (ADMIN authority is assumed from shell access).`)

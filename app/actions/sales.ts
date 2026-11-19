@@ -2364,7 +2364,9 @@ export async function applySalesOrderStatusTransition(
   // be serialized, so the capability tokens are not forgeable. (o3d-43oz)
   // `guardUnderLock` (a function, so it cannot cross the RPC boundary either) can only REFUSE a move: it is asked the
   // CURRENT status under the order lock and a non-null answer fails the transition (see updateSalesOrderStatusUnderLock).
-  options?: { pushStatusToWooCommerce?: boolean; internalBypassToken?: symbol; guardUnderLock?: (currentStatus: string) => string | null },
+  // `releasedAt` (honoured only with the full bypass token, like every system-only option here): when the storefront moved the order to processing (its paid time), so
+  // the confirmation of an order that was imported held is judged on the release and never on a later observation of it.
+  options?: { pushStatusToWooCommerce?: boolean; internalBypassToken?: symbol; guardUnderLock?: (currentStatus: string) => string | null; releasedAt?: Date },
   // `permanent: true` marks a failure a stable business rule refused, so a caller driving this from a
   // retrying transport (the Woo webhook inbox) can acknowledge it instead of retrying forever (o3d-bx9).
 ): Promise<{ success: boolean; error?: string; permanent?: boolean }> {
@@ -2730,6 +2732,17 @@ export async function applySalesOrderStatusTransition(
       // dedup under the order row lock) and never throws.
       const { queueDispatchEmailIfEligible } = await import('@/lib/dispatch-email')
       await queueDispatchEmailIfEligible(id)
+    }
+    // A storefront order that was imported HELD (PENDING_PAYMENT / ON_HOLD) and now moves to processing (a BACS / cheque payment received): WooCommerce sent its
+    // confirmation on that move before step W and is off after it, so nobody would send one. Same kind and dedupe as the import's confirmation, so once only; the
+    // helper self-guards (switch, switch-on instant, age from the release, storefront order) and never throws.
+    if (
+      (previousStatusForLog === 'PENDING_PAYMENT' || previousStatusForLog === 'ON_HOLD')
+      && (targetStatus === 'PROCESSING' || targetStatus === 'ALLOCATED' || targetStatus === 'PICKING' || targetStatus === 'PACKING')
+    ) {
+      const { queueStorefrontConfirmationIfEligible } = await import('@/lib/storefront-customer-email')
+      const releasedAt = bypassPermission && options?.releasedAt instanceof Date && Number.isFinite(options.releasedAt.getTime()) ? options.releasedAt : new Date()
+      await queueStorefrontConfirmationIfEligible(id, { releasedAt })
     }
     // Storefront orders (o3d-zvec.24, switch `storefront_customer_email_enabled`, default off): the delivered e-mail, once per order. Self-guarded
     // (status DELIVERED, a recent despatch, dedup under the order row lock) and never throws.

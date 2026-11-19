@@ -3,9 +3,10 @@ import {
   STEP_EVIDENCE_KINDS,
   type StepEvidenceKind,
   type StepEvidenceReading,
+  NATIVE_EMAIL_VIOLATION,
 } from '@/lib/security/writers-check-constants'
 import { isWriterAttestationKind } from '@/lib/security/writer-attestation-constants'
-import { BRIDGE_ATTESTATION_KIND, bridgeUnitViolations, readBridgePayload } from '@/lib/domain/writer-attestation/bridge-status'
+import { BRIDGE_ATTESTATION_KIND, bridgeLastTriggerReadable, bridgeUnitViolations, readBridgePayload } from '@/lib/domain/writer-attestation/bridge-status'
 import { STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY } from '@/lib/domain/storefront-customer-email/constants'
 import type { WooNativeEmailState } from '@/lib/connectors/woocommerce/native-email-state'
 import { parseProducerCutoff } from '@/lib/security/producer-disposition'
@@ -58,7 +59,7 @@ export type StepEvidenceReader = (ctx: StepEvidenceContext & { probeOnce: () => 
 const notBuilt: StepEvidenceReader = async () => ({ state: 'not-built' })
 
 /** The live-from instant of a step as the check reads it: a Date, `unset`, or `unreadable`. */
-function stepLiveFrom(env: Record<string, string | undefined>, step: LiveWriterStep): Date | 'unset' | 'unreadable' {
+export function stepLiveFrom(env: Record<string, string | undefined>, step: LiveWriterStep): Date | 'unset' | 'unreadable' {
   const name = PRODUCER_STEP_ENV[step]
   const read = parseProducerCutoff(Object.prototype.hasOwnProperty.call(env, name) ? env[name] : undefined)
   if (read.ok) return read.at
@@ -129,7 +130,7 @@ function attestationReader(kind: string): StepEvidenceReader {
 
 /**
  * BRIDGE_ATTESTATION: the newest `bridge-units-masked` attestation, which carries the host report. Present with the report's own facts: the unit
- * violations (anything not masked or not inactive) and the latest trigger time, which the evaluator judges against the step's live-from instant. A row whose
+ * violations (anything not masked, not persistently masked or not inactive), the generation time of the report and the latest trigger time, which the evaluator judges against the step's live-from instant. A row whose
  * payload is not the shape this version wrote is `unreadable`, never clean. Absent until one is recorded; not due before step M (P1 passes with none).
  */
 const bridgeAttestationReader: StepEvidenceReader = async ({ db }) => {
@@ -137,29 +138,39 @@ const bridgeAttestationReader: StepEvidenceReader = async ({ db }) => {
   if (!row) return { state: 'absent' }
   const report = readBridgePayload(row.payload)
   if (report === null) return { state: 'unreadable' }
-  return { state: 'present', at: row.attestedAt.toISOString(), violations: bridgeUnitViolations(report), lastTriggerAt: report.lastTriggerAt }
+  // `last_trigger: unknown`, or `never` without proof that the journal was read, is NOT "the bridge never ran": systemd's timestamps are in memory and a reboot
+  // wipes them. It is unreadable (fails closed), never a pass.
+  if (!bridgeLastTriggerReadable(report)) return { state: 'unreadable' }
+  return { state: 'present', at: row.attestedAt.toISOString(), violations: bridgeUnitViolations(report), lastTriggerAt: report.lastTriggerAt, generatedAt: report.generatedAt }
 }
 
 /**
- * NATIVE_EMAIL_EXCLUSIVE: WooCommerce native customer e-mail and the IMS storefront e-mail switch are mutually exclusive.
- * Before step W (no WooCommerce live-from) nothing is read from the store at all: the answer is `absent`, which no phase below W requires.
- * From step W: the IMS switch is read from the settings, the store's two native e-mails from the store. A store that does not answer, or answers
- * something else than yes/no, is `unreadable` and fails closed. Both on = duplicate e-mails; both off = nobody sends: each is a violation.
+ * NATIVE_EMAIL_EXCLUSIVE: WooCommerce native customer e-mail and the IMS storefront e-mail switch are mutually exclusive, JUDGED PER E-MAIL: every e-mail kind
+ * IMS replaces needs EXACTLY ONE sender. The IMS switch covers both the confirmation (WooCommerce's customer_processing_order) and the dispatched e-mail
+ * (customer_completed_order), so with the switch ON each native one must be OFF (else a duplicate), and with it OFF each must be ON (else nobody sends that
+ * kind: a mixed state, such as processing off with completed on, is a violation, not a pass).
+ * BEFORE STEP W (no live WooCommerce live-from: unset, unreadable or in the future) nothing is read from the store, but the IMS switch being ON is itself a
+ * violation: it would start IMS e-mail to live customers beside WooCommerce's, and no phase before W requires this evidence, so it is reported in every phase.
+ * From step W: the IMS switch is read from the settings, the store's two native e-mails from the store. A store that does not answer, or answers something
+ * else than yes/no, is `unreadable` and fails closed.
  */
-export const NATIVE_EMAIL_VIOLATION = { bothOn: 'native-and-ims-customer-email-both-on', bothOff: 'native-and-ims-customer-email-both-off' } as const
+export { NATIVE_EMAIL_VIOLATION }
 
-const nativeEmailExclusiveReader: StepEvidenceReader = async ({ db, env, readNativeEmail }) => {
-  const live = env?.WC_WRITES_LIVE_FROM
-  if (live === undefined || live.trim() === '') return { state: 'absent' }
+const nativeEmailExclusiveReader: StepEvidenceReader = async ({ db, env, now, readNativeEmail }) => {
   const setting = await db.setting.findUnique({ where: { key: STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY }, select: { value: true } })
   const imsOn = setting?.value === 'true'
+  const liveFrom = stepLiveFrom(env ?? process.env, 'woocommerce')
+  if (liveFrom === 'unset' || liveFrom === 'unreadable' || liveFrom.getTime() > now.getTime()) {
+    return imsOn ? { state: 'probed', violations: [NATIVE_EMAIL_VIOLATION.imsOnBeforeStepW] } : { state: 'absent' }
+  }
   const read = readNativeEmail ?? (async () => (await import('@/lib/connectors/woocommerce/native-email-state')).readWooNativeCustomerEmailState())
   const native = await read()
   if (!native.ok) return { state: 'unreadable' }
-  const nativeOn = Object.values(native.enabled).some((on) => on)
   const violations: string[] = []
-  if (imsOn && nativeOn) violations.push(NATIVE_EMAIL_VIOLATION.bothOn)
-  if (!imsOn && !nativeOn) violations.push(NATIVE_EMAIL_VIOLATION.bothOff)
+  for (const [id, on] of Object.entries(native.enabled)) {
+    if (imsOn && on) violations.push(`${NATIVE_EMAIL_VIOLATION.bothOn}:${id}`)
+    if (!imsOn && !on) violations.push(`${NATIVE_EMAIL_VIOLATION.bothOff}:${id}`)
+  }
   return { state: 'probed', violations }
 }
 

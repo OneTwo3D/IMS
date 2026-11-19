@@ -9,6 +9,7 @@ import {
   EVIDENCE_CONTESTS,
   EVIDENCE_KIND_STEP,
   PHASE_OF_LIVE_STEP,
+  NATIVE_EMAIL_VIOLATION,
   STEP_ATTESTATION_BEFORE_STEP,
   STEP_REPORT_TRIGGER_BEFORE_STEP,
   STEP_EVIDENCE_ATTESTATION_KIND,
@@ -511,6 +512,11 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
       findings.push({ code: 'evidence-not-probed', severity: 'fail', subject: kind, message: `${STEP_EVIDENCE_LABEL[kind]} was not probed: the probe did not answer, so the check cannot show the incumbent has stopped.` })
       continue
     }
+    // The IMS customer e-mail switch ON before step W is a violation in EVERY phase (it would e-mail live customers beside WooCommerce), not only where the kind is required.
+    if (kind === 'NATIVE_EMAIL_EXCLUSIVE' && reading.state === 'probed' && reading.violations.includes(NATIVE_EMAIL_VIOLATION.imsOnBeforeStepW)) {
+      findings.push({ code: 'step-evidence-violation', severity: 'fail', subject: kind, message: `The IMS customer e-mail switch for storefront orders is ON, but step W is not live: WooCommerce still sends these e-mails, so every customer would get two. Turn the switch off (it is refused in the screen and in settings:set before step W; this means it was set another way).` })
+      continue
+    }
     if (!required) continue
     switch (reading.state) {
       case 'not-built':
@@ -540,9 +546,18 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
         const triggerStep = STEP_REPORT_TRIGGER_BEFORE_STEP[kind]
         if (triggerStep !== undefined) {
           const triggerRead = stepReads.find((entry) => entry.step === triggerStep)
-          if (reading.lastTriggerAt === undefined || reading.violations === undefined) {
+          const generatedMs = reading.generatedAt === undefined ? Number.NaN : Date.parse(reading.generatedAt)
+          if (reading.lastTriggerAt === undefined || reading.violations === undefined || reading.generatedAt === undefined) {
             // A host report that does not say what it showed is not a pass.
-            unreadable(kind, `${STEP_EVIDENCE_LABEL[kind]} carries no report facts (units, last trigger), so nothing can be shown from it.`)
+            unreadable(kind, `${STEP_EVIDENCE_LABEL[kind]} carries no report facts (units, last trigger, generation time), so nothing can be shown from it.`)
+          } else if (!Number.isFinite(generatedMs)) {
+            unreadable(kind, `${STEP_EVIDENCE_LABEL[kind]} carries a generation time that cannot be read.`)
+          } else if (!triggerRead?.read.ok) {
+            // The instant it is judged against cannot be read: no verdict on the report, so no pass (the live-from itself is reported separately).
+            unreadable(kind, `${STEP_EVIDENCE_LABEL[kind]} cannot be judged: the live-from instant of ${triggerStep} is not readable, so the report cannot be compared with it.`)
+          } else if (generatedMs < triggerRead.read.ms || attestedMs < triggerRead.read.ms) {
+            // A report taken (or recorded) before S describes the host before S: it says nothing about the bridge running up to and past S.
+            findings.push({ code: 'attestation-missing', severity: 'fail', subject: kind, message: `${STEP_EVIDENCE_LABEL[kind]} was ${generatedMs < triggerRead.read.ms ? 'generated' : 'recorded'} before ${triggerRead.name}: it does not describe the host after IMS went live. Run the script again after ${triggerRead.name} and record the new output.` })
           } else if (reading.lastTriggerAt !== null) {
             const triggerMs = Date.parse(reading.lastTriggerAt)
             if (!triggerRead?.read.ok) {
