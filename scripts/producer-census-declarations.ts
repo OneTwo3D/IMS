@@ -485,6 +485,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Queues INVENTORY_ADJUSTMENT for a stock adjustment.'),
   d('lib/domain/sales/return-restock-cost.ts::queueReturnRestockValueJournal::queueAccountingSyncTxWithOutcome#1', 'xero', 'inventory.journals', 'queue-producer', 'required',
     'Queues INVENTORY_ADJUSTMENT for the inventory value a returns-inbox restock adds (Dr Inventory / Cr COGS).'),
+  d('lib/domain/sales/return-restock-cost.ts::queueAdoptionReclassJournal::queueAccountingSyncTxWithOutcome#1', 'xero', 'inventory.journals', 'queue-producer', 'required',
+    'Queues INVENTORY_ADJUSTMENT for the COGS reversal and stock-gain reclass of a refund that adopts an already restocked returns-inbox arrival.'),
   d('lib/domain/purchasing/landed-cost-journal-outbox.ts::scheduleLandedCostJournalOutbox::enqueueIntegrationOutbox#1', 'internal', 'landed-cost-adjustment-journal', 'queue-producer', 'not-applicable',
     'Internal backstop whose effect is a sync-log row, which meets the Xero seam.'),
   d('lib/domain/purchasing/landed-cost-service.ts::queueLandedCostAdjustmentJournals::queueAccountingSyncTx#1', 'xero', 'inventory.journals', 'queue-producer', 'required',
