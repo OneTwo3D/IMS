@@ -57,6 +57,8 @@ type SendEmailResult = {
 
 /** Reason on a send that hit its deadline: the message may or may not have been accepted, so it is never retried automatically. */
 export const SEND_DEADLINE_UNKNOWN_OUTCOME = 'Outcome unknown: the mail server did not answer before the send deadline, so the message may or may not have been delivered. Check before re-sending.'
+/** The unknown outcome of a transport failure AFTER the message was handed over (the DATA reply was seen): the server's final answer was lost. */
+export const SEND_FINAL_REPLY_UNKNOWN_OUTCOME = 'Outcome unknown: the connection failed after the message was handed to the mail server and before its final answer arrived, so the message may or may not have been delivered. Check before re-sending.'
 
 const emailSchema = z.email()
 const RESERVED_EXAMPLE_DOMAIN_PATTERN = /\bexample\.(com|org|net)\b/i
@@ -127,8 +129,8 @@ async function getSmtpSettings(): Promise<SmtpSettingsInput> {
   }
 }
 
-function classifySendFailure(e: unknown, unknownOutcome: boolean): SendEmailResult {
-  if (unknownOutcome) return { success: false, permanent: true, unknownOutcome: true, error: SEND_DEADLINE_UNKNOWN_OUTCOME }
+function classifySendFailure(e: unknown, unknownOutcome: false | 'deadline' | 'lost-reply'): SendEmailResult {
+  if (unknownOutcome) return { success: false, permanent: true, unknownOutcome: true, error: unknownOutcome === 'deadline' ? SEND_DEADLINE_UNKNOWN_OUTCOME : SEND_FINAL_REPLY_UNKNOWN_OUTCOME }
   const error = e as { code?: string; responseCode?: number }
   const message = normalizeMailError(String(e))
   const responseCode = typeof error.responseCode === 'number' ? error.responseCode : null
@@ -226,7 +228,7 @@ export async function sendEmailWithSmtpSettings(
       if (outcome === 'deadline') {
         sending.catch(() => undefined)
         transport.close()
-        return classifySendFailure(null, true)
+        return classifySendFailure(null, 'deadline')
       }
     } else {
       await sending
@@ -234,7 +236,11 @@ export async function sendEmailWithSmtpSettings(
 
     return { success: true }
   } catch (e) {
-    return classifySendFailure(e, unknownOutcomeProbe?.(e) ?? false)
+    if (unknownOutcomeProbe?.(e)) {
+      // A transport timeout after DATA is the deadline in another form; any other failure after DATA is a lost final reply.
+      return classifySendFailure(e, (e as { code?: string } | null)?.code === 'ETIMEDOUT' ? 'deadline' : 'lost-reply')
+    }
+    return classifySendFailure(e, false)
   }
 }
 

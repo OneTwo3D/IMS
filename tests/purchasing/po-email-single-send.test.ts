@@ -62,6 +62,11 @@ test('mailer: a disconnect after DATA is written but before the 354 reply is ret
   const late = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 60_000, singleSend: true })
   assert.equal(late.permanent, true)
   assert.equal(late.unknownOutcome, true)
+  // The wording says what happened: the connection failed after the hand-over, NOT that a deadline passed (customer kinds also carry a deadline now, but this is a lost reply).
+  const { SEND_FINAL_REPLY_UNKNOWN_OUTCOME, SEND_DEADLINE_UNKNOWN_OUTCOME } = await import('../../lib/mailer.ts')
+  assert.equal(late.error, SEND_FINAL_REPLY_UNKNOWN_OUTCOME)
+  assert.notEqual(late.error, SEND_DEADLINE_UNKNOWN_OUTCOME)
+  assert.match(late.error ?? '', /connection failed after the message was handed to the mail server/)
 })
 
 test('mailer: a truncated final 2xx reply followed by a disconnect is unknown; a final 451 stays retryable and a final 550 permanent', async () => {

@@ -92,7 +92,7 @@ import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
 import { raiseWmsOperatorTask, refundNoteQuery, warehouseOrderRef } from '@/lib/domain/wms/operator-tasks'
 import { SHOP_REFUND_CONNECTOR, raiseShopRefundTask } from '@/lib/domain/sales/shop-refund-tasks'
 import { returnExchangeRefusals } from '@/lib/domain/sales/return-exchange'
-import { findRestockedInboxesToAdopt, type InboxAdoption } from '@/lib/domain/sales/return-restock-cost'
+import { findRestockedInboxesToAdopt, queueAdoptionReclassJournal, type InboxAdoption } from '@/lib/domain/sales/return-restock-cost'
 
 /**
  * Deliberate call-site boundary for this number-shaped refund service contract.
@@ -4804,9 +4804,12 @@ export async function createSalesOrderRefund(
     // o3d-hqvrp.32: shipped units whose issued cost is not on record are NOT restocked (a costless unit must
     // never enter stock) and are not silently dropped either: they are listed in a WARNING on the order below.
     const parkedForUnknownCost: Array<{ productId: string; qty: number; refundLineId: string | null }> = []
+    // The rows this refund would actually return (shipped units with a known cost): also the quantity an adoption is sized from, so a unit that
+    // never shipped, or that is parked for an unknown cost, is not asked of the returns inbox.
+    let restockableRows: RefundReturnRow[] | null = null
     if (storefrontRefund && effectiveReturnWarehouseId) {
-      const restockable = await buildRefundFallbackReturnRows(tx, input.orderId, refundLines, undefined, { skipUnshipped: true, parked: parkedForUnknownCost })
-      if (restockable.length === 0) restockWarehouseId = undefined
+      restockableRows = await buildRefundFallbackReturnRows(tx, input.orderId, refundLines, undefined, { skipUnshipped: true, parked: parkedForUnknownCost })
+      if (restockableRows.length === 0) restockWarehouseId = undefined
     }
 
     // Returned units in transit: decided HERE, once, under the order lock, from the switch as it reads in this
@@ -4817,7 +4820,9 @@ export async function createSalesOrderRefund(
     // Decided under the order lock taken above; the claim on each arrival is recorded per inbox row and quantity in the refund's own transaction (below).
     let inboxAdoptions: InboxAdoption[] = []
     if (restockWarehouseId && await readReturnsInTransitEnabled(tx)) {
-      inboxAdoptions = (await findRestockedInboxesToAdopt(tx, { orderId: input.orderId, lines: refundLines })) ?? []
+      // A storefront refund is sized from the rows it would return (the same quantity the return-expectation path creates); an operator-recorded
+      // refund returns every itemised unit it names (it never skips or parks), so its own lines are that quantity.
+      inboxAdoptions = (await findRestockedInboxesToAdopt(tx, { orderId: input.orderId, lines: restockableRows ?? refundLines })) ?? []
       if (inboxAdoptions.length > 0) restockWarehouseId = undefined
     }
     const returnInTransit = Boolean(restockWarehouseId) && await readReturnsInTransitEnabled(tx)
@@ -5652,6 +5657,10 @@ export async function createSalesOrderRefund(
           metadata: { refundId: createdRefund.id, adoptions: inboxAdoptions },
         },
       })
+      // The restock already booked Dr Inventory / Cr the stock-gain reason; this refund returns no stock of its own, so it books the COGS reversal
+      // at the original cost and moves the restock's credit off the reason account (net: Dr Inventory / Cr COGS, as a normal return).
+      const adoptedRows = restockableRows ?? await buildRefundFallbackReturnRows(tx, input.orderId, createdRefundLines, createdRefund.id, { skipUnshipped: storefrontRefund })
+      await queueAdoptionReclassJournal(tx, { refundId: createdRefund.id, orderId: input.orderId, orderRef: so.orderNumber ?? input.orderId, adoptions: inboxAdoptions, rows: adoptedRows })
     }
     if (returnInTransit) {
       await createReturnExpectationTx(tx, {

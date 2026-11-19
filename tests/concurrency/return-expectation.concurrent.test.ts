@@ -403,3 +403,26 @@ test('return expectation (o3d-iil0b): partial quantities are consumed per inbox 
     await rig.pool.end()
   }
 })
+
+test('return expectation (o3d-iil0b round 1): a PARTLY SHIPPED storefront refund adopts the units it would return (the shipped one), not every refund line', adoptionTest, async () => {
+  const rig = await openRig()
+  const suffix = randomUUID().replace(/-/g, '').slice(0, 12)
+  let fx: Awaited<ReturnType<typeof seed>> | undefined
+  try {
+    fx = await seed(rig, suffix)
+    await rig.db.setting.upsert({ where: { key: SWITCH }, create: { key: SWITCH, value: 'true' }, update: { value: 'true' } })
+    // Only ONE of the two units shipped; the shipped unit came back and the warehouse restocked it.
+    await rig.db.shipmentLine.updateMany({ where: { shipment: { orderId: fx.orderId } }, data: { qty: new rig.Prisma.Decimal('1'), costLayerSnapshot: [{ costLayerId: 'retexp-issued-layer', qty: '1', unitCostBase: '40' }] } })
+    const inboxId = await addRestockedArrival(rig, fx, suffix, '1', 'partship')
+    // The storefront refunds BOTH units. Sized from every refund line (2) the arrival (1) would not cover it; sized from the units that shipped (1) it does.
+    const result = await rig.createSalesOrderRefund(rig.db, { ...refundInput(fx, suffix, 6_600_000 + Math.floor(Math.random() * 90_000)), lines: [{ lineId: fx.lineId, productId: fx.productId, description: 'rxc line', qty: 2, totalBase: 100 }] })
+    assert.equal(result.success, true, result.success ? '' : result.error)
+    const links = await rig.db.salesOrderRefundInboxAdoption.findMany({ where: { inboxId }, select: { qty: true } })
+    assert.deepEqual(links.map((l) => Number(l.qty)), [1], 'the shipped unit is adopted')
+    assert.equal(await rig.db.returnExpectation.count({ where: { orderId: fx.orderId } }), 0, 'no expectation on top of the inbox restock (no double count)')
+  } finally {
+    await cleanup(rig, fx)
+    await rig.db.$disconnect()
+    await rig.pool.end()
+  }
+})

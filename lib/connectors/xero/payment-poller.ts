@@ -1027,6 +1027,8 @@ export async function readSalesResidualVerdicts(
       // o3d-cdhl: what measuring a PART removal needs. The same query, not a second read, so the figure is taken from
       // the rows the verdict was.
       totalForeign: true, currency: true, paymentRemovedForeign: true,
+      // DELIBERATE EXCEPTION to the soft-delete filter (o3d-ngmt.22): a deleted refund still counts as a refund here, so a payment removal on such an order stays
+      // UNMEASURABLE (held for a person) rather than being measured as if no credit note had ever been raised against it. The conservative direction.
       _count: { select: { refunds: true } },
     },
   })

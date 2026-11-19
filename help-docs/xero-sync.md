@@ -3043,6 +3043,7 @@ Three things about those rows:
 | `sales_invoice_import` (SALES_INVOICE / SalesOrder) | The invoice is queued once, when the WooCommerce order is imported, and nothing queues it again. |
 | `stock_adjustment_journal` (INVENTORY_ADJUSTMENT / StockMovement) | The journal is queued once, with the stock movement; nothing queues it again for that movement. |
 | `returns_inbox_restock_journal` (INVENTORY_ADJUSTMENT / WmsReturnsInbox) | The journal is queued once, with the restock; the returns-inbox item is then closed, so restocking again is not possible. |
+| `refund_adoption_reclass_journal` (INVENTORY_ADJUSTMENT / SalesOrderRefund) | The reclass is queued once, with the refund that adopted the returned arrival; nothing queues it again, and the refund cannot be recorded a second time. |
 | `purchase_order_cancellation_reversal` (INVENTORY_ADJUSTMENT / PurchaseOrder) | Retired. Cancelling a part-received purchase order now closes it short and queues no reversal, so nothing raises this posting any more; the kind stays so a row already in the inbox can still be marked handled. |
 | `supplier_return_reversal` (INVENTORY_ADJUSTMENT / PurchaseReturn) | The reversal is queued once, with the return; raising the return again would be a second return. |
 | `stock_receipt_journal` (STOCK_RECEIPT / PurchaseOrder) | The journal is queued once, with the receipt; receiving again is a different receipt. |

@@ -102,6 +102,10 @@ export const POSTING_REFUSAL_KINDS = {
     type: 'INVENTORY_ADJUSTMENT', referenceType: 'WmsReturnsInbox', clearing: 'manual',
     how: 'The journal is queued once, with the restock; the returns-inbox item is then closed, so restocking again is not possible.',
   },
+  refund_adoption_reclass_journal: {
+    type: 'INVENTORY_ADJUSTMENT', referenceType: 'SalesOrderRefund', clearing: 'manual',
+    how: 'The reclass is queued once, with the refund that adopted the returned arrival; nothing queues it again, and the refund cannot be recorded a second time.',
+  },
   purchase_order_cancellation_reversal: {
     type: 'INVENTORY_ADJUSTMENT', referenceType: 'PurchaseOrder', clearing: 'manual',
     how: 'Retired. Cancelling a part-received purchase order now closes it short and queues no reversal, so nothing raises this posting any more; the kind stays so a row already in the inbox can still be marked handled.',

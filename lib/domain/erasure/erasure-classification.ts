@@ -101,9 +101,10 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   // amounts and a JSON of the reversed movements (ids and quantities); the one free-text column is the operator's delete reason, retained like the refund's own reason.
   SalesOrderRefundDeletion: {
     erased: [],
-    notPersonal: ['refundId', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'deletedById', 'voidSyncLogId', 'reversal'],
+    notPersonal: ['refundId', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'deletedById', 'voidSyncLogId'],
     retained: {
       reason: 'owner decision (as for the refund reason): the reason an operator gave for deleting a refund is part of the audit record',
+      reversal: 'the deleted refund\'s lines are copied whole into it (ids, amounts, cost snapshots and each line\'s description text, retained like the line itself); the rest is ids and quantities of reversed movements',
     },
   },
   // o3d-iil0b: which returns-inbox arrival (and how many of its units) a refund adopted. Ids and a quantity only.

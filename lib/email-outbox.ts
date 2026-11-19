@@ -153,6 +153,23 @@ const EMAIL_CLAIM_STALE_MS = 15 * 60 * 1000
  * per-install value would make that claim unknowable from the code.
  */
 export const EMAIL_MAX_STALE_RECLAIMS = 1
+/**
+ * Owner decision 2026-11-18, "never send a customer email twice": the kinds whose stale PROCESSING row MAY still be reclaimed once. Only the
+ * purchase order, which carries its own delivery-boundary guard and a 60 s send deadline. EVERY OTHER KIND (every customer email) has a reclaim
+ * cap of ZERO: a worker that died or was restarted after the DATA command was accepted but before it settled the row leaves it PROCESSING, and a
+ * reclaim would send again. A stale row of such a kind is PARKED (PARKED_SEND_CAP) instead, for an operator to check the mail log and release or
+ * cancel it. Parking is the "outcome unknown" state: the row is not re-sent and is not silently dropped.
+ */
+const RECLAIMABLE_EMAIL_KINDS: ReadonlySet<string> = new Set(['PURCHASE_ORDER'])
+export function staleReclaimCapForKind(kind: string): number {
+  return RECLAIMABLE_EMAIL_KINDS.has(kind) ? EMAIL_MAX_STALE_RECLAIMS : 0
+}
+/**
+ * The send deadline every kind without its own gets, so a send can never outlast the stale window: at the deadline the transport is closed and the
+ * answer is the terminal "outcome unknown" failure. It must stay well under EMAIL_CLAIM_STALE_MS (asserted in tests), or a second worker could
+ * find the row stale while the first is still sending.
+ */
+export const EMAIL_DEFAULT_SEND_DEADLINE_MS = 5 * 60 * 1000
 /** The status a row at the reclaim cap is moved to. The sweep never selects it. */
 export const EMAIL_OUTBOX_PARKED_STATUS = 'PARKED_SEND_CAP'
 const EMAIL_BACKOFF_BASE_MS = 60_000
@@ -1934,8 +1951,9 @@ function refuseSweptRowsFromOutsideTheStore(swept: EmailOutboxRow[], rows: () =>
 async function claimEmailRow(
   client: EmailOutboxClient,
   id: string,
-  claim: { claimedAt: Date; staleCutoff: Date; token: string },
+  claim: { claimedAt: Date; staleCutoff: Date; token: string; kind: string },
 ): Promise<'claimed' | 'parked' | 'none'> {
+  const reclaimCap = staleReclaimCapForKind(claim.kind)
   const first = await client.emailOutbox.updateMany({
     where: {
       id,
@@ -1957,7 +1975,7 @@ async function claimEmailRow(
       attempts: { lt: EMAIL_MAX_ATTEMPTS },
       status: 'PROCESSING',
       processingStartedAt: { lt: claim.staleCutoff },
-      staleReclaimCount: { lt: EMAIL_MAX_STALE_RECLAIMS },
+      staleReclaimCount: { lt: reclaimCap },
     },
     data: {
       status: 'PROCESSING',
@@ -1973,14 +1991,17 @@ async function claimEmailRow(
       id,
       status: 'PROCESSING',
       processingStartedAt: { lt: claim.staleCutoff },
-      staleReclaimCount: { gte: EMAIL_MAX_STALE_RECLAIMS },
+      staleReclaimCount: { gte: reclaimCap },
     },
     data: {
       status: EMAIL_OUTBOX_PARKED_STATUS,
       processingStartedAt: null,
       lockedBy: null,
-      lastError: `Parked at the send cap: already reclaimed ${EMAIL_MAX_STALE_RECLAIMS} time(s), and the holder `
-        + 'went stale again. Not retried automatically; an operator must release or cancel it (o3d-hpeg).',
+      lastError: reclaimCap === 0
+        ? 'Outcome unknown: the worker that claimed this email stopped (a crash, restart or stall) before recording the result, so the message may or may not have '
+          + 'reached the recipient. It was not re-sent, to avoid a duplicate. Check the mail server log, then release or cancel it (o3d-hpeg).'
+        : `Parked at the send cap: already reclaimed ${reclaimCap} time(s), and the holder `
+          + 'went stale again. Not retried automatically; an operator must release or cancel it (o3d-hpeg).',
     },
   })
   return parked.count > 0 ? 'parked' : 'none'
@@ -2456,17 +2477,18 @@ export async function processPendingEmailOutbox(
     let unknownOutcomeReason: string | null = null
     const claimedAt = now()
     const token = randomUUID()
-    const verdict = await claimEmailRow(client, email.id, { claimedAt, staleCutoff, token })
+    const verdict = await claimEmailRow(client, email.id, { claimedAt, staleCutoff, token, kind: email.kind })
     if (verdict === 'parked') {
       // o3d-hpeg: this row had already been reclaimed EMAIL_MAX_STALE_RECLAIMS times and its latest
       // holder has gone stale too. It is NOT reclaimed a further time; it is parked, and the drain
       // never selects it again. Said loudly, because nothing will move it on but an operator.
       result.parked++
       const reference = email.referenceType && email.referenceId ? ` for ${email.referenceType} ${email.referenceId}` : ''
-      const message = `Email outbox row ${email.id} (${email.kind}${reference}, to ${email.toEmail}) was PARKED at the `
-        + `send cap: it had already been reclaimed ${EMAIL_MAX_STALE_RECLAIMS} time(s) and its holder has gone stale `
-        + 'again, so the sender has been entered at least twice for it and a copy may already have reached the '
-        + 'customer. It will not be sent automatically. Check the mail server or provider log, then release it '
+      const cap = staleReclaimCapForKind(email.kind)
+      const message = `Email outbox row ${email.id} (${email.kind}${reference}, to ${email.toEmail}) was PARKED: ` + (cap === 0
+        ? 'the worker that claimed it stopped before recording the result, so the message may or may not have reached the recipient (outcome unknown). It was not re-sent, to avoid a duplicate. '
+        : `it had already been reclaimed ${cap} time(s) and its holder has gone stale again, so the sender has been entered at least twice for it and a copy may already have reached the customer. `)
+        + 'It will not be sent automatically. Check the mail server or provider log, then release it '
         + `(tsx scripts/email-outbox-parked.ts --row ${email.id} --release --apply) or cancel it (--cancel --apply) (o3d-hpeg).`
       console.error(`[email-outbox] ${message}`)
       await log({
@@ -2482,7 +2504,7 @@ export async function processPendingEmailOutbox(
           referenceType: email.referenceType,
           referenceId: email.referenceId,
           staleReclaimCount: email.staleReclaimCount,
-          cap: EMAIL_MAX_STALE_RECLAIMS,
+          cap,
         },
         resolveUser: false,
       })
@@ -2596,7 +2618,7 @@ export async function processPendingEmailOutbox(
         subject: prepared?.subject ?? email.subject,
         html: prepared?.html ?? email.html,
         attachments,
-        ...(prepared?.sendDeadlineMs ? { deadlineMs: prepared.sendDeadlineMs } : {}),
+        deadlineMs: prepared?.sendDeadlineMs ?? EMAIL_DEFAULT_SEND_DEADLINE_MS,
         // EVERY kind is single-send (owner decision 2026-11-18): a lost final SMTP response ends FAILED with an operator notice rather than
         // requeueing, so a customer is never sent a duplicate. Possibly-undelivered mail is the accepted trade.
         singleSend: true,

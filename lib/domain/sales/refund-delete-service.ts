@@ -546,7 +546,7 @@ export async function deleteSalesOrderRefund(
       })
       reversal.shopRefundTasksClosed = shopTasks.count
 
-      // ---- 5. THE RECORD: SOFT DELETE (owner decision 2026-11-18). The refund and its lines are KEPT for audit and marked deleted; readers skip it. ----
+      // ---- 5. THE RECORD: SOFT DELETE (owner decision 2026-11-18). The refund row is KEPT for audit and marked deleted (readers skip it); its LINES are hard-deleted below and live on in the tombstone. ----
       // PDF evidence is withdrawn (kept, still attached) and the credit note's fetch state is closed (DONE, nothing scheduled), not removed.
       await tx.salesOrderInvoiceDocument.updateMany({ where: { refundId: refund.id }, data: { withdrawnAt: now } })
       await tx.invoiceDocumentFetchState.updateMany({ where: { refundId: refund.id }, data: { status: 'DONE', nextAttemptAt: null, leaseUntil: null, leaseHolder: null } })

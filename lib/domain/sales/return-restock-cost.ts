@@ -2,11 +2,13 @@ import type { Prisma } from '@/app/generated/prisma/client'
 import { getAccountingSettings, queueAccountingSyncTxWithOutcome } from '@/lib/accounting'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
+import { WORK_SLOT_OCCUPIED_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import type { PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { buildInventoryAdjustmentJournal } from '@/lib/domain/inventory/stock-adjustment-apply'
 import { getAverageUnitCost, getHistoricalAverageUnitCost } from '@/lib/cost-layers'
 import type { RefundReturnRow } from '@/lib/domain/sales/refund-service'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
+import { businessDateYmd } from '@/lib/business-date'
 
 /**
  * Layers whose cost an operator or a receipt stated: a purchase receipt line, a manual adjustment, opening stock, or a
@@ -306,4 +308,145 @@ export async function findRestockedInboxesToAdopt(
     if (need > 1e-9) return null
   }
   return [...adoptions].map(([inboxId, qty]) => ({ inboxId, qty }))
+}
+
+const money2 = (n: number): number => Math.round(n * 100) / 100
+
+/**
+ * o3d-iil0b (Codex round 1): THE LEDGER SIDE OF AN ADOPTION.
+ *
+ * The warehouse's restock already booked Dr Inventory / Cr the stock-gain reason account (`queueReturnRestockValueJournal`), or nothing when no
+ * reason was chosen. A normal return books Dr Inventory / Cr COGS (the refund's COGS reversal at the original cost). An adopting refund books no
+ * COGS reversal of its own (it returns no stock), so left alone the shipped COGS would stay expensed and the reason account would hold a customer
+ * return as a gain. This books the difference, so the net matches a normal return:
+ *   Dr the restock's reason account   what the restock credited it, for the adopted units
+ *   Dr / Cr Inventory                 the difference between the original cost and what the restock booked (nothing when they agree)
+ *   Cr COGS                           the original cost of the adopted units (the shipment cost the refund's rows carry)
+ * Queued through the ordinary journal enqueue (the outbound hold, the period lock and the connector pin apply), in the refund's own transaction.
+ *
+ * A restock that booked NO journal (no reason account, or none queued) is NOT guessed at: the Inventory debit is still owed to the ledger by the
+ * restock's own owed-posting record, and posting Dr Inventory / Cr COGS here as well could book Inventory twice if that is fixed by hand. It is
+ * reported as an owed posting with the exact entry, so a person books the whole of it once.
+ *
+ * The original cost is split across the adopted inbox rows by quantity.
+ */
+export async function queueAdoptionReclassJournal(
+  tx: Prisma.TransactionClient,
+  params: {
+    refundId: string
+    orderId: string
+    orderRef: string
+    adoptions: readonly InboxAdoption[]
+    /** The rows the refund returned in effect (shipped, costed): their value is the original cost being reversed. */
+    rows: readonly RefundReturnRow[]
+  },
+): Promise<{ queued: boolean; owedValueBase: number }> {
+  const totalQty = params.adoptions.reduce((s, a) => s + a.qty, 0)
+  const originalCost = params.rows.reduce((s, r) => s + r.qty * Number(r.unitCostBase ?? 0), 0)
+  if (!(totalQty > 0) || !(originalCost > 0)) return { queued: false, owedValueBase: 0 }
+  const settings = await getAccountingSettings()
+  const inboxIds = params.adoptions.map((a) => a.inboxId)
+  const movements = await tx.stockMovement.groupBy({
+    by: ['referenceId'],
+    where: { type: 'RETURN_INBOUND', referenceType: 'WmsReturnsInbox', referenceId: { in: inboxIds } },
+    _sum: { qty: true },
+  })
+  const movementQty = new Map(movements.map((g) => [g.referenceId ?? '', Number(g._sum.qty ?? 0)]))
+  const restockJournals = await tx.accountingSyncLog.findMany({
+    // The restock journals that STAND (pending, processing or posted): the ledger module's own work-slot predicate, not a status list of mine.
+    where: { type: 'INVENTORY_ADJUSTMENT', referenceType: 'WmsReturnsInbox', referenceId: { in: inboxIds }, ...WORK_SLOT_OCCUPIED_WHERE },
+    select: { referenceId: true, payload: true },
+  })
+  // What each inbox restock credited to which non-inventory account, for the whole row.
+  const creditedByInbox = new Map<string, Map<string, number>>()
+  for (const j of restockJournals) {
+    const lines = (j.payload as { lines?: Array<{ accountCode?: string; credit?: number }> } | null)?.lines ?? []
+    for (const l of lines) {
+      if (!l.accountCode || !(Number(l.credit) > 0) || l.accountCode === settings.inventoryAccount) continue
+      const byAccount = creditedByInbox.get(j.referenceId) ?? new Map<string, number>()
+      byAccount.set(l.accountCode, (byAccount.get(l.accountCode) ?? 0) + Number(l.credit))
+      creditedByInbox.set(j.referenceId, byAccount)
+    }
+  }
+  const debitByAccount = new Map<string, number>()
+  let reclassifiedCost = 0
+  let owedCost = 0
+  for (const a of params.adoptions) {
+    const costShare = originalCost * (a.qty / totalQty)
+    const credited = creditedByInbox.get(a.inboxId)
+    const rowQty = movementQty.get(a.inboxId) ?? 0
+    if (!credited || !(rowQty > 0)) { owedCost += costShare; continue }
+    reclassifiedCost += costShare
+    for (const [account, amount] of credited) {
+      const share = amount * Math.min(1, a.qty / rowQty)
+      debitByAccount.set(account, (debitByAccount.get(account) ?? 0) + share)
+    }
+  }
+  let queued = false
+  const cogs = money2(reclassifiedCost)
+  if (cogs > 0 && settings.cogsAccount && settings.inventoryAccount) {
+    const lines: Array<{ accountCode: string; description: string; debit?: number; credit?: number }> = []
+    const description = `Adopted return reclass: ${params.orderRef}`
+    let debited = 0
+    for (const [accountCode, amount] of debitByAccount) {
+      const v = money2(amount)
+      if (v > 0) { lines.push({ accountCode, description, debit: v }); debited = money2(debited + v) }
+    }
+    const inventoryDelta = money2(cogs - debited)
+    if (inventoryDelta > 0) lines.push({ accountCode: settings.inventoryAccount, description, debit: inventoryDelta })
+    else if (inventoryDelta < 0) lines.push({ accountCode: settings.inventoryAccount, description, credit: -inventoryDelta })
+    lines.push({ accountCode: settings.cogsAccount, description, credit: cogs })
+    const outcome = await queueAccountingSyncTxWithOutcome(tx, {
+      type: 'INVENTORY_ADJUSTMENT',
+      referenceType: 'SalesOrderRefund',
+      referenceId: params.refundId,
+      idempotencyKey: `sales-order-refund:${params.refundId}:adoption-reclass`,
+      payload: {
+        date: businessDateYmd(new Date()),
+        reference: `Adopted return: ${params.orderRef}`,
+        narration: `COGS reversal and reclass of the returns-inbox restock — refund on order ${params.orderRef} adopted a returned arrival already restocked`,
+        lines,
+      },
+      chartConnector: settings.connector,
+      recordRefusalAsOutstanding: true,
+    })
+    queued = true
+    if (postingIsOwed(outcome)) {
+      await reportPostingNotQueued({
+        entityType: 'SALES_ORDER',
+        entityId: params.orderId,
+        action: 'refund_adoption_reclass_not_queued',
+        kind: 'refund_adoption_reclass_journal',
+        posting: `the COGS reversal and reclass for the adopted return on order ${params.orderRef}`,
+        committed: 'the refund and its link to the already restocked arrival are written in IMS',
+        remedy: `Post by hand: Dr the restock's stock-gain account / Cr COGS for the adopted units (net Dr Inventory / Cr COGS ${cogs.toFixed(2)} once the restock's own journal is counted).`,
+        outcome,
+        metadata: { refundId: params.refundId, adoptions: params.adoptions, chartConnector: settings.connector },
+        inTransaction: {
+          client: tx as unknown as PostingRefusalClient,
+          withSavepoint: <T,>(fn: () => Promise<T>) => withSavepoint(tx, fn),
+        },
+      })
+    }
+  }
+  const owed = money2(owedCost + (queued ? 0 : reclassifiedCost))
+  if (owed > 0 && (owedCost > 0 || !queued)) {
+    const unqueuedOutcome: EnqueueOutcomeLike = { queued: false, reason: 'refused', connector: settings.connector }
+    await reportPostingNotQueued({
+      entityType: 'SALES_ORDER',
+      entityId: params.orderId,
+      action: 'refund_adoption_cogs_reversal_owed',
+      kind: 'refund_adoption_reclass_journal',
+      posting: `the COGS reversal for the adopted return on order ${params.orderRef} (${money2(owedCost || reclassifiedCost).toFixed(2)})`,
+      committed: 'the refund and its link to the already restocked arrival are written in IMS',
+      remedy: `The returns-inbox restock booked no inventory journal (no reason account), so the refund's COGS reversal is not booked either: post Dr Inventory / Cr COGS ${owed.toFixed(2)} once, by hand, and do not also post the restock's own Dr Inventory / Cr stock-gain entry.`,
+      outcome: unqueuedOutcome,
+      metadata: { refundId: params.refundId, adoptions: params.adoptions, owedValueBase: owed, chartConnector: settings.connector },
+      inTransaction: {
+        client: tx as unknown as PostingRefusalClient,
+        withSavepoint: <T,>(fn: () => Promise<T>) => withSavepoint(tx, fn),
+      },
+    })
+  }
+  return { queued, owedValueBase: owed }
 }

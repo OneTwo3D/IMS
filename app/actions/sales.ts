@@ -1610,6 +1610,8 @@ const EDIT_GUARD_SELECT = {
   unregisteredPaidAt: true,
   storeCreditForeign: true,
   invoiceNumber: true,
+  // DELIBERATE EXCEPTION to the soft-delete filter (o3d-ngmt.22): `refunds` here counts a deleted refund too, so an order that ever carried a refund stays
+  // locked against edits, the conservative direction (a deleted refund's credit note and journals have reached the ledger and are still referenced).
   _count: { select: { allocations: true, shipments: true, shoppingLinks: true, lines: true, refunds: true, returnExpectations: true, payments: true, invoiceDocuments: true } },
   wmsOrderPush: { select: { id: true, externalOrderId: true } },
   wcLineBaseline: true,
@@ -4592,6 +4594,8 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
           // by. An order can sit in several A2 batches; one column names one of them.
           allocationBatchPasses: true,
           lines: { select: { productId: true, qty: true } },
+          // DELIBERATE EXCEPTION to the soft-delete filter (o3d-ngmt.22): a deleted refund still counts. The refund row (soft-deleted, not removed) keeps its foreign key to the
+          // order, so the order cannot be deleted while one exists, and an order that was refunded and had it deleted is still not one to throw away.
           _count: { select: { refunds: true, payments: true } },
         },
       })
