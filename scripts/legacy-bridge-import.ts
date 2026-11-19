@@ -14,8 +14,11 @@ import {
 import { RESOLUTION_DECISIONS, type ResolutionDecision } from '@/lib/connectors/mintsoft/legacy-bridge-import/state'
 
 /**
- * `npm run cutover:legacy-import [-- --apply --bridge-stopped] [-- --verify-mintsoft] [-- --statuses a,b] [-- --connector id] [-- --verify-max N] [-- --json]`
+ * `npm run cutover:legacy-import [-- --apply --bridge-stopped --bridge-fence-cleared --by <name>] [-- --verify-mintsoft] [-- --statuses a,b] [-- --connector id] [-- --verify-max N] [-- --json]`
  * `npm run cutover:legacy-import -- --resolve <wcOrderId>[,<id>...] --as <ours|not-ours|cancelled> [--apply --bridge-stopped]`
+ *
+ * A full `--apply` also needs `--bridge-fence-cleared --by <name>` (an attestation, recorded in the apply audit, that on the bridge host `var/manual_reconcile.json` is resolved and empty and
+ * `var/minted_orders.json` holds no `intent` / `intent-unseen` entry; IMS cannot read the bridge host). A `--resolve` / grouped apply does not need it.
  *
  * Imports the legacy bridge's `_mintsoft_*` order state into IMS's own link rows (o3d-zvec.22) and prints the Step M precondition report.
  * DRY RUN BY DEFAULT: nothing is written without --apply. WooCommerce is only ever read (GET). Mintsoft is not called at all unless
@@ -28,9 +31,9 @@ import { RESOLUTION_DECISIONS, type ResolutionDecision } from '@/lib/connectors/
  * carries a requested decision nobody has recorded: it is never MET.
  *
  * CANCELLED / REFUNDED HISTORY: only orders modified inside a window are LINKED or GROUPED: `--history-days N` (default 60) or `--history-since YYYY-MM-DD`. The window
- * never hides a queued bridge action: the WHOLE older cancelled / refunded history is also read (paced, only the meta fields), and an order outside the window that
- * carries `_mintsoft_sync_pending` with a Mintsoft id, a `_mintsoft_fence*` mark, or a verify id with no trusted id is a gate blocker of its own kind, `historic-queued`,
- * never linked, cleared by `--resolve <wcOrderId> --as cancelled` after the Mintsoft order is cancelled (read-checked). The report previews the counts.
+ * never hides a queued bridge action: the WHOLE older cancelled / refunded history is also read (paced, with a minimal `_fields` list: a smaller response, not a lighter server-side load), and an order outside the window that
+ * carries `_mintsoft_sync_pending` with a Mintsoft id, a verify id with no trusted id, or an id-less fenced shape (a queued update / cancel, `_mintsoft_verify_pending` or `_mintsoft_dead_letter` with no Mintsoft id) is a gate blocker of its own kind, `historic-queued`,
+ * never linked, cleared by `--resolve <wcOrderId> --as cancelled` after the Mintsoft order is cancelled (read-checked; an order with no id is looked up by order number: cancelled when Mintsoft has none or holds it CANCELLED). The same id-less shapes block inside the window too. The report previews the counts.
  * `--statuses` is always unioned with cancelled and refunded. An in-window cancelled / refunded order with a Mintsoft order that IMS will not link (no IMS order,
  * IMS does not show it cancelled, or it is fully refunded and still PROCESSING) is ONE grouped gate blocker, cleared by ONE decision:
  * `--resolve-all-historic-cancelled --as cancelled --reason "<why>" [--apply --bridge-stopped]` (each member is re-read in Mintsoft: cancelled or despatched; a member
@@ -38,19 +41,18 @@ import { RESOLUTION_DECISIONS, type ResolutionDecision } from '@/lib/connectors/
  * `--as ours` for a merge survivor whose other order is live). Historic orders IMS still holds as PROCESSING are flagged in the report: they stay out of creation only
  * while the step M create floor (paidNotBefore; PRODUCER_HOLD_ENFORCED_DESTINATIONS covering mintsoft) is in force.
  *
- * READ COST: each status set is walked twice (the second walk, ids only, is the id-set drift check anchored on the set's high-water id) plus the outside-window
- * history read. `--no-drift-check` skips the second walk for a READ-ONLY PREVIEW (the report then fails the gate); `--apply` refuses it.
+ * READ COST: the outside-window history is read FIRST, then each status set is walked twice (the second walk, ids only, is the id-set drift check anchored on the set's high-water id). `--no-drift-check` skips the second walk for a READ-ONLY PREVIEW (the report then fails the gate); `--apply` refuses it.
  *
  * `--resolve` records the operator's decision, taken after checking the Mintsoft order BY HAND, for a blocked order (verify-pending, verify-exhausted,
  * a queued bridge update or cancel left by a stopped bridge, or a cancelled WooCommerce order IMS never imported): `ours` (the Mintsoft order is this
  * order's: SYNCED link), `not-ours` (it is not: no link, IMS creates the order afresh) or `cancelled` (it was cancelled in Mintsoft: CANCELLED link).
- * `not-ours` is refused when the bridge PROVED the id, and `ours` / `cancelled` are checked read-only against Mintsoft (order number; status) first: any mismatch refuses.
+ * `not-ours` is refused when the bridge PROVED the id (and, on a cancelled / refunded order, unless both the id and the number search say absent), and `ours` / `cancelled` are checked read-only against Mintsoft (order number; status; an order with no id by its number) first: any mismatch refuses. A merge survivor adopted with `ours` is always MERGED (Mintsoft's "a+b" number or MergedOrder flag decides, not the WooCommerce flag).
  * Without --apply it only shows what would happen (the gate then reads "MET IF RECORDED", exit 3, never MET); with --apply (and --bridge-stopped) it records the decision in the activity log and writes ONLY
  * those orders' links. A recorded decision clears the blocker on every later run, until the order's bridge state changes.
  */
 
 const DISCONNECT_TIMEOUT_MS = 5_000
-const USAGE = 'Usage: npm run cutover:legacy-import [-- --apply --bridge-stopped] [-- --verify-mintsoft] [-- --verify-max N] [-- --statuses a,b,c] [-- --connector id] [-- --history-days N | --history-since YYYY-MM-DD] [-- --no-drift-check] [-- --json] | -- --resolve <wcOrderId>[,<id>...] --as <ours|not-ours|cancelled> [--apply --bridge-stopped] | -- --resolve-all-historic-cancelled --as cancelled --reason "<why>" [--apply --bridge-stopped]'
+const USAGE = 'Usage: npm run cutover:legacy-import [-- --apply --bridge-stopped --bridge-fence-cleared --by <name>] [-- --verify-mintsoft] [-- --verify-max N] [-- --statuses a,b,c] [-- --connector id] [-- --history-days N | --history-since YYYY-MM-DD] [-- --no-drift-check] [-- --json] | -- --resolve <wcOrderId>[,<id>...] --as <ours|not-ours|cancelled> [--apply --bridge-stopped] | -- --resolve-all-historic-cancelled --as cancelled --reason "<why>" [--apply --bridge-stopped]'
 
 type Logger = Pick<typeof console, 'log' | 'error'>
 
@@ -104,6 +106,8 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
 
   let apply = false
   let bridgeStopped = false
+  let bridgeFenceCleared = false
+  let by: string | undefined
   let verifyMintsoft = false
   let json = false
   let noDriftCheck = false
@@ -120,6 +124,14 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
     const arg = args[index]!
     if (arg === '--apply') { apply = true; continue }
     if (arg === '--bridge-stopped') { bridgeStopped = true; continue }
+    if (arg === '--bridge-fence-cleared') { bridgeFenceCleared = true; continue }
+    if (arg === '--by') {
+      const raw = (args[index + 1] ?? '').trim()
+      if (raw.length < 2 || raw.length > 80 || raw.startsWith('--')) { stderr.error(`--by needs the operator's name (2 to 80 characters). ${USAGE}`); return LEGACY_IMPORT_EXIT.usage }
+      by = raw
+      index += 1
+      continue
+    }
     if (arg === '--verify-mintsoft') { verifyMintsoft = true; continue }
     if (arg === '--json') { json = true; continue }
     if (arg === '--no-drift-check') { noDriftCheck = true; continue }
@@ -217,13 +229,22 @@ export async function runLegacyImportCli(options: LegacyImportCliOptions = {}): 
     return LEGACY_IMPORT_EXIT.usage
   }
 
+  if (bridgeFenceCleared !== (by !== undefined)) {
+    stderr.error(`--bridge-fence-cleared and --by <name> go together (the attestation names who made it). ${USAGE}`)
+    return LEGACY_IMPORT_EXIT.usage
+  }
+  if (apply && resolve === undefined && resolveAllHistoricCancelled === undefined && !bridgeFenceCleared) {
+    stderr.error(`--apply refuses without --bridge-fence-cleared --by <name>: on the bridge host, resolve and empty var/manual_reconcile.json and clear the intent / intent-unseen entries of var/minted_orders.json first (runbook, step M). ${USAGE}`)
+    return LEGACY_IMPORT_EXIT.usage
+  }
+
   try {
     const ports = options.ports
       ? await options.ports({ verifyMintsoft, connector })
       : (await import('@/lib/connectors/mintsoft/legacy-bridge-import/ports')).createLegacyImportPorts({ verifyMintsoft, connector })
     // cancelled and refunded are ALWAYS read: an explicit --statuses never drops them (a queued bridge cancel on one would be invisible).
     const resolvedStatuses = withHistoryStatuses(statuses ?? await (options.defaultStatuses ?? defaultStatuses)())
-    const report: LegacyImportReport = await runLegacyBridgeImport(ports, { apply, bridgeStopped, verifyMintsoft, verifyMax, resolve, resolveAllHistoricCancelled, historyWindow, driftCheck: !noDriftCheck, statuses: resolvedStatuses, now: options.now })
+    const report: LegacyImportReport = await runLegacyBridgeImport(ports, { apply, bridgeStopped, ...(bridgeFenceCleared && by !== undefined ? { bridgeFenceCleared: { by } } : {}), verifyMintsoft, verifyMax, resolve, resolveAllHistoricCancelled, historyWindow, driftCheck: !noDriftCheck, statuses: resolvedStatuses, now: options.now })
     if (json) stdout.log(JSON.stringify(report, null, 2))
     else {
       stdout.log(renderLegacyImportReport(report))

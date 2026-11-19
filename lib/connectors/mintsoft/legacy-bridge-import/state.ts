@@ -40,7 +40,6 @@ export const LEGACY_META = {
 const META_PREFIX = '_mintsoft_'
 /** The merge-candidate / merge-hold / merge-shipping-refund keys the cutover design names. The bridge in this tree writes none of them; any that appear are reported, never imported. */
 const MERGE_STATE_PREFIX = '_mintsoft_merge_'
-const FENCE_PREFIX = '_mintsoft_fence'
 
 export type LegacyMetaEntry = { key: string; value?: unknown; hasValue: boolean }
 
@@ -73,8 +72,6 @@ export type LegacyOrderState = {
   terminalForcedReason: string | null
   /** Merge-state keys with a value (candidate, hold, shipping refund): reported only. */
   mergeStateKeys: string[]
-  /** `_mintsoft_fence*` marks with a value (the bridge fenced this order: its sweep skips it without writing, so it never leaves the history window). Reported by name. */
-  fenceKeys: string[]
   /** Bridge keys that are present but cannot be read, by name. */
   unreadable: string[]
   /** True when the order carries at least one non-empty `_mintsoft_*` mark. */
@@ -203,8 +200,6 @@ export function readLegacyOrderState(order: { id: unknown; number?: unknown; sta
 
   const mergeStateKeys = entries.filter((e) => e.key.startsWith(MERGE_STATE_PREFIX) && isMark(e.value)).map((e) => e.key).sort()
 
-  const fenceKeys = entries.filter((e) => e.key.startsWith(FENCE_PREFIX) && isMark(e.value)).map((e) => e.key).sort()
-
   const hasBridgeState = entries.some((e) => e.key.startsWith(META_PREFIX) && isMark(e.value))
 
   return {
@@ -227,7 +222,6 @@ export function readLegacyOrderState(order: { id: unknown; number?: unknown; sta
     terminalForced: present(LEGACY_META.terminalForced),
     terminalForcedReason,
     mergeStateKeys,
-    fenceKeys,
     unreadable: unreadable.sort(),
     hasBridgeState,
   }
@@ -293,17 +287,22 @@ export const LEGACY_DEAD_LETTER_ERROR = 'Imported from the legacy bridge: its ou
  * - no id at all and dead-lettered -> DEAD_LETTER (out of the create queue, surfaced for a person);
  * - nothing created              -> none.
  */
-export function desiredLinkFor(state: LegacyOrderState, resolution: ResolutionDecision | null = null): DesiredLink {
+export function desiredLinkFor(state: LegacyOrderState, resolution: ResolutionDecision | null = null, found: ResolutionFound | null = null): DesiredLink {
   const unreadableIds = state.unreadable.filter((key) => key === LEGACY_META.orderId || key === LEGACY_META.verifyOrderId)
   if (unreadableIds.length > 0) return { kind: 'unreadable', keys: unreadableIds }
   if (resolution !== null) {
-    // THE OPERATOR'S DECISION about the Mintsoft order the bridge left unproved or with an action still queued (the one id the order carries).
-    const id = state.mintsoftOrderId ?? state.verifyOrderId
+    // THE OPERATOR'S DECISION about the Mintsoft order the bridge left unproved or with an action still queued (the one id the order carries). An order that
+    // carries NO id (a fenced or queued-with-no-id order) is identified by the number search the decision was checked with (`found`).
+    const id = state.mintsoftOrderId ?? state.verifyOrderId ?? found?.id ?? null
     if (id !== null) {
       if (resolution === 'not-ours') return { kind: 'none', reason: 'not-created-by-bridge' }
-      if (resolution === 'cancelled') return { kind: 'link', state: 'CANCELLED', externalOrderId: id, externalOrderNumber: state.mintsoftOrderNumber, lastError: null }
-      // 'ours': the id is ours, as if the bridge had proved it.
-      return desiredLinkFor({ ...state, mintsoftOrderId: id, verifyOrderId: null, verifyPending: false }, null)
+      const number = found?.orderNumber ?? state.mintsoftOrderNumber
+      if (resolution === 'cancelled') return { kind: 'link', state: 'CANCELLED', externalOrderId: id, externalOrderNumber: number, lastError: null }
+      // 'ours': the id is ours, as if the bridge had proved it. A merge survivor is MERGED whatever the WooCommerce `_mintsoft_merged` flag says (the bridge stamps it
+      // lazily and a failed status write loses it): Mintsoft's own evidence (an "a+b" number, or its MergedOrder flag, read when the decision was checked) is enough.
+      const mergedByMintsoft = found?.merged === true || (found?.orderNumber ?? '').includes('+')
+      if (mergedByMintsoft) return { kind: 'link', state: 'MERGED', externalOrderId: id, externalOrderNumber: found?.orderNumber ?? null, lastError: null }
+      return desiredLinkFor({ ...state, mintsoftOrderId: id, verifyOrderId: null, verifyPending: false, mintsoftOrderNumber: number }, null)
     }
   }
   if (state.mintsoftOrderId !== null) {
@@ -328,7 +327,10 @@ export function desiredLinkFor(state: LegacyOrderState, resolution: ResolutionDe
 export const RESOLUTION_DECISIONS = ['ours', 'not-ours', 'cancelled'] as const
 export type ResolutionDecision = (typeof RESOLUTION_DECISIONS)[number]
 
-export type BlockingQueueKind = 'verify-pending' | 'verify-exhausted' | 'sync-pending'
+/** What a decision learned from Mintsoft about the order it names (read when the decision was checked, kept with it): the id, the number Mintsoft holds, and whether it is a merge survivor. */
+export type ResolutionFound = { id: string | null; orderNumber: string | null; merged: boolean }
+
+export type BlockingQueueKind = 'verify-pending' | 'verify-exhausted' | 'sync-pending' | 'sync-pending-no-id' | 'verify-pending-no-id' | 'dead-letter-no-id'
 
 /** The bridge gave up verifying: it cleared its pending flag, kept the id and set `_mintsoft_dead_letter`. Nothing in the bridge revisits it, and the plugin's requeue refuses it. */
 export const isVerifyExhausted = (state: LegacyOrderState): boolean => state.mintsoftOrderId === null && state.verifyOrderId !== null && !state.verifyPending && state.writebackDeadLetter
@@ -337,13 +339,26 @@ export const isVerifyExhausted = (state: LegacyOrderState): boolean => state.min
  * The queue entries that block the gate for this order BY THEMSELVES (all cleared by one operator decision):
  * - a verify id with no trusted id: verify-pending (the bridge is still verifying) or verify-exhausted (it gave up);
  * - ANY queued outbound action (create, update or cancel) while a Mintsoft order exists for it: the import stamps the link as pushed, so IMS would never
- *   send that edit and never cancel that order. With NO Mintsoft id and no verify id nothing can be lost (a queued update is a create, a queued cancel
- *   has nothing to cancel), so it does not block.
+ *   send that edit and never cancel that order. With NO Mintsoft id and no verify id a queued create (or an update / cancel on a LIVE order) is harmless (IMS creates
+ *   the order, and its create dedupes on "Order Number already exists"), but the fenced shapes below are not.
+ * - the no-id shapes of a FENCED order (see the body): a queued update / cancel on a cancelled or refunded order, `_mintsoft_verify_pending`, `_mintsoft_dead_letter`.
  */
 export function blockingQueueKinds(state: LegacyOrderState): BlockingQueueKind[] {
   const out: BlockingQueueKind[] = []
+  const noId = state.mintsoftOrderId === null && state.verifyOrderId === null && !state.unreadable.some((key) => key === LEGACY_META.orderId || key === LEGACY_META.verifyOrderId)
   if (state.mintsoftOrderId === null && state.verifyOrderId !== null) out.push(isVerifyExhausted(state) ? 'verify-exhausted' : 'verify-pending')
   if (state.syncPending !== null && (state.mintsoftOrderId !== null || state.verifyOrderId !== null)) out.push('sync-pending')
+  // THE SIGNALS WOOCOMMERCE ACTUALLY SHOWS FOR A FENCED ORDER (the bridge's fence is a file on the bridge host, `var/manual_reconcile.json`, and it is written exactly when WooCommerce
+  // has NO id: a verify park that ran out of attempts, or a create whose journal and writeback both failed). The Mintsoft order may exist anyway, so each of these blocks until a
+  // read-only lookup by order number has settled it:
+  //  - a cancelled / refunded order with a queued update or cancel and no id: a cancel the bridge REFUSED to send (a normal cancel-before-push is cleared by its sweep);
+  //  - `_mintsoft_verify_pending` with no id: a create in flight whose outcome was never recorded;
+  //  - `_mintsoft_dead_letter` with no id: verification ran out (the fence), nothing revisits it.
+  if (noId) {
+    if (state.syncPending !== null && (state.syncPending === 'cancel' || state.syncPending === 'update') && (state.wcStatus === 'cancelled' || state.wcStatus === 'refunded')) out.push('sync-pending-no-id')
+    if (state.verifyPending) out.push('verify-pending-no-id')
+    if (state.writebackDeadLetter) out.push('dead-letter-no-id')
+  }
   return out
 }
 

@@ -314,6 +314,50 @@ export async function probeMintsoftOrderPresence(
 }
 
 /**
+ * The by-NUMBER lookup behind the legacy bridge import's decisions (read only): the same search as `probeMintsoftOrderPresence`, but when exactly ONE order carries
+ * the number (an exact match, or a merge survivor holding it as one "+" part) it is re-read by id and returned with its status and merge flag, so a decision can name
+ * the order it found. MISSING: the search found no trace. AMBIGUOUS: candidates exist but not exactly one distinct order (fail closed).
+ */
+export type MintsoftNumberLookup =
+  | 'MISSING'
+  | 'AMBIGUOUS'
+  | { found: true; id: string; orderNumber: string | null; status: string | null; dispatched: boolean; merged: boolean }
+
+export function mintsoftRowIsMergeFlagged(order: RawOrder): boolean {
+  return Array.isArray(order.OrderNameValues) && (order.OrderNameValues as unknown[]).some((entry) => {
+    const nv = entry as Record<string, unknown> | null
+    return nv !== null && typeof nv === 'object' && toStr(nv.Name) === 'MergedOrder' && toStr(nv.Value)?.toLowerCase() === 'true'
+  })
+}
+
+export async function lookupMintsoftOrderByNumber(orderNumber: string, clientId: number | null): Promise<MintsoftNumberLookup> {
+  const reference = orderNumber.trim()
+  if (!reference) return 'MISSING'
+  const scopedClientId = requireMintsoftClientId(clientId, 'Mintsoft order number lookup')
+  const matches = await searchMintsoftOrdersByNumber(reference, scopedClientId)
+  if (matches.length === 0) return 'MISSING'
+  const candidates = matches.filter((order) => toStr(order.OrderNumber) === reference || mergedParts(toStr(order.OrderNumber)).includes(reference))
+  const ids = new Set(candidates.map((order) => toStr(order.ID ?? order.Id ?? order.id)))
+  if (candidates.length === 0 || ids.size !== 1 || ids.has(null)) return 'AMBIGUOUS'
+  const picked = pickOrderRow(matches, reference, scopedClientId)
+  const id = [...ids][0]!
+  if (!picked) return 'AMBIGUOUS'
+  // The search row can carry null status fields: the authoritative read is by id.
+  const detail = await fetchMintsoftOrderById(id, scopedClientId)
+  if (detail === null) return 'AMBIGUOUS'
+  const normalized = await normalizeMintsoftOrderRow(detail)
+  const number = toStr(detail.OrderNumber)
+  return {
+    found: true,
+    id,
+    orderNumber: number,
+    status: normalized ? normalized.status.toUpperCase() || null : null,
+    dispatched: normalized?.dispatched === true,
+    merged: mintsoftRowIsMergeFlagged(detail) || mergedParts(number).length > 0,
+  }
+}
+
+/**
  * The keys the DISPATCH path reads off a delta row and whose ABSENCE it would
  * otherwise read as a positive fact (o3d-6j8). Derived from the consumers in this
  * module, not copied from the Python guard list — the IMS dispatch path reads a

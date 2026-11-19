@@ -266,3 +266,25 @@ test('[o3d-6j8] a COMPLETE split reconciles both parts normally', async () => {
   assert.deepEqual(parts.map((p) => p.dispatched), [true, true])
   assert.deepEqual(parts.map((p) => p.tracking[0]?.trackingNumber), ['TN-1', 'TN-2'])
 })
+
+test('[legacy import] lookupMintsoftOrderByNumber: MISSING for no trace, the one order (re-read by id, with status and merge flag) when exactly one carries the number, AMBIGUOUS otherwise', async () => {
+  reset()
+  const { lookupMintsoftOrderByNumber } = await orders()
+  await assert.rejects(() => lookupMintsoftOrderByNumber('1001', null), /requires a ClientId/)
+  assert.deepEqual(calls, [])
+  assert.equal(await lookupMintsoftOrderByNumber('1001', CLIENT), 'MISSING')
+  // Exactly one exact match: re-read by id for its status; a despatched one says so.
+  searchRows = [ownOrder('M-1', { OrderNumber: '1001' })]
+  details.set('M-1', ownOrder('M-1', { OrderNumber: '1001' }))
+  assert.deepEqual(await lookupMintsoftOrderByNumber('1001', CLIENT), { found: true, id: 'M-1', orderNumber: '1001', status: 'DESPATCHED', dispatched: true, merged: false })
+  // A merge survivor holding the number as one "+" part, flagged MergedOrder.
+  searchRows = [ownOrder('M-2', { OrderNumber: '1001+1002' })]
+  details.set('M-2', ownOrder('M-2', { OrderNumber: '1001+1002', OrderNameValues: [{ Name: 'MergedOrder', Value: 'True' }] }))
+  const survivor = await lookupMintsoftOrderByNumber('1001', CLIENT)
+  assert.equal(typeof survivor === 'object' && survivor.merged, true)
+  // Two distinct orders carrying the number, or rows that match nothing: AMBIGUOUS (fail closed).
+  searchRows = [ownOrder('M-1', { OrderNumber: '1001' }), ownOrder('M-3', { OrderNumber: '1001+1004' })]
+  assert.equal(await lookupMintsoftOrderByNumber('1001', CLIENT), 'AMBIGUOUS')
+  searchRows = [ownOrder('M-4', { OrderNumber: '10019' })]
+  assert.equal(await lookupMintsoftOrderByNumber('1001', CLIENT), 'AMBIGUOUS')
+})
