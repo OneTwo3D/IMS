@@ -2,7 +2,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import type { WmsSupplierRef } from '@/lib/connectors/wms/types'
-import { MINTSOFT_SUPPLIER_SYNC_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
+import { WMS_SUPPLIER_LIST_SYNC_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { acquirePinnedAdvisoryLockOrNull } from '@/lib/db/pinned-advisory-lock'
 import { MINTSOFT_SUPPLIER_LAST_SYNC_SETTING } from './settings'
 
@@ -70,7 +70,7 @@ export async function runMintsoftSupplierSync(options: { triggeredBy: string; us
   const connector = getWmsConnector('mintsoft')
   if (typeof connector.listSuppliers !== 'function') throw new Error('The Mintsoft connector cannot list suppliers.')
   // Single-flight: a second click would double the request rate on the shared live tenant. Refused, not queued.
-  const lock = await acquirePinnedAdvisoryLockOrNull(0, MINTSOFT_SUPPLIER_SYNC_LOCK_NAMESPACE)
+  const lock = await acquirePinnedAdvisoryLockOrNull(0, WMS_SUPPLIER_LIST_SYNC_LOCK_NAMESPACE)
   if (!lock) throw new Error('A Mintsoft supplier refresh is already running. Wait for it to finish, then reload.')
   try {
     const suppliers = await connector.listSuppliers({ sleep: options.sleep, pauseMs: options.pauseMs })
