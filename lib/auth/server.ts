@@ -85,6 +85,15 @@ export async function requireFreshAdmin(): Promise<AuthSession> {
 }
 
 /**
+ * Requires one of the given roles AND a recently authenticated session: `requireFreshAdmin` for an action that managers may also take (CRM merge/unmerge).
+ */
+export async function requireFreshRole(...roles: string[]): Promise<AuthSession> {
+  const session = await requireAuth()
+  requireRoleSession(session, roles)
+  return requireFreshAuthSession(session)
+}
+
+/**
  * Requires the current user to hold a specific RBAC permission.
  * Use this on mutating server actions so that non-admin roles can be granted
  * (or denied) specific capabilities.

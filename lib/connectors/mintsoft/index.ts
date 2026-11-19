@@ -1,4 +1,4 @@
-import type { WmsAmbiguousCreateResolution, WmsMergedItemRemoval, WmsMergedSurvivorLookup, WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsOrderHoldResult, WmsExpectedOrder, WmsOrderItemRef, WmsOrderPart, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsOrderUpdateResult, WmsProductContentResult, WmsProductContentUpdate, WmsProductDeleteResult, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
+import type { WmsAmbiguousCreateResolution, WmsMergedItemRemoval, WmsMergedSurvivorLookup, WmsAsnInput, WmsAsnRef, WmsBundleDto, WmsBundleRef, WmsConnectionCheck, WmsConnector, WmsOrderCancelResult, WmsOrderHoldResult, WmsExpectedOrder, WmsOrderItemRef, WmsOrderPart, WmsOrderPushInput, WmsOrderPushResult, WmsOrderStatus, WmsOrderUpdateResult, WmsProductContentResult, WmsProductContentUpdate, WmsProductDeleteResult, WmsProductDto, WmsProductRef, WmsReturnRecord, WmsStockLine, WmsSupplierCreateInput, WmsSupplierCreateResult, WmsSupplierRef, WmsUpsertProductOptions, WmsWarehouseRef } from '@/lib/connectors/wms/types'
 import {
   getMintsoftApiConfiguration,
   isMintsoftConfigured,
@@ -8,6 +8,7 @@ import { updateMintsoftProductContent } from './api/product-content'
 import { createMintsoftAsn, createMintsoftBundle, deleteMintsoftProduct, fetchMintsoftAsnById, fetchMintsoftBundle, fetchMintsoftProduct, fetchMintsoftProductBySku, fetchMintsoftReturns, fetchMintsoftStockLevels, fetchMintsoftWarehouses, upsertMintsoftProduct } from './api/client'
 import { fetchMintsoftOrderList, fetchMintsoftOrderStatus, fetchMintsoftOrderParts, fetchMintsoftPartItems, probeMintsoftOrderPresence } from './api/orders'
 import { addMintsoftOrderComment, readMintsoftOrderItemRefs, cancelMintsoftOrder, holdMintsoftOrderForMerge, findMintsoftMergedSurvivor, pushMintsoftOrder, removeMintsoftOrderItems, reconcileMintsoftAmbiguousCreate, probeMintsoftOrderAmendable, updateMintsoftOrder, verifyMintsoftPushedOrder } from './api/order-push'
+import { createMintsoftSupplier, fetchMintsoftSuppliers } from './api/suppliers'
 import { parseMintsoftPositiveId } from './settings/schema'
 import { getSettingValue } from '@/lib/settings-store'
 
@@ -83,6 +84,14 @@ export class MintsoftConnector implements WmsConnector {
 
   async createAsn(input: WmsAsnInput): Promise<WmsAsnRef> {
     return createMintsoftAsn(input)
+  }
+
+  async listSuppliers(options?: { pauseMs?: number; sleep?: (ms: number) => Promise<void> }): Promise<WmsSupplierRef[]> {
+    return fetchMintsoftSuppliers(options)
+  }
+
+  async createSupplier(input: WmsSupplierCreateInput): Promise<WmsSupplierCreateResult> {
+    return createMintsoftSupplier(input)
   }
 
   async fetchAsnById(externalAsnId: string): Promise<WmsAsnRef | null> {

@@ -61,6 +61,7 @@ import { ProductThumb } from '@/components/inventory/product-thumb'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { useStepUpReauth, isFreshAuthFailure } from '@/components/auth/use-step-up-reauth'
+import { assertPaymentRegistrationNeverExistedAction } from '@/app/actions/payment-registration-assertion'
 import { hasPermission } from '@/lib/permissions'
 import { formatMoney } from '@/lib/utils'
 import { getTrackingUrl } from '@/lib/tracking'
@@ -1262,7 +1263,8 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
    * useless if the operator cannot see both at once — and until this change the result of
    * deletePayment was DISCARDED entirely, so the refusal would not have appeared anywhere at all.
    */
-  const [paymentRefusal, setPaymentRefusal] = useState<{ paymentId: string; message: string; code?: string } | null>(null)
+  const [paymentRefusal, setPaymentRefusal] = useState<{ paymentId: string; message: string; code?: string; assertableRegistrationIds?: string[] } | null>(null)
+  const [neverExistedReason, setNeverExistedReason] = useState('')
   // o3d-1vuv: the payment reference an operator read off the invoice in the accounting system, for a
   // registration that failed without recording one. IMS asks about THAT payment; it does not take the
   // typing of it as a claim that anything was reversed.
@@ -2276,7 +2278,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
                               // nobody. It is now shown against the receipt it refused.
                               const result = await deletePayment(p.id, so.id)
                               if (result.success) { router.refresh(); return }
-                              setPaymentRefusal({ paymentId: p.id, message: result.error ?? 'Failed to delete the payment.', code: result.code })
+                              setPaymentRefusal({ paymentId: p.id, message: result.error ?? 'Failed to delete the payment.', code: result.code, assertableRegistrationIds: result.assertableRegistrationIds })
                               setUndecidedAttempt(result.code === 'registration_attempt_undecided' ? p.id : null)
                             })
                           }}
@@ -2313,6 +2315,56 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
                             {isPending ? <Loader2 className="h-3 w-3 mr-1 animate-spin" /> : <Undo2 className="h-3 w-3 mr-1" />}
                             I have reversed it — check and delete
                           </Button>
+                        )}
+                        {paymentRefusal.assertableRegistrationIds && paymentRefusal.assertableRegistrationIds.length > 0 && currentUserRole === 'ADMIN' && (
+                          /*
+                            o3d-5fx28: AN ADMIN'S ASSERTION THAT THE PAYMENT NEVER EXISTED IN THE ACCOUNTING SYSTEM. For a retired registration nothing
+                            can prove it was never sent, and when it never reached the ledger there is no payment reference to supply. The admin's word
+                            is recorded against their name (audit row) and clears the block for this one entry; IMS checks nothing in the ledger.
+                          */
+                          <div className="space-y-2">
+                            <label className="block text-[11px] text-muted-foreground" htmlFor={`never-existed-${p.id}`}>
+                              Administrators only: I have checked the invoice in the accounting system and this payment never existed there. Why are you sure? (recorded against your name)
+                            </label>
+                            <input
+                              id={`never-existed-${p.id}`}
+                              type="text"
+                              value={neverExistedReason}
+                              onChange={(e) => setNeverExistedReason(e.target.value)}
+                              className="w-full rounded border bg-background px-2 py-1 text-xs"
+                            />
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-6 text-xs"
+                              disabled={isPending || neverExistedReason.trim().length < 10}
+                              onClick={() => startTransition(async () => {
+                                const ids = paymentRefusal.assertableRegistrationIds ?? []
+                                const run = async () => {
+                                  for (const id of ids) {
+                                    const r = await assertPaymentRegistrationNeverExistedAction(id, so.id, neverExistedReason)
+                                    if (!r.success) return r
+                                  }
+                                  return { success: true as const }
+                                }
+                                let result = await run()
+                                if (isFreshAuthFailure(result) && await promptReauth()) result = await run()
+                                if (isFreshAuthFailure(result)) {
+                                  setPaymentRefusal({ paymentId: p.id, message: 'Sign in again to record this assertion.', code: paymentRefusal.code, assertableRegistrationIds: ids })
+                                  return
+                                }
+                                if (!result.success) {
+                                  setPaymentRefusal({ paymentId: p.id, message: result.error, code: paymentRefusal.code, assertableRegistrationIds: ids })
+                                  return
+                                }
+                                setNeverExistedReason('')
+                                setPaymentRefusal({ paymentId: p.id, message: 'Recorded. The block is cleared: delete the payment again.', code: undefined })
+                                router.refresh()
+                              })}
+                            >
+                              Record that it never existed
+                            </Button>
+                          </div>
                         )}
                         {undecidedAttempt === p.id && (
                           /*

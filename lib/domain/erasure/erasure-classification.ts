@@ -37,7 +37,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   // wcLineBaseline (JSON): WooCommerce line item ids, quantities, SKUs and the order total taken at the first IMS line edit. Product and money figures only: no name, address, email or free text.
   SalesOrder: {
     erased: ['customerName', 'customerEmail', 'customerVatNumber', 'billingAddress', 'shippingAddress', 'notes', 'internalNotes', 'trackingNumber'],
-    notPersonal: ['id', 'externalOrderNumber', 'withdrawalLastWcStatus', 'currency', 'customerId', 'shippingService', 'courierKey', 'shippingMethodId', 'taxRateName', 'shipFromWarehouseId', 'salesRep', 'discountStr', 'discountRestatement', 'euVatLineAccount', 'euVatRegimeBasis', 'orderNumber', 'iossNumber', 'deliveryTerm', 'paymentMethod', 'paymentMethodTitle', 'revenueDeferredBatchRef', 'inventoryAllocatedBatchRef', 'allocationBatchSyncLogId', 'allocationBatchConnector', 'allocationBatchAccountCode', 'allocationBatchPasses', 'wcLineBaseline'],
+    notPersonal: ['id', 'externalOrderNumber', 'withdrawalLastWcStatus', 'withdrawalRequestId', 'currency', 'customerId', 'shippingService', 'courierKey', 'shippingMethodId', 'taxRateName', 'shipFromWarehouseId', 'salesRep', 'discountStr', 'discountRestatement', 'euVatLineAccount', 'euVatRegimeBasis', 'orderNumber', 'iossNumber', 'deliveryTerm', 'paymentMethod', 'paymentMethodTitle', 'revenueDeferredBatchRef', 'inventoryAllocatedBatchRef', 'allocationBatchSyncLogId', 'allocationBatchConnector', 'allocationBatchAccountCode', 'allocationBatchPasses', 'wcLineBaseline'],
     retained: {
       invoiceNumber: 'issued invoice number, statutory record',
       accountingInvoiceId: 'ledger document id, statutory record',
@@ -91,20 +91,31 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   PaymentRemovalReconciliation: { erased: [], notPersonal: ['id', 'orderId', 'connector', 'accountingInvoiceId', 'kind', 'currency', 'matchedPaymentIds', 'ledgerAction', 'refundId'], retained: {} },
   SalesOrderRefund: {
     erased: ['accountingWarning'],
-    notPersonal: ['id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'returnReasonId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
+    notPersonal: ['deletedById', 'id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'returnReasonId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
     retained: {
       reason: 'owner decision: the refund reason text is kept',
+      deleteReason: 'owner decision (as for the refund reason): the reason an operator gave for deleting a refund is part of the audit record',
     },
   },
   // o3d-ngmt.22: the record that a refund recorded in error was deleted. Keyed to its order by id only (no foreign key, so it outlives a deleted order). Ids, a credit note number,
   // amounts and a JSON of the reversed movements (ids and quantities); the one free-text column is the operator's delete reason, retained like the refund's own reason.
   SalesOrderRefundDeletion: {
     erased: [],
-    notPersonal: ['refundId', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'deletedById', 'voidSyncLogId', 'reversal'],
+    notPersonal: ['refundId', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'deletedById', 'voidSyncLogId'],
     retained: {
       reason: 'owner decision (as for the refund reason): the reason an operator gave for deleting a refund is part of the audit record',
+      reversal: 'the deleted refund\'s lines are copied whole into it (ids, amounts, cost snapshots and each line\'s description text, retained like the line itself); the rest is ids and quantities of reversed movements',
     },
   },
+  // o3d-iil0b: which returns-inbox arrival (and how many of its units) a refund adopted. Ids and a quantity only.
+  SalesOrderRefundInboxAdoption: { erased: [], notPersonal: ['refundId', 'inboxId'], retained: {} },
+  // CRM customer identity: the insert-only merge / unmerge audit. Ids only (the pair of customer ids and the staff user who decided); no name, email or free text,
+  // so there is nothing to erase, and the rows are KEPT by an erasure (the audit trail of who was joined to whom must survive). No foreign keys: it is reached by id.
+  CustomerMergeEvent: { erased: [], notPersonal: ['customerId', 'otherCustomerId', 'decidedByUserId'], retained: {} },
+  // CRM cluster erasure request: the saved member list of a whole-person erasure. Ids only (the customers it covered and the staff user who asked); no name, email or
+  // free text, so there is nothing to erase and the row is KEPT as the proof of what the erasure covered. No foreign keys: reached by id. memberIdentityKeys holds
+  // SHA-256 digests of the members' folded emails (member id -> digest) while the request is PENDING, and is emptied when it completes or is cancelled.
+  CustomerClusterErasure: { erased: [], notPersonal: ['requestedCustomerId', 'memberIds', 'requestedByUserId', 'excludedMemberIds', 'cancelledByUserId', 'memberIdentityKeys'], retained: {} },
   // Linked by a relation, with no text or JSON column of their own (only keys, amounts and dates).
   CogsEntry: { erased: [], notPersonal: [], retained: {} },
   CostLayer: { erased: [], notPersonal: ['returnMovementId'], retained: {} },
@@ -233,6 +244,8 @@ ERASURE_CLASSIFICATION.WcOrderDivergence = {
   notPersonal: ['orderId', 'externalOrderId', 'externalOrderNumber', 'differences', 'fingerprint', 'resolution', 'amendmentClaim'],
   retained: {},
 }
+// Once-only record of a withdrawal outcome written to the storefront: the order id, a request key (`r<request id>` / `u:<order id>` / `x:<order id>:<request id>`), the outcome kind (a log action code) and a result code. Ids and codes: no name, address, email or free text.
+ERASURE_CLASSIFICATION.WcWithdrawalOutcome = { erased: [], notPersonal: ['id', 'orderId', 'requestKey', 'outcomeKind', 'result'], retained: {} }
 ERASURE_CLASSIFICATION.WcOrderDivergenceRecheck = { erased: [], notPersonal: ['orderId', 'externalOrderId'], retained: {} }
 // Xero payment-matching results: one row per customer receipt, keyed by the payment and order ids (no foreign key, so the row outlives a deleted receipt). It holds ids, a Xero
 // bank-account id, an amount, a currency and a reason code in fixed wording built by IMS: no person is named and no remote free text is stored, so nothing is erased.

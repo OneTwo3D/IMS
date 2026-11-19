@@ -405,6 +405,16 @@ export function legacyCourierRetry(
   return { input: legacyInput, courier: mappedId != null ? { kind: 'mappedId', courierServiceId: mappedId } : { kind: 'name' } }
 }
 
+/**
+ * Behind `mintsoft_send_shipping_vat` (default OFF): the derived shipping VAT is sent as ShippingTotalVat. Off, or with nothing derived, the input is
+ * returned as it was, so the payload is byte-identical to the one sent before the setting existed.
+ */
+function withShippingVat(input: WmsOrderPushInput, settings: { mintsoft_send_shipping_vat?: string }): WmsOrderPushInput {
+  if (settings.mintsoft_send_shipping_vat !== 'true') return input
+  if (input.shippingVat !== 0 || !(typeof input.shippingVatDerived === 'number' && input.shippingVatDerived > 0)) return input
+  return { ...input, shippingVat: input.shippingVatDerived }
+}
+
 export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOrderPushResult> {
   // Fail closed BEFORE creating anything (o3d-bjc.6). Every later lifecycle step —
   // amend, hold/cancel, warehouse comment — requires the tenant scope, so creating
@@ -417,6 +427,7 @@ export async function pushMintsoftOrder(input: WmsOrderPushInput): Promise<WmsOr
   // operator's change or clear applies to every order not yet created in Mintsoft. A cleared/invalid setting sends no IOSSNumber.
   const iossNumber = settings.mintsoft_send_ioss_number === 'true' && input.iossStamped ? await readShopIossNumber() : null
   if (iossNumber) input = { ...input, iossNumber }
+  input = withShippingVat(input, settings)
   // Courier selection: a configured shipping-service → CourierServiceId mapping
   // wins; else pass the name through for the WMS to resolve; else (no service on
   // the order at all) fall straight to the configured default id if one is set.
@@ -982,6 +993,7 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
   if (gateRefusal) return gateRefusal
 
   const settings = await getMintsoftSettings()
+  input = withShippingVat(input, settings)
   const courierMap = settings.mintsoft_courier_service_map
   const defaultId = parseDefaultCourierId(settings.mintsoft_default_courier_service_id)
   // The courier for the FIRST post, chosen before any write. An order created on the placeholder courier is amended on the

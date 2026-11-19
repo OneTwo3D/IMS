@@ -372,6 +372,7 @@ export async function readCreditNoteOrderDiscount(
     }
   }
 
+  // soft-delete exception (ledger cascade): includes soft-deleted refunds on purpose, their credit-note and reversal rows are still in the ledger and must be netted.
   const refunds = await client.salesOrderRefund.findMany({
     where: { id: { in: [...evidence.refundIds] } },
     select: {

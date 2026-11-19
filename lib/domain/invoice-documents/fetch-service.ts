@@ -254,7 +254,7 @@ async function ensureUnderLease(
     }
   } else {
     const refund = await db.salesOrderRefund.findUnique({
-      where: { id: input.refundId! },
+      where: { id: input.refundId!, deletedAt: null }, // a soft-deleted refund has no credit note to fetch
       select: { orderId: true, creditNoteNumber: true, createdAt: true },
     })
     if (!refund || refund.orderId !== input.orderId) return { status: 'not-applicable', reason: 'the refund is not on this order' }

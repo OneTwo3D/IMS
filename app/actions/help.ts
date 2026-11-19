@@ -22,6 +22,7 @@ const HELP_DOCS = [
   { slug: 'stock-control', title: 'Stock Control' },
   { slug: 'purchasing', title: 'Purchasing' },
   { slug: 'sales', title: 'Sales Orders' },
+  { slug: 'customers', title: 'Customers' },
   { slug: 'manufacturing', title: 'Manufacturing' },
   { slug: 'warehouse', title: 'Warehouse' },
   { slug: 'analytics', title: 'Analytics & Reports' },

@@ -70,7 +70,7 @@ import { WC_PRODUCT_PUSH_RECORD_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { runWithWcAttemptFence } from '../attempt-fence'
 import type { ProductLifecycleStatus, ProductType } from '@/app/generated/prisma/client'
 import type { WcFullProduct, WcVariation, SyncResult } from './types'
-import { storeWcProductContent } from './product-content'
+import { storeWcProductContent, storeWcVariationContentBatch } from './product-content'
 
 const WEBHOOK_PRIMARY_FRESH_MS = 24 * 60 * 60 * 1000
 const MANUAL_PRODUCT_SYNC_JOB_KEY = 'manual_wc_product_sync_job'
@@ -1946,6 +1946,7 @@ async function applyVariations(
   parentImsBefore: WcTradeSnapshot | null,
 ): Promise<WcProductStructureConflict[]> {
   const conflicts: WcProductStructureConflict[] = []
+  const variationContent: Array<{ productId: string; source: Parameters<typeof storeWcProductContent>[2] }> = []
   const entries = variations
     .map((v) => ({ v, sku: asTrimmedString(v.sku) }))
     .filter((entry): entry is { v: WcVariation; sku: string } => Boolean(entry.sku)) // skip variations without SKU
@@ -2182,7 +2183,7 @@ async function applyVariations(
       // The adoption landed; same rule as the parent branch (r4).
       if (adoptionTransformsRow) structurallyTransformed.set(existing.id, existing.sku)
       await bumpFulfillmentGraphVersions(tx, existing.id, kitnessMutation)
-      await storeWcProductContent(tx, existing.id, v)
+      variationContent.push({ productId: existing.id, source: v })
       // Reflect the FULL applied update, not just the new mapping. A later sibling sharing this
       // SKU builds its `?? existing.x` fallbacks from this row; caching the pre-update values
       // would write the first sibling's fresh description/image straight back out again.
@@ -2221,10 +2222,12 @@ async function applyVariations(
       // has no children, and nothing may re-derive it from the type. Stating it is also what
       // keeps `imsRowHasChildren` free to throw on a row that was never asked (r5).
       existingBySku.set(sku, { ...created, hasChildren: false })
-      await storeWcProductContent(tx, created.id, v)
+      variationContent.push({ productId: created.id, source: v })
     }
   }
 
+  // One read for every variation's content row, one write per CHANGED one (was two serial round trips per variation inside the import transaction).
+  await storeWcVariationContentBatch(tx, variationContent)
   return conflicts
 }
 

@@ -127,6 +127,7 @@ export const PRIMITIVES: Readonly<Record<string, Primitive>> = {
   pushPartialShipmentToWc: { family: 'woocommerce-writer' },
   pushInvoiceNoteToWc: { family: 'woocommerce-writer' },
   publishInvoiceDocumentFlagToWc: { family: 'woocommerce-writer' },
+  postWithdrawalOutcome: { family: 'woocommerce-writer' },
   pushFxRatesToWc: { family: 'woocommerce-writer' },
   pushCurrentFxRatesToWc: { family: 'woocommerce-writer' },
   probeFxHelperPlugin: { family: 'woocommerce-writer' },
@@ -142,6 +143,7 @@ export const PRIMITIVES: Readonly<Record<string, Primitive>> = {
   updateMintsoftProductContent: { family: 'mintsoft-write' },
   deleteMintsoftProduct: { family: 'mintsoft-write' },
   createMintsoftAsn: { family: 'mintsoft-write' },
+  createMintsoftSupplier: { family: 'mintsoft-write' },
   createMintsoftBundle: { family: 'mintsoft-write' },
   requestMintsoftAuthSession: { family: 'mintsoft-write' },
   runWmsOrderPushSweep: { family: 'mintsoft-write' },
@@ -160,6 +162,7 @@ export const PRIMITIVES: Readonly<Record<string, Primitive>> = {
   updateProductContent: { family: 'mintsoft-write', memberOnly: true },
   deleteProduct: { family: 'mintsoft-write', memberOnly: true },
   createAsn: { family: 'mintsoft-write', memberOnly: true },
+  createSupplier: { family: 'mintsoft-write', memberOnly: true },
   createBundle: { family: 'mintsoft-write', memberOnly: true },
   // ---- Operator buttons that re-arm or trigger a write ------------------------------------------------------------
   replayWmsOrderPush: { family: 'operator-action' },

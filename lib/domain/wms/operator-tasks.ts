@@ -15,7 +15,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * new task.
  */
 
-export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE', 'SHOP_REFUND_DUE', 'AMENDMENT_NOT_APPLIED', 'ORDER_NOT_FOUND', 'CANCELLED_POSTED_INVOICE', 'WC_EDIT_AFTER_PICKING', 'REFUND_REMAINDER_DUE', 'MERGE_HOLD', 'MERGE_HOLD_OVERDUE', 'MERGE_HOLD_WITHDRAWAL'] as const
+export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE', 'SHOP_REFUND_DUE', 'AMENDMENT_NOT_APPLIED', 'ORDER_NOT_FOUND', 'CANCELLED_POSTED_INVOICE', 'WC_EDIT_AFTER_PICKING', 'REFUND_REMAINDER_DUE', 'MERGE_HOLD', 'MERGE_HOLD_OVERDUE', 'MERGE_HOLD_WITHDRAWAL', 'WITHDRAWAL_REJECT_NOT_WRITTEN'] as const
 export type WmsOperatorTaskReasonValue = (typeof WMS_OPERATOR_TASK_REASONS)[number]
 
 /** What an operator reads for each reason (the exceptions section). */
@@ -33,6 +33,7 @@ export const WMS_OPERATOR_TASK_REASON_LABELS: Record<WmsOperatorTaskReasonValue,
   CANCELLED_POSTED_INVOICE: 'Cancelled order with a posted invoice: the invoice is still uncredited in the ledger',
   WC_EDIT_AFTER_PICKING: 'Order edited in WooCommerce after picking started: IMS sent nothing, apply the change in the warehouse by hand',
   REFUND_REMAINDER_DUE: 'Returned units were refunded: ask the warehouse to send the remaining units',
+  WITHDRAWAL_REJECT_NOT_WRITTEN: 'Withdrawal request filed after despatch: IMS could not reject it on the storefront, reject it in WooCommerce',
   MERGE_HOLD: 'Orders on merge hold in the warehouse: merge them there and confirm the merged order yourself',
   MERGE_HOLD_OVERDUE: 'Merge hold overdue: merge and confirm the order in the warehouse',
   MERGE_HOLD_WITHDRAWAL: 'Withdrawal or cancel on an order on merge hold: act in the warehouse',

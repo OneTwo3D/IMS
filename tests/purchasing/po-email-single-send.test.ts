@@ -47,9 +47,23 @@ test('mailer: a sendMail rejection exactly at the deadline, after DATA, is the s
   const r = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 20, singleSend: true })
   assert.deepEqual(r, { success: false, permanent: true, unknownOutcome: true, error: SEND_DEADLINE_UNKNOWN_OUTCOME })
   // ... and the timer winning gives the identical answer.
-  behave = () => new Promise<never>(() => undefined)
+  behave = (o) => { sendCommand(o, 'DATA'); return new Promise<never>(() => undefined) }
   const t = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 20, singleSend: true })
   assert.deepEqual(t, r)
+})
+
+test('mailer: the deadline timer firing BEFORE the message was handed over (no connection, greeting or DATA) is a retryable failure, not an unknown outcome', async () => {
+  const { sendEmailWithSmtpSettings } = await import('../../lib/mailer.ts')
+  behave = () => new Promise<never>(() => undefined)
+  const r = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 20, singleSend: true })
+  assert.equal(r.success, false)
+  assert.equal(r.permanent, false)
+  assert.equal(r.unknownOutcome, undefined)
+  // DATA command written but no 354 yet: still nothing handed over.
+  behave = (o) => { sendDataCommandOnly(o); return new Promise<never>(() => undefined) }
+  const early = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 20, singleSend: true })
+  assert.equal(early.permanent, false)
+  assert.equal(early.unknownOutcome, undefined)
 })
 
 test('mailer: a pre-delivery rejection just before the deadline (no DATA seen) stays retryable', async () => {
@@ -75,6 +89,11 @@ test('mailer: a disconnect after DATA is written but before the 354 reply is ret
   const late = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 60_000, singleSend: true })
   assert.equal(late.permanent, true)
   assert.equal(late.unknownOutcome, true)
+  // The wording says what happened: the connection failed after the hand-over, NOT that a deadline passed (customer kinds also carry a deadline now, but this is a lost reply).
+  const { SEND_FINAL_REPLY_UNKNOWN_OUTCOME, SEND_DEADLINE_UNKNOWN_OUTCOME } = await import('../../lib/mailer.ts')
+  assert.equal(late.error, SEND_FINAL_REPLY_UNKNOWN_OUTCOME)
+  assert.notEqual(late.error, SEND_DEADLINE_UNKNOWN_OUTCOME)
+  assert.match(late.error ?? '', /connection failed after the message was handed to the mail server/)
 })
 
 test('mailer: a truncated final 2xx reply followed by a disconnect is unknown; a final 451 stays retryable and a final 550 permanent', async () => {
@@ -233,7 +252,7 @@ function matchesWhere(row: StoredRow, where: Where): boolean {
 }
 
 
-async function makeClient(rows: EmailOutboxRow[], failFirstSettlement = false) {
+async function makeClient(rows: EmailOutboxRow[], failFirstSettlement: boolean | 'SENT' = false) {
   let settlementFailed = false
   const { EMAIL_OUTBOX_IN_MEMORY_ROWS, createEmailOutboxHarnessClient } = await import('@/lib/email-outbox')
   const store: StoredRow[] = rows.map((row) => ({ ...row }))
@@ -248,7 +267,7 @@ async function makeClient(rows: EmailOutboxRow[], failFirstSettlement = false) {
       },
       async updateMany(args: unknown) {
         const { where, data } = args as { where: Where; data: Record<string, unknown> }
-        if (failFirstSettlement && !settlementFailed && (data.status === 'FAILED' || data.status === 'PENDING')) {
+        if (failFirstSettlement && !settlementFailed && (failFirstSettlement === 'SENT' ? data.status === 'SENT' : (data.status === 'FAILED' || data.status === 'PENDING'))) {
           settlementFailed = true
           throw new Error('the settlement write did not commit')
         }
@@ -286,7 +305,7 @@ function makeRow(overrides: Partial<EmailOutboxRow>): EmailOutboxRow {
 
 const T0 = new Date('2026-09-10T10:00:00.000Z')
 
-async function drainWith(row: EmailOutboxRow, prepared: Record<string, unknown> | null, failFirstSettlement = false) {
+async function drainWith(row: EmailOutboxRow, prepared: Record<string, unknown> | null, failFirstSettlement: boolean | 'SENT' = false, logEntity = 'PURCHASE_ORDER') {
   const { sendEmailWithSmtpSettings } = await import('../../lib/mailer.ts')
   const { processPendingEmailOutbox } = await import('@/lib/email-outbox')
   const { client, rows } = await makeClient([row], failFirstSettlement)
@@ -300,7 +319,7 @@ async function drainWith(row: EmailOutboxRow, prepared: Record<string, unknown> 
       sendEmail: ((m: Parameters<typeof sendEmailWithSmtpSettings>[1]) => sendEmailWithSmtpSettings(SMTP, m)) as never,
     },
   })
-  return { result, row: rows[0], logs: logs.filter((l) => l.entityType === 'PURCHASE_ORDER') }
+  return { result, row: rows[0], logs: logs.filter((l) => l.entityType === logEntity) }
 }
 
 test('outbox: a PO send rejected exactly at the deadline ends FAILED, is not requeued, and is logged on the PO at WARNING', async () => {
@@ -342,12 +361,38 @@ test('outbox: a guard-level unknown outcome on a PO is also logged on the PO', a
   assert.equal(logs[0].action, 'email_outcome_unknown')
 })
 
-test('outbox: another kind with the same socket failure after DATA is unchanged (requeued, nothing logged on a PO)', async () => {
-  behave = async (o) => { if (o.logger) sendCommand(o, 'DATA'); throw reject('ESOCKET', 'read ECONNRESET') }
-  const { row, logs } = await drainWith(makeRow({ kind: 'ACCOUNTING_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-1' }), null)
+test('outbox: a customer kind with a socket failure after DATA is single-send too: FAILED, not requeued, "may not have been delivered" notice on the order', async () => {
+  sendMailCalls = 0
+  behave = async (o) => { sendCommand(o, 'DATA'); throw reject('ESOCKET', 'read ECONNRESET') }
+  const row0 = makeRow({ kind: 'ACCOUNTING_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-1', toEmail: 'supplier@example.test' })
+  const { row, logs } = await drainWith(row0, null, false, 'SALES_ORDER')
+  assert.equal(row.status, 'FAILED')
+  assert.equal(row.attempts, 1)
+  assert.match(String(row.lastError ?? ''), /Outcome unknown/)
+  assert.equal(logs.length, 1)
+  assert.equal(logs[0].action, 'email_outcome_unknown')
+  assert.equal(logs[0].entityId, 'order-1')
+  assert.equal(logs[0].level, 'WARNING')
+  assert.match((logs[0] as unknown as { description: string }).description, /may not have been delivered/)
+  const again = await drainWith(row, null, false, 'SALES_ORDER')
+  assert.equal(again.result.processed, 0)
+  assert.equal(sendMailCalls, 1, 'no second send, so no duplicate')
+})
+
+test('outbox: a customer kind refused before DATA is still retryable', async () => {
+  behave = async () => { throw reject('ECONNECTION', 'connect ECONNREFUSED 127.0.0.1:587') }
+  const { row, logs } = await drainWith(makeRow({ kind: 'ACCOUNTING_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-1' }), null, false, 'SALES_ORDER')
+  assert.equal(row.status, 'PENDING')
+  assert.equal(logs.length, 0)
+})
+
+test('outbox: a customer kind whose deadline fires before DATA is retried with backoff, not parked as unknown', async () => {
+  behave = () => new Promise<never>(() => undefined)
+  const { row, logs } = await drainWith(makeRow({ kind: 'ACCOUNTING_INVOICE', referenceType: 'SalesOrder', referenceId: 'order-1' }), { sendDeadlineMs: 20, singleSend: true }, false, 'SALES_ORDER')
   assert.equal(row.status, 'PENDING')
   assert.equal(row.attempts, 1)
   assert.equal(logs.length, 0)
+  assert.doesNotMatch(String(row.lastError ?? ''), /Outcome unknown/)
 })
 
 test('outbox: a settlement write that fails after an unknown outcome still ends FAILED, and nothing is sent on the next tick', async () => {
@@ -364,6 +409,76 @@ test('outbox: a settlement write that fails after an unknown outcome still ends 
   // The guard's unknown-outcome branch has the same protection.
   const guarded = await drainWith(makeRow({}), { sendGuard: async () => ({ unknown: 'Outcome unknown: guard backstop.' }), singleSend: true }, true)
   assert.equal(guarded.row.status, 'FAILED')
+})
+
+test('outbox: a SENT write that throws once after a delivered send settles SENT (never PENDING), and the next drain sends nothing', async () => {
+  // Owner decision o3d-hqvrp.388: a customer email is never sent twice. Every kind, PO included.
+  for (const kind of ['PURCHASE_ORDER', 'SALES_ORDER_CONFIRMATION']) {
+    sendMailCalls = 0
+    behave = async () => ({ accepted: ['supplier@example.test'] })
+    const row = makeRow(kind === 'PURCHASE_ORDER' ? {} : { kind, referenceType: 'SalesOrder', referenceId: 'so-1' })
+    const first = await drainWith(row, { sendDeadlineMs: 60_000, singleSend: true }, 'SENT', kind === 'PURCHASE_ORDER' ? 'PURCHASE_ORDER' : 'SALES_ORDER')
+    assert.equal(sendMailCalls, 1, kind)
+    assert.equal(first.row.status, 'SENT', `${kind}: the delivered message is recorded as SENT, not requeued`)
+    assert.equal(first.result.sent, 1)
+    const again = await drainWith(first.row, { sendDeadlineMs: 60_000, singleSend: true })
+    assert.equal(again.result.processed, 0, kind)
+    assert.equal(sendMailCalls, 1, `${kind}: the next drain sends nothing`)
+  }
+})
+
+test('outbox: a sender that THROWS settles FAILED with the unknown-outcome notice, never PENDING', async () => {
+  sendMailCalls = 0
+  const row = makeRow({})
+  const { processPendingEmailOutbox } = await import('@/lib/email-outbox')
+  const { client, rows } = await makeClient([row])
+  const logs: { action: string }[] = []
+  await processPendingEmailOutbox({
+    harness: {
+      client, now: () => T0,
+      prepareQueuedEmail: async () => ({ to: 'supplier@example.test', subject: 's', html: 'h', singleSend: true }) as never,
+      logActivity: (async (entry: { action: string }) => { logs.push(entry) }) as never,
+      sendEmail: (async () => { sendMailCalls++; throw new Error('sender blew up') }) as never,
+    },
+  })
+  assert.equal(rows[0].status, 'FAILED')
+  assert.match(String(rows[0].lastError ?? ''), /Outcome unknown/)
+  assert.ok(logs.some((l) => l.action === 'email_outcome_unknown'))
+  assert.equal(sendMailCalls, 1)
+})
+
+test('guard backstop: a send still reading its SMTP settings when the backstop fires sends nothing afterwards', async () => {
+  const { runUnderPoEmailSendLock, PO_SEND_UNKNOWN_OUTCOME } = await import('../../lib/purchase-order-email.ts')
+  const { sendEmailWithSmtpSettings } = await import('../../lib/mailer.ts')
+  sendMailCalls = 0
+  behave = async () => ({ accepted: ['to@example.test'] })
+  const client = {
+    $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn({ $executeRaw: async () => undefined, setting: { findUnique: async () => ({ value: 'true' }) } }),
+  }
+  const slowSettingsRead = new Promise((resolve) => setTimeout(resolve, 100))
+  const out = await runUnderPoEmailSendLock(
+    client,
+    async (signal) => { await slowSettingsRead; return sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 60_000, singleSend: true, signal }) },
+    { backstopMs: 20 },
+  )
+  assert.deepEqual(out, { unknown: PO_SEND_UNKNOWN_OUTCOME })
+  await slowSettingsRead
+  await new Promise((resolve) => setTimeout(resolve, 30))
+  assert.equal(sendMailCalls, 0, 'the mailer saw the aborted signal and never opened a transaction with the server')
+})
+
+test('mailer: with a deadline the socket is destroyed on close (socketCloseTimeout 0), and a signal already aborted sends nothing', async () => {
+  const { sendEmailWithSmtpSettings } = await import('../../lib/mailer.ts')
+  behave = (o) => { sendCommand(o, 'DATA'); return new Promise<never>(() => undefined) }
+  await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 20, singleSend: true })
+  assert.equal(lastOptions?.socketCloseTimeout, 0, 'nodemailer 10.6: 0 destroys the socket on close')
+  sendMailCalls = 0
+  const ac = new AbortController()
+  ac.abort()
+  const r = await sendEmailWithSmtpSettings(SMTP, { ...mail, deadlineMs: 60_000, singleSend: true, signal: ac.signal })
+  assert.equal(r.success, false)
+  assert.equal(r.permanent, false)
+  assert.equal(sendMailCalls, 0)
 })
 
 test('mailer: replies are matched to commands in order, with and without PIPELINING; the reply that answers DATA (2xx or 3xx) starts the DATA phase', async () => {

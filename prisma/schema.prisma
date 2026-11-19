@@ -1386,10 +1386,57 @@ model Supplier {
   preferredForProducts Product[] @relation("ProductPreferredSupplier")
   productionOrders ProductionOrder[]
   users           User[]
+  mintsoftSupplierLink MintsoftSupplierLink?
 
   @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "suppliers_name_trgm_idx")
   @@unique([accountingContactId, accountingContactProvenance])
   @@map("suppliers")
+}
+
+/// Read-only CACHE of the Mintsoft supplier list (GET /api/Product/Suppliers). Never written to Mintsoft; refreshed by the supplier sync.
+/// Holds supplier-company contact details only (name, code, contact e-mail), no customer or order data.
+model MintsoftSupplier {
+  id            String    @id @default(cuid())
+  /// Mintsoft's ProductSupplier ID, as text.
+  externalId    String    @unique @map("external_id")
+  name          String
+  code          String?
+  email         String?
+  /// Mintsoft's ProductSupplier has no VAT field; kept for the day a tenant exposes one, so a shared VAT number is a matching signal.
+  vatNumber     String?   @map("vat_number")
+  active        Boolean   @default(true)
+  raw           Json?
+  /// The sync run that last saw this row; a row not seen by the latest full run is marked missing, never deleted.
+  lastSeenRunId String?   @map("last_seen_run_id")
+  lastSeenAt    DateTime  @default(now()) @map("last_seen_at")
+  missingSince  DateTime? @map("missing_since")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  @@map("mintsoft_suppliers")
+}
+
+/// IMS supplier -> Mintsoft supplier decision. One row per IMS supplier. state MAPPED carries externalSupplierId; CREATE_PENDING records the
+/// operator's "create in Mintsoft" choice while the create setting is off (nothing was sent); CREATING is the claim held while a create is on its
+/// way (a row left in it means the outcome is unknown: the supplier may exist in Mintsoft, so an operator checks and maps it by hand).
+model MintsoftSupplierLink {
+  id                 String    @id @default(cuid())
+  supplierId         String    @unique @map("supplier_id")
+  state              String
+  externalSupplierId String?   @map("external_supplier_id")
+  /// Who or what decided: OPERATOR_CONFIRMED_SUGGESTION, OPERATOR_PICKED, OPERATOR_CREATE, OPERATOR_CREATE_PENDING.
+  decisionSource     String    @map("decision_source")
+  /// The 0..100 suggestion score the operator saw, when the decision followed a suggestion.
+  suggestionScore    Int?      @map("suggestion_score")
+  decidedBy          String?   @map("decided_by")
+  decidedAt          DateTime  @default(now()) @map("decided_at")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+
+  supplier           Supplier  @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@index([externalSupplierId], map: "mintsoft_supplier_links_external_idx")
+  @@map("mintsoft_supplier_links")
 }
 
 /// Last known purchase price per supplier per product
@@ -1885,6 +1932,73 @@ model Customer {
   @@map("customers")
 }
 
+/// CRM customer identity: the insert-only record of every merge or unmerge between two Customer rows. The Customer rows are NEVER
+/// merged, rewritten or deleted: a cluster is a read-time overlay (lib/domain/crm/cluster-resolver.ts) over the originals, and these rows are
+/// the audit trail and the operator override.
+///   source AUTO_EMAIL  the system saw two customers share a folded email key. Audit only; the resolver re-derives that rule on every read,
+///                      so an auto row never keeps two customers joined after their emails stop matching.
+///   source OPERATOR    a MANAGER or ADMIN merged or unmerged the pair. For a pair, the NEWEST operator row decides (merge forces a link, unmerge blocks
+///                      the derived rule), whatever the email says.
+/// The pair is stored once, smaller id first (customerId < otherCustomerId, enforced by a CHECK). NO FOREIGN KEYS on purpose: the rows must outlive
+/// anything, and the table holds ids only (no name, email or free text), so an erasure has nothing to clear here. INSERT-ONLY by trigger.
+model CustomerMergeEvent {
+  id              String                 @id @default(cuid())
+  /// Strict insertion order. The newest operator row of a pair wins.
+  seq             BigInt                 @unique @default(autoincrement())
+  kind            CustomerMergeEventKind
+  source          CustomerMergeEventSource
+  customerId      String
+  otherCustomerId String
+  /// The staff user for an OPERATOR row; null for AUTO_EMAIL.
+  decidedByUserId String?
+  createdAt       DateTime               @default(now())
+
+  @@index([customerId])
+  @@index([otherCustomerId])
+  @@map("customer_merge_events")
+}
+
+/// CRM cluster erasure request: the resolved member list of one whole-person erasure, saved before the first member is erased so an erasure that fails part
+/// way is FINISHED FROM THIS LIST (re-resolving would lose members that were reachable only through an already-anonymised one). Ids only, no foreign keys, kept
+/// by an erasure. While PENDING, merge and unmerge refuse the members. Members are stored in erasure order, the requested customer last.
+model CustomerClusterErasure {
+  id                  String                       @id @default(cuid())
+  requestedCustomerId String
+  memberIds           String[]
+  status              CustomerClusterErasureStatus @default(PENDING)
+  requestedByUserId   String?
+  createdAt           DateTime                     @default(now())
+  completedAt         DateTime?
+  /// Members an operator EXCLUDED from the request (wrongly included): never erased by it, and not added back when the cluster is re-resolved.
+  excludedMemberIds   String[]                     @default([])
+  /// CANCELLED by a MANAGER/ADMIN: releases the merge/unmerge block; records already erased stay erased. The reason lives in the activity log.
+  cancelledAt         DateTime?
+  cancelledByUserId   String?
+  /// memberId -> SHA-256 (hex) of the loose identity key of the email the member had BEFORE it was erased. An erased member's email is blanked, so the completion
+  /// re-resolve finds an alias imported mid-run through these saved digests. Digests, not emails; emptied ({}) when the request completes or is cancelled.
+  memberIdentityKeys  Json                         @default("{}")
+
+  @@index([status])
+  @@index([memberIds], type: Gin)
+  @@map("customer_cluster_erasures")
+}
+
+enum CustomerClusterErasureStatus {
+  PENDING
+  COMPLETE
+  CANCELLED
+}
+
+enum CustomerMergeEventKind {
+  MERGE
+  UNMERGE
+}
+
+enum CustomerMergeEventSource {
+  AUTO_EMAIL
+  OPERATOR
+}
+
 // SALES ORDERS
 // ---------------------------------------------------------------------------
 
@@ -1937,11 +2051,20 @@ model SalesOrder {
   /// a newer resubmission; without a version it would overwrite the newer
   /// state and leave the generation stale. Older events are ignored.
   withdrawalLastWcEventAt DateTime?
+  /// The storefront withdrawal plugin's request id for the order's CURRENT request (from the helper plugin's `_oti_wdraw_request_id` order meta). IMS's own
+  /// record: the withdrawal outcome writer sends it, so a rejection never depends on a meta only the bridge wrote.
+  withdrawalRequestId String?
+  wcWithdrawalOutcomes WcWithdrawalOutcome[]
   currency          String           @default("GBP")
   fxRateToBase       Decimal          @db.Decimal(18, 8) @default(1)
 
   // Customer
   customerId        String?
+  /// The WooCommerce (storefront) customer id the order was placed under, from the payload's `customer_id` (null for a guest order, a manual
+  /// order, and an order imported before this column existed unless the stored-payload backfill reached it). Written by the order importer
+  /// on create and on every delivery that follows WooCommerce; never read by a money path. It identifies the person's storefront account,
+  /// so an erasure clears it (like Customer.externalCustomerId). Additive, no backfill in the migration.
+  externalCustomerId Int?            @map("external_customer_id")
   customerName      String?
   customerEmail     String?
   customerVatNumber String?          // customer-entered VAT/IOSS number from the storefront, sent to the WMS for customs
@@ -2301,6 +2424,8 @@ model SalesOrder {
   @@index([status])
   @@index([status, updatedAt(sort: Desc)], map: "sales_orders_status_updatedAt_idx")
   @@index([createdAt])
+  /// A customer's timeline: their orders newest first (CRM). Built CONCURRENTLY in its own migration.
+  @@index([customerId, createdAt(sort: Desc)], map: "sales_orders_customerId_createdAt_idx")
   // o3d-0qoo: "which orders are in batch <ref>" — the reverse of the delete guard's lookup.
   @@index([revenueDeferredBatchRef], map: "sales_orders_revenue_deferred_batch_ref_idx")
   @@index([inventoryAllocatedBatchRef], map: "sales_orders_inventory_allocated_batch_ref_idx")
@@ -2516,10 +2641,17 @@ model SalesOrderRefund {
   reversalStagingStatePredatesColumn Boolean @default(false) @map("reversal_staging_state_predates_column")
   refundedAt      DateTime   @default(now())
   createdAt       DateTime   @default(now())
+  /// SOFT DELETE (owner decision 2026-11-18): set when an operator deletes a refund recorded in error. The row and its credit note
+  /// number stay for audit (the lines are hard-deleted and copied whole into the deletion record's `reversal`); every ordinary reader (order refund list, refund status and ceiling, analytics, accounting checks) skips a row with
+  /// this set. NULL: a live refund. Written only by lib/domain/sales/refund-delete-service.ts.
+  deletedAt       DateTime?  @map("deleted_at")
+  deletedById     String?    @map("deleted_by_id")
+  deleteReason    String?    @map("delete_reason")
 
   order           SalesOrder @relation(fields: [orderId], references: [id])
   returnWarehouse Warehouse? @relation(fields: [returnWarehouseId], references: [id])
   lines           SalesOrderRefundLine[]
+  inboxAdoptions  SalesOrderRefundInboxAdoption[]
   /// The replacement lines added to the order for this refund (an exchange). Empty for every refund that is not part of one.
   exchangeLines   SalesOrderLine[] @relation("RefundExchangeLines")
   payments        Payment[]
@@ -2531,17 +2663,36 @@ model SalesOrderRefund {
   @@index([orderId])
   @@index([stockCorrectionRequired, stockCorrectionQueuedAt])
   @@index([returnReasonId])
+  @@index([orderId, deletedAt])
   @@map("sales_order_refunds")
+}
+
+/// o3d-iil0b: a refund ADOPTING a returns-inbox arrival the warehouse had already restocked. One row per refund and inbox row, with the units adopted, so each arrival's
+/// consumption is known per row and quantity (a row consumed in full is never adopted again; a partly consumed one offers only what is left). Rows of a soft-deleted refund
+/// are ignored when counting. Written only by lib/domain/sales/refund-service.ts, under the order lock.
+model SalesOrderRefundInboxAdoption {
+  id        String   @id @default(cuid())
+  refundId  String   @map("refund_id")
+  inboxId   String   @map("inbox_id")
+  qty       Decimal  @db.Decimal(14, 6)
+  createdAt DateTime @default(now()) @map("created_at")
+
+  refund SalesOrderRefund @relation(fields: [refundId], references: [id])
+  inbox  WmsReturnsInbox  @relation(fields: [inboxId], references: [id])
+
+  @@unique([refundId, inboxId])
+  @@index([inboxId])
+  @@map("sales_order_refund_inbox_adoptions")
 }
 
 /// Goods a refund sent back that have not yet arrived. One per refund that was routed in transit.
 /// It holds NO stock: nothing here is on hand, allocatable or pushed to a storefront. The value sits in the
 /// Stock in Transit account (the refund's COGS reversal debits it) until the units arrive or are written off.
 /// Lines carry the dispatch-cost snapshot the refund was valued at, so arrival can clear exactly that value.
-/// The record that a refund recorded in error was deleted (o3d-ngmt.22). The refund row and its lines are gone; this keeps the
+/// The record that a refund recorded in error was deleted (o3d-ngmt.22). The refund row is SOFT-deleted (deletedAt); its lines are copied whole into `reversal.lines` and hard-deleted; this keeps the
 /// identity, the credit note number and the figures it carried, who deleted it and why, and what the delete reversed. It is also the
 /// idempotency anchor: one row per deleted refund id, so a retried delete finds it and reports done.
-/// Structural data only (ids, numbers, amounts, dates): no line text and no customer detail is copied in. `reason` is the operator's own text.
+/// Mostly structural data (ids, numbers, amounts, dates). `reversal.lines` holds the deleted refund's line rows as they were, INCLUDING each line's `description` (retained product or fee text, as on the line itself). `reason` is the operator's own text.
 model SalesOrderRefundDeletion {
   id                      String   @id @default(cuid())
   /// The deleted refund's own id. Unique: a delete happens once.
@@ -4580,6 +4731,8 @@ enum WmsOperatorTaskReason {
   WC_EDIT_AFTER_PICKING
   /// A shipped unit was returned and refunded, so IMS still owes the customer those units but the warehouse push netted the gross refund: a person asks the warehouse to send the remainder. IMS changes no quantity at the warehouse.
   REFUND_REMAINDER_DUE
+  /// An EU withdrawal request filed after despatch could not be rejected on the storefront (no request id known, withdrawal plugin missing, or the write failed): a person rejects it in WooCommerce.
+  WITHDRAWAL_REJECT_NOT_WRITTEN
   /// Merge hold (setting wms_merge_hold_enabled): IMS held every order of a same-customer group in the warehouse so a person can merge them there. Carries the EU and FedEx warnings.
   MERGE_HOLD
   /// A merge hold has stood longer than MERGE_HOLD_REMIND_HOURS: a person has to merge and confirm the orders in the warehouse (IMS never releases a merge hold).
@@ -5562,6 +5715,7 @@ model WmsReturnsInbox {
   updatedAt        DateTime              @updatedAt
 
   order            SalesOrder?           @relation("WmsReturnsInboxOrder", fields: [orderId], references: [id], onDelete: SetNull)
+  refundAdoptions  SalesOrderRefundInboxAdoption[]
   product          Product?              @relation("WmsReturnsInboxProduct", fields: [productId], references: [id], onDelete: SetNull)
   warehouse        Warehouse?            @relation("WmsReturnsInboxWarehouse", fields: [warehouseId], references: [id], onDelete: SetNull)
 
@@ -5697,6 +5851,8 @@ model EmailOutbox {
   /// EMAIL_MAX_STALE_RECLAIMS (lib/email-outbox.ts); a first claim of a PENDING row does not touch it. A
   /// stale PROCESSING row at the cap is parked (PARKED_SEND_CAP) instead of reclaimed again.
   staleReclaimCount   Int              @default(0)
+  /// Stamped by the drain immediately before it enters the SMTP sender, cleared at every claim. A stale PROCESSING row with NULL here never reached the sender, so nothing was sent and it is safe to retry; one with a value may have been sent.
+  sendEnteredAt       DateTime?
   sentAt              DateTime?
   createdAt           DateTime         @default(now())
   updatedAt           DateTime         @updatedAt
@@ -6201,4 +6357,62 @@ model WriterAttestation {
 
   @@index([kind, attestedAt], map: "writer_attestations_kind_attested_idx")
   @@map("writer_attestations")
+}
+
+/// The last stock quantity the drift observer saw for one WooCommerce product or variation (switchover step W). Replaced on every observation.
+model WcStockSnapshot {
+  externalProductId String   @id @map("external_product_id")
+  sku               String?
+  quantity          Int?
+  observedAt        DateTime @map("observed_at")
+
+  @@map("wc_stock_snapshots")
+}
+
+/// A WooCommerce stock change that no order, refund or IMS push explains: Qoblex (or somebody) is still writing stock. Append-only.
+model WcStockDriftEvent {
+  id                 String   @id @default(cuid())
+  externalProductId  String   @map("external_product_id")
+  sku                String?
+  fromQuantity       Int?     @map("from_quantity")
+  toQuantity         Int?     @map("to_quantity")
+  previousObservedAt DateTime @map("previous_observed_at")
+  observedAt         DateTime @map("observed_at")
+
+  @@index([observedAt], map: "wc_stock_drift_events_observed_idx")
+  @@map("wc_stock_drift_events")
+}
+
+/// One look of the drift observer. `ok` only when the whole catalogue was read and every snapshot saved.
+model WcStockDriftRun {
+  id           String    @id @default(cuid())
+  startedAt    DateTime  @map("started_at")
+  finishedAt   DateTime? @map("finished_at")
+  ok           Boolean   @default(false)
+  productsSeen Int       @default(0) @map("products_seen")
+  driftFound   Int       @default(0) @map("drift_found")
+
+  @@index([startedAt], map: "wc_stock_drift_runs_started_idx")
+  @@map("wc_stock_drift_runs")
+}
+
+/// THE ONCE-ONLY RECORD of a withdrawal outcome written to the storefront: one row per (order, request, outcome kind). The identity is the withdrawal request,
+/// never a modified time, so a later change to the order (a tracking update, an admin edit, the plugin's own save) cannot make a second note.
+model WcWithdrawalOutcome {
+  id          String   @id @default(cuid())
+  orderId     String   @map("order_id")
+  /// `r<request id>` when IMS knows the storefront request, else the fixed `u:<order id>`; `x:<order id>:<request id>` marks an ambiguous-request task.
+  requestKey  String   @map("request_key")
+  /// The withdrawal log action (wc_withdrawal_approved, wc_withdrawal_after_dispatch, ...).
+  outcomeKind String   @map("outcome_kind")
+  /// The storefront's answer: noted, rejected, already_done, or task_raised (a terminal row: it could not be done and a task was raised).
+  result      String
+  writtenAt   DateTime @default(now()) @map("written_at")
+  /// The order's withdrawalHoldGeneration when the row was written; tells a later submission from the request that was handled.
+  holdGeneration Int?  @map("hold_generation")
+
+  order       SalesOrder @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId, requestKey, outcomeKind], map: "wc_withdrawal_outcomes_once_key")
+  @@map("wc_withdrawal_outcomes")
 }

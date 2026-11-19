@@ -63,7 +63,7 @@ async function findRefundOfOrder(orderId: string, externalRefundId: string): Pro
   // The storefront's refund id is a number; anything else names no refund.
   if (!/^\d{1,12}$/.test(externalRefundId)) return null
   const refund = await db.salesOrderRefund.findFirst({
-    where: { orderId, externalRefundId: Number(externalRefundId) },
+    where: { orderId, externalRefundId: Number(externalRefundId), deletedAt: null }, // a deleted (voided) credit note is not served to the storefront
     select: { id: true, creditNoteNumber: true },
   })
   return refund ? { refundId: refund.id, creditNoteNumber: refund.creditNoteNumber } : null

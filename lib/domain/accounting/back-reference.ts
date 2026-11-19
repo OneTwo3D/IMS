@@ -1162,6 +1162,7 @@ export async function backReferenceIsMissing(deps: BackReferenceDeps, params: Ba
     return so != null && !so.accountingInvoiceId
   }
   if (type === 'CREDIT_NOTE' && referenceType === 'SalesOrderRefund') {
+    // soft-delete exception: the credit-note id of a deleted refund is still needed to void it in the ledger.
     const refund = await deps.salesOrderRefund.findUnique({ where: { id: referenceId }, select: { accountingCreditNoteId: true } })
     return refund != null && !refund.accountingCreditNoteId
   }

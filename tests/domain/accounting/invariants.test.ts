@@ -1208,6 +1208,9 @@ test('o3d-o97 r4 + o3d-2sm1: the refund queries carry no refundStatus, status or
   // The row sets are only as visible as their queries. Every filter on the sales-order query is
   // right there and fatal here, so this pins each predicate to exactly the one condition that
   // bounds it. A window or a status filter added to either would silence its report again.
+  // The ONE added predicate is the soft-delete exclusion (`deletedAt: null`, owner decision 2026-11-18): a deleted refund is a kept audit row whose
+  // lines and ledger effects were reversed, so reporting it would raise findings against a refund that no longer exists. It is not a status,
+  // refundStatus or retention filter, so a live refund of ANY status or age is still visible.
   const refundQueries: Array<{ where: unknown; select?: Record<string, unknown> }> = []
   const client = {
     salesOrder: { async findMany() { return [] } },
@@ -1229,11 +1232,11 @@ test('o3d-o97 r4 + o3d-2sm1: the refund queries carry no refundStatus, status or
   assert.deepEqual(
     refundQueries.map((query) => query.where),
     [
-      { allocationBasisUnresolved: { not: null } },
+      { allocationBasisUnresolved: { not: null }, deletedAt: null },
       // o3d-2sm1: the flag o3d-mrwu made durable is the bound. Nothing else — a FULL refund is
       // exactly the row this set exists for, so the per-order query's `refundStatus` exclusion
       // would remove every one of them.
-      { accountingRetryRequired: true },
+      { accountingRetryRequired: true, deletedAt: null },
     ],
   )
 

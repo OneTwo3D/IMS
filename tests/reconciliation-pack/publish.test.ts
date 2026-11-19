@@ -116,7 +116,7 @@ test('exit code: 0 only when every applicable item passed', () => {
 })
 
 test('exit code: one failing applicable item is 1; fail beats inconclusive', () => {
-  const failing: ItemInput = { id: 'R15', outcome: 'fail', reasons: ['DIFFERENCES'] }
+  const failing: ItemInput = { id: 'R15', outcome: 'fail', reasons: ['DIFFERENCES'], entries: { onlyVendor: [{ key: 'A|MAIN' as never, ims: null, vendor: '1', delta: null }] } }
   assert.equal(ok(publish(fresh(), 0, { phase: 'P0', items: { ...passingAt('P0'), R15: failing } })).exitCode, 1)
   const mixed = { ...passingAt('P1'), R15: failing }
   delete (mixed as Record<string, unknown>).R3
@@ -131,7 +131,7 @@ test('exit code: one inconclusive applicable item is 5, and so is a run in which
 })
 
 test('exit code: a listed-only item (R2 at P1) is reported but never moves the exit code', () => {
-  const r2fail: ItemInput = { id: 'R2', outcome: 'fail', reasons: ['DIFFERENCES'] }
+  const r2fail: ItemInput = { id: 'R2', outcome: 'fail', reasons: ['DIFFERENCES'], entries: { onlyVendor: [{ key: 'A|MAIN' as never, ims: null, vendor: '1', delta: null }] } }
   const r2inc: ItemInput = { id: 'R2', outcome: 'inconclusive', reasons: ['NO_RUNNER'] }
   assert.equal(ok(publish(fresh(), 0, { phase: 'P1', items: { ...passingAt('P1'), R2: r2fail } })).exitCode, 0)
   assert.equal(ok(publish(fresh(), 0, { phase: 'P1', items: { ...passingAt('P1'), R2: r2inc } })).exitCode, 0)

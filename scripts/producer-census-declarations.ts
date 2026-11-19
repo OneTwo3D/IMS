@@ -50,11 +50,16 @@ export const EXCLUDED_OPERATIONS: Readonly<Record<string, string>> = {
  * producer nor an entry here fails.
  */
 export const NO_PRODUCER: Readonly<Record<string, string>> = {
-  'woocommerce.order.withdrawal-outcome': 'Owner answer 6: the endpoint stays in the WooCommerce withdrawal plugin; IMS only RECEIVES the outcome through an authenticated API, so IMS has no outbound producer for it.',
   'woocommerce.order.trackship-reconcile': 'Owner answer 6: the endpoint stays in the TrackShip plugin; IMS only receives TrackShip events through an authenticated API, so IMS has no outbound producer for it.',
 }
 
 export const DECLARATIONS: readonly Declaration[] = [
+  d('lib/connectors/woocommerce/sync/withdrawal-outcome.ts::writeWithdrawalOutcomeForEvent::postWithdrawalOutcome#1', 'woocommerce', 'order.withdrawal-outcome', 'direct-write', 'not-applicable',
+    'Owner decision 2026-11-18 (1): at step M IMS writes the outcome of a customer\'s EU withdrawal request (an order note, and the rejection of a request made after despatch) through the companion plugin\'s signed route; off unless wc_withdrawal_outcome_enabled, held until step M is live, behind the egress barrier, idempotent per outcome key.'),
+  d('scripts/switchover-gaps.ts::liveDeps::scheduleWcOrderCompletion#1', 'woocommerce', 'order.status', 'script', 'required',
+    'The per-order take-over of a G_despatch order (npm run switchover:gaps -- --take-over): it reads the storefront order first, then queues the ordinary completion job with the obligation time now (dry run by default); the producer seam keeps it a shadow until step M is live.'),
+  d('scripts/switchover-hand-back.ts::liveLoad::wcPut#1', 'woocommerce', 'order.status', 'script', 'required',
+    'Rollback of step M (npm run switchover:hand-back): writes the bridge\'s link metas _mintsoft_order_id and _mintsoft_order_number onto open orders IMS created in Mintsoft, so the resumed bridge adopts them. Dry run by default, reads each order first, goes through wcPut and so through the egress barrier.'),
   d('app/(dashboard)/sync/exceptions/exceptions-client.tsx::ExceptionsClient::replayWmsOrderPush#1', 'mintsoft', 'order.create', 'operator-action', 'required',
     'Exceptions-inbox button that re-arms the create of a Mintsoft order.'),
   d('app/(dashboard)/sync/exceptions/exceptions-client.tsx::ExceptionsClient::repushMissingWmsOrder#1', 'mintsoft', 'order.create', 'operator-action', 'required',
@@ -287,6 +292,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'The connector method delegates to the Mintsoft product deleter (DELETE /api/Product/{id}).'),
   d('lib/connectors/mintsoft/index.ts::MintsoftConnector.createAsn::createMintsoftAsn#1', 'mintsoft', 'asn.create', 'facade', 'not-applicable',
     'The connector method delegates to the Mintsoft ASN writer.'),
+  d('lib/connectors/mintsoft/index.ts::MintsoftConnector.createSupplier::createMintsoftSupplier#1', 'mintsoft', 'supplier.create', 'facade', 'not-applicable',
+    'The connector method delegates to the Mintsoft supplier creator (PUT /api/Product/Suppliers). Create-only: nothing here updates a supplier.'),
   d('lib/connectors/mintsoft/index.ts::MintsoftConnector.createBundle::createMintsoftBundle#1', 'mintsoft', 'product.bundle', 'facade', 'not-applicable',
     'The connector method delegates to the Mintsoft bundle writer.'),
   d('lib/connectors/mintsoft/index.ts::MintsoftConnector.pushOrder::pushMintsoftOrder#1', 'mintsoft', 'order.create', 'facade', 'required',
@@ -327,6 +334,10 @@ export const DECLARATIONS: readonly Declaration[] = [
     'The bare-reference check that the connector offers a delete method; it calls nothing. The call itself is the next declaration.'),
   d('lib/connectors/mintsoft/sync/parent-sku-deletion.ts::deleteConfirmedParent::deleteProduct#1', 'mintsoft', 'product.delete', 'seam', 'not-applicable',
     'Deletes the Mintsoft record of one variable product\'s parent SKU; reached only by the product verify run, behind mintsoft_parent_sku_delete_enabled (default off), after the stored links prove every variation present. SHADOW by producerDisposition until IMS is the live writer; also held by the outbound-write hold.'),
+  d('lib/connectors/mintsoft/suppliers/mapping.ts::createMintsoftSupplierForImsSupplier::createSupplier[reference]#1', 'mintsoft', 'supplier.create', 'direct-write', 'not-applicable',
+    'The bare-reference check that the connector offers a supplier create; it calls nothing. The call itself is the next declaration.'),
+  d('lib/connectors/mintsoft/suppliers/mapping.ts::createMintsoftSupplierForImsSupplier::createSupplier#1', 'mintsoft', 'supplier.create', 'seam', 'not-applicable',
+    'Creates one supplier in Mintsoft when an operator chooses "create in Mintsoft"; behind mintsoft_supplier_create_enabled (default off, which records the choice as pending and sends nothing). SHADOW by producerDisposition until IMS is the live writer; also held by the outbound-write hold.'),
   d('lib/connectors/mintsoft/sync/product-sync.ts::syncOneMintsoftProduct::upsertProduct#1', 'mintsoft', 'product.upsert', 'seam', 'not-applicable',
     'Upserts one product in Mintsoft; reached by the product-sync hook, the verify cron and the operator button.'),
   d('lib/connectors/mintsoft/sync/stock-sync.ts::enqueueAlignmentStockSync::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',

@@ -128,7 +128,7 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
       shoppingLinks: { select: { connector: true } },
       lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true, discountAmount: true, cogsBase: true, taxRate: { select: { rate: true } } } },
       // o3d-iigc: the basis was not even fetched before, so the report could not have respected it.
-      refunds: { select: { totalsBasis: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
+      refunds: { where: { deletedAt: null }, select: { totalsBasis: true, lines: { select: { productId: true, qty: true, totalBase: true } } } },
     },
   })
 
@@ -468,7 +468,7 @@ export async function getInvoiceStats(dateFrom?: string, dateTo?: string): Promi
       invoicedAt: true, createdAt: true, status: true, totalBase: true, totalForeign: true, currency: true, paidAt: true, paymentRemovedForeign: true, paymentRemovals: { select: { kind: true, amountForeign: true, createdAt: true } },
       lines: { select: { productId: true, sku: true, description: true, qty: true, totalBase: true } },
       payments: { select: { amount: true, currency: true, paidAt: true, refundId: true, settlementRateToBase: true } },
-      refunds: { select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
+      refunds: { where: { deletedAt: null }, select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
     },
   })
 
@@ -539,7 +539,7 @@ export async function getRefundStats(dateFrom?: string, dateTo?: string): Promis
   if (dateTo) dateFilter.lte = new Date(dateTo + 'T23:59:59')
 
   const refunds = await db.salesOrderRefund.findMany({
-    where: Object.keys(dateFilter).length ? { refundedAt: dateFilter } : undefined,
+    where: Object.keys(dateFilter).length ? { refundedAt: dateFilter, deletedAt: null } : { deletedAt: null },
     select: {
       id: true, creditNoteNumber: true, reason: true, totalBase: true, refundedAt: true, totalsBasis: true,
       // taxBase is what makes the order's NET total derivable, so a NET credit can be measured
@@ -626,7 +626,7 @@ export async function getCustomerAging(): Promise<CustomerAgingRow[]> {
       shipFromWarehouse: { select: { code: true } },
       payments: { select: { amount: true, currency: true, paidAt: true, refundId: true, settlementRateToBase: true } },
       // o3d-iigc: the basis was not fetched before, so the report could not have respected it.
-      refunds: { select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
+      refunds: { where: { deletedAt: null }, select: { ...REFUND_TURNOVER_SELECT.select, refundedAt: true } },
     },
     orderBy: { createdAt: 'desc' },
   })

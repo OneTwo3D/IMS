@@ -3,6 +3,7 @@ import { legacyLiveFromFindings } from '@/lib/security/live-from-legacy-config'
 import { explainProducerDisposition, parseProducerCutoff, producerGrantCutoffAgreement } from '@/lib/security/producer-disposition'
 import { PRODUCER_STEP_ENV, liveStepsOfDestination } from '@/lib/security/producer-disposition-constants'
 import { producerOperationEgressVerdict, producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
+import { XERO_SYNC_TYPE_SETTING } from '@/lib/connectors/xero/sync-type-setting'
 import { LIVE_WRITER_STEPS, WRITER_OWNERSHIP_MAP, type LiveWriterStep, type OwnershipRow } from '@/lib/security/writer-ownership-map'
 import {
   EVIDENCE_CONTESTS,
@@ -86,6 +87,20 @@ export const WRITER_CRON_ROUTES: Readonly<Record<string, 'always-callable' | 'fl
   'wms-order-push': 'always-callable',
 }
 
+/**
+ * THE POSTING-MODE REQUIREMENT OF THE JOURNAL OPERATION, DERIVED FROM THE SAME TWO TABLES THE QUEUE GATE USES: every sync type in the
+ * ownership row of `xero.inventory.journals`, and the queue's per-type switch table. A type with a switch contributes it ("any of these
+ * on"); a type with NO switch (STOCK_IN_TRANSIT, UNEARNED_REV_REVERSAL, ALLOCATION_REVERSAL) is queued as 'submitted' whenever Xero sync is
+ * on, so it makes the operation a capability on the master switch alone and no per-type setting can say IMS cannot write it.
+ */
+function journalModeRequirement(): Requirement[] {
+  const row = (WRITER_OWNERSHIP_MAP as readonly OwnershipRow[]).find((entry) => entry.destination === 'xero' && entry.operation === 'inventory.journals')
+  const types = row?.accountingSyncTypes ?? []
+  const keys = types.map((type) => XERO_SYNC_TYPE_SETTING[type])
+  if (keys.length === 0 || keys.some((key) => key === undefined)) return []
+  return [{ anyMode: [...new Set(keys as string[])] }]
+}
+
 /** The IMS-side switches of every operation IMS has a writer for. */
 export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   { key: 'xero.sales.invoice', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_sales_invoice' }] },
@@ -100,16 +115,7 @@ export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   { key: 'xero.purchase.bill-payment', trigger: 'automatic', requires: [...XERO_MASTER] },
   { key: 'xero.purchase.bill-attachment', trigger: 'automatic', requires: [...XERO_MASTER, { settingTrue: 'xero_sync_attach_pdf', defaultValue: 'true' }] },
   { key: 'xero.purchase.supplier-credit', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_purchase_credit_note' }] },
-  {
-    key: 'xero.inventory.journals',
-    trigger: 'automatic',
-    requires: [...XERO_MASTER, {
-      anyMode: [
-        'xero_sync_stock_receipt', 'xero_sync_inventory_adjustment', 'xero_sync_cogs_journal', 'xero_sync_cogs_reversal',
-        'xero_sync_stock_allocation', 'xero_sync_manufacturing_journal',
-      ],
-    }],
-  },
+  { key: 'xero.inventory.journals', trigger: 'automatic', requires: [...XERO_MASTER, ...journalModeRequirement()] },
   { key: 'xero.daily-batch', trigger: 'automatic', requires: [...XERO_MASTER, { settingTrue: 'xero_daily_batch_enabled', defaultValue: 'false' }] },
   { key: 'xero.tax-rate', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_tax_rate' }] },
   { key: 'mintsoft.order.create', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
@@ -122,15 +128,19 @@ export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   { key: 'mintsoft.product.delete', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }, { settingTrue: 'mintsoft_parent_sku_delete_enabled', defaultValue: 'false' }] },
   { key: 'mintsoft.product.bundle', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
   { key: 'mintsoft.asn.create', trigger: 'operator', requires: [{ plugin: 'mintsoft' }] },
+  { key: 'mintsoft.supplier.create', trigger: 'operator', requires: [{ plugin: 'mintsoft' }, { settingTrue: 'mintsoft_supplier_create_enabled', defaultValue: 'false' }] },
   { key: 'woocommerce.stock', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, { settingTrue: 'wc_stock_sync_enabled', defaultValue: 'false' }] },
   { key: 'woocommerce.product.meta', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }] },
   { key: 'woocommerce.order.status', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }] },
   { key: 'woocommerce.order.tracking', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }] },
   { key: 'woocommerce.order.partial-shipment', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }] },
   { key: 'woocommerce.order.wms-status-meta', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }] },
-  { key: 'woocommerce.order.invoice-note', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, ...XERO_MASTER, { mode: 'xero_sync_sales_invoice' }] },
+  // A dedicated switch (default OFF): the note used to follow xero_sync_sales_invoice, which defaults on, so IMS's note would have joined Xeroom's the moment the Xero flow ran.
+  { key: 'woocommerce.order.invoice-note', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, ...XERO_MASTER, { settingTrue: 'wc_invoice_note_enabled', defaultValue: 'false' }] },
   { key: 'woocommerce.order.invoice-document', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, { settingTrue: 'wc_invoice_document_enabled', defaultValue: 'false' }] },
   // The bridge's /trackship/reconcile is taken over by the refire (owner decision 2026-11-18): the same switch drives both rows.
+  // The outcome of a customer's EU withdrawal request, written to the storefront order (companion plugin 1.5.0); off by default.
+  { key: 'woocommerce.order.withdrawal-outcome', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, { settingTrue: 'wc_withdrawal_outcome_enabled', defaultValue: 'false' }] },
   { key: 'woocommerce.order.trackship-reconcile', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, { settingTrue: 'trackship_refire_enabled', defaultValue: 'false' }] },
   { key: 'woocommerce.order.trackship-refire', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, { settingTrue: 'trackship_refire_enabled', defaultValue: 'false' }] },
   { key: 'woocommerce.fx-rates', trigger: 'automatic', requires: [{ plugin: 'woocommerce' }, { settingTrue: 'wc_fx_push_enabled', defaultValue: 'false' }] },
@@ -142,7 +152,6 @@ export const WRITERS_WITHOUT_IMS_SWITCH: Readonly<Record<string, string>> = {
   'xero.fx-journal': 'never produced for Xero (suppressed)',
   'xero.demo-provisioning': 'a manual script against a demo tenant; no setting or schedule drives it',
   'mintsoft.auth.login': 'key minting is governed by the transport hold, not by a producer',
-  'woocommerce.order.withdrawal-outcome': 'the IMS writer is a later build (until then the bridge plugin\'s route does this; the map gives it to IMS from step M, so the no-writer check fails the phase until the writer exists)',
   'woocommerce.tax-rate': 'IMS has no writer for it yet (the owner corrects WooCommerce by hand from the VAT difference report in P1 and P2; the map gives it to IMS when the writer is built)',
 }
 
@@ -509,6 +518,9 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
       case 'unreadable':
         unreadable(kind, `${STEP_EVIDENCE_LABEL[kind]} could not be read, and phase ${phase} requires it.`)
         break
+      case 'not-due':
+        unreadable(kind, `${STEP_EVIDENCE_LABEL[kind]} was not asked (its reader judges the step not live) although phase ${phase} requires it: the live-from instants could not be read consistently.`)
+        break
       case 'absent':
         findings.push({ code: 'attestation-missing', severity: 'fail', subject: kind, message: `Phase ${phase} requires ${STEP_EVIDENCE_LABEL[kind]}, and none is recorded.` })
         break
@@ -647,7 +659,7 @@ export async function readWritersCheckInputs(options: { env?: Record<string, str
 
   // Never throws: a reader that fails answers `unreadable` for its own kind.
   const { readStepEvidence } = await import('@/lib/ops/writers-check-step-evidence')
-  base.stepEvidence = await readStepEvidence({ db: db as never, now })
+  base.stepEvidence = await readStepEvidence({ db: db as never, now, env })
 
   const floors = evidenceFloors(env, now, windowDays)
   try {

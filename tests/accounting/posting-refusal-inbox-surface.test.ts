@@ -1235,6 +1235,7 @@ test('[o3d-j625 r26] every writer to a refusal row accounts for the hand-post cl
     'lib/domain/accounting/posting-mark-handled.ts',
     'lib/domain/accounting/posting-refusal-inbox.ts',
     'lib/domain/accounting/posting-suppression.ts',
+    'lib/domain/sales/refund-delete-service.ts',
   ]
   for (const file of expected) {
     assert.ok(files.includes(file), `PRECONDITION: the walk must reach ${file}, or this census asserts nothing`)
@@ -1278,6 +1279,15 @@ test('[o3d-j625 r26] every writer to a refusal row accounts for the hand-post cl
   const suppression = await readFile(path.join(root, 'lib/domain/accounting/posting-suppression.ts'), 'utf8')
   assert.match(suppression, /where: \{ \.\.\.key, resolvedAt: null, handPostClaimedAt: \{ not: null \} \}/,
     'the deferral record only fires while a claim is held, which is the whole of what it records')
+
+  // THE REFUND DELETE's one write closes the owed-posting record an adopting refund raised, because the refund it names is gone. It is an
+  // updateMany on a single scope, predicated on `resolvedAt: null` AND `handPostClaimedAt: null`: a row an operator has claimed to settle by hand
+  // is never resolved from under them (the same rule as the clear), so it cannot cause a stuck suppression or a duplicate hand-post.
+  const refundDelete = await readFile(path.join(root, 'lib/domain/sales/refund-delete-service.ts'), 'utf8')
+  assert.equal((refundDelete.match(/accountingPostingRefusal\.(update|updateMany|upsert|delete|deleteMany|create)\(/g) ?? []).length, 1,
+    'the refund delete makes exactly one refusal-row write')
+  assert.match(refundDelete, /accountingPostingRefusal\.updateMany\(\{\s*\n\s*where: \{[^\n]*resolvedAt: null, handPostClaimedAt: null \}/,
+    'the refund delete closes only an unresolved, UNCLAIMED row')
 
   // AND NOTHING DELETES A REFUSAL ROW in production, which is what lets the census reason about lifecycles.
   for (const file of expected) {

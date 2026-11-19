@@ -579,3 +579,24 @@ test('an importer result without the system outcome ends the step FAILED and jou
   assert.deepEqual(step.importer[0].errors, [{ code: 'EXCEPTION', row: null }])
   assert.equal(db.journalRecord?.steps.suppliers?.status, 'FAILED')
 })
+
+test('run lease: a resume of a RUNNING record while another runner holds the run lease is refused before the record is touched or any importer is called; with the lease free it resumes', async () => {
+  const { prepared, db, options } = setup()
+  assert.equal((await runLoad(prepared, db.ports(), options())).exit, 'OK')
+  db.journalRecord = { ...(db.journalRecord as RunRecord), status: 'RUNNING' }
+  const runningVersion = (db.journalRecord as RunRecord).version
+  const executedBefore = db.executed.length
+  for (const reason of ['busy', 'unavailable'] as const) {
+    const refused = await runLoad(prepared, db.ports({ withRunLease: async () => { throw new StepLockError(reason) } }), options({ resume: true }))
+    assert.equal(refused.exit, 'PRECONDITION_REFUSED', reason)
+    assert.match(refused.problems[0], /another runner holds this load/)
+  }
+  assert.equal((db.journalRecord as RunRecord).version, runningVersion, 'the record was not advanced by the refused runner')
+  assert.equal(db.executed.length, executedBefore, 'no importer call was made')
+  let leased = 0
+  const resumed = await runLoad(prepared, db.ports({ withRunLease: async (body) => { leased++; return body() } }), options({ resume: true }))
+  assert.equal(leased, 1, 'the whole run ran under one lease')
+  assert.equal(resumed.exit, 'OK', resumed.problems.join('; '))
+  const lost = await runLoad(prepared, db.ports({ withRunLease: async (body) => { await body(); throw new StepLockError('lost') } }), options({ resume: true }))
+  assert.notEqual(lost.exit, 'OK', 'a lease that was lost during the run is never reported as a success')
+})
