@@ -621,6 +621,30 @@ build_node_options() {
 # Validated up front: a malformed override found at the build step is found after the pull.
 BUILD_NODE_OPTIONS="$(build_node_options)" || { echo "Nothing has been changed." >&2; exit 1; }
 
+# THE NODE MAJOR THIS HOST RUNS MAY NOT BE BELOW THE ONE package.json "engines" ASKS FOR.
+#
+# CI exercises only the engines major, and `npm ci` does not enforce engines (.npmrc does not set
+# engine-strict, and the warning is easy to miss), so without this a release that uses an API newer
+# than the host's Node deploys cleanly and fails at runtime. It reads the major from the
+# `>=N` form of engines.node in the tree about to be built, compares it with the running Node, and
+# REFUSES while nothing has been stopped, built or migrated. An engines range in any other form
+# is not evaluated here (it is left to npm). Both entrypoints carry this function.
+node_engine_preflight() {
+  local pkg="$1" want have
+  [[ -r "${pkg}" ]] || return 0
+  want="$(sed -n '/"engines"[[:space:]]*:/,/}/s/.*"node"[[:space:]]*:[[:space:]]*">=[[:space:]]*v\{0,1\}\([0-9][0-9]*\).*/\1/p' "${pkg}" | head -n 1)" || want=""
+  [[ -n "${want}" ]] || return 0
+  have="$(node -p 'process.versions.node.split(".")[0]' 2>/dev/null)" || have=""
+  if [[ ! "${have}" =~ ^[0-9]+$ ]]; then
+    die "Cannot determine the installed Node version (\`node\` is missing or failed), and ${pkg} requires Node ${want} or newer. Install Node ${want}+ and re-run. NOTHING HAS BEEN STOPPED, BUILT OR MIGRATED BY THIS RUN."
+  fi
+  if (( have < want )); then
+    die "This host runs Node ${have} and ${pkg} requires Node ${want} or newer (engines.node). Upgrade Node first (NodeSource setup_${want}.x, then upgrade the nodejs package), run npm ci as the application user, and re-run. NOTHING HAS BEEN STOPPED, BUILT OR MIGRATED BY THIS RUN."
+  fi
+}
+
+node_engine_preflight "${APP_DIR_REAL}/package.json"
+
 as_app_user() {
   if [[ "$(id -un)" == "$APP_USER" ]]; then
     "$@"
