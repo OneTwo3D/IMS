@@ -12,7 +12,7 @@ export type UnitDpRoundingResolution = { ok: true; account: string | null; rateO
  * so a document whose prices Xero keeps exactly never touches them.
  */
 export async function resolveUnitDpRoundingAccount(input: Omit<XeroRoundingPlanInput, 'account' | 'rateOf'>): Promise<UnitDpRoundingResolution> {
-  if (!unitDpChangesAnyLine(input.lines)) return { ok: true, account: null, rateOf: undefined }
+  if (!unitDpChangesAnyLine(input.lines) && typeof input.orderTotal !== 'number') return { ok: true, account: null, rateOf: undefined }
   let rateOf: XeroTaxRateOf | undefined
   if (!input.lineAmountsIncludeTax) {
     const rates = await loadStoredXeroRateOf()

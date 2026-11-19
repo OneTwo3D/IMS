@@ -122,7 +122,7 @@ export function salesInvoiceRoundingInput(data: InvoiceData): Omit<XeroRoundingP
   const extraLines: XeroTotalLine[] = []
   if (connectorEmitsShipping(data)) extraLines.push({ quantity: 1, unitAmount: data.shippingAmount, taxType: data.shippingTaxType })
   if (connectorEmitsDiscount(data)) extraLines.push({ quantity: 1, unitAmount: -data.discountAmount, taxType: data.discountTaxType })
-  return { lines: data.lines, extraLines, lineAmountsIncludeTax: Boolean(data.lineAmountsIncludeTax) }
+  return { lines: data.lines, extraLines, lineAmountsIncludeTax: Boolean(data.lineAmountsIncludeTax), orderTotal: data.orderTotal ?? null }
 }
 
 export function buildSalesInvoicePayload(

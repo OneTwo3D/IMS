@@ -22,6 +22,7 @@ import {
 } from '@/lib/domain/purchasing/landed-cost-service'
 import { validatePurchaseOrderStatusTransition } from '@/lib/domain/workflows/action-guards'
 import { lockLandedCostRevaluationScope } from '@/lib/domain/wms/transfer-asn-lock-order'
+import { billNetPayableBase } from '@/lib/domain/purchasing/bill-net-payable'
 import { supplierCreditNoteAmountBase } from '@/lib/domain/purchasing/supplier-credit-note-amount'
 
 const PURCHASE_ORDER_CANCELLATION_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -156,7 +157,9 @@ export async function cancelPurchaseOrderService(
           type: true,
           // Base-currency totals are the GL predicate; per-bill credit attribution
           // prevents a credit for one bill satisfying another (Codex review).
-          invoices: { select: { id: true, totalBase: true } },
+          currency: true,
+          // The reverse-charge lines give the NET PAYABLE the credit gate offsets against (the stored total carries VAT the bill accounts for itself).
+          invoices: { select: { id: true, totalBase: true, totalForeign: true, lines: { select: { totalForeign: true, taxRateValue: true, taxReverseCharge: true } } } },
           supplierCreditNotes: { where: { status: 'POSTED' }, select: { purchaseInvoiceId: true, amountBase: true, amountForeign: true, fxRateToBase: true } },
         },
       })
@@ -181,7 +184,7 @@ export async function cancelPurchaseOrderService(
         const invoiceGate = evaluatePurchaseOrderCancellationInvoiceGate({
           isFreight: existing.type === 'FREIGHT',
           invoices: existing.invoices.map((inv) => ({
-            totalBase: Number(inv.totalBase),
+            totalBase: billNetPayableBase(inv, existing.currency).toNumber(),
             creditedBase: creditedBaseByInvoice.get(inv.id) ?? 0,
           })),
         })
