@@ -7,6 +7,7 @@ import {
   resolveSwitchKey,
   validateSwitchValue,
   writeSwitch,
+  adminRefusal,
   crossKeyRefusal,
   type SwitchWriteClient,
 } from '@/lib/domain/settings/system-switches'
@@ -16,6 +17,9 @@ import {
  * `npm run settings:set -- --key <k> --value <v> --by <name> --reason "<text>" [--yes]`
  *     without --yes: a dry run showing the current and proposed values, writing nothing;
  *     with --yes: the settings row and an activity-log entry (who, why, old, new) in ONE transaction, then a read-back.
+ *
+ * The Mintsoft supplier switches are ADMIN with a fresh sign-in in the screen. A shell has no session, so ADMIN authority is ASSUMED from shell
+ * access, and writing one needs --confirm-admin as well as --yes; the audit entry records the operator (--by) and that ADMIN was assumed.
  *
  * Only the allowlisted system-managed switches in lib/domain/settings/system-switches.ts; credentials are refused. Never prints a secret.
  * Exit codes: 0 ok, 3 usage or refused input, 5 failed.
@@ -39,13 +43,15 @@ export async function runSettingsCli(options: SettingsCliOptions): Promise<numbe
   const args = options.argv ?? process.argv.slice(2)
   const usage = options.mode === 'get'
     ? 'Usage: npm run settings:get -- --key <key>'
-    : 'Usage: npm run settings:set -- --key <key> --value <value> --by <name> --reason "<text>" [--yes]'
+    : 'Usage: npm run settings:set -- --key <key> --value <value> --by <name> --reason "<text>" [--yes] [--confirm-admin]'
 
   const values: Record<string, string> = {}
   let yes = false
+  let confirmAdmin = false
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i]
     if (arg === '--yes' && options.mode === 'set') { yes = true; continue }
+    if (arg === '--confirm-admin' && options.mode === 'set') { confirmAdmin = true; continue }
     const allowed = options.mode === 'get' ? ['--key'] : ['--key', '--value', '--by', '--reason']
     if (!allowed.includes(arg)) { stderr.error(usage); return 3 }
     const value = args[i + 1]
@@ -89,13 +95,15 @@ export async function runSettingsCli(options: SettingsCliOptions): Promise<numbe
 
     const refusal = await crossKeyRefusal(db, def, proposed)
     if (refusal) { stderr.error(refusal); return 3 }
+    if (def.adminOnly && yes && !confirmAdmin) { stderr.error(adminRefusal(def)); return 3 }
     if (!yes) {
+      if (def.adminOnly) stdout.log(`${def.key} is an ADMIN switch in the screen; writing it needs --yes --confirm-admin (ADMIN authority is assumed from shell access).`)
       stdout.log(`Dry run. ${def.key}: current ${current.stored === null ? `(no row, default ${def.defaultValue})` : current.stored}, proposed ${proposed}${current.stored === proposed ? ' (no change)' : ''}.`)
       stdout.log(`By ${by}: ${reason}`)
       stdout.log('Nothing written; add --yes to apply.')
       return 0
     }
-    const result = await writeSwitch(db, { def, value: proposed, by, reason })
+    const result = await writeSwitch(db, { def, value: proposed, by, reason, adminConfirmed: confirmAdmin })
     if (!result.ok) { stderr.error(result.error); return 3 }
     if (!result.changed) { stdout.log(`${def.key} is already ${proposed}; nothing written, no audit entry added.`); return 0 }
     const back = await readSwitch(db, def)

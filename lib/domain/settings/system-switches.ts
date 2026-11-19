@@ -17,8 +17,11 @@ import { WMS_MERGE_CANDIDATE_MODES, WMS_MERGE_CANDIDATE_MODE_SETTING } from '@/l
  * AN ALLOWLIST, NOT A DENYLIST. A key that is not listed is refused, and so is every key in the encrypted-settings set (a credential), before
  * anything is read or written, with a message that never echoes a stored value.
  *
- * KEYS NOT HERE ON PURPOSE: switches that exist only in an open pull request (the supplier/ASN and storefront-customer-email switches) are added
- * with the code that reads them.
+ * ADMIN SWITCHES. The three supplier switches are ADMIN-with-fresh-sign-in in the screen (the supplier mapping screen), because they
+ * change what IMS sends to the LIVE warehouse. A shell has no session, so the command assumes ADMIN authority from shell access to the host and, in
+ * exchange, refuses to write one without `--confirm-admin` as well as `--yes`, and records the operator (`--by`) and that assumption in the audit entry.
+ *
+ * KEYS NOT HERE ON PURPOSE: the storefront-customer-email switch exists only in an open pull request and is added with the code that reads it.
  */
 
 export type SwitchKind = 'boolean' | 'enum'
@@ -31,13 +34,28 @@ export type SwitchDefinition = {
   readonly defaultValue: string
   /** Switches that must already be `true` / a given value before this one may be turned on. */
   readonly requires?: ReadonlyArray<{ key: string; value: string; why: string }>
+  /** The screen that sets this switch needs ADMIN and a fresh sign-in; the command needs `--confirm-admin` to write it and records that it assumed ADMIN. */
+  readonly adminOnly?: boolean
 }
 
 const BOOLEAN_VALUES = ['true', 'false'] as const
 
-const booleanSwitch = (key: string, requires?: SwitchDefinition['requires']): SwitchDefinition => ({
-  key, kind: 'boolean', allowed: BOOLEAN_VALUES, defaultValue: 'false', requires,
+const booleanSwitch = (key: string, requires?: SwitchDefinition['requires'], adminOnly?: boolean): SwitchDefinition => ({
+  key, kind: 'boolean', allowed: BOOLEAN_VALUES, defaultValue: 'false', requires, adminOnly,
 })
+
+// Literals, not imports of the connector's constants: that module imports the database client, which this registry (and its tests) must not load.
+// tests/settings-cli.test.ts holds them equal to the connector's exported constants.
+const SUPPLIER_CREATE_KEY = 'mintsoft_supplier_create_enabled' // wms-connector-boundary-ok: 2026-11-19: operator switch registry names the setting key
+const ASN_SEND_SUPPLIER_KEY = 'mintsoft_asn_send_supplier_enabled' // wms-connector-boundary-ok: 2026-11-19: operator switch registry names the setting key
+const ASN_SUPPLIER_REQUIRED_KEY = 'mintsoft_asn_supplier_required' // wms-connector-boundary-ok: 2026-11-19: operator switch registry names the setting key
+
+// The screen refuses "required" unless "send the supplier" is on (the field name is unverified until controlled-run step 2), so it is a prerequisite here too.
+const ASN_REQUIRED_NEEDS_SEND = {
+  key: ASN_SEND_SUPPLIER_KEY,
+  value: 'true',
+  why: 'refusing an ASN without a mapped supplier needs the supplier to be sent on the ASN as well (only after controlled-run step 2 has verified the field)',
+}
 
 const PARENT_SKU_DELETE_NEEDS_PARITY = {
   key: 'mintsoft_product_parity_enabled', // wms-connector-boundary-ok: 2026-11-19: operator switch registry names the setting key
@@ -59,6 +77,9 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   booleanSwitch('wc_invoice_document_enabled'),
   booleanSwitch('wms_refund_remainder_task_enabled'),
   booleanSwitch('wc_order_amendment_write_enabled'),
+  booleanSwitch(SUPPLIER_CREATE_KEY, undefined, true),
+  booleanSwitch(ASN_SEND_SUPPLIER_KEY, undefined, true),
+  booleanSwitch(ASN_SUPPLIER_REQUIRED_KEY, [ASN_REQUIRED_NEEDS_SEND], true),
 ]
 
 export const SYSTEM_SWITCH_KEYS: readonly string[] = SYSTEM_SWITCHES.map((s) => s.key)
@@ -135,6 +156,10 @@ export async function crossKeyRefusal(client: ReadClient, def: SwitchDefinition,
   return null
 }
 
+export function adminRefusal(def: SwitchDefinition): string {
+  return `${def.key} needs ADMIN with a fresh sign-in in the screen. This command assumes ADMIN authority from shell access to the host: add --confirm-admin to confirm you act as an ADMIN, and --by names who is accountable.`
+}
+
 export type SwitchReading = {
   key: string
   stored: string | null
@@ -169,7 +194,7 @@ export async function readSwitch(client: AuditReadClient, def: SwitchDefinition)
   }
 }
 
-export type SwitchWriteInput = { def: SwitchDefinition; value: string; by: string; reason: string }
+export type SwitchWriteInput = { def: SwitchDefinition; value: string; by: string; reason: string; adminConfirmed?: boolean }
 
 type TxClient = ReadClient & {
   setting: ReadClient['setting'] & { upsert(args: Record<string, unknown>): Promise<unknown> }
@@ -193,7 +218,8 @@ class SwitchRefused extends Error {}
  * An unchanged value writes nothing, not even an audit row.
  */
 export async function writeSwitch(client: SwitchWriteClient, input: SwitchWriteInput): Promise<SwitchWriteResult> {
-  const { def, value, by, reason } = input
+  const { def, value, by, reason, adminConfirmed } = input
+  if (def.adminOnly && !adminConfirmed) return { ok: false, error: adminRefusal(def) }
   try {
     return await client.$transaction(async (tx) => {
       const refusal = await crossKeyRefusal(tx, def, value)
@@ -209,7 +235,8 @@ export async function writeSwitch(client: SwitchWriteClient, input: SwitchWriteI
         action: SWITCH_AUDIT_ACTION,
         tag: 'settings',
         description: `System switch ${def.key} changed from ${oldValue ?? `(unset, default ${def.defaultValue})`} to ${value} by ${by}: ${reason}`,
-        metadata: { by, reason, oldValue, newValue: value, via: 'settings:set' },
+        ...(def.adminOnly ? { level: 'WARNING' as const } : {}),
+        metadata: { by, reason, oldValue, newValue: value, via: 'settings:set', ...(def.adminOnly ? { adminAuthorityAssumed: true } : {}) },
       })
       const after = await tx.setting.findUnique({ where: { key: def.key } })
       if (after?.value !== value) throw new Error(`Read-back of ${def.key} did not match what was written; nothing was committed.`)

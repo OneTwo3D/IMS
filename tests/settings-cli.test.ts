@@ -49,7 +49,8 @@ const SET = ['--by', 'jan', '--reason', 'switchover step M']
 
 test('allowlist contains exactly the switches that exist on development, and none is a credential', () => {
   assert.deepEqual([...SYSTEM_SWITCH_KEYS].sort(), [
-    'mintsoft_parent_sku_delete_enabled', 'mintsoft_product_parity_enabled', 'trackship_refire_enabled', 'wc_invoice_document_enabled',
+    'mintsoft_asn_send_supplier_enabled', 'mintsoft_asn_supplier_required', 'mintsoft_parent_sku_delete_enabled',
+    'mintsoft_product_parity_enabled', 'mintsoft_supplier_create_enabled', 'trackship_refire_enabled', 'wc_invoice_document_enabled',
     'wc_invoice_note_enabled', 'wc_order_amendment_write_enabled', 'wc_withdrawal_outcome_enabled', 'wms_merge_candidate_mode',
     'wms_merge_hold_enabled', 'wms_mixed_warehouse_push_enabled', 'wms_refund_remainder_task_enabled',
   ])
@@ -141,4 +142,68 @@ test('--by must be a name, --reason is required, unknown flags and bad values ar
 test('an unchanged value writes nothing and adds no audit entry', async () => {
   const r = await run('set', ['--key', 'wc_invoice_note_enabled', '--value', 'true', ...SET, '--yes'], fakeDb({ wc_invoice_note_enabled: 'true' }))
   assert.equal(r.code, 0); assert.match(r.out, /nothing written/); assert.equal(r.f.audits.length, 0)
+})
+
+const ASN_KEYS = ['mintsoft_supplier_create_enabled', 'mintsoft_asn_send_supplier_enabled', 'mintsoft_asn_supplier_required']
+
+test('the supplier switches validate as the readers read them: exact true/false only', () => {
+  for (const key of ASN_KEYS) {
+    const def = findSwitch(key)!
+    assert.equal(validateSwitchValue(def, 'true').ok, true)
+    assert.equal(validateSwitchValue(def, 'false').ok, true)
+    for (const bad of ['TRUE', '1', 'yes', ' true', '']) assert.equal(validateSwitchValue(def, bad).ok, false, `${key} accepted ${JSON.stringify(bad)}`)
+  }
+})
+
+test('supplier switches are ADMIN in the screen: --yes alone is refused, --confirm-admin writes, and the audit records the assumption and the operator', async () => {
+  const refused = await run('set', ['--key', 'mintsoft_asn_send_supplier_enabled', '--value', 'true', ...SET, '--yes'])
+  assert.equal(refused.code, 3); assert.match(refused.err, /--confirm-admin/)
+  assert.equal(refused.f.transactions, 0)
+  assert.equal(refused.f.settings.size, 0)
+
+  const dry = await run('set', ['--key', 'mintsoft_asn_send_supplier_enabled', '--value', 'true', ...SET])
+  assert.equal(dry.code, 0); assert.match(dry.out, /--confirm-admin/); assert.equal(dry.f.transactions, 0)
+
+  const ok = await run('set', ['--key', 'mintsoft_asn_send_supplier_enabled', '--value', 'true', ...SET, '--yes', '--confirm-admin'])
+  assert.equal(ok.code, 0, ok.err)
+  assert.equal(ok.f.settings.get('mintsoft_asn_send_supplier_enabled')!.value, 'true')
+  const data = ok.f.audits[0]!.data
+  assert.equal(data.level, 'WARNING')
+  assert.deepEqual(data.metadata, { by: 'jan', reason: 'switchover step M', oldValue: null, newValue: 'true', via: 'settings:set', adminAuthorityAssumed: true })
+
+  // A non-admin switch never needs the flag.
+  const plain = await run('set', ['--key', 'wc_invoice_note_enabled', '--value', 'true', ...SET, '--yes'])
+  assert.equal(plain.code, 0, plain.err)
+  assert.equal((plain.f.audits[0]!.data.metadata as Record<string, unknown>).adminAuthorityAssumed, undefined)
+})
+
+test('the admin rule is enforced inside writeSwitch too, not only in the CLI', async () => {
+  const f = fakeDb()
+  const { writeSwitch } = await import('../lib/domain/settings/system-switches')
+  const res = await writeSwitch(f.db as never, { def: findSwitch('mintsoft_supplier_create_enabled')!, value: 'true', by: 'jan', reason: 'x' })
+  assert.equal(res.ok, false)
+  assert.equal(f.settings.size, 0)
+})
+
+test('required needs send on; send cannot be turned off while required is on', async () => {
+  const flags = ['--yes', '--confirm-admin']
+  let r = await run('set', ['--key', 'mintsoft_asn_supplier_required', '--value', 'true', ...SET, ...flags])
+  assert.equal(r.code, 3); assert.match(r.err, /mintsoft_asn_send_supplier_enabled/)
+  assert.equal(r.f.transactions, 0)
+  r = await run('set', ['--key', 'mintsoft_asn_supplier_required', '--value', 'true', ...SET, ...flags], fakeDb({ mintsoft_asn_send_supplier_enabled: 'false' }))
+  assert.equal(r.code, 3)
+  const ok = await run('set', ['--key', 'mintsoft_asn_supplier_required', '--value', 'true', ...SET, ...flags], fakeDb({ mintsoft_asn_send_supplier_enabled: 'true' }))
+  assert.equal(ok.code, 0, ok.err)
+  const pull = await run('set', ['--key', 'mintsoft_asn_send_supplier_enabled', '--value', 'false', ...SET, ...flags], fakeDb({ mintsoft_asn_send_supplier_enabled: 'true', mintsoft_asn_supplier_required: 'true' }))
+  assert.equal(pull.code, 3); assert.match(pull.err, /mintsoft_asn_supplier_required/)
+  // With required off, send may be turned off; create has no prerequisite either way.
+  const off = await run('set', ['--key', 'mintsoft_asn_send_supplier_enabled', '--value', 'false', ...SET, ...flags], fakeDb({ mintsoft_asn_send_supplier_enabled: 'true', mintsoft_asn_supplier_required: 'false' }))
+  assert.equal(off.code, 0, off.err)
+  const create = await run('set', ['--key', 'mintsoft_supplier_create_enabled', '--value', 'true', ...SET, ...flags])
+  assert.equal(create.code, 0, create.err)
+})
+
+test('the registry keys equal the connector constants the readers use', async () => {
+  const c = await import('../lib/connectors/mintsoft/suppliers/settings')
+  assert.deepEqual([...ASN_KEYS].sort(), [c.MINTSOFT_SUPPLIER_CREATE_SETTING, c.MINTSOFT_ASN_SEND_SUPPLIER_SETTING, c.MINTSOFT_ASN_SUPPLIER_REQUIRED_SETTING].sort())
 })
