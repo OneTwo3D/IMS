@@ -100,12 +100,13 @@ type GuardOutcome<T> = { refused: string; unknown?: undefined } | { unknown: str
  * THE LOCK IS BOUNDED. The send has a deadline (60 s: the mailer's transport timeouts, then its own race that CLOSES the connection) and the
  * guard races it again at 75 s; the transaction's own timeout is 120 s, so the lock is never released by the transaction timing out under a
  * live send. A send that hits a deadline AFTER the message began streaming settles as a terminal "outcome unknown" failure, never retried automatically;
- * one that hits it BEFORE any hand-over is retryable, but the mailer first DESTROYS the connection it owns (transport.close() would not). So in both
- * cases no email can go out after the lock is released and an Off save has committed. A person
+ * one that hits it BEFORE any hand-over is retryable, but the mailer first aborts its AbortSignal, which closes the connection (with socketCloseTimeout 0, destroying the socket). The
+ * guard also owns an AbortController of its own and aborts it at the backstop, so a send still reading its SMTP settings when the backstop fires
+ * sends nothing afterwards. So in both cases no email can go out after the lock is released and an Off save has committed. A person
  * can re-queue it with Email PO (which re-checks the flag). An error thrown by the transaction AFTER the send returned (commit, release)
  * returns the send's answer instead of rethrowing, so a delivered email is not left retryable.
  */
-export async function purchaseOrderSendGuard<T>(send: () => Promise<T>): Promise<GuardOutcome<T>> {
+export async function purchaseOrderSendGuard<T>(send: (signal: AbortSignal) => Promise<T>): Promise<GuardOutcome<T>> {
   return runUnderPoEmailSendLock(db, send)
 }
 
@@ -123,7 +124,7 @@ export async function purchaseOrderSendGuard<T>(send: () => Promise<T>): Promise
  * order is refused until it is approved again.
  */
 export function purchaseOrderSendGuardFor(poId: string, rendered?: PoRenderedFacts) {
-  return async function guard<T>(send: () => Promise<T>): Promise<GuardOutcome<T>> {
+  return async function guard<T>(send: (signal: AbortSignal) => Promise<T>): Promise<GuardOutcome<T>> {
     const refusal = await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR SHARE`
       try {
@@ -146,7 +147,7 @@ type LockableClient = {
 /** @internal exported for tests, which pass a double client. */
 export async function runUnderPoEmailSendLock<T>(
   client: unknown,
-  send: () => Promise<T>,
+  send: (signal: AbortSignal) => Promise<T>,
   options: { backstopMs?: number } = {},
 ): Promise<GuardOutcome<T>> {
   let answered: GuardOutcome<T> | null = null
@@ -156,13 +157,16 @@ export async function runUnderPoEmailSendLock<T>(
       const row = await tx.setting.findUnique({ where: { key: PO_EMAIL_SETTING_KEY }, select: { value: true } })
       if (row?.value !== 'true') return { refused: PO_EMAIL_DISABLED_REASON } as GuardOutcome<T>
       let timer: ReturnType<typeof setTimeout> | undefined
-      const sending = send()
+      const backstop = new AbortController()
+      const sending = send(backstop.signal)
       const raced = await Promise.race([
         sending.then((value) => ({ value }) as { value: T }),
         new Promise<'deadline'>((resolve) => { timer = setTimeout(() => resolve('deadline'), options.backstopMs ?? PO_SEND_BACKSTOP_MS) }),
       ]).finally(() => { if (timer) clearTimeout(timer) })
       if (raced === 'deadline') {
         sending.catch(() => undefined)
+        // Abort BEFORE answering: the mailer closes the connection (or never opens one), so nothing is delivered after the lock is released.
+        backstop.abort()
         answered = { unknown: PO_SEND_UNKNOWN_OUTCOME }
         return answered
       }

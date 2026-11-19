@@ -2133,6 +2133,14 @@ export async function processPendingEmailOutbox(
       get attempted(): boolean {
         return sendEntered
       },
+      /** The sender ANSWERED, and the answer was success: the message was delivered. */
+      get deliveredByAnswer(): boolean {
+        return sendReturned && delivered
+      },
+      /** The sender was entered and never answered (it threw): the message may or may not be on the wire. */
+      get senderLeftUnanswered(): boolean {
+        return sendEntered && !sendReturned
+      },
       send: async (...args: Parameters<typeof sendOverSmtp>) => {
         sendEntered = true
         const answer = await sendOverSmtp(...args)
@@ -2678,7 +2686,7 @@ export async function processPendingEmailOutbox(
       let sendResult: Awaited<ReturnType<typeof smtp.send>>
       if (prepared?.sendGuard) {
         // The kind's own delivery-boundary check, held across the send (see PURCHASE_ORDER_EMAIL_SEND_LOCK_NAMESPACE). A refusal sent nothing.
-        const guarded = await prepared.sendGuard(() => smtp.send(outgoing))
+        const guarded = await prepared.sendGuard((signal) => smtp.send({ ...outgoing, signal }))
         if (guarded.refused !== undefined) {
           await refuseRecipient(guarded.refused, { keepAddress: true })
           continue
@@ -2763,16 +2771,45 @@ export async function processPendingEmailOutbox(
       else await recordConflict(claim, 'a failed send', smtp)
       if (sendResult.unknownOutcome) await recordUnknownOutcomeOnReference(email, sendError ?? 'Outcome unknown')
     } catch (error) {
+      // OWNER DECISION o3d-hqvrp.388: a customer email is NEVER sent twice. Once the sender was entered, nothing here may settle the row to PENDING
+      // on the strength of a database error: (a) the sender reported SUCCESS and a later write threw -> the message WAS delivered, settle SENT;
+      // (b) the sender itself threw -> delivery is unknown, settle FAILED with the unknown-outcome notice. Both are the same for every kind,
+      // PO included (a PO whose row is SENT or FAILED is never reclaimed). The settle is retried a few times because it is the one write that
+      // keeps the row out of the PO's single stale reclaim; if the database stays down for all of them the error escapes and the row is left to that reclaim.
+      if (smtp.attempted && smtp.senderLeftUnanswered && unknownOutcomeReason === null) {
+        unknownOutcomeReason = `Outcome unknown: the mail sender failed before reporting a result (${String(error)}), so the message may or may not have been delivered.`
+      }
+      const deliveredByAnswer = smtp.deliveredByAnswer
       const attempts = email.attempts + 1
       const permanentFailure = attempts >= EMAIL_MAX_ATTEMPTS || unknownOutcomeReason !== null
-      const settled = await settleClaimedEmail(client, claim, {
-        status: permanentFailure ? 'FAILED' : 'PENDING',
-        attempts,
-        lastError: unknownOutcomeReason ?? String(error),
-        availableAt: permanentFailure ? email.availableAt : new Date(now().getTime() + getBackoffMs(email.attempts)),
-        processingStartedAt: null,
-      })
-      if (settled) result.failed++
+      const settleData = deliveredByAnswer
+        ? { status: 'SENT', sentAt: now(), lastError: null, processingStartedAt: null }
+        : {
+          status: permanentFailure ? 'FAILED' : 'PENDING',
+          attempts,
+          lastError: unknownOutcomeReason ?? String(error),
+          availableAt: permanentFailure ? email.availableAt : new Date(now().getTime() + getBackoffMs(email.attempts)),
+          processingStartedAt: null,
+        }
+      let settled: boolean
+      if (smtp.attempted) {
+        let lastFailure: unknown
+        settled = false
+        for (let tryNo = 0; tryNo < 3; tryNo++) {
+          try {
+            settled = await settleClaimedEmail(client, claim, settleData)
+            lastFailure = undefined
+            break
+          } catch (settleError) {
+            lastFailure = settleError
+            if (tryNo < 2) await new Promise((resolve) => setTimeout(resolve, 200 * (tryNo + 1)))
+          }
+        }
+        if (lastFailure !== undefined) throw lastFailure
+      } else {
+        settled = await settleClaimedEmail(client, claim, settleData)
+      }
+      if (settled) { if (deliveredByAnswer) result.sent++; else result.failed++ }
       // THE PHASE IS DERIVED TOO, for the same reason the flag is — AND IT IS DERIVED FROM THE WHOLE
       // OF THE ROW'S PROGRESS, not from one flag (r22, Codex LOW). This `catch` covers the
       // preparation and the attachment decode BEFORE the sender, and the suppression upsert and the

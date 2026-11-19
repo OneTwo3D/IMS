@@ -37,6 +37,12 @@ type EmailOptions = {
    */
   deadlineMs?: number
   /**
+   * An EXTERNAL abort (the purchase-order send guard's backstop). Aborting it closes the connection exactly as the deadline does, and a send whose
+   * signal is already aborted when it starts (a slow SMTP-settings read outlived the guard) sends nothing. Without it a guard that gave up could
+   * still see the message delivered after it released its lock.
+   */
+  signal?: AbortSignal
+  /**
    * The message must reach the recipient AT MOST ONCE (a purchase order). Once delivery has begun (the DATA command was issued on an
    * established connection), any failure that is not a definite server answer, and the deadline timer firing, is the terminal
    * "outcome unknown" result (`permanent` + `unknownOutcome`): the server may have accepted the message with the final response lost, so
@@ -155,6 +161,7 @@ export async function sendEmailWithSmtpSettings(
   opts: EmailOptions,
 ): Promise<SendEmailResult> {
   let unknownOutcomeProbe: ((e: unknown) => boolean) | undefined
+  let forwardAbort: (() => void) | undefined
   try {
     const smtp = normalizeSmtpSettings(smtpInput)
     if (!smtp.fromEmail) {
@@ -167,6 +174,7 @@ export async function sendEmailWithSmtpSettings(
     const fromName = sanitizeDisplayName(smtp.fromName)
 
     const deadlineMs = opts.deadlineMs
+    if (opts.signal?.aborted) return { success: false, permanent: false, error: SEND_DEADLINE_BEFORE_DATA }
     // singleSend: watch the transaction log for the server's reply to DATA (after which the message streams; a failure between the DATA command and that reply sent nothing). The log entry is read for that one
     // fact and discarded; nothing it carries (addresses, credentials) is kept.
     // Replies are matched to commands IN ORDER, as nodemailer's own _responseActions queue does, starting at MAIL FROM: with PIPELINING nodemailer writes MAIL FROM / RCPT TO / DATA before any
@@ -214,8 +222,9 @@ export async function sendEmailWithSmtpSettings(
           level: noop, trace: noop, info: noop, warn: noop, error: noop, fatal: noop,
         },
       } : {}),
+      // socketCloseTimeout 0 (nodemailer 10.6 smtp-connection): close() DESTROYS the socket instead of ending it and waiting up to 5 s, so an abort cannot let bytes already buffered finish after the answer was given.
       // The connect and greeting phases are bounded at HALF the send deadline so the transport's own timeouts normally settle the send first.
-      ...(deadlineMs ? { connectionTimeout: Math.max(1, Math.floor(deadlineMs / 2)), greetingTimeout: Math.max(1, Math.floor(deadlineMs / 2)), socketTimeout: deadlineMs } : {}),
+      ...(deadlineMs ? { connectionTimeout: Math.max(1, Math.floor(deadlineMs / 2)), greetingTimeout: Math.max(1, Math.floor(deadlineMs / 2)), socketTimeout: deadlineMs, socketCloseTimeout: 0 } : {}),
       host: smtp.host,
       port: smtp.port,
       secure: smtp.secure === 'ssl',
@@ -223,9 +232,13 @@ export async function sendEmailWithSmtpSettings(
       tls: smtp.secure === 'tls' ? { rejectUnauthorized: true } : undefined,
     }
     const transport = nodemailer.createTransport(transportOptions)
+    if (opts.signal) {
+      forwardAbort = () => { ac.abort(); transport.close() }
+      opts.signal.addEventListener('abort', forwardAbort, { once: true })
+    }
 
     const sending = transport.sendMail({
-      ...(deadlineMs ? { signal: ac.signal } : {}),
+      ...(deadlineMs || opts.signal ? { signal: ac.signal } : {}),
       from: fromName ? { name: fromName, address: fromEmail } : fromEmail,
       replyTo: replyToEmail,
       to: toEmail,
@@ -264,6 +277,8 @@ export async function sendEmailWithSmtpSettings(
       return classifySendFailure(e, (e as { code?: string } | null)?.code === 'ETIMEDOUT' ? 'deadline' : 'lost-reply')
     }
     return classifySendFailure(e, false)
+  } finally {
+    if (forwardAbort) opts.signal?.removeEventListener('abort', forwardAbort)
   }
 }
 
