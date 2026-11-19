@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState, useTransition } from 'react'
 import { useRouter } from 'next/navigation'
+import Link from 'next/link'
 import { AlertTriangle, Check, Loader2, Plus, RefreshCw, Settings2, Trash2 } from 'lucide-react'
 import {
   confirmMintsoftAlignmentMode,
@@ -583,6 +584,9 @@ export function MintsoftClient({ data, configured }: Props) {
         ) : null}
       </Card>
 
+      <p className="text-sm">
+        <Link href="/sync/mintsoft-suppliers" className="underline">Mintsoft suppliers</Link>: map each IMS supplier to its Mintsoft supplier (needed before ASNs can be created).
+      </p>
       <MintsoftCourierMapSection />
 
       <MintsoftOrderDispatchSection />

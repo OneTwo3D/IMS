@@ -57,6 +57,7 @@ import {
   writeMintsoftBindingHandover,
 } from '@/lib/connectors/mintsoft/sync/stock-sync'
 import { mintsoftAsnCreateShadowNotice, mintsoftProducerSeam } from '@/lib/connectors/mintsoft/producer-seam'
+import { resolveAsnSupplier } from '@/lib/connectors/mintsoft/suppliers/asn-supplier'
 import { runMintsoftProductVerify } from '@/lib/connectors/mintsoft/sync/product-sync'
 import { describeContentRun } from '@/lib/connectors/mintsoft/sync/product-content-sync'
 import { describeShadowedBundles, describeShadowedProducts } from '@/lib/connectors/mintsoft/operator-action-seam'
@@ -3197,6 +3198,14 @@ export async function createMintsoftPurchaseOrderAsn(
     return { success: false, shadowed: true, error: asnSeam.notice }
   }
 
+  // THE MINTSOFT SUPPLIER (o3d-qk7z0): a mapped supplier id goes on the ASN; with `mintsoft_asn_supplier_required` on, an unmapped supplier refuses the
+  // create BEFORE any reservation (an operator task names the supplier to map). With the setting off an unmapped ASN is created exactly as before.
+  const asnSupplier = await resolveAsnSupplier({ kind: 'PurchaseOrder', id: String(parsedId.data) })
+  if (asnSupplier.kind === 'refuse') {
+    return { success: false, error: asnSupplier.error }
+  }
+  const externalSupplierId = asnSupplier.kind === 'send' ? asnSupplier.externalSupplierId : null
+
   const data = parsedInput.data
   const eta = trimToNull(data.eta)
   let etaIso: string | null = null
@@ -4135,6 +4144,7 @@ export async function createMintsoftPurchaseOrderAsn(
           externalWarehouseId: reservation.externalWarehouseId,
           reference: reservation.reference,
           supplierReference: reservation.supplierReference,
+          externalSupplierId,
           carrier: reservation.carrier,
           eta: reservation.eta,
           packagingType: reservation.packagingType,
@@ -4351,6 +4361,14 @@ export async function createMintsoftTransferAsn(
   if (!asnSeam.proceed) {
     return { success: false, shadowed: true, error: asnSeam.notice }
   }
+
+  // THE MINTSOFT SUPPLIER (o3d-qk7z0): a mapped supplier id goes on the ASN; with `mintsoft_asn_supplier_required` on, an unmapped supplier refuses the
+  // create BEFORE any reservation (an operator task names the supplier to map). With the setting off an unmapped ASN is created exactly as before.
+  const asnSupplier = await resolveAsnSupplier({ kind: 'Transfer', id: String(parsedId.data) })
+  if (asnSupplier.kind === 'refuse') {
+    return { success: false, error: asnSupplier.error }
+  }
+  const externalSupplierId = asnSupplier.kind === 'send' ? asnSupplier.externalSupplierId : null
 
   const data = parsedInput.data
   const eta = trimToNull(data.eta)
@@ -5348,6 +5366,7 @@ export async function createMintsoftTransferAsn(
           externalWarehouseId: reservation.externalWarehouseId,
           reference: reservation.reference,
           supplierReference: reservation.supplierReference,
+          externalSupplierId,
           carrier: reservation.carrier,
           eta: reservation.eta,
           packagingType: reservation.packagingType,
