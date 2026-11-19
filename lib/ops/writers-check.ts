@@ -3,6 +3,7 @@ import { legacyLiveFromFindings } from '@/lib/security/live-from-legacy-config'
 import { explainProducerDisposition, parseProducerCutoff, producerGrantCutoffAgreement } from '@/lib/security/producer-disposition'
 import { PRODUCER_STEP_ENV, liveStepsOfDestination } from '@/lib/security/producer-disposition-constants'
 import { producerOperationEgressVerdict, producerSeamVerdict, readProducerEnforcement } from '@/lib/security/producer-seam'
+import { XERO_SYNC_TYPE_SETTING } from '@/lib/connectors/xero/sync-type-setting'
 import { LIVE_WRITER_STEPS, WRITER_OWNERSHIP_MAP, type LiveWriterStep, type OwnershipRow } from '@/lib/security/writer-ownership-map'
 import {
   EVIDENCE_CONTESTS,
@@ -86,6 +87,20 @@ export const WRITER_CRON_ROUTES: Readonly<Record<string, 'always-callable' | 'fl
   'wms-order-push': 'always-callable',
 }
 
+/**
+ * THE POSTING-MODE REQUIREMENT OF THE JOURNAL OPERATION, DERIVED FROM THE SAME TWO TABLES THE QUEUE GATE USES: every sync type in the
+ * ownership row of `xero.inventory.journals`, and the queue's per-type switch table. A type with a switch contributes it ("any of these
+ * on"); a type with NO switch (STOCK_IN_TRANSIT, UNEARNED_REV_REVERSAL, ALLOCATION_REVERSAL) is queued as 'submitted' whenever Xero sync is
+ * on, so it makes the operation a capability on the master switch alone and no per-type setting can say IMS cannot write it.
+ */
+function journalModeRequirement(): Requirement[] {
+  const row = (WRITER_OWNERSHIP_MAP as readonly OwnershipRow[]).find((entry) => entry.destination === 'xero' && entry.operation === 'inventory.journals')
+  const types = row?.accountingSyncTypes ?? []
+  const keys = types.map((type) => XERO_SYNC_TYPE_SETTING[type])
+  if (keys.length === 0 || keys.some((key) => key === undefined)) return []
+  return [{ anyMode: [...new Set(keys as string[])] }]
+}
+
 /** The IMS-side switches of every operation IMS has a writer for. */
 export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   { key: 'xero.sales.invoice', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_sales_invoice' }] },
@@ -100,16 +115,7 @@ export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   { key: 'xero.purchase.bill-payment', trigger: 'automatic', requires: [...XERO_MASTER] },
   { key: 'xero.purchase.bill-attachment', trigger: 'automatic', requires: [...XERO_MASTER, { settingTrue: 'xero_sync_attach_pdf', defaultValue: 'true' }] },
   { key: 'xero.purchase.supplier-credit', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_purchase_credit_note' }] },
-  {
-    key: 'xero.inventory.journals',
-    trigger: 'automatic',
-    requires: [...XERO_MASTER, {
-      anyMode: [
-        'xero_sync_stock_receipt', 'xero_sync_inventory_adjustment', 'xero_sync_cogs_journal', 'xero_sync_cogs_reversal',
-        'xero_sync_stock_allocation', 'xero_sync_manufacturing_journal',
-      ],
-    }],
-  },
+  { key: 'xero.inventory.journals', trigger: 'automatic', requires: [...XERO_MASTER, ...journalModeRequirement()] },
   { key: 'xero.daily-batch', trigger: 'automatic', requires: [...XERO_MASTER, { settingTrue: 'xero_daily_batch_enabled', defaultValue: 'false' }] },
   { key: 'xero.tax-rate', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_tax_rate' }] },
   { key: 'mintsoft.order.create', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },

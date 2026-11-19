@@ -232,6 +232,17 @@ test('ARM (b2): IMS able to post the Xero sales documents (legacy path, no produ
   assert.ok(oneOff.findings.some((f) => f.subject === 'xero.sales.credit-note' && f.code === 'ims-writes-owned-elsewhere'))
 })
 
+test('xero.inventory.journals stays a capability with every per-type journal mode off: STOCK_IN_TRANSIT, UNEARNED_REV_REVERSAL and ALLOCATION_REVERSAL have no switch and queue as submitted', () => {
+  const { PRODUCER_HOLD_ENFORCED_DESTINATIONS: _hold, ...legacyAll } = ALL_STEPS_LIVE_ENV
+  void _hold
+  const modesOff = ['xero_sync_stock_receipt', 'xero_sync_inventory_adjustment', 'xero_sync_cogs_journal', 'xero_sync_cogs_reversal', 'xero_sync_stock_allocation', 'xero_sync_manufacturing_journal'].map((key): [string, string] => [key, 'off'])
+  const report = evaluateWritersCheck(inputs({ env: legacyAll, settings: new Map([['xero_sync_enabled', 'true'], ...modesOff]) }))
+  const journals = (r: typeof report) => r.operations.find((op) => op.key === 'xero.inventory.journals')
+  assert.equal(journals(report)?.imsSwitchedOn, true, 'the switchless types still post, so IMS can write the journals')
+  const syncOff = evaluateWritersCheck(inputs({ env: legacyAll, settings: new Map([['xero_sync_enabled', 'false'], ...modesOff]) }))
+  assert.equal(journals(syncOff)?.imsSwitchedOn, false)
+})
+
 test('owners: an undecided owner fails, nobody warns, an operator button warns, IMS-owned is clean', () => {
   const env = { MINTSOFT_WRITE_ALLOWED: 'https://api.mintsoft.example|89', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', MINTSOFT_WRITES_LIVE_FROM: CUTOFF }
   const base = (WRITER_OWNERSHIP_MAP as readonly OwnershipRow[])

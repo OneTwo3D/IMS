@@ -2471,6 +2471,24 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.equal(await m.lock.withStepLock('opening-stock', async () => 'again'), 'again')
       })
 
+      it('the RUN LEASE (lock 0, outside every step number) is held for the whole run: a second runner is refused while it is held, a step lock is still free, and it is released afterwards', async () => {
+        // Mutation named: the lease number equal to a step's -> a step is refused while the lease is held; the try form replaced by a blocking lock -> the second call hangs.
+        assert.equal(m.lock.RUN_LEASE_LOCK_NUMBER, 0)
+        let release!: () => void
+        const gate = new Promise<void>((resolve) => { release = resolve })
+        let entered!: () => void
+        const inside = new Promise<void>((resolve) => { entered = resolve })
+        const first = m.lock.withRunLease(async () => { entered(); await gate; return 'ran' })
+        await inside
+        assert.deepEqual(await held(), [{ objid: 0, granted: true }])
+        await assert.rejects(m.lock.withRunLease(async () => 'never'), (e: unknown) => e instanceof StepLockError && e.reason === 'busy')
+        assert.equal(await m.lock.withStepLock('suppliers', async () => 'a step under the lease'), 'a step under the lease')
+        release()
+        assert.equal(await first, 'ran')
+        assert.deepEqual(await held(), [])
+        assert.equal(await m.lock.withRunLease(async () => 'again'), 'again')
+      })
+
       it('the lock is released when the body throws', async () => {
         await assert.rejects(m.lock.withStepLock('suppliers', async () => { throw new Error('boom') }), /boom/)
         assert.deepEqual(await held(), [])
@@ -2572,7 +2590,8 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
         assert.equal(result.exit, 'APPLIED_UNVERIFIED', result.problems.join('; '))
         precondition(t, 'importer calls observed', order.length)
         assert.deepEqual(order.map((o) => o.step), prepared.steps.map((s) => s.step))
-        for (const o of order) assert.deepEqual(o.held, [APPLY_STEP_IDS.indexOf(o.step) + 1], o.step)
+        // The run lease (lock 0) is held for the whole run; beside it exactly that step's lock.
+        for (const o of order) assert.deepEqual(o.held, [m.lock.RUN_LEASE_LOCK_NUMBER, APPLY_STEP_IDS.indexOf(o.step) + 1], o.step)
         assert.deepEqual(await sql(`select 1 from pg_locks where locktype = 'advisory' and classid = $1 and objsubid = 2`, [LOCK_NAMESPACE]), [])
       })
 

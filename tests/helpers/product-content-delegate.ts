@@ -17,6 +17,8 @@ export function createProductContentDelegate() {
     rows,
     findUnique: async ({ where }: { where: { productId: string } }) =>
       rows.find((row) => row.productId === where.productId) ?? null,
+    findMany: async ({ where }: { where: { productId: { in: string[] } } }) =>
+      rows.filter((row) => where.productId.in.includes(row.productId as string)),
     upsert: async ({ where, create, update }: { where: { productId: string }; create: Row; update: Row }) => {
       const row = rows.find((candidate) => candidate.productId === where.productId)
       if (row) {

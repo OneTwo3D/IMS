@@ -14,7 +14,7 @@ import {
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { mirrorAccountingSyncLogToEvent } from '@/lib/domain/accounting/accounting-event-mirror'
-import { getXeroSettings, type XeroSettings } from './settings'
+import { getXeroSettings } from './settings'
 import { scheduleXeroAccountingOutbox } from './outbox'
 import {
   findStaleOrderLevelDiscount,
@@ -39,28 +39,9 @@ import {
 } from '@/lib/domain/accounting/prior-posting-evidence'
 // Type-only, so the facade's dynamic import of this module stays the only runtime edge between them.
 import type { ConnectorEnqueueOutcome } from '@/lib/accounting'
+import { XERO_SYNC_TYPE_SETTING } from './sync-type-setting'
 
-/** Map sync type enum → setting key for per-type enable/disable */
-const SYNC_TYPE_SETTING: Record<string, keyof XeroSettings> = {
-  SALES_INVOICE: 'xero_sync_sales_invoice',
-  SALES_INVOICE_UPDATE: 'xero_sync_sales_invoice',
-  CREDIT_NOTE: 'xero_sync_credit_note',
-  CREDIT_NOTE_VOID: 'xero_sync_credit_note',
-  PURCHASE_INVOICE: 'xero_sync_purchase_invoice',
-  PURCHASE_INVOICE_UPDATE: 'xero_sync_purchase_invoice',
-  SALES_INVOICE_DELETE: 'xero_sync_sales_invoice',
-  PURCHASE_INVOICE_DELETE: 'xero_sync_purchase_invoice',
-  COGS_JOURNAL: 'xero_sync_cogs_journal',
-  COGS_REVERSAL: 'xero_sync_cogs_reversal',
-  STOCK_RECEIPT: 'xero_sync_stock_receipt',
-  INVENTORY_ADJUSTMENT: 'xero_sync_inventory_adjustment',
-  STOCK_ALLOCATION: 'xero_sync_stock_allocation',
-  REALISED_FX_JOURNAL: 'xero_sync_realised_fx_journal',
-  UNREALISED_FX_JOURNAL: 'xero_sync_unrealised_fx_journal',
-  MANUFACTURING_JOURNAL: 'xero_sync_manufacturing_journal',
-  MANUFACTURING_RECLASS: 'xero_sync_manufacturing_journal',
-  TAX_RATE_SYNC: 'xero_sync_tax_rate',
-}
+const SYNC_TYPE_SETTING = XERO_SYNC_TYPE_SETTING
 
 export async function queueXeroSync(params: {
   type: 'SALES_INVOICE' | 'SALES_INVOICE_UPDATE' | 'SALES_INVOICE_DELETE' | 'PURCHASE_INVOICE_DELETE' | 'CREDIT_NOTE' | 'CREDIT_NOTE_VOID' | 'PURCHASE_CREDIT_NOTE' | 'PURCHASE_CREDIT_NOTE_ALLOCATION' | 'COGS_REVERSAL' | 'STOCK_IN_TRANSIT' | 'STOCK_RECEIPT' | 'PURCHASE_INVOICE' | 'PURCHASE_INVOICE_UPDATE' | 'COGS_JOURNAL' | 'INVENTORY_ADJUSTMENT' | 'STOCK_ALLOCATION' | 'DAILY_BATCH_REVENUE_DEFERRAL' | 'DAILY_BATCH_INVENTORY_ALLOC' | 'DAILY_BATCH_GROUP_B' | 'DAILY_BATCH_INVENTORY_RECONCILIATION' | 'DAILY_BATCH_COGS_RECONCILIATION' | 'DAILY_BATCH_TRANSIT_RECONCILIATION' | 'DAILY_BATCH_GRIR_RECLASS' | 'UNEARNED_REV_REVERSAL' | 'ALLOCATION_REVERSAL' | 'BILL_PAYMENT' | 'INVOICE_PAYMENT' | 'BILL_ATTACHMENT' | 'INVOICE_PDF' | 'INVOICE_EMAIL' | 'WC_INVOICE_NOTE' | 'REALISED_FX_JOURNAL' | 'UNREALISED_FX_JOURNAL' | 'MANUFACTURING_JOURNAL' | 'MANUFACTURING_RECLASS' | 'TAX_RATE_SYNC'
