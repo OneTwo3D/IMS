@@ -49,7 +49,7 @@ import { normaliseWcOrderStatus, WC_DEFAULT_SYNC_ORDER_STATUSES } from '@/lib/co
 import { STOCK_TRACKED_PRODUCT_TYPES } from '@/lib/domain/inventory/backorder-policy'
 import { AccountingSyncStatus, AccountingSyncType, ProductType, PurchaseOrderStatus, SalesOrderStatus } from '@/app/generated/prisma/enums'
 import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
-import { QOBLEX_BASE_CURRENCY, TRANSIT_COVERAGE_SETTING_KEY } from '@/lib/reconciliation-pack/constants'
+import { LONDON_DAY_CUTIN_SETTING_KEY, QOBLEX_BASE_CURRENCY, TRANSIT_COVERAGE_SETTING_KEY } from '@/lib/reconciliation-pack/constants'
 
 /** The slice of a `pg` client this module needs. A test double implements it; `pg.Client` satisfies it. */
 export interface ImsQueryClient {
@@ -223,7 +223,7 @@ export type ImsTransitSchedule = { asOf: string; coverageStart: string | null; p
  * payment's own provenance is read too, below) and `orderRate` is the order's stored rate (SalesOrder.fxRateToBase, the rate the importer gives a same-day receipt); `wooOrder` is true for a document of a sales order imported from the storefront.
  * Read-only, in the snapshot of the other sections.
  */
-export type XeroPostedRateRow = { id: string; type: string; externalId: string; noPayload: boolean; currency: string | null; date: string | null; rate: string | null; wooReceipt: boolean; orderRate: string | null; wooOrder: boolean; /** The payment's own provenance, from the payments row its payload names (`paymentId`): `hasPaymentId` the payload names one, `paymentFound` it exists, `paymentFromStorefront` its notes are the importer's ('Imported from WooCommerce' / 'Recorded from WooCommerce'). A receipt is identified by this, not by the importer's rate marker, so a payload from before the marker is judged too. */ hasPaymentId: boolean; paymentFound: boolean; paymentFromStorefront: boolean; /** SalesOrder.externalCreatedAt (the storefront's creation instant, UTC ISO) of the order the record belongs to; null when unknown. */ orderCreatedAt: string | null }
+export type XeroPostedRateRow = { id: string; type: string; externalId: string; noPayload: boolean; currency: string | null; date: string | null; rate: string | null; wooReceipt: boolean; orderRate: string | null; wooOrder: boolean; /** The payment's own provenance, from the payments row its payload names (`paymentId`): `hasPaymentId` the payload names one, `paymentFound` it exists, `paymentFromStorefront` its notes are the importer's ('Imported from WooCommerce' / 'Recorded from WooCommerce'). A receipt is identified by this, not by the importer's rate marker, so a payload from before the marker is judged too. */ hasPaymentId: boolean; paymentFound: boolean; paymentFromStorefront: boolean; /** SalesOrder.externalCreatedAt (the storefront's creation instant, UTC ISO) of the order the record belongs to; null when unknown. */ orderCreatedAt: string | null; /** When the sync record was created (UTC ISO): which date convention the posting carries, against `londonDayCutIn`. */ createdAt: string | null; /** The recorded instant the London business day replaced the UTC day on posted documents (the system-managed setting stamped by migration), UTC ISO; null when none is recorded (every posting is then on the London day). */ londonDayCutIn: string | null; /** The day convention the payload RECORDS for its own date (`dateConvention`, 'london'), null for a payload built before it was recorded: that one is judged by `createdAt`. */ dateConvention: string | null; /** When the SOURCE sync record of a receipt (the SALES_INVOICE it settles) was created (UTC ISO), null for any other type or an unlinked source: the importer's rate stamp was decided at import, on this instant. */ sourceCreatedAt: string | null }
 
 export type ImsSectionValues = {
   identity: ImsIdentity
@@ -315,6 +315,13 @@ function unique<T>(rows: readonly T[], identity: (row: T) => string): void {
 }
 
 /** Instants as text the parsers above accept: millisecond precision, a trailing Z. Prisma's DateTime columns are timestamp(3) without a zone and hold UTC; the session zone is pinned to UTC anyway. */
+/** The recorded London-day cut-in: null when none is recorded, a UTC ISO instant otherwise; anything else is unreadable (never guessed at). */
+function cutIn(value: unknown): string | null {
+  if (value === null || value === undefined) return null
+  if (typeof value !== 'string' || !ISO_UTC_RE.test(value) || Number.isNaN(Date.parse(value))) throw new Unreadable('SOURCE_UNREADABLE')
+  return value
+}
+
 const UTC = (column: string) => `to_char(${column}, 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"')`
 
 // ---------------------------------------------------------------------------------------------
@@ -529,7 +536,8 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
       CASE WHEN l.type::text IN ('INVOICE_PAYMENT', 'BILL_PAYMENT') THEN l.payload->>'paymentDate' ELSE l.payload->>'date' END AS doc_date,
       CASE WHEN l.type::text IN ('INVOICE_PAYMENT', 'BILL_PAYMENT') THEN l.payload->>'settlementRateToBase' ELSE l.payload->>'currencyRateToBase' END AS rate,
       COALESCE((src.payload ? '_paymentSettlementRateToBase'), false) AS woo_receipt, so."fxRateToBase"::text AS order_rate,
-      ((l.payload->>'paymentId') IS NOT NULL) AS has_payment_id, (pay.id IS NOT NULL) AS payment_found, COALESCE((pay.notes LIKE 'Imported from WooCommerce%' OR pay.notes LIKE 'Recorded from WooCommerce%'), false) AS payment_woo, (so."externalOrderNumber" IS NOT NULL) AS woo_order, ${UTC('so."externalCreatedAt"')} AS order_created
+      ((l.payload->>'paymentId') IS NOT NULL) AS has_payment_id, (pay.id IS NOT NULL) AS payment_found, COALESCE((pay.notes LIKE 'Imported from WooCommerce%' OR pay.notes LIKE 'Recorded from WooCommerce%'), false) AS payment_woo, (so."externalOrderNumber" IS NOT NULL) AS woo_order, ${UTC('so."externalCreatedAt"')} AS order_created, ${UTC('l."createdAt"')} AS created_at, l.payload->>'dateConvention' AS date_convention, ${UTC('src."createdAt"')} AS source_created_at,
+      (SELECT st.value FROM settings st WHERE st.key = '${LONDON_DAY_CUTIN_SETTING_KEY}') AS london_cutin
       FROM accounting_sync_logs l
       LEFT JOIN accounting_sync_logs src ON l.type::text = 'INVOICE_PAYMENT' AND src.id = l.payload->>'sourceEntryId'
       LEFT JOIN payments pay ON l.type::text = 'INVOICE_PAYMENT' AND pay.id = l.payload->>'paymentId'
@@ -538,7 +546,7 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
         AND l.type::text IN ('SALES_INVOICE', 'PURCHASE_INVOICE', 'CREDIT_NOTE', 'PURCHASE_CREDIT_NOTE', 'INVOICE_PAYMENT', 'BILL_PAYMENT') ORDER BY l.id`)
     const posted = rows.map((row): XeroPostedRateRow => ({
       id: text(row.id), type: text(row.type, 'SOURCE_UNREADABLE'), externalId: text(row.external_id), noPayload: bool(row.no_payload),
-      currency: textOrNull(row.currency), date: textOrNull(row.doc_date), rate: textOrNull(row.rate), wooReceipt: bool(row.woo_receipt), orderRate: textOrNull(row.order_rate), wooOrder: bool(row.woo_order === null ? false : row.woo_order), hasPaymentId: bool(row.has_payment_id), paymentFound: bool(row.payment_found), paymentFromStorefront: bool(row.payment_woo), orderCreatedAt: textOrNull(row.order_created),
+      currency: textOrNull(row.currency), date: textOrNull(row.doc_date), rate: textOrNull(row.rate), wooReceipt: bool(row.woo_receipt), orderRate: textOrNull(row.order_rate), wooOrder: bool(row.woo_order === null ? false : row.woo_order), hasPaymentId: bool(row.has_payment_id), paymentFound: bool(row.payment_found), paymentFromStorefront: bool(row.payment_woo), orderCreatedAt: textOrNull(row.order_created), createdAt: textOrNull(row.created_at), londonDayCutIn: cutIn(row.london_cutin), dateConvention: textOrNull(row.date_convention), sourceCreatedAt: textOrNull(row.source_created_at),
     }))
     unique(posted, (row) => row.id)
     return posted

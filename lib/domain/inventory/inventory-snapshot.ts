@@ -330,6 +330,11 @@ export function previousUtcDate(from: Date = new Date()): Date {
 /**
  * The snapshot label for a cron run at `from`: the BUSINESS (Europe/London) day that has just ended. The cron fires at 00:00 host
  * time (London), which in BST is 23:00 UTC of the day before, so the UTC-based previousUtcDate labelled that run a day too early.
+ *
+ * ACCEPTED LIMIT (o3d-cr517): snapshot rows written BEFORE the label moved to the London day keep the label they were written under (in BST a run at
+ * 00:00 London was labelled the day before its London day). They are NOT relabelled: a snapshot's label is part of its key, the rows are point-in-time
+ * captures of current state taken at that run (their content cannot be re-derived for a different day), and rewriting a key could collide with the row
+ * the new rule wrote for the same label. The affected rows are the BST ones from before the change; GMT days are unaffected (London day = UTC day).
  */
 export function previousBusinessDate(from: Date = new Date()): Date {
   return addUtcDays(parseSnapshotDate(businessDateYmd(from)), -1)

@@ -81,6 +81,8 @@ mock.module('@/lib/db', {
           return state.rows.filter((row) => matches(row, where))
         },
       },
+      // o3d-cr517: the receivable read asks which refunds / invoices were posted by hand; none here.
+      accountingPostingRefusal: { findMany: async () => [] },
       salesOrder: { findMany: async () => state.receivables },
       purchaseInvoice: { findMany: async () => [] },
       $transaction: async <T>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn({
@@ -165,7 +167,8 @@ test('[o3d-j625 r3 HIGH 4] the same-date read names the connector in its WHERE â
   assert.equal(scoped.length, 1, `exactly the same-date read is connector-scoped. Queries: ${JSON.stringify(state.queries)}`)
   // And the PRIOR-revaluation read deliberately is NOT: a retired connector's revaluation must still
   // be found so it can be reversed in its own books.
-  assert.equal(state.queries.filter((where) => !('connector' in where)).length, 1, 'the prior read spans every connector')
+  // (The receivable population's hand-posted-document lookup, o3d-cr517, is a per-document question keyed on referenceType, not a revaluation read.)
+  assert.equal(state.queries.filter((where) => !('connector' in where) && !('referenceType' in where)).length, 1, 'the prior read spans every connector')
 })
 
 // ---------------------------------------------------------------------------------------------------
