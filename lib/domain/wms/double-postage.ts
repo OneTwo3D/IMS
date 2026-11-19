@@ -16,6 +16,7 @@
  * dispatch and push sweeps are never blocked by it.
  */
 
+import type { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
@@ -55,32 +56,43 @@ export function decideDoublePostage(
   }
 }
 
+/** The slice of a Prisma client (the shared one, or a transaction's) the flag needs. */
+export type DoublePostageClient = Pick<Prisma.TransactionClient, 'wmsOrderPushLink' | 'salesOrder'>
+
+/**
+ * The flag evaluation on the GIVEN client, THROWING on a database error: a caller inside a transaction wants the failure to abort the write, not to
+ * be swallowed after the write committed. Returns whether a flag was raised.
+ */
+export async function raiseDoublePostageForMergedLink(client: DoublePostageClient, linkId: string): Promise<boolean> {
+  const link = await client.wmsOrderPushLink.findUnique({
+    where: { id: linkId },
+    select: { id: true, orderId: true, connector: true, externalOrderId: true, externalOrderNumber: true, doublePostageAt: true },
+  })
+  if (!link || !link.externalOrderId || link.doublePostageAt) return false
+  const siblings = await client.wmsOrderPushLink.findMany({
+    where: { connector: link.connector, externalOrderId: link.externalOrderId, state: { in: ['SYNCED', 'MERGED'] } },
+    select: { orderId: true },
+  })
+  const orderIds = [...new Set([link.orderId, ...siblings.map((row) => row.orderId)])]
+  const orders = await client.salesOrder.findMany({
+    where: { id: { in: orderIds } },
+    select: { id: true, orderNumber: true, externalOrderNumber: true, currency: true, shippingForeign: true, status: true },
+  })
+  const self = orders.find((order) => order.id === link.orderId)
+  if (!self) return false
+  const decision = decideDoublePostage(self, orders, link.externalOrderNumber)
+  if (!decision.raise) return false
+  const written = await client.wmsOrderPushLink.updateMany({
+    where: { id: link.id, doublePostageAt: null },
+    data: { doublePostageAt: new Date(), doublePostageDetail: decision.detail },
+  })
+  return written.count > 0
+}
+
 /** Raise the flag for a link that has just been re-pointed at a merge survivor. Never throws. Returns whether a flag was raised. */
 export async function flagDoublePostageForMergedLink(linkId: string): Promise<boolean> {
   try {
-    const link = await db.wmsOrderPushLink.findUnique({
-      where: { id: linkId },
-      select: { id: true, orderId: true, connector: true, externalOrderId: true, externalOrderNumber: true, doublePostageAt: true },
-    })
-    if (!link || !link.externalOrderId || link.doublePostageAt) return false
-    const siblings = await db.wmsOrderPushLink.findMany({
-      where: { connector: link.connector, externalOrderId: link.externalOrderId, state: { in: ['SYNCED', 'MERGED'] } },
-      select: { orderId: true },
-    })
-    const orderIds = [...new Set([link.orderId, ...siblings.map((row) => row.orderId)])]
-    const orders = await db.salesOrder.findMany({
-      where: { id: { in: orderIds } },
-      select: { id: true, orderNumber: true, externalOrderNumber: true, currency: true, shippingForeign: true, status: true },
-    })
-    const self = orders.find((order) => order.id === link.orderId)
-    if (!self) return false
-    const decision = decideDoublePostage(self, orders, link.externalOrderNumber)
-    if (!decision.raise) return false
-    const written = await db.wmsOrderPushLink.updateMany({
-      where: { id: link.id, doublePostageAt: null },
-      data: { doublePostageAt: new Date(), doublePostageDetail: decision.detail },
-    })
-    return written.count > 0
+    return await raiseDoublePostageForMergedLink(db, linkId)
   } catch (error) {
     console.error(`[wms-double-postage] could not evaluate the double-postage flag for link ${linkId}`, error)
     return false

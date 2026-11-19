@@ -42,6 +42,7 @@
     "rehearse:woo-import": "tsx scripts/rehearse-woo-import.ts",
     "outbound:status": "tsx scripts/outbound-status.ts",
     "retire:held-backlog": "tsx scripts/retire-held-backlog.ts",
+    "cutover:legacy-import": "tsx scripts/legacy-bridge-import.ts",
     "switchover:gaps": "tsx scripts/switchover-gaps.ts",
     "switchover:hand-back": "tsx scripts/switchover-hand-back.ts",
     "switchover:stock-drift": "tsx scripts/switchover-stock-drift.ts",
