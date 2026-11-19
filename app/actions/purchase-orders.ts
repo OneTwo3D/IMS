@@ -4091,6 +4091,8 @@ export type InvoiceRow = {
   taxBase: number
   totalForeign: number
   totalBase: number
+  /** What is owed to the supplier: the stored total less the VAT a reverse-charge line accounts for itself (equal to `totalForeign` when none does). The figure markBillPaid registers; `totalForeign` is the gross, shown as secondary. */
+  netPayableForeign: number
   notes: string | null
   supplierInvoiceUrl: string | null
   accountingInvoiceId: string | null

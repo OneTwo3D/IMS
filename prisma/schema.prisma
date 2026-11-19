@@ -6008,6 +6008,7 @@ model PaymentRemovalReconciliation {
 
   @@index([orderId])
   @@index([refundId])
+  @@unique([refundId])
   @@map("payment_removal_reconciliations")
 }
 

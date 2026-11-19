@@ -229,6 +229,8 @@ type State = {
   lines: SalesLine[]
   refunds: Refund[]
   refundLines: RefundLine[]
+  /** o3d-hqvrp.395: payment removal records (PaymentRemovalReconciliation), so the removal credit note's claim and conflict guard are testable. Default none. */
+  paymentRemovals?: Array<{ id: string; orderId: string; kind: string; refundId: string | null; ledgerAction?: string }>
   // o3d-ee9: actionable WooCommerce refund parks, so createSalesOrderRefund's under-lock park check is testable.
   shoppingSyncLogs?: Array<{ id: string; connector: string; direction: string; entityType: string; entityId: string | null; externalId: string; status: string }>
 
@@ -668,6 +670,20 @@ function createClient(state: State): RefundServiceClient {
         return order
       },
     },
+    paymentRemovalReconciliation: {
+      findMany: async ({ where }: { where: { orderId?: string; kind?: string; refundId?: { not: null } } }) =>
+        (state.paymentRemovals ?? [])
+          .filter((r) => (where.orderId === undefined || r.orderId === where.orderId) && (where.kind === undefined || r.kind === where.kind) && (where.refundId === undefined || r.refundId !== null))
+          .map((r) => ({ id: r.id, refundId: r.refundId })),
+      findUnique: async ({ where }: { where: { id: string } }) => (state.paymentRemovals ?? []).find((r) => r.id === where.id) ?? null,
+      updateMany: async ({ where, data }: { where: { id: string; refundId: null }; data: { refundId: string; ledgerAction: string } }) => {
+        const row = (state.paymentRemovals ?? []).find((r) => r.id === where.id && r.refundId === where.refundId)
+        if (!row) return { count: 0 }
+        row.refundId = data.refundId
+        row.ledgerAction = data.ledgerAction
+        return { count: 1 }
+      },
+    },
     salesOrderRefund: {
       // Filters on whatever keys the caller supplied. The refund service queries this three
       // ways: by {orderId, externalRefundId} (external replay), by {orderId, chargeback} and
@@ -707,6 +723,10 @@ function createClient(state: State): RefundServiceClient {
         }
       },
       findMany: async ({ where, select }: { where: { orderId?: string; creditNoteNumber?: { startsWith: string } }; select: Record<string, boolean> }) => {
+        // o3d-hqvrp.395: the removal-credit-note guard lists the order's refunds by id.
+        if (select.id && select.creditNoteNumber) {
+          return state.refunds.filter((refund) => where.orderId == null || refund.orderId === where.orderId).map((refund) => ({ id: refund.id, creditNoteNumber: refund.creditNoteNumber }))
+        }
         if (select.creditNoteNumber) {
           return state.refunds
             .filter((refund) => where.creditNoteNumber == null || refund.creditNoteNumber?.startsWith(where.creditNoteNumber.startsWith))
@@ -11256,4 +11276,86 @@ test('an order-level reversal with no lines and no summary makes the Allocated I
     String(state.refunds[0].allocationBasisUnresolved),
     /no readable lines and no preserved account summary/,
   )
+})
+
+// ---------------------------------------------------------------------------
+// o3d-hqvrp.395: THE PARTIAL PAYMENT REMOVAL CREDIT NOTE IS A FIRST-CLASS CONFLICT, in both orders of events.
+// ---------------------------------------------------------------------------
+
+const removalLines = [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 0, totalBase: 25 }]
+
+test('o3d-hqvrp.395: a removal credit note exists -> a LATER WooCommerce refund for the same money is refused (prior-removal-credit-note), not double-credited', async () => {
+  const state = reversalRaceState()
+  state.refunds.push({ id: 'refund-removal', orderId: 'order-1', creditNoteNumber: 'CN-0005', externalRefundId: null, reason: 'Payment partly removed from the ledger (removal rem-1)', totalForeign: 25, totalBase: 25, returnWarehouseId: null, chargeback: false })
+  state.paymentRemovals = [{ id: 'rem-1', orderId: 'order-1', kind: 'REMOVED', refundId: 'refund-removal', ledgerAction: 'CREDIT_NOTE' }]
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1', lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 0, totalBase: 25 }],
+    reason: 'WooCommerce refund', externalRefundId: 7001, creditNotePrefix: 'CN-', accountingSettings,
+  })
+
+  assert.equal(result.success, false)
+  assert.equal(result.success === false && result.conflict, 'prior-removal-credit-note')
+  assert.match(result.success === false ? result.error : '', /CN-0005/)
+  assert.equal(state.refunds.length, 1, 'exactly one credit note exists for the order')
+})
+
+test('o3d-hqvrp.395: an operator-typed ordinary refund is refused the same way once a removal credit note exists', async () => {
+  const state = reversalRaceState()
+  state.refunds.push({ id: 'refund-removal', orderId: 'order-1', creditNoteNumber: 'CN-0005', externalRefundId: null, reason: 'Payment partly removed from the ledger (removal rem-1)', totalForeign: 25, totalBase: 25, returnWarehouseId: null, chargeback: false })
+  state.paymentRemovals = [{ id: 'rem-1', orderId: 'order-1', kind: 'REMOVED', refundId: 'refund-removal', ledgerAction: 'CREDIT_NOTE' }]
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1', lines: [{ lineId: 'line-1', productId: 'product-1', description: 'Product 1', qty: 0, totalBase: 10 }],
+    reason: 'Goodwill', creditNotePrefix: 'CN-', accountingSettings,
+  })
+
+  assert.equal(result.success === false && result.conflict, 'prior-removal-credit-note')
+  assert.equal(state.refunds.length, 1)
+})
+
+test('o3d-hqvrp.395: a WooCommerce refund already covers the money -> NO removal credit note is raised (prior-refund), and the record stays unlinked', async () => {
+  const state = reversalRaceState()
+  state.refunds.push({ id: 'refund-wc', orderId: 'order-1', creditNoteNumber: 'CN-0001', externalRefundId: 7001, reason: 'WooCommerce refund', totalForeign: 25, totalBase: 25, returnWarehouseId: null, chargeback: false })
+  state.paymentRemovals = [{ id: 'rem-1', orderId: 'order-1', kind: 'REMOVED', refundId: null, ledgerAction: 'OPERATOR_DECISION' }]
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1', lines: removalLines, reason: 'Payment partly removed from the ledger (removal rem-1)',
+    creditNotePrefix: 'CN-', accountingSettings, paymentRemovalRecordId: 'rem-1',
+  })
+
+  assert.equal(result.success, false)
+  assert.equal(result.success === false && result.conflict, 'prior-refund')
+  assert.match(result.success === false ? result.error : '', /CN-0001/)
+  assert.equal(state.refunds.length, 1, 'no second credit note')
+  assert.equal(state.paymentRemovals[0]?.refundId, null)
+})
+
+test('o3d-hqvrp.395: with no other refund the removal credit note is created and the record is linked to it in the same transaction', async () => {
+  const state = reversalRaceState()
+  state.paymentRemovals = [{ id: 'rem-1', orderId: 'order-1', kind: 'REMOVED', refundId: null, ledgerAction: 'OPERATOR_DECISION' }]
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1', lines: removalLines, reason: 'Payment partly removed from the ledger (removal rem-1)',
+    creditNotePrefix: 'CN-', accountingSettings, paymentRemovalRecordId: 'rem-1',
+  })
+
+  assert.equal(result.success, true)
+  assert.equal(state.refunds.length, 1)
+  assert.equal(state.paymentRemovals[0]?.refundId, state.refunds[0]?.id)
+  assert.equal(state.paymentRemovals[0]?.ledgerAction, 'CREDIT_NOTE')
+})
+
+test('o3d-hqvrp.395: a second claim for the same removal record (poller racing the server action) is refused, not a second credit note', async () => {
+  const state = reversalRaceState()
+  state.refunds.push({ id: 'refund-removal', orderId: 'order-1', creditNoteNumber: 'CN-0005', externalRefundId: null, reason: 'Payment partly removed from the ledger (removal rem-1)', totalForeign: 25, totalBase: 25, returnWarehouseId: null, chargeback: false })
+  state.paymentRemovals = [{ id: 'rem-1', orderId: 'order-1', kind: 'REMOVED', refundId: 'refund-removal', ledgerAction: 'CREDIT_NOTE' }]
+
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1', lines: removalLines, reason: 'Payment partly removed from the ledger (removal rem-1)',
+    creditNotePrefix: 'CN-', accountingSettings, paymentRemovalRecordId: 'rem-1',
+  })
+
+  assert.equal(result.success === false && result.conflict, 'removal-already-credited')
+  assert.equal(state.refunds.length, 1)
 })

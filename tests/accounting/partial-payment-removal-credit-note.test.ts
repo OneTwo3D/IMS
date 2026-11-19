@@ -24,10 +24,39 @@ test('the removed amount is spread pro rata: the credit is the same fraction of 
   assert.equal(net(plan.lines) * 1.2, 33, 'with the 20% VAT each part carries, the credit is exactly the removed amount')
 })
 
-test('an order discount is already inside the net total, so the credit is still the removed fraction of the order', () => {
+/** The gross a credit note comes to when each line is taxed at its own rate (the discount line at the order default rate), as Xero does: per line, rounded to the penny once in total. */
+const gross = (lines: Array<{ totalBase: number; lineId?: string | null; lineKind?: string }>, rateOf: (l: { lineId?: string | null; lineKind?: string }) => number) =>
+  lines.reduce((s, l) => s + l.totalBase * (1 + rateOf(l)), 0)
+
+test('an order-level discount is mirrored as its own negative line, so the credit is the removed fraction of every part', () => {
   // goods 100 + shipping 0, discount 20 (net total 80), VAT 16: gross 96; 48 removed = half.
   const plan = planRemovalCreditNoteLines({ lines: [{ lineId: 'a', productId: 'p', description: 'A', totalBase: 100 }], shippingBase: 0, orderNetTotalBase: 80, totalForeign: 96, removedForeign: 48 })
   assert.equal(plan.ok && net(plan.lines), 40)
+  assert.deepEqual(plan.ok && plan.lines.map((l) => [l.lineKind, l.totalBase]), [['sale', 50], ['discount', -10]])
+})
+
+test('mixed-rate order with a discount: removing 80 credits EXACTLY 80 (the discount line carries the order default rate)', () => {
+  // A 100 @20%, B 100 @0%, discount 50 @20% (the order default): net 150, VAT 10, total 160. Spreading the discount over the pre-discount nets
+  // (the old plan) gave 37.5 + 37.5 and a credit note of 82.5 against 80 removed.
+  const plan = planRemovalCreditNoteLines({
+    lines: [{ lineId: 'a', productId: 'p1', description: 'A', totalBase: 100 }, { lineId: 'b', productId: 'p2', description: 'B', totalBase: 100 }],
+    shippingBase: 0, orderNetTotalBase: 150, totalForeign: 160, removedForeign: 80,
+  })
+  assert.equal(plan.ok, true)
+  if (!plan.ok) return
+  assert.equal(plan.discountBase.toNumber(), 50)
+  assert.deepEqual(plan.lines.map((l) => [l.lineId ?? null, l.lineKind, l.totalBase]), [['a', 'sale', 50], ['b', 'sale', 50], [null, 'discount', -25]])
+  const rate = (l: { lineId?: string | null; lineKind?: string }) => (l.lineId === 'b' ? 0 : 0.2)
+  assert.equal(Math.round(gross(plan.lines, rate) * 100) / 100, 80, 'the credit note\'s gross equals the removed amount')
+})
+
+test('single-rate order with shipping: the credit note gross equals the removed amount', () => {
+  const plan = planRemovalCreditNoteLines({
+    lines: [{ lineId: 'a', productId: 'p1', description: 'A', totalBase: 80 }, { lineId: 'b', productId: 'p2', description: 'B', totalBase: 20 }],
+    shippingBase: 10, orderNetTotalBase: 110, totalForeign: 132, removedForeign: 33,
+  })
+  assert.equal(plan.ok, true)
+  if (plan.ok) assert.equal(Math.round(gross(plan.lines, () => 0.2) * 100) / 100, 33)
 })
 
 test('rounding residue lands on the largest part so the credit net is exact', () => {

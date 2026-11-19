@@ -6819,6 +6819,7 @@ export async function processClaimedEntry(
         lines: payload.lines as Array<{ itemCode?: string; description: string; quantity: number; unitAmount: number; accountCode: string; taxType?: string; noTaxKind?: SalesNoTaxLineKind }>,
         reference: payload.reference as string | undefined,
         lineAmountsIncludeTax: payload.lineAmountsIncludeTax as boolean | undefined,
+        ...(typeof payload.orderTotal === 'number' && Number.isFinite(payload.orderTotal) ? { orderTotal: payload.orderTotal } : {}),
       }, resolveInvoiceStatus(postingMode), { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note'), customerId: creditCustomerId, ...(creditNoteBeforePostHook ? { beforePost: creditNoteBeforePostHook } : {}), contactGate: () => resolveSalesPostContact(referenceType, referenceId, payload) }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
     }
 

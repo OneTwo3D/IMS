@@ -274,6 +274,11 @@ export type CreditNoteData = {
    * false/omit this. The flag exists to avoid hard-coding one mode.
    */
   lineAmountsIncludeTax?: boolean
+  /**
+   * The order total the invoice this credit note FULLY reverses was rounded to (setting `xero_round_to_order_total_enabled`). Set only on a full-refund or chargeback credit note
+   * while the setting is on: the connector then posts the same Rounding line, so the credit note totals what the invoice does and its allocation does not fail. Absent = none.
+   */
+  orderTotal?: number
   reference?: string
 }
 
