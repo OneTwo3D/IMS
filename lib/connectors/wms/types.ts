@@ -86,6 +86,7 @@ export type WmsWriteOperation =
   | 'product.delete'
   | 'product.bundle'
   | 'asn.create'
+  | 'supplier.create'
 
 declare const WMS_WRITE_CLEARANCE: unique symbol
 export type WmsWriteClearance<Op extends WmsWriteOperation = WmsWriteOperation> = {
@@ -231,6 +232,11 @@ export type WmsAsnInput = {
   externalWarehouseId: string
   reference: string
   supplierReference?: string | null
+  /**
+   * The warehouse's own id for the ASN's supplier (Mintsoft: `NewASN.ProductSupplierId`), from the operator-confirmed mapping. ABSENT or
+   * null sends no supplier field, so with no mapping (or `mintsoft_asn_supplier_required` off and no link) the payload is exactly what it was.
+   */
+  externalSupplierId?: string | null
   carrier?: string | null
   eta?: string | null
   packagingType?: WmsAsnPackagingType | null
@@ -347,6 +353,30 @@ export type WmsProductContentResult = { sent: true } | { sent: false; held: true
  * linked to orders or bundles) and `message` says why. Either way nothing was removed.
  */
 export type WmsProductDeleteResult = { deleted: true } | { deleted: false; held?: true; message: string }
+
+/** One supplier as a warehouse holds it. Read-only data: IMS never overwrites an existing warehouse supplier. */
+export type WmsSupplierRef = {
+  externalId: string
+  name: string
+  code: string | null
+  email: string | null
+  vatNumber: string | null
+  active: boolean
+  raw: Record<string, unknown> | null
+}
+
+/** What IMS may send when it creates a supplier the warehouse does not have: the name and, when IMS holds them, contact basics. */
+export type WmsSupplierCreateInput = {
+  name: string
+  email?: string | null
+  contactName?: string | null
+  phone?: string | null
+}
+
+/** `created: false, held: true` is the outbound-write hold refusing BEFORE the request left IMS: nothing was sent. */
+export type WmsSupplierCreateResult =
+  | { created: true; externalId: string }
+  | { created: false; held?: true; message: string }
 
 export type WmsBundleComponent = {
   externalProductId: string | null
@@ -694,6 +724,10 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
   /** Delete a product record in the WMS. DESTRUCTIVE: a caller deletes only on proof that its replacements exist. Absent: the WMS cannot. */
   deleteProduct?(externalProductId: string, clearance: WmsWriteClearance<'product.delete'>): Promise<WmsProductDeleteResult>
   createAsn(input: WmsAsnInput, clearance: WmsWriteClearance<'asn.create'>): Promise<WmsAsnRef>
+  /** Every supplier the warehouse holds, read-only. Throws (never returns a partial list) when the list cannot be proven complete. Absent: the WMS has no supplier list. */
+  listSuppliers?(options?: { pauseMs?: number; sleep?: (ms: number) => Promise<void> }): Promise<WmsSupplierRef[]>
+  /** Create a NEW supplier in the WMS. Never updates one. Absent: the WMS cannot. */
+  createSupplier?(input: WmsSupplierCreateInput, clearance: WmsWriteClearance<'supplier.create'>): Promise<WmsSupplierCreateResult>
   fetchAsnById?(externalAsnId: string): Promise<WmsAsnRef | null>
   pollReturns(since: Date): Promise<WmsReturnRecord[]>
   /**

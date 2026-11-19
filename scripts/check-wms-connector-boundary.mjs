@@ -311,6 +311,9 @@ const ALLOWLIST = [
   // flows that call it spell no connector.
   'lib/connectors/wms/producer-seam.ts',
   'app/actions/mintsoft-sync.ts',
+  // The Mintsoft supplier mapping screen and its actions (o3d-qk7z0): connector-specific by content, like the courier map next to it.
+  'app/actions/mintsoft-suppliers.ts',
+  'app/(dashboard)/sync/mintsoft-suppliers/',
   'app/api/cron/mintsoft-',
   'app/api/webhooks/mintsoft/',
   'app/api/e2e/mintsoft',

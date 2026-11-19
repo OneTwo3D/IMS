@@ -11,6 +11,7 @@ import {
 import { readMintsoftAsnItemReceipt } from './asn-quantities'
 import { readMintsoftAsnWireStatusField } from './asn-status'
 import { classifyMintsoftRequest } from './read-allowlist'
+import { MINTSOFT_ASN_SUPPLIER_FIELD } from '../suppliers/contract'
 import { mintsoftEgressHold, mintsoftEgressRefusalText, mintsoftHopGate } from '../producer-egress'
 import * as connectorTransport from '@/lib/security/connector-fetch'
 import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
@@ -486,6 +487,10 @@ function buildMintsoftAsnPayload(input: WmsAsnInput): Record<string, unknown> {
     })),
   }
   if (supplierNotes) payload.SupplierNotes = supplierNotes
+  // The mapped Mintsoft supplier (UNVERIFIED against the live tenant: see suppliers/contract.ts). Absent unless an operator confirmed a mapping, so
+  // an unmapped ASN is byte-identical to what it was before suppliers existed.
+  const supplierId = input.externalSupplierId?.trim()
+  if (supplierId) payload[MINTSOFT_ASN_SUPPLIER_FIELD] = /^\d+$/.test(supplierId) ? Number.parseInt(supplierId, 10) : supplierId
   if (input.eta) payload.EstimatedDelivery = input.eta
   return payload
 }

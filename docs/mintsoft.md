@@ -567,6 +567,35 @@ Product **content** (description, short description, picture) is authored in Woo
 
 **Known overlap.** The product upsert (meta) also sends `ImageURL` from the product's primary image, which is the same address as the content step's first picture. Both write the same value; removing it from the meta payload is a P2 decision.
 
+## Mintsoft Suppliers (mapping, and the supplier on an ASN; o3d-qk7z0)
+
+Mintsoft needs a supplier on every ASN. Before this, `buildMintsoftAsnPayload` sent none: the supplier reference and carrier went into `SupplierNotes` only, and IMS held no list of Mintsoft's suppliers. Most of Qoblex's suppliers already exist in Mintsoft, with minimal details and names that are not identical to IMS's, so IMS **maps** to them first and creates only when an operator chooses to.
+
+**The contract (from the published Mintsoft swagger; UNVERIFIED against the live tenant).** In Mintsoft a supplier is a `ProductSupplier`. `GET /api/Product/Suppliers` lists them (`PageNo`, `Limit` max 100, `ClientId` admin-only) and `PUT /api/Product/Suppliers` creates one (answers a `ToolkitResult`); there is no update route, so IMS cannot overwrite an existing supplier. `NewASN.ProductSupplierId` (int32) is the ASN's supplier (`NewASN.Supplier` is a free-text name and is not used). Every name lives in `lib/connectors/mintsoft/suppliers/contract.ts`, marked UNVERIFIED, so a correction is a one-line change.
+
+**Controlled-run step (owner-sanctioned; NOTHING here has been run).** Before `mintsoft_asn_supplier_required` is turned on at step M:
+1. One read of `GET /api/Product/Suppliers` (the screen's *Refresh Mintsoft supplier list* does exactly this and writes nothing): confirm the paging, the field names, that a client user sees its own suppliers, and whether `ClientId` must be omitted for a client user (as it must be on `NewASN`).
+2. One ASN create carrying `ProductSupplierId` on stage or the sanctioned test tenant, read back with `GET /api/ASN/{id}` to see the supplier on the ASN, then `DELETE /api/ASN/{id}`.
+3. Only if IMS is to create suppliers: one `PUT /api/Product/Suppliers` with a throwaway name.
+
+**The read-only sync.** *Refresh Mintsoft supplier list* walks the list (limit 100, a pause of 400 ms between pages), refuses a partial list (a repeated id, a row it cannot read, a malformed page, more than 200 pages, or an empty answer from a tenant it had suppliers for) and caches it in `mintsoft_suppliers`. A supplier the latest full list no longer holds is marked missing, never deleted, and a mapping to it is refused for use.
+
+**Suggested matches.** For every IMS supplier without a mapping the screen offers the top three Mintsoft suppliers. Names are compared after folding case, accents, punctuation, whitespace, `&`/`and` and legal suffixes (Ltd, Limited, Inc, plc, LLC, GmbH, Co, Company and the rest of the list in `suppliers/match.ts`), as the larger of a character-bigram similarity and a token overlap. A shared e-mail (+25), VAT number (+30) or account number equal to the Mintsoft code (+20) adds to the score and can surface a pair whose names differ. (An equivalent of the CRM company-suffix fold is used here: that fold has not reached `development`.) Nothing is ever mapped automatically.
+
+**The mapping screen** (Integrations > Mintsoft > Mintsoft suppliers, `/sync/mintsoft-suppliers`; ADMIN and MANAGER). For each IMS supplier the operator can confirm a suggestion, pick any Mintsoft supplier, choose *Create in Mintsoft*, or unmap. Every decision is audited in the same transaction as the change (activity actions `mintsoft_supplier_mapped`, `_unmapped`, `_create_pending`, `_created`; the decision source, the score the operator saw and who decided are kept on `mintsoft_supplier_links`).
+
+**Create in Mintsoft is a real write.** It is ownership-map operation `mintsoft/supplier.create` (step M, P1 owner the operator by hand), goes through the producer seam and the outbound-write hold, and is behind `mintsoft_supplier_create_enabled` (default OFF). Off, the choice is recorded as `CREATE_PENDING` and nothing is sent. On, IMS first refuses when the cached list already holds a supplier with the same normalised name (map that one instead), takes a `CREATING` claim before the request so two clicks cannot create twice, releases the claim on a clean refusal, and **keeps** it when the outcome is unknown (a transport error): the supplier may exist, so an operator checks Mintsoft, refreshes the list and maps it by hand. IMS never updates an existing Mintsoft supplier; enriching one from IMS would be a separate opt-in write and is not built.
+
+**Transfers.** Transfer ASNs carry the supplier "One Two Enterprises Ltd" (owner decision 2026-11-19): the setting `mintsoft_transfer_supplier_id` names that IMS supplier, and it is mapped through the same screen. With none chosen, a transfer ASN is treated like an unmapped PO.
+
+**On ASN create** (`createMintsoftPurchaseOrderAsn`, `createMintsoftTransferAsn`; after the producer seam, before any sync job or reservation):
+- the supplier (the PO's, or the transfer supplier) has a mapping: its Mintsoft id is sent as `ProductSupplierId`;
+- it has none and `mintsoft_asn_supplier_required` is OFF (the default): the ASN is created exactly as before (no supplier field, byte-identical body);
+- it has none and the setting is ON: the create is **refused**, nothing is reserved or sent, and a standing task is raised (Sync > Exceptions, *ASN not created: supplier not mapped in the warehouse*, "Map supplier X in Settings > Mintsoft suppliers"). The task closes when the supplier is mapped or the ASN is created.
+`SupplierNotes` (supplier reference and carrier) is unchanged.
+
+**`mintsoft_asn_supplier_required` MUST be ON before step M**, once every active supplier and the transfer supplier are mapped: step M hands ASN creation to IMS, and Mintsoft rejects or mis-files an ASN with no supplier. It ships OFF so current behaviour is unchanged until the mapping work is done. The switch screen shows how many suppliers are still unmapped.
+
 ## Returns
 
 - Returns are first collected into `wms_returns_inbox`.

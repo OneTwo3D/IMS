@@ -1386,10 +1386,57 @@ model Supplier {
   preferredForProducts Product[] @relation("ProductPreferredSupplier")
   productionOrders ProductionOrder[]
   users           User[]
+  mintsoftSupplierLink MintsoftSupplierLink?
 
   @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "suppliers_name_trgm_idx")
   @@unique([accountingContactId, accountingContactProvenance])
   @@map("suppliers")
+}
+
+/// Read-only CACHE of the Mintsoft supplier list (GET /api/Product/Suppliers). Never written to Mintsoft; refreshed by the supplier sync.
+/// Holds supplier-company contact details only (name, code, contact e-mail), no customer or order data.
+model MintsoftSupplier {
+  id            String    @id @default(cuid())
+  /// Mintsoft's ProductSupplier ID, as text.
+  externalId    String    @unique @map("external_id")
+  name          String
+  code          String?
+  email         String?
+  /// Mintsoft's ProductSupplier has no VAT field; kept for the day a tenant exposes one, so a shared VAT number is a matching signal.
+  vatNumber     String?   @map("vat_number")
+  active        Boolean   @default(true)
+  raw           Json?
+  /// The sync run that last saw this row; a row not seen by the latest full run is marked missing, never deleted.
+  lastSeenRunId String?   @map("last_seen_run_id")
+  lastSeenAt    DateTime  @default(now()) @map("last_seen_at")
+  missingSince  DateTime? @map("missing_since")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  @@map("mintsoft_suppliers")
+}
+
+/// IMS supplier -> Mintsoft supplier decision. One row per IMS supplier. state MAPPED carries externalSupplierId; CREATE_PENDING records the
+/// operator's "create in Mintsoft" choice while the create setting is off (nothing was sent); CREATING is the claim held while a create is on its
+/// way (a row left in it means the outcome is unknown: the supplier may exist in Mintsoft, so an operator checks and maps it by hand).
+model MintsoftSupplierLink {
+  id                 String    @id @default(cuid())
+  supplierId         String    @unique @map("supplier_id")
+  state              String
+  externalSupplierId String?   @map("external_supplier_id")
+  /// Who or what decided: OPERATOR_CONFIRMED_SUGGESTION, OPERATOR_PICKED, OPERATOR_CREATE, OPERATOR_CREATE_PENDING.
+  decisionSource     String    @map("decision_source")
+  /// The 0..100 suggestion score the operator saw, when the decision followed a suggestion.
+  suggestionScore    Int?      @map("suggestion_score")
+  decidedBy          String?   @map("decided_by")
+  decidedAt          DateTime  @default(now()) @map("decided_at")
+  createdAt          DateTime  @default(now()) @map("created_at")
+  updatedAt          DateTime  @updatedAt @map("updated_at")
+
+  supplier           Supplier  @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+
+  @@index([externalSupplierId], map: "mintsoft_supplier_links_external_idx")
+  @@map("mintsoft_supplier_links")
 }
 
 /// Last known purchase price per supplier per product

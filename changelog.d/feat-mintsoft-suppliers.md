@@ -1,0 +1,6 @@
+### Mintsoft suppliers: mapping screen and the supplier on ASN create (Mintsoft)
+- New **Integrations > Mintsoft > Mintsoft suppliers** screen (managers and administrators): a read-only, paced refresh of Mintsoft's supplier list, suggested matches per IMS supplier (case, punctuation and legal-suffix folding, similarity, shared e-mail/VAT/code), and audited decisions: confirm a suggestion, pick any Mintsoft supplier, "create in Mintsoft", unmap. IMS never overwrites an existing Mintsoft supplier.
+- "Create in Mintsoft" is a real write (ownership-map row `mintsoft/supplier.create`, step M, producer seam and outbound hold) behind `mintsoft_supplier_create_enabled` (default OFF; off records the choice as pending and sends nothing).
+- Transfer ASNs carry the supplier named by `mintsoft_transfer_supplier_id` ("One Two Enterprises Ltd"), mapped through the same screen.
+- ASN create sends the mapped supplier id (`NewASN.ProductSupplierId`, UNVERIFIED against the live tenant; controlled-run step in docs/mintsoft.md). With `mintsoft_asn_supplier_required` ON an unmapped supplier refuses the ASN and raises a Sync > Exceptions task; the setting ships OFF so current behaviour is unchanged, and must be ON before step M.
+- Migration `20261119190000_mintsoft_supplier_mapping` (additive): `mintsoft_suppliers` (read cache) and `mintsoft_supplier_links`.

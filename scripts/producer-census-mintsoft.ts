@@ -66,7 +66,7 @@ export const MINT_SEAM_DEFINITION_FILES = [
 ] as const
 /** The warehouse write methods of the connector contract. Each takes a clearance as its last argument. */
 export const MINT_WRITE_METHODS = [
-  'pushOrder', 'updateOrder', 'cancelOrder', 'holdOrder', 'removeOrderItems', 'cancelMergedOrder', 'addOrderComment', 'upsertProduct', 'createBundle', 'createAsn', 'updateProductContent', 'deleteProduct',
+  'pushOrder', 'updateOrder', 'cancelOrder', 'holdOrder', 'removeOrderItems', 'cancelMergedOrder', 'addOrderComment', 'upsertProduct', 'createBundle', 'createAsn', 'updateProductContent', 'deleteProduct', 'createSupplier',
 ] as const
 export const CLEARANCE_MINT_FILE = 'lib/connectors/wms/clearance.ts'
 export const CLEARANCE_MINT_FUNCTION = 'mintWmsWriteClearance'
@@ -142,6 +142,12 @@ export const MINT_SEAM_FUNCTIONS: readonly MintSeamFunction[] = [
     mustCall: ['mintsoftProducerSeam'], beforeCalls: ['deleteProduct'],
     operations: ['product.delete'],
     why: 'The one parent-SKU deleter: it asks before the connector call, so a shadow deletes nothing and leaves the link as it was.',
+  },
+  {
+    file: 'lib/connectors/mintsoft/suppliers/mapping.ts', decl: 'createMintsoftSupplierForImsSupplier', role: 'producer',
+    mustCall: ['mintsoftProducerSeam'], beforeCalls: ['createSupplier'],
+    operations: ['supplier.create'],
+    why: 'The one Mintsoft supplier creator ("create in Mintsoft" on the mapping screen): it asks before the claim and the connector call, so a shadow creates nothing and claims nothing.',
   },
   {
     file: 'lib/connectors/mintsoft/sync/product-content-sync.ts', decl: 'syncMintsoftProductContent', role: 'producer',
