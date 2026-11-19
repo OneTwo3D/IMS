@@ -80,7 +80,14 @@ export type BridgeStatusReport = {
 export function bridgeLastTriggerReadable(report: BridgeStatusReport): boolean {
   if (report.lastTriggerState === 'unknown') return false
   if (report.lastTriggerState === 'never') {
-    return report.journalExit === 0 && report.journalReadable === true && report.journalPersistent === true && report.journalEarliestAt !== null
+    if (!(report.journalExit === 0 && report.journalReadable === true && report.journalPersistent === true && report.journalEarliestAt !== null)) return false
+    // The journal's current boot must be a real, coherent one: reported, not before the earliest entry, and not after the report itself.
+    if (report.bootId === null || report.bootStartedAt === null) return false
+    const earliest = Date.parse(report.journalEarliestAt)
+    const bootStarted = Date.parse(report.bootStartedAt)
+    const generated = Date.parse(report.generatedAt)
+    if (![earliest, bootStarted, generated].every(Number.isFinite)) return false
+    return bootStarted >= earliest && bootStarted <= generated
   }
   return report.lastTriggerAt !== null
 }

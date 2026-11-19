@@ -1,0 +1,104 @@
+import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
+import test, { mock } from 'node:test'
+import { config } from 'dotenv'
+
+/**
+ * Follow-ups to the storefront release confirmation, on a real Postgres. Only the edges are doubles (session, Next cache); a confirmation is a row in
+ * the e-mail outbox, nothing is sent and no network is touched.
+ *   (1) an import auto-allocated while still unpaid (PENDING_PAYMENT -> ALLOCATED, marker still armed) is released by WooCommerce `processing`: one confirmation;
+ *       a later hold + release of that order never fires the marker; two racing releases queue one e-mail.
+ *   (3) the release claim is in the status transaction: when the e-mail cannot be queued the move rolls back whole and the marker stays armed.
+ */
+const skip = process.env.RUN_DB_RETENTION_TESTS !== '1'
+
+mock.module('@/lib/auth/server', { namedExports: { requirePermission: async () => ({ user: { id: 'u', role: 'ADMIN' } }), requireInternalUser: async () => ({ user: { id: 'u', role: 'ADMIN' } }), requireRole: async () => ({ user: { id: 'u', role: 'ADMIN' } }) } })
+mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidateTag: () => {} } })
+
+const HOUR = 3_600_000
+
+test('o3d-3634b: release of an allocated-while-unpaid import, hold/release never fires it late, and the claim is atomic with the status move', { skip }, async (t) => {
+  config({ path: '.env.local', quiet: true })
+  config({ quiet: true })
+  if (!process.env.DATABASE_URL) throw new Error('DATABASE_URL is required when RUN_DB_RETENTION_TESTS=1')
+  const { db } = await import('../../lib/db/index.ts')
+  const { Prisma } = await import('../../app/generated/prisma/client')
+  const { applySalesOrderStatusTransition } = await import('../../app/actions/sales.ts')
+  const { syncWcOrderStatus } = await import('../../lib/connectors/woocommerce/sync/order-status.ts')
+  const { releaseStorefrontConfirmationOnPaid } = await import('../../lib/storefront-customer-email.ts')
+  const { INTERNAL_STATUS_TRANSITION_BYPASS } = await import('../../lib/sales/status-transition-bypass.ts')
+  const D = (v: string) => new Prisma.Decimal(v)
+  const keys = ['storefront_customer_email_enabled', 'storefront_customer_email_enabled_at']
+  const saved = await db.setting.findMany({ where: { key: { in: keys } } })
+  const enabledAt = new Date(Date.now() - 2 * HOUR)
+  for (const [key, value] of [[keys[0], 'true'], [keys[1], enabledAt.toISOString()]] as const) await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+  const ids: string[] = []
+  t.after(async () => {
+    await db.$executeRawUnsafe('DROP TRIGGER IF EXISTS o3d_3634b_block ON email_outbox')
+    await db.$executeRawUnsafe('DROP FUNCTION IF EXISTS o3d_3634b_block()')
+    await db.emailOutbox.deleteMany({ where: { referenceId: { in: ids } } })
+    await db.shoppingOrderLink.deleteMany({ where: { orderId: { in: ids } } })
+    await db.salesOrder.deleteMany({ where: { id: { in: ids } } })
+    for (const key of keys) {
+      const row = saved.find((s) => s.key === key)
+      if (row) await db.setting.update({ where: { key }, data: { value: row.value } })
+      else await db.setting.deleteMany({ where: { key } })
+    }
+  })
+  const externalIds = new Map<string, number>()
+  const seed = async (label: string, status: 'PENDING_PAYMENT' | 'ALLOCATED', placedAt: Date) => {
+    const order = await db.salesOrder.create({
+      data: {
+        orderNumber: `RG-${label}-${randomUUID().slice(0, 8)}`, status, currency: 'GBP', fxRateToBase: D('1'), subtotalForeign: D('1'), totalForeign: D('1'), subtotalBase: D('1'), taxBase: D('0'), totalBase: D('1'),
+        customerEmail: 'buyer@example.test', customerName: 'Buyer', externalCreatedAt: placedAt, confirmationOnReleasePendingAt: placedAt,
+      },
+      select: { id: true },
+    })
+    ids.push(order.id)
+    const wcId = 910_000_000 + Math.floor(Math.random() * 80_000_000)
+    externalIds.set(order.id, wcId)
+    await db.shoppingOrderLink.create({ data: { orderId: order.id, connector: 'woocommerce', externalOrderId: String(wcId) } })
+    return order.id
+  }
+  const mails = (id: string) => db.emailOutbox.count({ where: { referenceId: id, kind: 'STOREFRONT_ORDER_CONFIRMATION' } })
+  const marker = async (id: string) => (await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { confirmationOnReleasePendingAt: true } })).confirmationOnReleasePendingAt
+  const move = (id: string, status: string) => applySalesOrderStatusTransition(id, status as never, undefined, { internalBypassToken: INTERNAL_STATUS_TRANSITION_BYPASS, pushStatusToWooCommerce: false })
+  const wcProcessing = (id: string, paidAt: Date) => ({ id: externalIds.get(id)!, number: String(externalIds.get(id)), status: 'processing', date_paid_gmt: paidAt.toISOString().slice(0, 19), date_modified_gmt: paidAt.toISOString().slice(0, 19) }) as never
+
+  // (1a) The import allocated an unpaid order (status ALLOCATED, marker still armed); WooCommerce then reports `processing` (paid): ONE confirmation, marker consumed.
+  const allocated = await seed('alloc', 'ALLOCATED', new Date(Date.now() - HOUR))
+  assert.equal((await syncWcOrderStatus(wcProcessing(allocated, new Date()))).success, true)
+  assert.equal(await mails(allocated), 1, 'the paid allocated import is confirmed')
+  assert.equal(await marker(allocated), null)
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: allocated }, select: { status: true } })).status, 'ALLOCATED', 'IMS never moves it back to processing')
+  assert.equal((await syncWcOrderStatus(wcProcessing(allocated, new Date()))).success, true)
+  assert.equal(await mails(allocated), 1, 'a redelivered processing sends nothing more')
+
+  // (1b) The leftover marker cannot fire at an unrelated moment: allocated-while-unpaid, put on hold and released: nothing, marker disarmed by the hold.
+  const held = await seed('hold', 'ALLOCATED', new Date(Date.now() - HOUR))
+  assert.equal((await move(held, 'ON_HOLD')).success, true)
+  assert.equal(await marker(held), null, 'the hold disarms the unconsumed marker')
+  assert.equal((await move(held, 'ALLOCATED')).success, true)
+  assert.equal(await mails(held), 0, 'a hold-release of an allocated-while-unpaid import confirms nothing')
+
+  // (1c) Two racing releases queue exactly one e-mail (the claim is one atomic update).
+  const race = await seed('race', 'ALLOCATED', new Date(Date.now() - HOUR))
+  await Promise.all([releaseStorefrontConfirmationOnPaid(race, { releasedAt: new Date() }), releaseStorefrontConfirmationOnPaid(race, { releasedAt: new Date() }), releaseStorefrontConfirmationOnPaid(race)])
+  assert.equal(await mails(race), 1)
+
+  // (3) ATOMIC WITH THE STATUS MOVE: the e-mail cannot be queued (a trigger refuses the outbox insert). The status move rolls back whole: still PENDING_PAYMENT,
+  // marker still armed, nothing queued. (Before: the status committed, the marker was consumed on its own, and the confirmation was lost.)
+  await db.$executeRawUnsafe(`CREATE OR REPLACE FUNCTION o3d_3634b_block() RETURNS trigger AS $$ BEGIN RAISE EXCEPTION 'o3d-3634b test: outbox insert refused'; END $$ LANGUAGE plpgsql`)
+  await db.$executeRawUnsafe(`CREATE TRIGGER o3d_3634b_block BEFORE INSERT ON email_outbox FOR EACH ROW WHEN (NEW.kind = 'STOREFRONT_ORDER_CONFIRMATION') EXECUTE FUNCTION o3d_3634b_block()`)
+  const atomic = await seed('atomic', 'PENDING_PAYMENT', new Date(Date.now() - HOUR))
+  const refused = await move(atomic, 'PROCESSING')
+  assert.equal(refused.success, false, 'the move fails with the queue')
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: atomic }, select: { status: true } })).status, 'PENDING_PAYMENT', 'the status did not move')
+  assert.notEqual(await marker(atomic), null, 'the marker is still armed')
+  assert.equal(await mails(atomic), 0)
+  await db.$executeRawUnsafe('DROP TRIGGER o3d_3634b_block ON email_outbox')
+  // The same order, retried once the queue works: the status moves and the confirmation is queued, exactly once.
+  assert.equal((await move(atomic, 'PROCESSING')).success, true)
+  assert.equal(await mails(atomic), 1)
+  assert.equal(await marker(atomic), null)
+})

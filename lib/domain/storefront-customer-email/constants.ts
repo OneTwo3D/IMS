@@ -64,10 +64,11 @@ export function isStorefrontCustomerEmailKind(kind: string): boolean {
 /**
  * HISTORY IS NOT RE-ANNOUNCED, by TWO bounds that must both hold. (1) AGE: an order imported long after it was placed (a back-fill) gets no confirmation, and
  * an order marked delivered or a shipment despatched long ago (an operator bulk-advancing old orders) gets no delivered / partial / dispatched e-mail.
- * (2) THE SWITCH-ON INSTANT (`storefront_customer_email_enabled_at`): an order PLACED before it gets no confirmation (release included) (WooCommerce sent it, even when the import
- * was retried after the switch came on), and a dispatched / partial / delivered e-mail goes out only for a shipment DISPATCHED after it. The one exception is
- * the RELEASE of an order that was imported held (PENDING_PAYMENT / ON_HOLD) and later moves to processing: its confirmation is anchored on the release
- * (the paid time), because WooCommerce's native confirmation fires on that move and is off by then.
+ * (2) THE SWITCH-ON INSTANT (`storefront_customer_email_enabled_at`): an order PLACED before it gets no confirmation, by any path, the release of a held order
+ * included (WooCommerce sent it, or owed it and no longer sends it), and a dispatched / partial / delivered e-mail goes out only for a shipment DISPATCHED
+ * after it. There is NO exception: a bank-transfer order placed before the switch-on and paid after it is confirmed by nobody in IMS. Those orders are
+ * covered by a person, from the read-only list `npm run storefront:hand-send` (runbook step W). The release of an order placed after the switch-on is judged
+ * on the release (the paid time), because WooCommerce's native confirmation fires on that move and is off by then.
  */
 export const STOREFRONT_CONFIRMATION_MAX_AGE_MS = 48 * 60 * 60 * 1000
 export const STOREFRONT_SHIPMENT_EMAIL_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000

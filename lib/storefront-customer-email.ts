@@ -12,11 +12,16 @@
  */
 
 import { db } from '@/lib/db'
+import type { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
 import { isUndeliveredEmailCollision } from '@/lib/email-outbox'
+import { withSavepoint } from '@/lib/db/savepoint'
 import { isStorefrontCustomerEmailEnabled, readStorefrontCustomerEmailEnabledAt } from '@/lib/domain/storefront-customer-email/switch'
 import {
+  STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY,
+  STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY,
+  parseStorefrontEmailEnabledAt,
   STOREFRONT_CONFIRMATION_KIND,
   STOREFRONT_DELIVERED_KIND,
   evaluateStorefrontEmailEligibility,
@@ -32,7 +37,100 @@ const SUBJECT: Record<StorefrontEmailKindName, (ref: string) => string> = {
   delivered: (ref) => `Your order ${ref} has been delivered`,
 }
 
-async function queueStorefrontEmail(params: { name: StorefrontEmailKindName; kind: string; orderId: string; shipmentId?: string; releasedAt?: Date }): Promise<QueueResult> {
+type EmailParams = { name: StorefrontEmailKindName; kind: string; orderId: string; shipmentId?: string; releasedAt?: Date }
+type InTxOutcome = { queued: false; reason: string } | { queued: true; ref: string }
+
+/**
+ * The decision and the outbox insert for one e-mail, on a transaction the CALLER holds with the order row ALREADY LOCKED. The one body behind both the
+ * stand-alone queue (own transaction) and the release claim (inside the status transaction). `skipDuplicates` turns the database's undelivered-row
+ * uniqueness into "already_queued" instead of an error, which inside a caller's transaction would abort it.
+ */
+async function decideAndQueueUnderLock(tx: Prisma.TransactionClient, params: EmailParams, ctx: { enabledAt: Date | null; skipDuplicates: boolean }): Promise<InTxOutcome> {
+  const { name, kind, orderId } = params
+  const order = await tx.salesOrder.findUnique({
+    where: { id: orderId },
+    select: {
+      status: true,
+      isQuote: true,
+      erasedAt: true,
+      customer: { select: { gdprAnonymisedAt: true } },
+      customerEmail: true,
+      orderNumber: true,
+      externalOrderNumber: true,
+      externalCreatedAt: true,
+      shippedAt: true,
+      createdAt: true,
+      _count: { select: { shoppingLinks: true } },
+    },
+  })
+  // Read under the order lock just taken: an erased order, or one whose customer is erased, gets no e-mail.
+  if (order?.erasedAt || order?.customer?.gdprAnonymisedAt) return { queued: false, reason: 'recipient_erased' }
+  const shipment = params.shipmentId
+    ? await tx.shipment.findUnique({ where: { id: params.shipmentId }, select: { status: true, shippedAt: true, orderId: true } })
+    : null
+  // ANY status of this kind counts: a FAILED row (an unknown outcome included) is not queued again automatically. A person re-sends it.
+  const existing = await tx.emailOutbox.findFirst({ where: { kind, referenceType: 'SalesOrder', referenceId: orderId }, select: { id: true } })
+  const eligibility = evaluateStorefrontEmailEligibility({
+    kind: name,
+    settingValue: 'true',
+    enabledAt: ctx.enabledAt,
+    now: new Date(),
+    orderId,
+    order: order
+      ? {
+        status: order.status,
+        isQuote: order.isQuote,
+        customerEmail: order.customerEmail,
+        shoppingLinkCount: order._count.shoppingLinks,
+        placedAt: order.externalCreatedAt ?? order.createdAt,
+        shippedAt: order.shippedAt,
+        releasedAt: params.releasedAt ?? null,
+      }
+      : null,
+    shipment,
+    alreadyQueued: existing !== null,
+  })
+  if (!eligibility.eligible) return { queued: false, reason: eligibility.reason }
+
+  const ref = order!.orderNumber ?? order!.externalOrderNumber ?? orderId.slice(0, 8)
+  const data = {
+    kind,
+    toEmail: order!.customerEmail!.trim().toLowerCase(),
+    subject: SUBJECT[name](ref),
+    html: 'queued',
+    referenceType: 'SalesOrder',
+    referenceId: orderId,
+  }
+  // Inside a caller's transaction the insert runs in a savepoint: a collision on the undelivered-row index (a writer the order lock does not serialise) is
+  // "already_queued" and must not abort the caller's transaction. A stand-alone queue throws it and the caller maps it.
+  const insert = () => tx.emailOutbox.create({ data })
+  if (ctx.skipDuplicates) {
+    try {
+      await withSavepoint(tx, insert)
+    } catch (error) {
+      if (isUndeliveredEmailCollision(error)) return { queued: false, reason: 'already_queued' }
+      throw error
+    }
+  } else {
+    await insert()
+  }
+  return { queued: true, ref }
+}
+
+async function recordQueued(name: StorefrontEmailKindName, kind: string, orderId: string, ref: string): Promise<void> {
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: orderId,
+    action: 'storefront_customer_email_queued',
+    tag: 'sales',
+    level: 'INFO',
+    description: `Queued ${name} e-mail for storefront order ${ref}`,
+    metadata: { kind },
+    resolveUser: false,
+  })
+}
+
+async function queueStorefrontEmail(params: EmailParams): Promise<QueueResult> {
   const { name, kind, orderId } = params
   try {
     if (!(await isStorefrontCustomerEmailEnabled())) return { queued: false, reason: 'disabled' }
@@ -41,81 +139,65 @@ async function queueStorefrontEmail(params: { name: StorefrontEmailKindName; kin
 
     const outcome = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
-      const order = await tx.salesOrder.findUnique({
-        where: { id: orderId },
-        select: {
-          status: true,
-          isQuote: true,
-          erasedAt: true,
-          customer: { select: { gdprAnonymisedAt: true } },
-          customerEmail: true,
-          orderNumber: true,
-          externalOrderNumber: true,
-          externalCreatedAt: true,
-          shippedAt: true,
-          createdAt: true,
-          _count: { select: { shoppingLinks: true } },
-        },
-      })
-      // Read under the order lock just taken: an erased order, or one whose customer is erased, gets no e-mail.
-      if (order?.erasedAt || order?.customer?.gdprAnonymisedAt) return { queued: false as const, reason: 'recipient_erased' }
-      const shipment = params.shipmentId
-        ? await tx.shipment.findUnique({ where: { id: params.shipmentId }, select: { status: true, shippedAt: true, orderId: true } })
-        : null
-      // ANY status of this kind counts: a FAILED row (an unknown outcome included) is not queued again automatically. A person re-sends it.
-      const existing = await tx.emailOutbox.findFirst({ where: { kind, referenceType: 'SalesOrder', referenceId: orderId }, select: { id: true } })
-      const eligibility = evaluateStorefrontEmailEligibility({
-        kind: name,
-        settingValue: 'true',
-        enabledAt,
-        now: new Date(),
-        orderId,
-        order: order
-          ? {
-            status: order.status,
-            isQuote: order.isQuote,
-            customerEmail: order.customerEmail,
-            shoppingLinkCount: order._count.shoppingLinks,
-            placedAt: order.externalCreatedAt ?? order.createdAt,
-            shippedAt: order.shippedAt,
-            releasedAt: params.releasedAt ?? null,
-          }
-          : null,
-        shipment,
-        alreadyQueued: existing !== null,
-      })
-      if (!eligibility.eligible) return { queued: false as const, reason: eligibility.reason }
-
-      const ref = order!.orderNumber ?? order!.externalOrderNumber ?? orderId.slice(0, 8)
-      await tx.emailOutbox.create({
-        data: {
-          kind,
-          toEmail: order!.customerEmail!.trim().toLowerCase(),
-          subject: SUBJECT[name](ref),
-          html: 'queued',
-          referenceType: 'SalesOrder',
-          referenceId: orderId,
-        },
-      })
-      return { queued: true as const, ref }
+      return decideAndQueueUnderLock(tx, params, { enabledAt, skipDuplicates: false })
     })
     if (!outcome.queued) return outcome
 
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: orderId,
-      action: 'storefront_customer_email_queued',
-      tag: 'sales',
-      level: 'INFO',
-      description: `Queued ${name} e-mail for storefront order ${outcome.ref}`,
-      metadata: { kind },
-      resolveUser: false,
-    })
+    await recordQueued(name, kind, orderId, outcome.ref)
     return { queued: true }
   } catch (error) {
     // The database refused a second undelivered row for this (kind, order): a writer the order lock does not serialise, which is what the index is for.
     if (isUndeliveredEmailCollision(error)) return { queued: false, reason: 'already_queued' }
     await recordQueueFailure(name, orderId, error)
+    return { queued: false, reason: 'error' }
+  }
+}
+
+export type ReleaseClaimResult = { claimed: boolean; queued: boolean; reason?: string; afterCommit: (() => Promise<void>) | null }
+
+/**
+ * THE RELEASE CLAIM, ON THE CALLER'S TRANSACTION (order row already locked by the caller). A storefront order imported HELD carries a one-shot marker
+ * (`confirmationOnReleasePendingAt`); the first move of it to a despatch-pending status consumes it and, in the SAME transaction, judges and queues the
+ * confirmation, so a crash can neither consume the marker with nothing queued nor leave it armed after the status moved. The claim is one atomic
+ * `updateMany` (count === 1): of any number of racing moves exactly one wins. It runs AFTER the caller's own eligibility (the status write it belongs to),
+ * and a refused confirmation (switch off, too old, placed before the switch-on) still consumes the marker, so it can never fire later.
+ * `afterCommit` records the activity once the transaction has committed (null when nothing was queued).
+ */
+export async function claimAndQueueConfirmationOnReleaseInTx(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  options?: { releasedAt?: Date },
+): Promise<ReleaseClaimResult> {
+  const claim = await tx.salesOrder.updateMany({ where: { id: orderId, confirmationOnReleasePendingAt: { not: null } }, data: { confirmationOnReleasePendingAt: null } })
+  if (claim.count !== 1) return { claimed: false, queued: false, reason: 'no_marker', afterCommit: null }
+  const switchRow = await tx.setting.findUnique({ where: { key: STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY }, select: { value: true } })
+  if (switchRow?.value !== 'true') return { claimed: true, queued: false, reason: 'disabled', afterCommit: null }
+  const stampRow = await tx.setting.findUnique({ where: { key: STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY }, select: { value: true } })
+  const outcome = await decideAndQueueUnderLock(tx, {
+    name: 'confirmation', kind: STOREFRONT_CONFIRMATION_KIND, orderId, ...(options?.releasedAt ? { releasedAt: options.releasedAt } : {}),
+  }, { enabledAt: parseStorefrontEmailEnabledAt(stampRow?.value), skipDuplicates: true })
+  if (!outcome.queued) return { claimed: true, queued: false, reason: outcome.reason, afterCommit: null }
+  return { claimed: true, queued: true, afterCommit: () => recordQueued('confirmation', STOREFRONT_CONFIRMATION_KIND, orderId, outcome.ref).catch(() => undefined) }
+}
+
+/**
+ * A WooCommerce `processing` (the order is paid) for an order IMS already moved on to ALLOCATED / PICKING / PACKING while it was still held in the store
+ * (the import auto-allocated a pending-payment order): the state machine refuses that move, so the hook in the status change never runs. This is the
+ * release for it: claim the marker and queue the confirmation, in one transaction. Nothing to claim = nothing happens. Never throws.
+ */
+export async function releaseStorefrontConfirmationOnPaid(orderId: string, options?: { releasedAt?: Date }): Promise<QueueResult> {
+  try {
+    const outcome = await db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, orderId)
+      const now = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } })
+      if (!now || !['ALLOCATED', 'PICKING', 'PACKING'].includes(now.status)) return null
+      return claimAndQueueConfirmationOnReleaseInTx(tx, orderId, options)
+    })
+    if (!outcome) return { queued: false, reason: 'wrong_status' }
+    if (outcome.afterCommit) await outcome.afterCommit()
+    return { queued: outcome.queued, ...(outcome.reason ? { reason: outcome.reason } : {}) }
+  } catch (error) {
+    await recordQueueFailure('confirmation', orderId, error)
     return { queued: false, reason: 'error' }
   }
 }

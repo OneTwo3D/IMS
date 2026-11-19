@@ -830,10 +830,14 @@ async function applyScopedWmsDespatch(
       )
       if (result.success && target === 'SHIPPED') processedInBatch.push(shipment.id)
       if (!result.success) {
-        // A failed batch judges NO partial e-mail: the failure may be the fence refusing the order flip AFTER the last shipment shipped, in which case the
-        // order is still PROCESSING while the store / WMS reported the whole order despatched. The retry either flips the order (dispatched e-mail, no
-        // partial) or ends in a terminal refusal; the shipments already shipped are not re-judged.
-        discardPartialEmails()
+        // A failed batch judges NO partial e-mail when the failing shipment is the LAST one: the failure may be the fence refusing the order flip AFTER it
+        // shipped, in which case the order is still PROCESSING while the store / WMS reported the whole order despatched, so "the rest will follow" would be
+        // false. The retry either flips the order (dispatched e-mail, no partial) or ends in a terminal refusal.
+        // When a LATER shipment of the batch is still unshipped the order genuinely owes more (the partial rule re-checks the order under its lock), and the
+        // shipments already shipped would never be judged again (the retry's open list excludes them), so their partial e-mails are flushed now. One e-mail
+        // per shipment (the kind carries the shipment id), so nothing can go out twice.
+        if (index < open.length - 1) await flushPartialEmails()
+        else discardPartialEmails()
         await logActivity({
           entityType: 'SALES_ORDER',
           entityId: order.id,
@@ -1135,10 +1139,14 @@ export async function applyExternalFulfillmentUpdate(
       if (result.success && target === 'SHIPPED') shippedInBatch.push(shipment.id)
 
       if (!result.success) {
-        // A failed batch judges NO partial e-mail: the failure may be the fence refusing the order flip AFTER the last shipment shipped, in which case the
-        // order is still PROCESSING while the store / WMS reported the whole order despatched. The retry either flips the order (dispatched e-mail, no
-        // partial) or ends in a terminal refusal; the shipments already shipped are not re-judged.
-        discardPartialEmails()
+        // A failed batch judges NO partial e-mail when the failing shipment is the LAST one: the failure may be the fence refusing the order flip AFTER it
+        // shipped, in which case the order is still PROCESSING while the store / WMS reported the whole order despatched, so "the rest will follow" would be
+        // false. The retry either flips the order (dispatched e-mail, no partial) or ends in a terminal refusal.
+        // When a LATER shipment of the batch is still unshipped the order genuinely owes more (the partial rule re-checks the order under its lock), and the
+        // shipments already shipped would never be judged again (the retry's open list excludes them), so their partial e-mails are flushed now. One e-mail
+        // per shipment (the kind carries the shipment id), so nothing can go out twice.
+        if (index < shipments.length - 1) await flushPartialEmails()
+        else discardPartialEmails()
         await logActivity({
           entityType: 'SALES_ORDER',
           entityId: order.id,

@@ -1,0 +1,6 @@
+### Storefront confirmation e-mail on release: follow-ups to the first release marker (sales, cutover)
+- A held storefront import that the import auto-allocated before it was paid is now released by WooCommerce's `processing` (claim of the one-shot marker, one confirmation); putting such an order on hold and releasing it later can no longer fire the leftover marker.
+- The release claim now runs inside the status-change transaction, after the move is validated, together with the queued e-mail (atomic: one winner, no lost e-mail, no armed marker after a crash).
+- New read-only `npm run storefront:hand-send` lists open unpaid held storefront orders (and, with `--natives-off-at`, orders placed between natives-off and the switch-on) with no confirmation, for hand-sending at step W; runbook step W and help-docs updated. IMS still never confirms an order placed before the switch-on.
+- A failed external-dispatch batch now still queues the partial e-mails of shipments that shipped when a later shipment of the batch remains unshipped (never when the failing shipment is the last).
+- `bridge_writers_status.py`: system journal only for `journal_earliest`, `/run` and `/usr/lib` journald drop-ins read, boot consistency checked, `--assume-groups` only honoured with a test-only environment variable.
