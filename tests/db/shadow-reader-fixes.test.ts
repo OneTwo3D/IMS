@@ -129,6 +129,34 @@ test('RECONCILE WHILE HELD: an unlinked paid order is NOT_PUSHED drift with the 
   })
 })
 
+test('RECONCILE WHILE HELD: a held-create shadow record that cannot be read is COUNTED (shadowReadErrors), leaves the finding open, and a readable one counts none', { skip }, async (t) => {
+  const d = await deps()
+  const tag = `srh${randomUUID().slice(0, 8)}`
+  const wh = await seedWarehouse(d, tag)
+  const orderId = await seedOrderIn(d, wh, tag, new Date('2026-05-01T00:00:00Z'))
+  t.after(() => cleanupWarehouse(d, wh))
+  const finding = await d.db.wmsOrderDiscrepancy.create({ data: { connector: 'mintsoft', orderId, category: 'NOT_PUSHED', status: 'OPEN', detail: 'old' }, select: { id: true } })
+  const resolve = () => d.reconcile.resolveNotPushedChunk({ connectorId: 'mintsoft', boundWarehouseIds: [wh.warehouseId], rows: [{ id: finding.id, orderId }], now: new Date() })
+  await withEnv(HELD, async () => {
+    const readable = await resolve()
+    assert.equal(readable.shadowReadErrors, 0, 'CONTROL: a readable (empty) shadow table reports no read error')
+    const db = d.db as unknown as { $queryRaw: (...args: unknown[]) => Promise<unknown> }
+    const original = db.$queryRaw
+    db.$queryRaw = async () => { throw new Error('shadow table unreadable') }
+    const quiet = console.error
+    console.error = () => {}
+    try {
+      const unreadable = await resolve()
+      assert.equal(unreadable.shadowReadErrors, 1, 'the unreadable batch is reported, so the sweep run is PARTIAL')
+      assert.equal((await d.db.wmsOrderDiscrepancy.findUnique({ where: { id: finding.id } }))?.status, 'OPEN', 'an unreadable record reads as no record: the finding stays open')
+    } finally {
+      db.$queryRaw = original
+      console.error = quiet
+    }
+  })
+  await withEnv(OFF, async () => assert.equal((await resolve()).shadowReadErrors, 0, 'no hold, no shadow read'))
+})
+
 test('HELD CREATE PASS CURSOR: the real port pages candidates by id after the cursor; the cursor is stored and cleared; without a rotation the legacy updatedAt order is untouched', { skip }, async (t) => {
   const d = await deps()
   const tag = `srg${randomUUID().slice(0, 8)}`

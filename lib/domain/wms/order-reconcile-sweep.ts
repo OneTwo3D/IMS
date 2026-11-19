@@ -365,15 +365,16 @@ export async function resolveNotPushedChunk(input: {
   boundWarehouseIds: string[]
   rows: Array<{ id: string; orderId: string }>
   now: Date
-}): Promise<{ resolved: number; outOfScope: number }> {
+}): Promise<{ resolved: number; outOfScope: number; shadowReadErrors: number }> {
   const { rows } = input
   // HELD: while the producer-side hold stands every create is a shadow and writes no link. That explains the missing link ONLY for an order
   // IMS actually shadowed: a finding raised during an earlier live period (the push cron really stopped) must not be closed by a later hold.
   // So while held, close only the findings whose order has a DURABLE held-create shadow record; every other row falls through to the normal
-  // drift predicate and stays open while it drifts. An unreadable record reads as no record (the finding stays open).
+  // drift predicate and stays open while it drifts. An unreadable record reads as no record (the finding stays open) and is COUNTED in
+  // `shadowReadErrors`, which the sweep adds to its error counter so the run is PARTIAL rather than a clean SUCCEEDED.
   let heldRows = rows
   if (wmsProducerHold(input.connectorId).held) {
-    const shadowed = await orderIdsWithHeldCreateShadow(input.connectorId, rows.map((row) => row.orderId))
+    const { found: shadowed, shadowReadErrors } = await orderIdsWithHeldCreateShadow(input.connectorId, rows.map((row) => row.orderId))
     const heldIds = rows.filter((row) => shadowed.has(row.orderId)).map((row) => row.id)
     if (heldIds.length > 0) {
       await db.wmsOrderDiscrepancy.updateMany({
@@ -383,29 +384,34 @@ export async function resolveNotPushedChunk(input: {
     }
     const closed = new Set(heldIds)
     heldRows = rows.filter((row) => !closed.has(row.id))
-    if (heldRows.length === 0) return { resolved: 0, outOfScope: heldIds.length }
+    if (heldRows.length === 0) return { resolved: 0, outOfScope: heldIds.length, shadowReadErrors }
     const rest = await resolveNotPushedChunkLive({ ...input, rows: heldRows })
-    return { resolved: rest.resolved, outOfScope: rest.outOfScope + heldIds.length }
+    return { resolved: rest.resolved, outOfScope: rest.outOfScope + heldIds.length, shadowReadErrors }
   }
-  return resolveNotPushedChunkLive(input)
+  return { ...(await resolveNotPushedChunkLive(input)), shadowReadErrors: 0 }
 }
 
 const SHADOW_READ_BATCH = 10
 
-/** The orders of `orderIds` with a durable held-create shadow record. A record that cannot be read is no record: the finding stays open. */
-async function orderIdsWithHeldCreateShadow(connectorId: string, orderIds: string[]): Promise<Set<string>> {
+/**
+ * The orders of `orderIds` with a durable held-create shadow record. A batch that cannot be read is no record: its findings stay open, and the
+ * failure is counted in `shadowReadErrors` (the caller reports it into the sweep's error counter) as well as logged.
+ */
+async function orderIdsWithHeldCreateShadow(connectorId: string, orderIds: string[]): Promise<{ found: Set<string>; shadowReadErrors: number }> {
   const found = new Set<string>()
-  if (!(connectorId in WMS_PRODUCER_DESTINATION)) return found
+  let shadowReadErrors = 0
+  if (!(connectorId in WMS_PRODUCER_DESTINATION)) return { found, shadowReadErrors }
   const destination = WMS_PRODUCER_DESTINATION[connectorId as keyof typeof WMS_PRODUCER_DESTINATION]
   for (let i = 0; i < orderIds.length; i += SHADOW_READ_BATCH) {
     try {
       const records = await findDurableShadowRecords(db, destination, [{ subjectType: 'SalesOrder', exactIds: orderIds.slice(i, i + SHADOW_READ_BATCH), operations: ['order.create'] }])
       for (const record of records) found.add(record.subjectId)
     } catch (error) {
+      shadowReadErrors += 1
       console.error(`[wms-reconcile] could not read held-create shadow records: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
-  return found
+  return { found, shadowReadErrors }
 }
 
 async function resolveNotPushedChunkLive(input: {
@@ -904,7 +910,9 @@ export async function runWmsOrderReconcileSweep(
       })
       if (openNotPushed.length === 0) break
       lastId = openNotPushed[openNotPushed.length - 1].id
-      await resolveNotPushedChunk({ connectorId, boundWarehouseIds: resolutionBindings.map((b) => b.warehouseId), rows: openNotPushed, now })
+      const chunk = await resolveNotPushedChunk({ connectorId, boundWarehouseIds: resolutionBindings.map((b) => b.warehouseId), rows: openNotPushed, now })
+      // An unreadable held-create shadow record leaves its finding open; the run is PARTIAL, not a clean SUCCEEDED.
+      counters.errors += chunk.shadowReadErrors
       if (openNotPushed.length < RESOLUTION_CHUNK) break
     }
 
