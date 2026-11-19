@@ -1,0 +1,7 @@
+### Review follow-ups to the order-amendment, refund-remainder and Mintsoft name-parity work (wms, woocommerce)
+- Mintsoft name parity (flag `mintsoft_product_parity_enabled`, off): when a variation name is refused, the name Mintsoft already holds is sent back byte for byte; it is no longer trimmed, so a name with leading or trailing spaces is not renamed.
+- The "product name refused" discrepancy now closes when parity is switched off, when the product stops being eligible, and when the sync stops on a SKU rename, instead of staying open for good.
+- WooCommerce order amendments (flag `wc_order_amendment_write_enabled`, off): a live re-read that keeps failing because the warehouse state is unreadable and runs out of attempts now raises a visible refused action (Sync > Exceptions) instead of being dropped silently. New column `wc_order_divergence_rechecks.from_retry` (additive).
+- The recheck drain no longer counts an order that is still pending (its recheck row was re-created) as resolved.
+- Recording what WooCommerce last showed for an order's lines no longer uses a timestamp cast that could fail and freeze the record; a failure is now logged.
+- Refund remainder tasks (flag `wms_refund_remainder_task_enabled`, off): refunds that were deleted no longer count, and a new remainder task closes any earlier open remainder task for the same order so the warehouse is never asked for the sum of two.

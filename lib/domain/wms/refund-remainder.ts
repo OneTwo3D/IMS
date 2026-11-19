@@ -2,7 +2,10 @@ import { db } from '@/lib/db'
 import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import { loadNettedRefundLines } from '@/lib/domain/sales/refund-demand-netting'
 import { isMirroredFeeLine } from './mirrored-fee-line'
-import { raiseWmsOperatorTask, refundRemainderQuery, warehouseOrderRef, type WmsOperatorTaskInput } from './operator-tasks'
+import { raiseWmsOperatorTask, refundRemainderQuery, warehouseOrderRef, wmsOperatorTaskHash, type WmsOperatorTaskInput } from './operator-tasks'
+
+/** `doneBy` of a remainder task the system closed because a newer one for the same order states the remainder now (never a user id). */
+export const REFUND_REMAINDER_SUPERSEDED_ACTOR = 'system:refund-remainder-superseded'
 
 /**
  * THE UNSHIPPED REMAINDER AFTER A SHIPPED-UNITS RETURN AND REFUND (owner decision 2026-11-18, o3d-2q9vp).
@@ -76,6 +79,8 @@ export type RefundRemainderDeps = {
   refundTotals(orderId: string): Promise<{ gross: Map<string, unknown>; netted: Map<string, unknown> }>
   shipped(orderId: string, lines: ReadonlyArray<RemainderLine>): Promise<Map<string, unknown>>
   raise(task: WmsOperatorTaskInput): Promise<boolean>
+  /** Close every OPEN remainder task of the order except the one with `keepContentHash`: the new task states the whole remainder, so an earlier open one would double the request. Returns how many were closed. */
+  supersedeEarlier?(input: { connector: string; orderId: string; keepContentHash: string }): Promise<number>
   /** The sweep cursor: the last order examined, so the next sweep continues after it. */
   readCursor?(connector: string): Promise<string | null>
   writeCursor?(connector: string, orderId: string | null): Promise<void>
@@ -114,14 +119,14 @@ export const defaultRefundRemainderDeps: RefundRemainderDeps = {
     }))
   },
   async refundTotals(orderId) {
-    const rows = await db.salesOrderRefundLine.findMany({ where: { refund: { orderId } }, select: { salesOrderLineId: true, qty: true } })
+    const rows = await db.salesOrderRefundLine.findMany({ where: { refund: { orderId, deletedAt: null } }, select: { salesOrderLineId: true, qty: true } })
     const gross = new Map<string, unknown>()
     for (const row of rows) {
       if (!row.salesOrderLineId) continue
       gross.set(row.salesOrderLineId, toDecimal(gross.get(row.salesOrderLineId) as never ?? 0).plus(toDecimal(row.qty)))
     }
     const netted = new Map<string, unknown>()
-    for (const row of await loadNettedRefundLines(db, { refund: { orderId } })) {
+    for (const row of await loadNettedRefundLines(db, { refund: { orderId, deletedAt: null } })) {
       if (!row.salesOrderLineId) continue
       netted.set(row.salesOrderLineId, toDecimal(netted.get(row.salesOrderLineId) as never ?? 0).plus(toDecimal(row.qty as never)))
     }
@@ -142,6 +147,13 @@ export const defaultRefundRemainderDeps: RefundRemainderDeps = {
   },
   async raise(task) {
     return raiseWmsOperatorTask(db, task)
+  },
+  async supersedeEarlier({ connector, orderId, keepContentHash }) {
+    const { count } = await db.wmsOperatorTask.updateMany({
+      where: { connector, orderId, reason: 'REFUND_REMAINDER_DUE', status: 'OPEN', contentHash: { not: keepContentHash } },
+      data: { status: 'DONE', doneAt: new Date(), doneBy: REFUND_REMAINDER_SUPERSEDED_ACTOR },
+    })
+    return count
   },
   async readCursor(connector) {
     const row = await db.setting.findUnique({ where: { key: cursorKey(connector) }, select: { value: true } })
@@ -178,7 +190,7 @@ export async function raiseRefundRemainderTasks(connector: string, limit = 50, d
       })
       if (remainder.length === 0) continue
       const orderRef = candidate.orderNumber ?? candidate.orderId
-      const created = await deps.raise({
+      const task: WmsOperatorTaskInput = {
         connector,
         orderId: candidate.orderId,
         externalOrderId: candidate.externalOrderId,
@@ -188,8 +200,13 @@ export async function raiseRefundRemainderTasks(connector: string, limit = 50, d
         // Per order, SKU and EPISODE, not per exact remainder: a partly delivered remainder (8 shipped, then 9) changes the quantity and must not raise a second "send 1" task while "send 2" is in progress, but a
         // FURTHER returned-and-refunded unit of the same SKU is a new episode (the returned-and-refunded quantity, gross minus netted, moved) and must raise its own task even though the first one is done. The dedupe also matches finished tasks.
         dedupeBasis: refundRemainderBasis(remainder, candidate.lines, totals.gross, totals.netted),
-      })
-      if (created) raised += 1
+      }
+      const created = await deps.raise(task)
+      if (created) {
+        raised += 1
+        // Each task states the CUMULATIVE remainder, so an earlier task still open ("send 1") plus this one ("send 2") would let an operator ask the warehouse for 3. The new one replaces it.
+        if (deps.supersedeEarlier) await deps.supersedeEarlier({ connector, orderId: candidate.orderId, keepContentHash: wmsOperatorTaskHash(task) })
+      }
     } catch (error) {
       failed += 1
       console.error('[wms-order-push] could not check the refund remainder of an order', candidate.orderId, error instanceof Error ? error.message : error)

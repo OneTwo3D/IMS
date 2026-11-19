@@ -47,6 +47,7 @@ import { logActivity } from '@/lib/activity-log'
 import { currencyMinorUnits, ledgerMatchEpsilon, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import type { WcFullOrder } from './types'
 import { applyWcOrderAmendment } from './order-amendment'
+import { recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER } from '@/lib/domain/refused-actions'
 import { parseWcGmtInstant } from './receipt-settlement-rate'
 import { buildWcSeenLines, hasLineItems, isOlderThanSeen, isSameSecondConflict, parseWcSeenLines, type WcSeenLines } from './wc-seen-lines'
 
@@ -335,6 +336,22 @@ export async function rerunDeferredWcOrderDivergence(wcOrder: WcFullOrder): Prom
  * Resolve deferred comparisons by a live read, for the runs that do not sweep refunds (the ordinary poll). Bounded per run, oldest first; a row that is still deferred counts an attempt and is dropped at the
  * attempt or age cap. Never throws.
  */
+export const WC_AMENDMENT_RECHECK_GATE = 'WC_AMENDMENT_RECHECK_EXHAUSTED'
+
+async function raiseRecheckExhausted(row: { orderId: string; externalOrderId: string; attempts: number }): Promise<void> {
+  await recordRefusedAction(db, {
+    entityType: REFUSED_ACTION_ENTITY_SALES_ORDER,
+    entityId: row.orderId,
+    action: 'WC_ORDER_AMENDMENT',
+    gate: WC_AMENDMENT_RECHECK_GATE,
+    permanence: 'PERMANENT',
+    severity: 'MEDIUM',
+    intent: { externalOrderId: row.externalOrderId, attempts: row.attempts },
+    detail: `WooCommerce changed this order but IMS could not decide what to do (the warehouse state could not be read) after ${row.attempts} live re-reads, and has stopped retrying. IMS refunded and sent nothing: check the order in WooCommerce and decide.`,
+  })
+  console.error('wc_order_divergence: a recheck ran out of attempts; a refused action was raised for the order')
+}
+
 export async function drainDeferredWcOrderDivergences(limit: number = RECHECK_PER_RUN): Promise<{ examined: number; resolved: number; dropped: number }> {
   const out = { examined: 0, resolved: 0, dropped: 0 }
   try {
@@ -344,7 +361,13 @@ export async function drainDeferredWcOrderDivergences(limit: number = RECHECK_PE
       return out
     }
     const cutoff = new Date(Date.now() - RECHECK_MAX_AGE_DAYS * 86_400_000)
-    out.dropped += (await db.wcOrderDivergenceRecheck.deleteMany({ where: { OR: [{ deferredAt: { lt: cutoff } }, { attempts: { gte: RECHECK_MAX_ATTEMPTS } }] } })).count
+    const expired = await db.wcOrderDivergenceRecheck.findMany({ where: { OR: [{ deferredAt: { lt: cutoff } }, { attempts: { gte: RECHECK_MAX_ATTEMPTS } }] }, select: { id: true, orderId: true, externalOrderId: true, attempts: true, fromRetry: true } })
+    for (const row of expired) {
+      // A row the write step queued because it could NOT decide (warehouse unreadable, two deliveries in one second) is a paid order WooCommerce changed that IMS has neither refunded nor told anyone about: dropping it silently leaves
+      // nothing that says so. It becomes a visible refused action (Sync > Exceptions) a person decides. A row deferred only for an unrecorded refund that never came owes nothing and is dropped as before.
+      if (row.fromRetry) await raiseRecheckExhausted(row).catch((e) => console.error('wc_order_divergence: could not raise the exhausted recheck', e instanceof Error ? e.constructor.name : typeof e))
+    }
+    if (expired.length > 0) out.dropped += (await db.wcOrderDivergenceRecheck.deleteMany({ where: { id: { in: expired.map((row) => row.id) } } })).count
     const rows = await db.wcOrderDivergenceRecheck.findMany({ orderBy: { lastAttemptAt: 'asc' }, take: Math.max(1, limit) })
     for (const row of rows) {
       out.examined++
@@ -352,7 +375,8 @@ export async function drainDeferredWcOrderDivergences(limit: number = RECHECK_PE
       const live = await readLiveOrder(row.externalOrderId)
       if (!live) continue
       await surfaceWcOrderDivergence(row.orderId, live)
-      if ((await db.wcOrderDivergenceRecheck.count({ where: { id: row.id } })) === 0) out.resolved++
+      // By ORDER, not row id: a comparison that could not decide deletes the row and re-creates it (new id) for the next drain, and that order is still pending, not resolved.
+      if ((await db.wcOrderDivergenceRecheck.count({ where: { orderId: row.orderId } })) === 0) out.resolved++
     }
   } catch (e) {
     console.error('wc_order_divergence: could not drain deferred comparisons', e instanceof Error ? e.constructor.name : typeof e)
@@ -364,12 +388,22 @@ export async function drainDeferredWcOrderDivergences(limit: number = RECHECK_PE
  * Store the seen WooCommerce lines, CONDITIONALLY IN SQL on the stored time: an older delivery never overwrites a newer one however the two commit. Raw, so `updatedAt` (client-side @updatedAt) is NOT bumped:
  * the detection never makes the order a warehouse amend candidate. Never throws.
  */
+const SEEN_AT_SHAPE = '^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}$'
+
+function logSeenLinesFailure(e: unknown): undefined {
+  console.error('wc_order_divergence: could not record the seen WooCommerce lines', e instanceof Error ? e.constructor.name : typeof e)
+  return undefined
+}
+
 export async function recordWcSeenLines(orderId: string, seen: WcSeenLines): Promise<void> {
   const json = JSON.stringify(seen)
   if (seen.at) {
-    await db.$executeRaw`UPDATE sales_orders SET wc_seen_lines = ${json}::jsonb WHERE id = ${orderId} AND (wc_seen_lines IS NULL OR wc_seen_lines->>'at' IS NULL OR (wc_seen_lines->>'at')::timestamp <= ${seen.at}::timestamp)`.catch(() => undefined)
+    // NO CAST: both sides are WooCommerce's offset-less GMT string `YYYY-MM-DDTHH:MM:SS`, fixed width, so a byte-wise (COLLATE "C") text comparison orders them exactly like the instants and can never raise. A stored or incoming value
+    // in any other shape (a pre-round-2 row, an odd date_modified fallback) cannot be ordered here: it is overwritten, as the JS isOlderThanSeen above treats an unparseable time as "not older". A `::timestamp` cast here threw on such a value
+    // and froze the seen state for the order for good.
+    await db.$executeRaw`UPDATE sales_orders SET wc_seen_lines = ${json}::jsonb WHERE id = ${orderId} AND (wc_seen_lines IS NULL OR wc_seen_lines->>'at' IS NULL OR CASE WHEN wc_seen_lines->>'at' ~ ${SEEN_AT_SHAPE}::text AND ${seen.at}::text ~ ${SEEN_AT_SHAPE}::text THEN (wc_seen_lines->>'at') COLLATE "C" <= ${seen.at}::text COLLATE "C" ELSE true END)`.catch(logSeenLinesFailure)
   } else {
-    await db.$executeRaw`UPDATE sales_orders SET wc_seen_lines = ${json}::jsonb WHERE id = ${orderId} AND wc_seen_lines IS NULL`.catch(() => undefined)
+    await db.$executeRaw`UPDATE sales_orders SET wc_seen_lines = ${json}::jsonb WHERE id = ${orderId} AND wc_seen_lines IS NULL`.catch(logSeenLinesFailure)
   }
 }
 
@@ -431,8 +465,12 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
     // The write step asks for a live re-read when it could not decide (warehouse unreadable, two deliveries in one second): the same bounded recheck row the deferred comparisons use, keeping the attempts and age already spent.
     const runStep = async (differences: ReadonlyArray<DivergenceDifference>, fingerprint: string) => {
       const outcome = await applyWcOrderAmendment(orderId, wcOrder, differences, fingerprint, undefined, { sameSecondConflict })
+      if (!(outcome.kind === 'skipped' && outcome.retry)) {
+        // The step decided (or is off): an "ran out of rechecks" refusal raised earlier for this order has been overtaken.
+        await resolveRefusedActions(db, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action: 'WC_ORDER_AMENDMENT', gate: WC_AMENDMENT_RECHECK_GATE }, 'NO_LONGER_NEEDED').catch(() => undefined)
+      }
       if (outcome.kind === 'skipped' && outcome.retry) {
-        await db.wcOrderDivergenceRecheck.upsert({ where: { orderId }, create: { orderId, externalOrderId: String(wcOrder.id), attempts: priorRecheck?.attempts ?? 0, ...(priorRecheck ? { deferredAt: priorRecheck.deferredAt } : {}) }, update: {} }).catch(() => undefined)
+        await db.wcOrderDivergenceRecheck.upsert({ where: { orderId }, create: { orderId, externalOrderId: String(wcOrder.id), fromRetry: true, attempts: priorRecheck?.attempts ?? 0, ...(priorRecheck ? { deferredAt: priorRecheck.deferredAt } : {}) }, update: { fromRetry: true } }).catch(() => undefined)
       }
     }
     const now = new Date()

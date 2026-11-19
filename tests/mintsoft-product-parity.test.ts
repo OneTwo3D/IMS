@@ -27,6 +27,9 @@ const state = {
   linkWrites: [] as Row[],
   echo: {} as Row,
   shadow: false,
+  remoteName: undefined as string | undefined,
+  renamed: false,
+  discrepancyUpdates: [] as Array<{ category: unknown; status: unknown; dataStatus: unknown }>,
 }
 
 const PARENT = 'Mandala Rose Works FireThorn Flex Plate with ThornGrip Textured PEI'
@@ -50,7 +53,7 @@ mock.module('@/lib/db', {
       wmsSyncJob: { create: async () => ({ id: 'job-1' }), update: async () => ({}) },
       wmsSyncLog: { createMany: async ({ data }: { data: Row[] }) => { state.syncLogs.push(...data); return { count: data.length } } },
       wmsProductLink: { upsert: async (args: Row) => { state.linkWrites.push(args); return {} }, updateMany: async () => ({ count: 1 }), update: async () => ({}) },
-      wmsStockDiscrepancy: { updateMany: async () => ({ count: 0 }), create: async () => ({}), createMany: async () => ({ count: 0 }) },
+      wmsStockDiscrepancy: { findFirst: async () => null, updateMany: async (args: { where: Row; data: Row }) => { state.discrepancyUpdates.push({ category: args.where.category, status: args.where.status, dataStatus: args.data.status }); return { count: 0 } }, create: async () => ({}), createMany: async () => ({ count: 0 }) },
     },
   },
 })
@@ -68,8 +71,8 @@ mock.module('../lib/connectors/mintsoft/producer-seam.ts', {
 mock.module('@/lib/connectors/wms/registry', {
   namedExports: {
     getWmsConnector: () => ({
-      async fetchProduct() { return { externalId: '168', sku: 'SKU-1', barcode: null, raw: { ProductId: 168, SKU: 'SKU-1' } } },
-      async fetchProductBySku() { return { externalId: '168', sku: 'SKU-1', barcode: null, raw: { ProductId: 168, SKU: 'SKU-1' } } },
+      async fetchProduct() { return { externalId: '168', sku: state.renamed ? 'OLD-SKU' : 'SKU-1', barcode: null, raw: { ProductId: 168, SKU: 'SKU-1', ...(state.remoteName === undefined ? {} : { Name: state.remoteName }) } } },
+      async fetchProductBySku() { if (state.renamed) return null; return { externalId: '168', sku: 'SKU-1', barcode: null, raw: { ProductId: 168, SKU: 'SKU-1', ...(state.remoteName === undefined ? {} : { Name: state.remoteName }) } } },
       async upsertProduct(dto: Row, options: Row) {
         state.upserts.push({ dto, options })
         return { externalId: '168', sku: 'SKU-1', barcode: null, raw: { ID: 168, SKU: 'SKU-1', ...state.echo } }
@@ -85,6 +88,9 @@ function reset(over: { flags?: Record<string, string>; product?: Row; layers?: R
   state.components = over.components ?? []
   state.echo = over.echo ?? {}
   state.shadow = false
+  state.remoteName = undefined
+  state.renamed = false
+  state.discrepancyUpdates.length = 0
   state.upserts.length = 0
   state.seamPayloads.length = 0
   state.costLayerReads = 0
@@ -276,4 +282,58 @@ test('MED (r1): a refused name withholds ONLY the name: the other parity fields 
   assert.equal(rest.widthCm, 4)
   assert.equal((rest as { costPrice?: number }).costPrice, 7)
   assert.equal(rest.barcode, '123')
+})
+
+const AMBIGUOUS_OVER: Row = {
+  type: 'VARIANT',
+  sku: 'SKU-1',
+  name: 'P — Voron 2.4 / Trident',
+  weight: null, widthCm: null, heightCm: null, depthCm: null,
+  parent: { name: 'P', weight: '3', widthCm: '4', heightCm: '5', depthCm: '6', options: [{ values: 'Voron 2.4 / Trident,Voron 2.4,Trident' }] },
+}
+const resolvedNameRefusals = () => state.discrepancyUpdates.filter((u) => u.category === 'PRODUCT_NAME_REFUSED' && u.dataStatus === 'RESOLVED')
+
+test('y1cqe 1: a refused name is sent back to Mintsoft BYTE FOR BYTE (leading and trailing spaces kept), never trimmed', async () => {
+  const { client } = await loadModules()
+  const held = '  Held name with spaces  '
+  reset({ flags: { mintsoft_product_parity_enabled: 'true' }, product: AMBIGUOUS_OVER })
+  state.remoteName = held
+  await run()
+  assert.equal(state.upserts.length, 1)
+  assert.equal(state.upserts[0]!.dto.name, held)
+  assert.ok(client.buildMintsoftProductUpsertRequest(state.upserts[0]!.dto as never, state.upserts[0]!.options as never).body.includes(`"Name":${JSON.stringify(held)}`))
+})
+
+test('y1cqe 1: a whitespace-only Mintsoft name still reads as unreadable (nothing is sent)', async () => {
+  reset({ flags: { mintsoft_product_parity_enabled: 'true' }, product: AMBIGUOUS_OVER })
+  state.remoteName = '   '
+  await run()
+  assert.equal(state.upserts.length, 0)
+})
+
+test('y1cqe 2: PRODUCT_NAME_REFUSED is resolved when parity is OFF', async () => {
+  reset({ flags: {}, product: AMBIGUOUS_OVER })
+  await run()
+  assert.equal(resolvedNameRefusals().length, 1)
+})
+
+test('y1cqe 2: PRODUCT_NAME_REFUSED stays open while the name is still refused (control)', async () => {
+  reset({ flags: { mintsoft_product_parity_enabled: 'true' }, product: AMBIGUOUS_OVER })
+  state.remoteName = 'Held'
+  await run()
+  assert.equal(resolvedNameRefusals().length, 0)
+})
+
+test('y1cqe 2: PRODUCT_NAME_REFUSED is resolved when the product becomes ineligible', async () => {
+  reset({ flags: { mintsoft_product_parity_enabled: 'true' }, product: { ...AMBIGUOUS_OVER, lifecycleStatus: 'ARCHIVED' } })
+  await run()
+  assert.equal(resolvedNameRefusals().length, 1)
+})
+
+test('y1cqe 2: PRODUCT_NAME_REFUSED is resolved on the SKU-rename early return', async () => {
+  reset({ flags: { mintsoft_product_parity_enabled: 'true' }, product: AMBIGUOUS_OVER })
+  state.renamed = true
+  await run()
+  assert.equal(state.upserts.length, 0)
+  assert.equal(resolvedNameRefusals().length, 1)
 })
