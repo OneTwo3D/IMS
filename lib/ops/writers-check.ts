@@ -8,6 +8,7 @@ import {
   EVIDENCE_KIND_STEP,
   PHASE_OF_LIVE_STEP,
   STEP_ATTESTATION_BEFORE_STEP,
+  STEP_EVIDENCE_ATTESTATION_KIND,
   STEP_EVIDENCE_KINDS,
   STEP_EVIDENCE_LABEL,
   STEP_EVIDENCE_REQUIRED_FROM,
@@ -306,7 +307,12 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
   const map = inputs.map ?? (WRITER_OWNERSHIP_MAP as readonly OwnershipRow[])
   const findings: WritersCheckFinding[] = []
   const operations: WritersCheckOperation[] = []
-  const context = { env: inputs.env, now: inputs.now }
+  // The owner's confirmations that the evidence reading holds: the producer decision keeps a step-X write held without `qoblex-xero-stopped`.
+  const attested = new Set<string>()
+  for (const [kind, attestationKind] of Object.entries(STEP_EVIDENCE_ATTESTATION_KIND)) {
+    if (inputs.stepEvidence?.[kind as StepEvidenceKind]?.state === 'present') attested.add(attestationKind)
+  }
+  const context = { env: inputs.env, now: inputs.now, attestations: attested }
   const enforcement = readProducerEnforcement(inputs.env)
 
   const unreadable = (subject: string | null, message: string): void => {

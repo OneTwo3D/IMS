@@ -20,6 +20,12 @@ export async function register() {
     await establishStartupOptionByteSafety(process.env.DATABASE_URL)
   }
 
+  // The producer decision reads the owner's confirmations from an in-process snapshot (fail closed until the first read).
+  if (process.env.NEXT_RUNTIME === 'nodejs') {
+    const { startAttestationRefresh } = await import('./lib/security/writer-attestation-snapshot')
+    startAttestationRefresh(async () => (await import('./lib/db')).db as never)
+  }
+
   // Error tracking (GlitchTip). Each init is a no-op unless SENTRY_DSN is set.
   if (process.env.NEXT_RUNTIME === 'nodejs') {
     await import('./sentry.server.config')

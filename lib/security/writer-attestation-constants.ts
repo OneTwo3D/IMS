@@ -27,11 +27,19 @@ export const WRITER_ATTESTATION_NOTE_MAX = 500
 
 /**
  * The settings an IMS writer switch is guarded by: turning the setting ON is refused until the matching attestation exists.
- * `wc_stock_sync_enabled` is the WooCommerce stock push; `xero_sync_enabled` is the Xero live switch (every Xero posting needs it).
+ * Only `wc_stock_sync_enabled` (the WooCommerce stock push). `xero_sync_enabled` is NOT guarded: P1 reads from Xero with it on; Xero WRITES are held by the
+ * producer decision until the Qoblex confirmation exists (STEP_LIVE_ATTESTATION).
  */
 export const ATTESTATION_GUARDED_SETTINGS: Readonly<Record<string, WriterAttestationKind>> = {
   wc_stock_sync_enabled: 'qoblex-stock-push-stopped',
-  xero_sync_enabled: 'qoblex-xero-stopped',
+}
+
+/**
+ * The confirmation a step's WRITES need before the producer decision may call them LIVE (the writers:check phase needs the same one). Step X moves Xero posting from
+ * Qoblex to IMS, so IMS stays held until the owner has said Qoblex stopped. `xero_sync_enabled` itself is NOT guarded: P1 reads from Xero with it on.
+ */
+export const STEP_LIVE_ATTESTATION: Readonly<Partial<Record<'mintsoft' | 'woocommerce' | 'xero', WriterAttestationKind>>> = {
+  xero: 'qoblex-xero-stopped',
 }
 
 export function attestationRefusalText(setting: string, kind: WriterAttestationKind): string {

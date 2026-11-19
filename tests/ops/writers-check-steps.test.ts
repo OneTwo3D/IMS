@@ -161,6 +161,10 @@ test('attestations: absent fails; present but recorded after the step went live 
   assert.ok(!evaluateWritersCheck(inputs(STEP_M, { stepEvidence: { ...clean(), QOBLEX_STOCK_PUSH_STOPPED: { state: 'absent' } } })).findings.some((f) => f.subject === 'QOBLEX_STOCK_PUSH_STOPPED'))
   const xero = evaluateWritersCheck(inputs(STEP_MWX, { stepEvidence: { ...clean(), QOBLEX_XERO_STOPPED: { state: 'absent' } } }))
   assert.ok(xero.findings.some((f) => f.code === 'attestation-missing' && f.subject === 'QOBLEX_XERO_STOPPED'))
+  assert.equal(xero.verdict, 'step-gap', 'P2-X without the Qoblex confirmation fails')
+  // The producer decision holds the step-X writes too: IMS cannot write them, so the confirmation is enforced in both places.
+  assert.equal(xero.operations.find((op) => op.key === 'xero.purchase.bill')?.imsCanWrite, false)
+  assert.equal(evaluateWritersCheck(inputs(STEP_MWX)).operations.find((op) => op.key === 'xero.purchase.bill')?.imsCanWrite, true)
 })
 
 test('counted evidence and probe violations are double claims: a foreign Mintsoft order, a drift, a Xeroom note, a probe that reports the bridge still active', () => {

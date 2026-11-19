@@ -48,21 +48,19 @@ test('recording writes the row AND an audit-log entry; an unknown kind, a missin
   assert.match((unlogged as { error: string }).error, /audit-log/)
 })
 
-test('the setting guard: wc_stock_sync_enabled=true and xero_sync_enabled=true are refused without the matching attestation (MUTATION: drop the guard => red)', async () => {
+test('the setting guard: wc_stock_sync_enabled=true is refused without the stock attestation; xero_sync_enabled=true is NOT guarded (P1 reads from Xero) (MUTATION: drop the guard => red)', async () => {
   const { store } = await load()
   logResult = true
   const { db } = fakeDb()
   const off = async () => 'false'
   const stock = await store.refuseGuardedSettingWithoutAttestation({ wc_stock_sync_enabled: 'true' }, { db: db as never, currentValue: off })
   assert.match(stock ?? '', /wc_stock_sync_enabled/)
-  const xero = await store.refuseGuardedSettingWithoutAttestation({ xero_sync_enabled: 'true' }, { db: db as never, currentValue: off })
-  assert.match(xero ?? '', /xero_sync_enabled/)
+  assert.equal(await store.refuseGuardedSettingWithoutAttestation({ xero_sync_enabled: 'true' }, { db: db as never, currentValue: off }), null, 'a fresh P1 install can enable reading from Xero')
   // Turning OFF, or a different setting, is never refused.
   assert.equal(await store.refuseGuardedSettingWithoutAttestation({ wc_stock_sync_enabled: 'false', xero_sync_enabled: 'false', wc_sync_enabled: 'true' }, { db: db as never, currentValue: off }), null)
   // The MATCHING kind is what counts: the Xero confirmation does not unlock the stock push.
   await store.recordWriterAttestation(db as never, { kind: 'qoblex-xero-stopped', userId: 'u' })
   assert.match((await store.refuseGuardedSettingWithoutAttestation({ wc_stock_sync_enabled: 'true' }, { db: db as never, currentValue: off })) ?? '', /wc_stock_sync_enabled/)
-  assert.equal(await store.refuseGuardedSettingWithoutAttestation({ xero_sync_enabled: 'true' }, { db: db as never, currentValue: off }), null)
   await store.recordWriterAttestation(db as never, { kind: 'qoblex-stock-push-stopped', userId: 'u' })
   assert.equal(await store.refuseGuardedSettingWithoutAttestation({ wc_stock_sync_enabled: 'true' }, { db: db as never, currentValue: off }), null)
 })
@@ -73,7 +71,7 @@ test('the guard only gates a switch-ON: a setting already on is left alone; an u
   const { db } = fakeDb()
   assert.equal(await store.refuseGuardedSettingWithoutAttestation({ wc_stock_sync_enabled: 'true' }, { db: db as never, currentValue: async () => 'true' }), null)
   const broken = fakeDb(true)
-  assert.match((await store.refuseGuardedSettingWithoutAttestation({ xero_sync_enabled: 'true' }, { db: broken.db as never, currentValue: async () => 'false' })) ?? '', /xero_sync_enabled/)
+  assert.match((await store.refuseGuardedSettingWithoutAttestation({ wc_stock_sync_enabled: 'true' }, { db: broken.db as never, currentValue: async () => 'false' })) ?? '', /wc_stock_sync_enabled/)
 })
 
 test('writers:attest records with --yes only, lists, and refuses bad arguments (usage 3) and failures (5)', async () => {

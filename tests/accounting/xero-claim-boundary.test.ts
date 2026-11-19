@@ -1,3 +1,4 @@
+import '../helpers/xero-attested.ts'
 import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test, { mock } from 'node:test'

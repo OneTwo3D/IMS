@@ -13,7 +13,8 @@
  *     step M and read MINTSOFT_WRITES_LIVE_FROM, while their destination's grant is still WC_WRITEBACK_ALLOWED_ORIGIN. A row whose step is
  *     `never` (an incumbent keeps it in every phase) is read against its destination's own variable and is never IMS-owned;
  *  3. now is at or after that instant (a future instant is a scheduled flip and stays SHADOW until then);
- *  4. the ownership map says IMS owns the operation in the phase that 1-3 establish (P2);
+ *  4. the ownership map says IMS owns the operation in the phase that 1-3 establish (P2), and, for a step whose incumbent the owner stops by hand (step X:
+ *     Qoblex's Xero posting), the owner's confirmation exists (reason `attestation_missing`, which names it);
  *  5. the business-event time of the work, `obligationAt`, is at or after the instant (work for an event that
  *     happened before it belongs to the writer that owned it then); for a row the map marks obligationTime
  *     'required' it MUST be passed, and omitting it is SHADOW. Rows marked 'not-applicable' may omit it.
@@ -35,11 +36,15 @@ import {
 } from './producer-disposition-constants'
 import { OUTBOUND_GRANT_ENV, type OutboundConnector } from './outbound-write-hold-constants'
 import { readOutboundGrantStates, type OutboundEnv } from './outbound-write-grant'
+import { attestationInForce } from './writer-attestation-snapshot'
+import { STEP_LIVE_ATTESTATION } from './writer-attestation-constants'
 import { ownershipRowFor, type MappedOperation, type WriterOwner } from './writer-ownership-map'
 
 export type ProducerDisposition = 'LIVE' | 'SHADOW'
 
 export type ProducerDecisionContext = {
+  /** The owner's confirmations in force; defaults to the process snapshot (writer-attestation-snapshot.ts), which is empty until read (fail closed). */
+  attestations?: ReadonlySet<string>
   /** Defaults to process.env. */
   env?: OutboundEnv
   /** Defaults to the current time. */
@@ -193,6 +198,13 @@ function evaluate<D extends OutboundConnector>(
   const base = { owner, phase: 'P2' as const, cutoff: cutoff.at, grant: 'granted' as const }
   const ownerReason = ownerShadowReason(owner)
   if (ownerReason !== null) return shadow(ownerReason, base)
+
+  // A step whose writes replace an incumbent the owner must stop by hand stays held until the owner's confirmation exists: the reason names it.
+  const needed = row !== null && row.step !== 'never' ? STEP_LIVE_ATTESTATION[row.step] : undefined
+  if (needed !== undefined) {
+    const supplied: unknown = hasOwn.call(context, 'attestations') ? context.attestations : undefined
+    if (!attestationInForce(needed, supplied instanceof Set ? supplied : undefined)) return shadow('attestation_missing', base)
+  }
 
   if (obligationAt === undefined) {
     // A row that says the business-event time is required cannot be LIVE without it: an omitted time would
