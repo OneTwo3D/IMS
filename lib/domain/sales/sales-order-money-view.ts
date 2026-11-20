@@ -24,7 +24,7 @@
  * Pure numbers, no database or Decimal runtime: the order page (a client component), the PDFs and the refund dialog all read this.
  */
 import { orderDiscountReversal, refundableNet } from '@/lib/domain/sales/refund-line-net'
-import { planSplitDiscountReversal, type DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
+import { planSplitDiscountReversal, type DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split-plan'
 import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basis'
 
 // decimal-boundary-ok: display-only (these are rendering figures, rounded to the minor unit; the stored Decimals are never written back from them)
