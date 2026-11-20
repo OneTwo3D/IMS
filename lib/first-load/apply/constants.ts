@@ -200,7 +200,7 @@ export const WAREHOUSE_PROFILE_KEYS = ['type', 'availableForSale', 'syncToStore'
 
 /** The apply manifest keys, a closed list. */
 export const APPLY_MANIFEST_KEYS = [
-  'formatVersion', 'runId', 'preparedDir', 'baseCurrency', 'steps', 'expectWarehouses', 'acceptZeroCost', 'forbidSkus', 'restorePointDir', 'wooSnapshot',
+  'formatVersion', 'runId', 'preparedDir', 'baseCurrency', 'steps', 'expectWarehouses', 'acceptZeroCost', 'forbidSkus', 'restorePointDir', 'wooSnapshot', 'stockExtractedAt',
 ] as const
 export const APPLY_WOO_SNAPSHOT_KEYS = ['snapshot', 'provenance', 'variantParents', 'origin', 'visibilityChecked'] as const
 

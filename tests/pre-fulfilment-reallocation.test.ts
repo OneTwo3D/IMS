@@ -694,6 +694,9 @@ function markerTx(
           } else if (field === 'shipments') {
             assert.deepEqual(clause, { none: {} }, 'the shipment-free clause must be asked for')
             if (order._count.shipments > 0) return null
+          } else if (field === 'outsideImsFulfilmentAt') {
+            // o3d-hqvrp.92: an order settled outside IMS is never swept; these doubles model orders that are not.
+            assert.equal(clause, null, 'the outside-IMS exclusion must be asked for')
           } else {
             throw new Error(`markerTx does not model the sweep selection clause '${field}'`)
           }

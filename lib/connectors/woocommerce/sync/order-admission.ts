@@ -384,7 +384,7 @@ export type WcAdmissionRefusalDrainResult = {
 }
 
 /** The live order; `gone` when the store says it does not exist; `failed` when it could not be read for any other reason. */
-async function readLiveWcOrder(externalOrderId: string): Promise<{ order: WcFullOrder } | { gone: true } | { failed: true }> {
+export async function readLiveWcOrder(externalOrderId: string): Promise<{ order: WcFullOrder } | { gone: true } | { failed: true }> {
   try {
     const { wcFetch } = await import('../api')
     const { data, error } = await wcFetch(`/orders/${externalOrderId}`)

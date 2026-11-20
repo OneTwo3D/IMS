@@ -82,6 +82,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Asks the shopping facade to push this product\'s stock to the storefront.'),
   d('app/actions/allocation.ts::deallocateOrder::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push this product\'s stock to the storefront.'),
+  d('lib/connectors/woocommerce/sync/outside-ims-despatch.ts::releaseUnbookedAllocation::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
+    'Asks the shopping facade to push this product\'s stock to the storefront.'),
   d('app/actions/allocation.ts::reopenShipmentForRepackAction::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push this product\'s stock to the storefront.'),
   d('app/actions/allocation.ts::updateShipmentStatus::queueDispatchEmailIfEligible#1', 'customer-email', 'despatch', 'queue-producer', 'not-applicable',

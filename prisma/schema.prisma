@@ -2034,6 +2034,11 @@ model SalesOrder {
   /// order back to PROCESSING, making its WMS link releasable and re-sending withdrawn
   /// goods to the warehouse.
   withdrawalApprovedAt DateTime?
+  /// Set when the storefront import first saw this order AFTER its sale was settled outside IMS: already completed (or mapped to
+  /// shipped / delivered), or refunded. The incumbent despatched it or the customer was refunded, so IMS must never ask a warehouse to
+  /// pick it: the WMS create fences read this column. The order is created PROCESSING (not a post-dispatch status), so the stock the
+  /// despatch consumed is booked through the ordinary external-fulfilment path rather than left unconsumed. Never cleared.
+  outsideImsFulfilmentAt DateTime? @map("outside_ims_fulfilment_at")
   /// o3d-6x66: monotonic counter, bumped once per NEWLY handled withdrawal
   /// submission. `withdrawalHoldAt` deliberately does NOT move on a repair or
   /// redelivery run — an operator needs to see how long an order has really

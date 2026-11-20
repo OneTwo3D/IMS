@@ -90,6 +90,7 @@ import { notify } from '@/lib/notifications'
 import { parsePositiveIntegerEnv } from '@/lib/env'
 import { startWcIncumbentEvidence } from '@/lib/domain/incumbent-evidence/record'
 import { isWcStatus, readWcOrderStatus } from './status-mapping'
+import { bookOutsideImsDespatchIfOwed, firstSeenOutsideIms, readOpeningStockCutoffIfNeeded } from './outside-ims-despatch'
 import type { WcAdmissionRefusalReason } from './order-admission'
 import {
   normaliseWcOrderStatus,
@@ -3299,10 +3300,10 @@ class WcImportErasedRetry extends Error {
  */
 export async function importWcOrder(wcOrder: WcFullOrder, options: ImportWcOrderOptions = {}): Promise<ImportWcOrderResult> {
   const first = await importWcOrderOnce(wcOrder, options)
-  if (!first.erasedRetry) return first
+  if (!first.erasedRetry) return await bookOutsideImsDespatchIfOwed(first, wcOrder)
   const { erasedRetry, ...rest } = await importWcOrderOnce(wcOrder, { ...options, erasedOnCreate: first.erasedRetry })
   void erasedRetry
-  return rest
+  return await bookOutsideImsDespatchIfOwed(rest, wcOrder)
 }
 
 async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOptions): Promise<ImportWcOrderResult> {
@@ -3423,7 +3424,12 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     // lifecycle status plus a refundStatus; the allocation/invoice gates below still
     // key off the mapped imsStatus, and the refund records sync separately.
     const importRefundDisposition = refundDispositionForStatus(imsStatus)
-    const lifecycleStatus = importRefundDisposition === 'NONE' ? imsStatus : 'PROCESSING'
+    // o3d-hqvrp.92: AN ORDER FIRST SEEN AFTER ITS SALE WAS SETTLED OUTSIDE IMS. See `firstSeenOutsideIms`.
+    const outsideIms = firstSeenOutsideIms(statusReading, wcOrder, await readOpeningStockCutoffIfNeeded(statusReading, wcOrder))
+    // A post-dispatch status is NOT written at create: COMPLETED is reachable only from SHIPPED and SHIPPED only through a shipment, so
+    // writing it directly left stock reserved (or, once unreserved, unconsumed and with no COGS). The order is created PROCESSING and the
+    // despatch is booked through the ordinary external-fulfilment path below, which consumes the stock, takes FIFO cost and promotes it.
+    const lifecycleStatus = outsideIms.despatched || importRefundDisposition !== 'NONE' ? 'PROCESSING' : imsStatus
 
     // THE CURRENCY IS A FACT WOOCOMMERCE STATES, NOT ONE IMS SUPPLIES (r13). Placed HERE, above
     // `upsertCustomer`, for the same reason the two status refusals sit above it: a refusal that
@@ -3833,6 +3839,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
           // The invoice this import will queue is OWED from the moment the order commits, and stays owed until the enqueue or the park records it (same predicate as the enqueue below).
           ...(imsStatus === 'PROCESSING' && !options.skipAccounting ? { salesInvoiceOwedAt: new Date() } : {}),
           refundStatus: importRefundDisposition,
+          ...(outsideIms.any ? { outsideImsFulfilmentAt: new Date() } : {}),
           shipFromWarehouseId: wcDefaultWarehouseId,
           currency,
           fxRateToBase: fxRate,
@@ -4042,7 +4049,10 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     // Auto-allocate stock (skip for terminal statuses, and for an order written as a DRAFT: a status the operator mapped to Draft holds no stock — allocation
     // declines a draft, it is allocated and invoiced when the order is finalised — and the import is acknowledged as completed without it)
     const TERMINAL_STATUSES = ['CANCELLED']
-    if (!TERMINAL_STATUSES.includes(imsStatus) && lifecycleStatus !== 'DRAFT') {
+    // A refunded order the goods never left holds no demand: nothing is allocated, and the refund sweep records its refunds (the order is
+    // PROCESSING, so createRefund accepts them) and stamps the refund disposition, which is what makes it zero-demand for good.
+    // A HISTORICAL order (completed before the opening stock was taken, or no cut-off to say) is recorded with no allocation, movement, cost or reservation.
+    if (!TERMINAL_STATUSES.includes(imsStatus) && lifecycleStatus !== 'DRAFT' && !outsideIms.historical && !(outsideIms.refunded && !outsideIms.despatched)) {
       const { autoAllocateOrder } = await import('@/app/actions/allocation')
       const allocation = await autoAllocateOrder(so.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
       if (!allocation.success && allocation.error !== 'No stock available for allocation') {
@@ -4076,6 +4086,19 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     // resolving before it would read an order that has no allocation rows yet.
     if (isFulfilmentStatus(lifecycleStatus)) {
       await resolveDirectCreateShortfall(so.id)
+    }
+
+    if (outsideIms.despatched || outsideIms.historical || outsideIms.refunded) {
+      await logActivity({
+        entityType: 'SALES_ORDER', entityId: so.id, tag: 'sync', level: outsideIms.noInstant ? 'WARNING' : 'INFO', resolveUser: false,
+        action: outsideIms.historical ? 'wc_import_first_seen_historical' : outsideIms.despatched ? 'wc_import_first_seen_despatched_pending' : 'wc_import_first_seen_refunded',
+        description: outsideIms.historical
+          ? `WooCommerce order ${wcOrder.number} was first seen already ${wcOrder.status}, completed before the opening stock was taken (or with no opening-stock instant on record: this install's opening stock was not loaded through the first-load apply, so no completed order is ever consumed here): recorded as ${lifecycleStatus} with no allocation, stock movement or cost, and never pushed to a warehouse.`
+          : outsideIms.despatched
+            ? `WooCommerce order ${wcOrder.number} was first seen already ${wcOrder.status}: created PROCESSING and fenced from the warehouse; its despatch is booked as made outside IMS.`
+            : `WooCommerce order ${wcOrder.number} was first seen already refunded: imported as ${lifecycleStatus} with no allocation and never pushed to a warehouse; its refunds are recorded by the refund sweep.`,
+        metadata: { externalOrderId: wcOrder.id, wcStatus: wcOrder.status },
+      })
     }
 
     // Queue accounting sales invoice — only for PROCESSING orders, when accounting is not

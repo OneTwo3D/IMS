@@ -186,6 +186,7 @@ Expected result:
 
 - backup reconciliation behaves as a safety net, not the main sync mechanism
 - if live order webhooks were skipped during the initial-import window, the first reconcile after initial import completion backfills them
+- **Record the time of the stock extract.** The first-load apply manifest requires `stockExtractedAt` (ISO-8601 UTC, the moment the Qoblex stock figures were read). It is stored as `facts.openingStockCutoffAt` on the first-load run record. Completed WooCommerce orders IMS first sees on or after it are despatched out of IMS's stock (on-hand and cost layers consumed, nothing sent to a warehouse); completed before it, they are recorded with no stock effect because the extract already reflects them. An install without that fact (stock not loaded through the first-load apply) consumes nothing for first-seen completed orders and logs a WARNING (`wc_import_first_seen_historical`) for each. Orders owed for want of stock are listed under Sync > Exceptions and retried by the withdrawal-sweep job.
 
 ## Evidence to capture
 

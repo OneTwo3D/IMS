@@ -17,6 +17,8 @@ import type { ApplyPorts, RailTally } from '../orchestrate'
 import type { PreparedRun } from '../prepared'
 import { createExecutor } from './execute'
 import { createJournal, setFactOnce } from './journal'
+import { judgeStockExtractedAt } from '../manifest'
+import { OPENING_STOCK_CUTOFF_FACT } from '@/lib/first-load/opening-stock-cutoff'
 import { db } from '@/lib/db'
 import { StepLockError, type StepLock } from '../orchestrate'
 import { withRunLease, withStepLock } from './lock'
@@ -101,7 +103,16 @@ export function createDbPorts(prepared: PreparedRun, options: DbPortsOptions): A
     journal,
     observe: (step) => observeStep(prepared, step),
     railTally: () => [...tally.values()],
-    preflight: async ({ resuming }) => note(await evaluateRailResults(prepared, { phase: 'preflight', resuming, step: null }, options.preload)),
+    preflight: async ({ resuming }) => {
+      const problems = note(await evaluateRailResults(prepared, { phase: 'preflight', resuming, step: null }, options.preload))
+      // The stock extract instant is judged against THIS apply instant before anything is written (a plan reports it too).
+      const extractedAt = prepared.manifest.stockExtractedAt
+      if (prepared.steps.some((st) => st.step === 'opening-stock') && extractedAt !== null) {
+        const refusal = judgeStockExtractedAt(extractedAt, Date.now())
+        if (refusal !== null) problems.push(refusal)
+      }
+      return problems
+    },
     // A recheck happens inside a run that holds a record, so the target is by definition not "fresh": emptiness is a preflight rail only.
     recheckRails: async (step, phase) => {
       const problems = note(await evaluateRailResults(prepared, { phase: 'recheck', resuming: true, step }, options.preload))
@@ -114,6 +125,15 @@ export function createDbPorts(prepared: PreparedRun, options: DbPortsOptions): A
         } catch {
           throw new ObservationError(DATABASE_READ_FAILED)
         }
+      }
+      // Just before the first OPENING-STOCK write, with every rail holding: the instant the Qoblex stock was EXTRACTED (the manifest's stockExtractedAt, bound into the digest), recorded once (o3d-hqvrp.92).
+      // Sales completed before it are already in the quantities this step loads; the storefront order import consumes stock only for orders completed at or after it. Re-judged here against THIS apply instant
+      // (the manifest was parsed earlier). The first recording counts: a resume or re-run cannot move it.
+      if (problems.length === 0 && step === 'opening-stock' && phase === 'before-first-write') {
+        const extractedAt = prepared.manifest.stockExtractedAt
+        const refusal = extractedAt === null ? 'apply manifest stockExtractedAt is required when opening-stock is a step' : judgeStockExtractedAt(extractedAt, Date.now())
+        if (refusal !== null || extractedAt === null) return note([{ id: 'data-classes', problems: [refusal ?? 'stockExtractedAt missing'], detail: '' }])
+        try { await setFactOnce(OPENING_STOCK_CUTOFF_FACT, new Date(extractedAt).toISOString()) } catch { throw new ObservationError(DATABASE_READ_FAILED) }
       }
       // Just before the first SUPPLIER write, with every rail holding: a purchase tax type with no IMS rate is imported from the stored Xero list (tax-import.ts; the rates and the run fact
       // `purchaseTaxImport` commit in ONE transaction), then the supplier tax rail is evaluated again WITHOUT the import allowance - the rates must now exist and be unique. The step lock is held and the run record exists; tax_rates is a table the runner may write.

@@ -37,6 +37,10 @@ mock.module('@/lib/connectors/woocommerce/sync/withdrawal', {
   },
 })
 mock.module('@/lib/connectors/woocommerce/sync/order-import', { namedExports: { importWcOrder: async () => ({ success: true }) } })
+// The owed first-seen despatch retry (o3d-hqvrp.92) is one more sweep this queue-only run keeps empty (it reads orders by SQL, which this double does not model).
+mock.module('@/lib/connectors/woocommerce/sync/outside-ims-despatch', {
+  namedExports: { retryOwedOutsideImsDespatches: async () => ({ scanned: 0, booked: 0, stillOwed: 0, terminal: 0, failed: 0, resolved: 0 }) },
+})
 mock.module('@/lib/connectors/woocommerce/sync/anonymisation-sweep', {
   namedExports: { runWithErasureSweepAlways: async (work: () => Promise<Record<string, unknown>>) => ({ ...(await work()), erasureSweep: { skipped: true, reason: 'not_due' } }) },
 })

@@ -15,7 +15,7 @@ import { planImportCalls } from '../../lib/first-load/apply/import-calls'
 import { buildResidual, classifyStep, listConflicts, ObservationError } from '../../lib/first-load/apply/residual'
 import type { PreparedRun } from '../../lib/first-load/apply/prepared'
 import { CLEAN_PRELOAD, CLEAN_SNAPSHOT } from './apply-preload'
-import { loadOk, NO_LOCK, prepareSynthetic, preparedFiles, WAREHOUSES } from './apply-helpers'
+import { STOCK_EXTRACTED_AT, loadOk, NO_LOCK, prepareSynthetic, preparedFiles, WAREHOUSES } from './apply-helpers'
 import { precondition } from './helpers'
 import { D } from '../../lib/first-load/money'
 import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-keys'
@@ -960,12 +960,29 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       assert.equal(await count('cost_layers'), prepared.steps.find((s) => s.step === 'opening-stock')!.units.length)
       assert.equal(Number((await sql<{ n: string }>(`select count(*)::text as n from cost_layers where "unitCostBase" = 0`))[0]!.n), prepared.zeroCostPairs.length)
       assert.equal(await count('first_load_apply_runs'), 1)
+      // o3d-hqvrp.92: the instant the opening stock was taken is recorded once, on the run record, for the storefront order import to read.
+      const cutoff = (await sql<{ facts: { openingStockCutoffAt?: string } }>('select facts from first_load_apply_runs'))[0]!.facts.openingStockCutoffAt
+      assert.equal(cutoff, new Date(STOCK_EXTRACTED_AT).toISOString(), 'the recorded instant is the manifest\'s stockExtractedAt (the stock extract), not the apply time')
       const record = await m.journal.createJournal().load()
       assert.equal(record!.status, 'APPLIED')
       assert.equal(record!.manifestDigest, prepared.manifestDigest)
       // The actor is recorded.
       const imports = await sql<{ metadata: { actor?: { kind: string; runId: string } } }>(`select metadata from activity_logs where "entityType" = 'IMPORT'`)
       assert.ok(imports.length >= 4 && imports.every((r) => r.metadata?.actor?.kind === 'system' && r.metadata.actor.runId === prepared.manifest.runId))
+    })
+
+    it('a stock extract instant after the apply, or implausibly old, is refused by the preflight, before anything is written (o3d-hqvrp.92)', async () => {
+      const runs = await count('first_load_apply_runs')
+      const ok = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore' })
+      assert.deepEqual((await ports(ok).preflight!({ resuming: false })).filter((p) => /stockExtractedAt/.test(p)), [], 'control: the honest instant is not refused')
+      for (const [what, instant, pattern] of [
+        ['after the apply', new Date(Date.now() + 86_400_000).toISOString(), /later than the apply instant/],
+        ['implausibly old', new Date(Date.now() - 90 * 86_400_000).toISOString(), /more than 45 days/],
+      ] as const) {
+        const bad = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore', stockExtractedAt: instant })
+        assert.match((await ports(bad).preflight!({ resuming: false })).join(';'), pattern, what)
+      }
+      assert.equal(await count('first_load_apply_runs'), runs, 'nothing was written')
     })
 
     it('a plan over the loaded database finds every unit present and matching, and sends nothing', async () => {

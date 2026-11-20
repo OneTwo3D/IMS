@@ -72,6 +72,17 @@ export async function GET(request: Request) {
         // look like a broken cron every fifteen minutes.
         const admissionRefusals = await drainWcOrderAdmissionRefusals()
 
+        // A FOURTH by-id backstop: the despatches of orders first seen already completed that IMS could not book for want of stock (o3d-hqvrp.92). Bounded
+        // (attempts and age); counts only, and never fails this job: an order still owed is listed under Sync > Exceptions.
+        let outsideImsDespatchError: string | null = null
+        let outsideImsDespatches: Awaited<ReturnType<typeof import('@/lib/connectors/woocommerce/sync/outside-ims-despatch').retryOwedOutsideImsDespatches>> | undefined
+        try {
+          outsideImsDespatches = await (await import('@/lib/connectors/woocommerce/sync/outside-ims-despatch')).retryOwedOutsideImsDespatches()
+        } catch (error) {
+          console.error('[wc-withdrawal-sweep] owed despatch retry failed:', error)
+          outsideImsDespatchError = error instanceof Error ? error.message : String(error)
+        }
+
         // Unresolved rows are orders we could not prove are safe to import. A
         // silent 200 here is exactly how a credential outage hides.
         if (sweep.unresolved > 0) {
@@ -92,7 +103,16 @@ export async function GET(request: Request) {
                 + '— the rotation cursor was held, so they are re-screened next run',
           )
         }
-        return { ...sweep, dispatchScreen: recon ?? undefined, admissionRefusals }
+        // The owed-despatch retry is counted, not swallowed: a run that could not retry (or whose attempts failed outright) must not answer 200.
+        if (outsideImsDespatchError || (outsideImsDespatches && outsideImsDespatches.failed > 0)) {
+          throw new Error(
+            outsideImsDespatchError
+              ? `The owed first-seen despatch retry failed: ${outsideImsDespatchError}`
+              : `${outsideImsDespatches?.failed} owed first-seen despatch(es) could not be retried `
+                + `(scanned ${outsideImsDespatches?.scanned}, booked ${outsideImsDespatches?.booked}, still owed ${outsideImsDespatches?.stillOwed}); they stay listed under Sync > Exceptions and are retried next run`,
+          )
+        }
+        return { ...sweep, dispatchScreen: recon ?? undefined, admissionRefusals, outsideImsDespatches }
       })
     },
     outcomeOf: (result) => cronOutcome('wc-withdrawal-sweep', result),

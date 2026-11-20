@@ -51,6 +51,9 @@ export const REALLOCATION_ELIGIBLE_STATUSES = [
 export const REALLOCATION_SWEEP_SELECTION = {
   status: { in: [...REALLOCATION_ELIGIBLE_STATUSES] },
   shipments: { none: {} },
+  // o3d-hqvrp.92: an order first seen after its sale was settled outside IMS (refunded, historical, or awaiting its despatch booking) is never
+  // allocated by a sweep: nothing is to be picked for it, and a reservation here would never clear.
+  outsideImsFulfilmentAt: null,
 } satisfies Prisma.SalesOrderWhereInput
 
 /** The narrow client shape this needs, so a caller inside a transaction can pass its `tx`. */

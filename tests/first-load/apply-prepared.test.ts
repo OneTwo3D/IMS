@@ -9,7 +9,7 @@ import { ApplyManifestError, parseApplyManifest } from '../../lib/first-load/app
 import { loadPreparedRun } from '../../lib/first-load/apply/prepared.ts'
 import { TRANSFERS_REFUSAL } from '../../lib/first-load/apply/constants.ts'
 import { IMPORT_TARGETS, MAX_ROWS_PER_FILE, MAX_BYTES_PER_FILE } from '../../lib/first-load/spec.ts'
-import { load, loadOk, manifest, manifestText, prepareSynthetic, preparedFiles, problemsOf, withConsistentFile, withFile, withReport, type EditableReport, type FileMap } from './apply-helpers.ts'
+import { STOCK_EXTRACTED_AT, load, loadOk, manifest, manifestText, prepareSynthetic, preparedFiles, problemsOf, withConsistentFile, withFile, withReport, type EditableReport, type FileMap } from './apply-helpers.ts'
 import { sha256Hex } from '../../lib/first-load/snapshot.ts'
 import { precondition } from './helpers.ts'
 
@@ -40,6 +40,7 @@ test('the digest changes with the manifest and with the prepared files, and igno
   digests.set('runId', loadOk(honest, { runId: 'other-run' }).manifestDigest)
   digests.set('steps', loadOk(honest, { steps: ['suppliers', 'products'], expectWarehouses: undefined, acceptZeroCost: undefined, fxRates: undefined }).manifestDigest)
   digests.set('profile', loadOk(honest, { expectWarehouses: { 'ZQSENT-MAIN': { type: 'STANDARD', availableForSale: true, syncToStore: true }, 'ZQSENT-OVER': { type: 'RESTOCK', availableForSale: false, syncToStore: false } } }).manifestDigest)
+  digests.set('stock extract instant', loadOk(honest, { stockExtractedAt: new Date(Date.parse(STOCK_EXTRACTED_AT) - 60_000).toISOString() }).manifestDigest)
   digests.set('file byte', loadOk(withConsistentFile(honest, SUPPLIERS, (text) => text.replace('NONE', 'INPUT2'))).manifestDigest)
   precondition(t, 'variants compared', digests.size)
   for (const [what, digest] of digests) assert.notEqual(digest, base, `${what} must change the digest`)
@@ -74,6 +75,10 @@ test('manifest: control parses; every malformed manifest is refused with its rea
     ['zero-cost twice', { acceptZeroCost: ['A@ZQSENT-MAIN', 'a@zqsent-main'] }, /twice/],
     ['zero-cost without stock step', { steps: ['suppliers', 'products'], expectWarehouses: undefined, fxRates: undefined }, /opening-stock is not a step/],
     ['a rate declared in the manifest (a file rate is never accepted)', { fxRates: { EUR: '1.25' } }, /unknown apply manifest key/],
+    ['stock extract instant missing', { stockExtractedAt: undefined }, /stockExtractedAt is required/],
+    ['stock extract instant not ISO UTC', { stockExtractedAt: '2026-11-20' }, /ISO-8601 UTC instant ending in Z/],
+    ['stock extract instant with an offset', { stockExtractedAt: '2026-11-20T09:00:00+01:00' }, /ISO-8601 UTC instant ending in Z/],
+    ['stock extract instant without a stock step', { steps: ['suppliers', 'products'], expectWarehouses: undefined, acceptZeroCost: undefined, stockExtractedAt: STOCK_EXTRACTED_AT }, /opening-stock is not a step/],
     ['restore dir relative', { restorePointDir: 'restore' }, /absolute path/],
     ['woo snapshot incomplete', { wooSnapshot: { snapshot: 'a' } }, /wooSnapshot/],
   ]
