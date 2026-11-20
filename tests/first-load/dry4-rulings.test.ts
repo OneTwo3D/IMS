@@ -130,6 +130,31 @@ test('blankStockIsZero: blank everywhere loads as 0 on hand with one INFO per ro
   assert.throws(() => parseColumnMap(JSON.stringify({ formatVersion: 1, source: 'qoblex', datasets: { products: { columns: { sku: 'S', name: 'N', type: 'T' }, blankStockIsZero: true } } }), 'm'), /blankStockIsZero/)
 })
 
+// [mutation: a blank total over zero cells stays refused, or a non-zero / unparseable cell is read as zero, or the key is not needed]
+test('blankStockIsZero: a blank total over blank-or-zero warehouse cells is 0 on hand; a non-zero or unparseable cell is refused; the key is opt-in', (t) => {
+  const r = stock(csv(
+    stockRow('SYN-ZEROS', 'simple', ['', '0', '0.0', '0.0000', '0', '0']),
+    stockRow('SYN-HALF', 'simple', ['', '', '0', '', '0.0', '']),
+    stockRow('SYN-NONZERO', 'simple', ['', '0', '0', '0.5', '0', '0']),
+    stockRow('SYN-ODD', 'simple', ['', '0', 'n/a', '0', '0', '0']),
+  ))
+  precondition(t, 'stock rows read', r.recordsRead)
+  assert.deepEqual(r.rejected.map((x) => x.code), ['WIDE_TOTAL_MISMATCH', 'WIDE_TOTAL_MISMATCH'])
+  const notes = r.notes!.filter((n) => n.code === 'BLANK_STOCK_AS_ZERO')
+  assert.equal(notes.length, 2)
+  assert.match(notes[0].reason, /SYN-ZEROS.*warehouse .*cell is zero/)
+  assert.match(notes[1].reason, /SYN-HALF.*blank or zero/)
+  for (const sku of ['SYN-ZEROS', 'SYN-HALF']) {
+    const rows = r.rows.filter((x) => x.values.sku === sku)
+    assert.equal(rows.length, 5)
+    assert.ok(rows.every((x) => x.values.qty === '0'))
+  }
+  assert.ok(!r.rows.some((x) => x.values.sku === 'SYN-NONZERO' || x.values.sku === 'SYN-ODD'))
+  const without = parseColumnMap(mapText.replace(/,\s*"blankStockIsZero": true/, ''), 'm').datasets['stock-lots']!
+  const refused = stock(csv(stockRow('SYN-ZEROS', 'simple', ['', '0', '0', '0', '0', '0'])), undefined, without)
+  assert.deepEqual(refused.rejected.map((x) => x.code), ['WIDE_TOTAL_MISMATCH'])
+})
+
 // ---------------------------------------------------------------------------
 // A variation that carries a BOM recipe
 // ---------------------------------------------------------------------------

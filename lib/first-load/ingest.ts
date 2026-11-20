@@ -58,7 +58,7 @@ export interface DatasetMapping {
   nonStock: { column: string; value: string } | null
   /** products and stock-lots: two or more rows of one SKU of which EXACTLY ONE is not typed `ghost` in `column` keep that one and drop the ghosts (reported with `quantityColumn`, the first header of that name). Anything else stays a duplicate. */
   ghostRows: { column: string; ghost: string; quantityColumn: string | null } | null
-  /** stock-lots with a `wide` layout only: a row whose all-warehouses total AND every warehouse cell are blank loads as 0 on hand (owner ruling), reported per row (BLANK_STOCK_AS_ZERO). A blank total next to any non-blank warehouse cell stays refused. */
+  /** stock-lots with a `wide` layout only: a row whose all-warehouses total is blank and every warehouse cell is blank or exactly zero loads as 0 on hand (owner ruling), reported per row (BLANK_STOCK_AS_ZERO). A blank total next to any non-zero cell stays refused. */
   blankStockIsZero: boolean
 }
 
@@ -1022,12 +1022,27 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
       // A row the map (or a decision, which rewrites the kind cell) SKIPS is not stock and is never total-checked: its stock cells are ignored, not refused.
       const skippedRow = mapping.rowSelect !== null && mapping.rowSelect.some((selector, i) => selectIndexes[i]! >= 0 && selector.skip.includes(clean(record.cells[selectIndexes[i]!])))
       for (const [column, totalAt] of skippedRow ? [] : totalIndex) {
-        if (mapping.blankStockIsZero && clean(record.cells[totalAt]) === '' && blocks.every((block) => clean(record.cells[block.index.get(column)!]) === '')) {
-          // Owner ruling: nothing stated anywhere on the row is zero on hand. Said per row; the cells are read as 0 so the sum check passes.
-          record.cells[totalAt] = '0'
-          for (const block of blocks) record.cells[block.index.get(column)!] = '0'
-          blankZeroNote = { line: record.line, code: 'BLANK_STOCK_AS_ZERO', reason: `SKU ${skuAt !== undefined ? clean(record.cells[skuAt]) : '(no SKU)'} line ${record.line}: the all-warehouses ${column} and every warehouse ${column} cell are blank; loaded as 0 on hand by the map's blankStockIsZero (owner ruling)` }
-          continue
+        if (mapping.blankStockIsZero && clean(record.cells[totalAt]) === '') {
+          // Owner ruling: a blank total beside warehouse cells that are all blank or numerically exactly zero is 0 on hand. Zero is judged by the
+          // same decimal parser as every other cell (never a string compare); any non-zero or unparseable cell falls through to the normal
+          // reconciliation, which refuses the row as WIDE_TOTAL_MISMATCH.
+          let zeroCells = 0
+          let allBlankOrZero = true
+          for (const block of blocks) {
+            const raw = clean(record.cells[block.index.get(column)!])
+            if (raw === '') continue
+            const cell = parseDecimal(raw, column, { maxIntDigits: 12, maxDp: 6 }, { allowNegative: true })
+            if (cell.ok && cell.value.isZero()) zeroCells++
+            else { allBlankOrZero = false; break }
+          }
+          if (allBlankOrZero) {
+            // Said per row; the cells are read as 0 so the sum check passes.
+            record.cells[totalAt] = '0'
+            for (const block of blocks) record.cells[block.index.get(column)!] = '0'
+            const stated = zeroCells === 0 ? 'blank' : zeroCells === blocks.length ? 'zero' : 'blank or zero'
+            blankZeroNote = { line: record.line, code: 'BLANK_STOCK_AS_ZERO', reason: `SKU ${skuAt !== undefined ? clean(record.cells[skuAt]) : '(no SKU)'} line ${record.line}: the all-warehouses ${column} is blank and every warehouse ${column} cell is ${stated}; loaded as 0 on hand by the map's blankStockIsZero (owner ruling)` }
+            continue
+          }
         }
         const total = parseDecimal(clean(record.cells[totalAt]), column, { maxIntDigits: 12, maxDp: 6 }, { allowNegative: true })
         let blockSum = new D(0)

@@ -2196,7 +2196,7 @@ export function prepare(input: PrepareInput): PrepareResult {
     }
     for (const note of dataset.notes ?? []) run.find('INFO', note.code, `${name}: ${note.reason}`, name)
     const blankAsZero = (dataset.notes ?? []).filter((note) => note.code === 'BLANK_STOCK_AS_ZERO').length
-    if (blankAsZero > 0) run.find('INFO', 'BLANK_STOCK_AS_ZERO_COUNT', `${name}: ${blankAsZero} stock row(s) stated nothing (the all-warehouses total and every warehouse cell blank) and were loaded as 0 on hand by the map's blankStockIsZero (owner ruling); each is listed above`, name)
+    if (blankAsZero > 0) run.find('INFO', 'BLANK_STOCK_AS_ZERO_COUNT', `${name}: ${blankAsZero} stock row(s) stated no total and only blank or zero warehouse cells and were loaded as 0 on hand by the map's blankStockIsZero (owner ruling); each is listed above`, name)
     for (const replaced of dataset.superseded) run.add(name, replaced.line, replaced.key, 'EXCLUDED', 'SUPERSEDED_BY_LATER_FILE', replaced.reason)
   }
 
