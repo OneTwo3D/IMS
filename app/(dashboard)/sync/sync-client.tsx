@@ -1142,7 +1142,15 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
               <input type="checkbox" checked={s.wc_order_amendment_write_enabled === 'true'} onChange={(e) => setS({ ...s, wc_order_amendment_write_enabled: e.target.checked ? 'true' : 'false' })} className="mt-1 rounded border-input" />
               <div>
                 <span className="text-sm font-medium">Act on orders reduced in WooCommerce</span>
-                <p className="text-xs text-muted-foreground">Off by default; needs the report above to be on. Latest edit wins, line by line. When a PAID order is reduced in WooCommerce, IMS records the reduction through the refund path (credit note, stock released) and never edits the paid amount. When the warehouse has started picking, IMS sends nothing and raises a warehouse task instead. Other differences stay on the exceptions list.</p>
+                <p className="text-xs text-muted-foreground">Off by default; needs the report above to be on. Latest edit wins, line by line. When a PAID order is reduced in WooCommerce, IMS records the reduction through the refund path (credit note, stock released) and never edits the paid amount. When the warehouse has started picking, IMS sends nothing and raises a warehouse task instead. A paid order that is INCREASED in WooCommerce (more units, an added item, a higher price) is not changed in IMS: a warehouse task names the lines and the difference. Other differences stay on the exceptions list.</p>
+              </div>
+            </label>
+
+            <label className="flex items-start gap-3 cursor-pointer">
+              <input type="checkbox" checked={s.wc_order_amendment_unpaid_rewrite_enabled === 'true'} onChange={(e) => setS({ ...s, wc_order_amendment_unpaid_rewrite_enabled: e.target.checked ? 'true' : 'false' })} className="mt-1 rounded border-input" />
+              <div>
+                <span className="text-sm font-medium">Rewrite unpaid orders edited in WooCommerce</span>
+                <p className="text-xs text-muted-foreground">Off by default; needs the report above to be on. When an UNPAID order is edited in WooCommerce before the warehouse picks it, IMS rewrites its lines and totals to exactly what WooCommerce shows (WooCommerce&apos;s own figures, nothing re-priced). It refuses, and lists the order under Sync &gt; Exceptions, when it cannot take the edit exactly (an unknown SKU, a tax or total that does not add up, a different currency, an order already invoiced). At or after picking it raises a warehouse task instead. A paid order is never rewritten; IMS never writes order lines or totals back to WooCommerce.</p>
               </div>
             </label>
 

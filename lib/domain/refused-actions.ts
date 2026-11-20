@@ -39,7 +39,9 @@ export const REFUSED_ACTIONS = {
   /** A transfer's dispatch was cancelled in IMS and its warehouse ASN closed here: a person must ask the warehouse to cancel it (IMS writes nothing to the warehouse). Closes only when an operator presses Done (nothing in IMS can see the warehouse's ASN state). */
   WMS_ASN_CANCEL_REQUEST: { label: 'Ask the warehouse to cancel an ASN', gates: ['WMS_ASN_CANCEL_NOT_CONFIRMED'] },
   /** A paid order WooCommerce changed that IMS could not decide about (the warehouse state stayed unreadable through every live re-read). Nothing was refunded or sent; a person decides. */
-  WC_ORDER_AMENDMENT: { label: 'WooCommerce order change not acted on: IMS could not decide', gates: ['WC_AMENDMENT_RECHECK_EXHAUSTED'] },
+  WC_ORDER_AMENDMENT: { label: 'WooCommerce order change not acted on: IMS could not decide', gates: ['WC_AMENDMENT_RECHECK_EXHAUSTED', 'WC_PAID_INCREASE'] },
+  /** An UNPAID order edited in WooCommerce that IMS could not rewrite exactly (an unknown SKU, a tax or total mismatch, a currency difference, ...), or that was edited after picking with no warehouse order to carry a task. Nothing was written; a person decides. */
+  WC_ORDER_REWRITE: { label: 'WooCommerce order edit not applied: IMS could not take it exactly', gates: ['WC_REWRITE_REFUSED', 'WC_REWRITE_AFTER_PICKING'] },
 } as const
 export type RefusedActionName = keyof typeof REFUSED_ACTIONS
 
