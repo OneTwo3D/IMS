@@ -1,0 +1,2 @@
+### First load: a blank total over zero warehouse cells is 0 on hand (stock map)
+- With the map's `blankStockIsZero`, a stock row whose all-warehouses total is blank and whose warehouse cells are all blank or exactly zero (`0`, `0.0`, `0.0000`) now loads as 0 on hand instead of being refused as `WIDE_TOTAL_MISMATCH` (101 rows of the real Qoblex export). A blank total beside any non-zero or unparseable cell, and a stated total that disagrees with the cells, are still refused. The per-row INFO `BLANK_STOCK_AS_ZERO` now says whether the cells were blank, zero or blank or zero.
