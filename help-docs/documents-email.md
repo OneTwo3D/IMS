@@ -238,7 +238,7 @@ Until the WooCommerce step of the switchover, WooCommerce (with its partial-ship
 
 #### Which customer e-mails IMS sends after step W, and which stay in WooCommerce
 
-There is one switch for all of it (`storefront_customer_email_enabled`); there are no per-e-mail switches.
+One switch (`storefront_customer_email_enabled`) covers the four storefront order e-mails: confirmation, dispatched, partial shipment and delivered. There are no per-e-mail switches. It does not gate the invoice e-mails (sent by an operator, or automatically after Xero posting) or the sales quote.
 
 | E-mail | Sent by, before step W | Sent by, after step W |
 | --- | --- | --- |
@@ -246,8 +246,8 @@ There is one switch for all of it (`storefront_customer_email_enabled`); there a
 | Dispatched (WooCommerce "completed order") | WooCommerce | IMS |
 | Partial shipment (partial-shipment plugin, AST) | WooCommerce and its plugins | IMS |
 | Delivered (AST, TrackShip) | WooCommerce and its plugins | IMS |
-| Customer invoice (WooCommerce "customer invoice") | WooCommerce | IMS |
-| Refund / credit note (WooCommerce "refunded order") | WooCommerce | IMS, **planned**: until IMS sends it, WooCommerce keeps sending it |
+| Customer invoice (WooCommerce "customer invoice") | IMS (operator, or after Xero posting) in every phase | IMS (operator, or after Xero posting) in every phase; WooCommerce's manual customer-invoice action stays available |
+| Refund / credit note (WooCommerce "refunded order") | WooCommerce | IMS, **planned** for a later release behind the same switch: until IMS sends it, WooCommerce keeps sending it |
 | Sales quote | IMS | IMS (no WooCommerce equivalent) |
 | New account, password reset | WooCommerce | WooCommerce, permanently |
 | Customer note | WooCommerce | WooCommerce, permanently |

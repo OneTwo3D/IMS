@@ -2,9 +2,11 @@
  * INVENTORY OF THE CUSTOMER E-MAILS WOOCOMMERCE (AND ITS PLUGINS) SENDS, AND WHO SENDS EACH ONE AFTER STEP W. Static, typed, pure: no database, no network.
  *
  * Owner rulings of 2026-11-20 (customer e-mails from IMS):
- *   (a) ONE switch at step W (`storefront_customer_email_enabled`) covers every e-mail IMS sends for a storefront order. There are no per-email flags.
+ *   (a) ONE switch at step W (`storefront_customer_email_enabled`) covers the four storefront order e-mails: confirmation, dispatched, partial shipment and delivered.
+ *       There are no per-email flags. It does NOT gate the invoice e-mails (`INVOICE`, sent by an operator, and `ACCOUNTING_INVOICE`, sent after Xero posting) or the sales quote
+ *       (own setting `sales_quote_email_enabled`).
  *   (c) These stay in WooCommerce for good: the account e-mails (new account, password reset), the customer note and the on-hold, cancelled and failed status e-mails.
- *   (d) IMS sends the refund / credit-note e-mail, replacing `customer_refunded_order` at cutover.
+ *   (d) IMS will send the refund / credit-note e-mail, replacing `customer_refunded_order`, in a later slice behind the same switch.
  *
  * Every entry names the ownership row (`customer-email.<rowOperation>` in lib/security/writer-ownership-map.ts) that says who owns it in each phase.
  *
@@ -25,8 +27,12 @@ import {
 } from '@/lib/domain/storefront-customer-email/constants'
 import { SALES_QUOTE_EMAIL_KIND } from '@/lib/domain/sales/sales-quote'
 
-/** The kind `INVOICE` of the e-mail queue (the manual and queued customer invoice mail). */
+/** The manual customer invoice e-mail (an operator sends it). */
 export const INVOICE_EMAIL_KIND = 'INVOICE'
+/** The customer invoice e-mail sent automatically after Xero posting. */
+export const ACCOUNTING_INVOICE_EMAIL_KIND = 'ACCOUNTING_INVOICE'
+/** The order confirmation an operator sends from the sales order. */
+export const SALES_ORDER_CONFIRMATION_KIND = 'SALES_ORDER_CONFIRMATION'
 
 export type WooEmailSource = 'woocommerce-core' | 'plugin' | 'ims-only'
 
@@ -41,14 +47,14 @@ type EntryBase = {
 export type WooEmailInventoryEntry =
   | (EntryBase & {
       disposition: 'replaced-by-ims'
-      /** The e-mail queue kind IMS sends instead; with `kindIsPrefix` the kind is `<imsKind>:<id>`. */
-      imsKind: string
+      /** The e-mail queue kinds IMS sends instead; with `kindIsPrefix` a kind is `<imsKind>:<id>`. */
+      imsKinds: readonly string[]
       kindIsPrefix: boolean
     })
   | (EntryBase & {
       /** Owner ruling (d): IMS will send it; the kind is added in a later slice. */
       disposition: 'ims-planned'
-      imsKind: null
+      imsKinds: readonly []
     })
   | (EntryBase & {
       /** Owner ruling (c): WooCommerce keeps sending it in every phase. */
@@ -58,20 +64,20 @@ export type WooEmailInventoryEntry =
   | (EntryBase & {
       /** An e-mail with no WooCommerce counterpart: IMS is the only sender. */
       disposition: 'ims-only'
-      imsKind: string
+      imsKinds: readonly string[]
       kindIsPrefix: false
     })
 
 const RULING_C = 'Owner ruling 2026-11-20 (c): stays in WooCommerce for good.'
 
 export const WOO_CUSTOMER_EMAIL_INVENTORY: readonly WooEmailInventoryEntry[] = [
-  { rowOperation: 'order-confirmation', wooEmailIds: ['customer_processing_order'], source: 'woocommerce-core', disposition: 'replaced-by-ims', imsKind: STOREFRONT_CONFIRMATION_KIND, kindIsPrefix: false },
-  { rowOperation: 'despatch', wooEmailIds: ['customer_completed_order'], source: 'woocommerce-core', disposition: 'replaced-by-ims', imsKind: STOREFRONT_DISPATCHED_KIND, kindIsPrefix: false },
-  { rowOperation: 'invoice', wooEmailIds: ['customer_invoice'], source: 'woocommerce-core', disposition: 'replaced-by-ims', imsKind: INVOICE_EMAIL_KIND, kindIsPrefix: false },
-  { rowOperation: 'partial-shipment', wooEmailIds: ['plugin:partial-shipment', 'plugin:ast-partial-shipped'], source: 'plugin', disposition: 'replaced-by-ims', imsKind: STOREFRONT_PARTIAL_KIND_PREFIX, kindIsPrefix: true },
-  { rowOperation: 'delivered', wooEmailIds: ['plugin:ast-delivered', 'plugin:trackship-delivered'], source: 'plugin', disposition: 'replaced-by-ims', imsKind: STOREFRONT_DELIVERED_KIND, kindIsPrefix: false },
-  { rowOperation: 'refund', wooEmailIds: ['customer_refunded_order'], source: 'woocommerce-core', disposition: 'ims-planned', imsKind: null },
-  { rowOperation: 'quote', wooEmailIds: [], source: 'ims-only', disposition: 'ims-only', imsKind: SALES_QUOTE_EMAIL_KIND, kindIsPrefix: false },
+  { rowOperation: 'order-confirmation', wooEmailIds: ['customer_processing_order'], source: 'woocommerce-core', disposition: 'replaced-by-ims', imsKinds: [STOREFRONT_CONFIRMATION_KIND, SALES_ORDER_CONFIRMATION_KIND], kindIsPrefix: false },
+  { rowOperation: 'despatch', wooEmailIds: ['customer_completed_order'], source: 'woocommerce-core', disposition: 'replaced-by-ims', imsKinds: [STOREFRONT_DISPATCHED_KIND], kindIsPrefix: false },
+  { rowOperation: 'invoice', wooEmailIds: ['customer_invoice'], source: 'woocommerce-core', disposition: 'replaced-by-ims', imsKinds: [INVOICE_EMAIL_KIND, ACCOUNTING_INVOICE_EMAIL_KIND], kindIsPrefix: false },
+  { rowOperation: 'partial-shipment', wooEmailIds: ['plugin:partial-shipment', 'plugin:ast-partial-shipped'], source: 'plugin', disposition: 'replaced-by-ims', imsKinds: [STOREFRONT_PARTIAL_KIND_PREFIX], kindIsPrefix: true },
+  { rowOperation: 'delivered', wooEmailIds: ['plugin:ast-delivered', 'plugin:trackship-delivered'], source: 'plugin', disposition: 'replaced-by-ims', imsKinds: [STOREFRONT_DELIVERED_KIND], kindIsPrefix: false },
+  { rowOperation: 'refund', wooEmailIds: ['customer_refunded_order'], source: 'woocommerce-core', disposition: 'ims-planned', imsKinds: [] },
+  { rowOperation: 'quote', wooEmailIds: [], source: 'ims-only', disposition: 'ims-only', imsKinds: [SALES_QUOTE_EMAIL_KIND], kindIsPrefix: false },
   { rowOperation: 'account-new', wooEmailIds: ['customer_new_account'], source: 'woocommerce-core', disposition: 'stays-in-woo', reason: `${RULING_C} Account e-mail.` },
   { rowOperation: 'account-password-reset', wooEmailIds: ['customer_reset_password'], source: 'woocommerce-core', disposition: 'stays-in-woo', reason: `${RULING_C} Account e-mail.` },
   { rowOperation: 'customer-note', wooEmailIds: ['customer_note'], source: 'woocommerce-core', disposition: 'stays-in-woo', reason: `${RULING_C} Customer note.` },
@@ -91,8 +97,9 @@ export function inventoryOwnershipKey(entry: WooEmailInventoryEntry): string {
 /** The inventory entry an IMS e-mail queue kind belongs to, or null when the kind is not a customer e-mail of the inventory. */
 export function inventoryEntryForKind(kind: string): WooEmailInventoryEntry | null {
   for (const entry of WOO_CUSTOMER_EMAIL_INVENTORY) {
-    if (!('imsKind' in entry) || entry.imsKind === null) continue
-    if ('kindIsPrefix' in entry && entry.kindIsPrefix ? kind.startsWith(`${entry.imsKind}:`) : kind === entry.imsKind) return entry
+    const prefix = 'kindIsPrefix' in entry && entry.kindIsPrefix
+    if (!('imsKinds' in entry)) continue
+    if (entry.imsKinds.some((imsKind) => (prefix ? kind.startsWith(`${imsKind}:`) : kind === imsKind))) return entry
   }
   return null
 }

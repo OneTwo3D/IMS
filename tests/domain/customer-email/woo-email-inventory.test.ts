@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
 import {
@@ -17,11 +18,22 @@ import {
 import { WOO_NATIVE_CUSTOMER_EMAIL_IDS } from '@/lib/connectors/woocommerce/native-email-state'
 import { ownershipRowFor } from '@/lib/security/writer-ownership-map'
 
-const KINDS = [STOREFRONT_CONFIRMATION_KIND, STOREFRONT_DELIVERED_KIND, storefrontPartialKind('ship_1'), storefrontPartialKind('ship_2'), STOREFRONT_DISPATCHED_KIND, 'INVOICE', 'SALES_QUOTE']
+// The kinds the e-mail builder really prepares, read from its source (buildEmail in lib/order-email.ts), so a new kind cannot be missed.
+const BUILDER_SOURCE = readFileSync(new URL('../../../lib/order-email.ts', import.meta.url), 'utf8')
+const CONSTANT_KINDS: Record<string, string> = { STOREFRONT_CONFIRMATION_KIND, STOREFRONT_DELIVERED_KIND }
+const BUILDER_KINDS = [
+  ...[...BUILDER_SOURCE.matchAll(/\bkind === '([A-Z_]+)'/g)].map((match) => match[1]!),
+  ...[...BUILDER_SOURCE.matchAll(/\bkind === ([A-Z_]+_KIND)\b/g)].map((match) => CONSTANT_KINDS[match[1]!] ?? assert.fail(`unresolved kind constant ${match[1]}`)),
+]
+const KINDS = [...BUILDER_KINDS, storefrontPartialKind('ship_1'), storefrontPartialKind('ship_2')]
+
+test('the builder source was read: it prepares the known kinds', () => {
+  for (const kind of ['SALES_ORDER_CONFIRMATION', 'INVOICE', 'ACCOUNTING_INVOICE', 'SHIPMENT_DISPATCHED', STOREFRONT_CONFIRMATION_KIND, STOREFRONT_DELIVERED_KIND, 'SALES_QUOTE']) assert.ok(BUILDER_KINDS.includes(kind), kind)
+})
 
 test('every IMS customer e-mail kind maps to exactly one inventory entry', () => {
   for (const kind of KINDS) {
-    const matches = WOO_CUSTOMER_EMAIL_INVENTORY.filter((entry) => 'imsKind' in entry && entry.imsKind !== null && ('kindIsPrefix' in entry && entry.kindIsPrefix ? kind.startsWith(`${entry.imsKind}:`) : kind === entry.imsKind))
+    const matches = WOO_CUSTOMER_EMAIL_INVENTORY.filter((entry) => 'imsKinds' in entry && entry.imsKinds.some((imsKind) => ('kindIsPrefix' in entry && entry.kindIsPrefix ? kind.startsWith(`${imsKind}:`) : kind === imsKind)))
     assert.equal(matches.length, 1, kind)
     assert.equal(inventoryEntryForKind(kind), matches[0], kind)
   }
