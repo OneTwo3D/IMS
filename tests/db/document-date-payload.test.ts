@@ -119,3 +119,24 @@ test('[db] a credit note run twice (a retry, long after) carries the refund\'s o
   assert.equal(observed.retry, '2026-09-30', 'the retry rebuilds the credit note with the same date')
   assert.equal(observed.unknown, null)
 })
+
+test('[db] o3d-tqwjt: readPostedSalesInvoiceDate prefers a SYNCED row over an older row of another status that names the same document', { skip }, async () => {
+  const run = randomUUID().slice(0, 8)
+  const posted = await withRollback(async (tx) => {
+    const order = await seedOrder(tx, run, { accountingInvoiceId: `XI-${run}` })
+    await syncRow(tx, order.id, { status: 'FAILED', externalTransactionId: `XI-${run}`, payload: { date: '2026-01-01' } })
+    await syncRow(tx, order.id, { status: 'SYNCED', externalTransactionId: `XI-${run}`, payload: { date: '2026-09-30' } })
+    return readPostedSalesInvoiceDate(tx, order.id, `XI-${run}`)
+  })
+  assert.equal(posted?.toISOString(), '2026-09-30T00:00:00.000Z')
+})
+
+test('[db] o3d-tqwjt: with no SYNCED row the reader still falls back to another row naming the document', { skip }, async () => {
+  const run = randomUUID().slice(0, 8)
+  const posted = await withRollback(async (tx) => {
+    const order = await seedOrder(tx, run, { accountingInvoiceId: `XI-${run}` })
+    await syncRow(tx, order.id, { status: 'FAILED', externalTransactionId: `XI-${run}`, payload: { date: '2026-01-01' } })
+    return readPostedSalesInvoiceDate(tx, order.id, `XI-${run}`)
+  })
+  assert.equal(posted?.toISOString(), '2026-01-01T00:00:00.000Z')
+})

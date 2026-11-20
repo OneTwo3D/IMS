@@ -118,6 +118,9 @@ export async function loadTimeline(db: Reader, customerIds: string[], options: {
       select: { ...orderSelect, cancelledAt: true, status: true },
       orderBy: [{ cancelledAt: 'desc' }, { id: 'desc' }], take,
     }),
+    // KNOWN LIMIT (accepted): this source is bounded and ordered by `invoicedAt` (the document day, UTC midnight), but a same-day invoice is DISPLAYED at its order's creation instant (invoiceEventInstant), which is later.
+    // The two orders agree except inside one London day: when more than `take` invoices fall on that day, one displayed late may be crowded out of the page its display instant belongs to. Ordering by the display instant
+    // would need a computed sort key (a raw query or a stored column) for a customer with over TIE_ROOM + limit invoices in one day, so it is documented rather than fixed.
     db.salesOrder.findMany({
       where: { ...inOrder, invoicedAt: upTo ? { not: null, lte: upTo } : { not: null } },
       select: { ...orderSelect, invoicedAt: true, createdAt: true, invoiceNumber: true, currency: true, totalForeign: true },

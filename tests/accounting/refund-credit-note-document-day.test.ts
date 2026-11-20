@@ -4,6 +4,11 @@ import test from 'node:test'
 import { creditNoteDocumentDay, originalDayDecision, originalSalesInvoiceDay, salesInvoiceDocumentDay } from '@/lib/domain/accounting/document-date'
 import { postedInvoicedAt } from '@/lib/domain/accounting/posted-invoice-date'
 import { SalesInvoiceNotQueuedError, SalesInvoiceOriginalDateUnknownError } from '@/lib/domain/sales/sales-invoice-reconciliation'
+import { salesInvoiceUpdateDateDecision } from '@/lib/domain/accounting/document-date'
+import { salesInvoiceUpdateSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
+import { WRITER_OWNERSHIP_MAP } from '@/lib/security/writer-ownership-map'
+import { PRODUCER_CUTOFF_ENV, PRODUCER_HOLD_ENFORCED_ENV } from '@/lib/security/producer-disposition-constants'
+import { OUTBOUND_GRANT_ENV } from '@/lib/security/outbound-write-hold-constants'
 
 /**
  * The documents IMS sends keep their ORIGINAL document day on a retry or an update. Every rule here is a pure function exercised by its inputs; the
@@ -63,4 +68,39 @@ test('with no readable date the update is refused when it would be sent, and onl
   assert.equal(originalDayDecision('2026-09-30', true), 'use')
   assert.equal(originalDayDecision(null, false), 'refuse')
   assert.equal(originalDayDecision(null, true), 'shadow-unknown')
+})
+
+// ---- o3d-tqwjt: the update's date decision asks the facade's own question ----
+
+const T_NOW = new Date('2026-06-01T12:00:00Z')
+const T_ENFORCED = { [PRODUCER_HOLD_ENFORCED_ENV]: 'xero' }
+const T_LIVE = { ...T_ENFORCED, [OUTBOUND_GRANT_ENV.xero]: '4f7f0c6e-1111-4222-8333-944455556666', [PRODUCER_CUTOFF_ENV.xero]: '2026-01-01T00:00:00Z' }
+const unknownDay = (env: Record<string, string | undefined>, over: Partial<Parameters<typeof salesInvoiceUpdateDateDecision>[0]> = {}) =>
+  salesInvoiceUpdateDateDecision({ documentDay: null, today: '2026-06-01', chartConnector: 'xero', documentConnector: 'xero', typeEnabled: true, env, now: T_NOW, ...over })
+
+test('o3d-tqwjt: an unknown day under today\'s map and the enforced hold is a shadow-unknown; a known day is used', () => {
+  assert.equal(unknownDay(T_ENFORCED), 'shadow-unknown')
+  assert.equal(unknownDay(T_LIVE), 'shadow-unknown', 'Xeroom owns the update in P2 too')
+  assert.equal(salesInvoiceUpdateDateDecision({ documentDay: '2026-05-01', today: '2026-06-01', chartConnector: 'xero', documentConnector: 'xero', typeEnabled: true, env: T_LIVE, now: T_NOW }), 'use')
+})
+
+test('o3d-tqwjt: a SIMULATED WRITER-MAP CHANGE (IMS owns sales.invoice-update in P2): the date check refuses where the old inputs said shadow, and agrees with the facade\'s verdict', () => {
+  const target = (WRITER_OWNERSHIP_MAP as unknown as Array<{ destination: string; operation: string; owners: Record<string, string>; step: string }>).find((r) => r.destination === 'xero' && r.operation === 'sales.invoice-update')!
+  const saved = { owners: { ...target.owners }, step: target.step }
+  target.owners.P2 = 'IMS'
+  target.step = 'xero'
+  try {
+    assert.equal(salesInvoiceUpdateSeamVerdict({ connector: 'xero', date: '2026-06-01', env: T_LIVE, now: T_NOW }).kind, 'live', 'precondition: the facade\'s inputs say LIVE')
+    assert.equal(unknownDay(T_LIVE), 'refuse', 'the update would be sent with today\'s date, so the edit is refused')
+  } finally {
+    target.owners = saved.owners
+    target.step = saved.step
+  }
+})
+
+test('o3d-tqwjt: with the hold unset the refusal fires only when a live send would happen (Xero chart and document, type switched on)', () => {
+  assert.equal(unknownDay({}), 'refuse', 'legacy and would be sent')
+  assert.equal(unknownDay({}, { typeEnabled: false }), 'shadow-unknown', 'sync off: nothing would be sent')
+  assert.equal(unknownDay({}, { chartConnector: 'quickbooks' }), 'shadow-unknown', 'no active Xero connector: nothing would be sent')
+  assert.equal(unknownDay({}, { documentConnector: null }), 'shadow-unknown', 'the facade refuses an unattributable document: nothing is sent')
 })

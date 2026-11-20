@@ -1,7 +1,7 @@
 'use server'
 
 import { businessDateYmd } from '@/lib/business-date'
-import { creditNoteDocumentDay, originalDayDecision, originalSalesInvoiceDay, readCreditNoteDocumentDay } from '@/lib/domain/accounting/document-date'
+import { creditNoteDocumentDay, originalSalesInvoiceDay, readCreditNoteDocumentDay, salesInvoiceUpdateDateDecision } from '@/lib/domain/accounting/document-date'
 import { readPostedSalesInvoiceDate } from '@/lib/domain/accounting/posted-invoice-date'
 import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import type { InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
@@ -184,7 +184,6 @@ import {
   releaseOrderAllocationsInTx,
   updateSalesOrderStatusUnderLock,
 } from '@/lib/domain/sales/allocation-service'
-import { producerSeamVerdict } from '@/lib/security/producer-seam'
 import { wmsCreateObligationFloor } from '@/lib/connectors/wms/producer-seam'
 import { WMS_PRE_CUTOVER_NOTICE, WMS_PRE_CUTOVER_PUSH_STATE, wmsPushIsPreCutover } from '@/lib/domain/wms/create-eligibility'
 import { findSalesOrderDeleteBlocker } from '@/lib/domain/sales/order-delete-guard'
@@ -2166,19 +2165,14 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   const documentDay = originalSalesInvoiceDay({ accountingInvoiceId: so.accountingInvoiceId, postedPayloadDate, externalCreatedAt: so.externalCreatedAt, invoicedAt: so.invoicedAt })
   // Refused only when the update would really be SENT. Under the enforced Xero hold the update is only recorded as a shadow (nothing is delivered), so it is recorded with today's date and
   // flagged `dateUnknown`, and the edit goes through: refusing it would block an edit that sends nothing, with no way out in IMS.
+  // The decision is the facade's own (xeroProducerSeamVerdict: the chart's connector, the update type and a payload carrying the date it would send), and the facade refuses a `dateUnknown` payload that is not a shadow (a backstop).
+  // The hold not enforced (legacy) sends only when the enqueue would not answer not-configured: Xero is the chart and the document's connector and the update type is switched on.
+  const today = businessDateYmd(new Date())
   let dateUnknown = false
   if (documentDay === null) {
-    if (originalDayDecision(documentDay, producerSeamVerdict('xero', 'sales.invoice-update').kind === 'shadow') === 'refuse') throw new SalesInvoiceOriginalDateUnknownError()
+    const typeEnabled = settings.connector === 'xero' ? await isAccountingSyncTypeEnabledFor('xero', 'SALES_INVOICE_UPDATE').catch(() => true) : false
+    if (salesInvoiceUpdateDateDecision({ documentDay, today, chartConnector: settings.connector, documentConnector: so.accountingInvoiceConnector, typeEnabled }) === 'refuse') throw new SalesInvoiceOriginalDateUnknownError()
     dateUnknown = true
-    await logActivity({
-      entityType: 'SALES_ORDER',
-      entityId: so.id,
-      action: 'sales_invoice_update_date_unknown',
-      tag: 'accounting',
-      level: 'WARNING',
-      description: 'The original date of the posted invoice could not be read; the update was recorded as a shadow (nothing was sent) with today\'s date, flagged as unknown.',
-      metadata: { accountingInvoiceId: so.accountingInvoiceId },
-    })
   }
 
   const payload = {
@@ -2186,7 +2180,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     contactName: so.customerName ?? 'Unknown',
     contactEmail: so.customerEmail ?? undefined,
     // An UPDATE of a posted invoice keeps the ORIGINAL document date (an edit or a return-exchange on 2 Oct must not move a 30 Sep invoice into the next VAT period); see originalSalesInvoiceDay.
-    date: documentDay ?? businessDateYmd(new Date()),
+    date: documentDay ?? today,
     ...(dateUnknown ? { dateUnknown: true } : {}),
     currency: so.currency,
     // Stamp IMS's FX rate on the document so Xero/QuickBooks don't apply
@@ -2298,6 +2292,8 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
         return outcome
       },
       logActivity,
+      // The date-unknown warning of a shadowed update commits or rolls back with the edit.
+      logShadowWarning: (params) => logActivityInTransaction(tx, { ...params, userId: null }),
       recordPostingRefusal: async ({ posting, ...record }) => { await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, posting, record) },
     })
     return

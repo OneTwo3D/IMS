@@ -252,6 +252,20 @@ export function xeroProducerSeamVerdict(input: {
 }
 
 /**
+ * THE ONE QUESTION "WOULD THIS SALES INVOICE UPDATE BE PRODUCED LIVE?", asked with the inputs the enqueue facade (createAccountingSyncLogRow) asks with: the row's connector, its
+ * type and a payload carrying the date the update will carry (the declared obligation field, see XERO_OBLIGATION_SOURCES). The date check of an update whose original date is unknown
+ * calls this with the date it is about to send (today), so the pre-check and the facade cannot decide on different inputs (a connector or an obligation time one of them left out).
+ */
+export function salesInvoiceUpdateSeamVerdict(input: { connector: string; date: string; env?: Record<string, string | undefined>; now?: Date }): XeroSeamVerdict {
+  return xeroProducerSeamVerdict({ connector: input.connector, type: 'SALES_INVOICE_UPDATE', payload: { date: input.date }, ...(input.env ? { env: input.env } : {}), ...(input.now ? { now: input.now } : {}) })
+}
+
+/** True when the payload says its document date could not be read and today's date stands in for it (a SALES_INVOICE_UPDATE built with `dateUnknown`). Such a payload may only ever be a shadow. */
+export function payloadDateIsUnknown(payload: unknown): boolean {
+  return typeof payload === 'object' && payload !== null && !Array.isArray(payload) && (payload as Record<string, unknown>).dateUnknown === true
+}
+
+/**
  * THE DELIVERY GATE OF ONE QUEUED ACCOUNTING ROW, per operation: asked at the claim boundary, after the producer decision said LIVE. It answers for the
  * row's OWN operation (a bill and a daily batch are step X; the invoice note is step X too but writes to WooCommerce), so a destination opened by an
  * earlier step never lets a later step's row out. When the only thing missing is the owner's confirmation (absent, or not read yet) the row is HELD and

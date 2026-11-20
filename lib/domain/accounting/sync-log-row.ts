@@ -6,7 +6,7 @@ import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { withSavepoint } from '@/lib/db/savepoint'
 import { RETIRED_TAX_CODE_REASON, RetiredTaxCodeInPayloadError, retiredTaxCodesInPayload } from '@/lib/tax/retired-tax-code-guard'
 import { HELD_SHADOW_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
-import { xeroProducerSeamVerdict, xeroResolveObligationAt, type ObligationParentReader, type XeroSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
+import { payloadDateIsUnknown, xeroProducerSeamVerdict, xeroResolveObligationAt, type ObligationParentReader, type XeroSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
 import { attachShadowSyncLog, recordOutboundShadow } from '@/lib/domain/outbound-shadow/record'
 import { clearAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import {
@@ -41,6 +41,14 @@ import {
  */
 export type SyncLogRowClient = {
   accountingSyncLog: { create(args: { data: Prisma.AccountingSyncLogUncheckedCreateInput }): Promise<{ id: string }> } & NonNullable<ObligationParentReader['accountingSyncLog']>
+}
+
+/** A payload flagged `dateUnknown` reached the enqueue with a verdict that would send it (live, or the hold not enforced). Never queued: today's date would re-date a posted ledger document. */
+export class DateUnknownPayloadNotShadowedError extends Error {
+  constructor(public readonly type: string, public readonly verdict: 'live' | 'legacy') {
+    super(`The ${type} was refused: its document date is unknown (today's date stood in for it) and it would be SENT (${verdict}), which would re-date the posted document in the ledger. Nothing was queued. Only a recorded shadow may carry an unknown date.`)
+    this.name = 'DateUnknownPayloadNotShadowedError'
+  }
 }
 
 /**
@@ -167,6 +175,9 @@ export async function createAccountingSyncLogRow<T extends { id: string }>(
     payload: data.payload,
     obligationAt: await xeroResolveObligationAt(client, { type: String(data.type), payload: data.payload, connector: String(data.connector), referenceType: String(data.referenceType), referenceId: String(data.referenceId) }),
   })
+  // A payload that says its document date is unknown (today's date stands in for it) may only be RECORDED as a shadow: queued live, today's date would re-date a posted invoice in the ledger.
+  // Refused whatever the writer map says, so a later ownership change cannot turn the flag into a send. Nothing is written; the caller's transaction rolls back.
+  if (verdict.kind !== 'shadow' && payloadDateIsUnknown(data.payload)) throw new DateUnknownPayloadNotShadowedError(String(data.type), verdict.kind)
   let rowData = data
   let shadow: PreparedShadow | null = null
   if (verdict.kind === 'shadow') {

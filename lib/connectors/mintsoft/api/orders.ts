@@ -499,6 +499,7 @@ export async function normalizeMintsoftOrderRow(
     tracking,
     ...(items ? { items } : {}),
     dispatched: isMintsoftDispatched({ status, externalName: resolved.externalName, tracking }),
+    lastUpdated: toStr((order as Record<string, unknown>).LastUpdated) ?? null,
     raw: order,
   }
 }
@@ -918,6 +919,8 @@ export type MintsoftOrderPart = {
   /** Normalised dispatched flag for this part. */
   dispatched: boolean
   tracking: WmsOrderTracking[]
+  /** Mintsoft's LastUpdated for this part, as written; compared for equality only. */
+  lastUpdated?: string | null
 }
 
 /**
@@ -967,6 +970,7 @@ export async function fetchMintsoftOrderParts(
       status: partStatus,
       dispatched: isMintsoftDispatched({ status: partStatus, externalName: partResolved.externalName, tracking: partTracking }),
       tracking: partTracking,
+      lastUpdated: toStr((detail as Record<string, unknown>).LastUpdated) ?? null,
     })
   }
   return parts.sort((a, b) => a.partNumber - b.partNumber)
