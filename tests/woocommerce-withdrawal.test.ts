@@ -275,7 +275,7 @@ test('an unresolved suppression is not a skip', async () => {
   // leaves the row pending rather than recording a run error).
   const start = src.lastIndexOf("if (guarded.outcome === 'unresolved') {")
   assert.ok(start > 0, 'the poll must handle an unresolved suppression explicitly')
-  const block = src.slice(start, src.indexOf('continue', start))
+  const block = src.slice(start, src.indexOf('return', start))
   assert.ok(block.includes('result.errors.push'), 'unresolved must record an error, not a skip')
   assert.ok(!block.includes('result.skipped++'), 'unresolved must not count as a skip')
 })

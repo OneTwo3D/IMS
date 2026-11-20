@@ -105,6 +105,28 @@ import {
 // Import a single WC order into IMS
 // ---------------------------------------------------------------------------
 
+/** Orders per sweep read. */
+const WC_ORDER_SWEEP_PAGE_SIZE = 100
+/**
+ * How far the sweep's in-run position steps back from the last row's modified time. `orderby=modified` may sort by the SITE-LOCAL modified field
+ * while the filter compares the GMT one, and the two orderings differ by up to an hour (and repeat an hour across a DST rollback), so a page can end
+ * with an unseen order whose GMT time is up to that far before the last row's. The same bound the erasure sweep uses.
+ */
+const WC_ORDER_SWEEP_KEYSET_OVERLAP_MS = 65 * 60 * 1000
+
+/** GMT, second precision, NO zone suffix: what WooCommerce reads with `dates_are_gmt=true` (a Z suffix is converted to site-local time first). */
+function wcGmtParam(ms: number): string {
+  return new Date(ms).toISOString().replace(/\.\d{3}Z$/, '')
+}
+
+/** The order's `date_modified_gmt` as epoch ms, or null when absent or unreadable. */
+function wcModifiedGmtMs(order: WcFullOrder): number | null {
+  const raw = (order as { date_modified_gmt?: unknown }).date_modified_gmt
+  if (typeof raw !== 'string' || raw === '') return null
+  const ms = parseWcGmtInstant(raw).getTime()
+  return Number.isNaN(ms) ? null : ms
+}
+
 export type ImportWcOrderOptions = {
   /** INTERNAL: set by the retry below when a customer erasure was found mid-import; the order is then created erased from the whole projection. */
   erasedOnCreate?: { customerId: string | null }
@@ -4932,7 +4954,7 @@ export async function sweepWcCancellations(modifiedAfter: string | null, result:
     let endedOnEmptyPage = false
     let unsupported = false
     while (page <= MAX_WC_PAGE_WALK_PAGES) {
-      const { data, error } = await wcFetch('/orders', { status: slug, per_page: '100', page: String(page), orderby: 'date', order: 'asc', ...(modifiedAfter ? { modified_after: modifiedAfter } : {}) })
+      const { data, error } = await wcFetch('/orders', { status: slug, per_page: '100', page: String(page), orderby: 'date', order: 'asc', ...(modifiedAfter && Number.isFinite(Date.parse(modifiedAfter)) ? { modified_after: wcGmtParam(Date.parse(modifiedAfter)), dates_are_gmt: 'true' } : {}) })
       if (error || !Array.isArray(data)) {
         const message = `WooCommerce ${slug} orders could not be read for the cancellation backstop: ${error ?? 'unreadable response'}`
         if (!required && isWcUnsupportedStatusRefusal(error)) {
@@ -5159,33 +5181,25 @@ export async function syncNewWcOrders(
   // `totalPages` is a header, and `readWcCountHeader` answers the caller's default of 1 for an
   // absent one; ending on it let a store that sends none truncate this sweep to 100 orders with no
   // error, after which the cursor below advanced past everything it had never asked for.
+  // KEYSET PAGING ON MODIFICATION TIME (o3d-hqvrp.87), not offsets over `orderby=date`. The filter is `modified_after`, so the sort must be the
+  // modification time too: with creation-date order and offset pages, an order that leaves the status set mid-walk shifts every later offset
+  // by one and one order is skipped. Every request is `page=1` of `modified_after = <position>` ordered by `modified` ascending, and the
+  // position moves to the last row's GMT modified time minus an overlap after each fully processed page. An order modified mid-run gets a
+  // LATER modified time, beyond the position, and is read later; the overlap re-reads the boundary. Re-reading is idempotent (an order IMS
+  // holds takes the update path), and an order already handled in this run at the same or a later modified time is not handled again.
+  // `dates_are_gmt=true` with values sent as GMT WITHOUT a zone suffix: a Z-suffixed value is converted to site-local time and then compared
+  // with the GMT column (the BST window shift #1026 backed out); the suffix-less GMT form is what the erasure sweep sends.
+  // A page whose span is within the overlap cannot advance the position (a dense hour, or one modified second shared by a full page): that
+  // window is then read by offset INSIDE (position, position + overlap), twice through, exhaustive by filter and independent of the sort.
+  // THE ONLY PROOF OF AN ENDING stays an empty page (o3d-xnwu): a short page is never taken as the end by itself.
   const walkOrders = async (statusList: string[], modifiedAfter: string | null): Promise<{ endedOnEmptyPage: boolean; page: number }> => {
-  let page = 1
-  let endedOnEmptyPage = false
+    const seenModified = new Map<number, number>()
+    let position: number | null = modifiedAfter && Number.isFinite(Date.parse(modifiedAfter)) ? Date.parse(modifiedAfter) : null
+    let win = null as { start: number; end: number; pass: 1 | 2; page: number; proof?: boolean } | null
+    let pages = 0
+    let endedOnEmptyPage = false
 
-  while (page <= MAX_WC_PAGE_WALK_PAGES) {
-    const params: Record<string, string> = {
-      status: statusList.join(','),
-      per_page: '100',
-      page: String(page),
-      orderby: 'date',
-      order: 'asc',
-    }
-    if (modifiedAfter) params.modified_after = modifiedAfter
-
-    const { data, error } = await wcFetch('/orders', params)
-    if (error) { result.errors.push(error); break }
-
-    const orders = data as WcFullOrder[]
-
-    // THE ONLY PROOF OF AN ENDING (o3d-xnwu). Before any work, so it costs one request and imports
-    // nothing.
-    if (orders.length === 0) {
-      endedOnEmptyPage = true
-      break
-    }
-
-    for (const order of orders) {
+    const handleOrder = async (order: WcFullOrder): Promise<void> => {
       // Normalised on both sides (o3d-tj6v r4). `getWithdrawalStatuses` already returns normalised
       // slugs, so a store reporting `wc-withdrawn` compared raw would miss the backstop that stops
       // a withdrawn order carrying on to the warehouse.
@@ -5211,7 +5225,7 @@ export async function syncNewWcOrders(
       )
       if (guarded.outcome === 'skipped-withdrawal') {
         result.skipped++
-        continue
+        return
       }
       if (guarded.outcome === 'unresolved') {
         // NOT a skip. A skip is a resolved decision and lets this run advance
@@ -5221,7 +5235,7 @@ export async function syncNewWcOrders(
         result.errors.push(
           `WooCommerce order #${order.number}: a withdrawal suppression could not be resolved; left for the next run`,
         )
-        continue
+        return
       }
       const importResult = guarded.result
       if (guarded.compensationFailed) {
@@ -5235,7 +5249,7 @@ export async function syncNewWcOrders(
         // invites an operator to release a live withdrawal.
         if (importResult.orderId) result.synced++
         else result.skipped++
-        continue
+        return
       }
       if (importResult.success) {
         // The backstop for a withdrawal whose webhook never arrived.
@@ -5280,9 +5294,78 @@ export async function syncNewWcOrders(
       }
     }
 
-    page++
-  }
-  return { endedOnEmptyPage, page }
+    while (pages < MAX_WC_PAGE_WALK_PAGES) {
+      const params: Record<string, string> = {
+        status: statusList.join(','),
+        per_page: String(WC_ORDER_SWEEP_PAGE_SIZE),
+        orderby: 'modified',
+        order: 'asc',
+        dates_are_gmt: 'true',
+      }
+      if (win) {
+        params.modified_after = wcGmtParam(win.start)
+        // The PROOF read is page 2 of the very query that just returned a short page 1: no upper bound, so it asks the same question.
+        if (!win.proof) params.modified_before = wcGmtParam(win.end)
+        params.page = String(win.page)
+      } else {
+        if (position !== null) params.modified_after = wcGmtParam(position)
+        params.page = '1'
+      }
+
+      const { data, error } = await wcFetch('/orders', params)
+      pages++
+      if (error) { result.errors.push(error); break }
+      const orders = data as WcFullOrder[]
+
+      // THE ONLY PROOF OF AN ENDING (o3d-xnwu). Before any work, so it costs one request and imports nothing.
+      if (orders.length === 0) {
+        if (win) {
+          if (win.proof) { endedOnEmptyPage = true; break }
+          if (win.pass === 1) { win = { ...win, pass: 2, page: 1 }; continue }
+          // Both passes read the whole window: resume just inside its upper edge (an order stamped exactly at `end` was excluded by the bound).
+          position = win.end - 1000
+          win = null
+          continue
+        }
+        endedOnEmptyPage = true
+        break
+      }
+
+      let lastModified: number | null = null
+      for (const order of orders) {
+        const modified = wcModifiedGmtMs(order)
+        if (modified !== null && (lastModified === null || modified > lastModified)) lastModified = modified
+        const before = seenModified.get(order.id)
+        if (before !== undefined && modified !== null && modified <= before) continue
+        if (modified !== null) seenModified.set(order.id, modified)
+        else seenModified.set(order.id, Number.POSITIVE_INFINITY)
+        await handleOrder(order)
+      }
+
+      if (win) {
+        // A PROOF read that was not empty (a store serving fewer rows than asked for, or a row that shifted in): the exhaustive window read takes over.
+        win = win.proof
+          ? { start: win.start, end: win.start + WC_ORDER_SWEEP_KEYSET_OVERLAP_MS, pass: 1, page: 1 }
+          : { ...win, page: win.page + 1 }
+        continue
+      }
+      if (lastModified === null) {
+        result.errors.push('The WooCommerce order sweep read a page whose orders carry no modified time, so it cannot advance safely')
+        break
+      }
+      const candidate = lastModified - WC_ORDER_SWEEP_KEYSET_OVERLAP_MS
+      if (position === null || candidate > position) {
+        position = candidate
+      } else if (orders.length < WC_ORDER_SWEEP_PAGE_SIZE) {
+        // The tail: a short page that cannot move the position. It is NOT taken as the end by itself (o3d-xnwu): page 2 of the same query must come back empty.
+        win = { start: position, end: position + WC_ORDER_SWEEP_KEYSET_OVERLAP_MS, pass: 1, page: 2, proof: true }
+      } else {
+        // No progress by timestamp on a FULL page (a dense hour, or a block sharing one modified second): read the window (position, position + overlap)
+        // by offset, exhaustively by filter.
+        win = { start: position, end: position + WC_ORDER_SWEEP_KEYSET_OVERLAP_MS, pass: 1, page: 1 }
+      }
+    }
+    return { endedOnEmptyPage, page: pages + 1 }
   }
 
   // The recovery read runs first. If it fails, the sweep below does not run (the run is held either way).

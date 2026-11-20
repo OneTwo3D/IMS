@@ -84,7 +84,7 @@ test('a cancelled order IMS holds is applied; one IMS never saw is not imported;
   const result = await run()
   assert.deepEqual(result.errors, [])
   assert.deepEqual(state.applied, [{ id: 1, status: 'cancelled' }])
-  assert.ok(state.asked.every((p) => p.modified_after === '2026-11-01T00:00:00.000Z'), 'bounded by the sweep window')
+  assert.ok(state.asked.every((p) => p.modified_after === '2026-11-01T00:00:00' && p.dates_are_gmt === 'true'), 'bounded by the sweep window')
 })
 
 test('a trashed order is applied as a cancellation', async () => {
@@ -188,7 +188,7 @@ test('backstop job, later run: bounded by its own cursor; a failed read holds th
   state.fetchError.cancelled = 'WC API error: 503 down'
   const result = await job()
   assert.equal(result.errors.length, 1)
-  assert.ok(state.asked.every((p) => p.modified_after === '2026-11-10T00:00:00.000Z'))
+  assert.ok(state.asked.every((p) => p.modified_after === '2026-11-10T00:00:00' && p.dates_are_gmt === 'true'))
   assert.equal(state.settings.get(CURSOR), '2026-11-10T00:00:00.000Z', 'held')
   state.fetchError = {}
   state.asked = []

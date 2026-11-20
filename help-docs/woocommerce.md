@@ -237,6 +237,8 @@ numbered `INWC-…` in Xero. IMS does not fill the blank for those either (logge
 `sales_invoice_number_capture_refused`): doing so would make the next invoice update try to renumber
 a live document onto the storefront's number.
 
+**How the order poll and reconcile page through WooCommerce.** They ask for orders modified since the sweep position, **sorted by modification time**, one page at a time, and move the position by the last order's modified time rather than by page number, so an order that changes or leaves the selected statuses while a sweep is running is not skipped, and one that changes after its page was read is read again at its newer time. Dates are sent to WooCommerce as GMT (`dates_are_gmt=true`, no time-zone suffix), so the window is the same all year, including during British Summer Time. The sweep position itself is the time the run **started** (less a two-minute overlap), never the time it finished; a webhook never moves it. A run ends only when WooCommerce returns an empty page.
+
 **WooCommerce "completed" orders** receive special handling: the system auto-allocates stock, creates shipments, applies any tracking information from the WC order meta (AST plugin), and transitions the shipments through to Shipped status.
 
 This uses the same shared external-fulfillment path that future WMS plugins will use. WooCommerce does not bypass the IMS shipment model or dispatch stock directly at order level.
