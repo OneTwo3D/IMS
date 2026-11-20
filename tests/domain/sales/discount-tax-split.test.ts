@@ -50,7 +50,7 @@ test('flag OFF: no split is produced and the model carries no discountTaxSplit k
 const invoiceOf = (discount: number, withParts: boolean) => {
   const m = build(discount)
   const total = m.totals.totalForeign
-  const parts = invoiceDiscountParts({ split: m.discountTaxSplit!, lineAmountsIncludeTax: false, totalAmount: m.totals.discountAmount, taxTypeOf: (e) => e.accountingTaxType })
+  const parts = invoiceDiscountParts({ split: m.discountTaxSplit!, lineAmountsIncludeTax: false, totalAmount: m.totals.discountAmount, taxTypeOf: (e) => e.accountingTaxType })!
   const doc = {
     lineAmountsIncludeTax: false, headerRate: 0.2,
     lines: [0.2, 0.05, 0].map((rate) => ({ quantity: 1, unitAmount: 100, rate, storedTax: 0 })),
@@ -81,7 +81,7 @@ test('reconciliation: the capped discount (300) reconciles per rate as well', ()
 test('an inclusive document sends each part gross (net + its own VAT) and the parts add up to the discount sent', () => {
   const m = buildSalesOrderWriteModel({ fxRate: 1, vatRate: 0.2, pricesIncludeVat: true, shippingForeign: 12, orderDiscountForeign: 22, apportionDiscountTax: true,
     lines: lines.slice(0, 1).concat(lines.slice(2)).map((l) => ({ ...l, input: { ...l.input, unitPriceForeign: l.rate > 0 ? 120 : 100 } })) })
-  const parts = invoiceDiscountParts({ split: m.discountTaxSplit!, lineAmountsIncludeTax: true, totalAmount: 22, taxTypeOf: (e) => e.accountingTaxType })
+  const parts = invoiceDiscountParts({ split: m.discountTaxSplit!, lineAmountsIncludeTax: true, totalAmount: 22, taxTypeOf: (e) => e.accountingTaxType })!
   assert.deepEqual(parts.map((p) => [p.taxType, p.amount]), [['OUT-A', 12], ['OUT-C', 10]])
   assert.equal(parts.reduce((s, p) => s + p.amount, 0), 22)
 })
@@ -172,4 +172,11 @@ test('VAT report residual: an order that apportioned its discount shows the ship
   const b = fresh(); addShippingOrder(b, row(null))
   assert.equal(String([...a.byJurisdiction.values()][0]!.tax), '2', 'shipping VAT 2')
   assert.equal(String([...b.byJurisdiction.values()][0]!.tax), '-3', 'header-rate treatment: shipping 2 less the 5 of discount VAT')
+})
+
+test('a split that disagrees with the discount by more than rounding is refused (null), not absorbed by the largest rate; a penny of rounding still is', () => {
+  const split = build(60).discountTaxSplit!
+  const run = (totalAmount: number) => invoiceDiscountParts({ split, lineAmountsIncludeTax: false, totalAmount, taxTypeOf: (e) => e.accountingTaxType })
+  assert.equal(run(65), null, 'a stale split 5 short of the discount')
+  assert.deepEqual(run(60.01)!.map((p) => p.amount), [20.01, 20, 20], 'a rounding penny lands on the largest part')
 })

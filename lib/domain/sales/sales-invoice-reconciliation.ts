@@ -89,6 +89,15 @@ export class SalesInvoiceDoesNotReconcileError extends Error {
   }
 }
 
+/** The stored per-rate split of the order discount does not add up to the discount the invoice carries (beyond rounding): refused, since spreading the difference onto one rate would mis-tax it. */
+export class SalesInvoiceDiscountSplitError extends SalesInvoiceDoesNotReconcileError {
+  constructor(amount: number, currency: string) {
+    super({ expected: 0, orderTotal: 0, difference: 0 }, currency)
+    this.message = `This order's discount of ${amount.toFixed(2)} ${currency} was taxed per VAT rate, but the stored split no longer adds up to it, so the invoice would put the discount's VAT on the wrong rates. It was not queued and the order was not moved or saved. The order's discount has to be re-entered (edit the order) so it is re-split.`
+    this.name = 'SalesInvoiceDiscountSplitError'
+  }
+}
+
 /**
  * A positive shipping or order-discount amount the connector would DROP because its account is not mapped: the invoice would book short of (or over) that
  * money. Named so the message says which mapping is missing; still a reconciliation refusal, so every caller that refuses a mismatch refuses this.

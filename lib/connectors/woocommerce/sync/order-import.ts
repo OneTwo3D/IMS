@@ -45,7 +45,7 @@ import {
   type MappedLine,
 } from './field-mapping'
 import { assertNoOrderPostingInFlightForReview } from '@/lib/domain/accounting/store-credit-posting-fence'
-import { checkWcStoreCreditReconciles, classifyWcCouponLines, describeWcCouponRefusal, planWcOrderCoupons, wcReportedOrderAmounts, wcRoundedTaxByRate, wcUpdateNeedsStoreCreditReview } from './coupon-classification'
+import { checkWcStoreCreditReconciles, classifyWcCouponLines, describeWcCouponRefusal, planWcOrderCoupons, wcReportedOrderAmounts, wcUpdateNeedsStoreCreditReview } from './coupon-classification'
 import { STORE_CREDIT_INVOICE_WITHHELD_ACTION, STORE_CREDIT_REVIEW_ACTION, storeCreditInvoiceQueuedNotice } from '@/lib/domain/accounting/store-credit-invoice-refusal'
 import { countSalesInvoiceRowsThatMayHavePosted, decideStoredInvoiceNumberUpdate, resolveWcAccountingInvoiceNumber } from './invoice-number'
 import {
@@ -3637,7 +3637,6 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
         subtotalForeign: reported.goodsNet,
         taxForeign: reported.tax,
         shippingForeign: reported.shipping,
-        roundedTaxForeign: wcRoundedTaxByRate(wcOrder, currency),
         orderLevelDiscountForeign: toDecimal(orderLevelDiscountForeign),
         storeCreditForeign,
         orderTotalForeign: totalForeign,

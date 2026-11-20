@@ -140,7 +140,7 @@ import { NO_TAX_TYPE, connectorEmitsDiscount, connectorEmitsShipping, droppedExt
 import { describeAllocationAttempt } from '@/lib/domain/sales/allocation-activity'
 import { matchContinuedOrderLines } from '@/lib/domain/sales/order-edit-lines'
 import { resolveOrderEditWmsGate } from '@/lib/domain/sales/order-edit-wms-gate'
-import { SalesInvoiceDoesNotReconcileError, SalesInvoiceOriginalDateUnknownError, SalesInvoiceExtraNotMappedError, SalesInvoiceNotQueuedError, SalesInvoiceReverseChargeSwapNotSetError, reverseChargeSwapMissing, assertInvoiceQueuedOrNotOwed, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
+import { SalesInvoiceDoesNotReconcileError, SalesInvoiceOriginalDateUnknownError, SalesInvoiceExtraNotMappedError, SalesInvoiceDiscountSplitError, SalesInvoiceNotQueuedError, SalesInvoiceReverseChargeSwapNotSetError, reverseChargeSwapMissing, assertInvoiceQueuedOrNotOwed, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
 import {
   INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
   STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
@@ -1338,6 +1338,10 @@ async function prepareSalesOrderWrite(input: CreateSoInput, options?: { pinnedFx
   if (!taxValidation.success) return { ok: false as const, error: taxValidation.error }
 
   const apportionDiscountTax = (await getSettingValue('sales_order_discount_tax_apportion_enabled')) === 'true'
+  // The discount's per-rate split is keyed by the rate id: a line that names none cannot be placed on a rate, so such an order is refused rather than split ambiguously.
+  if (apportionDiscountTax && (input.orderDiscountForeign ?? 0) > 0 && lineResolved.some((r) => !r.taxRateId)) {
+    return { ok: false as const, error: 'The order discount is taxed per line rate, but a line has no tax rate to place its share of the discount on. Give every line a tax rate and try again.' }
+  }
   const model = buildSalesOrderWriteModel({
     fxRate,
     vatRate,
@@ -2136,7 +2140,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   // An order whose discount tax was apportioned across its line rates posts the discount as one negative line PER tax code (same account), so the ledger's VAT per rate is the order's: the single
   // header-rate line would put the discount's VAT on the wrong rate. `discountAmount` stays the document's total; an order priced the header-rate way carries no parts and posts as before.
   const discountSplit = discountForeign > 0 ? parseDiscountTaxSplit(so.discountTaxSplit) : null
-  const discountParts = discountSplit
+  const discountPartsOrNull = discountSplit
     ? invoiceDiscountParts({
         split: discountSplit,
         lineAmountsIncludeTax,
@@ -2144,6 +2148,8 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
         taxTypeOf: (entry) => resolveSalesLineTaxType({ baseTaxType: entry.accountingTaxType ?? orderDefaultTaxType, reverseCharge: entry.reverseCharge, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }) ?? null,
       })
     : []
+  if (discountPartsOrNull === null) throw new SalesInvoiceDiscountSplitError(discountForeign, so.currency)
+  const discountParts = discountPartsOrNull
 
   // o3d-k26m.1: prefer the number already recorded on the order over one derived here. See
   // lib/domain/accounting/sales-invoice-number.ts — the create is an upsert on InvoiceNumber, so

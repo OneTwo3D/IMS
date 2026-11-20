@@ -104,7 +104,7 @@ export function invoiceDiscountParts(input: {
   totalAmount: number
   /** The code a split entry is sent on (its rate's code, after the reverse-charge swap), or null when none is known. */
   taxTypeOf: (entry: DiscountTaxSplitEntry) => string | null
-}): { amount: number; taxType: string | null; taxRateId: string | null }[] {
+}): { amount: number; taxType: string | null; taxRateId: string | null }[] | null {
   const merged = new Map<string, { amount: ReturnType<typeof toDecimal>; taxType: string | null; taxRateId: string | null }>()
   for (const entry of input.split) {
     const taxType = input.taxTypeOf(entry)
@@ -116,6 +116,8 @@ export function invoiceDiscountParts(input: {
   const parts = [...merged.values()].map((p) => ({ amount: round(p.amount, 2), taxType: p.taxType, taxRateId: p.taxRateId }))
   if (parts.length === 0) return []
   const gap = toDecimal(input.totalAmount).sub(parts.reduce((s, p) => s.add(p.amount), toDecimal(0)))
+  // Only a rounding penny per part is absorbed. A split that disagrees with the discount by more (stale or corrupt JSON, a net/gross mismatch) is refused, never spread onto one rate.
+  if (gap.abs().gt(toDecimal('0.01').mul(parts.length).add('0.000001'))) return null
   // The rounding difference lands on the largest part, so no part can be pushed below zero by it.
   let largest = 0
   parts.forEach((p, i) => { if (p.amount > parts[largest]!.amount) largest = i })
