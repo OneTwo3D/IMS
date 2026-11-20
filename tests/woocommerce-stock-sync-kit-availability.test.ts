@@ -77,3 +77,46 @@ test('a nested KIT absent from productById values the parent at 0 (no crash)', (
 
   assert.equal(available.get('P'), 0)
 })
+
+// o3d-hqvrp.105
+test('a NON_INVENTORY component imposes no limit: Mug + Gift wrap with 50 mugs pushes 50, not 0', () => {
+  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(rows(['MUG', 'A', 50]))
+  const K = kit('K', [{ componentId: 'MUG', qty: 1 }, { componentId: 'WRAP', qty: 1, type: 'NON_INVENTORY' }])
+  const productById = new Map<string, CandidateProduct>([['K', K], ['MUG', simpleProduct('MUG')]])
+
+  const available = computeAvailableByProduct([K], ['A'], stockByProduct, stockByProductWarehouse, productById, [])
+
+  assert.equal(available.get('K'), 50)
+})
+
+test('a VARIABLE component still fails closed at 0 (never skipped: its variations may all be out)', () => {
+  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(rows(['MUG', 'A', 50]))
+  const K = kit('K', [{ componentId: 'MUG', qty: 1 }, { componentId: 'PARENT', qty: 1, type: 'VARIABLE' }])
+  const productById = new Map<string, CandidateProduct>([['K', K], ['MUG', simpleProduct('MUG')]])
+
+  const available = computeAvailableByProduct([K], ['A'], stockByProduct, stockByProductWarehouse, productById, [])
+
+  assert.equal(available.get('K'), 0)
+})
+
+test('an all-NON_INVENTORY kit fails closed at 0 rather than infinite', () => {
+  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(rows())
+  const K = kit('K', [{ componentId: 'WRAP', qty: 1, type: 'NON_INVENTORY' }, { componentId: 'LEAF', qty: 2, type: 'NON_INVENTORY' }])
+  const productById = new Map<string, CandidateProduct>([['K', K]])
+
+  const available = computeAvailableByProduct([K], ['A'], stockByProduct, stockByProductWarehouse, productById, [])
+
+  assert.equal(available.get('K'), 0)
+})
+
+test('with a warehouse connector enabled, a kit with a NON_INVENTORY part is held at 0 (the warehouse cannot fulfil it)', () => {
+  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(rows(['MUG', 'A', 50]))
+  const K = kit('K', [{ componentId: 'MUG', qty: 1 }, { componentId: 'WRAP', qty: 1, type: 'NON_INVENTORY' }])
+  const Plain = kit('PLAIN', [{ componentId: 'MUG', qty: 1 }])
+  const productById = new Map<string, CandidateProduct>([['K', K], ['PLAIN', Plain], ['MUG', simpleProduct('MUG')]])
+
+  const available = computeAvailableByProduct([K, Plain], ['A'], stockByProduct, stockByProductWarehouse, productById, [], undefined, true)
+
+  assert.equal(available.get('K'), 0)
+  assert.equal(available.get('PLAIN'), 50)
+})

@@ -68,7 +68,7 @@ test('every refusal in the component pass records the failure and none adds a sk
   const end = src.indexOf('if (preview) {\n    return buildImportPreviewResult(rows.length + dropped', start)
   const pass2 = src.slice(start, end)
   assert.equal((pass2.match(/result\.skipped\+\+/g) ?? []).length, 0, 'no skipped++ in pass 2')
-  assert.equal((pass2.match(/recordComponentRowFailure\(result, cr\)/g) ?? []).length, 8)
+  assert.equal((pass2.match(/recordComponentRowFailure\(result, cr\)/g) ?? []).length, 10)
   const ui = await readFile(path.join(process.cwd(), 'components/ui/csv-import-flow.tsx'), 'utf8')
   assert.match(ui, /result\?\.componentsFailed/)
 })

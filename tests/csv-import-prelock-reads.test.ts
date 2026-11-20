@@ -34,8 +34,9 @@ async function componentPassBody(): Promise<string> {
   const txAt = src.lastIndexOf('await db.$transaction', at)
   assert.notEqual(txAt, -1, 'it must open its own transaction')
   // Widened as the pass grew (o3d-4kfh r4 added the in-flight sales guard). It has to reach the
-  // deleteMany, or the ordering assertions degrade into claims about a truncated slice.
-  return src.slice(txAt, at + 2200)
+  // deleteMany, or the ordering assertions degrade into claims about a truncated slice. Widened
+  // again for o3d-hqvrp.105 (the kit-component policy refusal runs inside the pass).
+  return src.slice(txAt, at + 3200)
 }
 
 test('the component pass takes the write lock (o3d-w998)', async () => {

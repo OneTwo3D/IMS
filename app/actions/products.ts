@@ -1,5 +1,6 @@
 'use server'
 
+import { findKitComponentRefusal, isKitIgnoredComponentType } from '@/lib/products/kit-component-policy'
 import { revalidatePath } from 'next/cache'
 import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { redirect } from 'next/navigation'
@@ -1500,6 +1501,17 @@ export async function saveProductComponents(
       if (current.sku !== _sku) return 'moved' as const
       if (current.type !== 'KIT' && current.type !== 'BOM') return 'not-component-bearing' as const
 
+      // o3d-hqvrp.105: a KIT may not take a variable parent, and may not be made only of non-inventory
+      // items (see kit-component-policy). Checked under the graph lock, before any write.
+      if (current.type === 'KIT' && components.length > 0) {
+        const componentTypes = await tx.product.findMany({
+          where: { id: { in: components.map((c) => c.componentId) } },
+          select: { sku: true, type: true },
+        })
+        const refusal = findKitComponentRefusal(componentTypes)
+        if (refusal) return { kind: 'component-refused' as const, message: refusal }
+      }
+
       // o3d-4kfh r5: REFUSE EARLY WHILE SALES WORK IS IN FLIGHT AGAINST THIS GRAPH.
       //
       // Every fulfilment consumer expands the CURRENT component graph, so re-composing a KIT that
@@ -1578,6 +1590,9 @@ export async function saveProductComponents(
     if (conflict === 'not-component-bearing') {
       return { success: false, error: 'This product is no longer a kit or BOM, so it cannot have components' }
     }
+    if (conflict && typeof conflict === 'object' && conflict.kind === 'component-refused') {
+      return { success: false, error: conflict.message }
+    }
     if (conflict && typeof conflict === 'object' && conflict.kind === 'in-flight-sales') {
       return { success: false, error: describeComponentGraphEditBlockers(conflict.blockers) }
     }
@@ -1624,7 +1639,7 @@ export async function getKitStock(productId: string): Promise<KitStockRow[]> {
   await requireInternalUser()
   const components = await db.productComponent.findMany({
     where: { productId },
-    include: { component: { select: { id: true, sku: true } } },
+    include: { component: { select: { id: true, sku: true, type: true } } },
   })
   if (components.length === 0) return []
 
@@ -1653,7 +1668,11 @@ export async function getKitStock(productId: string): Promise<KitStockRow[]> {
     let minQty = Infinity
     let limitingComponent: string | null = null
 
+    let stockLimited = false
     for (const comp of components) {
+      // o3d-hqvrp.105: non-inventory components impose no limit (same rule as the WooCommerce push).
+      if (isKitIgnoredComponentType(comp.component.type)) continue
+      stockLimited = true
       const required = Number(comp.qty)
       const available = Math.max(0, stockMap.get(comp.componentId)?.get(w.id) ?? 0)
       const canMake = required > 0 ? Math.floor(available / required) : 0
@@ -1668,8 +1687,8 @@ export async function getKitStock(productId: string): Promise<KitStockRow[]> {
       warehouseId: w.id,
       warehouseCode: w.code,
       warehouseName: w.name,
-      calculatedQty: minQty === Infinity ? 0 : minQty,
-      limitingComponent: minQty === Infinity ? null : limitingComponent,
+      calculatedQty: minQty === Infinity || !stockLimited ? 0 : minQty,
+      limitingComponent: minQty === Infinity || !stockLimited ? null : limitingComponent,
     }
   })
 }

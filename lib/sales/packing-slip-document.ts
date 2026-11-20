@@ -8,7 +8,7 @@ import {
   type PdfTableColumn,
 } from '@/lib/pdf'
 import { formatCountryDisplay } from '@/lib/countries'
-import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { collectNonStockPackComponents, loadFulfillmentProductGraph, type FulfillmentGraphNode } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirementQuantities } from '@/lib/products/fulfillment-requirement-snapshot'
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
@@ -88,6 +88,33 @@ export function packingSlipOrderNumber(so: PackingSlipData['so']): string {
   return so.orderNumber ?? so.externalOrderNumber ?? so.id.slice(0, 8)
 }
 
+/**
+ * o3d-hqvrp.105: the "pack, not stock" lines. A kit's NON_INVENTORY parts (gift wrap, leaflet) are left out
+ * of the stock requirements (allocation, dispatch, COGS) but the customer paid for them, so the packer must
+ * still be told. One row per part, naming the kit it belongs to. Shown on the whole-order slip and under the
+ * shipment tables alike (the parts belong to no warehouse's stock, so they are order-level).
+ */
+export function buildNonStockPackRows(
+  lines: Array<{ productId: string | null; qty: unknown; product: { sku: string; name: string } | null }>,
+  graph: Map<string, FulfillmentGraphNode>,
+): string[][] {
+  const rows: string[][] = []
+  for (const line of lines) {
+    if (!line.productId) continue
+    for (const part of collectNonStockPackComponents(line.productId, Number(line.qty), graph).values()) {
+      rows.push([
+        String(rows.length + 1),
+        part.sku,
+        `Pack with kit ${line.product?.sku ?? ''}${line.product?.name ? ` - ${line.product.name}` : ''} (not stock-tracked)`,
+        '',
+        String(part.qty.toNumber()),
+        '[   ]',
+      ])
+    }
+  }
+  return rows
+}
+
 /** Draws one order's slip from the current position of `doc` (the caller starts a new page between orders). */
 export async function drawPackingSlip(doc: PDFKit.PDFDocument, data: PackingSlipData, ctx: PackingSlipContext): Promise<void> {
   const { so, shipments } = data
@@ -119,6 +146,9 @@ export async function drawPackingSlip(doc: PDFKit.PDFDocument, data: PackingSlip
     { label: 'Packed', width: 50, align: 'center' },
   ]
 
+  const productIds = so.lines.map((line) => line.productId).filter((value): value is string => !!value)
+  const graph = await loadFulfillmentProductGraph(db, productIds)
+
   if (shipments.length > 0) {
     // Shipment-based: one table per shipment
     const multipleShipments = shipments.length > 1
@@ -143,8 +173,6 @@ export async function drawPackingSlip(doc: PDFKit.PDFDocument, data: PackingSlip
       drawTable(doc, columns, rows, branding)
     }
   } else {
-    const productIds = so.lines.map((line) => line.productId).filter((value): value is string => !!value)
-    const graph = await loadFulfillmentProductGraph(db, productIds)
     type PackingSlipRow = { productId?: string; sku: string; name: string; qty: number }
 
     const expandedRows: PackingSlipRow[] = so.lines.flatMap((line) => {
@@ -188,6 +216,14 @@ export async function drawPackingSlip(doc: PDFKit.PDFDocument, data: PackingSlip
     })
 
     drawTable(doc, columns, rows, branding)
+  }
+
+  const nonStockRows = buildNonStockPackRows(so.lines, graph)
+  if (nonStockRows.length > 0) {
+    if (doc.y > 720) doc.addPage()
+    doc.font('Helvetica-Bold').fontSize(10).fillColor('#333').text('Also pack (not stock-tracked)', 50, doc.y)
+    doc.y += 8
+    drawTable(doc, columns, nonStockRows, branding)
   }
 
   drawTemplateNotes(doc, tpl, 'footer')
