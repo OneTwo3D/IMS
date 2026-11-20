@@ -279,7 +279,7 @@ test('THE NATIVE MAP COVERS THE TYPES AND STATES R14 NEEDS: kit, bom, non-invent
     if (!/state/.test(label)) assert.notEqual(partReason(r, 'stock'), 'ok', `${label}: stock`)
   }
   // a kit or non-inventory row whose state is unknown is still refused (the skip is for the listed type, not for a row that is otherwise unreadable)
-  assert.notEqual(partReason(exportOf([row('COV-X8', 'kit', 'Archived')]), 'products'), 'ok')
+  assert.notEqual(partReason(exportOf([row('COV-X8', 'kit', 'Suspended')]), 'products'), 'ok')
 })
 
 // [mutation: the native-map digest check removed from ingest()]
