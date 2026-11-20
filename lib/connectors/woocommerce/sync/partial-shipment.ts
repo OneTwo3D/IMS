@@ -12,7 +12,7 @@
  * `wc_webhook_secret`, sent as `X-OTI-Signature`.
  */
 
-import { createHmac } from 'node:crypto'
+import { createHmac, randomBytes } from 'node:crypto'
 
 import { db } from '@/lib/db'
 import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
@@ -86,6 +86,29 @@ export function buildPartialShipmentBody(input: WcPartialShipmentPush): string {
   })
 }
 
+/** The path the route is served at, which is part of what is signed (it carries the order id). */
+export function partialShipmentPath(orderId: string): string {
+  return `/wp-json/oti/v1/order/${encodeURIComponent(orderId)}/partial-shipment`
+}
+
+/**
+ * The signature helper plugin 1.5.3 and later require (header `X-OTI-Signature-V2`): HMAC-SHA256, hex, of
+ * `timestamp \n METHOD \n path \n nonce \n body`. The path carries the order id and the nonce is single-use inside the 300 second window, so a captured request
+ * cannot be pointed at another order or re-sent.
+ */
+export function signPartialShipmentV2(input: { timestamp: number; orderId: string; nonce: string; body: string }, secret: string): string {
+  return createHmac('sha256', secret).update(`${input.timestamp}\nPOST\n${partialShipmentPath(input.orderId)}\n${input.nonce}\n${input.body}`).digest('hex')
+}
+
+/**
+ * The legacy body-only signature (header `X-OTI-Signature`), which a helper plugin older than 1.5.3 checks and 1.5.3 ignores. It is replayable and covers
+ * no order id: it is sent only so IMS keeps working against a store whose plugin is not upgraded yet.
+ * REMOVE it (and this function) once every store runs plugin 1.5.3 or later; see docs/installation.md "Partial-shipment signature".
+ */
+export function signPartialShipmentLegacy(body: string, secret: string): string {
+  return createHmac('sha256', secret).update(body).digest('hex')
+}
+
 /**
  * Post one despatched part of a WC order to the helper plugin. Resolves the WC
  * external order id from the order's shopping link, mirroring pushImsTrackingToWc.
@@ -116,13 +139,21 @@ export async function pushPartialShipmentToWc(
   if (egressHold.held) return { supported: true, ok: false, shadowed: true, shadowReason: egressHold.reason, error: egressHold.notice }
 
   const body = buildPartialShipmentBody(input)
-  const signature = createHmac('sha256', secret).update(body).digest('hex')
-  const endpoint = `${validatedUrl.normalizedUrl}/wp-json/oti/v1/order/${encodeURIComponent(link.externalOrderId)}/partial-shipment`
+  const timestamp = Math.floor(Date.now() / 1000)
+  const nonce = randomBytes(16).toString('hex')
+  const endpoint = `${validatedUrl.normalizedUrl}${partialShipmentPath(link.externalOrderId)}`
 
   try {
     const res = await connectorFetch(endpoint, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-OTI-Signature': signature },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-OTI-Timestamp': String(timestamp),
+        'X-OTI-Nonce': nonce,
+        'X-OTI-Signature-V2': signPartialShipmentV2({ timestamp, orderId: link.externalOrderId, nonce, body }, secret),
+        // Transition only (plugin < 1.5.3 checks this one; 1.5.3+ ignores it).
+        'X-OTI-Signature': signPartialShipmentLegacy(body, secret),
+      },
       body,
       signal: AbortSignal.timeout(PUSH_TIMEOUT_MS),
     }, { connectorName: 'WooCommerce' })
