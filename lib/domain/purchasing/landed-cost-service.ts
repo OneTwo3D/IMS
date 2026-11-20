@@ -24,6 +24,7 @@ import { toJsonInputValue } from '@/lib/db/json-input'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { loadTransferLineLandedQty, requireLandedQty } from '@/lib/domain/inventory/transfer-landed-quantity'
+import { recordTransferTransitRevaluations } from '@/lib/domain/inventory/transfer-in-transit-value'
 import { LANDED_COST_PROPAGATION_MAX_DEPTH } from '@/lib/domain/wms/transfer-asn-lock-order'
 import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconciliation'
 import { scheduleLandedCostJournalOutbox } from './landed-cost-journal-outbox'
@@ -293,6 +294,8 @@ export type LandedCostServiceDeps = {
   getTransferConsumedQtyForCostLayer: typeof getTransferConsumedQtyForCostLayer
   /** o3d-nrl4 PR B: the transfer lines whose units may still be in transit (see capitaliseInTransitResidue). */
   getInTransitTransferLinesForCostLayer: typeof getInTransitTransferLinesForCostLayer
+  /** ACC-M12: mirror each in-transit residue entry durably, so the in-transit valuation can add it back as of any date. */
+  recordTransferTransitRevaluations: typeof recordTransferTransitRevaluations
   getDependentOutputSourceLines: typeof getDependentOutputSourceLines
   updateSnapshotsForCostLayerChange: typeof updateSnapshotsForCostLayerChange
   refreshShipmentCogsForCostLayerChange: typeof refreshShipmentCogsForCostLayerChange
@@ -309,6 +312,7 @@ const defaultDeps: LandedCostServiceDeps = {
   getReversalConsumedQtyForCostLayer,
   getTransferConsumedQtyForCostLayer,
   getInTransitTransferLinesForCostLayer,
+  recordTransferTransitRevaluations,
   getDependentOutputSourceLines,
   updateSnapshotsForCostLayerChange,
   refreshShipmentCogsForCostLayerChange,
@@ -532,6 +536,8 @@ export async function capitaliseInTransitResidue(
     totalQty = totalQty.add(qty)
     totalDelta = totalDelta.add(delta)
   }
+  // The GL takes this share as DR Inventory now; the mirror row is what lets the in-transit valuation carry it as of any later date.
+  await deps.recordTransferTransitRevaluations(tx, entries)
   return { delta: totalDelta, qty: totalQty, entries }
 }
 
