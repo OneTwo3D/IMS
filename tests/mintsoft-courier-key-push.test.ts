@@ -393,7 +393,7 @@ test('an accepted fallback post followed by an /Items failure throws a partial e
   assert.equal(posts[2]!.CourierServiceId, 77, 'the fallback post itself was accepted')
 })
 
-test('o3d-jtfy7: an /Items failure after some lines were added throws a partial error that names the SKUs already added', async () => {
+test('o3d-jtfy7: an /Items failure after some lines were added throws a partial error that names the SKUs added or being added', async () => {
   const { WmsOrderUpdatePartialError } = await import('@/lib/connectors/wms/courier-form')
   const { updateMintsoftOrder } = await import('@/lib/connectors/mintsoft/api/order-push')
   defaultCourierId = ''
@@ -408,5 +408,6 @@ test('o3d-jtfy7: an /Items failure after some lines were added throws a partial 
   assert.ok(error instanceof WmsOrderUpdatePartialError)
   assert.match((error as Error).message, /item write refused/)
   assert.equal(itemWrites, 2, 'the first add was accepted, the second refused')
-  assert.deepEqual((error as InstanceType<typeof WmsOrderUpdatePartialError>).addedSkus, ['SKU-1'])
+  // The refused one is recorded too: an add whose reply is lost may have landed, and a SKU never sent costs nothing.
+  assert.deepEqual((error as InstanceType<typeof WmsOrderUpdatePartialError>).addedSkus, ['SKU-1', 'SKU-2'])
 })

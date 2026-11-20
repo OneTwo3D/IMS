@@ -22,6 +22,7 @@
  *
  * Reads only through the connectors' own read clients; the module itself calls no write function of Mintsoft or WooCommerce.
  */
+import { Prisma } from '@/app/generated/prisma/client'
 import { WMS_CREATE_ELIGIBLE_ORDER_FENCES, WMS_CREATE_READY_STATUSES } from '@/lib/domain/wms/create-eligibility'
 
 export const GAP_KINDS = ['G_create', 'G_despatch'] as const
@@ -167,9 +168,10 @@ export async function takeOverGapOrder(orderId: string, since: Date, apply: bool
   if (!apply) return { outcome: 'would-adopt', kind: 'G_create', externalOrderId }
   await deps.db.wmsOrderPushLink.upsert({
     where: { orderId },
-    create: { orderId, connector: 'mintsoft', externalOrderId, externalOrderNumber: reference(order), state: 'PENDING_VERIFY', pushedAt: now, pushWarehouseId: order.shipFromWarehouseId },
+    create: { orderId, connector: 'mintsoft', externalOrderId, externalOrderNumber: reference(order), state: 'PENDING_VERIFY', pushedAt: now, pushWarehouseId: order.shipFromWarehouseId, sentLineSkus: Prisma.DbNull },
     // A link that exists has no Mintsoft id yet (checked above): point it at the order Mintsoft holds and let the sweep verify it is ours.
-    update: { externalOrderId, externalOrderNumber: reference(order), state: 'PENDING_VERIFY', pushedAt: now, pushWarehouseId: order.shipFromWarehouseId },
+    // The adopted order's lines are not known to IMS: any earlier record described a different warehouse order.
+    update: { externalOrderId, externalOrderNumber: reference(order), state: 'PENDING_VERIFY', pushedAt: now, pushWarehouseId: order.shipFromWarehouseId, sentLineSkus: Prisma.DbNull },
   })
   return { outcome: 'adopted', kind: 'G_create', externalOrderId }
 }

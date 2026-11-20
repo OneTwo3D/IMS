@@ -2,6 +2,7 @@
  * THE REAL PORTS of the legacy bridge import: IMS's database (the only thing it writes), the WooCommerce read client (GET only) and the
  * Mintsoft order read (GET only, and only for `--verify-mintsoft`). Kept apart from run.ts so the decision runs without any of them.
  */
+import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivityPersisted } from '@/lib/activity-log'
 import { getShoppingConnectorPrefixes } from '@/lib/connectors/shopping-registry'
@@ -166,6 +167,8 @@ async function writeLink(input: { orderId: string; connector: string; shipFromWa
           // The bridge never told IMS the warehouse's line ids, so the recorded snapshot cannot be trusted: a merged-order line removal
           // falls back to the operator notice until an amendment stores a verified one (the same mark a create with no read-back carries).
           lineSnapshotUnsafeAt: now,
+          // Adopted, not created by IMS: the SKUs it holds were never recorded (and any record on the placeholder described another order).
+          sentLineSkus: Prisma.DbNull,
         }
       : {
           connector,

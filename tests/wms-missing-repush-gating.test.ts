@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+import { Prisma } from '../app/generated/prisma/client.ts'
 /**
  * o3d-2k5r r6: order-push-sweep is loaded LAZILY, after `mock.module('@/lib/db')` has run.
  *
@@ -340,6 +341,7 @@ test('o3d-2k5r r5 repush: a replay-safe connector re-queues, and CLEARS the stam
   const link = state.link!
   assert.equal(link.state, 'PENDING_CREATE')
   assert.equal(link.externalOrderId, null)
+  assert.equal(link.sentLineSkus, Prisma.DbNull, 'o3d-jtfy7: a link with no warehouse order keeps no record of the missing one')
   assert.equal(link.attempts, 0)
   // THE FIX, and the thing the whole finding turns on. With the stamp left on, decideCreateClaim
   // parks the link that was just re-queued.

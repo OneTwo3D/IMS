@@ -922,7 +922,7 @@ async function snapshotMintsoftOrderItems(
   }
 }
 
-/** The line reconcile failed part-way: `addedSkus` are the SKUs of the lines it had already added to the warehouse order. */
+/** The line reconcile failed part-way: `addedSkus` are the SKUs of the lines it had added or was adding when it failed (an add whose reply was lost may have landed). */
 class MintsoftItemReconcileError extends Error {
   constructor(message: string, readonly addedSkus: string[]) {
     super(message)
@@ -946,6 +946,8 @@ async function reconcileMintsoftOrderItems(externalOrderId: string, input: WmsOr
     if (amendment.kind === 'delete') {
       result = await mintsoftRequest<unknown>(`${base}/${encodeURIComponent(String(amendment.itemId))}`, { method: 'DELETE' })
     } else if (amendment.kind === 'add') {
+      // Recorded BEFORE the request: an add that landed but whose reply failed must keep its SKU too (a SKU that was never sent costs nothing: the line has no other record).
+      added.push(amendment.line.sku)
       result = await mintsoftRequest<unknown>(base, {
         method: 'PUT',
         headers: { 'Content-Type': 'application/json' },
@@ -959,7 +961,6 @@ async function reconcileMintsoftOrderItems(externalOrderId: string, input: WmsOr
       })
     }
     if (result.error) throw new Error(result.error)
-    if (amendment.kind === 'add') added.push(amendment.line.sku)
   }
   } catch (error) {
     throw new MintsoftItemReconcileError(error instanceof Error ? error.message : String(error), added)

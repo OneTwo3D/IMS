@@ -3243,7 +3243,7 @@ export async function runWmsOrderPushSweepCore(
               // operator may still reject.
               const state: PushState = approved ? 'CANCELLED' : 'HELD'
               await port.updateLinkByOrder?.(order.id, {
-                state, cancelledAt: ts, lastError: null, lastAttemptAt: ts, reconcileCheckedAt: null,
+                state, cancelledAt: ts, lastError: null, lastAttemptAt: ts, reconcileCheckedAt: null, sentLineSkus: null,
               })
               if (approved) result.cancelled += 1
               else result.held += 1
