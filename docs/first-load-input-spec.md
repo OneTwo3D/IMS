@@ -693,7 +693,7 @@ Every importer rejection rule that depends on what is in IMS. The importers' CSV
 | transfer-reference-free | transfers | No existing transfer already has a prefixed transferKey as its reference. |
 | transfer-source-stock | transfers | The opening-stock file for the source warehouse has been loaded first, nothing is reserved against it, and its cost layers cover the dispatched quantity. |
 | barcode-free | products | No barcode in the products file is already used by a product that exists in IMS. |
-| product-parent-exists | products | A VARIANT's parent is in an earlier or the same file (proved here) or already in IMS. |
+| product-parent-exists | products | A VARIANT's or BOM variation's parent is in an earlier or the same file (proved here) or already in IMS. |
 
 The rules the tool does prove: required fields, quantity and cost signs and scales (every emitted number is checked against the scale of the column it is stored in: weight 4 dp, dimensions 2 dp, prices 4 dp, quantities 4 or 6 dp, costs 6 dp, exchange rate 8 dp, tax rate 4 dp as a fraction, and rejected rather than rounded), date shapes, the lifecycle of products in the catalogue file (a purchase order line needs ACTIVE or DRAFT, a transfer anything but ARCHIVED; `active` FALSE means EOL), order-group consistency and the value ranges of every column written.
 
