@@ -1170,7 +1170,10 @@ NODE_ENV=production npm run preflight:production
 The preflight checks required secrets, production URLs, PostgreSQL URL shape,
 explicit persistent storage paths, writable upload/backup directories, scanner
 policy and command health, trusted proxy configuration when
-`REQUIRE_TRUSTED_PROXY_CONFIG=true`, and database-restore kill switches. Set
+`REQUIRE_TRUSTED_PROXY_CONFIG=true`, database-restore kill switches, and that the
+Xero producer hold is enforced while Xeroom owns sales invoices and credit notes
+(`PRODUCER_HOLD_ENFORCED_DESTINATIONS` names `xero` or `all`; see "Producer hold
+readiness" below). Set
 `PREFLIGHT_DB_CONNECT=true` during production rollout when the preflight process
 can reach Postgres; this adds a short `SELECT 1` connectivity probe. It prints
 variable names and status messages only; it does not print secret values.
@@ -1526,7 +1529,7 @@ Two files per run, `readiness-report.json` and `readiness-report.md`, under `<re
 | 2 | Seeded rows | Exactly one Organisation, `default`, with base currency **GBP** and country GB; the `DEFAULT` warehouse, flagged default and the only one; at least four tax rates including the default `UK Standard Rate (20%)`; the six seeded currencies; one active admin from `provision-instance.mjs`; no SMTP settings. **A non-GBP base currency makes the report RED.** |
 | 3 | `isBaseCurrencyLocked()` | Asked of the application's own code (`scripts/lib/first-install-probe.ts`, run against the throwaway database) after the six tables the lock reads were counted at zero and the `base_currency_locked` setting was found absent: the answer must be `false`. |
 | 4 | `system_identifier` | Read from `pg_control_system()` and recorded, so a later restore or clone can be told apart from the cluster that produced the report. |
-| 5 | `npm run preflight:production` | Exits 0. It checks **infrastructure** readiness only (secrets, URLs, writable directories, the push-state enum); it is not a data check. Warnings are listed in the report. |
+| 5 | `npm run preflight:production` | Exits 0. It checks **infrastructure** readiness only (secrets, URLs, writable directories, the push-state enum, the Xero producer hold); it is not a data check. Warnings are listed in the report. |
 | 6 | `npm run validate:db` | Exits 0, which includes the check that the non-negative and `reservedQty <= quantity` constraints are installed and fire. The concurrency tier inside it is skipped unless `IMS_CONCURRENCY_SCRATCH_DB` is set, and the report says so. |
 | 7 | `npm run invariant-check:preflight` | Exits 0: no critical invariant findings on the freshly provisioned database. |
 | 8 | `npm run outbound:status` | **Optional while `package.json` has no `outbound:status` script** (the step is recorded as skipped, with the reason, and does not make the report RED); **required the moment the script exists**: it is run as `npm run outbound:status -- --json --expect-held`, must exit 0, and its JSON report must list each of woocommerce, mintsoft and xero exactly once with `state` equal to `held` and `anyGranted` false (a granted or unreadable grant, a missing, duplicated or unknown connector fails; the output must contain exactly one JSON report with nothing around it but the npm banner and the `Exit code` line, so two reports or any other text fail; free text is never searched for the word held). |
@@ -5897,6 +5900,18 @@ Before upgrading, check the grant and live-from variables on every installation 
 
 Names the destinations whose producers obey the decision. A destination that is named obeys it for every operation; one that is not named is untouched. A value that is not a list of known destinations or `all` (a misspelling, a destination that does not exist) enforces EVERY destination, because a typo must not leave a hold off. Switching it on for Xero on an installation with no grant and no live-from instant makes every new Xero write a shadow and stops the Xero queue from receiving new work; switching it off again does not recover shadows, which are records and not queued work. Switching it on for Mintsoft on an installation with no grant and no live-from instant makes every Mintsoft write IMS would have produced a shadow (orders, amendments, holds, cancellations, notes, products, bundles, ASNs and product content), stops the order-push sweep from creating or re-opening anything, and refuses the buttons that re-arm a create; reads, the despatch poll and the stock alignment are not affected; key minting (POST /api/Auth, which replaces the tenant API key every other integration uses) is refused with a hold text, before anything is sent, until the installation is in its live phase (an installation on a fixed API key is unaffected). Switching it on for WooCommerce on an installation with no grant and no live-from instant makes every WooCommerce write IMS would have produced a shadow, queues nothing new for the store, and stops the WooCommerce queue drains; the forced stock push stays behind the stock-sync setting as before.
 <!-- /producer-disposition:enforcement -->
+
+#### Producer hold readiness (reinstalling production)
+
+The statement "IMS changes nothing in Xero" for sales invoices, invoice updates and sales credit notes holds only while the producer hold is enforced for Xero. The writer-ownership map gives those operations to Xeroom in P1 and in P2 ("IMS shadows for ever"), and the shadowing is the producer-side hold, which exists only for a destination named in `PRODUCER_HOLD_ENFORCED_DESTINATIONS`. With the variable unset, every producer queues live, so IMS would post the same invoices, updates and credit notes Xeroom posts. Stage sets `PRODUCER_HOLD_ENFORCED_DESTINATIONS=xero`; a reinstalled production gets it only if its environment file carries it (the installer preserves an existing value on a re-run but does not invent one on a fresh install).
+
+`npm run preflight:production` therefore has a check, `producer-hold-xero`, which **fails** when the ownership map says Xeroom owns `sales.invoice`, `sales.invoice-update` or `sales.credit-note` in the installation's current phase and `xero` (or `all`) is not among the enforced destinations. The preflight is the post-install check (`npm run preflight:production` is step 5 of the first-install rehearsal, and the operator runs it after every install or re-run); the rollout-readiness gate (`readiness:gate`) carries the preflight's verdict, so an installation without the hold fails the preflight after install and is blocked at go/no-go. The installer itself does not invent the value on a fresh install. The fix is one line in the environment file (the installer's `.env`, see `.env.example`):
+
+```
+PRODUCER_HOLD_ENFORCED_DESTINATIONS=xero
+```
+
+`all` also passes. A value that is not a list of known destinations enforces every destination (a misspelling cannot leave the hold off). Add it to the production reinstall checklist before the first start, and to the switchover runbook's global gates and step X preconditions (`docs/woocommerce-live-runbook.md`).
 
 #### Retiring the held backlog
 

@@ -12,6 +12,9 @@ import {
 } from '@/lib/ops/instance-identity'
 import { checkFileScanHealth, type FileScanResult } from '@/lib/security/file-scan'
 import { RETIRED_ENV_VARS } from '@/lib/ops/retired-env-vars'
+import { readProducerEnforcement } from '@/lib/security/producer-seam'
+import { explainProducerDisposition } from '@/lib/security/producer-disposition'
+import { PRODUCER_HOLD_ENFORCED_ENV } from '@/lib/security/producer-disposition-constants'
 import {
   missingWmsPushStates,
   pgConnectionConfig,
@@ -514,6 +517,38 @@ function checkRetiredEnvVars(checks: PreflightCheck[], env: Env): void {
   }
 }
 
+/** The Xero operations whose incumbent writer (Xeroom) must keep them: IMS shadows them only while the producer hold is enforced for xero. */
+const XERO_INCUMBENT_OWNED_OPERATIONS = ['sales.invoice', 'sales.invoice-update', 'sales.credit-note'] as const
+
+/**
+ * THE PRODUCER HOLD MUST BE ENFORCED FOR XERO WHILE XEROOM OWNS SALES INVOICES AND CREDIT NOTES.
+ *
+ * The writer-ownership map gives sales invoices, their updates and sales credit notes to Xeroom in the current phase, and IMS only SHADOWS them. That
+ * shadowing is the producer-side hold, and it exists only for a destination named in PRODUCER_HOLD_ENFORCED_DESTINATIONS: with the variable unset (the default,
+ * and what a reinstalled production gets unless it is carried over) every producer queues live and IMS would post the same documents Xeroom does. Fails loudly.
+ */
+function checkXeroProducerHold(checks: PreflightCheck[], env: Env): void {
+  const enforcement = readProducerEnforcement(env)
+  const enforcedForXero = enforcement.enforced && enforcement.destinations.has('xero')
+  if (enforcedForXero) {
+    add(checks, 'pass', 'producer-hold-xero', PRODUCER_HOLD_ENFORCED_ENV, 'The producer hold is enforced for Xero.')
+    return
+  }
+  // The owner is the current phase's owner (the phase follows from the grant and the live-from instant, never a setting of its own).
+  const owned = XERO_INCUMBENT_OWNED_OPERATIONS.filter((operation) => explainProducerDisposition('xero', operation, undefined, { env }).owner === 'xeroom')
+  if (owned.length === 0) {
+    add(checks, 'pass', 'producer-hold-xero', PRODUCER_HOLD_ENFORCED_ENV, 'The producer hold is not enforced for Xero, and the ownership map gives IMS every Xero sales invoice and credit note operation in the current phase.')
+    return
+  }
+  add(
+    checks,
+    'fail',
+    'producer-hold-xero',
+    PRODUCER_HOLD_ENFORCED_ENV,
+    `The ownership map says Xeroom owns ${owned.join(', ')} in the current phase, but ${PRODUCER_HOLD_ENFORCED_ENV} does not name xero (or all), so IMS would post those documents live beside Xeroom. Set ${PRODUCER_HOLD_ENFORCED_ENV}=xero (or all) in the environment file; see "Producer hold readiness" in docs/installation.md.`,
+  )
+}
+
 export async function runProductionPreflight(options: PreflightOptions = {}): Promise<PreflightResult> {
   const env = { ...process.env, ...options.env }
   const checks: PreflightCheck[] = []
@@ -564,6 +599,7 @@ export async function runProductionPreflight(options: PreflightOptions = {}): Pr
   await checkFileScanner(checks, env, options.scanHealth ?? ((scanEnv) => checkFileScanHealth({ env: scanEnv })))
   checkRestoreFlags(checks, env)
   checkRetiredEnvVars(checks, env)
+  checkXeroProducerHold(checks, env)
 
   return {
     ok: !checks.some((check) => check.status === 'fail'),

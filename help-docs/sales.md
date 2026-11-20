@@ -631,6 +631,8 @@ payload is constructed by the same builder used for the original push, so what X
 fresh post would have sent. A payload-derived idempotency key prevents duplicates if you re-save
 without any content change. (This is not an operator Edit: see **Editing an order** above.)
 
+The update keeps the invoice's **original date**: it is read from the invoice IMS posted, then from the order's storefront creation day, then from the invoice stamp on the order, and an edit never moves the invoice to the day of the edit. If none of these can be read (an invoice whose date IMS never recorded), the edit is **refused** with a message saying the original date is unknown and nothing is saved; IMS does not send today's date instead. Repair the invoice date (the accounting back-reference repair) or amend the invoice in the accounting system by hand.
+
 If the accounting connector rejects the update (e.g. the external invoice is locked, paid, or
 voided), an amber **rejected sync** alert appears at the top of the sales order detail page with
 the connector, timestamp, retry count, and a safely truncated error message. Operators correct the

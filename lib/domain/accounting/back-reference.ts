@@ -41,9 +41,12 @@ export type BackReferenceParams = {
    *
    * Three states, and the difference between the last two is the whole issue:
    *
-   *   • ABSENT — the LIVE post path. `now` genuinely IS the business date there: the document was
-   *     created in the ledger seconds ago. Unchanged behaviour, and the only caller allowed to
-   *     omit it.
+   *   • ABSENT — the LIVE post path when the payload carries no readable date (every sales
+   *     invoice builder fills `payload.date`, so this is a legacy or malformed payload, and
+   *     any other document type, which does not stamp the sales order). `now` is then the
+   *     business date: the document was created in the ledger seconds ago. A live sales
+   *     invoice post does NOT omit it: it passes the payload date it SENT (postedInvoicedAt in
+   *     posted-invoice-date.ts), so a post delayed past London midnight keeps its document day.
    *   • a Date — a REPAIR that recovered the posted document's own date (from the payload that was
    *     sent). This is what makes a repair reproduce the original write instead of re-dating it.
    *   • NULL — a repair that could NOT recover it. Nothing is written: `invoicedAt` keeps whatever

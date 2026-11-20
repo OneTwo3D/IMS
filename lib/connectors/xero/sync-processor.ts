@@ -67,6 +67,7 @@ import { lookupXeroInvoiceNumberClaim } from './invoice-number-claim'
 import { parseXeroDeleteTarget, runXeroDocumentDelete } from './document-delete'
 import { completeAccountingDocumentDeletion, pendingDocumentDeletionRefusal, recordDeletionTargetStatus } from '@/lib/domain/accounting/document-delete-service'
 import { lockSalesOrder } from '@/lib/domain/sales/allocation-service'
+import { postedInvoicedAt } from '@/lib/domain/accounting/posted-invoice-date'
 import { refuseUnreconciledDocument } from '@/lib/domain/accounting/document-tax-reconciliation'
 import { purchaseDocumentTaxTypeRefusal } from '@/lib/domain/accounting/purchase-document-tax-types'
 import { salesDocumentTaxTypeRefusal, type SalesDocumentTaxTypeInput, type SalesNoTaxLineKind } from '@/lib/domain/accounting/sales-document-tax-types'
@@ -74,7 +75,6 @@ import { storeCreditBlock, type StoreCreditBlock, storeCreditCreditNotePosterErr
 import {
   BACK_REFERENCE_REPAIRABLE_STATUSES,
   applyBackReference,
-  recoverPostedBusinessDate,
   backReferenceIsMissing,
   claimFollowUpObligation,
   followUpObligationRecoveryNote,
@@ -7237,7 +7237,7 @@ async function updateBackReference(
   // from the stored id. Swallowing left the document permanently orphaned.
   // A sales invoice's `invoicedAt` is the date the document was SENT with (its payload date), not the instant the post succeeded: a post delayed past London midnight keeps its document day,
   // which is also the day the VAT report uses for an order with no storefront date. A payload with no readable date keeps the live path's own `now`.
-  const postedDate = type === 'SALES_INVOICE' && referenceType === 'SalesOrder' && typeof postedPayload === 'object' && postedPayload !== null ? recoverPostedBusinessDate(postedPayload as Record<string, unknown>) : null
+  const postedDate = postedInvoicedAt(type, referenceType, postedPayload) ?? null
   const applied = await applyBackReference(db, { connector: XERO_CONNECTOR, type, referenceType, referenceId, externalId, invoiceNumber, ...(postedDate ? { invoicedAt: postedDate } : {}) })
   // o3d-9kek: a legacy PurchaseOrder-keyed row that cannot be attributed to one bill is
   // refused rather than written onto the newest unlinked bill. Surface it — silence here

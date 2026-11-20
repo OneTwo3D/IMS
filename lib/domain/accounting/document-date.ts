@@ -1,4 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
+import type { db } from '@/lib/db'
 import { businessDateYmd } from '@/lib/business-date'
 
 /**
@@ -13,7 +14,7 @@ import { businessDateYmd } from '@/lib/business-date'
  *    `PurchaseInvoice.invoiceDate`, which is inside the same London day in both GMT and BST. The report already windows on it.
  *  - SALES CREDIT NOTE: the London day of `SalesOrderRefund.createdAt`, on the first hand-off AND on every retry (queueRefundAccountingActions in app/actions/sales.ts reads the refund's own creation).
  *  - SUPPLIER CREDIT NOTE: the London day of `SupplierCreditNote.postedAt`: one clock read gives both the date sent and `postedAt` (app/actions/purchase-orders.ts).
- *  - AN UPDATE of a posted sales invoice (order edit, return-exchange) keeps the ORIGINAL document date (`originalSalesInvoiceDay`), so an edit never re-dates the invoice.
+ *  - AN UPDATE of a posted sales invoice (order edit, return-exchange) keeps the ORIGINAL document date (`originalSalesInvoiceDay`: the posted row's payload date first), so an edit never re-dates the invoice, and is REFUSED when no date is readable.
  *
  * NOTE ON WHO POSTS: the writer-ownership map gives sales invoices, their updates and sales credit notes to Xeroom in P1 and P2 (IMS shadows them), so these dates describe the
  * documents IMS would send and the ones Xeroom holds; purchase bills and supplier credit notes are Qoblex-native in P1 and IMS in P2.
@@ -27,6 +28,15 @@ export function salesInvoiceDocumentDay(orderCreatedAt: Date): string {
 /** The date (YYYY-MM-DD) a sales credit note is sent with: the London day of the refund's creation. */
 export function creditNoteDocumentDay(refundCreatedAt: Date): string {
   return businessDateYmd(refundCreatedAt)
+}
+
+/**
+ * The credit note's OWN document day, read from the refund row: the London day of its creation, on the first hand-off AND on every retry (a retry rebuilds the credit note and
+ * must not re-date it to the retry day). Null when the refund row cannot be read; the caller then has only the clock.
+ */
+export async function readCreditNoteDocumentDay(client: Pick<typeof db, 'salesOrderRefund'>, refundId: string): Promise<string | null> {
+  const refund = await client.salesOrderRefund.findUnique({ where: { id: refundId }, select: { createdAt: true } })
+  return refund ? creditNoteDocumentDay(refund.createdAt) : null
 }
 
 /** The date (YYYY-MM-DD) a supplier credit note is sent with: the London day it was posted. */
@@ -57,11 +67,24 @@ export function salesInvoiceDocumentDateWhere(window: { gte: Date; lt: Date }): 
 }
 
 /**
- * The date an UPDATE of an already-posted sales invoice must carry: the date the invoice already has. In order: the London day of the storefront creation (what the importer sent),
- * else the London day of the stored invoice stamp (the live post writes it from the payload date it sent; a repair does the same), else today (nothing posted yet).
+ * The date a sales invoice document is sent with, decided in one place: a FIRST post is dated today; an UPDATE of an already-posted invoice (the order has an accounting
+ * invoice id) keeps the date the invoice already has. For an update, in order:
+ *   1. the date in the payload of the SALES_INVOICE row that posted it (`postedPayloadDate`, read by readPostedSalesInvoiceDate): the date the ledger was actually sent;
+ *   2. the London day of the storefront creation (what the importer sent);
+ *   3. the London day of the stored invoice stamp (written from the payload date by the live post and the repair path).
+ * When none of them is readable the answer is NULL: the update is REFUSED. Never today, because today is exactly the wrong date (it would re-date the invoice into the
+ * period of the edit), and a legacy `invoicedAt` that holds the post instant can be a day off the payload date, which is why the payload is read first.
  */
-export function originalSalesInvoiceDay(input: { externalCreatedAt: Date | null; invoicedAt: Date | null; now?: Date }): string {
+export function originalSalesInvoiceDay(input: {
+  accountingInvoiceId: string | null | undefined
+  postedPayloadDate?: Date | null
+  externalCreatedAt: Date | null
+  invoicedAt: Date | null
+  now?: Date
+}): string | null {
+  if (!input.accountingInvoiceId) return businessDateYmd(input.now ?? new Date())
+  if (input.postedPayloadDate) return businessDateYmd(input.postedPayloadDate)
   if (input.externalCreatedAt) return businessDateYmd(input.externalCreatedAt)
   if (input.invoicedAt) return businessDateYmd(input.invoicedAt)
-  return businessDateYmd(input.now ?? new Date())
+  return null
 }

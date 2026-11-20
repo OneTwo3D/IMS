@@ -10,6 +10,7 @@
  * the same millisecond neither repeats nor skips one (up to TIE_ROOM ties per source).
  */
 import type { Prisma } from '@/app/generated/prisma/client'
+import { businessDateYmd } from '@/lib/business-date'
 
 export const TIMELINE_PAGE_SIZE = 50
 const TIE_ROOM = 50
@@ -63,11 +64,30 @@ export function decodeCursor(cursor: string | null | undefined): { atMs: number;
   return { atMs, key: cursor.slice(i + 1) }
 }
 
-/** Sort newest first, then by key descending; the cursor cut uses the same order. */
+/**
+ * Among events of the SAME instant the invoice is the later one (it follows the order it invoices), so newest first lists it above the order placed. Every other pair keeps the
+ * key order. The rank comes from the key (`<KIND>:<id>`), which is all a cursor carries.
+ */
+function sameInstantRank(key: string): number {
+  return key.startsWith('INVOICE:') ? 1 : 0
+}
+
+/** Sort newest first; events of the same instant: the invoice above the order placed, then by key descending. The cursor cut uses the same order. */
 export function compareEvents(a: Pick<TimelineEvent, 'at' | 'key'>, b: Pick<TimelineEvent, 'at' | 'key'>): number {
   const d = new Date(b.at).getTime() - new Date(a.at).getTime()
   if (d !== 0) return d
+  const rank = sameInstantRank(b.key) - sameInstantRank(a.key)
+  if (rank !== 0) return rank
   return a.key < b.key ? 1 : a.key > b.key ? -1 : 0
+}
+
+/**
+ * The instant an invoice is shown at. A sales invoice's `invoicedAt` is the document DAY (UTC midnight of the day it was dated), so on the day the order was placed it is
+ * earlier than the order's own creation time. On that same London day the invoice is shown at the order's creation instant (and ranks after it); otherwise as stored.
+ */
+export function invoiceEventInstant(invoicedAt: Date, orderCreatedAt: Date | null | undefined): Date {
+  if (orderCreatedAt && invoicedAt.getTime() < orderCreatedAt.getTime() && businessDateYmd(invoicedAt) === businessDateYmd(orderCreatedAt)) return orderCreatedAt
+  return invoicedAt
 }
 
 /** The events strictly after the cursor (older), at most `limit`, and the cursor for the page after. Pure. */
@@ -100,7 +120,7 @@ export async function loadTimeline(db: Reader, customerIds: string[], options: {
     }),
     db.salesOrder.findMany({
       where: { ...inOrder, invoicedAt: upTo ? { not: null, lte: upTo } : { not: null } },
-      select: { ...orderSelect, invoicedAt: true, invoiceNumber: true, currency: true, totalForeign: true },
+      select: { ...orderSelect, invoicedAt: true, createdAt: true, invoiceNumber: true, currency: true, totalForeign: true },
       orderBy: [{ invoicedAt: 'desc' }, { id: 'desc' }], take,
     }),
     db.payment.findMany({
@@ -128,7 +148,7 @@ export async function loadTimeline(db: Reader, customerIds: string[], options: {
   const events: TimelineEvent[] = []
   for (const o of placed) events.push({ key: `ORDER_PLACED:${o.id}`, kind: 'ORDER_PLACED', at: o.createdAt.toISOString(), orderId: o.id, orderNumber: orderLabel(o), customerId: o.customerId, reference: null, amount: o.totalForeign.toString(), currency: o.currency, status: o.status })
   for (const o of cancelled) events.push({ key: `ORDER_CANCELLED:${o.id}`, kind: 'ORDER_CANCELLED', at: o.cancelledAt!.toISOString(), orderId: o.id, orderNumber: orderLabel(o), customerId: o.customerId, reference: null, amount: null, currency: null, status: o.status })
-  for (const o of invoiced) events.push({ key: `INVOICE:${o.id}`, kind: 'INVOICE', at: o.invoicedAt!.toISOString(), orderId: o.id, orderNumber: orderLabel(o), customerId: o.customerId, reference: o.invoiceNumber, amount: o.totalForeign.toString(), currency: o.currency, status: null })
+  for (const o of invoiced) events.push({ key: `INVOICE:${o.id}`, kind: 'INVOICE', at: invoiceEventInstant(o.invoicedAt!, o.createdAt).toISOString(), orderId: o.id, orderNumber: orderLabel(o), customerId: o.customerId, reference: o.invoiceNumber, amount: o.totalForeign.toString(), currency: o.currency, status: null })
   for (const p of payments) events.push({ key: `${p.refundId ? 'REFUND_PAYMENT' : 'PAYMENT'}:${p.id}`, kind: p.refundId ? 'REFUND_PAYMENT' : 'PAYMENT', at: p.paidAt.toISOString(), orderId: p.order.id, orderNumber: orderLabel(p.order), customerId: p.order.customerId, reference: p.method, amount: p.amount.toString(), currency: p.currency, status: null })
   for (const r of refunds) events.push({ key: `CREDIT_NOTE:${r.id}`, kind: 'CREDIT_NOTE', at: r.createdAt.toISOString(), orderId: r.order.id, orderNumber: orderLabel(r.order), customerId: r.order.customerId, reference: r.creditNoteNumber, amount: r.totalForeign.toString(), currency: r.order.currency, status: null })
   for (const r of expectations) events.push({ key: `RETURN_EXPECTED:${r.id}`, kind: 'RETURN_EXPECTED', at: r.createdAt.toISOString(), orderId: r.order.id, orderNumber: orderLabel(r.order), customerId: r.order.customerId, reference: r.reference, amount: null, currency: null, status: r.status })

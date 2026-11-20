@@ -33,7 +33,7 @@ The **Other customers at this company** card lists customers who share this cust
 
 ## Timeline
 
-The **Timeline** shows, newest first, what happened for this person: orders placed and cancelled, invoices issued, payments received, credit notes and refunds, refunds paid, returns expected and returns received by the warehouse. Each line links to the order. It is read-only and shows numbers, dates and amounts, never notes or free text. When the person has several records, switch between **Whole person** and **This record only**. **Load older** shows the next page.
+The **Timeline** shows, newest first, what happened for this person: orders placed and cancelled, invoices issued, payments received, credit notes and refunds, refunds paid, returns expected and returns received by the warehouse. An invoice dated the day the order was placed is listed after the order placed (it is shown at the order's own time, as the invoice carries only a date). Each line links to the order. It is read-only and shows numbers, dates and amounts, never notes or free text. When the person has several records, switch between **Whole person** and **This record only**. **Load older** shows the next page.
 
 ## Erasure covers the whole person
 
