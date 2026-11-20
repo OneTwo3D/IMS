@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { cursorRaw } from './helpers/cursor-raw'
+import { serveWcOrders, type StoreOrder } from './helpers/wc-order-store'
 import test, { mock } from 'node:test'
 
 /**
@@ -30,6 +31,7 @@ const state = {
   recoveryError: null as string | null,
   /** When true the recovery read never reaches an empty page. */
   recoveryEndless: false,
+  endlessCount: 0,
   /** Ids of every order the sweep passed through the import path. */
   imported: [] as string[],
 }
@@ -71,15 +73,15 @@ mock.module('@/lib/connectors/woocommerce/api', {
         if (Array.isArray(registeredAtCall) && params.status.split(',').some((slug) => !registeredAtCall.includes(slug))) {
           return { data: null, totalPages: 0, totalItems: 0, error: 'WC API error: 400 rest_invalid_param' }
         }
-        const isRecoveryRead = params.modified_after === undefined && params.status.split(',').every((slug) => slug === 'pending-wdraw' || slug === 'withdrawn')
+        const isRecoveryRead = params.status.split(',').every((slug) => slug === 'pending-wdraw' || slug === 'withdrawn')
         if (isRecoveryRead) {
           if (state.recoveryError) {
             const error = state.recoveryError
             state.recoveryError = null
             return { data: null, totalPages: 0, totalItems: 0, error }
           }
-          if (state.recoveryEndless) return { data: [{ id: 1000 + Number(params.page), number: String(params.page), status: 'withdrawn' }], totalPages: 1, totalItems: 0 }
-          return { data: params.page === '1' ? state.withdrawalOrders : [], totalPages: 1, totalItems: 0 }
+          if (state.recoveryEndless) return { data: [{ id: 1000 + (state.endlessCount += 1), number: String(state.endlessCount), status: 'withdrawn', date_modified_gmt: '2026-08-15T00:00:00' }], totalPages: 1, totalItems: 0 }
+          return { data: serveWcOrders(state.withdrawalOrders as StoreOrder[], params), totalPages: 1, totalItems: 0 }
         }
       }
       return { data: [], totalPages: 1, totalItems: 0 }
@@ -250,8 +252,11 @@ test('a store with the plugin registered is swept with the withdrawal statuses, 
   assert.equal(state.activity.some((entry) => entry.action === WARN), false)
 })
 
-const WDRAW_ORDER = { id: 7, number: '7', status: 'withdrawn', date_modified: '2026-08-15T00:00:00' }
+const WDRAW_ORDER = { id: 7, number: '7', status: 'withdrawn', date_modified: '2026-08-15T00:00:00', date_modified_gmt: '2026-08-15T00:00:00' }
+/** The recovery read has NO date bound on its first request (the keyset then moves its own position, so later requests carry one). */
 const isRecoveryRead = (index: number) => state.statusParams[index] === 'pending-wdraw,withdrawn' && state.modifiedAfter[index] === undefined
+/** The form the sweep sends a cursor in: GMT, second precision, no zone suffix (`dates_are_gmt=true`). */
+const gmt = (iso: string | undefined) => iso?.replace(/\.\d{3}Z$/, '')
 
 test('a drop records only that it happened, and the fingerprint does not churn while the plugin stays off', async () => {
   await reset({ [CURSOR_STATUSES_KEY]: JSON.stringify(['processing', 'pending-wdraw', 'withdrawn']) })
@@ -333,7 +338,7 @@ test('a stale admission refusal does not rewind a withdrawal-only re-registratio
 
   await sweep()
 
-  assert.equal(state.modifiedAfter.at(-1), cursorAfterDrop, 'the ordinary sweep keeps its cursor')
+  assert.equal(state.modifiedAfter.at(-1), gmt(cursorAfterDrop), 'the ordinary sweep keeps its cursor')
   assert.equal(state.activity.some((entry) => entry.action === 'wc_order_sync_cursor_rewound'), false)
 })
 
@@ -347,7 +352,7 @@ test('a selection widening still rewinds to the refusal watermark', async () => 
 
   await sweep()
 
-  assert.deepEqual(state.modifiedAfter, ['2026-08-01T00:00:00.000Z'])
+  assert.deepEqual(state.modifiedAfter, ['2026-08-01T00:00:00'])
 })
 
 test('a recovery read that errors leaves the marker set, holds the run, and retries next run', async () => {
@@ -428,7 +433,7 @@ test('a status the operator ticked that is a withdrawal slug widens the selectio
 
   await sweep()
 
-  assert.equal(state.modifiedAfter.at(-1), '2026-08-01T00:00:00.000Z', 'a ticked status that was not being read rewinds to the refusal watermark')
+  assert.equal(state.modifiedAfter.at(-1), '2026-08-01T00:00:00', 'a ticked status that was not being read rewinds to the refusal watermark')
 })
 
 test('a recovery read that never reaches an empty page is refused loudly and leaves the marker set', async () => {

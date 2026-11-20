@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { cursorRaw } from '../helpers/cursor-raw'
+import { serveWcOrders, type StoreOrder } from '../helpers/wc-order-store'
 import test, { mock } from 'node:test'
 
 import { MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '@/lib/connectors/woocommerce/api'
@@ -39,7 +40,11 @@ async function upsert({ where, create, update }: { where: { key: string }; creat
 }
 
 // ---- WooCommerce order sweep rig --------------------------------------------------------------
-let pages: Record<string, Array<Record<string, unknown>>> = {}
+/** The orders the store holds (it honours the sweep's keyset filters). */
+let storeOrders: StoreOrder[] = []
+/** A store that never returns an empty page. */
+let neverEnds = false
+let fresh = 1
 let wcError: string | null = null
 // ---- order-status sweep rig --------------------------------------------------------------------
 let statusOrders: Array<Record<string, unknown>> = []
@@ -104,7 +109,7 @@ mock.module('@/lib/connectors/woocommerce/api', {
   namedExports: {
     wcFetch: async (_path: string, params: Record<string, string>) => {
       if (wcError) return { data: [], totalPages: 1, totalItems: 0, error: wcError }
-      const rows = pages[String(params.page ?? '1')] ?? []
+      const rows = neverEnds ? [wcOrder(fresh++)] : serveWcOrders(storeOrders, params)
       return { data: rows, totalPages: 1, totalItems: rows.length, error: null }
     },
     MAX_WC_PAGE_WALK_PAGES,
@@ -152,8 +157,8 @@ function reset() {
   probeImpl = async () => 'ABSENT'
 }
 
-function wcOrder(id: number) {
-  return { id, number: String(id), status: 'processing', line_items: [] }
+function wcOrder(id: number): StoreOrder {
+  return { id, number: String(id), status: 'processing', line_items: [], date_modified_gmt: '2026-08-01T10:00:00' }
 }
 
 async function runWcSweep(mode: 'poll' | 'reconcile' = 'poll') {
@@ -165,7 +170,8 @@ async function runWcSweep(mode: 'poll' | 'reconcile' = 'poll') {
 }
 
 test('[wc] a clean sweep advances the stamp IN THE SAME $transaction batch as the cursor', async () => {
-  pages = { '1': [wcOrder(1), wcOrder(2)], '2': [] }
+  neverEnds = false
+  storeOrders = [wcOrder(1), wcOrder(2)]
   const result = await runWcSweep('poll')
   console.log(`precondition: errors=${result.errors.length} skipped=${result.skipped} batches=${JSON.stringify(batches)}`)
   assert.deepEqual(result.errors, [])
@@ -177,7 +183,8 @@ test('[wc] a clean sweep advances the stamp IN THE SAME $transaction batch as th
 })
 
 test('[wc] a sweep that legitimately found nothing new advances the stamp (an empty first page is a successful read)', async () => {
-  pages = { '1': [] }
+  neverEnds = false
+  storeOrders = []
   const result = await runWcSweep('reconcile')
   console.log(`precondition: orders returned=0 errors=${result.errors.length} synced=${result.synced} skipped=${result.skipped}`)
   assert.deepEqual(result.errors, [])
@@ -187,7 +194,8 @@ test('[wc] a sweep that legitimately found nothing new advances the stamp (an em
 })
 
 test('[wc] a failed sweep does not advance the stamp - a fetch error that returned nothing is not "nothing new"', async () => {
-  pages = { '1': [] }
+  neverEnds = false
+  storeOrders = []
   settings.clear()
   const previous = '2026-10-01T00:00:00.000Z'
   const result = await (async () => {
@@ -207,14 +215,14 @@ test('[wc] a failed sweep does not advance the stamp - a fetch error that return
 })
 
 test('[wc] a sweep that ran out of ceiling, and one before the initial import, do not advance the stamp', async () => {
-  let id = 1
-  pages = new Proxy({}, { get: () => [wcOrder(id++)] }) as typeof pages
+  neverEnds = true
   const ceiling = await runWcSweep('poll')
   assert.equal(ceiling.errors.length, 1)
   assert.equal(upserts.includes(WC_ORDER_SWEEP_LAST_SUCCESS_SETTING), false)
 
   reset()
-  pages = { '1': [] }
+  neverEnds = false
+  storeOrders = []
   const { syncNewWcOrders } = await import('@/lib/connectors/woocommerce/sync/order-import')
   const before = await syncNewWcOrders({ mode: 'poll' })
   console.log(`precondition: before-initial-import errors=${JSON.stringify(before.errors)}`)

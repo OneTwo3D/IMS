@@ -93,6 +93,8 @@ const REFUSED_SINCE_KEY = 'wc_order_admission_refused_since'
 
 const CURSOR_AT = '2026-08-10T00:00:00.000Z'
 const REFUSED_AT = '2026-08-01T10:00:00.000Z'
+/** The form the sweep sends: GMT, second precision, no zone suffix (it sets `dates_are_gmt=true`). */
+const gmt = (iso: string) => iso.replace(/\.\d{3}Z$/, '')
 
 function reset(overrides: Record<string, string> = {}) {
   state.settings = new Map<string, string>([
@@ -123,7 +125,7 @@ test('a WIDENED selection rewinds the cursor to the earliest order the boundary 
 
   assert.deepEqual(
     state.modifiedAfter,
-    [REFUSED_AT],
+    [gmt(REFUSED_AT)],
     'the orders refused while `pending` was unticked are older than the cursor and must be re-read',
   )
   assert.match(state.statusParams[0], /pending/)
@@ -136,7 +138,7 @@ test('an UNCHANGED selection does not rewind, so an ordinary sweep stays increme
 
   await poll()
 
-  assert.deepEqual(state.modifiedAfter, [CURSOR_AT], 'nothing became newly wanted, so nothing is re-read')
+  assert.deepEqual(state.modifiedAfter, [gmt(CURSOR_AT)], 'nothing became newly wanted, so nothing is re-read')
   assert.equal(state.activity.some((entry) => entry.action === 'wc_order_sync_cursor_rewound'), false)
 })
 
@@ -149,7 +151,7 @@ test('a NARROWED selection does not rewind either — nothing excluded has becom
 
   await poll()
 
-  assert.deepEqual(state.modifiedAfter, [CURSOR_AT])
+  assert.deepEqual(state.modifiedAfter, [gmt(CURSOR_AT)])
 })
 
 test('a widening with NOTHING ever refused does not re-read the store', async () => {
@@ -160,7 +162,7 @@ test('a widening with NOTHING ever refused does not re-read the store', async ()
 
   await poll()
 
-  assert.deepEqual(state.modifiedAfter, [CURSOR_AT])
+  assert.deepEqual(state.modifiedAfter, [gmt(CURSOR_AT)])
 })
 
 test('a refusal NEWER than the cursor does not drag the cursor forward', async () => {
@@ -171,7 +173,7 @@ test('a refusal NEWER than the cursor does not drag the cursor forward', async (
 
   await poll()
 
-  assert.deepEqual(state.modifiedAfter, [CURSOR_AT], 'a rewind may only ever move the window backwards')
+  assert.deepEqual(state.modifiedAfter, [gmt(CURSOR_AT)], 'a rewind may only ever move the window backwards')
 })
 
 test('the cursor and the selection it was earned under are written together', async () => {

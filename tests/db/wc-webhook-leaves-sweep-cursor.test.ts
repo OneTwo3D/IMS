@@ -31,7 +31,8 @@ const hooks: { onOrdersFetch: null | (() => Promise<void>) } = { onOrdersFetch: 
 mock.module('@/lib/connectors/woocommerce/api', {
   namedExports: {
     wcFetch: async (path: string, params: Record<string, string> = {}) => {
-      asked.push({ path, modifiedAfter: params.modified_after })
+      // The order sweep sends GMT without a zone suffix (dates_are_gmt=true): read it back as the ISO instant it denotes.
+      asked.push({ path, modifiedAfter: path === '/orders' && params.modified_after ? new Date(`${params.modified_after}Z`).toISOString() : params.modified_after })
       if (path === '/orders') await hooks.onOrdersFetch?.()
       return { data: [], totalPages: 1, totalItems: 0 }
     },
@@ -362,7 +363,7 @@ test('a status added while the initial import runs is NOT claimed by the fingerp
     await put('wc_order_admission_refused_since', refusedAt)
     asked.length = 0
     assert.deepEqual((await syncNewWcOrders({ mode: 'poll' })).errors, [])
-    assert.equal(asked.find((call) => call.path === '/orders')?.modifiedAfter, refusedAt, 'the poll treated it as a widening and rewound')
+    assert.equal(asked.find((call) => call.path === '/orders')?.modifiedAfter, refusedAt.replace(/\.\d{3}Z$/, '.000Z'), 'the poll treated it as a widening and rewound (the request carries second precision)')
     assert.equal(await get(`${ORDER_CURSOR}_statuses`), wideList)
   })
 })

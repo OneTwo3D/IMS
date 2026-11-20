@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import { cursorRaw } from './helpers/cursor-raw'
+import { serveWcOrders, type StoreOrder } from './helpers/wc-order-store'
 import test, { mock } from 'node:test'
 
 import { MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '@/lib/connectors/woocommerce/api'
@@ -32,8 +33,11 @@ const fetchedPages: string[] = []
 const settingUpserts: string[] = []
 const activity: Array<Record<string, unknown>> = []
 
-/** Pages the store serves for GET /orders. A Proxy models a store that never returns an empty one. */
-let pages: Record<string, Array<Record<string, unknown>>> = {}
+/** The orders the store holds; it honours `modified_after` / `modified_before` / `page` (the sweep pages by keyset on modification time). */
+let storeOrders: StoreOrder[] = []
+/** A store that never returns an empty page: every read answers with a fresh order (same modified second, so the keyset cannot advance). */
+let neverEnds = false
+let nextFresh = 1
 
 function settingRow(key: string): SettingRow | null {
   const value = settings.get(key)
@@ -80,7 +84,7 @@ mock.module('@/lib/connectors/woocommerce/api', {
       if (_path === '/orders' && (params?.status === 'cancelled' || params?.status === 'trash')) return { data: [], totalPages: 1, totalItems: 0 }
       const page = String(params.page ?? '1')
       fetchedPages.push(page)
-      const rows = pages[page] ?? []
+      const rows = neverEnds ? [wcOrder(nextFresh++)] : serveWcOrders(storeOrders, params)
       return { data: rows, totalPages: 1, totalItems: rows.length, error: null }
     },
     // The REAL describer, so the sentence the stall test reads is the shipped one.
@@ -104,12 +108,13 @@ mock.module('@/lib/connectors/woocommerce/sync/withdrawal', {
   },
 })
 
-function wcOrder(id: number) {
-  return { id, number: String(id), status: 'processing', line_items: [] }
+function wcOrder(id: number): StoreOrder {
+  return { id, number: String(id), status: 'processing', line_items: [], date_modified_gmt: '2026-08-01T10:00:00' }
 }
 
 async function runSweep() {
   settings.clear()
+  nextFresh = 1
   settings.set('wc_initial_import_completed', 'true')
   settings.set('wc_sync_order_statuses', '["processing"]')
   fetchedPages.length = 0
@@ -121,7 +126,8 @@ async function runSweep() {
 }
 
 test('[round 3] the control: a sweep that reaches an empty page advances the cursor', async () => {
-  pages = { '1': [wcOrder(1), wcOrder(2)], '2': [] }
+  neverEnds = false
+  storeOrders = [wcOrder(1), wcOrder(2)]
 
   const result = await runSweep()
 
@@ -134,8 +140,7 @@ test('[round 3] the control: a sweep that reaches an empty page advances the cur
 test('[round 3] an unended sweep does NOT advance the cursor', async () => {
   // A store that ignores `page`: every page comes back full, so the walk runs to the ceiling
   // without ever being told the collection ended.
-  let id = 1
-  pages = new Proxy({}, { get: () => [wcOrder(id++)] }) as typeof pages
+  neverEnds = true
 
   const result = await runSweep()
 
@@ -156,8 +161,7 @@ test('[round 3] running out of ceiling is escalated as a STALL, not left as one 
   // The MEDIUM, on this walk. The error above holds `last_wc_order_sync_at`, so the next sweep
   // rebuilds the identical `modified_after` window and stops in the identical place — for ever.
   // "It will be retried" was the wrong sentence: the retry IS the failure.
-  let id = 1
-  pages = new Proxy({}, { get: () => [wcOrder(id++)] }) as typeof pages
+  neverEnds = true
 
   const result = await runSweep()
 
@@ -172,11 +176,10 @@ test('[round 3] running out of ceiling is escalated as a STALL, not left as one 
 test('[round 3] the walk is bounded — a store that never ends does not run for ever', async () => {
   // The ceiling is the only thing between "keep asking until it is empty" and a loop that never
   // terminates. Asserted as the number of DISTINCT pages asked for, against the shared constant.
-  let id = 1
-  pages = new Proxy({}, { get: () => [wcOrder(id++)] }) as typeof pages
+  neverEnds = true
 
   await runSweep()
 
-  assert.equal(new Set(fetchedPages).size, MAX_WC_PAGE_WALK_PAGES)
-  assert.equal(fetchedPages.at(-1), String(MAX_WC_PAGE_WALK_PAGES))
+  // Keyset reads are page 1; once the position cannot advance, the window is read by offset. Either way: exactly the ceiling's worth of requests.
+  assert.equal(fetchedPages.length, MAX_WC_PAGE_WALK_PAGES)
 })
