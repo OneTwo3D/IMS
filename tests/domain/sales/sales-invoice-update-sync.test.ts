@@ -334,3 +334,29 @@ test('[Codex r19] the unattributable-document refusal never advises a re-post: i
     assert.match(logged.description, /do not re-post the invoice from this order, which would create a second document/, 'and the duplicate-creating option is forbidden')
   }
 })
+
+test('o3d-tqwjt: the date-unknown WARNING is written only when the facade answers shadowed, through the transaction-bound logger', async () => {
+  const shadowed = makeDeps({ connector: { id: 'xero', name: 'Xero' }, enabled: true, answer: { queued: false, reason: 'shadowed' as never, connector: 'xero' } })
+  const inTx: unknown[] = []
+  shadowed.deps.logShadowWarning = async (input) => { inTx.push(input) }
+  const params = { ...baseParams, payload: { ...baseParams.payload, dateUnknown: true } }
+  await queueSalesInvoiceUpdateForExistingAccountingInvoice(params, shadowed.deps)
+  assert.equal(inTx.length, 1)
+  assert.equal((inTx[0] as { action: string; level: string }).action, 'sales_invoice_update_date_unknown')
+  assert.equal((inTx[0] as { level: string }).level, 'WARNING')
+  assert.ok(!shadowed.activity.some((a) => (a as { action: string }).action === 'sales_invoice_update_date_unknown'), 'not written through the global logger')
+
+  // Not shadowed (not configured, refused, queued): no warning anywhere.
+  for (const answer of [
+    { queued: false, reason: 'not-configured' as const, connector: 'xero' },
+    { queued: false, reason: 'refused' as const, connector: 'xero' },
+    { queued: true, connector: 'xero' },
+  ]) {
+    const other = makeDeps({ connector: { id: 'xero', name: 'Xero' }, enabled: true, answer })
+    const warned: unknown[] = []
+    other.deps.logShadowWarning = async (input) => { warned.push(input) }
+    await queueSalesInvoiceUpdateForExistingAccountingInvoice(params, other.deps)
+    assert.equal(warned.length, 0, JSON.stringify(answer))
+    assert.ok(!other.activity.some((a) => (a as { action: string }).action === 'sales_invoice_update_date_unknown'))
+  }
+})

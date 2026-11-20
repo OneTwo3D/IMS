@@ -459,6 +459,11 @@ export type WmsOrderStatus = {
    * engagement metric exists to expose (o3d-9vv).
    */
   authoritativeReread?: boolean
+  /**
+   * The WMS's own last-changed stamp for this order, as the WMS wrote it (Mintsoft `LastUpdated`), when the record carries one. Opaque: only ever compared for
+   * EQUALITY (the despatched units a held despatch stored are re-applied only while this is unchanged). Absent: unknown, which never matches.
+   */
+  lastUpdated?: string | null
   raw?: Record<string, unknown> | null
 }
 
@@ -477,6 +482,8 @@ export type WmsOrderPart = {
   /** Normalised dispatched flag for this part (connector-decided). */
   dispatched: boolean
   tracking: WmsOrderTracking[]
+  /** The WMS's last-changed stamp for this part (see WmsOrderStatus.lastUpdated). Compared for equality only. */
+  lastUpdated?: string | null
 }
 
 export type WmsOrderAddress = {

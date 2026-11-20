@@ -1,6 +1,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
 import { businessDateYmd } from '@/lib/business-date'
+import { salesInvoiceUpdateSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
 
 /**
  * THE DATE EACH DOCUMENT CARRIES IN THE LEDGER (Xero), defined once so the VAT report and the posters cannot disagree.
@@ -96,4 +97,26 @@ export function originalSalesInvoiceDay(input: {
 export function originalDayDecision(documentDay: string | null, wouldBeShadowed: boolean): 'use' | 'refuse' | 'shadow-unknown' {
   if (documentDay !== null) return 'use'
   return wouldBeShadowed ? 'shadow-unknown' : 'refuse'
+}
+
+/**
+ * The date decision of an UPDATE of a posted sales invoice, with the facade's own inputs (see salesInvoiceUpdateSeamVerdict: the chart's connector, the update type, a payload dated `today`, the date it would carry).
+ * `shadow-unknown` only when the update would NOT be sent: the hold records it as a shadow, or nothing is sent at all (legacy and the enqueue would answer not-configured: the chart or the document is not Xero's, or
+ * the update type is switched off). A live verdict, or a legacy one that would really be sent, refuses.
+ */
+export function salesInvoiceUpdateDateDecision(input: {
+  documentDay: string | null
+  today: string
+  chartConnector: string | null
+  documentConnector: string | null
+  /** Whether the chart's connector posts SALES_INVOICE_UPDATE (the facade's not-configured answer is its negation). Read only when the day is unknown. */
+  typeEnabled: boolean
+  env?: Record<string, string | undefined>
+  now?: Date
+}): 'use' | 'refuse' | 'shadow-unknown' {
+  if (input.documentDay !== null) return 'use'
+  const seam = salesInvoiceUpdateSeamVerdict({ connector: input.chartConnector ?? '', date: input.today, ...(input.env ? { env: input.env } : {}), ...(input.now ? { now: input.now } : {}) })
+  const wouldSend = seam.kind === 'live'
+    || (seam.kind === 'legacy' && input.chartConnector === 'xero' && input.documentConnector === 'xero' && input.typeEnabled)
+  return originalDayDecision(input.documentDay, !wouldSend)
 }

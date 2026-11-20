@@ -96,6 +96,11 @@ export type QueueSalesInvoiceUpdateDeps = {
   queueAccountingSync: QueueAccountingSync
   logActivity: LogActivity
   /**
+   * Where the date-unknown WARNING of a shadowed update is written. An edit queues its update inside its own transaction, so that caller hands in a logger bound to that transaction: the
+   * warning then commits or rolls back with the edit. Defaults to `logActivity`.
+   */
+  logShadowWarning?: LogActivity
+  /**
    * o3d-j625 r4 — the refusal, as OUTSTANDING work in the exception inbox rather than a log line an
    * operator has to already be reading. Injected like everything else this module uses.
    */
@@ -267,6 +272,18 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
         shadowed: true,
       },
     })
+    // An update built without a readable original date carries today's date and `dateUnknown`: say so, but only now that the facade has answered shadowed (nothing was sent), and in the writer's transaction when it has one.
+    if (params.payload.dateUnknown === true) {
+      await (deps.logShadowWarning ?? deps.logActivity)({
+        entityType: 'SALES_ORDER',
+        entityId: params.salesOrderId,
+        action: 'sales_invoice_update_date_unknown',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: 'The original date of the posted invoice could not be read; the update was recorded as a shadow (nothing was sent) with today\'s date, flagged as unknown.',
+        metadata: { accountingInvoiceId: params.accountingInvoiceId },
+      })
+    }
     return
   }
   if (!enqueued.queued) {

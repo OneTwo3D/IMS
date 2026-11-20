@@ -22,15 +22,19 @@ export async function readPostedSalesInvoiceDate(
   orderId: string,
   accountingInvoiceId: string,
 ): Promise<Date | null> {
-  const rows = await client.accountingSyncLog.findMany({
-    where: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: orderId, externalTransactionId: accountingInvoiceId },
-    orderBy: { createdAt: 'asc' },
-    select: { payload: true },
-    take: 5,
-  })
-  for (const row of rows) {
-    const date = recoverPostedBusinessDate((row.payload ?? {}) as Record<string, unknown>)
-    if (date) return date
+  // A SYNCED row is what the ledger really holds, so it is read first; any other row that names the document (a row still in flight, or a failed one that carries the id) is the fallback, oldest first.
+  const where = { type: 'SALES_INVOICE' as const, referenceType: 'SalesOrder', referenceId: orderId, externalTransactionId: accountingInvoiceId }
+  for (const status of ['SYNCED' as const, null]) {
+    const rows = await client.accountingSyncLog.findMany({
+      where: status ? { ...where, status } : { ...where, status: { not: 'SYNCED' } },
+      orderBy: { createdAt: 'asc' },
+      select: { payload: true },
+      take: 5,
+    })
+    for (const row of rows) {
+      const date = recoverPostedBusinessDate((row.payload ?? {}) as Record<string, unknown>)
+      if (date) return date
+    }
   }
   return null
 }

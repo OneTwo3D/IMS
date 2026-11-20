@@ -42,7 +42,7 @@ import {
 import { loadNettedRefundLines } from '@/lib/domain/sales/refund-demand-netting'
 import { UNCOMMITTED_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 import { withSavepoint } from '@/lib/db/savepoint'
-import { loadDespatchInstantFloors, lockInventorySnapshotFloorShared, resolveDespatchInstant, type DespatchInstantResolution } from '@/lib/domain/sales/despatch-instant'
+import { loadDespatchInstantFloors, resolveDespatchInstant, SNAPSHOT_RUNNING_MARK, tryLockInventorySnapshotFloorShared, type DespatchInstantResolution } from '@/lib/domain/sales/despatch-instant'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -1336,11 +1336,17 @@ export async function transitionShipmentStatus(
 
       // The instant this dispatch is booked at, read under the order lock: ONE instant for the shipment, the stock movement, its COGS entries and
       // the order flip (see lib/domain/sales/despatch-instant.ts). With no warehouse-reported time it is simply now, as it always was.
-      // The stock levels are locked FIRST, so the FIFO layers read for the receipt floor are the ones the dispatch below consumes (the same order of locks as before:
-      // order, then stock levels).
+      // The snapshot floor lock (shared) is TRIED first, before the stock-level row locks, and never waited for: this transaction already holds the ORDER lock and a
+      // pool connection, and a snapshot can run for minutes, so waiting would block every in-app action on the order and then fail with a transaction timeout. A
+      // refusal is retryable (nothing has been changed yet); the sweep sees it again on its next pass. Then the stock levels are locked, so the FIFO layers read for
+      // the receipt floor are the ones the dispatch below consumes (the same order of locks as before: order, then stock levels).
       if (input.despatchedAt) {
-        // The snapshot floor lock (shared) goes BEFORE the stock-level row locks, so a despatch waiting on a running snapshot does not hold the stock rows meanwhile.
-        await lockInventorySnapshotFloorShared(tx)
+        if (!(await tryLockInventorySnapshotFloorShared(tx))) {
+          return {
+            success: false as const,
+            error: `${SNAPSHOT_RUNNING_MARK}this despatch is dated by the warehouse and is applied again on the next pass, once the snapshot has finished.`,
+          }
+        }
         await lockStockLevels(tx, lockedProductIds, [lockedShipment.warehouseId])
       }
       const despatchNow = new Date()

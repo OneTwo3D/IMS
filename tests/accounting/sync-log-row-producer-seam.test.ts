@@ -205,3 +205,50 @@ test('A SHADOW NEVER BLOCKS THE LIVE POSTING THAT FOLLOWS IT: the prior-attempt 
   // A shadow beside a queued row changes nothing about the queued row's verdict.
   assert.equal(classifyPriorAttempts([shadow, { id: 'row-live', status: 'PENDING', externalTransactionId: null, abandonedBeforeRemoteCall: null, settlementBasis: null }]).kind, 'live')
 })
+
+// ---- o3d-tqwjt: a payload that says its document date is unknown may only ever be a SHADOW ----
+const UPDATE_LIVE_ENV = { [PRODUCER_HOLD_ENFORCED_ENV]: 'xero', [OUTBOUND_GRANT_ENV.xero]: TENANT, [PRODUCER_CUTOFF_ENV.xero]: '2026-01-01T00:00:00Z' }
+const updateRow = (payload: Record<string, unknown>) => row({ type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: 'so-1', payload: { _idempotencyKey: 'k-u', ...payload } })
+
+test('o3d-tqwjt: today\'s map (Xeroom owns sales.invoice-update): a dateUnknown update is recorded as a shadow, nothing queued', async () => {
+  await withEnv(UPDATE_LIVE_ENV, async () => {
+    const { client, recorded } = recordingClient()
+    const result = await createAccountingSyncLogRow(client as never, updateRow({ date: '2026-07-01', dateUnknown: true }) as never)
+    assert.ok(result.shadowed)
+    assert.equal(recorded.creates[0]!.status, 'CANCELLED')
+  })
+})
+
+test('o3d-tqwjt: a SIMULATED WRITER-MAP CHANGE giving IMS sales.invoice-update: the dateUnknown update is REFUSED with a visible reason, never queued with today\'s date; a dated update still goes live', async () => {
+  const { WRITER_OWNERSHIP_MAP } = await import('@/lib/security/writer-ownership-map')
+  const { DateUnknownPayloadNotShadowedError } = await import('@/lib/domain/accounting/sync-log-row')
+  const target = (WRITER_OWNERSHIP_MAP as unknown as Array<{ destination: string; operation: string; owners: Record<string, string>; step: string }>).find((r) => r.destination === 'xero' && r.operation === 'sales.invoice-update')!
+  const saved = { owners: { ...target.owners }, step: target.step }
+  target.owners.P2 = 'IMS'
+  target.step = 'xero'
+  try {
+    await withEnv({ ...UPDATE_LIVE_ENV, [PRODUCER_CUTOFF_ENV.xero]: '2026-01-01T00:00:00Z' }, async () => {
+      const dated = recordingClient()
+      const ok = await createAccountingSyncLogRow(dated.client as never, updateRow({ date: '2026-07-01' }) as never)
+      assert.ok(ok.row, 'CONTROL: with the map changed a dated update is LIVE')
+      const unknown = recordingClient()
+      await assert.rejects(
+        () => createAccountingSyncLogRow(unknown.client as never, updateRow({ date: '2026-07-01', dateUnknown: true }) as never),
+        (error: unknown) => error instanceof DateUnknownPayloadNotShadowedError && /document date is unknown/.test(error.message) && error.verdict === 'live',
+      )
+      assert.equal(unknown.recorded.creates.length, 0, 'nothing was written')
+    })
+  } finally {
+    target.owners = saved.owners
+    target.step = saved.step
+  }
+})
+
+test('o3d-tqwjt: with the hold NOT enforced (legacy sends), a dateUnknown update is refused too', async () => {
+  const { DateUnknownPayloadNotShadowedError } = await import('@/lib/domain/accounting/sync-log-row')
+  await withEnv({}, async () => {
+    const { client, recorded } = recordingClient()
+    await assert.rejects(() => createAccountingSyncLogRow(client as never, updateRow({ date: '2026-07-01', dateUnknown: true }) as never), DateUnknownPayloadNotShadowedError)
+    assert.equal(recorded.creates.length, 0)
+  })
+})
