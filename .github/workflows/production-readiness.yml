@@ -123,6 +123,8 @@ jobs:
       FILE_SCAN_MODE: disabled
       ALLOW_DATABASE_RESTORE: "false"
       ALLOW_DATABASE_RESTORE_UPLOAD: "false"
+      # Xeroom owns sales invoices and credit notes, so the preflight requires the Xero producer hold (matches deploy/host/ims.env.template).
+      PRODUCER_HOLD_ENFORCED_DESTINATIONS: all
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0

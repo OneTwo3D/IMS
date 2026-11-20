@@ -46,6 +46,7 @@ function baseEnv(storage: Record<string, string>): Record<string, string> {
     FILE_SCAN_MODE: 'disabled',
     ALLOW_DATABASE_RESTORE: 'false',
     ALLOW_DATABASE_RESTORE_UPLOAD: 'false',
+    PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero',
   }
 }
 
@@ -474,5 +475,36 @@ test('production preflight passes the retired environment variable check when no
 
     assertStatus(result, 'retired-env-vars', 'pass')
     assert.equal(result.checks.some((check) => check.id.startsWith('retired-env-var:')), false)
+  })
+})
+
+test('production preflight FAILS when Xeroom owns sales invoices and credit notes but the producer hold is not enforced for xero', async () => {
+  await withStorageDirs(async (storage) => {
+    for (const value of ['', 'woocommerce', 'mintsoft,woocommerce']) {
+      const result = await runProductionPreflight({ env: { ...baseEnv(storage), PRODUCER_HOLD_ENFORCED_DESTINATIONS: value } })
+      assert.equal(result.ok, false, `value "${value}" must fail`)
+      assertFailed(result, 'producer-hold-xero')
+      const check = result.checks.find((c) => c.id === 'producer-hold-xero')!
+      assert.match(check.message, /sales\.invoice.*sales\.credit-note|sales\.credit-note/)
+      assert.match(check.message, /PRODUCER_HOLD_ENFORCED_DESTINATIONS=xero/)
+    }
+  })
+})
+
+test('production preflight passes the producer-hold check when xero, all, or a list that names xero is enforced (a misspelling enforces everything)', async () => {
+  await withStorageDirs(async (storage) => {
+    for (const value of ['xero', 'all', 'woocommerce,xero']) {
+      const result = await runProductionPreflight({ env: { ...baseEnv(storage), PRODUCER_HOLD_ENFORCED_DESTINATIONS: value } })
+      assertStatus(result, 'producer-hold-xero', 'pass')
+    }
+  })
+})
+
+test('a misspelled producer hold value does not fail the preflight (every destination is held) but WARNS that it holds all of them', async () => {
+  await withStorageDirs(async (storage) => {
+    const result = await runProductionPreflight({ env: { ...baseEnv(storage), PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xer0' } })
+    assertStatus(result, 'producer-hold-xero', 'warn')
+    assert.match(result.checks.find((c) => c.id === 'producer-hold-xero')!.message, /EVERY destination/)
+    assert.equal(result.ok, true)
   })
 })

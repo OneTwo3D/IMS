@@ -182,6 +182,7 @@ function productionEnv(storage: Record<string, string>): Record<string, string> 
     FILE_SCAN_MODE: 'disabled',
     ALLOW_DATABASE_RESTORE: 'false',
     ALLOW_DATABASE_RESTORE_UPLOAD: 'false',
+    PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero',
     E2E_TEST_MODE: '',
   }
 }

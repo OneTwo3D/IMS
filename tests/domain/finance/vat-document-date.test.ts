@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
-import { getVatReport, type FinanceAnalyticsDeps } from '@/lib/domain/finance/finance-period-analytics'
+import { getVatReport, SHIPPING_ROW_NAME, type FinanceAnalyticsDeps } from '@/lib/domain/finance/finance-period-analytics'
 import { salesInvoiceDocumentDay, salesInvoiceDocumentDayOfOrder } from '@/lib/domain/accounting/document-date'
 
 /**
@@ -147,4 +147,107 @@ test('shipping VAT is on the sales side, so a shipping refund nets against VAT t
 test('the report says Xeroom-invoiced orders (no invoicedAt) are not included', async () => {
   const r = await run(Q3, deps({}))
   assert.ok(r.notices.some((n) => /Xeroom/.test(n)))
+})
+
+// ---- the shipping row ------------------------------------------------------------------------------------------------------------------------------------
+
+type ShipOrder = { id: string; shipping: number; orderTax: number; lineTax: number; address?: unknown }
+const GB = { country: 'GB' }
+/** A stand-in client with a no-tax-rate sales line (jurisdiction GB), the given orders for the shipping query (honouring take/cursor like the database), and refund lines. */
+function shippingDeps(orders: ShipOrder[], refundLines: Array<{ net: number; lineKind?: string | null; productId?: string | null; withOrderLine?: boolean }> = [], seen?: { pages: number }): FinanceAnalyticsDeps {
+  return {
+    now: () => NOW,
+    baseCurrency: async () => 'GBP',
+    client: {
+      salesOrder: {
+        findMany: async (a: { take?: number; cursor?: { id: string }; skip?: number }) => {
+          if (seen) seen.pages += 1
+          const sorted = [...orders].sort((x, y) => (x.id < y.id ? -1 : 1))
+          const start = a.cursor ? sorted.findIndex((o) => o.id === a.cursor!.id) + (a.skip ?? 0) : 0
+          return sorted.slice(start, start + (a.take ?? sorted.length)).map((o) => ({
+            id: o.id, shippingBase: D(o.shipping), taxBase: D(o.orderTax), shippingAddress: o.address ?? GB, lines: [{ taxBase: D(o.lineTax) }],
+          }))
+        },
+      },
+      salesOrderLine: {
+        // An untaxed fee line (no tax rate) in GB: the row the shipping VAT used to land on.
+        findMany: async () => [{ taxRateId: null, taxForeign: D(0), taxBase: D(0), totalBase: D(5), order: { shippingAddress: GB, pricesIncludeVat: false }, taxRate: null }],
+      },
+      purchaseInvoice: { findMany: async () => [] },
+      salesOrderRefundLine: {
+        findMany: async () => refundLines.map((r) => ({
+          totalBase: D(r.net), postedTaxRate: D(0.2), lineKind: r.lineKind ?? null, productId: r.productId ?? null, refund: { order: { shippingAddress: GB } },
+          salesOrderLine: r.withOrderLine ? { taxRateId: null, taxRate: null } : null,
+        })),
+      },
+      supplierCreditNote: { findMany: async () => [] },
+    } as never,
+  }
+}
+
+test('shipping VAT is on its OWN row, never added to the "No tax rate" row that an untaxed line shares a null tax rate id with', async () => {
+  const r = await run(Q3, shippingDeps([{ id: 'a', shipping: 10, orderTax: 2, lineTax: 0 }]))
+  const noRate = r.rows.find((row) => row.taxRateName === 'No tax rate')!
+  const shipping = r.rows.find((row) => row.taxRateName === SHIPPING_ROW_NAME)!
+  assert.ok(noRate && shipping, 'two distinct rows')
+  assert.equal(Number(noRate.taxBase), 0, 'the 0% row carries no VAT')
+  assert.equal(Number(noRate.taxableBase), 5)
+  assert.equal(Number(shipping.taxBase), 2)
+  assert.equal(Number(shipping.taxableBase), 10)
+  assert.equal(Number(r.totals.salesTaxBase), 2)
+})
+
+test('a shipping refund line (no order line, kind shipping or legacy kind-less) nets against the shipping row; a no-line sale line stays on "No tax rate"', async () => {
+  const r = await run(Q3, shippingDeps(
+    [{ id: 'a', shipping: 10, orderTax: 2, lineTax: 0 }],
+    [{ net: 10, lineKind: 'shipping' }, { net: 5, lineKind: 'sale' }],
+  ))
+  const shipping = r.rows.find((row) => row.taxRateName === SHIPPING_ROW_NAME)!
+  const noRate = r.rows.find((row) => row.taxRateName === 'No tax rate')!
+  assert.equal(Number(shipping.taxBase), 0, 'shipping VAT 2 less the shipping refund VAT 2')
+  assert.equal(Number(shipping.taxableBase), 0)
+  assert.equal(Number(noRate.taxBase), -1, 'the monetary-only sale line (kind sale) is not shipping: it stays on the no-rate row, 5 at 20%')
+  const legacy = await run(Q3, shippingDeps([{ id: 'a', shipping: 10, orderTax: 2, lineTax: 0 }], [{ net: 10, lineKind: null }]))
+  assert.equal(Number(legacy.rows.find((row) => row.taxRateName === SHIPPING_ROW_NAME)!.taxBase), 0)
+})
+
+test('an order whose order-level VAT is negative (an order-level discount) is reported, not clamped: the totals still add up', async () => {
+  const r = await run(Q3, shippingDeps([
+    { id: 'a', shipping: 10, orderTax: 1, lineTax: 5 },     // residual -4: header-discount VAT exceeds the shipping VAT
+    { id: 'b', shipping: 10, orderTax: 2, lineTax: 0 },     // residual +2
+    { id: 'c', shipping: 10, orderTax: 2.004, lineTax: 2 }, // a rounding penny is not "negative"
+  ]))
+  const shipping = r.rows.find((row) => row.taxRateName === SHIPPING_ROW_NAME)!
+  assert.equal(Number(shipping.taxBase), -2, 'the residual is kept as it is (-4 + 2 + 0.004, shown to the penny)')
+  assert.ok(r.notices.some((n) => /1 order in the period carries less VAT on the order than on its lines \(-4 in total/.test(n)), r.notices.join('\n'))
+  assert.ok(r.notices.some((n) => /RESIDUAL/.test(n)), 'the row is documented as a residual')
+  const clean = await run(Q3, shippingDeps([{ id: 'b', shipping: 10, orderTax: 2, lineTax: 0 }]))
+  assert.ok(!clean.notices.some((n) => /carries? less VAT on the order/.test(n)))
+})
+
+test('the shipping query is paged: more orders than one page are all counted, and no page holds them all', async () => {
+  const orders: ShipOrder[] = Array.from({ length: 4500 }, (_, i) => ({ id: `o${String(i).padStart(5, '0')}`, shipping: 1, orderTax: 0.2, lineTax: 0 }))
+  const seen = { pages: 0 }
+  const r = await run(Q3, shippingDeps(orders, [], seen))
+  const shipping = r.rows.find((row) => row.taxRateName === SHIPPING_ROW_NAME)!
+  assert.equal(shipping.lineCount, 4500)
+  assert.equal(Number(shipping.taxBase), 900)
+  assert.equal(Number(shipping.taxableBase), 4500)
+  assert.ok(seen.pages >= 3, `read in pages (saw ${seen.pages})`)
+})
+
+test('the notice says manual orders whose invoice number IMS minted are reported on the mint day while Xeroom posts them', async () => {
+  const r = await run(Q3, deps({}))
+  assert.ok(r.notices.some((n) => /Xeroom/.test(n) && /minted/.test(n) && /different period/.test(n)))
+})
+
+test('a kind-less legacy refund line follows the codebase legacy rule: a product is a sale, a negative total a discount, only the rest is shipping', async () => {
+  const orders = [{ id: 'a', shipping: 10, orderTax: 2, lineTax: 0 }]
+  const r = await run(Q3, shippingDeps(orders, [
+    { net: 10, lineKind: null },                    // shipping: nets the shipping row
+    { net: 5, lineKind: null, productId: 'p1' },    // legacy product refund: stays on "No tax rate"
+    { net: -4, lineKind: null },                    // legacy mirrored discount: stays on "No tax rate"
+  ]))
+  assert.equal(Number(r.rows.find((row) => row.taxRateName === SHIPPING_ROW_NAME)!.taxBase), 0, 'only the true shipping refund nets the shipping row')
+  assert.equal(Number(r.rows.find((row) => row.taxRateName === 'No tax rate')!.taxBase), -0.2, '5 at 20% off, minus a -4 at 20% = -1 + 0.8')
 })

@@ -234,7 +234,7 @@ test('a posted invoice: the edit queues an update of it in the same transaction;
   // A confirmed order whose invoice has posted (the column the Xero poster writes). Created BEFORE the accounting switches are read by the create path, so the create queued nothing we have to clean.
   const id = await createConfirmed(w, [{ p: 'p1', qty: 2 }])
   await db.accountingSyncLog.deleteMany({ where: { referenceId: id } })
-  await db.salesOrder.update({ where: { id }, data: { accountingInvoiceId: `XERO-${w.tag}`, accountingInvoiceConnector: 'xero', invoiceNumber: `INV-${w.tag}` } })
+  await db.salesOrder.update({ where: { id }, data: { accountingInvoiceId: `XERO-${w.tag}`, accountingInvoiceConnector: 'xero', invoiceNumber: `INV-${w.tag}`, invoicedAt: new Date('2026-09-30T00:00:00Z') } })
 
   // HELD: the producer-side hold is enforced and no grant is given, so the update is recorded as a shadow and nothing is on the queue.
   process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = 'xero'
@@ -506,7 +506,7 @@ test('an invoice update that cannot be queued (the posted invoice belongs to ano
   const id = await createConfirmed(w, [{ p: 'p1', qty: 2 }])
   await db.accountingSyncLog.deleteMany({ where: { referenceId: id } })
   // The invoice was posted by ANOTHER accounting connector: the update helper declines without asking the queue, which used to commit the edit with the invoice left at the old lines.
-  await db.salesOrder.update({ where: { id }, data: { accountingInvoiceId: `QBO-${w.tag}`, accountingInvoiceConnector: 'quickbooks', invoiceNumber: `INV-${w.tag}` } })
+  await db.salesOrder.update({ where: { id }, data: { accountingInvoiceId: `QBO-${w.tag}`, accountingInvoiceConnector: 'quickbooks', invoiceNumber: `INV-${w.tag}`, invoicedAt: new Date('2026-09-30T00:00:00Z') } })
   const before = await snapshot(id)
   const reservationBefore = await reservation(w, id)
   const refused = await updateSalesOrder(id, inputFor(w, [{ p: 'p1', qty: 3 }]) as never, await versionOf(id))

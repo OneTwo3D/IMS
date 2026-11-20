@@ -1,7 +1,8 @@
 'use server'
 
 import { businessDateYmd } from '@/lib/business-date'
-import { creditNoteDocumentDay, originalSalesInvoiceDay } from '@/lib/domain/accounting/document-date'
+import { creditNoteDocumentDay, originalDayDecision, originalSalesInvoiceDay, readCreditNoteDocumentDay } from '@/lib/domain/accounting/document-date'
+import { readPostedSalesInvoiceDate } from '@/lib/domain/accounting/posted-invoice-date'
 import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import type { InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
 import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
@@ -139,7 +140,7 @@ import { NO_TAX_TYPE, connectorEmitsDiscount, connectorEmitsShipping, droppedExt
 import { describeAllocationAttempt } from '@/lib/domain/sales/allocation-activity'
 import { matchContinuedOrderLines } from '@/lib/domain/sales/order-edit-lines'
 import { resolveOrderEditWmsGate } from '@/lib/domain/sales/order-edit-wms-gate'
-import { SalesInvoiceDoesNotReconcileError, SalesInvoiceExtraNotMappedError, SalesInvoiceNotQueuedError, SalesInvoiceReverseChargeSwapNotSetError, reverseChargeSwapMissing, assertInvoiceQueuedOrNotOwed, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
+import { SalesInvoiceDoesNotReconcileError, SalesInvoiceOriginalDateUnknownError, SalesInvoiceExtraNotMappedError, SalesInvoiceNotQueuedError, SalesInvoiceReverseChargeSwapNotSetError, reverseChargeSwapMissing, assertInvoiceQueuedOrNotOwed, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
 import {
   INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
   STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
@@ -182,6 +183,7 @@ import {
   releaseOrderAllocationsInTx,
   updateSalesOrderStatusUnderLock,
 } from '@/lib/domain/sales/allocation-service'
+import { producerSeamVerdict } from '@/lib/security/producer-seam'
 import { wmsCreateObligationFloor } from '@/lib/connectors/wms/producer-seam'
 import { WMS_PRE_CUTOVER_NOTICE, WMS_PRE_CUTOVER_PUSH_STATE, wmsPushIsPreCutover } from '@/lib/domain/wms/create-eligibility'
 import { findSalesOrderDeleteBlocker } from '@/lib/domain/sales/order-delete-guard'
@@ -1905,6 +1907,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
   } catch (e) {
     if (e instanceof CustomerAnonymisedError) return { success: false, error: e.message }
     if (e instanceof EditedOrderAllocationError) return { success: false, error: `Stock could not be re-reserved for the edited order, so nothing was changed: ${e.message}` }
+    if (e instanceof SalesInvoiceOriginalDateUnknownError) return { success: false, error: `The edit was refused, so nothing was changed: ${e.message}` }
     if (e instanceof SalesInvoiceDoesNotReconcileError || e instanceof SalesInvoiceNotQueuedError) return { success: false, error: `The edit would leave the order's invoice out of step with its total, so nothing was changed: ${e.message}` }
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -2128,15 +2131,34 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     orderReference: orderNumber,
   })
 
-  // An update keeps the first post's document date: the storefront creation day, else the stored invoice stamp (which the live post writes from the payload date it sent).
-  const originalInvoiceDay = originalSalesInvoiceDay({ externalCreatedAt: so.externalCreatedAt, invoicedAt: so.invoicedAt })
+  // A first post is dated today; an UPDATE of a posted invoice keeps the date the invoice already has: the date in the payload of the row that posted it, else the storefront creation day, else the stored stamp.
+  // None readable: the update is refused (never today's date, which would move the invoice into the period of the edit).
+  const postedPayloadDate = so.accountingInvoiceId ? await readPostedSalesInvoiceDate(reader, so.id, so.accountingInvoiceId) : null
+  const documentDay = originalSalesInvoiceDay({ accountingInvoiceId: so.accountingInvoiceId, postedPayloadDate, externalCreatedAt: so.externalCreatedAt, invoicedAt: so.invoicedAt })
+  // Refused only when the update would really be SENT. Under the enforced Xero hold the update is only recorded as a shadow (nothing is delivered), so it is recorded with today's date and
+  // flagged `dateUnknown`, and the edit goes through: refusing it would block an edit that sends nothing, with no way out in IMS.
+  let dateUnknown = false
+  if (documentDay === null) {
+    if (originalDayDecision(documentDay, producerSeamVerdict('xero', 'sales.invoice-update').kind === 'shadow') === 'refuse') throw new SalesInvoiceOriginalDateUnknownError()
+    dateUnknown = true
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: so.id,
+      action: 'sales_invoice_update_date_unknown',
+      tag: 'accounting',
+      level: 'WARNING',
+      description: 'The original date of the posted invoice could not be read; the update was recorded as a shadow (nothing was sent) with today\'s date, flagged as unknown.',
+      metadata: { accountingInvoiceId: so.accountingInvoiceId },
+    })
+  }
 
   const payload = {
     invoiceNumber: accountingInvoiceNumber,
     contactName: so.customerName ?? 'Unknown',
     contactEmail: so.customerEmail ?? undefined,
-    // A first post is dated today; an UPDATE of a posted invoice keeps the ORIGINAL document date (an edit or a return-exchange on 2 Oct must not move a 30 Sep invoice into the next VAT period).
-    date: so.accountingInvoiceId ? originalInvoiceDay : businessDateYmd(new Date()),
+    // An UPDATE of a posted invoice keeps the ORIGINAL document date (an edit or a return-exchange on 2 Oct must not move a 30 Sep invoice into the next VAT period); see originalSalesInvoiceDay.
+    date: documentDay ?? businessDateYmd(new Date()),
+    ...(dateUnknown ? { dateUnknown: true } : {}),
     currency: so.currency,
     // Stamp IMS's FX rate on the document so Xero/QuickBooks don't apply
     // their own daily rate (which causes 1-3 % drift on multi-currency
@@ -2911,7 +2933,7 @@ async function queueRefundAccountingActions(input: {
   accountingSyncs: RefundAccountingSyncRequest[]
   accountingSettings?: AccountingSettings
 }): Promise<RefundAccountingSettlement> {
-  const [settings, orderForCN, baseCurrency, salesTaxRatesForCn, refundRow] = await Promise.all([
+  const [settings, orderForCN, baseCurrency, salesTaxRatesForCn, refundDocumentDay] = await Promise.all([
     input.accountingSettings ? Promise.resolve(input.accountingSettings) : getAccountingSettings(),
     db.salesOrder.findUnique({
       where: { id: input.orderId },
@@ -2933,7 +2955,7 @@ async function queueRefundAccountingActions(input: {
     getBaseCurrencyCode(),
     db.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }),
     // The credit note's OWN document day: the refund's creation, on the first hand-off and on every retry (a retry rebuilds the credit note, and must not re-date it to the retry day).
-    db.salesOrderRefund.findUnique({ where: { id: input.refundId }, select: { createdAt: true } }),
+    readCreditNoteDocumentDay(db, input.refundId),
   ])
   const salesRateByTaxType = buildTaxTypeRateIndex(salesTaxRatesForCn)
   const cnContactName = orderForCN?.customer
@@ -2992,7 +3014,7 @@ async function queueRefundAccountingActions(input: {
     creditNoteNumber: input.creditNoteNumber ?? undefined,
     contactName: cnContactName,
     contactEmail: orderForCN?.customer?.email ?? undefined,
-    date: creditNoteDocumentDay(refundRow?.createdAt ?? new Date()),
+    date: refundDocumentDay ?? creditNoteDocumentDay(new Date()),
     currency: orderForCN?.currency ?? baseCurrency,
     reference: input.externalOrderNumber ?? undefined,
     // o3d-hqvrp.389, behind `xero_round_to_order_total_enabled`: a credit note that FULLY reverses the invoice (a chargeback, or the one refund of an order now fully refunded) carries
@@ -3980,6 +4002,7 @@ export async function createRefund(
     }
   } catch (e) {
     if (e instanceof CustomerAnonymisedError) return { success: false, error: e.message }
+    if (e instanceof SalesInvoiceOriginalDateUnknownError) return { success: false, error: `The exchange was refused, so nothing was recorded: ${e.message}` }
     if (e instanceof SalesInvoiceDoesNotReconcileError || e instanceof SalesInvoiceNotQueuedError) return { success: false, error: `The exchange would leave the order's invoice out of step with its total, so nothing was recorded: ${e.message}` }
     if (options?.externalRefundId && isExternalRefundIdUniqueConflict(e)) {
       // o3d-7yf: externalRefundId is globally unique, so this conflict may be a CROSS-ORDER race — the

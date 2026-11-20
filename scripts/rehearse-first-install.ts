@@ -752,6 +752,8 @@ export async function runRehearsal(options: RehearsalOptions = {}): Promise<Rehe
       BACKUP_DIR: path.join(stateDir, 'backups'),
       FILE_SCAN_MODE: 'disabled',
       PREFLIGHT_DB_CONNECT: '1',
+      // Xeroom owns sales invoices and credit notes in every phase, so production preflight refuses an installation that does not enforce the producer hold for xero.
+      PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero',
       DEFAULT_ADMIN_EMAIL: 'rehearsal-admin@ims-rehearsal.test',
       DEFAULT_ADMIN_NAME: 'Rehearsal Admin',
       DEFAULT_ADMIN_PASSWORD: adminPassword,

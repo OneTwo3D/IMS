@@ -242,6 +242,8 @@ type SalesOrderLineTaxRow = {
 type RefundLineTaxRow = {
   totalBase: DecimalInput
   postedTaxRate: DecimalInput | null
+  lineKind?: string | null
+  productId?: string | null
   refund: { order: { shippingAddress: unknown } }
   salesOrderLine: {
     taxRateId: string | null
@@ -550,6 +552,69 @@ function settlementRateToBase(
   }
 }
 
+/** Orders read per page of the shipping query. */
+/** A refund line's kind: the stored one, else the codebase's legacy rule (a product means a sale, a negative total a discount, otherwise shipping). */
+function refundLineKind(line: { lineKind?: string | null; productId?: string | null; totalBase: DecimalInput }): string {
+  if (line.lineKind) return line.lineKind
+  return line.productId ? 'sale' : toDecimal(line.totalBase).lt(0) ? 'discount' : 'shipping'
+}
+
+/** The label of the shipping row, which is its own row (never the "No tax rate" row). */
+export const SHIPPING_ROW_NAME = 'Shipping and order-level tax'
+const SHIPPING_PAGE_SIZE = 2000
+/** An order whose order-level VAT residual is below this (in base currency) is not "negative" for the notice: it is rounding. */
+const SHIPPING_NEGATIVE_TOLERANCE = new Prisma.Decimal('0.01')
+
+type ShippingTaxSums = {
+  byJurisdiction: Map<string, { orders: number; shipping: Prisma.Decimal; tax: Prisma.Decimal }>
+  /** Orders whose order-level VAT came out negative beyond rounding, and the sum of those negatives. */
+  negativeOrders: number
+  negativeTax: Prisma.Decimal
+}
+
+function emptyShippingTax(): ShippingTaxSums {
+  return { byJurisdiction: new Map(), negativeOrders: 0, negativeTax: new Prisma.Decimal(0) }
+}
+
+/** Folds one order into the shipping sums. Pure, so the arithmetic is tested without a database. */
+export function addShippingOrder(sums: ShippingTaxSums, order: ShippingOrderTaxRow): void {
+  const lineTax = order.lines.reduce((sum, l) => sum.add(toDecimal(l.taxBase)), new Prisma.Decimal(0))
+  const orderLevelTax = toDecimal(order.taxBase).sub(lineTax)
+  const shipping = toDecimal(order.shippingBase)
+  if (orderLevelTax.isZero() && shipping.isZero()) return
+  const jurisdiction = countryFromShippingAddress(order.shippingAddress)
+  const entry = sums.byJurisdiction.get(jurisdiction) ?? { orders: 0, shipping: new Prisma.Decimal(0), tax: new Prisma.Decimal(0) }
+  entry.orders += 1
+  entry.shipping = entry.shipping.add(shipping)
+  entry.tax = entry.tax.add(orderLevelTax)
+  sums.byJurisdiction.set(jurisdiction, entry)
+  if (orderLevelTax.lt(SHIPPING_NEGATIVE_TOLERANCE.neg())) {
+    sums.negativeOrders += 1
+    sums.negativeTax = sums.negativeTax.add(orderLevelTax)
+  }
+}
+
+async function collectShippingTax(client: FinanceAnalyticsClient, window: { dateFrom: Date; dateToExclusive: Date }): Promise<ShippingTaxSums> {
+  const sums = emptyShippingTax()
+  let cursor: string | undefined
+  for (;;) {
+    const page = await client.salesOrder.findMany({
+      where: {
+        ...salesInvoiceDocumentDateWhere({ gte: window.dateFrom, lt: window.dateToExclusive }),
+        status: { not: SalesOrderStatus.CANCELLED },
+      },
+      select: { id: true, shippingBase: true, taxBase: true, shippingAddress: true, lines: { select: { taxBase: true } } },
+      orderBy: { id: 'asc' },
+      take: SHIPPING_PAGE_SIZE,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+    }) as Array<ShippingOrderTaxRow & { id?: string }>
+    for (const order of page) addShippingOrder(sums, order)
+    const last = page[page.length - 1]
+    if (page.length < SHIPPING_PAGE_SIZE || !last?.id) return sums
+    cursor = last.id
+  }
+}
+
 export async function getVatReport(
   filters: FinanceAnalyticsFilters = {},
   options: { paginate?: boolean; deps?: FinanceAnalyticsDeps } = {},
@@ -559,7 +624,7 @@ export async function getVatReport(
   const baseCurrency = await baseCurrencyFromDeps(options.deps)
   const window = period(filters, generatedAt)
   const reportingCategoryFilter = filters.vatReportingCategory?.trim() || undefined
-  const [salesLines, purchaseInvoices, refundLines, supplierCredits, shippingOrders] = await Promise.all([
+  const [salesLines, purchaseInvoices, refundLines, supplierCredits, shippingTax] = await Promise.all([
     client.salesOrderLine.findMany({
       where: {
         order: {
@@ -627,6 +692,8 @@ export async function getVatReport(
       select: {
         totalBase: true,
         postedTaxRate: true,
+        lineKind: true,
+        productId: true,
         refund: { select: { order: { select: { shippingAddress: true } } } },
         salesOrderLine: {
           select: {
@@ -672,17 +739,11 @@ export async function getVatReport(
     }) ?? Promise.resolve([])) as Promise<SupplierCreditTaxRow[]>,
     // SHIPPING AND OTHER ORDER-LEVEL TAX: shipping is stored on the order, not on a line, so its VAT is the order's tax less its lines' tax. Read so the sales side carries the
     // shipping VAT a shipping refund (a credit line with no order line) takes off. Skipped under a reporting-category filter: the category of an order-level amount is not recorded.
-    reportingCategoryFilter ? Promise.resolve([]) : (client.salesOrder.findMany({
-      where: {
-        ...salesInvoiceDocumentDateWhere({ gte: window.dateFrom, lt: window.dateToExclusive }),
-        status: { not: SalesOrderStatus.CANCELLED },
-      },
-      select: { shippingBase: true, taxBase: true, shippingAddress: true, lines: { select: { taxBase: true } } },
-      take: SOURCE_ROW_LIMIT + 1,
-    }) as Promise<ShippingOrderTaxRow[]>),
+    // Read in pages and folded into per-jurisdiction sums as it goes, so a busy quarter never holds every order and its lines at once (and does not count toward SOURCE_ROW_LIMIT).
+    reportingCategoryFilter ? Promise.resolve(emptyShippingTax()) : collectShippingTax(client, window),
   ])
   const purchaseLineCount = purchaseInvoices.reduce((sum, invoice) => sum + invoice.lines.length, 0)
-  assertSourceLimit(salesLines.length + purchaseLineCount + refundLines.length + supplierCredits.length + shippingOrders.length, SOURCE_ROW_LIMIT, 'VAT report source rows')
+  assertSourceLimit(salesLines.length + purchaseLineCount + refundLines.length + supplierCredits.length, SOURCE_ROW_LIMIT, 'VAT report source rows')
 
   type Accumulator = {
     side: 'sales' | 'purchases'
@@ -706,12 +767,15 @@ export async function getVatReport(
     reportingCategory: string | null
     jurisdiction: string
     ratePct: string
+    /** A row that is not a tax rate (shipping): keyed on its own, so it can never merge into the "No tax rate" row (a null tax rate id). */
+    rowKind?: 'shipping'
   }) => {
-    const key = `${params.side}:${params.taxRateId ?? 'none'}:${params.jurisdiction}:${params.reportingCategory ?? 'none'}`
+    const { rowKind, ...rowFields } = params
+    const key = `${params.side}:${rowKind ? `~${rowKind}` : params.taxRateId ?? 'none'}:${params.jurisdiction}:${params.reportingCategory ?? 'none'}`
     let row = byKey.get(key)
     if (!row) {
       row = {
-        ...params,
+        ...rowFields,
         lineCount: 0,
         taxableBase: new Prisma.Decimal(0),
         taxBase: new Prisma.Decimal(0),
@@ -764,37 +828,37 @@ export async function getVatReport(
     }
   }
 
-  for (const order of shippingOrders) {
-    const lineTax = order.lines.reduce((sum, l) => sum.add(toDecimal(l.taxBase)), new Prisma.Decimal(0))
-    const orderLevelTax = toDecimal(order.taxBase).sub(lineTax)
-    const shipping = toDecimal(order.shippingBase)
-    if (orderLevelTax.isZero() && shipping.isZero()) continue
+  for (const [jurisdiction, entry] of shippingTax.byJurisdiction) {
     const row = getOrCreateRow({
       side: 'sales',
       taxRateId: null,
-      taxRateName: 'Shipping and order-level tax',
+      taxRateName: SHIPPING_ROW_NAME,
       accountingTaxType: null,
       reportingCategory: null,
-      jurisdiction: countryFromShippingAddress(order.shippingAddress),
+      jurisdiction,
       ratePct: '0',
+      rowKind: 'shipping',
     })
-    row.lineCount += 1
-    row.taxableBase = row.taxableBase.add(shipping)
-    row.taxBase = row.taxBase.add(orderLevelTax)
+    row.lineCount += entry.orders
+    row.taxableBase = row.taxableBase.add(entry.shipping)
+    row.taxBase = row.taxBase.add(entry.tax)
   }
   // CREDIT NOTES reduce the side they credit, exactly as Xero's return nets them by credit-note date.
   for (const line of refundLines) {
     const taxRate = line.salesOrderLine?.taxRate ?? null
     const rate = line.postedTaxRate != null ? toDecimal(line.postedTaxRate) : toDecimal(taxRate?.rate ?? 0)
     const net = toDecimal(line.totalBase)
+    // A shipping refund (a credit line with no order line, of kind shipping, or a legacy line with no kind) nets against the shipping row it was counted on, not the "No tax rate" row.
+    const isShippingRefund = line.salesOrderLine === null && refundLineKind(line) === 'shipping'
     const row = getOrCreateRow({
       side: 'sales',
       taxRateId: line.salesOrderLine?.taxRateId ?? null,
-      taxRateName: taxRate?.name ?? 'No tax rate',
+      taxRateName: isShippingRefund ? SHIPPING_ROW_NAME : taxRate?.name ?? 'No tax rate',
       accountingTaxType: taxRate?.accountingTaxType ?? null,
       reportingCategory: taxRate?.reportingCategory ?? null,
       jurisdiction: taxRate?.countryCode ?? countryFromShippingAddress(line.refund.order.shippingAddress),
-      ratePct: pctString(taxRate?.rate ?? 0),
+      ratePct: isShippingRefund ? '0' : pctString(taxRate?.rate ?? 0),
+      ...(isShippingRefund ? { rowKind: 'shipping' as const } : {}),
     })
     row.lineCount += 1
     row.taxableBase = row.taxableBase.sub(net)
@@ -863,9 +927,10 @@ export async function getVatReport(
   }, [
     'VAT totals use SalesOrderLine.taxBase for invoiced sales and proportional PurchaseOrderLine.taxBase for purchase invoice lines in the period; taxable base subtracts tax for tax-inclusive sales orders. Cancelled sales orders are excluded; archived orders are included (archiving only hides an order from operational lists, while the invoice stands in the ledger).',
     'Each document is placed in the period by the date it carries in the ledger, not by the moment it was posted: a sales invoice by the London day the order was created, a purchase bill by its bill date, a sales credit note by the London day it was raised, a supplier credit note by the London day it was posted. An order with no storefront creation date falls back to the stored invoice stamp.',
-    'Shipping and other order-level tax (the order tax less the line tax) is included on the sales side, on its own row, so a shipping refund nets against shipping VAT that was counted; it is left out when a reporting-category filter is set. Sales credit notes and supplier credit notes that Xero holds are netted off their side (shown as negative amounts on the matching rate row), so a period with refunds can be compared with the Xero VAT return. A supplier credit note shares the booked tax lines of the bill it offsets in proportion to its amount; a reverse-charge credit (booked net) is approximated by that share.',
+    'Shipping and other order-level tax is included on the sales side, on its own row ("'+SHIPPING_ROW_NAME+'", never the "No tax rate" row), so a shipping refund nets against shipping VAT that was counted; it is left out when a reporting-category filter is set. The figure on that row is a RESIDUAL: the order tax less the tax on its lines, so it is the shipping VAT plus any VAT the order carries that no line does (the VAT of a header discount, which takes it down, and a rounding penny); its taxable base is the shipping net alone. Sales credit notes and supplier credit notes that Xero holds are netted off their side (shown as negative amounts on the matching rate row), so a period with refunds can be compared with the Xero VAT return. A supplier credit note shares the booked tax lines of the bill it offsets in proportion to its amount; a reverse-charge credit (booked net) is approximated by that share.',
     ...(untiedSupplierCredits > 0 ? [`${untiedSupplierCredits} supplier credit note${untiedSupplierCredits === 1 ? '' : 's'} in the period ${untiedSupplierCredits === 1 ? 'is' : 'are'} not tied to a bill, so no tax treatment is recorded for ${untiedSupplierCredits === 1 ? 'it' : 'them'}: not included. Tie it to a bill to include it.`] : []),
-    'Orders invoiced by Xeroom (an invoice number but no IMS posting date, `invoicedAt` empty) are not included: the document date Xeroom used cannot be read from IMS.',
+    ...(shippingTax.negativeOrders > 0 ? [`${shippingTax.negativeOrders} order${shippingTax.negativeOrders === 1 ? '' : 's'} in the period carr${shippingTax.negativeOrders === 1 ? 'ies' : 'y'} less VAT on the order than on ${shippingTax.negativeOrders === 1 ? 'its' : 'their'} lines (${moneyString(shippingTax.negativeTax, baseCurrency)} in total on the shipping row): typically the VAT of an order-level discount, which comes off the shipping row's tax. Not clamped, so the report still adds up to the VAT the orders carry.`] : []),
+    'Orders invoiced by Xeroom (an invoice number but no IMS posting date, `invoicedAt` empty) are not included, and a manual order whose invoice number IMS minted but which Xeroom posts is reported on the day the number was minted: the document date Xeroom used cannot be read from IMS, so such an order can sit in a different period from the one on the Xero return.',
     'Jurisdiction uses TaxRate.countryCode when configured, otherwise the sales shipping country or supplier country.',
   ], options.paginate !== false)
 }

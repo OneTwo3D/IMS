@@ -362,6 +362,7 @@ test('F7: the production preflight passes the storage rules for the directory an
       FILE_SCAN_MODE: 'disabled',
       ALLOW_DATABASE_RESTORE: 'false',
       ALLOW_DATABASE_RESTORE_UPLOAD: 'false',
+      PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero',
     })
     for (const d of ['uploads/invoices', 'uploads/quarantine/invoices', 'public-uploads/avatars', 'public-uploads/branding', 'backups']) {
       mkdirSync(join(root, d), { recursive: true })

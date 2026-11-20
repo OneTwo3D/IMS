@@ -133,3 +133,15 @@ export function assertInvoiceQueuedOrNotOwed(outcome: { queued: boolean; reason?
   if (outcome.reason === 'not-configured' || outcome.reason === 'shadowed') return
   throw new SalesInvoiceNotQueuedError(outcome.reason ?? 'refused')
 }
+
+/**
+ * An UPDATE of an already-posted sales invoice for which the invoice's own date cannot be read (not from the posted row's payload, the storefront creation day or the stored stamp).
+ * Sending today's date would re-date the invoice into the period of the edit, so the update is refused. A subclass of the not-queued refusal, so every caller that refuses a declined invoice refuses this.
+ */
+export class SalesInvoiceOriginalDateUnknownError extends SalesInvoiceNotQueuedError {
+  constructor() {
+    super('the original date of the posted invoice is unknown')
+    this.message = 'The invoice already posted for this order has a date IMS cannot read (no posted record carries it and the order stores none), and sending today\'s date would re-date that invoice. The update was not queued and nothing was saved. An administrator has to record the posted invoice date on the order in the database before it can be edited while Xero writes are live.'
+    this.name = 'SalesInvoiceOriginalDateUnknownError'
+  }
+}
