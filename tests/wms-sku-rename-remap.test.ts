@@ -316,3 +316,15 @@ test('ignore race: an ignore of the same pair made while the pass creates the ro
   const created = rows.find((row) => row.id === 'd1')!
   assert.equal(created.status, 'RESOLVED', 'the hold does not come straight back')
 })
+
+test('o3d-jtfy7: the recorded line still applies when only the whitespace of its snapshot SKU changed (the same trimming as every other SKU comparison)', () => {
+  const recorded = { l1: { own: 'A', sent: 'B' } }
+  assert.equal(sentSkuForLine({ id: 'l1', sku: ' A ', productId: 'p1' }, undefined, recorded), 'B')
+  assert.equal(sentSkuForLine({ id: 'l1', sku: 'A', productId: 'p1' }, undefined, { l1: { own: ' A', sent: 'B' } }), 'B')
+  assert.equal(sentSkuForLine({ id: 'l1', sku: 'X', productId: 'p1' }, undefined, recorded), 'X', 'a different SKU still misses the record')
+})
+
+test('o3d-jtfy7: a trimmed match returns the line\'s own current SKU when nothing was remapped (flag OFF stays byte-identical), and the trimmed SKU when it was', () => {
+  assert.equal(sentSkuForLine({ id: 'l1', sku: 'A', productId: 'p1' }, undefined, { l1: { own: ' A', sent: ' A' } }), 'A')
+  assert.equal(sentSkuForLine({ id: 'l1', sku: ' A ', productId: 'p1' }, undefined, { l1: { own: 'A', sent: ' B ' } }), 'B')
+})

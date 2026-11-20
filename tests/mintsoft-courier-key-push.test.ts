@@ -25,6 +25,7 @@ let posts: Array<Record<string, unknown>> = []
 let searchRows: unknown[] = []
 let itemWrites = 0
 let itemsFail = false
+let failItemWritesAfter = Number.POSITIVE_INFINITY
 
 mock.module('@/lib/connectors/mintsoft/settings/schema', {
   namedExports: {
@@ -60,6 +61,7 @@ mock.module('@/lib/connectors/mintsoft/api/client', {
       if (pathname === '/api/Order/900/Items') {
         if ((init?.method ?? 'GET') === 'GET') return itemsFail ? { data: null, error: 'Mintsoft items endpoint down', status: 500 } : { data: [], status: 200 }
         itemWrites += 1
+        if (itemWrites > failItemWritesAfter) return { data: null, error: 'Mintsoft item write refused', status: 500 }
         return { data: { Success: true }, status: 200 }
       }
       if (pathname === '/api/Order/900' && init?.method === 'POST') {
@@ -177,6 +179,7 @@ async function amend(input: WmsOrderPushInput, steps: typeof postSequence, map =
   posts = []
   itemWrites = 0
   itemsFail = false
+  failItemWritesAfter = Number.POSITIVE_INFINITY
   const { updateMintsoftOrder } = await import('@/lib/connectors/mintsoft/api/order-push')
   return updateMintsoftOrder('900', input)
 }
@@ -388,4 +391,23 @@ test('an accepted fallback post followed by an /Items failure throws a partial e
   assert.match((error as Error).message, /items endpoint down/)
   assert.deepEqual((error as InstanceType<typeof WmsOrderUpdatePartialError>).applied, { courierFallback: true, courierForm: 'PLACEHOLDER', courierFormName: KEY })
   assert.equal(posts[2]!.CourierServiceId, 77, 'the fallback post itself was accepted')
+})
+
+test('o3d-jtfy7: an /Items failure after some lines were added throws a partial error that names the SKUs added or being added', async () => {
+  const { WmsOrderUpdatePartialError } = await import('@/lib/connectors/wms/courier-form')
+  const { updateMintsoftOrder } = await import('@/lib/connectors/mintsoft/api/order-push')
+  defaultCourierId = ''
+  courierMap = ''
+  postSequence = [{ result: [{ Success: true }] }]
+  posts = []
+  itemsFail = false
+  itemWrites = 0
+  failItemWritesAfter = 1
+  const two: WmsOrderPushInput = { ...INPUT, lines: [...INPUT.lines, { sku: 'SKU-2', quantity: 1, unitPriceExVat: 5, unitPriceVat: 1, description: 'Gadget' }] }
+  const error = await updateMintsoftOrder('900', two).then(() => null, (e: unknown) => e)
+  assert.ok(error instanceof WmsOrderUpdatePartialError)
+  assert.match((error as Error).message, /item write refused/)
+  assert.equal(itemWrites, 2, 'the first add was accepted, the second refused')
+  // The refused one is recorded too: an add whose reply is lost may have landed, and a SKU never sent costs nothing.
+  assert.deepEqual((error as InstanceType<typeof WmsOrderUpdatePartialError>).addedSkus, ['SKU-1', 'SKU-2'])
 })

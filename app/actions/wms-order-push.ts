@@ -2,6 +2,7 @@
 
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
+import { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
@@ -215,6 +216,8 @@ export async function replayWmsOrderPush(salesOrderId: string): Promise<{ succes
             where: { id: link.id, state: link.state, attempts: link.attempts, externalOrderId: null, pushedAt: link.pushedAt },
             data: {
               state: 'PENDING_VERIFY',
+              // The adopted warehouse order's lines are not known to IMS: any earlier record described a different order.
+              sentLineSkus: Prisma.DbNull,
               externalOrderId: reconciled.externalOrderId,
               externalOrderNumber: reconciled.externalOrderNumber,
               attempts: 0,

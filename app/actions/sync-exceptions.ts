@@ -1,7 +1,7 @@
 'use server'
 
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
-import type { Prisma } from '@/app/generated/prisma/client'
+import { Prisma } from '@/app/generated/prisma/client'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
@@ -4269,6 +4269,26 @@ export async function recordWithdrawnDespatch(orderId: string): Promise<Mutation
 }
 
 /**
+ * An order the store REOPENED after it was first seen completed (a despatch made outside IMS) is parked on the Exceptions list and stays fenced from the warehouse and from allocation:
+ * the store said the goods left, and a reopen (a payment dispute hold, an edit, a mis-click) is not proof they did not. This is the only way the fence comes off. Sync permission and a
+ * fresh sign-in; audited with who confirmed.
+ */
+export async function confirmReopenedOrderFulfillableByIms(orderId: string): Promise<MutationResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    const { releaseReopenedOrderFence } = await import('@/lib/connectors/woocommerce/sync/outside-ims-despatch')
+    const result = await releaseReopenedOrderFence(orderId, session.user.id)
+    if (!result.success) return { success: false, error: result.error }
+    revalidatePath('/sync/exceptions')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
  * o3d-rbyg round 2: the other half of finding 3 — clear a withheld row whose order is TERMINAL.
  *
  * When the withdrawal was approved the order is CANCELLED, and a cancelled order is outside
@@ -4570,6 +4590,8 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
           state: 'PENDING_CREATE',
           externalOrderId: null,
           externalOrderNumber: null,
+          // No warehouse order any more, so no record of what one was sent.
+          sentLineSkus: Prisma.DbNull,
           attempts: 0,
           lastError: null,
           // THE DISPATCH STAMP, cleared — and reached only after both keys turned.

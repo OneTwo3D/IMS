@@ -1,4 +1,4 @@
-import type { Prisma } from '@/app/generated/prisma/client'
+import { Prisma } from '@/app/generated/prisma/client'
 import { logActivityInTransaction } from '@/lib/activity-log'
 import { db } from '@/lib/db'
 import { getWmsConnector } from '@/lib/connectors/wms/registry'
@@ -82,7 +82,7 @@ export async function completeWmsOperatorTask(params: {
     if (partial) {
       const closed = await tx.wmsOrderPushLink.updateMany({
         where: { id: payload.linkId, orderId: task.orderId, externalOrderId: task.externalOrderId, state: { in: ['MERGED', 'SYNCED'] } },
-        data: { state: 'CANCELLED', cancelledAt: at, lastError: null, lastAttemptAt: at, reconcileCheckedAt: null },
+        data: { state: 'CANCELLED', cancelledAt: at, lastError: null, lastAttemptAt: at, reconcileCheckedAt: null, sentLineSkus: Prisma.DbNull },
       })
       settled = closed.count > 0
       // The obligation row has done its work either way: the lines are verified gone.

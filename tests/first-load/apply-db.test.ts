@@ -971,18 +971,40 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       assert.ok(imports.length >= 4 && imports.every((r) => r.metadata?.actor?.kind === 'system' && r.metadata.actor.runId === prepared.manifest.runId))
     })
 
-    it('a stock extract instant after the apply, or implausibly old, is refused by the preflight, before anything is written (o3d-hqvrp.92)', async () => {
+    it('a stock extract instant after the apply, or implausibly old, is refused by the preflight, before anything is written, under its own rail (o3d-hqvrp.92)', async () => {
       const runs = await count('first_load_apply_runs')
-      const ok = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore' })
-      assert.deepEqual((await ports(ok).preflight!({ resuming: false })).filter((p) => /stockExtractedAt/.test(p)), [], 'control: the honest instant is not refused')
-      for (const [what, instant, pattern] of [
-        ['after the apply', new Date(Date.now() + 86_400_000).toISOString(), /later than the apply instant/],
-        ['implausibly old', new Date(Date.now() - 90 * 86_400_000).toISOString(), /more than 45 days/],
-      ] as const) {
-        const bad = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore', stockExtractedAt: instant })
-        assert.match((await ports(bad).preflight!({ resuming: false })).join(';'), pattern, what)
+      // The cut-off is judged only while it is NOT yet recorded: take the recorded fact off for this test and put it back.
+      const factRows = await sql<{ facts: Record<string, unknown> }>('select facts from first_load_apply_runs')
+      await sql(`update first_load_apply_runs set facts = facts - 'openingStockCutoffAt'`)
+      try {
+        const ok = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore' })
+        assert.deepEqual((await ports(ok).preflight!({ resuming: false })).filter((p) => /stockExtractedAt/.test(p)), [], 'control: the honest instant is not refused')
+        for (const [what, instant, pattern] of [
+          ['after the apply', new Date(Date.now() + 86_400_000).toISOString(), /later than the apply instant/],
+          ['implausibly old', new Date(Date.now() - 90 * 86_400_000).toISOString(), /more than 45 days/],
+        ] as const) {
+          const bad = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore', stockExtractedAt: instant })
+          const badPorts = ports(bad)
+          assert.match((await badPorts.preflight!({ resuming: false })).join(';'), pattern, what)
+          const tally = badPorts.railTally!()
+          assert.equal(tally.find((r) => r.id === 'stock-extract-age')?.refusals, 1, `${what}: the refusal is on its own rail, so the report names it`)
+        }
+        // A resume before the cut-off is recorded is still judged (the bound still protects something).
+        const old = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore', stockExtractedAt: new Date(Date.now() - 90 * 86_400_000).toISOString() })
+        assert.match((await ports(old).preflight!({ resuming: true })).join(';'), /more than 45 days/)
+      } finally {
+        await sql(`update first_load_apply_runs set facts = $1::jsonb`, [JSON.stringify(factRows[0]!.facts)])
       }
       assert.equal(await count('first_load_apply_runs'), runs, 'nothing was written')
+    })
+
+    it('once the cut-off is recorded, a resume (or the verification-only resume of an APPLIED run) is not refused for the age of the extract', async (t) => {
+      const facts = (await sql<{ facts: { openingStockCutoffAt?: string } }>('select facts from first_load_apply_runs'))[0]!.facts
+      precondition(t, 'the cut-off is recorded', facts.openingStockCutoffAt ? 1 : 0)
+      const old = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore', stockExtractedAt: new Date(Date.now() - 90 * 86_400_000).toISOString() })
+      const oldPorts = ports(old)
+      assert.deepEqual((await oldPorts.preflight!({ resuming: true })).filter((p) => /stockExtractedAt/.test(p)), [], 'not refused')
+      assert.equal(oldPorts.railTally!().find((r) => r.id === 'stock-extract-age')?.refusals ?? 0, 0)
     })
 
     it('a plan over the loaded database finds every unit present and matching, and sends nothing', async () => {

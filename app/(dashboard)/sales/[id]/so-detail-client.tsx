@@ -193,7 +193,7 @@ const ACCOUNTING_SYNC_TYPE_LABEL: Record<RejectedAccountingDocumentUpdateWarning
 }
 
 /** The order as the money view reads it: the amounts as stored, on the basis they are stored in (SoRow.amountsIncludeVat). */
-function moneyViewOrderOf(so: SoDetail): MoneyViewOrder & { fxRateToBase: number; currencyMinorUnits: number; priorRefundLines: SoDetail['refunds'][number]['lines']; discount: { amount: number; amountsIncludeVat: boolean }; lines: (SoDetail['lines'][number])[] } {
+function moneyViewOrderOf(so: SoDetail): MoneyViewOrder & { fxRateToBase: number; currencyMinorUnits: number; priorRefundLines: SoDetail['refunds'][number]['lines']; discount: { amount: number; amountsIncludeVat: boolean; split?: SoDetail['discountTaxSplit'] }; lines: (SoDetail['lines'][number])[] } {
   return {
     pricesIncludeVat: so.amountsIncludeVat,
     taxRatePercent: so.taxRatePercent,
@@ -206,7 +206,7 @@ function moneyViewOrderOf(so: SoDetail): MoneyViewOrder & { fxRateToBase: number
     fxRateToBase: so.fxRateToBase,
     currencyMinorUnits: so.currencyMinorUnits,
     priorRefundLines: so.refunds.flatMap((r) => r.lines),
-    discount: { amount: so.discountAmount, amountsIncludeVat: so.amountsIncludeVat },
+    discount: { amount: so.discountAmount, amountsIncludeVat: so.amountsIncludeVat, split: so.discountTaxSplit },
     lines: so.lines,
   }
 }
