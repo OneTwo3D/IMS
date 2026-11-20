@@ -8,6 +8,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
+import { describeDespatchAdjustment } from '@/lib/domain/sales/despatch-instant'
 import { enqueueStockSync, pushOrderDeliveryMetadata } from '@/lib/shopping'
 import { pushShipmentCompletionToShopping } from '@/lib/fulfillment/shipment-completion-push'
 import { decimalToNumber } from '@/lib/decimal'
@@ -1599,6 +1600,11 @@ export async function updateShipmentStatus(
      * shipment but the last ("the rest will follow", then the dispatched e-mail seconds later).
      */
     deferStorefrontPartialEmail?: boolean
+    /**
+     * A warehouse-reported dispatch: when the goods left, as the warehouse said. The dispatch is booked at this instant (bounded and, when it had
+     * to be moved, recorded on the order; see lib/domain/sales/despatch-instant.ts). Honoured only for the internal caller.
+     */
+    despatchedAt?: Date | null
   },
 ): Promise<{ success: boolean; error?: string; despatchedWhileNotReady?: string }> {
   try {
@@ -1622,6 +1628,7 @@ export async function updateShipmentStatus(
       ...(targetStatus === 'SHIPPED' && options?.shipFence ? { fence: options.shipFence } : {}),
       ...(targetStatus === 'SHIPPED' ? { completion } : {}),
       ...(allowRecordWhenNotReady ? { allowRecordWhenNotReady: true } : {}),
+      ...(targetStatus === 'SHIPPED' && options?.despatchedAt && options.internalBypassToken === INTERNAL_ACTION_BYPASS ? { despatchedAt: options.despatchedAt } : {}),
     })
     if (!result.success) {
       try {
@@ -1636,6 +1643,24 @@ export async function updateShipmentStatus(
     let storefrontCompletionKey: string | null = null
     let fenceRefusal: string | null = null
     if (targetStatus === 'SHIPPED') {
+      // The warehouse's despatch time had to be moved (a future time, a locked or already-snapshotted period, an implausible age): say so on the order.
+      const adjustment = result.despatchInstant ? describeDespatchAdjustment(result.despatchInstant) : null
+      if (result.despatchInstant && adjustment) {
+        await logActivity({
+          entityType: 'SALES_ORDER',
+          entityId: result.shipment.orderId,
+          action: 'despatch_date_adjusted',
+          tag: 'sales',
+          level: 'WARNING',
+          description: adjustment,
+          metadata: {
+            shipmentId,
+            requestedAt: result.despatchInstant.requested?.toISOString() ?? null,
+            bookedAt: result.despatchInstant.instant.toISOString(),
+            reason: result.despatchInstant.adjustedFor,
+          },
+        })
+      }
       // Already reconciled in the dispatch transaction when this call did the dispatch; a re-run against an
       // already-SHIPPED shipment (retry, crashed post-commit step) reconciles here instead.
       const reconciliation = result.reconciliation

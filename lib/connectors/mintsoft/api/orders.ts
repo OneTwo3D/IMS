@@ -473,6 +473,7 @@ export async function normalizeMintsoftOrderRow(
   const merged = mergedParts(externalOrderNumber)
   const settings = ctx?.settings ?? (await getMintsoftSettings())
   const tracking = readTracking(order)
+  const items = readOrderItems(order)
 
   // Fail closed on an unresolved dispatch state (delta path only). A DespatchDate
   // is authoritative on its own — the goods demonstrably left — so a row that
@@ -496,9 +497,27 @@ export async function normalizeMintsoftOrderRow(
     mergedOrderNumbers: merged,
     deepLinkUrl: buildDeepLink(settings.mintsoft_admin_order_url_template, externalOrderId),
     tracking,
+    ...(items ? { items } : {}),
     dispatched: isMintsoftDispatched({ status, externalName: resolved.externalName, tracking }),
     raw: order,
   }
+}
+
+/**
+ * The order's own item rows (SKU + whole-unit Quantity), straight off the record already read (Order/List sends them, and so does Order/{id}).
+ * Undefined when the record carries no item array at all: "unknown", never "empty". Rows with no SKU or no positive quantity are skipped.
+ */
+function readOrderItems(order: RawOrder): Array<{ sku: string; qty: number }> | undefined {
+  const raw = (order as Record<string, unknown>).OrderItems
+  if (!Array.isArray(raw)) return undefined
+  const out: Array<{ sku: string; qty: number }> = []
+  for (const entry of raw) {
+    const row = entry as RawOrder
+    const sku = toStr(row?.SKU)
+    const qty = toInt(row?.Quantity) ?? 0
+    if (sku && qty > 0) out.push({ sku, qty })
+  }
+  return out
 }
 
 export async function fetchMintsoftOrderStatus(

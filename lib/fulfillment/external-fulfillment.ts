@@ -18,6 +18,7 @@ import { isWmsConnectorId, resolveWmsOrderLookupConnector } from '@/lib/connecto
 import { isMixedWarehousePushEnabled } from '@/lib/domain/wms/mixed-scope-flag'
 import { loadMixedScopeForOrder } from '@/lib/domain/wms/mixed-scope-loader'
 import { sameScopeLines, warehouseShipmentsMatchAllocations } from '@/lib/domain/wms/scoped-despatch-checks'
+import { describeDespatchQuantityMismatch, findDespatchQuantityMismatch, type DespatchQuantity, type DespatchQuantityMismatch } from '@/lib/fulfillment/despatch-quantity-check'
 
 // A fulfillment update originates from either a storefront (shopping) connector
 // that owns the order's ShoppingOrderLink, or a WMS/3PL connector that
@@ -51,6 +52,18 @@ export type ExternalFulfillmentUpdate = {
    * refuses the dispatch (what the verification proved no longer holds), so nothing is shipped on a stale proof.
    */
   shipFence?: (tx: ShipmentServiceClient) => Promise<string | null>
+  /**
+   * WMS source only: when the warehouse says the goods left. The shipment, its stock movement and the order flip are booked at this instant
+   * (bounded; see lib/domain/sales/despatch-instant.ts) instead of the moment this runs. Absent: booked now. The caller sends it only when it
+   * is an exact instant (never a date-only or ambiguous value) and only while `wms_despatch_date_enabled` is on.
+   */
+  despatchedAt?: Date | null
+  /**
+   * WMS source only: the units the warehouse despatched, per SKU, in the warehouse's own line terms. When present, they are compared with the
+   * units IMS books before anything is shipped, and a difference refuses the despatch (`despatch_quantity_mismatch`). Absent: no comparison.
+   * The caller sends it only while `wms_despatch_quantity_check_enabled` is on. See lib/fulfillment/despatch-quantity-check.ts.
+   */
+  despatchedQuantities?: ReadonlyArray<DespatchQuantity>
 }
 
 /**
@@ -83,6 +96,8 @@ export type ExternalFulfillmentRefusal =
   | 'wms_scope_mismatch'
   /** Mixed-warehouse scope: the store reported the order completed while the warehouse's part is still open. Ignored (nothing is shipped); permanent, so the delivery is acknowledged and an exception is raised. */
   | 'wms_part_open'
+  /** The units the warehouse despatched differ (over or under) from the units IMS books. Nothing is shipped; retryable; raised for a person, not counted as a connector failure. */
+  | 'despatch_quantity_mismatch'
 
 export type ExternalFulfillmentOutcome =
   | {
@@ -123,6 +138,8 @@ export type ExternalFulfillmentOutcome =
        * so the retry is not merely safe, it is the fix.
        */
       permanent: boolean
+      /** Only for `despatch_quantity_mismatch`: each SKU whose despatched quantity differs, with both quantities (SKUs and numbers only). */
+      quantityMismatches?: DespatchQuantityMismatch[]
     }
 
 /** The refusals a retry can never resolve. Everything unlisted stays retryable, which is the safe direction. */
@@ -689,6 +706,46 @@ async function refuseWmsForeignWarehouseShipments(
 }
 
 
+/**
+ * o3d-hqvrp.115: THE UNITS THE WAREHOUSE DESPATCHED MUST BE THE UNITS IMS BOOKS (lib/fulfillment/despatch-quantity-check.ts for the rule).
+ * Run once the shipments exist and cover demand, and BEFORE anything is shipped. A difference holds the despatch: nothing is applied, a
+ * WARNING is logged on the order with both quantities per SKU, and the caller records a standing refused action. Null: apply as usual
+ * (no quantities were supplied, they match, or they are not comparable).
+ */
+async function refuseOnDespatchQuantityMismatch(
+  update: ExternalFulfillmentUpdate,
+  orderId: string,
+  orderRef: string,
+  wmsWarehouseId: string | null,
+): Promise<ExternalFulfillmentOutcome | null> {
+  if (update.targetShipmentStatus !== 'SHIPPED' || !isWmsConnectorId(update.source) || update.despatchedQuantities === undefined) return null
+  const verdict = await findDespatchQuantityMismatch({ orderId, wmsWarehouseId, wmsQuantities: update.despatchedQuantities })
+  if (verdict.status !== 'MISMATCH') return null
+  const detail = describeDespatchQuantityMismatch(verdict.mismatches)
+  const error = `${update.source} despatched order ${orderRef}, but the units differ from what IMS books (${detail}). Nothing was shipped, because applying it would leave stock on hand wrong. `
+    + 'To clear this, correct the order\'s allocation and shipment in IMS to the units that really left (or ship the shipment by hand once it is right); the despatch is retried on every pass.'
+  await logActivity({
+    entityType: 'SALES_ORDER',
+    entityId: orderId,
+    action: 'external_fulfillment_quantity_mismatch',
+    tag: 'sync',
+    level: 'WARNING',
+    description: error,
+    metadata: { source: update.source, mismatches: verdict.mismatches },
+    resolveUser: false,
+  })
+  return { ...(refuseExternalFulfillment('despatch_quantity_mismatch', error) as Extract<ExternalFulfillmentOutcome, { success: false }>), quantityMismatches: verdict.mismatches }
+}
+
+/** The warehouse a WMS despatch is evidence about: the one the warehouse order was pushed for, else the order's ship-from warehouse; null when neither is known. */
+async function wmsDespatchWarehouseId(orderId: string): Promise<string | null> {
+  const [link, order] = await Promise.all([
+    db.wmsOrderPushLink.findUnique({ where: { orderId }, select: { pushWarehouseId: true } }),
+    db.salesOrder.findUnique({ where: { id: orderId }, select: { shipFromWarehouseId: true } }),
+  ])
+  return link?.pushWarehouseId ?? order?.shipFromWarehouseId ?? null
+}
+
 /** The order's push link as a despatch needs it (scope mode, version, the warehouse pushed for, whether the part is settled or frozen). Null when there is none. */
 type DespatchLink = { id: string; scopeMode: 'FULL' | 'MIXED' | null; scopeVersion: number; pushWarehouseId: string | null; despatchSettledAt: Date | null; scopeFrozenAt: Date | null; state: string }
 type MixedDespatchLink = DespatchLink
@@ -801,6 +858,9 @@ async function applyScopedWmsDespatch(
     return refuseExternalFulfillment('coverage_shortfall', error)
   }
 
+  const quantityRefusal = await refuseOnDespatchQuantityMismatch(update, order.id, orderRef, wmsWarehouseId)
+  if (quantityRefusal) return quantityRefusal
+
   const open = wmsShipments.filter((shipment) => shipment.status !== 'SHIPPED')
   // The partial-shipment e-mail (storefront switch) is judged ONCE, after the whole batch is applied, never shipment by shipment (see queueStorefrontPartialShipmentEmailsAfterBatch).
   const processedInBatch: string[] = []
@@ -826,6 +886,7 @@ async function applyScopedWmsDespatch(
           skipStorefrontPush: update.storefrontAlreadyCompleted === true,
           ...(update.storefrontAlreadyCompleted === true && update.shipFence ? { shipFence: update.shipFence } : {}),
           deferStorefrontPartialEmail: true,
+          ...(isWmsConnectorId(update.source) && update.despatchedAt ? { despatchedAt: update.despatchedAt } : {}),
         },
       )
       if (result.success && target === 'SHIPPED') processedInBatch.push(shipment.id)
@@ -1059,6 +1120,10 @@ export async function applyExternalFulfillmentUpdate(
       })
       return refuseExternalFulfillment('coverage_shortfall', error)
     }
+    if (update.despatchedQuantities !== undefined && isWmsConnectorId(update.source)) {
+      const quantityRefusal = await refuseOnDespatchQuantityMismatch(update, order.id, orderRef, await wmsDespatchWarehouseId(order.id))
+      if (quantityRefusal) return quantityRefusal
+    }
   }
 
   const shipments = await db.shipment.findMany({
@@ -1131,6 +1196,7 @@ export async function applyExternalFulfillmentUpdate(
           skipStorefrontPush: update.storefrontAlreadyCompleted === true,
           ...(update.storefrontAlreadyCompleted === true && update.shipFence ? { shipFence: update.shipFence } : {}),
           deferStorefrontPartialEmail: true,
+          ...(isWmsConnectorId(update.source) && update.despatchedAt ? { despatchedAt: update.despatchedAt } : {}),
         },
       )
 

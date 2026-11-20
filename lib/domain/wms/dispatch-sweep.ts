@@ -41,6 +41,7 @@ import { notify } from '@/lib/notifications'
 import { getSettingValue } from '@/lib/settings-store'
 import type { ShipmentServiceClient } from '@/lib/domain/sales/shipment-service'
 import { scrubWmsError } from './error-scrub'
+import { isWmsDespatchDateEnabled, isWmsDespatchQuantityCheckEnabled } from '@/lib/domain/wms/despatch-flags'
 import { recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER, type RefusedActionInput } from '@/lib/domain/refused-actions'
 import { recordWmsMutationEvent } from './mutation-audit'
 import { proveMergeLineage, type MergeLineageProof } from './merge-lineage'
@@ -479,8 +480,22 @@ export type WmsDispatchSweepDeps = {
      * storefront data - no completion job, no tracking, no order note, no status. The one storefront effect that remains is IMS's
      * ordinary stock-level sync for the stock the shipment consumed (owner ruling: IMS is the stock master after cutover).
      */
-    options?: { storefrontAlreadyCompleted?: boolean; fence?: PreCutoverFence },
-  ): Promise<{ success: boolean; error?: string; refusal?: string }>
+    options?: {
+      storefrontAlreadyCompleted?: boolean
+      fence?: PreCutoverFence
+      /**
+       * o3d-hqvrp.114: when the warehouse despatched, as an EXACT instant (every despatch entry of the order was a precise time; never a
+       * date-only or ambiguous one, never inherited from another part). The shipment, its stock movement and the order flip are booked at it.
+       * Absent: booked when applied, as before. Dropped by the real dependency while `wms_despatch_date_enabled` is off.
+       */
+      despatchedAt?: Date
+      /**
+       * o3d-hqvrp.115: the units the warehouse despatched, per SKU, in the warehouse's own line terms. Absent when the connector could not
+       * say (or the order is a merged survivor): nothing is compared. Dropped by the real dependency while `wms_despatch_quantity_check_enabled` is off.
+       */
+      despatchedQuantities?: Array<{ sku: string; qty: number }>
+    },
+  ): Promise<{ success: boolean; error?: string; refusal?: string; quantityMismatches?: Array<{ sku: string; wmsQty: number; imsQty: number }> }>
   /**
    * Fresh, READ-ONLY verification of a part despatched before the storefront went live. Asked only when the push for a part
    * was shadowed with the reason `obligation_before_cutoff`. It reads the order from the store it is CURRENTLY linked to
@@ -496,6 +511,12 @@ export type WmsDispatchSweepDeps = {
   despatchLowerBound?(orderId: string): Promise<Date | null>
   /** The clock used for the order-level cutoff decision; injected by tests. Defaults to the system clock. */
   clock?(): Date
+  /**
+   * o3d-hqvrp.114 / .115: hand the apply the warehouse's despatch instant and despatched units (`despatchedAt`, `despatchedQuantities`).
+   * Set by the production dependencies, which then drop each one while its own switch is off. Absent: the apply is called exactly as it was
+   * before either existed.
+   */
+  passDespatchFacts?: boolean
   // Whether the active connector supports per-part reconciliation (fetchOrderParts). When
   // false, a split order is surfaced as a clear "unsupported" pending rather than silently
   // stalling as "no parts visible".
@@ -829,6 +850,31 @@ export function hasUndatedDespatch(tracking: ReadonlyArray<{ despatchedAt?: stri
 }
 
 /**
+ * o3d-hqvrp.114: THE INSTANT THE ORDER'S DESPATCH IS BOOKED AT, or undefined when there is no trustworthy one (the apply time is then used, as
+ * before). Every despatched part must carry at least one tracking entry AND every entry of every part must be an exact instant
+ * ({@link preciseDespatchInstant}); the latest is used. A part with no tracking, an undated entry, a date-only value or an ambiguous local time
+ * (the autumn clock-change hour) makes the whole answer undefined: an undated part never inherits another part's date.
+ */
+export function bookableDespatchInstant(
+  parts: ReadonlyArray<ReadonlyArray<{ despatchedAt?: string | null }>>,
+  reading: ZonelessDespatchReading | undefined,
+): Date | undefined {
+  if (parts.length === 0 || parts.some((tracking) => tracking.length === 0)) return undefined
+  return strictLatestDespatchTime(parts.flat(), { zoneless: reading }) ?? undefined
+}
+
+/** o3d-hqvrp.115: the warehouse's despatched units per SKU (summed), or undefined when none were given. */
+function sumDespatchedQuantities(lists: ReadonlyArray<ReadonlyArray<{ sku: string; qty: number }>>): Array<{ sku: string; qty: number }> {
+  const bySku = new Map<string, { sku: string; qty: number }>()
+  for (const item of lists.flat()) {
+    const key = item.sku.trim().toLowerCase()
+    const current = bySku.get(key)
+    bySku.set(key, { sku: current?.sku ?? item.sku, qty: (current?.qty ?? 0) + item.qty })
+  }
+  return [...bySku.values()]
+}
+
+/**
  * The step-M live-from cutoff (the WooCommerce despatch writeback goes live with it), but ONLY while WooCommerce producer enforcement is active (the same predicate the producer seam
  * uses): with enforcement off the legacy path applies exactly as before, so no cutoff is read. Null when off, absent or unreadable.
  */
@@ -1068,6 +1114,8 @@ async function reconcileSplitOrder(
   // The cutoff disposition of a part is judged by its despatch time. For a WMS with a known zone for zone-less values that time must
   // not straddle the cutover: any part whose time could fall either side is held pending BEFORE anything is pushed (never a storefront write).
   const partDespatch = new Map<object, Date | null>()
+  // o3d-hqvrp.115: the despatched parts' own line items (already fetched for the storefront partial shipments; no extra read).
+  const partItems: Array<Array<{ sku: string; qty: number }>> = []
   if (recordPartials) {
     for (const part of dispatchedParts) {
       const cutoff = deps.storefrontCutoff?.() ?? null
@@ -1089,6 +1137,7 @@ async function reconcileSplitOrder(
         allRecorded = false
         continue
       }
+      partItems.push(items)
       // The cancel intent is re-read IMMEDIATELY BEFORE each storefront write, so a cancel or refund that committed since the check at the
       // top of this order is honoured for every part not yet pushed. What remains is the window between this read and the POST itself: an
       // inter-system limit that cannot be closed from inside IMS (see docs/mintsoft.md).
@@ -1218,7 +1267,15 @@ async function reconcileSplitOrder(
     if (decision.fence) fence = decision.fence
   }
   const storefrontAlreadyCompleted = mergedAlreadyCompleted || (recordPartials && dispatchedParts.length > 0 && verifiedPreCutoverParts === dispatchedParts.length)
-  const result = await deps.applyDispatch(candidate.orderId, aggregated, storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true, ...(fence ? { fence } : {}) } : undefined)
+  const despatchedAt = deps.passDespatchFacts ? bookableDespatchInstant(dispatchedParts.map((part) => part.tracking), deps.zonelessDespatchReading) : undefined
+  // Compared only when every despatched part's items were read (the push loop above); a merged survivor's parts mix several orders, so it never is.
+  const despatchedQuantities = deps.passDespatchFacts && recordPartials && partItems.length === dispatchedParts.length && partItems.length > 0 ? sumDespatchedQuantities(partItems) : undefined
+  const applyOptions = {
+    ...(storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true, ...(fence ? { fence } : {}) } : {}),
+    ...(despatchedAt ? { despatchedAt } : {}),
+    ...(despatchedQuantities ? { despatchedQuantities } : {}),
+  }
+  const result = await deps.applyDispatch(candidate.orderId, aggregated, Object.keys(applyOptions).length > 0 ? applyOptions : undefined)
   if (!result.success) return applyFailureOutcome(result, 'Dispatch apply failed after all parts despatched')
   return { action: 'dispatched', reason: `All ${totalParts} parts despatched` }
 }
@@ -1229,7 +1286,23 @@ async function reconcileSplitOrder(
  * breaker). The link stays a fully polled candidate, and a standing HIGH row
  * names it on Sync > Exceptions. Every other failure is an error, as before. The delta watermark is NOT held for it (see below): it must never block other orders.
  */
-function applyFailureOutcome(result: { error?: string; refusal?: string }, fallback: string): WmsDispatchOutcome {
+function applyFailureOutcome(result: { error?: string; refusal?: string; quantityMismatches?: Array<{ sku: string; wmsQty: number; imsQty: number }> }, fallback: string): WmsDispatchOutcome {
+  // o3d-hqvrp.115: the units the warehouse despatched differ from the units IMS books. Held, not applied, not an error: a person corrects the order in IMS
+  // (or ships it by hand once it is right). Same shape as a scope mismatch: counted nowhere, never dead-lettered, the watermark is NOT held.
+  if (result.refusal === 'despatch_quantity_mismatch') {
+    return {
+      action: 'pending',
+      reason: result.error ?? 'The units the warehouse despatched differ from the units IMS books',
+      refusal: {
+        action: 'WMS_DESPATCH_QUANTITY',
+        gate: 'WMS_QUANTITY_MISMATCH',
+        permanence: 'RETRYABLE',
+        severity: 'HIGH',
+        intent: { mismatches: (result.quantityMismatches ?? []).slice(0, 50) },
+        detail: 'The warehouse despatched a different number of units than IMS books for this order, so nothing was shipped in IMS (applying it would leave stock on hand wrong). Correct the order\'s allocation and shipment to what really left, or ship it by hand once it is right.',
+      },
+    }
+  }
   if (result.refusal === 'wms_scope_mismatch') {
     return {
       action: 'pending',
@@ -1458,7 +1531,15 @@ export async function reconcileOneOrder(
   let decision = orderLevelDespatchDecision(status.tracking, deps.zonelessDespatchReading, orderCutoff, (deps.clock ?? (() => new Date()))(), await undatedLowerBound(deps, candidate.orderId, status.tracking, orderCutoff))
   if (decision.action === 'verify') decision = await settleOrderLevelVerify(deps, candidate.orderId, status.tracking)
   if (decision.action === 'hold') return { action: 'pending', reason: `Order held: ${decision.reason}`, unresolved: requireResolution }
-  const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking), decision.storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true, ...(decision.fence ? { fence: decision.fence } : {}) } : undefined)
+  const despatchedAt = deps.passDespatchFacts ? bookableDespatchInstant([status.tracking], deps.zonelessDespatchReading) : undefined
+  // A merged survivor's lines mix several storefront orders, so its items are never compared with this one order's shipments.
+  const despatchedQuantities = deps.passDespatchFacts && status.items && !status.isMerged ? sumDespatchedQuantities([status.items]) : undefined
+  const applyOptions = {
+    ...(decision.storefrontAlreadyCompleted ? { storefrontAlreadyCompleted: true, ...(decision.fence ? { fence: decision.fence } : {}) } : {}),
+    ...(despatchedAt ? { despatchedAt } : {}),
+    ...(despatchedQuantities ? { despatchedQuantities } : {}),
+  }
+  const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking), Object.keys(applyOptions).length > 0 ? applyOptions : undefined)
   if (!result.success) return applyFailureOutcome(result, 'Dispatch apply failed')
   return { action: 'dispatched', reason: status.status || 'DESPATCHED' }
 }
@@ -2908,6 +2989,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
   }
   return {
     zonelessDespatchReading: getWmsConnectorHooks(connectorId).zonelessDespatchReading?.(),
+    passDespatchFacts: true,
     systemicBreaker: { store: createDbSystemicFailureStore(connectorId), connectorId },
     storefrontCutoff: () => storefrontCutoffWhileEnforced(),
     async despatchLowerBound(orderId) {
@@ -3102,12 +3184,19 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
           permanent: false,
         }
       }
+      // Both are OFF by default (system switches): with a switch off the despatch is applied exactly as before it existed.
+      const [datedByWarehouse, quantityChecked] = await Promise.all([
+        options?.despatchedAt ? isWmsDespatchDateEnabled() : Promise.resolve(false),
+        options?.despatchedQuantities ? isWmsDespatchQuantityCheckEnabled() : Promise.resolve(false),
+      ])
       const result = await applyExternalFulfillmentUpdate({
         source: connectorId,
         lookup: { orderId },
         targetShipmentStatus: 'SHIPPED',
         tracking,
         ...(options?.storefrontAlreadyCompleted === true ? { storefrontAlreadyCompleted: true, ...(options.fence ? { shipFence: options.fence } : {}) } : {}),
+        ...(datedByWarehouse && options?.despatchedAt ? { despatchedAt: options.despatchedAt } : {}),
+        ...(quantityChecked && options?.despatchedQuantities ? { despatchedQuantities: options.despatchedQuantities } : {}),
       })
       if (result.success && !('noop' in result && result.noop)) {
         await recordWmsMutationEvent({
@@ -3332,6 +3421,8 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
     },
     async resolveRefusedActions(orderId) {
       await resolveRefusedActions(db, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action: 'WMS_SPLIT_ORDER_COMPLETE' }, 'ACTION_SUCCEEDED')
+      // o3d-hqvrp.115: a held quantity mismatch closes once the order despatches (quantities now agree, or the shipments were shipped by hand).
+      await resolveRefusedActions(db, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action: 'WMS_DESPATCH_QUANTITY' }, 'ACTION_SUCCEEDED')
     },
     async clearWmsTerminalNonDespatch(orderId) {
       await db.wmsOrderDiscrepancy.updateMany({
