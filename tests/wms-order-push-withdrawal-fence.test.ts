@@ -210,6 +210,7 @@ test('create: a withdrawal that lands DURING the push is pulled back on the stor
   assert.equal(r.cancelled, 0)
   assert.equal(r.created, 0, 'and it is not counted as a create')
   assert.equal(updatesByOrder[0]?.data.state, 'HELD')
+  assert.equal(updatesByOrder[0]?.data.sentLineSkus, null, 'o3d-jtfy7: a pulled-back order keeps no sent-SKU record')
   assert.equal(events.some((e) => e.action === 'order_hold' && e.outcome === 'SUCCEEDED'), true)
 })
 
@@ -223,6 +224,7 @@ test('create: an APPROVED live withdrawal parks the link CANCELLED, not HELD (o3
   assert.equal(r.cancelled, 1, 'an approved withdrawal is terminal — there is nothing to release later')
   assert.equal(r.held, 0)
   assert.equal(updatesByOrder[0]?.data.state, 'CANCELLED')
+  assert.equal(updatesByOrder[0]?.data.sentLineSkus, null, 'o3d-jtfy7: a pulled-back order keeps no sent-SKU record')
 })
 
 test('create: an UNREADABLE storefront after the push does NOT cancel the new order (o3d-rbyg)', async () => {

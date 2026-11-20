@@ -1,7 +1,7 @@
 'use server'
 
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
-import type { Prisma } from '@/app/generated/prisma/client'
+import { Prisma } from '@/app/generated/prisma/client'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
@@ -4590,6 +4590,8 @@ export async function repushMissingWmsOrder(orderId: string): Promise<MutationRe
           state: 'PENDING_CREATE',
           externalOrderId: null,
           externalOrderNumber: null,
+          // No warehouse order any more, so no record of what one was sent.
+          sentLineSkus: Prisma.DbNull,
           attempts: 0,
           lastError: null,
           // THE DISPATCH STAMP, cleared — and reached only after both keys turned.

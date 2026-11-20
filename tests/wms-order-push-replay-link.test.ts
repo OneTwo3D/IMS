@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
+import { Prisma } from '../app/generated/prisma/client.ts'
 
 /**
  * Replay on a parked "create outcome unknown" row whose order the warehouse ALREADY HOLDS: an exact match (the warehouse's own record
@@ -173,6 +174,7 @@ test('replay: the warehouse already holds the order under its own reference -> L
   assert.equal(row.state, 'PENDING_VERIFY')
   assert.equal(row.externalOrderId, '555')
   assert.equal(row.attempts, 0)
+  assert.equal((row as unknown as Record<string, unknown>).sentLineSkus, Prisma.DbNull, 'o3d-jtfy7: the adopted order carries no record of an earlier warehouse order')
   assert.equal(state.activity.length, 1)
   assert.equal(state.activity[0].action, 'wms_push_linked')
 })

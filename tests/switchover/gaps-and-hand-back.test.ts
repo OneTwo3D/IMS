@@ -5,6 +5,8 @@ import { listSwitchoverGaps, takeOverGapOrder, type TakeOverDeps } from '@/lib/c
 import { handBackOne, listHandBackCandidates, runHandBack, type HandBackCandidate, type HandBackDeps } from '@/lib/connectors/mintsoft/switchover/hand-back'
 import { runSwitchoverGapsCli } from '../../scripts/switchover-gaps'
 import { runHandBackCli } from '../../scripts/switchover-hand-back'
+import { Prisma } from '../../app/generated/prisma/client.ts'
+let lastUpsert: { create: Record<string, unknown>; update: Record<string, unknown> } | undefined
 
 const S = new Date('2027-01-04T00:00:00.000Z')
 
@@ -48,7 +50,7 @@ function deps(row: OrderRow | null, over: Partial<TakeOverDeps> = {}) {
   const d: TakeOverDeps = {
     db: {
       salesOrder: { findUnique: async () => row },
-      wmsOrderPushLink: { upsert: async (a: unknown) => { events.push(`upsert ${JSON.stringify(a)}`) } },
+      wmsOrderPushLink: { upsert: async (a: unknown) => { lastUpsert = a as { create: Record<string, unknown>; update: Record<string, unknown> }; events.push(`upsert ${JSON.stringify(a)}`) } },
       $transaction: async (fn) => fn({}),
     },
     clientId: 89,
@@ -71,6 +73,8 @@ test('G_create dry run reads Mintsoft and writes nothing; --apply adopts the ord
   const write = JSON.parse(live.events[1]!.slice('upsert '.length)) as { create: Record<string, unknown> }
   assert.equal(write.create.state, 'PENDING_VERIFY', 'the push sweep still proves the id is ours')
   assert.equal(write.create.externalOrderId, '9001')
+  assert.equal(lastUpsert?.create.sentLineSkus, Prisma.DbNull, 'o3d-jtfy7: an adopted order carries no sent-SKU record (create arm)')
+  assert.equal(lastUpsert?.update.sentLineSkus, Prisma.DbNull, 'o3d-jtfy7: ... nor an earlier one left on an existing link (update arm)')
 })
 
 test('G_create refuses: nothing in Mintsoft (IMS never creates a pre-S order), several parts (split or merged), already linked, or paid at/after S', async () => {
