@@ -1,0 +1,4 @@
+### Customer e-mail: inventory of WooCommerce's customer e-mails and who sends each (no behaviour change)
+- New static registry `lib/domain/customer-email/woo-email-inventory.ts` lists every WooCommerce core customer e-mail and the known plugin ones (partial shipment, AST, TrackShip) with their disposition after step W: replaced by IMS, planned for IMS (refund) or staying in WooCommerce (account e-mails, customer note, on-hold, cancelled and failed).
+- The writer ownership map gains rows `customer-email.partial-shipment`, `delivered`, `refund` (WooCommerce in P1, IMS in P2) and the stays-in-WooCommerce rows (WooCommerce in every phase). Mapped only: nothing is sent or switched by this change, and the native e-mail exclusivity check still reads only the processing and completed e-mails.
+- Help: the customer e-mail page lists which e-mails come from IMS after step W and which stay in WooCommerce.

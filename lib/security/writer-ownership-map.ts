@@ -348,6 +348,51 @@ export const WRITER_OWNERSHIP_MAP = [
     obligationTime: 'not-applicable',
     note: 'Mapped only (as despatch): WooCommerce in P1, IMS in P2 (owner answers 2026-10-09).',
   }),
+  row('customer-email', 'partial-shipment', { P1: 'woocommerce-native', P2: 'IMS' }, {
+    step: 'woocommerce',
+    obligationTime: 'not-applicable',
+    note: 'Mapped only (as despatch). Owner ruling 2026-11-20 (a): the partial-shipment e-mail (one per shipment) is sent by WooCommerce and its plugins (partial-shipment plugin, AST, TrackShip) in P1 and by IMS in P2, behind the one step W switch `storefront_customer_email_enabled`; the plugins' own e-mails are switched off by hand (no check reads them).',
+  }),
+  row('customer-email', 'delivered', { P1: 'woocommerce-native', P2: 'IMS' }, {
+    step: 'woocommerce',
+    obligationTime: 'not-applicable',
+    note: 'Mapped only (as despatch). Owner ruling 2026-11-20 (a): the delivered e-mail is sent by WooCommerce and its plugins (partial-shipment plugin, AST, TrackShip) in P1 and by IMS in P2, behind the one step W switch `storefront_customer_email_enabled`; the plugins' own e-mails are switched off by hand (no check reads them).',
+  }),
+  row('customer-email', 'refund', { P1: 'woocommerce-native', P2: 'IMS' }, {
+    step: 'woocommerce',
+    obligationTime: 'not-applicable',
+    note: 'Mapped only. Owner ruling 2026-11-20 (d): IMS will send the refund / credit-note e-mail, replacing WooCommerce's customer_refunded_order at cutover. IMS has no writer for it yet (a later slice adds the kind under the same step W switch), and NATIVE_EMAIL_EXCLUSIVE does not read customer_refunded_order until then.',
+  }),
+  row('customer-email', 'account-new', { P1: 'woocommerce-native', P2: 'woocommerce-native' }, {
+    step: 'never',
+    obligationTime: 'not-applicable',
+    note: 'Mapped only. Owner ruling 2026-11-20 (c): the new-account e-mail stays in WooCommerce for good, so WooCommerce owns it in every phase and IMS never sends it.',
+  }),
+  row('customer-email', 'account-password-reset', { P1: 'woocommerce-native', P2: 'woocommerce-native' }, {
+    step: 'never',
+    obligationTime: 'not-applicable',
+    note: 'Mapped only. Owner ruling 2026-11-20 (c): the password-reset e-mail stays in WooCommerce for good, so WooCommerce owns it in every phase and IMS never sends it.',
+  }),
+  row('customer-email', 'customer-note', { P1: 'woocommerce-native', P2: 'woocommerce-native' }, {
+    step: 'never',
+    obligationTime: 'not-applicable',
+    note: 'Mapped only. Owner ruling 2026-11-20 (c): the customer-note e-mail stays in WooCommerce for good, so WooCommerce owns it in every phase and IMS never sends it.',
+  }),
+  row('customer-email', 'status-on-hold', { P1: 'woocommerce-native', P2: 'woocommerce-native' }, {
+    step: 'never',
+    obligationTime: 'not-applicable',
+    note: 'Mapped only. Owner ruling 2026-11-20 (c): the on-hold status e-mail stays in WooCommerce for good, so WooCommerce owns it in every phase and IMS never sends it.',
+  }),
+  row('customer-email', 'status-cancelled', { P1: 'woocommerce-native', P2: 'woocommerce-native' }, {
+    step: 'never',
+    obligationTime: 'not-applicable',
+    note: 'Mapped only. Owner ruling 2026-11-20 (c): the cancelled status e-mail stays in WooCommerce for good, so WooCommerce owns it in every phase and IMS never sends it.',
+  }),
+  row('customer-email', 'status-failed', { P1: 'woocommerce-native', P2: 'woocommerce-native' }, {
+    step: 'never',
+    obligationTime: 'not-applicable',
+    note: 'Mapped only. Owner ruling 2026-11-20 (c): the failed status e-mail stays in WooCommerce for good, so WooCommerce owns it in every phase and IMS never sends it.',
+  }),
   row('customer-email', 'quote', { P1: 'IMS', P2: 'IMS' }, {
     step: 'never',
     obligationTime: 'not-applicable',
