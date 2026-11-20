@@ -19,7 +19,7 @@ import { fitMintsoftName } from '../api/product-name'
 import { readMintsoftProductParityEnabled } from '../settings/product-parity'
 import { applyMintsoftProductParity, applyMintsoftProductParityExceptName, readMintsoftProductCost, redactMintsoftCostPrice } from './product-parity'
 import { runMintsoftParentSkuDeletionPass, withMetadataConfirmation, type ParentDeletionCounters } from './parent-sku-deletion'
-import { CONTENT_REFUSAL_MAX_ATTEMPTS, describeContentRun, syncMintsoftProductContent, type ContentLineResult } from './product-content-sync'
+import { CONTENT_REFUSAL_MAX_ATTEMPTS, CONTENT_REFUSAL_REOFFER_MINUTES, describeContentRun, syncMintsoftProductContent, type ContentLineResult } from './product-content-sync'
 
 const ELIGIBLE_PRODUCT_TYPES = [
   ProductType.SIMPLE,
@@ -823,7 +823,7 @@ export async function upsertProductDiscrepancy(params: {
 
 /**
  * Keeps ONE open PRODUCT_CONTENT_REFUSED discrepancy per product in step with the content Mintsoft keeps refusing: raised once a field's refusal cap
- * is spent (IMS has stopped sending that value), resolved when the value changed or Mintsoft accepted a send. Nothing is written for a product whose
+ * is spent (IMS has stopped retrying that value; it is re-offered weekly), resolved when the value changed, an operator reset the refusal, or Mintsoft accepted a send. Nothing is written for a product whose
  * content outcome did not touch a refusal.
  */
 export async function syncContentRefusalDiscrepancy(scopes: MintsoftProductSyncScope[], product: { id: string; sku: string }, content: ContentLineResult): Promise<void> {
@@ -836,7 +836,7 @@ export async function syncContentRefusalDiscrepancy(scopes: MintsoftProductSyncS
       category: 'PRODUCT_CONTENT_REFUSED',
       imsValue: null,
       wmsValue: null,
-      message: `${product.sku}: Mintsoft refused the ${capped.join(' and ')} content ${CONTENT_REFUSAL_MAX_ATTEMPTS} times, so IMS has stopped sending that value. Fix the content in WooCommerce (a value Mintsoft will take) or check the field in Mintsoft; this resolves itself when the value changes and Mintsoft accepts it.`,
+      message: `${product.sku}: Mintsoft refused the ${capped.join(' and ')} content ${CONTENT_REFUSAL_MAX_ATTEMPTS} times, so IMS has stopped retrying that value (it offers it again once every ${CONTENT_REFUSAL_REOFFER_MINUTES / 1440} days). Fix the content in WooCommerce (a value Mintsoft will take), or, if the cause was on the Mintsoft side (for example the image host was down), use Reset on this row to offer the value again now. This resolves itself when Mintsoft accepts a send.`,
     })
     return
   }

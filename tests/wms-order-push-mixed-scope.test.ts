@@ -391,12 +391,22 @@ test('create: a connector that resolves the input from its settings (shipping VA
   assert.equal(created?.after?.intent?.shippingVat, 1, 'the audit intent records what was sent, not 0')
 })
 
-test('create: a resolver that throws leaves the input as built (the send reads its own settings)', async () => {
+test('create: a resolver that throws REFUSES the push for that order (nothing is sent, the claim is given back, it counts as failed): guard, audit and wire never diverge', async () => {
   const sent: WmsOrderPushInput[] = []
   const { port } = makePort({ createCandidates: [candidate()] })
   const resolving = { ...connector({ pushOrder: async (input) => { sent.push(input); return okPush() } }), resolvePushInput: async () => { throw new Error('settings unreadable') } }
-  await runWmsOrderPushSweepCore(resolving as never, 'mintsoft', port, { now: NOW })
-  assert.equal(sent[0]?.shippingVat, 0)
+  const r = await runWmsOrderPushSweepCore(resolving as never, 'mintsoft', port, { now: NOW })
+  assert.equal(sent.length, 0, 'nothing reaches the wire when the input could not be resolved')
+  assert.equal(r.failed, 1)
+})
+
+test('amend: a resolver that throws sends no amendment (the link fails and stays due)', async () => {
+  const updated: WmsOrderPushInput[] = []
+  const { port } = makePort({ updatable: [dirtyLink()], loadMixedScope: async () => MIXED })
+  const resolving = { ...connector({ updateOrder: async (_id: string, input: WmsOrderPushInput) => { updated.push(input); return { updated: true, status: 'NEW' } } }), resolvePushInput: async () => { throw new Error('settings unreadable') } }
+  const r = await runWmsOrderPushSweepCore(resolving as never, 'mintsoft', port, { now: NOW })
+  assert.equal(updated.length, 0)
+  assert.equal(r.updated, 0)
 })
 
 // ---- o3d-k6x6m ------------------------------------------------------------------------------------------------------------------------------------

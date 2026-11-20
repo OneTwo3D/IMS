@@ -48,6 +48,12 @@ export type ContentRefusal = { hash: string; count: number; at: string }
 export const CONTENT_REFUSAL_MAX_ATTEMPTS = 5
 /** Minutes to wait after the Nth refusal of the same value before offering it again (index N-1). The last entry is never reached: the cap comes first. */
 export const CONTENT_REFUSAL_BACKOFF_MINUTES = [30, 120, 480, 1440, 1440] as const
+/**
+ * Once the cap is spent the same value is offered again ONCE per this many minutes (7 days). A refusal can be transient (an image host that was down when
+ * Mintsoft fetched it), so a spent cap must not hold a valid value for good. The interval is measured from the last refusal's `at`, which every answered
+ * refusal restamps, so a re-offer that is refused again waits a full interval again: it can never loop faster than this.
+ */
+export const CONTENT_REFUSAL_REOFFER_MINUTES = 7 * 24 * 60
 
 export type MintsoftContentProjection = Partial<Record<MintsoftContentField, string>>
 
@@ -123,7 +129,7 @@ export function contentRefusalCapSpent(refusal: ContentRefusal | null): boolean 
 
 function contentRefusalWaiting(refusal: ContentRefusal | null, now: Date): boolean {
   if (!refusal) return false
-  if (contentRefusalCapSpent(refusal)) return true
+  if (contentRefusalCapSpent(refusal)) return now.getTime() < Date.parse(refusal.at) + CONTENT_REFUSAL_REOFFER_MINUTES * 60_000
   const waitMinutes = CONTENT_REFUSAL_BACKOFF_MINUTES[Math.min(refusal.count, CONTENT_REFUSAL_BACKOFF_MINUTES.length) - 1] ?? 0
   return now.getTime() < Date.parse(refusal.at) + waitMinutes * 60_000
 }
@@ -181,6 +187,9 @@ function preview(value: string): string {
   return value.length > 300 ? `${value.slice(0, 300)}...` : value
 }
 
+/** What a save needs besides the state: the raw state this run read, the fields it sent (accepted), and the fields whose refusal record it dropped. */
+export type ContentSaveContext = { previous: unknown; sent: readonly MintsoftContentField[]; clearedRefusals?: readonly MintsoftContentField[] }
+
 export type ContentSyncInput = {
   product: { id: string; sku: string }
   link: { id: string; externalProductId: string; contentSyncState: unknown } | null
@@ -192,7 +201,7 @@ export type ContentSyncInput = {
    * Where the per-field state is kept; defaults to the product link row. Tests pass a recorder. `context.previous` is the raw state this run read
    * and `context.sent` the fields it sent: the default saver writes only if the stored state is still `previous`.
    */
-  saveState?: (linkId: string, state: ContentSyncState, context: { previous: unknown; sent: readonly MintsoftContentField[] }) => Promise<void>
+  saveState?: (linkId: string, state: ContentSyncState, context: ContentSaveContext) => Promise<void>
   /** Which fields are verified on the wire; defaults to the connector's own contract. */
   wireContract?: Readonly<Record<MintsoftContentField, { verified: boolean }>>
   /** The clock for the refusal back-off; defaults to now. Tests pass their own. */
@@ -205,32 +214,84 @@ export type ContentSyncInput = {
  * When it is not, another run moved it: the fields this run sent have no trustworthy hash, so their `pushed` hash is DROPPED from the fresh state and the
  * next run offers (and sends) the current value again, which converges on what the hub holds.
  */
-async function saveStateToLink(linkId: string, state: ContentSyncState, context: { previous: unknown; sent: readonly MintsoftContentField[] }): Promise<void> {
-  const next = state as unknown as Prisma.InputJsonValue
-  const swapped = await db.wmsProductLink.updateMany({
-    where: { id: linkId, contentSyncState: context.previous === null || context.previous === undefined ? { equals: Prisma.DbNull } : { equals: context.previous as Prisma.InputJsonValue } },
-    data: { contentSyncState: next },
-  })
+/** Bounded read-merge-CAS rounds of the fallback write. Each lost round means another run saved in between; three in a row is not a race but a storm. */
+const SAVE_MERGE_ROUNDS = 3
+
+const casWhere = (linkId: string, stored: unknown) => ({ id: linkId, contentSyncState: stored === null || stored === undefined ? { equals: Prisma.DbNull } : { equals: stored as Prisma.InputJsonValue } })
+
+/**
+ * The refusal record for a field after two runs each hold one. Same value: the counts add up (this run's increase over the state IT read is added to what is
+ * stored now, so two runs refusing the same value from the same base count 2, not 1) and the later time wins. Different values: the record stamped LATER wins,
+ * so a run holding an older value's refusal can never overwrite the record of a newer value.
+ */
+function mergeRefusal(stored: ContentRefusal | undefined, mine: ContentRefusal, base: ContentRefusal | undefined): ContentRefusal {
+  if (!stored) return mine
+  if (stored.hash === mine.hash) {
+    const gained = Math.max(0, mine.count - (base?.hash === mine.hash ? base.count : 0))
+    return { hash: mine.hash, count: stored.count + gained, at: Date.parse(mine.at) >= Date.parse(stored.at) ? mine.at : stored.at }
+  }
+  return Date.parse(mine.at) > Date.parse(stored.at) ? mine : stored
+}
+
+/**
+ * COMPARE-AND-SWAP SAVE. Two runs of the same product (the cron and a manual run) can both read the state, both send, and the slower save would
+ * overwrite the other's hash with one Mintsoft no longer holds. The write therefore lands only if the stored state is still the one this run read.
+ * When it is not, another run moved it: the fields this run sent have no trustworthy hash, so their `pushed` hash is DROPPED from the fresh state and the
+ * next run offers (and sends) the current value again, which converges on what the hub holds. The merge is then retried (read, merge, conditional write)
+ * a bounded number of times; a run that still loses leaves the stored state as it is and the next run converges from it.
+ */
+async function saveStateToLink(linkId: string, state: ContentSyncState, context: ContentSaveContext): Promise<void> {
+  const swapped = await db.wmsProductLink.updateMany({ where: casWhere(linkId, context.previous), data: { contentSyncState: state as unknown as Prisma.InputJsonValue } })
   if (swapped.count === 1) return
-  const row = await db.wmsProductLink.findUnique({ where: { id: linkId }, select: { contentSyncState: true } })
-  if (!row) return
-  const fresh = readContentSyncState(row.contentSyncState)
-  // Drop this run's hash only where the row does NOT already hold the same value: when both runs sent the same value, the other run's hash is right and
-  // dropping it would cause one redundant send. Hashes this run computed that the row lacks (a shadow, a refusal) are merged in rather than thrown away.
-  const mine = state
-  for (const field of context.sent) {
-    if (fresh.pushed[field] !== mine.pushed[field]) delete fresh.pushed[field]
+  const base = readContentSyncState(context.previous)
+  for (let round = 0; round < SAVE_MERGE_ROUNDS; round += 1) {
+    const row = await db.wmsProductLink.findUnique({ where: { id: linkId }, select: { contentSyncState: true } })
+    if (!row) return
+    const fresh = readContentSyncState(row.contentSyncState)
+    // Drop this run's hash only where the row does NOT already hold the same value: when both runs sent the same value, the other run's hash is right and
+    // dropping it would cause one redundant send. Hashes this run computed that the row lacks (a shadow, a refusal) are merged in rather than thrown away.
+    for (const field of context.sent) {
+      if (fresh.pushed[field] !== state.pushed[field]) delete fresh.pushed[field]
+      // An accepted send ends the refusals of THAT value; a record the row holds for another value is the other run's and stays.
+      const stored = fresh.refused[field]
+      if (stored && state.pushed[field] !== undefined && stored.hash === state.pushed[field]) delete fresh.refused[field]
+    }
+    for (const field of MINTSOFT_CONTENT_FIELDS) {
+      if (fresh.shadowed[field] === undefined && state.shadowed[field] !== undefined && !context.sent.includes(field)) fresh.shadowed[field] = state.shadowed[field]
+      const mine = state.refused[field]
+      if (mine) fresh.refused[field] = mergeRefusal(fresh.refused[field], mine, base.refused[field])
+      else if (context.clearedRefusals?.includes(field)) {
+        // This run dropped the record it had read (the value moved on, or Mintsoft accepted it): drop that same record from the fresh state, never a newer one.
+        const stored = fresh.refused[field]
+        const read = base.refused[field]
+        if (stored && read && stored.hash === read.hash) delete fresh.refused[field]
+      }
+    }
+    // Conditional on the state just read: if a third run saved in between, this write misses and the loop reads again.
+    const written = await db.wmsProductLink.updateMany({ where: casWhere(linkId, row.contentSyncState), data: { contentSyncState: fresh as unknown as Prisma.InputJsonValue } })
+    if (written.count === 1) return
   }
-  for (const field of MINTSOFT_CONTENT_FIELDS) {
-    if (fresh.shadowed[field] === undefined && mine.shadowed[field] !== undefined && !context.sent.includes(field)) fresh.shadowed[field] = mine.shadowed[field]
-    const refusal = mine.refused[field]
-    if (refusal && (fresh.refused[field]?.hash !== refusal.hash || fresh.refused[field]!.count < refusal.count)) fresh.refused[field] = refusal
+}
+
+/**
+ * OPERATOR RESET of the refusal records of a product's Mintsoft link: every field's refusal count and back-off is forgotten, so the stored values are
+ * offered again on the next run. For a refusal whose cause was never the value (an image host that was down, a product Mintsoft would not update).
+ * Nothing is sent here, and `pushed` / `shadowed` are untouched. Returns the fields that had a record.
+ */
+export async function resetContentRefusals(productId: string): Promise<{ linkFound: boolean; fields: MintsoftContentField[] }> {
+  const link = await db.wmsProductLink.findFirst({ where: { productId, connector: 'mintsoft' }, select: { id: true } })
+  if (!link) return { linkFound: false, fields: [] }
+  for (let round = 0; round < SAVE_MERGE_ROUNDS + 2; round += 1) {
+    const row = await db.wmsProductLink.findUnique({ where: { id: link.id }, select: { contentSyncState: true } })
+    if (!row) return { linkFound: false, fields: [] }
+    const state = readContentSyncState(row.contentSyncState)
+    const fields = MINTSOFT_CONTENT_FIELDS.filter((field) => state.refused[field] !== undefined)
+    if (fields.length === 0) return { linkFound: true, fields: [] }
+    state.refused = {}
+    const written = await db.wmsProductLink.updateMany({ where: casWhere(link.id, row.contentSyncState), data: { contentSyncState: state as unknown as Prisma.InputJsonValue } })
+    if (written.count === 1) return { linkFound: true, fields }
   }
-  // Conditional on the state just read: if a third run saved in between, this write misses and the next run converges from whatever is stored.
-  await db.wmsProductLink.updateMany({
-    where: { id: linkId, contentSyncState: row.contentSyncState === null ? { equals: Prisma.DbNull } : { equals: row.contentSyncState as Prisma.InputJsonValue } },
-    data: { contentSyncState: fresh as unknown as Prisma.InputJsonValue },
-  })
+  throw new Error('The refusal records changed while they were being reset; try again.')
 }
 
 export async function syncMintsoftProductContent(input: ContentSyncInput): Promise<ContentLineResult> {
@@ -250,21 +311,21 @@ export async function syncMintsoftProductContent(input: ContentSyncInput): Promi
   const now = input.now ?? new Date()
   // A refusal record holds only for the value it was recorded for. A field whose value moved (or that now matches what Mintsoft holds) drops its record.
   let refusalCleared = false
+  const clearedRefusals: MintsoftContentField[] = []
   for (const field of MINTSOFT_CONTENT_FIELDS) {
-    if (state.refused[field] && refusalFor(state, field, projection) === null) { delete state.refused[field]; refusalCleared = true }
+    if (state.refused[field] && refusalFor(state, field, projection) === null) { delete state.refused[field]; refusalCleared = true; clearedRefusals.push(field) }
   }
   const changed = changedContentFields(projection, state)
   if (changed.length === 0) {
     const line = result('unchanged', [])
     if (refusalCleared) {
-      await (input.saveState ?? saveStateToLink)(input.link.id, state, { previous: input.link.contentSyncState ?? null, sent: [] })
+      await (input.saveState ?? saveStateToLink)(input.link.id, state, { previous: input.link.contentSyncState ?? null, sent: [], clearedRefusals })
       line.refusalCleared = true
     }
     return line
   }
   // Fields Mintsoft refused (the same value) and that are backed off or past the cap: neither sent nor shadowed this run.
   const waiting = changed.filter((field) => contentRefusalWaiting(refusalFor(state, field, projection), now))
-  const capReachedFields = changed.filter((field) => contentRefusalCapSpent(refusalFor(state, field, projection)))
 
   const decision = explainProducerDisposition('mintsoft', 'product.content', undefined, input.context ?? {})
   const contract = input.wireContract ?? MINTSOFT_CONTENT_WIRE
@@ -288,54 +349,83 @@ export async function syncMintsoftProductContent(input: ContentSyncInput): Promi
   const toShadow = changed.filter((field) => !sendable.includes(field) && !waiting.includes(field))
 
   let sentFields: MintsoftContentField[] = []
-  let held: { message: string } | null = null
+  let heldFields: MintsoftContentField[] = []
+  let heldMessage = ''
+  let refusedFields: MintsoftContentField[] = []
+  let refusalMessage: string | undefined
+  let failure: { error: unknown } | null = null
   if (sendable.length > 0 && cleared !== null) {
-    const update: Parameters<NonNullable<ContentSyncInput['connector']['updateProductContent']>>[0] = {
-      externalProductId: input.link.externalProductId,
-      sku: input.product.sku,
-    }
-    for (const field of sendable) update[field] = projection[field]
-    let sent: Awaited<ReturnType<NonNullable<ContentSyncInput['connector']['updateProductContent']>>>
-    try {
-      sent = await input.connector.updateProductContent!(update, cleared.clearance)
-    } catch (error) {
-      if (!isMintsoftContentRefusal(error)) throw error
-      // Mintsoft ANSWERED no. Record it against the value (a repeat of the same value counts up) so the next runs back off and then stop, and
-      // surface the refusal as this run's content error exactly as before.
-      for (const field of sendable) {
-        const hash = contentValueHash(projection[field]!)
-        const previous = state.refused[field]
-        state.refused[field] = { hash, count: (previous?.hash === hash ? previous.count : 0) + 1, at: now.toISOString() }
+    const seamAnswer = cleared
+    type Attempt = { kind: 'sent' } | { kind: 'held'; message: string } | { kind: 'refused'; message: string | undefined }
+    const attempt = async (fields: readonly MintsoftContentField[]): Promise<Attempt> => {
+      const update: Parameters<NonNullable<ContentSyncInput['connector']['updateProductContent']>>[0] = {
+        externalProductId: input.link!.externalProductId,
+        sku: input.product.sku,
       }
-      await (input.saveState ?? saveStateToLink)(input.link.id, state, { previous: input.link.contentSyncState ?? null, sent: [] })
-      return {
-        ...result('refused', sendable, { refused: sendable, refusalCounts: Object.fromEntries(sendable.map((field) => [field, state.refused[field]!.count])) }, error instanceof Error ? error.message : undefined),
-        shadowedFields: toShadow,
-        capReachedFields: sendable.filter((field) => contentRefusalCapSpent(state.refused[field] ?? null)),
+      for (const field of fields) update[field] = projection[field]
+      try {
+        const sent = await input.connector.updateProductContent!(update, seamAnswer.clearance)
+        return sent.sent ? { kind: 'sent' } : { kind: 'held', message: sent.message }
+      } catch (error) {
+        if (!isMintsoftContentRefusal(error)) throw error
+        // Mintsoft ANSWERED no.
+        return { kind: 'refused', message: error instanceof Error ? error.message : undefined }
       }
     }
-    if (sent.sent) {
-      sentFields = sendable
+    // The first attempt sends every sendable field in ONE call, as before; an error other than an answered refusal propagates with no state change.
+    const first = await attempt(sendable)
+    if (first.kind === 'sent') sentFields = sendable
+    else if (first.kind === 'held') { heldFields = sendable; heldMessage = first.message }
+    else if (sendable.length === 1) { refusedFields = sendable; refusalMessage = first.message }
+    else {
+      // ATTRIBUTION. Mintsoft's answer names no field, so a refusal of a multi-field send cannot be charged to any one of them: a good field would be capped
+      // for a bad one's sake. The fields are therefore re-sent ONE AT A TIME and each is charged only for its own answer (an accepted one is recorded as
+      // accepted). Cost: at most one extra Mintsoft call per field, and only on the run where a multi-field send is refused; the alternative (charging none)
+      // would re-send the same refused group on every run with no back-off.
       for (const field of sendable) {
-        state.pushed[field] = contentValueHash(projection[field]!)
-        delete state.shadowed[field]
-        if (state.refused[field]) { delete state.refused[field]; refusalCleared = true }
+        let one: Attempt
+        try { one = await attempt([field]) } catch (error) { failure = { error }; break }
+        if (one.kind === 'sent') sentFields.push(field)
+        else if (one.kind === 'held') { heldFields.push(field); heldMessage = one.message }
+        else { refusedFields.push(field); refusalMessage = one.message }
       }
-    } else {
-      held = { message: sent.message }
+    }
+    // Record against the VALUE (a repeat of the same value counts up) so the next runs back off and then stop (re-offering weekly).
+    for (const field of refusedFields) {
+      const hash = contentValueHash(projection[field]!)
+      const previous = state.refused[field]
+      state.refused[field] = { hash, count: (previous?.hash === hash ? previous.count : 0) + 1, at: now.toISOString() }
+    }
+    for (const field of sentFields) {
+      state.pushed[field] = contentValueHash(projection[field]!)
+      delete state.shadowed[field]
+      if (state.refused[field]) { delete state.refused[field]; refusalCleared = true; clearedRefusals.push(field) }
     }
   }
+  const held = heldFields.length > 0 ? { message: heldMessage } : null
 
-  const heldFields = held ? sendable : []
   const newShadows = toShadow.filter((field) => state.shadowed[field] !== contentValueHash(projection[field]!))
   for (const field of newShadows) state.shadowed[field] = contentValueHash(projection[field]!)
-  if (sentFields.length > 0 || newShadows.length > 0 || refusalCleared) await (input.saveState ?? saveStateToLink)(input.link.id, state, { previous: input.link.contentSyncState ?? null, sent: sentFields })
+  if (sentFields.length > 0 || refusedFields.length > 0 || newShadows.length > 0 || refusalCleared) await (input.saveState ?? saveStateToLink)(input.link.id, state, { previous: input.link.contentSyncState ?? null, sent: sentFields, clearedRefusals })
+  // A non-refusal failure while re-sending fields one at a time: what was learned before it is saved above, then the failure surfaces as it always did.
+  if (failure) throw (failure as { error: unknown }).error
+  // The cap is read from the state AFTER this run's changes, for every changed field, so a field still capped keeps its discrepancy whatever else happened.
+  const capReachedFields = changed.filter((field) => contentRefusalCapSpent(refusalFor(state, field, projection)))
 
   const why = PRODUCER_REASON_TEXT[decision.reason]
   const shadowDetail = live
     ? 'The field name Mintsoft expects for it is not verified yet, so it is held back even though IMS may write.'
     : `IMS is not the live writer for this yet: ${why}.`
 
+  if (refusedFields.length > 0) {
+    // `refusalCleared` rides on the refused line too: a capped value that changed and was refused anew still ends the old cap's discrepancy.
+    return {
+      ...result('refused', refusedFields, { refused: refusedFields, sent: sentFields, refusalCounts: Object.fromEntries(refusedFields.map((field) => [field, state.refused[field]!.count])) }, refusalMessage),
+      shadowedFields: toShadow,
+      capReachedFields,
+      refusalCleared,
+    }
+  }
   // One result per product: a send beats a shadow beats a hold in what the line says; the payload carries all of it.
   const extra = {
     sent: sentFields,

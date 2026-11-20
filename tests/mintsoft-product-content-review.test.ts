@@ -161,11 +161,11 @@ test('f: a Success:false answer is RECORDED against the value, backs off, stops 
     else assert.deepEqual(line.capReachedFields, [])
   }
   assert.equal(h.calls.length, CONTENT_REFUSAL_MAX_ATTEMPTS)
-  now = new Date(now.getTime() + 365 * 24 * 3_600_000)
+  now = new Date(now.getTime() + 24 * 3_600_000)
   const capped = await run()
   assert.equal(capped.kind, 'refused_wait')
   assert.deepEqual(capped.capReachedFields, ['imageUrl'], 'the cap keeps naming the field every run')
-  assert.equal(h.calls.length, CONTENT_REFUSAL_MAX_ATTEMPTS, 'a year later it is still not sent again')
+  assert.equal(h.calls.length, CONTENT_REFUSAL_MAX_ATTEMPTS, 'inside the re-offer interval it is not sent again (the re-offer itself is tested in mintsoft-content-refusal-followups)')
   // A CHANGED value starts again at once, and the old refusal record is dropped.
   const changed = await syncMintsoftProductContent({ product: { id: 'p1', sku: 'SKU-1' }, link: { id: 'link-f', externalProductId: '168', contentSyncState: state }, content: { ...imageOnly, images: normalizeImageRefs([{ id: 1, src: 'https://shop.example.test/other.jpg' }]) }, connector: { async updateProductContent() { return { sent: true as const } } }, context: LIVE_CONTEXT, saveState: h.saveState, now })
   assert.equal(changed.kind, 'sent')

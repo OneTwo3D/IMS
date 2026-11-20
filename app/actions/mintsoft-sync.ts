@@ -60,7 +60,7 @@ import {
 import { mintsoftAsnCreateShadowNotice, mintsoftProducerSeam } from '@/lib/connectors/mintsoft/producer-seam'
 import { resolveAsnSupplier } from '@/lib/connectors/mintsoft/suppliers/asn-supplier'
 import { runMintsoftProductVerify } from '@/lib/connectors/mintsoft/sync/product-sync'
-import { describeContentRun } from '@/lib/connectors/mintsoft/sync/product-content-sync'
+import { describeContentRun, resetContentRefusals } from '@/lib/connectors/mintsoft/sync/product-content-sync'
 import { describeShadowedBundles, describeShadowedProducts } from '@/lib/connectors/mintsoft/operator-action-seam'
 import { runMintsoftBundleVerify } from '@/lib/connectors/mintsoft/sync/bundle-sync'
 import {
@@ -2816,6 +2816,33 @@ export async function ignoreMintsoftSkuRenameHoldAction(discrepancyId: string, n
     await logActivity({ entityType: 'SYNC', entityId: discrepancyId, action: 'sku_rename_hold_ignored', tag: 'sync', userId: session.user.id, level: 'WARNING', description: `Ignored a SKU renamed discrepancy, ending the order-push hold: ${trimmed}` })
     revalidatePath('/sync')
     return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * Reset the content refusals of a product (the PRODUCT_CONTENT_REFUSED row's Reset button). Mintsoft's "Success: false" does not always mean the value is
+ * bad (an image host that was down, a product Mintsoft would not update), and after five of them IMS only re-offers the value weekly. This forgets the
+ * refusal count and back-off so the stored value is offered again on the next product sync, and closes the open discrepancy; if Mintsoft refuses it
+ * again the count starts from one. Nothing is sent here. Sync permission and a fresh sign-in; the actor is recorded on the activity log and the row.
+ */
+export async function resetMintsoftContentRefusalAction(productId: string): Promise<{ success: boolean; error?: string; message?: string } | FreshAuthFailureResult> {
+  try {
+    const session = await requireFreshPermission('sync')
+    if (typeof productId !== 'string' || productId === '') return { success: false, error: 'No product was named.' }
+    const reset = await resetContentRefusals(productId)
+    if (!reset.linkFound) return { success: false, error: 'That product is not linked to Mintsoft.' }
+    const note = `Content refusal reset by an operator (${reset.fields.length > 0 ? reset.fields.join(', ') : 'no stored refusal'}); the value is offered again on the next product sync`
+    await db.wmsStockDiscrepancy.updateMany({
+      where: { connector: 'mintsoft', productId, category: 'PRODUCT_CONTENT_REFUSED', status: 'OPEN' },
+      data: { status: 'RESOLVED', resolvedAt: new Date(), resolvedBy: session.user.id, resolvedNote: note },
+    })
+    await logActivity({ entityType: 'SYNC', entityId: productId, action: 'content_refusal_reset', tag: 'sync', userId: session.user.id, level: 'WARNING', description: note, metadata: { productId, fields: reset.fields } })
+    revalidatePath('/sync')
+    return { success: true, message: reset.fields.length > 0 ? 'The refusal was reset; the content is offered again on the next product sync.' : 'There was no stored refusal; the discrepancy was closed.' }
   } catch (error) {
     const freshAuthFailure = freshAuthFailureResult(error)
     if (freshAuthFailure) return freshAuthFailure

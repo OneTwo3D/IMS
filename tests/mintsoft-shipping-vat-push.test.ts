@@ -115,3 +115,16 @@ test('with the setting ON the wire never carries ShippingTotalVat for an order w
   sendSetting = ''
   assert.equal((await resolveMintsoftPushInput(WITH_DERIVED)).shippingVat, 0, 'flag off: unchanged')
 })
+
+test('a RESOLVED input is sent as it stands: the setting flipping ON between the sweep\'s resolve and the send cannot put a ShippingTotalVat on the wire that the guard and audit never saw', async () => {
+  const { resolveMintsoftPushInput } = await import('@/lib/connectors/mintsoft/api/order-push')
+  sendSetting = ''
+  const resolved = await resolveMintsoftPushInput(WITH_DERIVED)
+  assert.equal(resolved.shippingVat, 0)
+  const wire = await push(resolved, 'true')
+  assert.equal(wire.ShippingTotalVat, 0, 'the audited figure (0) is the wire figure')
+  // And the other way: resolved ON, setting then OFF: the audited figure still goes out.
+  sendSetting = 'true'
+  const resolvedOn = await resolveMintsoftPushInput(WITH_DERIVED)
+  assert.equal((await push(resolvedOn, '')).ShippingTotalVat, 1)
+})

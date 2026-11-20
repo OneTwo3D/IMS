@@ -1,0 +1,6 @@
+### Mintsoft content refusals: operator reset, weekly re-offer, correct attribution (follow-ups to the refusal handling)
+- A value Mintsoft refused five times is no longer held back for good: IMS offers it again once every 7 days (a refused re-offer waits another 7 days), and the `PRODUCT_CONTENT_REFUSED` row has a **Reset: offer the content again** button (Sync permission, fresh sign-in, audited) that forgets the refusal count so the next product sync sends the value.
+- A refusal of a multi-field send is charged only to the field Mintsoft refuses on its own (the fields are re-sent one at a time on that run); an accepted field is recorded as accepted.
+- A `PRODUCT_CONTENT_REFUSED` row whose capped value has since changed (and was refused anew) now resolves instead of staying open with text saying IMS stopped sending.
+- The refusal state save no longer undercounts concurrent refusals, overwrites a newer value's record, or brings back a cleared refusal; it retries a bounded number of times.
+- The order push sweep no longer swallows a failure to resolve the connector's push input (Mintsoft shipping VAT): that order is not sent this sweep (retried next), and a resolved input is sent as it stands, so the total guard, the audit and the wire always carry the same figures.
