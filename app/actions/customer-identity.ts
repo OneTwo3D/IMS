@@ -7,6 +7,7 @@ import { clusterOf } from '@/lib/domain/crm/cluster-resolver'
 import { loadCompanyGroup, type CompanyGroup } from '@/lib/domain/crm/company-group'
 import { mergeCustomers, unmergeCustomer } from '@/lib/domain/crm/merge-service'
 import { cancelClusterErasure, excludeClusterErasureMember } from '@/lib/domain/erasure/cluster-erasure-control'
+import { getSettingValue } from '@/lib/settings-store'
 import { loadTimeline, type TimelinePage } from '@/lib/domain/crm/timeline'
 
 /**
@@ -86,7 +87,9 @@ export async function getCustomerTimeline(
   const exists = await db.customer.findUnique({ where: { id: customerId }, select: { id: true } })
   if (!exists) return null
   const ids = options.scope === 'customer' ? [customerId] : (await clusterOf(db, customerId)).ids
-  return loadTimeline(db, ids, { cursor: options.cursor })
+  // Sent customer e-mails join the timeline only when the operator switched them on (Settings > Sales); off reads nothing from the outbox.
+  const includeEmails = (await getSettingValue('crm_timeline_emails_enabled')) === 'true'
+  return loadTimeline(db, ids, { cursor: options.cursor, includeEmails })
 }
 
 export type MergeActionResult = { success: true } | { success: false; error: string; code?: string; reason?: string }

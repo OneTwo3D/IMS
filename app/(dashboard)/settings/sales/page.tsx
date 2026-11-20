@@ -7,6 +7,7 @@ import { getSetting } from '@/app/actions/settings'
 import { getRecentInvoicePdfTokenSecurityEvents, getRecentTaxRateFallbackEvents } from '@/app/actions/activity-log'
 import { InvoiceTriggerSetting } from '@/components/settings/invoice-trigger'
 import { DispatchEmailSetting } from '@/components/settings/dispatch-email'
+import { CrmTimelineEmailsSetting } from '@/components/settings/crm-timeline-emails'
 import { ReturnExchangeSetting } from '@/components/settings/return-exchange'
 import { DeliveryTrackingSettings } from '@/components/settings/delivery-tracking'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
@@ -28,6 +29,7 @@ export default async function SalesSettingsPage() {
     dispatchEmailEnabled,
     storefrontCustomerEmailEnabled,
     returnExchangeEnabled,
+    crmTimelineEmailsEnabled,
     trackingEnabled,
     trackingSource,
     trackshipKey,
@@ -40,6 +42,7 @@ export default async function SalesSettingsPage() {
     getSetting('dispatch_email_enabled'),
     getSetting('storefront_customer_email_enabled'),
     getSetting('return_exchange_enabled'),
+    getSetting('crm_timeline_emails_enabled'),
     getSetting('delivery_tracking_enabled'),
     getSetting('delivery_tracking_source'),
     getSetting('trackship_api_key'),
@@ -91,6 +94,17 @@ export default async function SalesSettingsPage() {
           Let the refund dialog record replacement items together with the return. They become new lines on the same order, linked to the refund.
         </p>
         <ReturnExchangeSetting currentValue={returnExchangeEnabled ?? 'false'} />
+      </Card>
+
+      <Card className="p-6">
+        <div className="flex items-center gap-2 mb-4">
+          <Mail className="h-4 w-4 text-muted-foreground" />
+          <h2 className="text-base font-semibold">Emails on the customer timeline</h2>
+        </div>
+        <p className="text-sm text-muted-foreground mb-4">
+          Show the emails IMS sent for a customer's orders on the customer page timeline.
+        </p>
+        <CrmTimelineEmailsSetting currentValue={crmTimelineEmailsEnabled ?? 'false'} />
       </Card>
 
       {woocommerceEnabled && (

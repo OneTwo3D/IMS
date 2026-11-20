@@ -19,6 +19,7 @@ const KIND_LABEL: Record<TimelineKind, string> = {
   REFUND_PAYMENT: 'Refund paid',
   RETURN_EXPECTED: 'Return expected',
   WAREHOUSE_RETURN: 'Warehouse return',
+  EMAIL: 'Email sent',
 }
 
 export function CustomerTimeline({ customerId, initial, showPersonScope }: { customerId: string; initial: TimelinePage; showPersonScope: boolean }) {

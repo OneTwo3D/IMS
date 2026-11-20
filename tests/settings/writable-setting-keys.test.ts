@@ -413,6 +413,12 @@ test('the key-shape scan is not vacuous — it sees a key added to a payload', (
   assert.deepEqual(keysOf(codeOf(join(REPO, 'components/settings/dispatch-email.tsx'))), ['dispatch_email_enabled', 'storefront_customer_email_enabled'])
 })
 
+test('the CRM timeline e-mail switch is a writable preference filed under its own screen', () => {
+  assert.ok(WRITABLE_SETTING_KEYS.includes('crm_timeline_emails_enabled'))
+  assert.equal(screenOfferingSettingKey('crm_timeline_emails_enabled'), 'components/settings/crm-timeline-emails.tsx')
+  assert.equal(settingKeyWriteRefusal('crm_timeline_emails_enabled'), null)
+})
+
 // ---------------------------------------------------------------------------
 // 8. Nothing system-managed has leaked onto the allowlist.
 // ---------------------------------------------------------------------------

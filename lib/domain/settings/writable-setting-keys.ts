@@ -85,6 +85,7 @@ const PREFERENCE_KEYS_BY_SCREEN: Readonly<Record<string, readonly string[]>> = {
     'activity_log_retention_warning',
     'activity_log_retention_error',
   ],
+  'components/settings/crm-timeline-emails.tsx': ['crm_timeline_emails_enabled'],
   'components/settings/data-retention.tsx': [
     'retention_sales_orders_months',
     'retention_purchase_orders_months',
