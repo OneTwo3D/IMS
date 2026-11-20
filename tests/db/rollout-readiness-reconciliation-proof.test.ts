@@ -112,8 +112,30 @@ test('[o3d-6e4v] DB: with NO truncated run the reader returns nothing, and says 
     const onlyNull = await getAccountingReconciliationHistory(newest('p6e4v-null-newest', null), tx)
     return [afterRecording, onlyNull]
   })
-  assert.deepEqual(before, { runs: [], overflow: false, recordedBeforeNewest: true })
-  assert.deepEqual(first, { runs: [], overflow: false, recordedBeforeNewest: false })
+  assert.deepEqual(before, { runs: [], overflow: false, recordedBeforeNewest: true, otherNullRowsRemain: false })
+  assert.deepEqual(first, { runs: [], overflow: false, recordedBeforeNewest: false, otherNullRowsRemain: false })
+})
+
+test('[o3d-65f4b] DB: otherNullRowsRemain is computed from the table: an older NULL row keeps the not-recorded warning, none escalates', { skip }, async () => {
+  const [withLegacy, alone, tied] = await withRollback(async (tx) => {
+    await tx.$executeRawUnsafe('DELETE FROM "accounting_reconciliation_runs"')
+    await insertRun(tx, 'p65f4b-legacy', 30, 90, null)
+    await insertRun(tx, 'p65f4b-newest', 0, 90, null)
+    const a = await getAccountingReconciliationHistory(newest('p65f4b-newest', null), tx)
+    await tx.$executeRawUnsafe(`DELETE FROM "accounting_reconciliation_runs" WHERE "id" = 'p65f4b-legacy'`)
+    const b = await getAccountingReconciliationHistory(newest('p65f4b-newest', null), tx)
+    // A tied sibling is judged WITH the newest run, so it does not count as a remaining legacy row.
+    await insertRun(tx, 'p65f4b-sibling', 0, 90, null)
+    const c = await getAccountingReconciliationHistory({ ...newest('p65f4b-newest', null), tiedRunIds: ['p65f4b-newest', 'p65f4b-sibling'] }, tx)
+    return [a, b, c]
+  })
+  assert.equal(withLegacy.otherNullRowsRemain, true)
+  assert.equal(alone.otherNullRowsRemain, false)
+  assert.equal(tied.otherNullRowsRemain, false)
+  const warn = evaluateReconciliationProof({ id: 'p65f4b-newest', status: 'COMPLETED', truncations: null }, withLegacy)
+  const block = evaluateReconciliationProof({ id: 'p65f4b-newest', status: 'COMPLETED', truncations: null }, alone)
+  assert.equal(warn.state === 'not-proven' && warn.notRecordedAfterRecording, false)
+  assert.equal(block.state === 'not-proven' && block.notRecordedAfterRecording, true)
 })
 
 // ---------------------------------------------------------------------------------------------------

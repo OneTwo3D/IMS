@@ -114,6 +114,13 @@ export type ReconciliationHistory = {
   overflow: boolean
   /** True when a run with a non-NULL truncations column exists OLDER than the newest run. */
   recordedBeforeNewest: boolean
+  /**
+   * o3d-65f4b: whether any run OTHER than the newest (and the runs tied with it) still has a NULL truncations
+   * column, i.e. a legacy row that predates completeness recording. COMPUTED by the reader from the table, never a
+   * setting. `false` means no legacy NULL row remains, so a not-recorded newest run is no longer explained by the
+   * migration and is a blocker. Absent (undefined) is read as "unknown": today's behaviour (a warning).
+   */
+  otherNullRowsRemain?: boolean
 }
 
 /** Checks asked of every row with no window, so any later recorded run re-asks the whole question. */
@@ -227,7 +234,7 @@ export function evaluateReconciliationProof(
   if ((newestState === 'truncated' || newestState === 'unreadable') && !runs.some((run) => run.id === newest.id)) {
     unresolved.push({ runId: newest.id, createdAt: '', fromDate: null, toDate: null, code: newestState === 'unreadable' ? EVERY_CHECK : '(newest run, not in history)' })
   }
-  const notRecordedAfterRecording = newestState === 'not-recorded' && history.recordedBeforeNewest
+  const notRecordedAfterRecording = newestState === 'not-recorded' && (history.recordedBeforeNewest || history.otherNullRowsRemain === false)
 
   const newestNotCompleted = !COVERING_RUN_STATUSES.includes(newest.status)
   if (unresolved.length === 0 && !history.overflow && newestState === 'complete' && !newestNotCompleted) return { state: 'proven' }

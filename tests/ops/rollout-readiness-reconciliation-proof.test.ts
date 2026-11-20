@@ -99,6 +99,8 @@ test('[o3d-6e4v] a newest run that RECORDED a truncation is blocked — and allo
   const handler = createRolloutReadinessHandler({
     authorize: async () => null,
     collect: () => collectRolloutReadiness(adapters(latest, history)),
+    resolveOverrideActor: async () => ({ id: 'admin-1' }),
+    recordOverride: async () => true,
   })
   const response = await handler(new Request('https://ims.example/api/admin/rollout-readiness?allowWarnings=true'))
   assert.equal(response.status, 412, 'a truncation is a blocker, not a warning the override can accept')
@@ -394,7 +396,7 @@ test('[o3d-6e4v] an UNREADABLE newest-run read is a blocker, not "no run": allow
   assert.equal(report.status, 'blocked')
   assert.deepEqual(report.blockers.map((f) => f.id), ['readiness-adapter:accounting-reconciliation'])
   assert.deepEqual(report.warnings.map((f) => f.id), [])
-  const handler = createRolloutReadinessHandler({ authorize: async () => null, collect: () => collectRolloutReadiness(failing) })
+  const handler = createRolloutReadinessHandler({ authorize: async () => null, collect: () => collectRolloutReadiness(failing), resolveOverrideActor: async () => ({ id: 'admin-1' }), recordOverride: async () => true })
   const response = await handler(new Request('https://ims.example/api/admin/rollout-readiness?allowWarnings=true'))
   assert.equal(response.status, 412)
 })
@@ -605,4 +607,15 @@ test('[o3d-6e4v] a newest run that is RUNNING, queued or of an unrecognised stat
     }
   }
   console.log(`precondition: ${table.length} newest-run statuses examined`)
+})
+
+test('[o3d-65f4b] a not-recorded newest run: warning while another NULL row remains, blocker once none does', async () => {
+  const latest = newestRun({ truncations: null })
+  const stillLegacy = await verdict(latest, { runs: [], overflow: false, recordedBeforeNewest: false, otherNullRowsRemain: true })
+  assert.equal(stillLegacy.status, 'warning')
+  const unknown = await verdict(latest, { runs: [], overflow: false, recordedBeforeNewest: false })
+  assert.equal(unknown.status, 'warning')
+  const none = await verdict(latest, { runs: [], overflow: false, recordedBeforeNewest: false, otherNullRowsRemain: false })
+  assert.equal(none.status, 'blocked')
+  assert.ok(none.blockers.some((id) => id === 'accounting-reconciliation:completeness-not-recorded'))
 })
