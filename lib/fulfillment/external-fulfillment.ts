@@ -1285,7 +1285,7 @@ export async function applyExternalFulfillmentUpdate(
 
       if (!result.success && quantityCaptured.mismatches && result.error?.startsWith(QUANTITY_FENCE_MARK)) {
         // Caught under the order lock, before anything moved for this shipment: the same hold as the pre-check (an operator edit landed in between). ACCEPTED NARROW RACE: each shipment is its own transaction, so an edit landing between shipment 1's commit and shipment 2's fence leaves shipment 1 shipped and the order part-despatched (the hold is still reported); the pre-check above already covered every shipment of the order.
-        shippedInBatch.length = 0 // a failed batch judges no partial (same as discardPartialEmails)
+        discardPartialEmails()
         const error = quantityMismatchMessage(update.source, order.externalOrderNumber ?? order.orderNumber ?? order.id, quantityCaptured.mismatches)
         await logQuantityMismatchIfChanged(update.source, order.id, error, quantityCaptured.mismatches)
         return quantityMismatchOutcome(error, quantityCaptured.mismatches, update.despatchedQuantities)
