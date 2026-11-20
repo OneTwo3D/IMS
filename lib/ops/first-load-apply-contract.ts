@@ -10,7 +10,7 @@
  */
 
 /** The apply report format the gate reads (lib/first-load/apply/constants.ts APPLY_REPORT_FORMAT_VERSION). */
-export const APPLY_REPORT_CONTRACT_FORMAT_VERSION = 2
+export const APPLY_REPORT_CONTRACT_FORMAT_VERSION = 3
 
 /** The exit a successful apply reports (APPLY_EXIT_CODES.OK). */
 export const APPLY_REPORT_CONTRACT_EXIT_OK = { name: 'OK', code: 0 } as const
@@ -54,6 +54,7 @@ export const APPLY_PRECONDITION_IDS = [
   'rail:base-currency',
   'rail:forbidden-skus',
   'rail:currency-lock',
+  'rail:stock-extract-age',
   'rail:warehouses',
   'rail:fx-rates',
   'rail:tax-rates',

@@ -375,6 +375,12 @@ export function unresolvedWcOrderRowSql(): Prisma.Sql {
  */
 export const WC_COMPLETION_REFUSAL_RECORD_KIND = 'WC_COMPLETION_REFUSAL'
 
+/**
+ * The refusal code of an OPEN completion-refusal row that the owed-despatch retry parked because the store reopened an order it had reported completed.
+ * It is never retried and never auto-closed: only an operator confirms the order may be fulfilled by IMS (which clears the outside-IMS fence).
+ */
+export const WC_REOPENED_OPERATOR_DECISION_REFUSAL = 'store_reopened_operator_decision'
+
 /** The status an OPEN completion refusal carries. */
 export const WC_COMPLETION_REFUSAL_OPEN_STATUS = 'QUARANTINED' as const
 
@@ -416,6 +422,23 @@ export function openWcCompletionRefusalRowSql(): Prisma.Sql {
     AND "shopping_sync_logs"."recordKind" = ${WC_COMPLETION_REFUSAL_RECORD_KIND}
     AND "shopping_sync_logs".status = ${WC_COMPLETION_REFUSAL_OPEN_STATUS}::"ShoppingSyncStatus"
   ), FALSE)`
+}
+
+/**
+ * The open completion-refusal family as plain conjuncts, for the partial index the owed-despatch retry scans (migration 20261121130000) and for the
+ * retry query itself. The partial index is only used by a query whose WHERE visibly IMPLIES its predicate, and the TOTAL form above
+ * (`COALESCE(..., FALSE)`) hides that from the planner, so the retry states these conjuncts too. The migration contains this text verbatim
+ * (held by tests/prisma/wc-completion-refusal-open-index-migration.test.ts). `qualifier` prefixes the columns when the query joins another table.
+ */
+export function openWcCompletionRefusalIndexPredicateSql(qualifier = ''): string {
+  const col = (name: string): string => `${qualifier === '' ? '' : `${qualifier}.`}${name}`
+  return [
+    `${col('connector')} = 'woocommerce'`,
+    `${col('direction')} = 'FROM_CONNECTOR'`,
+    `${col('"entityType"')} = 'SalesOrder'`,
+    `${col('"recordKind"')} = '${WC_COMPLETION_REFUSAL_RECORD_KIND}'`,
+    `${col('status')} = '${WC_COMPLETION_REFUSAL_OPEN_STATUS}'`,
+  ].join('\n  AND ')
 }
 
 /**
