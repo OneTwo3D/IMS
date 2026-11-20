@@ -64,6 +64,7 @@ async function setup() {
   const cleanup = async () => {
     await db.customerClusterErasure.deleteMany({ where: { memberIds: { hasSome: customerIds } } })
     await db.activityLog.deleteMany({ where: { OR: [{ entityId: { in: [...orderIds, ...customerIds] } }, { description: { contains: RUN } }] } })
+    await db.emailOutbox.deleteMany({ where: { referenceType: 'SalesOrder', referenceId: { in: orderIds } } })
     await db.payment.deleteMany({ where: { orderId: { in: orderIds } } })
     await db.returnExpectation.deleteMany({ where: { orderId: { in: orderIds } } })
     await db.salesOrderRefundLine.deleteMany({ where: { refund: { orderId: { in: orderIds } } } })
@@ -325,6 +326,54 @@ test('the auto-merge audit is bounded: a customer joining a large cluster record
   const written = await db.$transaction((tx) => recordAutoMergeAudit(tx, newcomer))
   assert.equal(written, AUTO_MERGE_AUDIT_MAX_PAIRS)
   assert.equal(await db.$transaction((tx) => recordAutoMergeAudit(tx, newcomer)), 0, 'idempotent')
+})
+
+test('timeline e-mails: only with the switch, only the cluster\'s orders, no subject or address, and never an erased order\'s', { skip }, async (t) => {
+  const { db, RUN, customer, order, cleanup } = await setup()
+  t.after(cleanup)
+  const { loadTimeline } = await import('@/lib/domain/crm/timeline')
+  const { eraseCustomerPersonalData } = await import('@/lib/domain/erasure/erase-personal-data')
+  const a = await customer('a', `${RUN}.m@example.test`)
+  const b = await customer('b', `${RUN}.m+two@example.test`)
+  const other = await customer('o', `${RUN}.mother@example.test`)
+  const gone = await customer('g', `${RUN}.mgone@example.test`)
+  const day = (n: number) => new Date(Date.UTC(2026, 1, n, 12))
+  const oa = await order('1', a, { createdAt: day(1) })
+  const ob = await order('2', b, { createdAt: day(2) })
+  const oOther = await order('9', other, { createdAt: day(3) })
+  const oGone = await order('7', gone, { createdAt: day(3) })
+  const mail = (referenceId: string, extra: Record<string, unknown>) =>
+    db.emailOutbox.create({ data: { kind: 'DISPATCH', toEmail: `secret.${RUN}@example.test`, subject: `Subject ${RUN}`, html: `<p>${RUN} body</p>`, referenceType: 'SalesOrder', referenceId, ...extra }, select: { id: true } })
+  const sentA = await mail(oa, { status: 'SENT', sentAt: day(10), createdAt: day(9) })
+  const queuedB = await mail(ob, { kind: 'INVOICE', status: 'PENDING', createdAt: day(11) })
+  await mail(oOther, { status: 'SENT', sentAt: day(12), createdAt: day(12) })
+  await mail(oa, { kind: 'OTHER_REF', referenceType: 'PurchaseOrder', status: 'SENT', sentAt: day(13), createdAt: day(13) })
+  await mail(oGone, { status: 'SENT', sentAt: day(14), createdAt: day(14) })
+  await eraseCustomerPersonalData(gone, { trigger: 'ON_REQUEST', userId })
+  const ids = [a, b, gone]
+
+  const off = await loadTimeline(db, ids)
+  assert.ok(!off.events.some((e) => e.kind === 'EMAIL'), 'switch off: no EMAIL event')
+  const on = await loadTimeline(db, ids, { includeEmails: true })
+  const emails = on.events.filter((e) => e.kind === 'EMAIL')
+  assert.deepEqual(emails.map((e) => [e.key, e.reference, e.status, e.orderId, e.at]), [
+    [`EMAIL:${queuedB.id}`, 'INVOICE', 'PENDING', ob, day(11).toISOString()],
+    [`EMAIL:${sentA.id}`, 'DISPATCH', 'SENT', oa, day(10).toISOString()],
+  ], 'cluster scope, sentAt ?? createdAt, no other order, no other reference type, no erased order')
+  const text = JSON.stringify(emails)
+  assert.ok(!text.includes('@') && !text.includes(RUN.concat(' body')) && !text.includes(`Subject ${RUN}`), 'no address, subject or body')
+  assert.ok(!on.events.some((e) => e.orderId === oOther), 'an order outside the cluster never appears')
+  assert.deepEqual((await loadTimeline(db, [a], { includeEmails: true })).events.filter((e) => e.kind === 'EMAIL').map((e) => e.orderId), [oa], 'this record only')
+
+  const seen: string[] = []
+  let cursor: string | null = null
+  for (let i = 0; i < 10; i++) {
+    const p = await loadTimeline(db, ids, { limit: 2, cursor, includeEmails: true })
+    seen.push(...p.events.map((e) => e.key))
+    if (!p.nextCursor) break
+    cursor = p.nextCursor
+  }
+  assert.deepEqual(seen, on.events.map((e) => e.key), 'pagination across the new kind: no repeat, no gap')
 })
 
 test('the timeline lists orders, invoices, payments, credit notes and returns of the whole cluster, newest first, and nothing of anyone else', { skip }, async (t) => {

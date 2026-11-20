@@ -2,7 +2,7 @@
  * CUSTOMER TIMELINE (CRM foundation): one chronological, newest-first list of what happened for a customer or a whole cluster. READ-ONLY.
  *
  * Sources, each its own bounded query (so a customer with thousands of orders never loads them all): the order placed, the order cancelled, the invoice
- * issued, a receipt, a credit note / refund, a refund payment, an expected return, and a warehouse return. An event carries ids, numbers, dates, an
+ * issued, a receipt, a credit note / refund, a refund payment, an expected return, a warehouse return and (behind the `crm_timeline_emails_enabled` switch, off by default) a customer e-mail queued for one of the orders. An event carries ids, numbers, dates, an
  * amount and a status, and NEVER a name, email, address, note or reason text, so rendering the timeline reveals nothing the order page does not.
  *
  * KEYSET PAGINATION. Events sort by (time desc, key desc); the cursor is the last event's `${epochMs}:${key}`. Each source is read with `time <= cursor
@@ -11,6 +11,7 @@
  */
 import type { Prisma } from '@/app/generated/prisma/client'
 import { businessDateYmd } from '@/lib/business-date'
+import { ERASURE_PLACEHOLDER_EMAIL } from '@/lib/domain/erasure/erasure-record'
 
 export const TIMELINE_PAGE_SIZE = 50
 const TIE_ROOM = 50
@@ -24,6 +25,7 @@ export type TimelineKind =
   | 'REFUND_PAYMENT'
   | 'RETURN_EXPECTED'
   | 'WAREHOUSE_RETURN'
+  | 'EMAIL'
 
 export interface TimelineEvent {
   /** Unique and stable: `<KIND>:<row id>`. */
@@ -34,7 +36,7 @@ export interface TimelineEvent {
   orderId: string
   orderNumber: string
   customerId: string | null
-  /** Invoice number, credit note number, payment method or return reference: an identifier, never free text. */
+  /** Invoice number, credit note number, payment method, return reference or e-mail kind: an identifier, never free text. */
   reference: string | null
   /** Decimal string in `currency`, null when the event has no amount. */
   amount: string | null
@@ -48,7 +50,7 @@ export interface TimelinePage {
   nextCursor: string | null
 }
 
-type Reader = Pick<Prisma.TransactionClient, 'salesOrder' | 'payment' | 'salesOrderRefund' | 'returnExpectation' | 'wmsReturnsInbox'>
+type Reader = Pick<Prisma.TransactionClient, 'salesOrder' | 'payment' | 'salesOrderRefund' | 'returnExpectation' | 'wmsReturnsInbox' | 'emailOutbox'>
 
 const orderLabel = (o: { id: string; orderNumber: string | null; externalOrderNumber: string | null }) => o.orderNumber ?? o.externalOrderNumber ?? o.id.slice(0, 8)
 
@@ -98,7 +100,7 @@ export function pageEvents(all: TimelineEvent[], cursor: { atMs: number; key: st
   return { events, nextCursor: after.length > limit ? encodeCursor(events[events.length - 1]!) : null }
 }
 
-export async function loadTimeline(db: Reader, customerIds: string[], options: { cursor?: string | null; limit?: number } = {}): Promise<TimelinePage> {
+export async function loadTimeline(db: Reader, customerIds: string[], options: { cursor?: string | null; limit?: number; includeEmails?: boolean } = {}): Promise<TimelinePage> {
   const limit = Math.min(Math.max(options.limit ?? TIMELINE_PAGE_SIZE, 1), 200)
   const cursor = decodeCursor(options.cursor)
   if (customerIds.length === 0) return { events: [], nextCursor: null }
@@ -107,7 +109,14 @@ export async function loadTimeline(db: Reader, customerIds: string[], options: {
   const inOrder = { customerId: { in: customerIds } }
   const orderSelect = { id: true, orderNumber: true, externalOrderNumber: true, customerId: true } as const
 
-  const [placed, cancelled, invoiced, payments, refunds, expectations, returns] = await Promise.all([
+  // E-MAILS (switch ON only): the outbox keys an e-mail to an order by (referenceType, referenceId), with no relation, so the cluster's order ids come first (ids and labels only).
+  // The event time is `sentAt ?? createdAt`, which Prisma cannot sort on, so the two populations are read separately: sent rows by sentAt, unsent ones by createdAt.
+  // A row the erasure scrubbed (address replaced by the placeholder) is dropped: it belongs to an erased person and shows nothing about them.
+  const emailOrders = options.includeEmails ? await db.salesOrder.findMany({ where: inOrder, select: orderSelect }) : []
+  const emailWhere = { referenceType: 'SalesOrder', referenceId: { in: emailOrders.map((o) => o.id) }, NOT: { toEmail: ERASURE_PLACEHOLDER_EMAIL } }
+  const emailSelect = { id: true, kind: true, status: true, sentAt: true, createdAt: true, referenceId: true } as const
+
+  const [placed, cancelled, invoiced, payments, refunds, expectations, returns, sentEmails, unsentEmails] = await Promise.all([
     db.salesOrder.findMany({
       where: { ...inOrder, ...(upTo ? { createdAt: { lte: upTo } } : {}) },
       select: { ...orderSelect, createdAt: true, status: true, currency: true, totalForeign: true },
@@ -146,6 +155,16 @@ export async function loadTimeline(db: Reader, customerIds: string[], options: {
       select: { id: true, reference: true, status: true, createdAt: true, order: { select: orderSelect } },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take,
     }),
+    emailOrders.length === 0 ? Promise.resolve([]) : db.emailOutbox.findMany({
+      where: { ...emailWhere, sentAt: upTo ? { not: null, lte: upTo } : { not: null } },
+      select: emailSelect,
+      orderBy: [{ sentAt: 'desc' }, { id: 'desc' }], take,
+    }),
+    emailOrders.length === 0 ? Promise.resolve([]) : db.emailOutbox.findMany({
+      where: { ...emailWhere, sentAt: null, ...(upTo ? { createdAt: { lte: upTo } } : {}) },
+      select: emailSelect,
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take,
+    }),
   ])
 
   const events: TimelineEvent[] = []
@@ -156,5 +175,11 @@ export async function loadTimeline(db: Reader, customerIds: string[], options: {
   for (const r of refunds) events.push({ key: `CREDIT_NOTE:${r.id}`, kind: 'CREDIT_NOTE', at: r.createdAt.toISOString(), orderId: r.order.id, orderNumber: orderLabel(r.order), customerId: r.order.customerId, reference: r.creditNoteNumber, amount: r.totalForeign.toString(), currency: r.order.currency, status: null })
   for (const r of expectations) events.push({ key: `RETURN_EXPECTED:${r.id}`, kind: 'RETURN_EXPECTED', at: r.createdAt.toISOString(), orderId: r.order.id, orderNumber: orderLabel(r.order), customerId: r.order.customerId, reference: r.reference, amount: null, currency: null, status: r.status })
   for (const r of returns) events.push({ key: `WAREHOUSE_RETURN:${r.id}`, kind: 'WAREHOUSE_RETURN', at: r.createdAt.toISOString(), orderId: r.order!.id, orderNumber: orderLabel(r.order!), customerId: r.order!.customerId, reference: r.reference, amount: null, currency: null, status: r.status })
+  const emailOrderById = new Map(emailOrders.map((o) => [o.id, o]))
+  for (const m of [...sentEmails, ...unsentEmails]) {
+    const o = emailOrderById.get(m.referenceId!)
+    if (!o) continue
+    events.push({ key: `EMAIL:${m.id}`, kind: 'EMAIL', at: (m.sentAt ?? m.createdAt).toISOString(), orderId: o.id, orderNumber: orderLabel(o), customerId: o.customerId, reference: m.kind, amount: null, currency: null, status: m.status })
+  }
   return pageEvents(events, cursor, limit)
 }

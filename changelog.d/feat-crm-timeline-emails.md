@@ -1,0 +1,2 @@
+### Customer timeline: sent emails (CRM)
+- New setting **Emails on the customer timeline** (Settings > Sales, `crm_timeline_emails_enabled`, off by default). When on, the customer timeline lists the emails IMS sent for the customer's orders (whole person or this record) as "Email sent" lines with the email kind, status and time. The subject, body and address are never shown, and emails of erased orders are left out. Off, the timeline is unchanged.
