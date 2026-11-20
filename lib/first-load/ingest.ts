@@ -992,7 +992,10 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
   const dateFormats = mapping?.dateFormats ?? {}
   const derived = mapping?.derived ?? {}
 
+  // set by the wide-total check for a row that is blank everywhere; reported only if the row is then actually emitted (not a ghost, not refused)
+  let blankZeroNote: { line: number; code: string; reason: string } | null = null
   for (const record of records) {
+    blankZeroNote = null
     if (record.cells.length !== header.length) {
       rejected.push({
         line: record.line,
@@ -1015,6 +1018,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
         continue
       }
       let mismatch: string | null = null
+      blankZeroNote = null
       // A row the map (or a decision, which rewrites the kind cell) SKIPS is not stock and is never total-checked: its stock cells are ignored, not refused.
       const skippedRow = mapping.rowSelect !== null && mapping.rowSelect.some((selector, i) => selectIndexes[i]! >= 0 && selector.skip.includes(clean(record.cells[selectIndexes[i]!])))
       for (const [column, totalAt] of skippedRow ? [] : totalIndex) {
@@ -1022,7 +1026,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
           // Owner ruling: nothing stated anywhere on the row is zero on hand. Said per row; the cells are read as 0 so the sum check passes.
           record.cells[totalAt] = '0'
           for (const block of blocks) record.cells[block.index.get(column)!] = '0'
-          notes.push({ line: record.line, code: 'BLANK_STOCK_AS_ZERO', reason: `SKU ${skuAt !== undefined ? clean(record.cells[skuAt]) : '(no SKU)'} line ${record.line}: the all-warehouses ${column} and every warehouse ${column} cell are blank; loaded as 0 on hand by the map's blankStockIsZero (owner ruling)` })
+          blankZeroNote = { line: record.line, code: 'BLANK_STOCK_AS_ZERO', reason: `SKU ${skuAt !== undefined ? clean(record.cells[skuAt]) : '(no SKU)'} line ${record.line}: the all-warehouses ${column} and every warehouse ${column} cell are blank; loaded as 0 on hand by the map's blankStockIsZero (owner ruling)` }
           continue
         }
         const total = parseDecimal(clean(record.cells[totalAt]), column, { maxIntDigits: 12, maxDp: 6 }, { allowNegative: true })
@@ -1079,6 +1083,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
         continue
       }
     }
+    const emittedBefore = rows.length
     for (const [position, block] of emissions.entries()) {
       const line = block ? slotLine(record.line, position) : record.line
       const values: Record<string, string> = {}
@@ -1121,6 +1126,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
       if (bad) rejected.push(bad)
       else rows.push({ line, values })
     }
+    if (blankZeroNote !== null && rows.length > emittedBefore) notes.push(blankZeroNote)
   }
 
   const unmappedHeaders: string[] = []

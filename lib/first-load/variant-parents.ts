@@ -200,7 +200,7 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
       if (view.state === 'rejected') { add(i.row, i.variantSku, 'EXCLUDED', 'QOBLEX_ROW_REJECTED', 'the Qoblex row with this SKU was rejected (see the products dataset): it is not joined'); continue }
       if (view.state === 'excluded') { add(i.row, i.variantSku, 'EXCLUDED', 'EXCLUDED_BY_LIST', 'the Qoblex row with this SKU is on the exclusion list'); continue }
       if (view.type !== 'VARIANT') {
-        add(i.row, i.variantSku, 'EXCLUDED', 'QOBLEX_TYPE_NOT_VARIANT', `Qoblex types this SKU as ${view.type}, which cannot have a parent in IMS: it loads as ${view.type} and the connector link step relates it to the WooCommerce variation`)
+        add(i.row, i.variantSku, 'EXCLUDED', 'QOBLEX_TYPE_NOT_VARIANT', `Qoblex types this SKU as ${view.type}, which does not take a parent from here (only a VARIANT, or a BOM that superseded a VARIANT, does): it loads as ${view.type} and the connector link step relates it to the WooCommerce variation`)
         typeNotVariant.push(i.variantSku)
         continue
       }
@@ -254,7 +254,7 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
     findings.push({
       severity: 'INFO',
       code: 'QOBLEX_TYPE_NOT_VARIANT',
-      message: `${typeNotVariant.length} SKU(s) are WooCommerce variations but Qoblex types them as something that cannot have a parent (a bundle or manufactured product). They load with their Qoblex type and no parent.`,
+      message: `${typeNotVariant.length} SKU(s) are WooCommerce variations but Qoblex types them as something that takes no parent from here (a bundle, a simple product, or a manufactured product the bundles file did not supersede from a variant). They load with their Qoblex type and no parent.`,
       keys: typeNotVariant.sort(cmp),
     })
   }

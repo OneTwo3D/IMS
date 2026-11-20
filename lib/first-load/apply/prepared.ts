@@ -289,7 +289,10 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
       if (type === 'VARIANT') {
         if (parent === '') problems.push(`products ${rowLocation(row)}: a VARIANT without a parentSku`)
         else if (productByExact.get(parent)?.type !== 'VARIABLE') problems.push(`products ${rowLocation(row)}: its parent is not a VARIABLE product in the same files (the importer resolves a parent by exact SKU)`)
-      } else if (parent !== '') problems.push(`products ${rowLocation(row)}: only a VARIANT may have a parentSku`)
+      } else if (type === 'BOM' && parent !== '') {
+        // A manufactured WooCommerce variation: IMS holds it as BOM under a VARIABLE parent (canTypeHaveVariableParent). KIT stays refused.
+        if (productByExact.get(parent)?.type !== 'VARIABLE') problems.push(`products ${rowLocation(row)}: its parent is not a VARIABLE product in the same files (the importer resolves a parent by exact SKU)`)
+      } else if (parent !== '') problems.push(`products ${rowLocation(row)}: only a VARIANT or a BOM variation may have a parentSku`)
       if (type === 'KIT' || type === 'BOM') {
         const skus = componentSkus(cell(products, row, 'components'))
         for (const component of skus) {

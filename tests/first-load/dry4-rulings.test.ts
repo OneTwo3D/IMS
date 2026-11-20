@@ -14,6 +14,8 @@ import path from 'node:path'
 import test, { after } from 'node:test'
 import { runCli } from '../../lib/first-load/cli.ts'
 import { ingestDataset, mergeIngested, parseColumnMap, type IngestDecisions } from '../../lib/first-load/ingest.ts'
+import { loadPreparedRun } from '../../lib/first-load/apply/prepared.ts'
+import { loadOk, problemsOf, prepareSynthetic, preparedFiles, syntheticDatasets, withConsistentFile } from './apply-helpers.ts'
 import { dispositionCodes, ds, findingCodes, lot, precondition, product, rowsOf, run } from './helpers.ts'
 
 const NATIVE = path.join(process.cwd(), 'tests', 'first-load', 'fixtures', 'qoblex-native')
@@ -233,7 +235,7 @@ test('sku-renames: a missing source SKU, an existing target, a chain, a cycle, a
 const scratch = mkdtempSync(path.join(tmpdir(), 'first-load-dry4-'))
 after(() => rmSync(scratch, { recursive: true, force: true }))
 
-// [mutation: sku-renames is not in the decisions-first set, or is applied after the data is joined]
+// [mutation: the rename is applied only to files read after it, or after the data is joined]
 test('runCli: sku-renames listed after the data files still renames the SKU in every dataset (o3d-jawwa)', async (t) => {
   const dir = path.join(scratch, 'in')
   const out = path.join(scratch, 'out')
@@ -260,4 +262,82 @@ test('runCli: sku-renames listed after the data files still renames the SKU in e
   assert.match(readFileSync(path.join(out, files.find((f) => f.includes('opening-stock') && f.endsWith('.csv'))!), 'utf8'), /NEW-1/)
   assert.ok(!/OLD-1,/.test(readFileSync(path.join(out, files.find((f) => f.includes('products') && f.endsWith('.csv'))!), 'utf8')))
   assert.match(all, /SKU_RENAMED/)
+})
+
+// [mutation: any one rejected path of an override stops triggering the whole-override rejection]
+test('o3d-1th8a: a repeated component line in an override rejects the whole override too (no partial recipe)', (t) => {
+  const dup = run({
+    ...bomBase(),
+    'recipe-overrides': ds('recipe-overrides', [
+      { parentSku: 'KIT-1', componentSku: 'C1', qty: '1', reason: 'owner' },
+      { parentSku: 'KIT-1', componentSku: 'C1', qty: '2', reason: 'owner' },
+      { parentSku: 'KIT-1', componentSku: 'C2', qty: '2', reason: 'owner' },
+    ]),
+  })
+  precondition(t, 'override dispositions', dup.report.dispositions.filter((d) => d.dataset === 'recipe-overrides').length)
+  assert.deepEqual(dispositionCodes(dup, 'recipe-overrides', 'REJECTED').sort(), ['DUPLICATE_RECIPE_LINE', 'DUPLICATE_RECIPE_LINE', 'RECIPE_OVERRIDE_INCOMPLETE'])
+  assert.ok(findingCodes(dup, 'ERROR').includes('RECIPE_OVERRIDE_REJECTED'))
+  assert.equal(dup.blocking, true)
+})
+
+// [mutation: the loader refuses a BOM with a parentSku again, or lets a KIT have one]
+test('apply: a prepared run holding a variant-BOM loads (BOM under a VARIABLE parent); a KIT with a parent, or a BOM whose parent is not VARIABLE, is refused', (t) => {
+  const d = syntheticDatasets()
+  const products = mergeIngested([
+    ds('products', [...d.products!.rows.map((r) => r.values), product('ZQSENT-TSHIRT-X', 'VARIANT', { parentSku: 'ZQSENT-TSHIRT' })], 'a.csv'),
+    ds('products', [product('ZQSENT-TSHIRT-X', 'BOM')], 'b.csv'),
+  ], [false, true])
+  const recipes = ds('recipe-lines', [...d['recipe-lines']!.rows.map((r) => r.values), { parentSku: 'ZQSENT-TSHIRT-X', componentSku: 'ZQSENT-OAK-BOARD', qty: '2' }])
+  const files = preparedFiles(prepareSynthetic({ ...d, products, 'recipe-lines': recipes }))
+  const name = [...files.keys()].find((k) => k.includes('products'))!
+  const loaded = loadOk(files)
+  precondition(t, 'steps loaded', loaded.steps.length)
+  const text = new TextDecoder().decode(files.get(name)!)
+  assert.match(text, /ZQSENT-TSHIRT-X,[^\r]*,BOM,ZQSENT-TSHIRT,/)
+  assert.ok(loadPreparedRun)
+  const kit = problemsOf(withConsistentFile(files, name, (x) => x.replace(/(ZQSENT-TSHIRT-X,[^\r]*,)BOM(,ZQSENT-TSHIRT,)/, '$1KIT$2')))
+  assert.ok(kit.some((p) => /only a VARIANT or a BOM variation may have a parentSku/.test(p)), JSON.stringify(kit))
+  const notVariable = problemsOf(withConsistentFile(files, name, (x) => x.replace(/(ZQSENT-TSHIRT-X,[^\r]*,BOM,)ZQSENT-TSHIRT,/, '$1ZQSENT-OAK-BOARD,')))
+  assert.ok(notVariable.some((p) => /parent is not a VARIABLE/.test(p)), JSON.stringify(notVariable))
+})
+
+// [mutation: the rename skips transfers, recipe-override components or products.parentSku; blankStockIsZero accepted on a long map]
+test('sku-renames reach a transfer line, a recipe-override component and products.parentSku; blankStockIsZero on a non-wide stock-lots map is refused', (t) => {
+  const transfer = run({
+    products: ds('products', [product('OLDA')]),
+    'stock-lots': ds('stock-lots', [lot('OLDA', '10', '2')]),
+    transfers: ds('transfers', [{ transferKey: 'TR1', status: 'IN_TRANSIT', fromWarehouseCode: 'MAIN', toWarehouseCode: 'OVER', sku: 'OLDA', qtyShipped: '4', qtyReceived: '0' }]),
+    'sku-renames': ds('sku-renames', [rename('OLDA', 'NEWA')]),
+  })
+  const transferRows = rowsOf(transfer, 'transfers')
+  precondition(t, 'transfer rows', transferRows.length)
+  assert.ok(transferRows.every((r) => r.sku === 'NEWA'))
+  const override = run({
+    products: ds('products', [product('KIT-1', 'BOM'), product('OLDC')]),
+    'recipe-overrides': ds('recipe-overrides', [{ parentSku: 'KIT-1', componentSku: 'OLDC', qty: '1', reason: 'owner' }]),
+    'sku-renames': ds('sku-renames', [rename('OLDC', 'NEWC')]),
+  })
+  assert.equal(rowsOf(override, 'products').find((r) => r.sku === 'KIT-1')!.components, 'NEWC:1')
+  const parent = run({
+    products: ds('products', [product('OLDP', 'VARIABLE'), product('V1', 'VARIANT', { parentSku: 'OLDP' })]),
+    'sku-renames': ds('sku-renames', [rename('OLDP', 'NEWP')]),
+  })
+  const rows = rowsOf(parent, 'products')
+  assert.equal(rows.find((r) => r.sku === 'V1')!.parentSku, 'NEWP')
+  assert.ok(rows.some((r) => r.sku === 'NEWP'))
+  assert.throws(() => parseColumnMap(JSON.stringify({ formatVersion: 1, source: 'qoblex', datasets: { 'stock-lots': { columns: { sku: 'S', warehouseCode: 'W', qty: 'Q', unitCost: 'U' }, blankStockIsZero: true } } }), 'm'), /blankStockIsZero/)
+})
+
+// [mutation: the note is written for a row that is later dropped or refused]
+test('BLANK_STOCK_AS_ZERO is reported only for rows actually emitted (not a ghost, not a refused row)', (t) => {
+  const r = stock(csv(
+    stockRow('SYN-EMIT', 'simple', NONE),
+    stockRow('SYN-GHOST', 'Unknown', NONE),
+    stockRow('SYN-GHOST', 'simple', ['2', '2', '0', '0', '0', '0']),
+    stockRow('SYN-ODD', 'weird', NONE), // unlisted kind: refused
+  ))
+  precondition(t, 'records', r.recordsRead)
+  const notes = r.notes!.filter((n) => n.code === 'BLANK_STOCK_AS_ZERO')
+  assert.equal(notes.length, 1)
+  assert.match(notes[0].reason, /SYN-EMIT/)
 })

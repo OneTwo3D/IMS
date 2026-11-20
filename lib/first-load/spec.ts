@@ -540,5 +540,5 @@ export const APPLY_TIME_CHECKS: ReadonlyArray<{ id: string; area: string; check:
   { id: 'transfer-reference-free', area: 'transfers', check: 'No existing transfer already has a prefixed transferKey as its reference.' },
   { id: 'transfer-source-stock', area: 'transfers', check: 'The opening-stock file for the source warehouse has been loaded first, nothing is reserved against it, and its cost layers cover the dispatched quantity.' },
   { id: 'barcode-free', area: 'products', check: 'No barcode in the products file is already used by a product that exists in IMS.' },
-  { id: 'product-parent-exists', area: 'products', check: 'A VARIANT\'s parent is in an earlier or the same file (proved here) or already in IMS.' },
+  { id: 'product-parent-exists', area: 'products', check: 'A VARIANT\'s or BOM variation\'s parent is in an earlier or the same file (proved here) or already in IMS.' },
 ]
