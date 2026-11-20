@@ -9,23 +9,28 @@
  *
  * EVERY TRANSFORM IN IT, and why none can change a compared value:
  *   products  rowsAboveHeader 1                 the report's label row above the header: structure, no data.
- *             columns sku/name/type/barcode/active  header renames only.
+ *             columns sku/name/type/barcode/lifecycleStatus  header renames only.
  *             valueMaps.type simple->SIMPLE, variable->VARIANT, kit->KIT, bom->BOM, non-inventory->NON_INVENTORY
  *                                               the product type is used only to set a variation aside from the storefront walk (R14); the map is
  *                                               fixed, so the set-aside is fixed, and every other type is PRESENCE-compared like a simple product.
  *                                               A type not listed here (the export's own "Unknown", or a label nobody has seen) is a closed list
  *                                               miss: the ingest rejects the row and the source is refused, never guessed at.
- *             valueMaps.active Active->TRUE, Inactive->FALSE  not read by the pack; an inactive product is still a product R14 compares. Any other
- *                                               state is a closed list miss, refused the same way.
+ *             valueMaps.lifecycleStatus Active->ACTIVE, Inactive->EOL, Archived->DRAFT  not read by the pack; a non-active product is still a product R14
+ *                                               compares. (Qoblex archives a product while it is a WooCommerce draft, so Archived is DRAFT, not end of
+ *                                               life.) Any other state is a closed list miss, refused the same way.
+ *             rowSelect State keep Active/Inactive/Archived, skip Deleted  a Deleted product is not part of the load (owner ruling): counted by the
+ *                                               ingest (rowsSkipped), never read as a product.
+ *             nameColumn Product, nonStock Product Type=non-inventory  decisions hooks: the pack is never given a decisions list, so they do nothing here.
+ *             ghostRows Product Type=Unknown  of several rows of one SKU exactly one of which is typed, the Unknown ones are dropped and reported (a ghost left behind in Qoblex); any other duplicate is still refused.
  *   stock-lots rowsAboveHeader 1                the same label row.
  *             columns sku, unitCost             header renames only (unit cost is the report's Moving Average Cost).
  *             constants.currency GBP            the report has no currency column; the manifest declares GBP and R5 refuses anything else. It cannot
  *                                               change a quantity, SKU or location. LIMIT: the currency is a declaration, not read from the file.
- *             rowSelect keep simple/variable/bom  the kinds that hold stock of their own (IMS stock-bearing types: SIMPLE, VARIANT, BOM).
+ *             rowSelect (a list, every selector must pass): Product Type keep simple/variable/bom  the kinds that hold stock of their own (IMS stock-bearing types: SIMPLE, VARIANT, BOM).
  *                                               skip kit/non-inventory  the two kinds that never hold stock in IMS (a kit's stock is its components', a
  *                                               non-inventory item has none; the first-load tool refuses opening stock for both). Those rows are counted
  *                                               by the ingest (rowsSkipped), not read as lots. A row of ANY other kind is refused by the ingest
- *                                               (UNLISTED_ROW_KIND), never dropped.
+ *                                               (UNLISTED_ROW_KIND), never dropped. State: the same keep/skip lists as the products (Deleted skipped).
  *             wide (blocks, label -> warehouse code, totals, uniqueBy sku)  the warehouse labels map to the fixed codes MIL1, CAMBRIDGE, RESTOCK,
  *                                               QUARANTINE-CAMBRIDGE, RXT2; the quantity of each block must add up to the report's all-warehouses
  *                                               total or the row is refused, and a repeated SKU refuses every row carrying it.
@@ -43,20 +48,20 @@ export const QOBLEX_NATIVE_COLUMN_MAP = `{
       "rowsAboveHeader": 1,
       "expectedHeaders": [
         "Product",
-        "Barcode",
         "Sku",
+        "Barcode",
+        "State",
         "Brand",
         "Product Type",
-        "State",
         "Supplier",
         "Updated At",
         "Moving Average Cost",
-        "Total Cost",
         "Purchase Price",
         "Wholesale Price",
         "Retail Price",
         "Retail Compare Price",
         "Wholesale Compare Price",
+        "Total Cost",
         "Quantity",
         "Allocated Quantity",
         "Available Quantity",
@@ -104,7 +109,7 @@ export const QOBLEX_NATIVE_COLUMN_MAP = `{
         "name": "Product",
         "type": "Product Type",
         "barcode": "Barcode",
-        "active": "State"
+        "lifecycleStatus": "State"
       },
       "valueMaps": {
         "type": {
@@ -114,30 +119,52 @@ export const QOBLEX_NATIVE_COLUMN_MAP = `{
           "bom": "BOM",
           "non-inventory": "NON_INVENTORY"
         },
-        "active": {
-          "Active": "TRUE",
-          "Inactive": "FALSE"
+        "lifecycleStatus": {
+          "Active": "ACTIVE",
+          "Inactive": "EOL",
+          "Archived": "DRAFT"
         }
+      },
+      "rowSelect": {
+        "column": "State",
+        "keep": [
+          "Active",
+          "Inactive",
+          "Archived"
+        ],
+        "skip": [
+          "Deleted"
+        ]
+      },
+      "nameColumn": "Product",
+      "nonStock": {
+        "column": "Product Type",
+        "value": "non-inventory"
+      },
+      "ghostRows": {
+        "column": "Product Type",
+        "ghost": "Unknown",
+        "quantityColumn": "Quantity"
       }
     },
     "stock-lots": {
       "rowsAboveHeader": 1,
       "expectedHeaders": [
         "Product",
-        "Barcode",
         "Sku",
+        "Barcode",
+        "State",
         "Brand",
         "Product Type",
-        "State",
         "Supplier",
         "Updated At",
         "Moving Average Cost",
-        "Total Cost",
         "Purchase Price",
         "Wholesale Price",
         "Retail Price",
         "Retail Compare Price",
         "Wholesale Compare Price",
+        "Total Cost",
         "Quantity",
         "Allocated Quantity",
         "Available Quantity",
@@ -187,18 +214,31 @@ export const QOBLEX_NATIVE_COLUMN_MAP = `{
       "constants": {
         "currency": "GBP"
       },
-      "rowSelect": {
-        "column": "Product Type",
-        "keep": [
-          "simple",
-          "variable",
-          "bom"
-        ],
-        "skip": [
-          "kit",
-          "non-inventory"
-        ]
-      },
+      "rowSelect": [
+        {
+          "column": "Product Type",
+          "keep": [
+            "simple",
+            "variable",
+            "bom"
+          ],
+          "skip": [
+            "kit",
+            "non-inventory"
+          ]
+        },
+        {
+          "column": "State",
+          "keep": [
+            "Active",
+            "Inactive",
+            "Archived"
+          ],
+          "skip": [
+            "Deleted"
+          ]
+        }
+      ],
       "wide": {
         "blockStart": "after-label",
         "warehouses": {
@@ -215,6 +255,16 @@ export const QOBLEX_NATIVE_COLUMN_MAP = `{
           "qty": "Quantity"
         },
         "uniqueBy": "sku"
+      },
+      "nameColumn": "Product",
+      "nonStock": {
+        "column": "Product Type",
+        "value": "non-inventory"
+      },
+      "ghostRows": {
+        "column": "Product Type",
+        "ghost": "Unknown",
+        "quantityColumn": "Quantity"
       }
     }
   }

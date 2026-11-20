@@ -7,7 +7,7 @@
  */
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
-import { InputError, ingestDataset, mergeIngested, parseColumnMap, type ColumnMap, type DatasetMapping, type IngestedDataset } from './ingest'
+import { InputError, decisionSkuKey, ingestDataset, type IngestDecisions, mergeIngested, parseColumnMap, type ColumnMap, type DatasetMapping, type IngestedDataset } from './ingest'
 import { renderAccountingTable, renderJson, renderMarkdown } from './report'
 import { DATASET_NAMES, EXIT_CODES, EXIT_CODE_TABLE, IN_TRANSIT_CONVENTIONS, type DatasetName, type InTransitConvention } from './spec'
 import { bindingFromVerification, normaliseStoreOrigin, parseVisibilityAttestation, verifyWooSnapshotBundle, type VisibilityAttestation, type VariantParentsBinding } from './snapshot'
@@ -244,8 +244,26 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
         return EXIT_CODES.USAGE
       }
     }
-    // Pass 2: read the files.
+    // Pass 2: read the files. The decisions lists that act while a source file is read (non-stock SKUs, SKU by product name) are read FIRST.
+    const DECISION_FIRST = new Set<DatasetName>(['non-stock-skus', 'sku-name-overrides'])
+    resolved.sort((a, b) => Number(DECISION_FIRST.has(b.input.dataset)) - Number(DECISION_FIRST.has(a.input.dataset)))
+    let decisions: IngestDecisions | undefined
+    const decisionsNow = (): IngestDecisions => {
+      const nonStockSkus = new Set<string>()
+      for (const part of parts['non-stock-skus'] ?? []) for (const row of part.ingested.rows) nonStockSkus.add(decisionSkuKey(row.values.sku ?? ''))
+      const skuByName = new Map<string, string>()
+      const typeByName = new Map<string, string>()
+      for (const part of parts['sku-name-overrides'] ?? []) for (const row of part.ingested.rows) {
+        const name = (row.values.name ?? '').trim()
+        const sku = (row.values.sku ?? '').trim()
+        if (name !== '' && sku !== '') skuByName.set(name, sku)
+        const type = (row.values.type ?? '').trim()
+        if (name !== '' && sku !== '' && (type === 'KIT' || type === 'BOM')) typeByName.set(name, type)
+      }
+      return { nonStockSkus, skuByName, typeByName }
+    }
     for (const { input, mapping } of resolved) {
+      if (decisions === undefined && !DECISION_FIRST.has(input.dataset)) decisions = decisionsNow()
       let bytes: Buffer
       try {
         bytes = readFileSync(resolve(input.file))
@@ -254,7 +272,7 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
         continue
       }
       try {
-        ;(parts[input.dataset] ??= []).push({ ingested: ingestDataset(input.dataset, bytes, input.file, mapping), supersedes: input.supersedesEarlier })
+        ;(parts[input.dataset] ??= []).push({ ingested: ingestDataset(input.dataset, bytes, input.file, mapping, decisions), supersedes: input.supersedesEarlier })
       } catch (error) {
         if (error instanceof InputError) problems.push(...error.problems)
         else throw error

@@ -207,7 +207,7 @@ test('the export is judged against the run\'s OWN cycle date: an export for the 
 // [mutation: the native-map digest check removed from the source]
 test('a column map that is not the native one (here one that skips a row kind) cannot make R2, R5 or R14 pass', async () => {
   const nativeDir = path.join(process.cwd(), 'tests/first-load/fixtures/qoblex-native')
-  const clean = readFileSync(path.join(nativeDir, 'stock-on-hand.csv'), 'utf8').split('\r\n').filter((line) => !/^"[^"]*","[^"]*","SYN-[0-9A-Z-]*","[^"]*","[Uu]nknown"/.test(line)).join('\r\n')
+  const clean = readFileSync(path.join(nativeDir, 'stock-on-hand.csv'), 'utf8').split('\r\n').filter((line) => !/^"[^"]*","SYN-[0-9A-Z-]*","[^"]*","[^"]*","[^"]*","[Uu]nknown"/.test(line)).join('\r\n')
   const m = JSON.parse(readFileSync(path.join(nativeDir, 'maps/qoblex-stock-on-hand.map.json'), 'utf8'))
   m.datasets['stock-lots'].rowSelect = { column: 'Product Type', keep: ['simple'], skip: ['variable'] }
   m.datasets.products.rowSelect = { column: 'Product Type', keep: ['simple'], skip: ['variable'] }

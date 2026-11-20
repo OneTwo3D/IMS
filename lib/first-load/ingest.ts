@@ -42,7 +42,8 @@ export interface DatasetMapping {
   /** The 'wide warehouse blocks' layout: one source row becomes one canonical row per warehouse block. */
   wide: WideLayout | null
   /** A closed list of the values of one column that decide whether a source row belongs to this dataset. */
-  rowSelect: RowSelect | null
+  /** One or more selectors; a row must pass ALL of them (each is a closed keep/skip list over its own column). null: no selection. */
+  rowSelect: RowSelect[] | null
   /** Rows that follow a parent row inherit its SKU as their parent (grouped layouts such as bundle files). */
   parentFrom: ParentFrom | null
   /** canonical column -> another canonical column of the same row it is derived from (then run through its own valueMaps). */
@@ -51,7 +52,22 @@ export interface DatasetMapping {
   dateFormats: Record<string, string>
   /** purchase-order-lines only: the source header the map DELIBERATELY reads as the line discount although its name does not look like a discount. Without it, lineDiscountPercent must map to a discount-looking header. */
   discountHeader: string | null
+  /** products and stock-lots: the source header that holds the product NAME. Used to name a row that has no SKU in its refusal and to find it in the sku-name-overrides decisions. */
+  nameColumn: string | null
+  /** products and stock-lots: the source cell that is OVERWRITTEN with `value` for a SKU on the non-stock-skus decisions list (so the row reads as that kind, e.g. Product Type = non-inventory). `value` must be a key the map already understands. */
+  nonStock: { column: string; value: string } | null
+  /** products and stock-lots: two or more rows of one SKU of which EXACTLY ONE is not typed `ghost` in `column` keep that one and drop the ghosts (reported with `quantityColumn`, the first header of that name). Anything else stays a duplicate. */
+  ghostRows: { column: string; ghost: string; quantityColumn: string | null } | null
 }
+
+/** Owner decisions that act while a source file is read (they never alter a file on disk). Keys are the trimmed, upper-cased SKU / the trimmed product name. */
+export interface IngestDecisions {
+  nonStockSkus: ReadonlySet<string>
+  skuByName: ReadonlyMap<string, string>
+  /** product name -> the product type (KIT or BOM) the owner states for a row found by name. */
+  typeByName?: ReadonlyMap<string, string>
+}
+export const decisionSkuKey = (sku: string): string => sku.normalize('NFKC').trim().toUpperCase()
 
 export interface WideLayout {
   blockStart: 'after-label' | 'at-label'
@@ -88,7 +104,7 @@ export interface ColumnMap {
 }
 
 const MAP_KEYS = new Set(['formatVersion', 'source', 'datasets'])
-const DATASET_MAP_KEYS = new Set(['columns', 'constants', 'valueMaps', 'expectedHeaders', 'delimiter', 'decimalSeparator', 'rowsAboveHeader', 'wide', 'rowSelect', 'parentFrom', 'derived', 'dateFormats', 'discountHeader'])
+const DATASET_MAP_KEYS = new Set(['columns', 'constants', 'valueMaps', 'expectedHeaders', 'delimiter', 'decimalSeparator', 'rowsAboveHeader', 'wide', 'rowSelect', 'parentFrom', 'derived', 'dateFormats', 'discountHeader', 'nameColumn', 'nonStock', 'ghostRows'])
 const DELIMITERS = new Set([',', ';', '\t', '|'])
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -210,18 +226,30 @@ function parseLayoutKeys(
     }
   }
 
-  let rowSelect: RowSelect | null = null
+  let rowSelect: RowSelect[] | null = null
   if (entry.rowSelect !== undefined) {
-    const r = entry.rowSelect
-    if (!isPlainObject(r)) problems.push(`${where}.rowSelect must be an object`)
-    else {
-      for (const key of Object.keys(r)) if (!ROW_SELECT_KEYS.has(key)) problems.push(`${where}.rowSelect: unknown key "${key}"`)
-      if (typeof r.column !== 'string' || r.column.trim() === '') problems.push(`${where}.rowSelect.column must be a source header`)
-      const keep = stringList(r.keep, `${where}.rowSelect.keep`, problems, false)
-      const skip = r.skip === undefined ? [] : stringList(r.skip, `${where}.rowSelect.skip`, problems, true)
-      for (const value of keep) if (skip.includes(value)) problems.push(`${where}.rowSelect: value ${JSON.stringify(value)} is in both keep and skip`)
-      if (typeof r.column === 'string') rowSelect = { column: r.column, keep, skip }
-    }
+    // One selector (an object, the original form) or a non-empty list of them: a row is read only when EVERY selector passes.
+    const selectors: unknown[] = Array.isArray(entry.rowSelect) ? entry.rowSelect : [entry.rowSelect]
+    const form = Array.isArray(entry.rowSelect) ? `${where}.rowSelect[` : `${where}.rowSelect`
+    if (Array.isArray(entry.rowSelect) && selectors.length === 0) problems.push(`${where}.rowSelect must not be an empty list`)
+    const parsed: RowSelect[] = []
+    selectors.forEach((r, i) => {
+      const at = Array.isArray(entry.rowSelect) ? `${form}${i}]` : form
+      if (!isPlainObject(r)) {
+        problems.push(`${at} must be an object`)
+        return
+      }
+      for (const key of Object.keys(r)) if (!ROW_SELECT_KEYS.has(key)) problems.push(`${at}: unknown key "${key}"`)
+      if (typeof r.column !== 'string' || r.column.trim() === '') problems.push(`${at}.column must be a source header`)
+      const keep = stringList(r.keep, `${at}.keep`, problems, false)
+      const skip = r.skip === undefined ? [] : stringList(r.skip, `${at}.skip`, problems, true)
+      for (const value of keep) if (skip.includes(value)) problems.push(`${at}: value ${JSON.stringify(value)} is in both keep and skip`)
+      if (typeof r.column === 'string') parsed.push({ column: r.column, keep, skip })
+    })
+    const columns = parsed.map((r) => r.column)
+    const repeated = columns.find((column, i) => columns.indexOf(column) !== i)
+    if (repeated !== undefined) problems.push(`${where}.rowSelect: column ${JSON.stringify(repeated)} is selected twice (merge the two lists)`)
+    if (parsed.length > 0) rowSelect = parsed
   }
 
   let parentFrom: ParentFrom | null = null
@@ -241,7 +269,7 @@ function parseLayoutKeys(
       if (typeof r.column === 'string' && typeof r.skuColumn === 'string' && typeof r.into === 'string') {
         parentFrom = { column: r.column, parentValues, skuColumn: r.skuColumn, into: r.into }
       }
-      if (rowSelect && parentFrom && rowSelect.column !== parentFrom.column) problems.push(`${where}: rowSelect.column and parentFrom.column must be the same source header`)
+      if (rowSelect && parentFrom && !rowSelect.some((r) => r.column === parentFrom!.column)) problems.push(`${where}: rowSelect.column and parentFrom.column must be the same source header`)
     }
   }
 
@@ -432,7 +460,27 @@ export function parseColumnMap(jsonText: string, label: string): ColumnMap {
         else if (columns.lineDiscountPercent !== entry.discountHeader) problems.push(`${where}.discountHeader: ${JSON.stringify(entry.discountHeader)} must be the header lineDiscountPercent is mapped to (found ${JSON.stringify(columns.lineDiscountPercent ?? null)})`)
         else discountHeader = entry.discountHeader
       }
-      datasets[name as DatasetName] = { columns, constants, valueMaps, expectedHeaders, discountHeader, delimiter: typeof delimiter === 'string' ? delimiter : ',', ...layout }
+      let nameColumn: string | null = null
+      let nonStock: { column: string; value: string } | null = null
+      if (entry.nameColumn !== undefined) {
+        if (name !== 'products' && name !== 'stock-lots') problems.push(`${where}.nameColumn: only products and stock-lots carry a product name`)
+        else if (typeof entry.nameColumn !== 'string' || entry.nameColumn.trim() === '') problems.push(`${where}.nameColumn must be a source header`)
+        else nameColumn = entry.nameColumn
+      }
+      if (entry.nonStock !== undefined) {
+        const n = entry.nonStock
+        if (name !== 'products' && name !== 'stock-lots') problems.push(`${where}.nonStock: only products and stock-lots can be set non-stock`)
+        else if (!isPlainObject(n) || typeof n.column !== 'string' || n.column.trim() === '' || typeof n.value !== 'string') problems.push(`${where}.nonStock must be { "column": <source header>, "value": <source value> }`)
+        else nonStock = { column: n.column, value: n.value }
+      }
+      let ghostRows: { column: string; ghost: string; quantityColumn: string | null } | null = null
+      if (entry.ghostRows !== undefined) {
+        const g = entry.ghostRows
+        if (name !== 'products' && name !== 'stock-lots') problems.push(`${where}.ghostRows: only products and stock-lots have ghost rows`)
+        else if (!isPlainObject(g) || typeof g.column !== 'string' || g.column.trim() === '' || typeof g.ghost !== 'string' || g.ghost === '' || (g.quantityColumn !== undefined && typeof g.quantityColumn !== 'string')) problems.push(`${where}.ghostRows must be { "column": <source header>, "ghost": <value>, "quantityColumn"?: <source header> }`)
+        else ghostRows = { column: g.column, ghost: g.ghost, quantityColumn: typeof g.quantityColumn === 'string' ? g.quantityColumn : null }
+      }
+      datasets[name as DatasetName] = { columns, constants, valueMaps, expectedHeaders, discountHeader, nameColumn, nonStock, ghostRows, delimiter: typeof delimiter === 'string' ? delimiter : ',', ...layout }
     }
   }
   if (problems.length > 0) throw new InputError(problems)
@@ -472,6 +520,8 @@ export interface IngestedDataset {
   recordsRead: number
   /** Rows the map's closed `rowSelect.skip` list deliberately left out, by the value that skipped them. Not records. */
   rowsSkipped: Record<string, number>
+  /** Explanatory lines the read adds to the report (INFO): ghost rows dropped, stock ignored on a KIT decided by the owner. */
+  notes?: Array<{ line: number; code: string; reason: string }>
   /**
    * Rows a LATER file of the same dataset deliberately replaced (manifest `supersedesEarlier`), with the line they were on.
    * They are records read, and the transform books each as EXCLUDED, so the accounting still reconciles.
@@ -618,6 +668,7 @@ export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = 
     rows: kept.flatMap((rows, index) => rows.map((row) => ({ ...row, line: shifted(row.line, index) }))),
     rejected: [...rejectedOf.flatMap((list, index) => list.map((rejection) => ({ ...rejection, line: shifted(rejection.line, index) }))), ...conflicts, ...crossRejected],
     unmappedHeaders: unmapped,
+    notes: parts.flatMap((part, index) => (part.notes ?? []).map((note) => ({ ...note, line: shifted(note.line, index) }))),
     recordsRead: parts.reduce((total, part) => total + part.recordsRead, 0) - removedRecords + crossRejected.length,
     superseded,
     wideKey: null,
@@ -710,7 +761,7 @@ function layoutBlocks(wide: WideLayout, labelRow: string[], header: string[], fi
   return blocks
 }
 
-export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: string, mapping: DatasetMapping | null): IngestedDataset {
+export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: string, mapping: DatasetMapping | null, decisions?: IngestDecisions): IngestedDataset {
   const spec = DATASETS[dataset]
   const sha256 = createHash('sha256').update(bytes).digest('hex')
   let text: string
@@ -748,7 +799,11 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
   const readIndexes = new Set<number>()
   let blocks: Block[] = []
   const totalIndex = new Map<string, number>()
-  let selectIndex = -1
+  let selectIndexes: number[] = []
+  let nameIndex = -1
+  let nonStockIndex = -1
+  let ghostIndex = -1
+  let ghostQtyIndex = -1
   let parentKindIndex = -1
   let parentSkuIndex = -1
   if (mapping === null) {
@@ -789,8 +844,21 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
     }
     if (dataset === 'purchase-order-lines') discountHeaderProblems(file, header, mapping, problems)
     if (mapping.rowSelect) {
-      selectIndex = locate(mapping.rowSelect.column, 'rowSelect')
-      if (selectIndex >= 0) readIndexes.add(selectIndex)
+      selectIndexes = mapping.rowSelect.map((selector) => locate(selector.column, 'rowSelect'))
+      for (const at of selectIndexes) if (at >= 0) readIndexes.add(at)
+    }
+    if (mapping.nameColumn) {
+      nameIndex = locate(mapping.nameColumn, 'nameColumn')
+      if (nameIndex >= 0) readIndexes.add(nameIndex)
+    }
+    if (mapping.nonStock) {
+      nonStockIndex = locate(mapping.nonStock.column, 'nonStock.column')
+      if (nonStockIndex >= 0) readIndexes.add(nonStockIndex)
+    }
+    if (mapping.ghostRows) {
+      ghostIndex = locate(mapping.ghostRows.column, 'ghostRows.column')
+      if (ghostIndex >= 0) readIndexes.add(ghostIndex)
+      if (mapping.ghostRows.quantityColumn) ghostQtyIndex = header.indexOf(mapping.ghostRows.quantityColumn)
     }
     if (mapping.parentFrom) {
       parentKindIndex = locate(mapping.parentFrom.column, 'parentFrom.column')
@@ -823,6 +891,61 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
   const rows: CanonRow[] = []
   const rejected: IngestRejection[] = []
   const rowsSkipped: Record<string, number> = {}
+  // OWNER DECISIONS, applied to the cells as they are read (before the wide keys, the row selection and the value maps see them):
+  // a blank SKU is filled from sku-name-overrides by the exact product name, and a SKU on non-stock-skus has its kind cell overwritten.
+  const skuAt = mapping ? indexOf.get('sku') : undefined
+  const notes: Array<{ line: number; code: string; reason: string }> = []
+  const kindFromDecision = new Map<number, string>()
+  const ghostLines = new Set<number>()
+  const quantityOf = (cells: string[]): string => {
+    const at = totalIndex.get('qty') ?? ghostQtyIndex
+    return at !== undefined && at >= 0 ? clean(cells[at]) : '(not read)'
+  }
+  if (mapping && decisions && skuAt !== undefined) {
+    const sourceKind = (type: string): string => {
+      const mapped = Object.entries(mapping.valueMaps.type ?? {}).find(([, canonical]) => canonical === type)
+      return mapped ? mapped[0] : type.toLowerCase().replace(/_/g, '-')
+    }
+    for (const record of records) {
+      if (record.cells.length !== header.length) continue
+      const sku = clean(record.cells[skuAt])
+      const name = nameIndex >= 0 ? clean(record.cells[nameIndex]) : ''
+      if (sku === '' && nameIndex >= 0) {
+        const fill = decisions.skuByName.get(name)
+        if (fill !== undefined) {
+          record.cells[skuAt] = fill
+          const type = decisions.typeByName?.get(name)
+          if (type && nonStockIndex >= 0) {
+            record.cells[nonStockIndex] = sourceKind(type)
+            kindFromDecision.set(record.line, type)
+          }
+        }
+      }
+      if (nonStockIndex >= 0 && mapping.nonStock && decisions.nonStockSkus.has(decisionSkuKey(record.cells[skuAt]))) record.cells[nonStockIndex] = mapping.nonStock.value
+    }
+  }
+  // GHOST ROWS: of several rows for one SKU, exactly one typed (not `ghost`) keeps its place and the ghosts are dropped, each reported with its quantity.
+  // Two typed rows, or only ghosts, are left alone: they are refused as duplicates downstream.
+  if (mapping?.ghostRows && skuAt !== undefined && ghostIndex >= 0) {
+    const ghost = mapping.ghostRows.ghost
+    const bySku = new Map<string, typeof records>()
+    for (const record of records) {
+      if (record.cells.length !== header.length) continue
+      const key = decisionSkuKey(record.cells[skuAt])
+      if (key !== '') bySku.set(key, [...(bySku.get(key) ?? []), record])
+    }
+    for (const group of bySku.values()) {
+      if (group.length < 2) continue
+      const typed = group.filter((r) => clean(r.cells[ghostIndex]) !== ghost)
+      if (typed.length !== 1) continue
+      for (const r of group) {
+        if (r === typed[0]) continue
+        ghostLines.add(r.line)
+        rowsSkipped['ghost row dropped'] = (rowsSkipped['ghost row dropped'] ?? 0) + 1
+        notes.push({ line: r.line, code: 'GHOST_ROW_DROPPED', reason: `ghost row dropped: SKU ${clean(r.cells[skuAt])} line ${r.line} is typed ${JSON.stringify(ghost)} and quantity ${quantityOf(r.cells)}; the typed row on line ${typed[0].line} (quantity ${quantityOf(typed[0].cells)}) is kept` })
+      }
+    }
+  }
   const emissions = blocks.length > 0 ? blocks : [null]
   // A wide file is one row per key: every row that shares its key with another row is refused, whatever else it says, because the
   // warehouse quantities of two rows are never to be added together (the report cannot say whether it repeated a row or listed a second one).
@@ -835,9 +958,10 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
     if (keyAt !== undefined) {
       for (const record of records) {
         if (record.cells.length !== header.length) continue
+        if (ghostLines.has(record.line)) continue
         // A row the map deliberately SKIPS is not part of this dataset, so its key is not a key of the dataset (rows that are kept, or refused
         // later, still count: a refused row is still a row that said something about that key).
-        if (mapping.rowSelect && selectIndex >= 0 && mapping.rowSelect.skip.includes(clean(record.cells[selectIndex]))) continue
+        if (mapping.rowSelect && mapping.rowSelect.some((selector, i) => selectIndexes[i]! >= 0 && selector.skip.includes(clean(record.cells[selectIndexes[i]!])))) continue
         const key = wideKeyOf(mapping, record.cells[keyAt])
         if (key !== '') {
           seen.set(key, (seen.get(key) ?? 0) + 1)
@@ -897,17 +1021,35 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
       const sku = clean(record.cells[parentSkuIndex])
       parent = sku === '' ? null : sku
     }
-    if (mapping?.rowSelect && selectIndex >= 0) {
-      const kind = clean(record.cells[selectIndex])
-      if (mapping.rowSelect.skip.includes(kind)) {
+    if (ghostLines.has(record.line)) continue
+    if (mapping?.rowSelect) {
+      // EVERY selector must pass. A deliberate skip on ANY selector leaves the row out (counted under that value) BEFORE any other selector's
+      // keep list is judged, so a Deleted row of an unlisted type is skipped, not refused. Only a row nothing skips is refused, on the first
+      // selector whose value is in neither list.
+      const kinds = mapping.rowSelect.map((selector, i) => (selectIndexes[i]! >= 0 ? clean(record.cells[selectIndexes[i]!]) : null))
+      const skipped = mapping.rowSelect.findIndex((selector, i) => kinds[i] !== null && selector.skip.includes(kinds[i]!))
+      if (skipped >= 0) {
+        const kind = kinds[skipped]!
         rowsSkipped[kind] = (rowsSkipped[kind] ?? 0) + 1
+        if (kindFromDecision.get(record.line) === 'KIT' && dataset === 'stock-lots' && skuAt !== undefined) {
+          notes.push({ line: record.line, code: 'KIT_STOCK_IGNORED', reason: `SKU ${clean(record.cells[skuAt])} is a KIT by the owner's decision: the on-hand quantity ${quantityOf(record.cells)} on line ${record.line} is Qoblex's computed availability, not stock, and is not loaded` })
+        }
         continue
       }
-      if (!mapping.rowSelect.keep.includes(kind)) {
+      if (skuAt !== undefined && clean(record.cells[skuAt]) === '' && nameIndex >= 0) {
+        rejected.push({
+          line: record.line,
+          code: 'BLANK_SKU',
+          reason: `the row for product ${JSON.stringify(clean(record.cells[nameIndex]))} has no SKU. Supply it in the sku-name-overrides decisions file (name, sku, reason) or fix it in the source`,
+        })
+        continue
+      }
+      const unlisted = mapping.rowSelect.findIndex((selector, i) => kinds[i] !== null && !selector.keep.includes(kinds[i]!))
+      if (unlisted >= 0) {
         rejected.push({
           line: record.line,
           code: 'UNLISTED_ROW_KIND',
-          reason: `${mapping.rowSelect.column} value ${JSON.stringify(kind)} is in neither rowSelect.keep nor rowSelect.skip of the column map (a row kind is never guessed; list it deliberately)`,
+          reason: `${mapping.rowSelect[unlisted]!.column} value ${JSON.stringify(kinds[unlisted])} is in neither rowSelect.keep nor rowSelect.skip of the column map (a row kind is never guessed; list it deliberately)`,
         })
         continue
       }
@@ -974,6 +1116,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
     superseded: [],
     wideKey: mapping?.wide && wideKeys ? { column: mapping.wide.uniqueBy, keys: wideKeys } : null,
     rowsSkipped,
+    notes,
     parts: [{ file, sha256, bytes: bytes.length }],
   }
 }

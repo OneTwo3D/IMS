@@ -210,7 +210,7 @@ test('the native column map is read once and parsed by the first-load ingest; a 
   const nativeDir = path.join(process.cwd(), 'tests/first-load/fixtures/qoblex-native')
   const native = readFileSync(path.join(nativeDir, 'stock-on-hand.csv'), 'utf8').split('\r\n')
   // The fixture carries a deliberately bad row ('Unknown' product type); the export an operator supplies must not.
-  const clean = native.filter((line) => !/^"[^"]*","[^"]*","SYN-[0-9A-Z-]*","[^"]*","[Uu]nknown"/.test(line)).join('\r\n')
+  const clean = native.filter((line) => !/^"[^"]*","SYN-[0-9A-Z-]*","[^"]*","[^"]*","[^"]*","[Uu]nknown"/.test(line)).join('\r\n')
   assert.ok(clean.length < native.join('\r\n').length, 'the bad row was dropped')
   const map = readFileSync(path.join(nativeDir, 'maps/qoblex-stock-on-hand.map.json'), 'utf8')
   const dir = writeExport(bases, {
@@ -239,10 +239,10 @@ test('the native column map is read once and parsed by the first-load ingest; a 
 test('THE NATIVE MAP COVERS THE TYPES AND STATES R14 NEEDS: kit, bom, non-inventory and inactive read through the full source; every other type or state is a closed refusal', () => {
   const nativeDir = path.join(process.cwd(), 'tests/first-load/fixtures/qoblex-native')
   const lines = readFileSync(path.join(nativeDir, 'stock-on-hand.csv'), 'utf8').split('\r\n')
-  const clean = lines.filter((line) => !/^"[^"]*","[^"]*","SYN-[0-9A-Z-]*","[^"]*","[Uu]nknown"/.test(line))
+  const clean = lines.filter((line) => !/^"[^"]*","SYN-[0-9A-Z-]*","[^"]*","[^"]*","[^"]*","[Uu]nknown"/.test(line))
   const template = clean.find((line) => line.includes('"SYN-1001"'))!
   const map = readFileSync(path.join(nativeDir, 'maps/qoblex-stock-on-hand.map.json'), 'utf8')
-  const row = (sku: string, type: string, state: string) => template.replace('"SYN-1001"', `"${sku}"`).replace('"simple","Active"', `"${type}","${state}"`)
+  const row = (sku: string, type: string, state: string) => template.replace('"SYN-1001"', `"${sku}"`).replace('"Active","Unknown","simple"', `"${state}","Unknown","${type}"`)
   const locations = ['MIL1', 'CAMBRIDGE', 'RESTOCK', 'QUARANTINE-CAMBRIDGE', 'RXT2'].map((code) => ({ code, company: 'ACME', threePl: code === 'RXT2' }))
   const exportOf = (extra: string[]) => {
     const csv = [...clean.filter((line) => line !== ''), ...extra, ''].join('\r\n')
@@ -257,8 +257,8 @@ test('THE NATIVE MAP COVERS THE TYPES AND STATES R14 NEEDS: kit, bom, non-invent
   const types = new Map((covered.value.products.ok ? covered.value.products.value : []).map((p) => [p.sku, p.type]))
   assert.deepEqual([types.get('COV-KIT'), types.get('COV-BOM'), types.get('COV-NONINV'), types.get('COV-OFF'), types.get('COV-OFFVAR')], ['KIT', 'BOM', 'NON_INVENTORY', 'SIMPLE', 'VARIANT'])
   // the state the map gives each product (the pack does not read it; the first-load tool does, so it is pinned here through the same ingest)
-  const rows = ingestDataset('products', Buffer.from([...clean.filter((line) => line !== ''), row('COV-ON', 'simple', 'Active'), row('COV-OFF', 'simple', 'Inactive'), ''].join('\r\n')), 'stock.csv', parseColumnMap(QOBLEX_NATIVE_COLUMN_MAP, 'native').datasets.products!).rows
-  assert.deepEqual([rows.find((r) => r.values.sku === 'COV-ON')?.values.active, rows.find((r) => r.values.sku === 'COV-OFF')?.values.active], ['TRUE', 'FALSE'])
+  const rows = ingestDataset('products', Buffer.from([...clean.filter((line) => line !== ''), row('COV-ON', 'simple', 'Active'), row('COV-OFF', 'simple', 'Inactive'), row('COV-DRAFT', 'simple', 'Archived'), ''].join('\r\n')), 'stock.csv', parseColumnMap(QOBLEX_NATIVE_COLUMN_MAP, 'native').datasets.products!).rows
+  assert.deepEqual([rows.find((r) => r.values.sku === 'COV-ON')?.values.lifecycleStatus, rows.find((r) => r.values.sku === 'COV-OFF')?.values.lifecycleStatus, rows.find((r) => r.values.sku === 'COV-DRAFT')?.values.lifecycleStatus], ['ACTIVE', 'EOL', 'DRAFT'])
   assert.ok(covered.value.stock.ok, JSON.stringify(covered.value.stock))
   const lotSkus = new Set((covered.value.stock.ok ? covered.value.stock.value : []).map((lot) => lot.sku))
   assert.ok(lotSkus.has('COV-BOM') && lotSkus.has('COV-OFF') && lotSkus.has('COV-OFFVAR'), 'a bom and an inactive product keep their stock lots')
@@ -268,7 +268,7 @@ test('THE NATIVE MAP COVERS THE TYPES AND STATES R14 NEEDS: kit, bom, non-invent
     ['the export\'s own Unknown type', row('COV-X1', 'Unknown', 'Active')],
     ['a type nobody has seen', row('COV-X2', 'bundle', 'Active')],
     ['a listed type in another case', row('COV-X3', 'Kit', 'Active')],
-    ['a state nobody has seen', row('COV-X4', 'simple', 'Archived')],
+    ['a state nobody has seen', row('COV-X4', 'simple', 'Suspended')],
     ['a state in another case', row('COV-X5', 'simple', 'active')],
     ['an empty state', row('COV-X6', 'simple', '')],
     ['an empty type', row('COV-X7', '', 'Active')],
@@ -285,7 +285,7 @@ test('THE NATIVE MAP COVERS THE TYPES AND STATES R14 NEEDS: kit, bom, non-invent
 // [mutation: the native-map digest check removed from ingest()]
 test('a column map cannot change what is compared: ONLY the repository\'s native map is accepted, by the bytes read (a valueMap 9 -> 10, a constant, a skip, one changed byte are all COLUMN_MAP_NOT_NATIVE)', () => {
   const nativeDir = path.join(process.cwd(), 'tests/first-load/fixtures/qoblex-native')
-  const clean = readFileSync(path.join(nativeDir, 'stock-on-hand.csv'), 'utf8').split('\r\n').filter((line) => !/^"[^"]*","[^"]*","SYN-[0-9A-Z-]*","[^"]*","[Uu]nknown"/.test(line)).join('\r\n')
+  const clean = readFileSync(path.join(nativeDir, 'stock-on-hand.csv'), 'utf8').split('\r\n').filter((line) => !/^"[^"]*","SYN-[0-9A-Z-]*","[^"]*","[^"]*","[^"]*","[Uu]nknown"/.test(line)).join('\r\n')
   const nativeText = readFileSync(path.join(nativeDir, 'maps/qoblex-stock-on-hand.map.json'), 'utf8')
   const original = JSON.parse(nativeText) as { datasets: Record<string, Record<string, unknown>> }
   const locations = ['MIL1', 'CAMBRIDGE', 'RESTOCK', 'QUARANTINE-CAMBRIDGE', 'RXT2'].map((code) => ({ code, company: 'ACME', threePl: code === 'RXT2' }))
@@ -347,7 +347,7 @@ test('a SKU or warehouse code the ingest would trim or normalise is IDENTITY_NOT
   // the native layout: the Sku cell of the stock report
   const nativeDir = path.join(process.cwd(), 'tests/first-load/fixtures/qoblex-native')
   const nativeText = readFileSync(path.join(nativeDir, 'maps/qoblex-stock-on-hand.map.json'), 'utf8')
-  const clean = readFileSync(path.join(nativeDir, 'stock-on-hand.csv'), 'utf8').split('\r\n').filter((line) => !/^"[^"]*","[^"]*","SYN-[0-9A-Z-]*","[^"]*","[Uu]nknown"/.test(line)).join('\r\n')
+  const clean = readFileSync(path.join(nativeDir, 'stock-on-hand.csv'), 'utf8').split('\r\n').filter((line) => !/^"[^"]*","SYN-[0-9A-Z-]*","[^"]*","[^"]*","[^"]*","[Uu]nknown"/.test(line)).join('\r\n')
   const locations = ['MIL1', 'CAMBRIDGE', 'RESTOCK', 'QUARANTINE-CAMBRIDGE', 'RXT2'].map((code) => ({ code, company: 'ACME', threePl: code === 'RXT2' }))
   const native = (csv: string) => read(writeExport(bases, { stock: csv, products: null, locations, extra: { 'map.json': nativeText, 'stock.csv': csv }, patch: (man) => {
     const ref = { file: 'stock.csv', sha256: sha256(csv), columnMap: { file: 'map.json', sha256: sha256(nativeText) } }
