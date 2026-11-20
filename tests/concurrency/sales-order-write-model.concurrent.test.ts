@@ -130,6 +130,8 @@ async function writtenRows(w: World, orderId: string) {
   const header: Record<string, unknown> = {}
   for (const [k, v] of Object.entries(so)) {
     if (['id', 'orderNumber', 'createdAt', 'updatedAt', 'lines', 'externalOrderNumber'].includes(k)) continue
+    // The per-rate discount tax split exists only for an order priced with the apportionment switch on (the flag-ON test below); NULL everywhere else, so the golden of the header-rate write is unchanged.
+    if (k === 'discountTaxSplit' && v === null) continue
     header[k] = v instanceof Date ? 'DATE' : isDecimal(v) ? String(v) : strip(v)
   }
   const lines = so.lines.map((l) => {
@@ -160,6 +162,42 @@ test('createSalesOrder writes rows byte-identical to the golden captured before 
     return
   }
   assert.deepEqual(JSON.parse(json), JSON.parse(readFileSync(GOLDEN, 'utf8')))
+})
+
+test('sales_order_discount_tax_apportion_enabled ON: the capped discount on the mixed-rate order keeps the header tax non-negative and the order stores the per-rate split; OFF clears it again on an edit', SKIP, async (t) => {
+  const w = await seedWorld()
+  const { db } = await import('@/lib/db')
+  const KEY = 'sales_order_discount_tax_apportion_enabled'
+  t.after(async () => { await db.setting.deleteMany({ where: { key: KEY } }); await w.teardown() })
+  const { createSalesOrder, updateSalesOrder } = await import('@/app/actions/sales')
+  const c = WRITE_CASES.find((x) => x.key === 'exclusive-usd-override-and-capped-discount')!
+  await db.setting.deleteMany({ where: { key: KEY } })
+  const off = await createSalesOrder(inputFor(w, c) as never)
+  assert.equal(off.success, true, off.error)
+  w.orderIds.push(off.order!.id)
+  const offRow = await db.salesOrder.findUniqueOrThrow({ where: { id: off.order!.id }, select: { taxForeign: true, discountTaxSplit: true } })
+  assert.ok(Number(offRow.taxForeign) < 0, 'the golden header-rate behaviour is untouched with the switch off: negative header tax')
+  assert.equal(offRow.discountTaxSplit, null)
+
+  await db.setting.upsert({ where: { key: KEY }, create: { key: KEY, value: 'true' }, update: { value: 'true' } })
+  const on = await createSalesOrder(inputFor(w, c) as never)
+  assert.equal(on.success, true, on.error)
+  w.orderIds.push(on.order!.id)
+  const onRow = await db.salesOrder.findUniqueOrThrow({ where: { id: on.order!.id }, select: { taxForeign: true, subtotalForeign: true, discountAmount: true, discountTaxSplit: true } })
+  assert.ok(Number(onRow.taxForeign) >= 0, `apportioned header tax ${onRow.taxForeign}`)
+  assert.equal(Number(onRow.discountAmount), Number(onRow.subtotalForeign), 'the discount is capped at the goods')
+  const split = onRow.discountTaxSplit as Array<{ taxRateId: string; netForeign: number; taxForeign: number }>
+  assert.ok(Array.isArray(split) && split.length === 2, 'two line rates (5% and 0%): one entry each')
+  assert.equal(Math.round(split.reduce((s2, e) => s2 + e.netForeign, 0) * 10000) / 10000, Number(onRow.subtotalForeign))
+  assert.deepEqual(split.map((e) => e.taxRateId).sort(), [w.rateIds.red, w.rateIds.zero].sort())
+
+  // An edit with the switch off writes the header-rate way again and clears the split.
+  await db.setting.deleteMany({ where: { key: KEY } })
+  const edited = await updateSalesOrder(on.order!.id, inputFor(w, c) as never, await versionOf(on.order!.id))
+  assert.equal(edited.success, true, edited.error)
+  const after = await db.salesOrder.findUniqueOrThrow({ where: { id: on.order!.id }, select: { discountTaxSplit: true, taxForeign: true } })
+  assert.equal(after.discountTaxSplit, null)
+  assert.ok(Number(after.taxForeign) < 0)
 })
 
 test('an edited draft writes exactly the rows creating the edited order fresh writes; identity is kept, lines are replaced, totals recomputed', SKIP, async (t) => {

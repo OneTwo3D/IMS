@@ -1,3 +1,4 @@
+import { parseDiscountTaxSplit } from '@/lib/domain/sales/discount-tax-split'
 import { businessDateYmd } from '@/lib/business-date'
 import { Prisma, SalesOrderStatus } from '@/app/generated/prisma/client'
 import { computeRealisedFx, describeFxRefusal, settlementAsOfFromStored, type FxSettlementSide } from '@/lib/accounting-fx'
@@ -40,6 +41,8 @@ export type FinanceAnalyticsClient = {
   purchaseOrder?: FindManyDelegate
   /** The VAT report's credit-note sources (a real client always has them; a stand-in without them reads no credit notes). */
   salesOrderRefundLine?: FindManyDelegate
+  /** Read for the rate a per-rate discount reversal belongs to (a real client always has it; a stand-in without it nets such a line on the "No tax rate" row, as before). */
+  taxRate?: FindManyDelegate
   supplierCreditNote?: FindManyDelegate
 }
 
@@ -223,12 +226,15 @@ export type CurrencySummaryReportRow = {
 
 type SalesOrderLineTaxRow = {
   taxRateId: string | null
+  orderId?: string
   taxForeign: DecimalInput
   taxBase: DecimalInput
   totalBase: DecimalInput
   order: {
     shippingAddress: unknown
     pricesIncludeVat: boolean
+    /** The order discount's tax by line rate (SalesOrder.discountTaxSplit), on an order priced with the apportionment on; null otherwise. */
+    discountTaxSplit?: unknown
   }
   taxRate: {
     name: string
@@ -240,6 +246,8 @@ type SalesOrderLineTaxRow = {
 }
 
 type RefundLineTaxRow = {
+  /** On a discount reversal of an apportioned order: the rate whose share of the discount it reverses ('' = a line with no rate id). */
+  discountTaxRateId?: string | null
   totalBase: DecimalInput
   postedTaxRate: DecimalInput | null
   lineKind?: string | null
@@ -255,6 +263,8 @@ type ShippingOrderTaxRow = {
   shippingBase: DecimalInput
   taxBase: DecimalInput
   shippingAddress: unknown
+  /** The discount's tax by line rate, when the order apportioned it: its VAT is on the rate rows, not in the order-level residual. */
+  discountTaxSplit?: unknown
   lines: Array<{ taxBase: DecimalInput }>
 }
 
@@ -579,7 +589,10 @@ function emptyShippingTax(): ShippingTaxSums {
 /** Folds one order into the shipping sums. Pure, so the arithmetic is tested without a database. */
 export function addShippingOrder(sums: ShippingTaxSums, order: ShippingOrderTaxRow): void {
   const lineTax = order.lines.reduce((sum, l) => sum.add(toDecimal(l.taxBase)), new Prisma.Decimal(0))
-  const orderLevelTax = toDecimal(order.taxBase).sub(lineTax)
+  // An order whose discount tax was apportioned across its line rates has that VAT taken off the rate rows (see getVatReport), so it is added back here: the residual is then the shipping VAT alone.
+  const split = parseDiscountTaxSplit(order.discountTaxSplit)
+  const discountTax = split ? split.reduce((sum, entry) => sum.add(toDecimal(entry.taxBase)), new Prisma.Decimal(0)) : new Prisma.Decimal(0)
+  const orderLevelTax = toDecimal(order.taxBase).sub(lineTax).add(discountTax)
   const shipping = toDecimal(order.shippingBase)
   if (orderLevelTax.isZero() && shipping.isZero()) return
   const jurisdiction = countryFromShippingAddress(order.shippingAddress)
@@ -603,7 +616,7 @@ async function collectShippingTax(client: FinanceAnalyticsClient, window: { date
         ...salesInvoiceDocumentDateWhere({ gte: window.dateFrom, lt: window.dateToExclusive }),
         status: { not: SalesOrderStatus.CANCELLED },
       },
-      select: { id: true, shippingBase: true, taxBase: true, shippingAddress: true, lines: { select: { taxBase: true } } },
+      select: { id: true, shippingBase: true, taxBase: true, shippingAddress: true, discountTaxSplit: true, lines: { select: { taxBase: true } } },
       orderBy: { id: 'asc' },
       take: SHIPPING_PAGE_SIZE,
       ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
@@ -640,10 +653,11 @@ export async function getVatReport(
       },
       select: {
         taxRateId: true,
+        orderId: true,
         taxForeign: true,
         taxBase: true,
         totalBase: true,
-        order: { select: { shippingAddress: true, pricesIncludeVat: true } },
+        order: { select: { shippingAddress: true, pricesIncludeVat: true, discountTaxSplit: true } },
         taxRate: { select: { name: true, rate: true, accountingTaxType: true, countryCode: true, reportingCategory: true } },
       },
       take: SOURCE_ROW_LIMIT + 1,
@@ -692,6 +706,7 @@ export async function getVatReport(
       select: {
         totalBase: true,
         postedTaxRate: true,
+        discountTaxRateId: true,
         lineKind: true,
         productId: true,
         refund: { select: { order: { select: { shippingAddress: true } } } },
@@ -785,6 +800,7 @@ export async function getVatReport(
     return row
   }
 
+  const discountSeen = new Set<string>()
   for (const line of salesLines) {
     const jurisdiction = line.taxRate?.countryCode ?? countryFromShippingAddress(line.order.shippingAddress)
     const ratePct = pctString(line.taxRate?.rate ?? 0)
@@ -803,6 +819,18 @@ export async function getVatReport(
       : toDecimal(line.totalBase)
     row.taxableBase = row.taxableBase.add(taxableBase)
     row.taxBase = row.taxBase.add(toDecimal(line.taxBase))
+    // An order whose discount tax was apportioned across its line rates: that rate's share of the discount (net and VAT) comes off this rate's row, once per order and rate, so each row is the
+    // base and VAT the invoice posted at the rate. An order priced the header-rate way has no split and keeps the discount VAT in the order-level residual.
+    const discountSplit = parseDiscountTaxSplit(line.order.discountTaxSplit)
+    if (discountSplit && line.orderId) {
+      const seenKey = `${line.orderId}:${line.taxRateId ?? ''}`
+      const entry = discountSplit.find((e) => e.taxRateId === line.taxRateId)
+      if (entry && !discountSeen.has(seenKey)) {
+        discountSeen.add(seenKey)
+        row.taxableBase = row.taxableBase.sub(toDecimal(entry.netBase))
+        row.taxBase = row.taxBase.sub(toDecimal(entry.taxBase))
+      }
+    }
   }
 
   for (const invoice of purchaseInvoices) {
@@ -844,15 +872,23 @@ export async function getVatReport(
     row.taxBase = row.taxBase.add(entry.tax)
   }
   // CREDIT NOTES reduce the side they credit, exactly as Xero's return nets them by credit-note date.
+  // The reversal of one rate's share of an apportioned order discount (a discount line with the rate it reverses) nets against THAT rate's row, whichever period the order's own lines fall in, so the rate is read by id.
+  const discountRateIds = [...new Set(refundLines.map((l) => l.discountTaxRateId).filter((id): id is string => typeof id === 'string' && id !== ''))]
+  const discountRates = new Map<string, NonNullable<RefundLineTaxRow['salesOrderLine']>['taxRate']>()
+  if (discountRateIds.length > 0 && client.taxRate) {
+    const found = await client.taxRate.findMany({ where: { id: { in: discountRateIds } }, select: { id: true, name: true, rate: true, accountingTaxType: true, countryCode: true, reportingCategory: true } }) as Array<{ id: string } & NonNullable<NonNullable<RefundLineTaxRow['salesOrderLine']>['taxRate']>>
+    for (const r of found) discountRates.set(r.id, r)
+  }
   for (const line of refundLines) {
-    const taxRate = line.salesOrderLine?.taxRate ?? null
+    const discountRateId = refundLineKind(line) === 'discount' && line.discountTaxRateId ? line.discountTaxRateId : null
+    const taxRate = line.salesOrderLine?.taxRate ?? (discountRateId ? discountRates.get(discountRateId) ?? null : null)
     const rate = line.postedTaxRate != null ? toDecimal(line.postedTaxRate) : toDecimal(taxRate?.rate ?? 0)
     const net = toDecimal(line.totalBase)
     // A shipping refund (a credit line with no order line, of kind shipping, or a legacy line with no kind) nets against the shipping row it was counted on, not the "No tax rate" row.
     const isShippingRefund = line.salesOrderLine === null && refundLineKind(line) === 'shipping'
     const row = getOrCreateRow({
       side: 'sales',
-      taxRateId: line.salesOrderLine?.taxRateId ?? null,
+      taxRateId: line.salesOrderLine?.taxRateId ?? (discountRateId && discountRates.has(discountRateId) ? discountRateId : null),
       taxRateName: isShippingRefund ? SHIPPING_ROW_NAME : taxRate?.name ?? 'No tax rate',
       accountingTaxType: taxRate?.accountingTaxType ?? null,
       reportingCategory: taxRate?.reportingCategory ?? null,

@@ -140,7 +140,7 @@ import { NO_TAX_TYPE, connectorEmitsDiscount, connectorEmitsShipping, droppedExt
 import { describeAllocationAttempt } from '@/lib/domain/sales/allocation-activity'
 import { matchContinuedOrderLines } from '@/lib/domain/sales/order-edit-lines'
 import { resolveOrderEditWmsGate } from '@/lib/domain/sales/order-edit-wms-gate'
-import { SalesInvoiceDoesNotReconcileError, SalesInvoiceOriginalDateUnknownError, SalesInvoiceExtraNotMappedError, SalesInvoiceNotQueuedError, SalesInvoiceReverseChargeSwapNotSetError, reverseChargeSwapMissing, assertInvoiceQueuedOrNotOwed, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
+import { SalesInvoiceDoesNotReconcileError, SalesInvoiceOriginalDateUnknownError, SalesInvoiceExtraNotMappedError, SalesInvoiceDiscountSplitError, SalesInvoiceNotQueuedError, SalesInvoiceReverseChargeSwapNotSetError, reverseChargeSwapMissing, assertInvoiceQueuedOrNotOwed, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
 import {
   INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
   STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
@@ -148,6 +148,7 @@ import {
   storedAmountsIncludeVat,
 } from '@/lib/domain/sales/sales-order-vat-basis'
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
+import { invoiceDiscountParts, parseDiscountTaxSplit, type DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
 import { decideChargebackOrderDiscount, resolvePostedOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
 import { claimDocumentNumber, mintCommittedDocumentNumber, retryWhenNumberTaken } from '@/lib/domain/numbering/mint'
 import { invoiceNumberIsExternallySupplied, resolveInvoiceNumberToRecord, resolveSalesInvoiceNumberForPost } from '@/lib/domain/accounting/sales-invoice-number'
@@ -352,6 +353,8 @@ export type SoDetail = SoRow & {
   customerId: string | null
   /** The order's version as loaded: the edit form sends it back and the edit is refused if the order moved since. */
   updatedAt: string
+  /** The discount's tax by line rate when the order was priced with the apportionment on; null otherwise (the header-rate treatment). */
+  discountTaxSplit: DiscountTaxSplitEntry[] | null
   billingAddress: unknown
   shippingAddress: unknown
   lines: SoLineRow[]
@@ -376,6 +379,8 @@ export type SoDetail = SoRow & {
       totalForeign: number
       totalBase: number
       lineKind: string | null
+      /** On a discount reversal of an apportioned order: the rate whose share it reverses ('' = a line with no rate id). */
+      discountTaxRateId: string | null
       /** The net the credit note carries for this line (its base column on a base-currency order, else its foreign one). */
       postedNet: number
       /** The rate of the tax code the line posts under (its persisted snapshot), or null when that code cannot be priced. */
@@ -1011,6 +1016,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
       ...SO_SELECT,
       customerId: true,
       updatedAt: true,
+      discountTaxSplit: true,
       billingAddress: true,
       shippingAddress: true,
       iossNumber: true,
@@ -1037,7 +1043,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
           id: true, creditNoteNumber: true, reason: true, returnReason: { select: { name: true } }, totalForeign: true, totalBase: true, refundedAt: true,
           accountingRetryRequired: true,
           lines: {
-            select: { id: true, salesOrderLineId: true, productId: true, description: true, qty: true, unitPriceForeign: true, totalForeign: true, totalBase: true, accountingTaxType: true, postedTaxRate: true, lineKind: true },
+            select: { id: true, salesOrderLineId: true, productId: true, description: true, qty: true, unitPriceForeign: true, totalForeign: true, totalBase: true, accountingTaxType: true, postedTaxRate: true, lineKind: true, discountTaxRateId: true },
           },
           payments: {
             select: { id: true, amount: true, currency: true, method: true, reference: true, notes: true, paidAt: true },
@@ -1136,6 +1142,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     settlement,
     customerId: so.customerId,
     updatedAt: so.updatedAt.toISOString(),
+    discountTaxSplit: parseDiscountTaxSplit(so.discountTaxSplit),
     billingAddress: so.billingAddress,
     shippingAddress: so.shippingAddress,
     lines: so.lines.map(mapLine),
@@ -1162,6 +1169,7 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
         totalForeign: Number(rl.totalForeign),
         totalBase: Number(rl.totalBase),
         lineKind: rl.lineKind,
+        discountTaxRateId: rl.discountTaxRateId ?? null,
         postedNet: creditFactsByRefund.get(r.id)![index].postedNet,
         vatRate: creditFactsByRefund.get(r.id)![index].vatRate,
         vatRateEstimated: creditFactsByRefund.get(r.id)![index].vatRateEstimated,
@@ -1330,6 +1338,10 @@ async function prepareSalesOrderWrite(input: CreateSoInput, options?: { pinnedFx
   if (!taxValidation.success) return { ok: false as const, error: taxValidation.error }
 
   const apportionDiscountTax = (await getSettingValue('sales_order_discount_tax_apportion_enabled')) === 'true'
+  // The discount's per-rate split is keyed by the rate id: a line that names none cannot be placed on a rate, so such an order is refused rather than split ambiguously.
+  if (apportionDiscountTax && (input.orderDiscountForeign ?? 0) > 0 && lineResolved.some((r) => !r.taxRateId)) {
+    return { ok: false as const, error: 'The order discount is taxed per line rate, but a line has no tax rate to place its share of the discount on. Give every line a tax rate and try again.' }
+  }
   const model = buildSalesOrderWriteModel({
     fxRate,
     vatRate,
@@ -1337,9 +1349,9 @@ async function prepareSalesOrderWrite(input: CreateSoInput, options?: { pinnedFx
     shippingForeign: input.shippingForeign,
     fees: input.fees,
     orderDiscountForeign: input.orderDiscountForeign,
-    // OFF unless an operator enables it: the invoice still posts the discount on the header rate, so the apportioned tax is only for a deployment whose posting follows it (see changelog).
+    // OFF unless an operator enables it. With it on the order stores the discount's per-rate split (SalesOrder.discountTaxSplit) and the invoice, the reconciliation, the refund reversal and the VAT report read it (lib/domain/sales/discount-tax-split.ts).
     apportionDiscountTax,
-    lines: input.lines.map((l, idx) => ({ input: l, rate: lineResolved[idx].taxRateValue, taxRateId: lineResolved[idx].taxRateId })),
+    lines: input.lines.map((l, idx) => ({ input: l, rate: lineResolved[idx].taxRateValue, taxRateId: lineResolved[idx].taxRateId, accountingTaxType: lineResolved[idx].accountingTaxType, reverseCharge: lineResolved[idx].reverseCharge })),
   })
   return { ok: true as const, fxRate, vatRate, inclVat, model, lineResolved, taxValidation, destCountry, productCategoryById, orderDefaultRate }
 }
@@ -1375,6 +1387,8 @@ function salesOrderHeaderData(input: CreateSoInput, prepared: { fxRate: number; 
     salesRep: input.salesRep || null,
     discountStr: input.orderDiscountStr || null,
     discountAmount: t.discountAmount,
+    // The discount's tax by line rate, only for an order priced with the apportionment on; NULL otherwise (an edit that no longer apportions clears it), so every consumer of the stored order knows which treatment it carries.
+    discountTaxSplit: prepared.model.discountTaxSplit ? (prepared.model.discountTaxSplit as unknown as Prisma.InputJsonValue) : Prisma.DbNull,
     notes: input.notes || null,
     internalNotes: input.internalNotes || null,
   }
@@ -2041,6 +2055,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
       pricesIncludeVat: true,
       shoppingLinks: { select: { connector: true } },
       discountAmount: true,
+      discountTaxSplit: true,
       totalForeign: true,
       accountingInvoiceId: true,
       // The invoice's document date is the storefront creation day (else the stamp written when the first post went out): an UPDATE keeps it.
@@ -2121,6 +2136,20 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   // `discountAmount` is stored in the same inclusive/exclusive convention as
   // the order (matching WC import), so it can be passed through directly.
   const discountForeign = roundDecimalNumber(so.discountAmount ?? 0, 2)
+
+  // An order whose discount tax was apportioned across its line rates posts the discount as one negative line PER tax code (same account), so the ledger's VAT per rate is the order's: the single
+  // header-rate line would put the discount's VAT on the wrong rate. `discountAmount` stays the document's total; an order priced the header-rate way carries no parts and posts as before.
+  const discountSplit = discountForeign > 0 ? parseDiscountTaxSplit(so.discountTaxSplit) : null
+  const discountPartsOrNull = discountSplit
+    ? invoiceDiscountParts({
+        split: discountSplit,
+        lineAmountsIncludeTax,
+        totalAmount: discountForeign,
+        taxTypeOf: (entry) => resolveSalesLineTaxType({ baseTaxType: entry.accountingTaxType ?? orderDefaultTaxType, reverseCharge: entry.reverseCharge, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }) ?? null,
+      })
+    : []
+  if (discountPartsOrNull === null) throw new SalesInvoiceDiscountSplitError(discountForeign, so.currency)
+  const discountParts = discountPartsOrNull
 
   // o3d-k26m.1: prefer the number already recorded on the order over one derived here. See
   // lib/domain/accounting/sales-invoice-number.ts — the create is an upsert on InvoiceNumber, so
@@ -2204,13 +2233,16 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     discountAccountCode: settings.discountAccount || undefined,
     discountTaxType: orderDefaultTaxType ?? undefined,
     ...rateBinding(orderDefaultRate?.id, 'plain', 'discount'),
+    ...(discountParts.length > 0
+      ? { discountParts: discountParts.map((part) => ({ amount: part.amount, taxType: part.taxType ?? undefined, ...rateBinding(part.taxRateId, 'sales_line') })) }
+      : {}),
     lineAmountsIncludeTax,
     // o3d-hqvrp.389, behind `xero_round_to_order_total_enabled` (off by default; with it off the payload is byte for byte what it was): the connector posts a Rounding line so the
     // document totals what the order totals. Not part of the posting key (lib/accounting/payload-key.ts).
     ...(roundToOrderTotal ? { orderTotal: Number(so.totalForeign) } : {}),
   }
 
-  const sentCodes = [...new Set([...payload.lines.map((l) => l.taxType), payload.shippingTaxType, payload.discountTaxType].filter((c): c is string => typeof c === 'string' && c.trim() !== '' && !isNoTaxType(c)))]
+  const sentCodes = [...new Set([...payload.lines.map((l) => l.taxType), payload.shippingTaxType, payload.discountTaxType, ...(payload.discountParts ?? []).map((part) => part.taxType)].filter((c): c is string => typeof c === 'string' && c.trim() !== '' && !isNoTaxType(c)))]
   const codeRates = sentCodes.length ? await reader.taxRate.findMany({ where: { accountingTaxType: { in: sentCodes }, active: true }, select: { accountingTaxType: true, rate: true } }) : []
   const rateOfSentCode = (code: string | null | undefined): number | null => {
     if (typeof code !== 'string' || code.trim() === '') return null
@@ -2232,6 +2264,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     lines: payload.lines.map((l, idx) => ({ quantity: l.quantity, unitAmount: l.unitAmount, discountAmount: l.discountAmount, rate: rateOfSentCode(l.taxType), storedTax: Number(so.lines[idx]?.taxForeign ?? 0) })),
     shippingRate: rateOfSentCode(payload.shippingTaxType),
     discountRate: rateOfSentCode(payload.discountTaxType),
+    discountParts: connectorEmitsDiscount(payload) ? payload.discountParts?.map((part) => ({ amount: part.amount, rate: rateOfSentCode(part.taxType) })) : undefined,
     shippingAmount: connectorEmitsShipping(payload) ? payload.shippingAmount : undefined,
     discountAmount: connectorEmitsDiscount(payload) ? payload.discountAmount : undefined,
   }, Number(so.totalForeign))
@@ -4089,6 +4122,7 @@ export async function raiseChargebackForReversedOrder(
       totalBase: true,
       taxBase: true,
       discountAmount: true,
+      discountTaxSplit: true,
       // o3d-y14 r3 finding 1: the credit note mirrors WHAT THE INVOICE POSTED, so the discount
       // resolution needs the order's currency, its restatement record and its invoice link.
       currency: true,
@@ -4235,6 +4269,22 @@ export async function raiseChargebackForReversedOrder(
           ? 'the order-level discount was restated after the invoice posted — manual chargeback required'
           : 'the posted order-level discount could not be established — manual chargeback required',
     }
+  }
+  // An order whose discount tax was apportioned across its line rates posted the discount per rate; the chargeback mirror below is ONE discount line at the header code, which would credit the
+  // wrong VAT per rate. Fail closed to the manual path (the refund dialog reverses the discount per rate) until the chargeback mirrors the split.
+  if (discountDecision.amount > 0 && parseDiscountTaxSplit(order.discountTaxSplit)) {
+    const orderRef = order.orderNumber ?? order.externalOrderNumber ?? orderId
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: orderId,
+      action: 'chargeback_requires_manual_handling',
+      tag: 'accounting',
+      level: 'WARNING',
+      description: withLedgerCheck(`Payment reversed on order ${orderRef}, whose order-level discount was taxed at its lines' rates (apportioned across the tax rates): the invoice posted the discount per rate, so the automatic chargeback (one discount line at the order's default rate) would credit the wrong VAT per rate. Auto-chargeback skipped; raise the refund from the order, which reverses the discount per rate, or the credit note manually.`),
+      metadata: { reason: 'DISCOUNT_TAX_APPORTIONED' },
+      resolveUser: false,
+    })
+    return { raised: false, reason: 'the order-level discount was taxed per line rate — manual chargeback required' }
   }
   // Past this point the posted document and the order agree (or nothing has posted), so the two
   // readings are interchangeable and the figure below is both.
