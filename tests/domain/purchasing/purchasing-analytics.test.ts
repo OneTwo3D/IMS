@@ -291,3 +291,24 @@ test('open purchase order report windows poSentAt/createdAt on LONDON days (BST 
   assert.equal(sentWindow.lt.toISOString(), '2026-07-31T23:00:00.000Z')
   assert.equal(report.rows[0]!.poSentAt, '2026-07-01', 'the sent date is the London day, not the UTC day')
 })
+
+test('lead-time rows carry the LONDON day of the latest receipt beside the UTC instant (23:30Z on 31 July is 1 August)', async () => {
+  const client: PurchasingAnalyticsClient = {
+    ...unusedClient(),
+    purchaseReceipt: {
+      findMany: async () => [{
+        id: 'receipt-late',
+        receivedAt: new Date('2026-07-31T23:30:00.000Z'),
+        po: { id: 'po-1', reference: 'PO-1', supplierId: 'supplier-1', expectedDelivery: null, poSentAt: new Date('2026-07-20T00:00:00.000Z'), createdAt: new Date('2026-07-20T00:00:00.000Z'), supplier },
+        lines: [{ poLineId: 'line-1', qtyReceived: decimal('1'), poLine: { qty: decimal('1'), productId: 'product-1', product } }],
+      }],
+    },
+    supplierProduct: { findMany: async () => [] },
+  }
+  const report = await getLeadTimeReport(
+    { dateFrom: '2026-08-01', dateTo: '2026-08-31' },
+    { deps: { client, now: () => new Date('2026-11-20T12:00:00.000Z') } },
+  )
+  assert.equal(report.rows[0]?.latestReceiptAt, '2026-07-31T23:30:00.000Z')
+  assert.equal(report.rows[0]?.latestReceiptDate, '2026-08-01')
+})

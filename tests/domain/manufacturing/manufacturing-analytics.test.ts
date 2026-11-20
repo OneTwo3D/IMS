@@ -749,3 +749,26 @@ test('WIP treats an empty snapshot as a real zero-component recipe (no reservati
   assert.equal(report.rows[0].reservedComponentValueBase, '0')
   assert.equal(report.notices.some((n) => /no usable frozen recipe/.test(n)), false)
 })
+
+test('production variance and WIP rows carry London dates beside the UTC instants (23:30Z on 31 July is 1 August)', async () => {
+  const late = {
+    scheduledAt: new Date('2026-07-31T23:30:00Z'),
+    startedAt: new Date('2026-07-31T23:45:00Z'),
+    completedAt: new Date('2026-07-31T23:50:00Z'),
+  }
+  const variance = await getProductionVarianceReport(
+    { dateFrom: '2026-08-01', dateTo: '2026-08-31' },
+    {},
+    { client: manufacturingClient({ orders: [frozenOrder(late)], movements: [{ referenceId: 'po-1', productId: 'component-a', qty: '16', totalValueBase: '80' }, { referenceId: 'po-1', productId: 'component-b', qty: '8', totalValueBase: '40' }] }), now: () => new Date('2026-11-20T12:00:00Z') },
+  )
+  assert.equal(variance.rows[0]?.completedAt, '2026-07-31T23:50:00.000Z')
+  assert.equal(variance.rows[0]?.completedDate, '2026-08-01')
+  assert.equal(variance.rows[0]?.scheduledDate, '2026-08-01')
+  const wip = await getWipReport(
+    {},
+    {},
+    { client: manufacturingClient({ orders: [wipOrder({ ...late, status: 'IN_PROGRESS', completedAt: null, manufacturingCostLines: [] })], movements: [] }), now: () => new Date('2026-11-20T12:00:00Z') },
+  )
+  assert.equal(wip.rows[0]?.startedDate, '2026-08-01')
+  assert.equal(wip.rows[0]?.scheduledDate, '2026-08-01')
+})

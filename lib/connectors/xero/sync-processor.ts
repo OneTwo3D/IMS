@@ -74,6 +74,7 @@ import { storeCreditBlock, type StoreCreditBlock, storeCreditCreditNotePosterErr
 import {
   BACK_REFERENCE_REPAIRABLE_STATUSES,
   applyBackReference,
+  recoverPostedBusinessDate,
   backReferenceIsMissing,
   claimFollowUpObligation,
   followUpObligationRecoveryNote,
@@ -4256,7 +4257,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         // moved. Whether it moved is still news for whoever moved it — see reportPostOnMovedAttempt.
         await reportPostOnMovedAttempt(attempt, entry, entry.externalTransactionId, payload)
         try {
-          await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
+          await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined, payload)
           // AFTER the enqueue, and that ORDER IS THE FIX (o3d-nepa r4, Codex finding 1).
           //
           // r3 put the announcement first and then threw when it could not be written, so a failed
@@ -4419,7 +4420,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         await reportPostOnMovedAttempt(attempt, entry, syncResult.externalId ?? null, payload)
 
         try {
-          await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
+          await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber, payload)
           const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult,
             // The record this post was made under, read in the same statement as the payload.
             { payload, ...origin },
@@ -4891,7 +4892,7 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
         // that an operator's decision about this attempt is now known to be wrong is not.
         await reportPostOnMovedAttempt(attempt, entry, entry.externalTransactionId, payload)
         try {
-          await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined)
+          await updateBackReference(entry.type, entry.referenceType, entry.referenceId, entry.externalTransactionId, undefined, payload)
           // AFTER the enqueue, and that ORDER IS THE FIX (o3d-nepa r4, Codex finding 1).
           //
           // r3 put the announcement first and then threw when it could not be written, so a failed
@@ -5078,7 +5079,7 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
         await reportPostOnMovedAttempt(attempt, entry, syncResult.externalId ?? null, payload)
 
         try {
-          await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber)
+          await updateBackReference(entry.type, entry.referenceType, entry.referenceId, syncResult.externalId, syncResult.invoiceNumber, payload)
           const followUps = await enqueueFollowUps(entry.id, entry.type, entry.referenceType, entry.referenceId, payload, syncResult,
             // The record this post was made under, read in the same statement as the payload.
             { payload, ...origin },
@@ -7221,6 +7222,7 @@ async function updateBackReference(
   referenceId: string,
   externalId?: string,
   invoiceNumber?: string,
+  postedPayload?: unknown,
 ): Promise<void> {
   if (!externalId) return
   // o3d-ngmt.21: a confirmed delete is not a back-reference at all — it UNWINDS the link. The unwind is idempotent and keyed on the ledger's
@@ -7233,7 +7235,10 @@ async function updateBackReference(
   // on the sync row (externalTransactionId) before this runs, and the caller's
   // catch marks the row for retry so the next pass re-applies the back-reference
   // from the stored id. Swallowing left the document permanently orphaned.
-  const applied = await applyBackReference(db, { connector: XERO_CONNECTOR, type, referenceType, referenceId, externalId, invoiceNumber })
+  // A sales invoice's `invoicedAt` is the date the document was SENT with (its payload date), not the instant the post succeeded: a post delayed past London midnight keeps its document day,
+  // which is also the day the VAT report uses for an order with no storefront date. A payload with no readable date keeps the live path's own `now`.
+  const postedDate = type === 'SALES_INVOICE' && referenceType === 'SalesOrder' && typeof postedPayload === 'object' && postedPayload !== null ? recoverPostedBusinessDate(postedPayload as Record<string, unknown>) : null
+  const applied = await applyBackReference(db, { connector: XERO_CONNECTOR, type, referenceType, referenceId, externalId, invoiceNumber, ...(postedDate ? { invoicedAt: postedDate } : {}) })
   // o3d-9kek: a legacy PurchaseOrder-keyed row that cannot be attributed to one bill is
   // refused rather than written onto the newest unlinked bill. Surface it — silence here
   // is what let a wrong id look like a successful write.

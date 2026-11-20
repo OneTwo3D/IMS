@@ -2,6 +2,7 @@
 
 import { claimDocumentNumber, mintCommittedDocumentNumber, retryWhenNumberTaken } from '@/lib/domain/numbering/mint'
 import { businessDateYmd } from '@/lib/business-date'
+import { supplierCreditNoteDocumentDay } from '@/lib/domain/accounting/document-date'
 import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import { type MoneyLike, assertPoApprovedForSend, PoApprovalRequiredError, approvalSpendBase, CLEARED_APPROVAL, editInvalidatesApproval, evaluatePoApproval, PO_APPROVAL_FACTS_SELECT, PO_APPROVAL_SELF_MESSAGE, PO_APPROVAL_CREATOR_UNKNOWN_MESSAGE, PO_APPROVAL_STATUSES_OPEN_FOR_APPROVAL, PO_APPROVAL_THRESHOLD_SETTING_KEY, approverIsRequester, readApprovalThreshold, validateApprovalThresholdInput } from '@/lib/domain/purchasing/po-approval'
 import { effectiveLineEta, parseLineEtaInput } from '@/lib/domain/purchasing/line-eta'
@@ -5988,7 +5989,9 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     // The credit's payload is built BEFORE the claim so an undecided tax type is refused while the credit is still a DRAFT: claiming first would leave it POSTED, refused by the poster with
     // no Xero credit and no way back (posting requires DRAFT). A legacy bill line can reconstruct the right VAT and still have no mapped tax type.
     // Single date for both the journal and its subledger row (they must share the GL date dimension the reconciliation windows on).
-    const creditNoteDate = businessDateYmd(new Date())
+    // ONE clock read: the date sent and `postedAt` cannot straddle London midnight.
+    const creditNotePostedAt = new Date()
+    const creditNoteDate = supplierCreditNoteDocumentDay(creditNotePostedAt)
     const creditNotePayload = shouldQueueXero ? buildSupplierCreditNoteSyncPayload({
       creditNoteId: cn.id,
       creditNoteNumber: cn.creditNoteNumber,
@@ -6055,7 +6058,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     const postSupplierCreditNoteTransaction = () => db.$transaction(async (tx) => {
       const claimed = await tx.supplierCreditNote.updateMany({
         where: { id, status: 'DRAFT' },
-        data: { status: 'POSTED', postedAt: new Date() },
+        data: { status: 'POSTED', postedAt: creditNotePostedAt },
       })
       if (claimed.count === 0) return false
       // GR/IR accrual: a return-generated credit note is the supplier crediting back goods that were billed and then returned, which lifts the

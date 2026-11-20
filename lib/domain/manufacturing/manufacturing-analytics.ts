@@ -1,3 +1,4 @@
+import { businessDateYmd } from '@/lib/business-date'
 import { Prisma, ProductionOrderStatus, ProductionOrderType, StockMovementType } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
@@ -53,7 +54,11 @@ export type ProductionVarianceReportRow = {
   productionOrderHref: string
   status: ProductionOrderStatus
   scheduledAt: string | null
+  /** The London business day of `scheduledAt` (YYYY-MM-DD), null when unset. */
+  scheduledDate: string | null
   completedAt: string | null
+  /** The London business day of `completedAt` (YYYY-MM-DD), null when unset. */
+  completedDate: string | null
   warehouseCode: string
   outputSku: string
   outputProductName: string
@@ -77,7 +82,11 @@ export type WipReportRow = {
   productionOrderHref: string
   status: ProductionOrderStatus
   startedAt: string | null
+  /** The London business day of `startedAt` (YYYY-MM-DD), null when unset. */
+  startedDate: string | null
   scheduledAt: string | null
+  /** The London business day of `scheduledAt` (YYYY-MM-DD), null when unset. */
+  scheduledDate: string | null
   daysSinceStart: string
   warehouseCode: string
   outputSku: string
@@ -514,7 +523,9 @@ export async function getProductionVarianceReport(
         productionOrderHref: orderHref(order.id),
         status: order.status,
         scheduledAt: order.scheduledAt?.toISOString() ?? null,
+        scheduledDate: order.scheduledAt ? businessDateYmd(order.scheduledAt) : null,
         completedAt: order.completedAt?.toISOString() ?? null,
+        completedDate: order.completedAt ? businessDateYmd(order.completedAt) : null,
         warehouseCode: order.warehouse.code,
         outputSku: order.outputProduct.sku,
         outputProductName: order.outputProduct.name,
@@ -657,7 +668,9 @@ export async function getWipReport(
       productionOrderHref: orderHref(order.id),
       status: order.status,
       startedAt: order.startedAt?.toISOString() ?? null,
+      startedDate: order.startedAt ? businessDateYmd(order.startedAt) : null,
       scheduledAt: order.scheduledAt?.toISOString() ?? null,
+      scheduledDate: order.scheduledAt ? businessDateYmd(order.scheduledAt) : null,
       daysSinceStart: roundQuantity(daysSinceStart, 1).toString(),
       warehouseCode: order.warehouse.code,
       outputSku: order.outputProduct.sku,

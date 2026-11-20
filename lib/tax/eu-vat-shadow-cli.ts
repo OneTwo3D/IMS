@@ -97,7 +97,7 @@ export function renderEuVatShadowUsage(): string {
     '--live-read is REQUIRED: it is the operator\'s statement that reading the live Xero organisation and the live store is intended. Run it only when the owner has said to.',
     '',
     '--orders   IMS order ids or storefront order numbers, comma separated.',
-    '--from/--to  IMS orders created in the range (inclusive, UTC dates).',
+    '--from/--to  IMS orders created in the range (inclusive, LONDON dates: a BST day runs 23:00Z to 23:00Z).',
     `--max      the most orders read (default ${SHADOW_DEFAULT_MAX_ORDERS}, hard ceiling ${SHADOW_HARD_MAX_ORDERS}). A selection larger than this is cut and reported as truncated.`,
     '',
     'Only the order number and the compared figures are printed: no customer name, email, address, description or response body.',

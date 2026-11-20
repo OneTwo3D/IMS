@@ -833,3 +833,22 @@ test('FX gain/loss measures a paid reverse-charge bill on its NET payable, the f
   assert.equal(report.rows[0]?.amountForeign, '100', 'the net payable, not the 120 gross')
   assert.equal(report.rows[0]?.bookedBase, '80', 'the stored base total prorated by the payable share: 96 x 100 / 120')
 })
+
+test('FX gain/loss rows carry the LONDON day of paidAt beside the UTC instant (23:30Z on 31 July is 1 August)', async () => {
+  const client: FinanceAnalyticsClient = {
+    ...unusedClient(),
+    payment: {
+      findMany: async () => [{
+        id: 'payment-late', amount: decimal('120'), currency: 'USD', paidAt: new Date('2026-07-31T23:30:00.000Z'), refundId: null,
+        order: { id: 'so-1', orderNumber: 'SO-1', invoiceNumber: 'INV-1', currency: 'USD', fxRateToBase: decimal('1.2'), customerName: 'Customer A', customerEmail: null },
+      }],
+    },
+    fxRate: { findMany: async () => [{ fromCurrency: 'GBP', toCurrency: 'USD', rate: decimal('1.1'), fetchedAt: new Date('2026-07-31T00:00:00.000Z') }] },
+  }
+  const report = await getFxGainLossReport(
+    { dateFrom: '2026-08-01', dateTo: '2026-08-31' },
+    { deps: { client, now: () => new Date('2026-11-20T12:00:00.000Z'), accountingSettings: settings } },
+  )
+  assert.equal(report.rows[0]?.paidAt, '2026-07-31T23:30:00.000Z')
+  assert.equal(report.rows[0]?.paidDate, '2026-08-01')
+})
