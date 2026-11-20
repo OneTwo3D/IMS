@@ -835,6 +835,7 @@ function noopDeps(overrides: Partial<LandedCostServiceDeps> = {}): LandedCostSer
     getReversalConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getTransferConsumedQtyForCostLayer: async () => new Prisma.Decimal(0),
     getInTransitTransferLinesForCostLayer: async () => [],
+    recordTransferTransitRevaluations: async () => {},
     getDependentOutputSourceLines: async () => [],
     updateSnapshotsForCostLayerChange: async () => 0,
     refreshShipmentCogsForCostLayerChange: async () => ({ shipmentsUpdated: 0, cogsRevaluationDelta: new Prisma.Decimal(0) }),
@@ -1896,6 +1897,7 @@ function worldDeps(world: ReturnType<typeof createLandedCostWorld>): LandedCostS
   return noopDeps({
     getTransferConsumedQtyForCostLayer: (tx, id) => getTransferConsumedQtyForCostLayer(tx, id) as never,
     getInTransitTransferLinesForCostLayer: (tx, id) => getInTransitTransferLinesForCostLayer(tx, id) as never,
+    recordTransferTransitRevaluations: async () => {},
     getDependentOutputSourceLines: async (tx, sourceCostLayerId) => {
       const rows = await tx.costLayerSourceLine.findMany({
         where: { sourceCostLayerId },

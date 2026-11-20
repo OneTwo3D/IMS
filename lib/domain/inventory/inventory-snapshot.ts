@@ -2,6 +2,7 @@ import { Prisma, type PrismaClient, type StockMovementType } from '@/app/generat
 import { db } from '@/lib/db'
 import { INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { businessDateYmd } from '@/lib/business-date'
+import { loadInTransitTransferValues, type InTransitTransferValue } from '@/lib/domain/inventory/transfer-in-transit-value'
 import {
   loadReservationSourceRows,
   type ReservationBreakdownClient,
@@ -88,6 +89,8 @@ export type InventorySnapshotRunInput = {
   source: 'cron' | 'backfill'
   checkMethod: string
   cutoffAt: Date | null
+  /** True when the run valued the stock in transit (inventory_transit_snapshots) for its date. */
+  inTransitCovered?: boolean
 }
 
 export type InventorySnapshotDrift = {
@@ -107,6 +110,8 @@ export type InventorySnapshotBuildResult = {
 export type InventorySnapshotWriteResult = {
   snapshotDate: string
   snapshotsWritten: number
+  /** Transfers valued in transit for this date (the "in transit" line); null when the client could not measure it. */
+  inTransitTransfersWritten?: number | null
   reservationSnapshotsWritten: number
   reservationSnapshotStockLevelCount: number
   driftCount: number
@@ -954,6 +959,38 @@ async function writeReservationSnapshotRun(
   } as never)
 }
 
+/**
+ * Persist the "in transit" line for `snapshotDate`: one row per transfer in transit at the capture instant. A re-run of the date
+ * replaces the day's rows (a transfer that has since stopped being in transit as of that instant drops out). Returns the number
+ * of rows, or null when the client cannot write them (an injected test double), so the run is not marked as covering transit.
+ */
+async function writeInTransitSnapshotRows(
+  client: SnapshotClient,
+  snapshotDate: Date,
+  values: readonly InTransitTransferValue[] | null,
+): Promise<number | null> {
+  if (values === null) return null
+  const transit = (client as unknown as {
+    inventoryTransitSnapshot?: {
+      deleteMany(args: unknown): Promise<unknown>
+      createMany(args: unknown): Promise<unknown>
+    }
+  }).inventoryTransitSnapshot
+  if (!transit) return null
+  await transit.deleteMany({ where: { snapshotDate } })
+  if (values.length > 0) {
+    await transit.createMany({
+      data: values.map((row) => ({
+        snapshotDate,
+        transferId: row.transferId,
+        valueBase: row.valueBase.toFixed(6),
+        valueReplayReliable: row.reliable,
+      })),
+    })
+  }
+  return values.length
+}
+
 async function writeInventorySnapshotRun(
   client: SnapshotClient,
   row: InventorySnapshotRunInput,
@@ -968,6 +1005,7 @@ async function writeInventorySnapshotRun(
       source: row.source,
       checkMethod: row.checkMethod,
       cutoffAt: row.cutoffAt,
+      ...(row.inTransitCovered ? { inTransitCovered: true } : {}),
     },
     update: {
       stockLevelCount: row.stockLevelCount,
@@ -975,6 +1013,7 @@ async function writeInventorySnapshotRun(
       source: row.source,
       checkMethod: row.checkMethod,
       cutoffAt: row.cutoffAt,
+      ...(row.inTransitCovered ? { inTransitCovered: true } : {}),
       updatedAt,
     },
   } as never)
@@ -1154,13 +1193,38 @@ export async function writeDailyInventorySnapshot(options: {
   return writeDailyInventorySnapshotOn(db as SnapshotClient, options, unlockedFence)
 }
 
+async function readStateAndInTransit(client: SnapshotClient): Promise<{
+  state: SnapshotState
+  costLayerQtyByKey: Map<string, Decimal>
+  inTransit: InTransitTransferValue[] | null
+}> {
+  const readOn = async (reader: SnapshotClient) => {
+    const current = await loadAggregatedCurrentSnapshotState(reader)
+    return { ...current, inTransit: await loadInTransitTransferValues(reader, new Date()) }
+  }
+  const transactional = client as unknown as {
+    $queryRaw?: unknown
+    $transaction?: (fn: (tx: SnapshotClient) => Promise<unknown>, options?: unknown) => Promise<unknown>
+  }
+  if (typeof transactional.$queryRaw === 'function' && typeof transactional.$transaction === 'function') {
+    return await transactional.$transaction((tx) => readOn(tx), {
+      isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead,
+      timeout: 10 * 60_000,
+    }) as Awaited<ReturnType<typeof readOn>>
+  }
+  return readOn(client)
+}
+
 async function writeDailyInventorySnapshotOn(client: SnapshotClient, options: {
   snapshotDate?: SnapshotDateInput
   tolerance?: Decimal
 }, fence?: SnapshotFence): Promise<InventorySnapshotWriteResult> {
   const snapshotDate = parseSnapshotDate(options.snapshotDate)
+  // The stock state is CURRENT state, so stock in transit is measured at the same instant (not at the day's end): a transfer received
+  // between the day's end and this run is already in the destination's state and must not also be counted in transit. Both reads
+  // run in ONE REPEATABLE READ transaction, so a receipt or dispatch committing between them is in both or in neither.
   await fence?.('before-state-read')
-  const { state, costLayerQtyByKey } = await loadAggregatedCurrentSnapshotState(client)
+  const { state, costLayerQtyByKey, inTransit } = await readStateAndInTransit(client)
   const reservationSnapshot = await loadCurrentReservationSnapshotRows(client, snapshotDate)
   const drift = findDrift(state, costLayerQtyByKey, options.tolerance)
   // Captured from current state today → point-in-time reliable.
@@ -1168,6 +1232,9 @@ async function writeDailyInventorySnapshotOn(client: SnapshotClient, options: {
 
   await fence?.('before-snapshot-rows')
   const snapshotsWritten = await writeSnapshotRows(client, rows, fence)
+  // In-transit rows are written before the run row (which carries inTransitCovered), behind the same fence: a stopped run leaves no marker.
+  await fence?.('before-in-transit-rows')
+  const inTransitTransfersWritten = await writeInTransitSnapshotRows(client, snapshotDate, inTransit)
   // Coverage marker so a future empty inventory_snapshots result for this date is
   // read as a genuine zero on-hand position rather than an uncovered date (scjz.60.5).
   await fence?.('before-run-row')
@@ -1178,6 +1245,7 @@ async function writeDailyInventorySnapshotOn(client: SnapshotClient, options: {
     source: 'cron',
     checkMethod: 'daily_current_state_v1',
     cutoffAt: startOfNextBusinessDay(snapshotDate),
+    inTransitCovered: inTransitTransfersWritten !== null,
   })
   await fence?.('before-reservation-rows')
   const reservationSnapshotsWritten = await writeReservationSnapshotRows(client, reservationSnapshot.rows)
@@ -1194,6 +1262,7 @@ async function writeDailyInventorySnapshotOn(client: SnapshotClient, options: {
   return {
     snapshotDate: formatSnapshotDate(snapshotDate),
     snapshotsWritten,
+    ...(inTransitTransfersWritten !== null ? { inTransitTransfersWritten } : {}),
     reservationSnapshotsWritten,
     reservationSnapshotStockLevelCount: reservationSnapshot.stockLevelCount,
     driftCount: drift.length,
@@ -1401,6 +1470,10 @@ async function backfillInventorySnapshotsOn(options: BackfillOptions, fence?: Sn
     const rows = rowsFromState(day, state, pairValueReplayReliable(day))
     snapshotsWritten += options.dryRun ? rows.length : await writeSnapshotRows(client, rows, fence)
     daysWritten += 1
+    // Stock in transit at the end of THIS business day, from the movement ledger (exact for any past instant, no replay needed).
+    await fence?.('backfill-in-transit')
+    const inTransitAtDayEnd = options.dryRun ? null : await loadInTransitTransferValues(client, startOfNextBusinessDay(day))
+    const inTransitWritten = options.dryRun ? null : await writeInTransitSnapshotRows(client, day, inTransitAtDayEnd)
 
     // Coverage marker per backfilled day so empty inventory_snapshots for a genuinely
     // zero-stock historical date reconciles instead of reading as uncovered (scjz.60.5).
@@ -1412,6 +1485,7 @@ async function backfillInventorySnapshotsOn(options: BackfillOptions, fence?: Sn
         source: 'backfill',
         checkMethod: INVENTORY_SNAPSHOT_BACKFILL_CHECK_METHOD,
         cutoffAt: startOfNextBusinessDay(day),
+        inTransitCovered: inTransitWritten !== null,
       })
     }
 

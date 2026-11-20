@@ -168,6 +168,8 @@ async function clearTransactionScope(guards: ResetGuards) {
   // Manufacturing / warehouse ops
   await db.productionOrder.deleteMany({})
   await db.stockLevel.deleteMany({})
+  await db.inventoryTransitSnapshot.deleteMany({})
+  await db.stockTransferTransitRevaluation.deleteMany({})
   await db.stockTransferLine.deleteMany({})
   await db.stockTransfer.deleteMany({})
   await db.stockCountLine.deleteMany({})
