@@ -228,6 +228,7 @@ export const DATASET_NAMES = [
   'sku-name-overrides',
   'supplier-overrides',
   'recipe-overrides',
+  'sku-renames',
   'ims-skus',
   'ims-suppliers',
   'ims-tax-rates',
@@ -350,6 +351,12 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     required: ['parentSku', 'componentSku', 'qty', 'reason'],
     sources: [],
     purpose: 'Owner decision: the COMPLETE recipe of a KIT or BOM, one row per component line. It REPLACES every line the source recipe export gives for that parent SKU. Always canonical.',
+  },
+  'sku-renames': {
+    columns: ['fromSku', 'toSku', 'reason'],
+    required: ['fromSku', 'toSku', 'reason'],
+    sources: [],
+    purpose: 'Owner decision: a source SKU that is loaded under another SKU (the source spelling differs from the WooCommerce one). Renames the SKU in every source dataset of the run (products, recipe lines and overrides, stock lots, purchase order lines, transfers) before any join. A rename whose fromSku is in no input, whose toSku already exists, that chains into another rename, or that is listed twice is refused. Always canonical.',
   },
   'ims-suppliers': {
     columns: ['name'],
@@ -533,5 +540,5 @@ export const APPLY_TIME_CHECKS: ReadonlyArray<{ id: string; area: string; check:
   { id: 'transfer-reference-free', area: 'transfers', check: 'No existing transfer already has a prefixed transferKey as its reference.' },
   { id: 'transfer-source-stock', area: 'transfers', check: 'The opening-stock file for the source warehouse has been loaded first, nothing is reserved against it, and its cost layers cover the dispatched quantity.' },
   { id: 'barcode-free', area: 'products', check: 'No barcode in the products file is already used by a product that exists in IMS.' },
-  { id: 'product-parent-exists', area: 'products', check: 'A VARIANT\'s parent is in an earlier or the same file (proved here) or already in IMS.' },
+  { id: 'product-parent-exists', area: 'products', check: 'A VARIANT\'s, KIT\'s or BOM\'s parent is in an earlier or the same file (proved here) or already in IMS.' },
 ]

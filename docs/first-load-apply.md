@@ -341,7 +341,7 @@ Every id of `APPLY_TIME_CHECKS` (see [first-load-input-spec.md](first-load-input
 | transfer-reference-free | not-applicable | The runner refuses a prepared run that contains transfers. | Not applicable. |
 | transfer-source-stock | not-applicable | The runner refuses a prepared run that contains transfers. | Not applicable. |
 | barcode-free | database | Needs the barcodes already in IMS. | The empty-target rail refuses a database that already holds products, and a product nobody in this run emitted is FOREIGN_ROW. The importer also refuses a barcode already in use. |
-| product-parent-exists | file-side | Every VARIANT's parent must be a VARIABLE product of the same products files (the first load is into an empty database), and a parent from WooCommerce must come from a verified snapshot. | The stored parent SKU of a variant is part of the product fingerprint. |
+| product-parent-exists | file-side | Every VARIANT's (and every KIT or BOM variation's) parent must be a VARIABLE product of the same products files (the first load is into an empty database), and a parent from WooCommerce must come from a verified snapshot. | The stored parent SKU of a variant is part of the product fingerprint. |
 
 ## The database side
 

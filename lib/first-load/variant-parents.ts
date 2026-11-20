@@ -199,8 +199,8 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
       if (view.state === 'absent') { add(i.row, i.variantSku, 'EXCLUDED', 'NO_QOBLEX_PRODUCT', 'WooCommerce has this variation but Qoblex has no product with the SKU: nothing to join (the coverage check lists it unless it is excluded)'); continue }
       if (view.state === 'rejected') { add(i.row, i.variantSku, 'EXCLUDED', 'QOBLEX_ROW_REJECTED', 'the Qoblex row with this SKU was rejected (see the products dataset): it is not joined'); continue }
       if (view.state === 'excluded') { add(i.row, i.variantSku, 'EXCLUDED', 'EXCLUDED_BY_LIST', 'the Qoblex row with this SKU is on the exclusion list'); continue }
-      if (view.type !== 'VARIANT') {
-        add(i.row, i.variantSku, 'EXCLUDED', 'QOBLEX_TYPE_NOT_VARIANT', `Qoblex types this SKU as ${view.type}, which cannot have a parent in IMS: it loads as ${view.type} and the connector link step relates it to the WooCommerce variation`)
+      if (view.type !== 'VARIANT' && view.type !== 'KIT' && view.type !== 'BOM') {
+        add(i.row, i.variantSku, 'EXCLUDED', 'QOBLEX_TYPE_NOT_VARIANT', `Qoblex types this SKU as ${view.type}, which cannot be a variation in IMS (only a VARIANT, KIT or BOM can sit under a variable parent): it loads as ${view.type} with no parent and the connector link step relates it to the WooCommerce variation`)
         typeNotVariant.push(i.variantSku)
         continue
       }
@@ -254,7 +254,7 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
     findings.push({
       severity: 'INFO',
       code: 'QOBLEX_TYPE_NOT_VARIANT',
-      message: `${typeNotVariant.length} SKU(s) are WooCommerce variations but Qoblex types them as something that cannot have a parent (a bundle or manufactured product). They load with their Qoblex type and no parent.`,
+      message: `${typeNotVariant.length} SKU(s) are WooCommerce variations but Qoblex types them as a type that cannot sit under a variable parent in IMS (for example a simple or non-inventory product). They load with their Qoblex type and no parent. (A KIT or BOM that is a variation joins its parent: see VARIANT_CARRIES_RECIPE.)`,
       keys: typeNotVariant.sort(cmp),
     })
   }

@@ -306,6 +306,11 @@ interface CatEntry {
   cells: Record<string, string>
   /** The lifecycle status the importer will give this product. */
   lifecycle: string
+  /**
+   * A manufactured product that is a WooCommerce variation: the source typed it VARIANT and a later file (or a recipe override) gave it a BOM recipe. IMS holds it as
+   * type BOM under its VARIABLE parent (`canTypeHaveVariableParent`), so it is joined to its parent exactly like a VARIANT and is refused without one.
+   */
+  variantRecipe?: boolean
 }
 
 interface StockGroup {
@@ -377,7 +382,7 @@ class Run {
   variantParentsRefused = false
   variantParentSummary = { supplied: false, rowsRead: 0, variantsJoined: 0, parentsEmitted: 0, parentsWithoutQoblexVariant: 0 }
 
-  constructor(readonly input: PrepareInput) {}
+  constructor(public input: PrepareInput) {}
 
   get config(): PrepareConfig {
     return this.input.config
@@ -441,6 +446,115 @@ function reportNormalisation(run: Run): void {
     const trimmed = run.skuTrimmed.get(dataset) ?? 0
     const respelled = run.skuRespelled.get(dataset) ?? 0
     run.find('INFO', 'SKU_NORMALISED', `${dataset}: ${trimmed} SKU cell(s) had outer whitespace trimmed and ${respelled} were matched to the catalogue under a different letter case (the catalogue spelling is what is written)`, dataset)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SKU renames (owner decision)
+// ---------------------------------------------------------------------------
+
+/** The SKU columns of the datasets a rename acts on: the source datasets and the read-time decision lists that name source SKUs. WMS, WooCommerce, IMS and exclusion lists are the target side and are never renamed. */
+const RENAMED_COLUMNS: ReadonlyArray<readonly [DatasetName, readonly string[]]> = [
+  ['products', ['sku', 'parentSku']],
+  ['recipe-lines', ['parentSku', 'componentSku']],
+  ['recipe-overrides', ['parentSku', 'componentSku']],
+  ['stock-lots', ['sku']],
+  ['purchase-order-lines', ['sku']],
+  ['transfers', ['sku']],
+  ['non-stock-skus', ['sku']],
+  ['sku-name-overrides', ['sku']],
+]
+
+/**
+ * OWNER DECISIONS (sku-renames): a source SKU is loaded under another one. Applied FIRST, to copies of the rows, so every join, check and output sees the new SKU and no input is
+ * altered. A rename is refused (never guessed) when: its SKU is bad, it has no reason, it renames a SKU to itself, its fromSku is listed twice, two renames share a toSku, it
+ * chains into (or loops through) another rename, its toSku already exists in a source dataset, or its fromSku is in no source dataset. Each applied rename is reported with the cells
+ * it changed; an accepted rename that touches no catalogue product is a warning.
+ */
+function loadSkuRenames(run: Run): void {
+  if (!run.has('sku-renames')) return
+  type Item = { row: CanonRow; from: string; fromKey: string; to: string; toKey: string }
+  const items: Item[] = []
+  for (const row of run.rows('sku-renames')) {
+    const from = parseSku(row.values.fromSku, 'fromSku')
+    const to = parseSku(row.values.toSku, 'toSku')
+    const label = from.ok ? from.sku : row.values.fromSku
+    if (!from.ok) { run.add('sku-renames', row.line, label, 'REJECTED', 'BAD_SKU', from.reason); continue }
+    if (!to.ok) { run.add('sku-renames', row.line, label, 'REJECTED', 'BAD_SKU', to.reason); continue }
+    if (row.values.reason === '') { run.add('sku-renames', row.line, label, 'REJECTED', 'MISSING_REASON', 'a SKU rename needs a written reason'); continue }
+    if (from.key === to.key) { run.add('sku-renames', row.line, label, 'REJECTED', 'RENAME_TO_SELF', `${from.sku} is renamed to ${to.sku}, which is the same SKU`); continue }
+    items.push({ row, from: from.sku, fromKey: from.key, to: to.sku, toKey: to.key })
+  }
+  const refused = new Map<Item, { code: string; reason: string }>()
+  const refuse = (item: Item, code: string, reason: string): void => {
+    if (!refused.has(item)) refused.set(item, { code, reason })
+  }
+  const byFrom = new Map<string, Item[]>()
+  const byTo = new Map<string, Item[]>()
+  for (const item of items) {
+    byFrom.set(item.fromKey, [...(byFrom.get(item.fromKey) ?? []), item])
+    byTo.set(item.toKey, [...(byTo.get(item.toKey) ?? []), item])
+  }
+  for (const list of byFrom.values()) if (list.length > 1) for (const item of list) refuse(item, 'DUPLICATE_RENAME', `${item.from} is renamed ${list.length} times; which rename is meant cannot be decided`)
+  for (const list of byTo.values()) if (list.length > 1) for (const item of list) refuse(item, 'RENAME_TARGET_COLLISION', `${list.length} SKUs are renamed to ${item.to}; they would become one product`)
+  for (const item of items) {
+    const next = byFrom.get(item.toKey)
+    if (next) refuse(item, 'RENAME_CHAIN', `${item.to} is itself renamed (${next.map((n) => `${n.from} -> ${n.to}`).join(', ')}); a chain or a cycle of renames is never followed, state the final SKU directly`)
+    const previous = byTo.get(item.fromKey)
+    if (previous) refuse(item, 'RENAME_CHAIN', `${item.from} is the target of another rename (${previous.map((n) => `${n.from} -> ${n.to}`).join(', ')}); a chain or a cycle of renames is never followed`)
+  }
+  // Where each SKU is read, by key: the existence checks.
+  const present = new Map<string, Set<DatasetName>>()
+  for (const [name, columns] of RENAMED_COLUMNS) {
+    for (const row of run.rows(name)) {
+      for (const column of columns) {
+        const parsed = parseSku(row.values[column] ?? '')
+        if (parsed.ok) present.set(parsed.key, (present.get(parsed.key) ?? new Set<DatasetName>()).add(name))
+      }
+    }
+  }
+  for (const item of items) {
+    if (refused.has(item)) continue
+    if (!present.has(item.fromKey)) refuse(item, 'RENAME_FROM_NOT_IN_SOURCE', `${item.from} is in no source dataset of this run (a typo, or the wrong file)`)
+    else if (present.has(item.toKey)) refuse(item, 'RENAME_TARGET_EXISTS', `${item.to} already exists in the source (${[...present.get(item.toKey)!].join(', ')}); renaming ${item.from} to it would merge two different products`)
+  }
+  const accepted = new Map<string, Item>()
+  for (const item of items) {
+    const why = refused.get(item)
+    if (why) run.add('sku-renames', item.row.line, item.from, 'REJECTED', why.code, why.reason)
+    else accepted.set(item.fromKey, item)
+  }
+  if (accepted.size === 0) return
+  const counts = new Map<Item, Map<DatasetName, number>>()
+  const datasets = { ...run.input.datasets }
+  for (const [name, columns] of RENAMED_COLUMNS) {
+    const dataset = datasets[name]
+    if (!dataset) continue
+    datasets[name] = {
+      ...dataset,
+      rows: dataset.rows.map((row) => {
+        let values = row.values
+        for (const column of columns) {
+          const parsed = parseSku(values[column] ?? '')
+          const item = parsed.ok ? accepted.get(parsed.key) : undefined
+          if (!item) continue
+          if (values === row.values) values = { ...row.values }
+          values[column] = item.to
+          const perDataset = counts.get(item) ?? new Map<DatasetName, number>()
+          perDataset.set(name, (perDataset.get(name) ?? 0) + 1)
+          counts.set(item, perDataset)
+        }
+        return values === row.values ? row : { ...row, values }
+      }),
+    }
+  }
+  run.input = { ...run.input, datasets }
+  for (const item of accepted.values()) {
+    const perDataset = counts.get(item) ?? new Map<DatasetName, number>()
+    const where = [...perDataset.entries()].map(([name, n]) => `${n} cell(s) in ${name}`).join(', ')
+    run.add('sku-renames', item.row.line, item.from, 'EMITTED', 'SKU_RENAMED', `${item.from} is loaded as ${item.to}: ${where}`)
+    run.find('INFO', 'SKU_RENAMED', `${item.from} -> ${item.to} (${item.row.values.reason}): ${where}`, 'sku-renames', [item.from])
+    if (run.has('products') && !perDataset.has('products')) run.find('WARNING', 'SKU_RENAME_UNUSED', `the rename ${item.from} -> ${item.to} changed no product row (the SKU is not in the products dataset); it only renamed ${where}`, 'sku-renames', [item.from])
   }
 }
 
@@ -587,7 +701,7 @@ function validateProductRow(row: CanonRow): { ok: true; entry: CatEntry } | { ok
   }
   // The importer's own derivation: a valid lifecycleStatus wins, otherwise active FALSE means EOL, otherwise ACTIVE.
   const lifecycle = cells.lifecycleStatus ?? (cells.active === 'FALSE' ? 'EOL' : 'ACTIVE')
-  return { ok: true, entry: { sku: sku.sku, key: sku.key, name: v.name, type: type as ProductType, parentSku, cells, lifecycle } }
+  return { ok: true, entry: { sku: sku.sku, key: sku.key, name: v.name, type: type as ProductType, parentSku, cells, lifecycle, ...(row.variantRecipe === true && (type === 'BOM' || type === 'KIT') ? { variantRecipe: true } : {}) } }
 }
 
 function loadCatalogue(run: Run): void {
@@ -607,7 +721,7 @@ function loadCatalogue(run: Run): void {
 
   const survivors: Candidate[] = []
   for (const [key, list] of [...groups.entries()]) {
-    const signatures = new Set(list.map((c) => JSON.stringify([c.entry.sku, c.entry.name, c.entry.type, c.entry.parentSku, c.entry.cells])))
+    const signatures = new Set(list.map((c) => JSON.stringify([c.entry.sku, c.entry.name, c.entry.type, c.entry.parentSku, c.entry.cells, c.entry.variantRecipe === true])))
     const distinctSkus = new Set(list.map((c) => c.entry.sku))
     if (distinctSkus.size > 1) {
       for (const c of list) run.add('products', c.row.line, c.entry.sku, 'REJECTED', 'SKU_CASE_COLLISION', `SKUs ${[...distinctSkus].sort(cmp).map((s) => JSON.stringify(s)).join(' and ')} differ only by letter case; the opening-stock, transfer and purchase-order importers cannot tell them apart`)
@@ -675,10 +789,11 @@ function loadCatalogue(run: Run): void {
   const typeOf = new Map<string, ProductType>([...remaining.map((c) => [c.entry.key, c.entry.type] as const), ...[...run.syntheticParents].map((key) => [key, 'VARIABLE' as const] as const)])
   const unjoined: string[] = []
   const unconfirmed: string[] = []
+  const recipeVariants: string[] = []
   const required = run.config.requireVariantParents === true || run.has('variant-parents')
   for (const c of remaining) {
     const { entry } = c
-    if (entry.type === 'VARIANT') {
+    if (entry.type === 'VARIANT' || entry.variantRecipe === true) {
       if (entry.parentSku === '') {
         run.add('products', c.row.line, entry.sku, 'REJECTED', 'VARIANT_WITHOUT_PARENT', run.variantParentsRefused
           ? 'a VARIANT needs a parentSku, and the variant-parents dataset was refused because it is not bound to a verified WooCommerce snapshot'
@@ -714,6 +829,10 @@ function loadCatalogue(run: Run): void {
     run.cat.set(entry.key, entry)
     run.catStatus.set(entry.key, 'ok')
     run.add('products', c.row.line, entry.sku, 'EMITTED', 'PRODUCT', 'in the products import file')
+    if (entry.variantRecipe === true) recipeVariants.push(`${entry.sku} (under ${entry.parentSku})`)
+  }
+  if (recipeVariants.length > 0) {
+    run.find('INFO', 'VARIANT_CARRIES_RECIPE', `${recipeVariants.length} WooCommerce variation(s) carry a recipe (KIT or BOM): each loads as that type under its VARIABLE parent (IMS holds a variation with a recipe as a KIT or BOM product with a parent)`, 'products', recipeVariants)
   }
   if (unconfirmed.length > 0) {
     run.find('ERROR', 'VARIANT_PARENT_UNCONFIRMED', `${unconfirmed.length} VARIANT product(s) name a parent but WooCommerce does not confirm it by exact SKU (the join is required: a prefilled parentSku is not enough). Fix the SKU or exclude each with a reason.`, 'products', unconfirmed)
@@ -778,7 +897,12 @@ function joinVariantParentsInto(run: Run, candidates: CatEntry[]): void {
     run.catStatus.set(entry.key, 'ok')
     run.syntheticParents.add(entry.key)
   }
-  for (const key of result.confirmed) run.variantConfirmed.add(key)
+  for (const key of result.confirmed) {
+    run.variantConfirmed.add(key)
+    // A KIT or BOM that WooCommerce confirms as a variation by exact SKU is a variation with a recipe: it keeps the parent (IMS: type KIT/BOM with a VARIABLE parent).
+    const joined = byKey.get(key)
+    if (joined && (joined.type === 'KIT' || joined.type === 'BOM')) joined.variantRecipe = true
+  }
   // A VARIABLE parent the products file carries keeps its row, but WooCommerce decides its title and lifecycle (the parent title comes from WooCommerce).
   const differing: string[] = []
   const lifecycleDisagrees: string[] = []
@@ -809,13 +933,36 @@ function loadRecipes(run: Run): void {
   // must exist in the catalogue, the quantity must be above zero, a repeated component is refused).
   const overrideParents = new Set<string>()
   const overrideItems: Array<{ ds: DatasetName; row: CanonRow }> = []
+  // ALL OR NOTHING: a rejected line of an override rejects that parent's whole override (and so its recipe). A partial recipe would load a product that cannot be built.
+  const overrideFailed = new Map<string, { sku: string; why: string[] }>()
+  const failOverride = (key: string, sku: string, why: string): void => {
+    const entry = overrideFailed.get(key) ?? { sku, why: [] }
+    entry.why.push(why)
+    overrideFailed.set(key, entry)
+  }
+  // A VARIANT the owner states a BOM recipe for becomes a BOM product under its parent (kept only if the override is accepted).
+  const convertedVariants = new Map<string, CatEntry>()
   for (const row of run.rows('recipe-overrides')) {
-    if (row.values.reason === '') { run.add('recipe-overrides', row.line, row.values.parentSku, 'REJECTED', 'MISSING_REASON', 'a recipe override needs a written reason'); continue }
-    if (row.values.type !== '' && row.values.type !== 'KIT' && row.values.type !== 'BOM') { run.add('recipe-overrides', row.line, row.values.parentSku, 'REJECTED', 'BAD_TYPE', `type ${JSON.stringify(row.values.type)} must be KIT or BOM (or blank)`); continue }
     const parent = parseSku(row.values.parentSku, 'parentSku')
+    const early = (code: string, reason: string): void => {
+      run.add('recipe-overrides', row.line, parent.ok ? parent.sku : row.values.parentSku, 'REJECTED', code, reason)
+      if (parent.ok) {
+        overrideParents.add(parent.key)
+        failOverride(parent.key, parent.sku, `line ${row.line} ${code}`)
+      }
+    }
+    if (row.values.reason === '') { early('MISSING_REASON', 'a recipe override needs a written reason'); continue }
+    if (row.values.type !== '' && row.values.type !== 'KIT' && row.values.type !== 'BOM') { early('BAD_TYPE', `type ${JSON.stringify(row.values.type)} must be KIT or BOM (or blank)`); continue }
     if (parent.ok && row.values.type !== '') {
       const entry = run.cat.get(parent.key)
-      if (entry && entry.type !== row.values.type) { run.add('recipe-overrides', row.line, parent.sku, 'REJECTED', 'RECIPE_OVERRIDE_TYPE_MISMATCH', `the override says ${parent.sku} is a ${row.values.type} but the products file loads it as ${entry.type}`); continue }
+      if (entry && entry.type === 'VARIANT') {
+        entry.type = row.values.type as ProductType
+        entry.variantRecipe = true
+        convertedVariants.set(parent.key, entry)
+      } else if (entry && entry.type !== row.values.type) {
+        early('RECIPE_OVERRIDE_TYPE_MISMATCH', `the override says ${parent.sku} is a ${row.values.type} but the products file loads it as ${entry.type}${entry.type === 'VARIANT' ? '' : ''}`)
+        continue
+      }
     }
     if (parent.ok) overrideParents.add(parent.key)
     overrideItems.push({ ds: 'recipe-overrides', row })
@@ -835,7 +982,10 @@ function loadRecipes(run: Run): void {
     const parent = parseSku(v.parentSku, 'parentSku')
     const component = parseSku(v.componentSku, 'componentSku')
     const label = parent.ok ? parent.sku : v.parentSku
-    const reject = (code: string, reason: string) => run.add(ds, row.line, label, 'REJECTED', code, reason)
+    const reject = (code: string, reason: string) => {
+      run.add(ds, row.line, label, 'REJECTED', code, reason)
+      if (ds === 'recipe-overrides' && parent.ok) failOverride(parent.key, parent.sku, `line ${row.line} ${code}`)
+    }
     if (!parent.ok) { reject('BAD_SKU', parent.reason); continue }
     if (!component.ok) { reject('BAD_SKU', component.reason); continue }
     if (/[;:]/.test(component.sku)) { reject('COMPONENT_SKU_HAS_DELIMITER', `component SKU ${JSON.stringify(component.sku)} contains ":" or ";", which the importer's components cell uses as separators`); continue }
@@ -868,12 +1018,33 @@ function loadRecipes(run: Run): void {
 
   const byPair = new Map<string, Line[]>()
   for (const line of candidates) byPair.set(`${line.parentKey}\u0000${line.componentKey}`, [...(byPair.get(`${line.parentKey}\u0000${line.componentKey}`) ?? []), line])
-  const valid: Line[] = []
+  const validPairs: Line[] = []
   for (const [, list] of [...byPair.entries()]) {
     if (list.length > 1) {
-      for (const line of list) run.add(line.ds, line.row.line, line.parent, 'REJECTED', 'DUPLICATE_RECIPE_LINE', `component ${line.component} is listed ${list.length} times for ${line.parent}; whether to add the quantities cannot be decided`)
-    } else valid.push(list[0])
+      for (const line of list) {
+        run.add(line.ds, line.row.line, line.parent, 'REJECTED', 'DUPLICATE_RECIPE_LINE', `component ${line.component} is listed ${list.length} times for ${line.parent}; whether to add the quantities cannot be decided`)
+        if (line.ds === 'recipe-overrides') failOverride(line.parentKey, line.parent, `line ${line.row.line} DUPLICATE_RECIPE_LINE`)
+      }
+    } else validPairs.push(list[0])
   }
+  // The accepted lines of a failed override are rejected with it, and nothing of its recipe is loaded.
+  const valid: Line[] = []
+  for (const line of validPairs) {
+    const failed = line.ds === 'recipe-overrides' ? overrideFailed.get(line.parentKey) : undefined
+    if (failed) run.add(line.ds, line.row.line, line.parent, 'REJECTED', 'RECIPE_OVERRIDE_INCOMPLETE', `another line of the override for ${line.parent} was rejected (${failed.why.join('; ')}), so the whole override and its recipe are rejected: a partial recipe is never loaded`)
+    else valid.push(line)
+  }
+  if (overrideFailed.size > 0) {
+    run.find('ERROR', 'RECIPE_OVERRIDE_REJECTED', `${overrideFailed.size} recipe override(s) had a rejected line: each is rejected as a whole and its parent gets NO recipe from this run (the export's lines for it stay set aside, never used). Fix the override rows.`, 'recipe-overrides', [...overrideFailed.values()].map((f) => f.sku))
+  }
+  for (const [key, entry] of convertedVariants) {
+    if (overrideFailed.has(key)) {
+      entry.type = 'VARIANT'
+      delete entry.variantRecipe
+    }
+  }
+  const convertedOk = [...convertedVariants.entries()].filter(([key]) => !overrideFailed.has(key)).map(([, entry]) => `${entry.sku} (under ${entry.parentSku})`)
+  if (convertedOk.length > 0) run.find('INFO', 'VARIANT_CARRIES_RECIPE', `${convertedOk.length} WooCommerce variation(s) get a KIT or BOM recipe from the recipe-overrides decisions: each loads as that type under its VARIABLE parent`, 'recipe-overrides', convertedOk)
 
   const { cycles, cyclicParents } = findRecipeCycles(valid.map((line) => ({ parent: line.parentKey, component: line.componentKey })))
   const skuOf = (key: string) => run.cat.get(key)?.sku ?? run.ims.get(key)?.sku ?? key
@@ -1141,6 +1312,7 @@ function loadStock(run: Run): void {
   type Lot = { row: CanonRow; sku: string; key: string; warehouse: string; qty: Dec; unitCostBase: Dec; lotRef: string; date: string; evidence: LotEvidence }
   const lots: Lot[] = []
   const excludedHolding = new Map<string, Dec>()
+  const kitVariationStock: string[] = []
   for (const row of run.rows('stock-lots')) {
     const v = row.values
     const sku = parseSku(v.sku)
@@ -1168,6 +1340,12 @@ function loadStock(run: Run): void {
     if (res.kind !== 'ok') continue
     trackSku(run, 'stock-lots', sku, res.sku)
     if (res.type === null) { reject('TYPE_UNKNOWN', `SKU ${sku.sku} exists only in IMS and its type is not known; give the type in the ims-skus file`); continue }
+    if (res.type === 'KIT' && run.cat.get(sku.key)?.variantRecipe === true) {
+      // A KIT that is a WooCommerce variation: the stock report's on-hand is Qoblex's computed availability of the bundle, not stock, exactly as for any KIT. Said, never loaded.
+      run.add('stock-lots', row.line, sku.sku, 'EXCLUDED', 'KIT_STOCK_IGNORED', 'a KIT holds no stock of its own: the on-hand in the stock report is the computed availability of its components and is not loaded')
+      if (qty.value.gt(0)) kitVariationStock.push(`${sku.sku} (${fmt(qty.value)})`)
+      continue
+    }
     if (!STOCK_BEARING_TYPES.has(res.type)) {
       run.add('stock-lots', row.line, sku.sku, 'EXCLUDED', 'EXCLUDED_TYPE', `${res.type} products cannot receive opening stock (only SIMPLE, VARIANT and BOM hold stock and cost layers)`)
       if (qty.value.gt(0)) run.find('ERROR', 'EXCLUDED_TYPE_HOLDS_STOCK', `${res.type} SKU ${sku.sku} has quantity ${fmt(qty.value)} in the stock extract but ${res.type} products cannot hold opening stock, so those units would be absent from every import file. Resolve it in the source (correct the type, or remove the stock row once the quantity is written off).`, 'stock-lots', [`${sku.sku} (${fmt(qty.value)})`])
@@ -1302,6 +1480,7 @@ function loadStock(run: Run): void {
       evidence: list.map((l) => l.evidence),
     })
   }
+  if (kitVariationStock.length > 0) run.find('INFO', 'KIT_STOCK_IGNORED', `${kitVariationStock.length} KIT variation(s) show an on-hand quantity in the stock report: it is the computed availability of the bundle, not stock, and is not loaded`, 'stock-lots', kitVariationStock)
   const zeroCost = [...run.stockGroups.values()].filter((g) => g.average.isZero()).map((g) => `${g.sku} in ${g.warehouseCode}`)
   if (zeroCost.length > 0) {
     run.find('WARNING', 'ZERO_COST_OPENING_STOCK', 'opening stock with a weighted-average cost of zero is accepted by the importer but would sell at zero cost of goods: confirm the cost in Qoblex', 'stock-lots', zeroCost)
@@ -2016,9 +2195,12 @@ export function prepare(input: PrepareInput): PrepareResult {
       run.add(name, rejection.line, `line ${rejection.line}`, 'REJECTED', rejection.code, rejection.reason)
     }
     for (const note of dataset.notes ?? []) run.find('INFO', note.code, `${name}: ${note.reason}`, name)
+    const blankAsZero = (dataset.notes ?? []).filter((note) => note.code === 'BLANK_STOCK_AS_ZERO').length
+    if (blankAsZero > 0) run.find('INFO', 'BLANK_STOCK_AS_ZERO_COUNT', `${name}: ${blankAsZero} stock row(s) stated nothing (the all-warehouses total and every warehouse cell blank) and were loaded as 0 on hand by the map's blankStockIsZero (owner ruling); each is listed above`, name)
     for (const replaced of dataset.superseded) run.add(name, replaced.line, replaced.key, 'EXCLUDED', 'SUPERSEDED_BY_LATER_FILE', replaced.reason)
   }
 
+  loadSkuRenames(run)
   loadExclusions(run)
   loadReadTimeDecisions(run)
   loadImsSkus(run)

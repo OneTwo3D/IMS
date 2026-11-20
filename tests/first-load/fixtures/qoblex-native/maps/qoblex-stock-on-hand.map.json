@@ -223,7 +223,8 @@
         "column": "Product Type",
         "ghost": "Unknown",
         "quantityColumn": "Quantity"
-      }
+      },
+      "blankStockIsZero": true
     }
   }
 }

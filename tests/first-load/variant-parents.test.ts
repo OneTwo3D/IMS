@@ -180,7 +180,7 @@ test('arm (i): a WooCommerce status becomes a lifecycle status through a closed 
   assert.equal(bad.blocking, true)
 })
 
-test('arm (j): a WooCommerce variation that Qoblex types as a bundle or a product loads with its Qoblex type, without a parent, and is not an error', (t) => {
+test('arm (j): a WooCommerce variation that Qoblex types as a BOM joins its parent; one typed as a plain product loads with its type, without a parent, and is not an error', (t) => {
   const result = run({
     products: ds('products', [product('KIT-1', 'BOM'), product('PLAIN-1'), variant('V-01')]),
     'recipe-lines': ds('recipe-lines', [{ parentSku: 'KIT-1', componentSku: 'PLAIN-1', qty: '1' }]),
@@ -189,11 +189,11 @@ test('arm (j): a WooCommerce variation that Qoblex types as a bundle or a produc
   const info = result.report.findings.find((f) => f.code === 'QOBLEX_TYPE_NOT_VARIANT')
   precondition(t, 'non-variant SKUs that are WooCommerce variations', info?.keys?.length ?? 0)
   assert.equal(info?.severity, 'INFO')
-  assert.deepEqual(info?.keys, ['KIT-1', 'PLAIN-1'])
+  assert.deepEqual(info?.keys, ['PLAIN-1'])
   assert.equal(result.blocking, false, JSON.stringify(result.report.findings))
   const rows = rowsOf(result, 'products')
   assert.equal(rows.find((r) => r.sku === 'KIT-1')?.type, 'BOM')
-  assert.equal(rows.find((r) => r.sku === 'KIT-1')?.parentSku, '')
+  assert.equal(rows.find((r) => r.sku === 'KIT-1')?.parentSku, 'MIXED')
   assert.equal(rows.find((r) => r.sku === 'V-01')?.parentSku, 'MIXED')
 })
 
