@@ -32,6 +32,11 @@ import {
 } from '@/app/actions/manufacturing'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 import { buildGuardedCsv } from '@/lib/csv-escape'
+import { getCurrencies, type CurrencyRow } from '@/app/actions/currencies'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
+import { useFormFxRate } from '@/components/currencies/use-form-fx-rate'
+import { FxRateInput, FxRateNotice } from '@/components/currencies/fx-rate-field'
+import { FX_RATE_CHANGED_FORM_MESSAGE, fxBlocksSubmit, isFxRateChangedError, usableRate } from '@/lib/currencies/form-fx-rate'
 
 const STATUS_BADGE: Record<string, string> = {
   DRAFT: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300',
@@ -270,6 +275,14 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
   const [scheduledAt, setScheduledAt] = useState('')
   const [notes, setNotes] = useState('')
 
+  // Order currency for foreign-currency cost lines. A new order is in the base currency until a foreign one is chosen and its table rate is read;
+  // the rate is display only, the server stores the fx_rates rate (never an invented 1).
+  const baseCurrency = useBaseCurrency()
+  const [currencies, setCurrencies] = useState<CurrencyRow[]>([])
+  const [currency, setCurrency] = useState(baseCurrency.code)
+  const { fx, load: loadFxRate } = useFormFxRate({ state: 'base' })
+  const fxRate = fx ? usableRate(fx) : null
+
   // Computed stock info
   const [maxUnits, setMaxUnits] = useState<number | null>(null)
   const [componentStocks, setComponentStocks] = useState<{ componentId: string; available: number; needed: number }[]>([])
@@ -277,10 +290,11 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
 
   // Load reference data
   useEffect(() => {
-    Promise.all([getBomProducts(), getWarehouses(), getSuppliers()]).then(([p, w, s]) => {
+    Promise.all([getBomProducts(), getWarehouses(), getSuppliers(), getCurrencies(true)]).then(([p, w, s, c]) => {
       setBomProducts(p)
       setWarehouses(w)
       setSuppliers(s)
+      setCurrencies(c)
       setLoading(false)
     }).catch(() => { setLoading(false) })
   }, [])
@@ -340,8 +354,13 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
   const qtyNum = parseInt(qty) || 0
   const stockInsufficient = maxUnits !== null && qtyNum > maxUnits
 
+  function handleCurrencyChange(code: string) {
+    setCurrency(code)
+    loadFxRate(code, code === baseCurrency.code)
+  }
+
   function handleCreate() {
-    if (!selectedProduct || !warehouseId || qtyNum <= 0) return
+    if (!selectedProduct || !warehouseId || qtyNum <= 0 || fxBlocksSubmit(fx)) return
     setError(null)
     startTransition(async () => {
       const result = await createManufacturingOrder({
@@ -352,9 +371,14 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
         qtyPlanned: qtyNum,
         scheduledAt: scheduledAt || null,
         notes: notes || null,
+        // Sent only for a foreign currency: a base-currency order is raised exactly as before.
+        ...(currency !== baseCurrency.code && { currency, expectedFxRate: fxRate ?? undefined }),
       })
       if (result.success) {
         onCreated()
+      } else if (isFxRateChangedError(result.error)) {
+        handleCurrencyChange(currency)
+        setError(FX_RATE_CHANGED_FORM_MESSAGE)
       } else {
         setError(result.error ?? 'Failed to create order.')
       }
@@ -572,6 +596,29 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
               </div>
             </div>
 
+            {/* Currency / FX rate (table rate): for foreign-currency cost lines on this order */}
+            <div className="space-y-1.5">
+              <Label className="text-xs">Currency / FX Rate (table rate)</Label>
+              <div className="flex gap-2">
+                <select
+                  value={currency}
+                  onChange={(e) => handleCurrencyChange(e.target.value)}
+                  aria-label="Order currency"
+                  className="w-28 h-9 rounded-md border border-input bg-background px-3 text-sm font-mono"
+                >
+                  <option value={baseCurrency.code}>{baseCurrency.code} {baseCurrency.symbol}</option>
+                  {currencies.filter((c) => c.code !== baseCurrency.code).map((c) => (
+                    <option key={c.code} value={c.code}>{c.code} {c.symbol}</option>
+                  ))}
+                </select>
+                <div className="flex-1 relative">
+                  <span className="absolute left-3 top-2 text-xs text-muted-foreground">1 {baseCurrency.code} =</span>
+                  <FxRateInput fx={fx} className="pl-16 h-9 font-mono text-sm" disabled={currency === baseCurrency.code} />
+                </div>
+              </div>
+              <FxRateNotice fx={fx} />
+            </div>
+
             {/* Notes */}
             <div className="space-y-1.5">
               <Label className="text-xs">Notes</Label>
@@ -595,7 +642,7 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
           <Button variant="outline" onClick={onClose} disabled={isPending}>Cancel</Button>
           <Button
             onClick={handleCreate}
-            disabled={isPending || !selectedProduct || !warehouseId || qtyNum <= 0}
+            disabled={isPending || !selectedProduct || !warehouseId || qtyNum <= 0 || fxBlocksSubmit(fx)}
           >
             {isPending && <Loader2 className="h-4 w-4 mr-1 animate-spin" />}
             Create Order
