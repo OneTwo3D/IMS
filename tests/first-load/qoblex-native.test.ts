@@ -432,7 +432,7 @@ test('the shipped fixture: a changed warehouse cell and a repeated SKU in the re
   // A repeated SKU with different quantity and cost (the real report has five of these).
   const dup = copyNative()
   const text = readFileSync(path.join(dup, 'stock-on-hand.csv'), 'utf8')
-  const twin = text.split('\r\n').find((line) => line.includes('"SYN-6001"'))!.replace('"Unknown","Active"', '"simple","Active"').replace('"Synthetic twin"', '"Synthetic twin again"').replace(/"SYN-6001","Unknown"/, '"SYN-3001","Unknown"')
+  const twin = text.split('\r\n').find((line) => line.includes('"SYN-6001"'))!.replace('"Active","Unknown","Unknown"', '"Active","Unknown","simple"').replace('"Synthetic twin"', '"Synthetic twin again"').replace('"SYN-6001"', '"SYN-3001"')
   assert.ok(twin.includes('"SYN-3001"'), 'precondition: the twin row names SYN-3001')
   writeFileSync(path.join(dup, 'stock-on-hand.csv'), text.replace('"Synthetic part one"', `${twin.replace(/^"[^"]*"/, '"Synthetic part one twin"')}\r\n"Synthetic part one"`))
   const second = ingestDataset('stock-lots', readFileSync(path.join(dup, 'stock-on-hand.csv')), 'stock-on-hand.csv', stockMap().datasets['stock-lots']!)
@@ -447,7 +447,7 @@ test('superseding: a later file fills what it lacks from the earlier row (barcod
   const made = merged.rows.find((row) => row.values.sku === 'SYN-5001')!
   precondition(t, 'merged rows', merged.rows.length)
   assert.equal(made.values.barcode, '5012345678900', 'the barcode only the stock report reads survives')
-  assert.equal(made.values.active, 'TRUE')
+  assert.equal(made.values.lifecycleStatus, 'ACTIVE')
   assert.equal(made.values.type, 'BOM')
   assert.equal(made.values.weight, '0', 'the later file fills a field the earlier one did not read')
   assert.match(merged.superseded[0].reason, /kept from this row: .*barcode/)

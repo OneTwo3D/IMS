@@ -1274,6 +1274,45 @@ model InventorySnapshot {
   @@map("inventory_snapshots")
 }
 
+/// Stock in transit on one dispatched transfer, valued as of a snapshot day. The units left the source warehouse (so they
+/// are in no inventory_snapshots row) but the Inventory GL still carries them, because a transfer posts nothing. One row per
+/// transfer with a non-zero in-transit value on that day: cost dispatched (TRANSFER_OUT) plus landed-cost revaluations
+/// capitalised while in transit, minus the cost received by every receipt path. Sparse like InventorySnapshot; the run's
+/// inTransitCovered flag says whether an absent row is a genuine zero.
+model InventoryTransitSnapshot {
+  id                  String   @id @default(cuid())
+  snapshotDate        DateTime @db.Date
+  transferId          String
+  valueBase           Decimal  @db.Decimal(18, 6)
+  /// False when a dispatch or receipt movement of the transfer carries no value (pre-valuation history).
+  valueReplayReliable Boolean  @default(true)
+  createdAt           DateTime @default(now())
+
+  transfer            StockTransfer @relation(fields: [transferId], references: [id])
+
+  @@unique([snapshotDate, transferId])
+  @@index([snapshotDate])
+  @@map("inventory_transit_snapshots")
+}
+
+/// The share of a landed-cost revaluation that was posted to Inventory for units still IN TRANSIT on a transfer line
+/// (DR Inventory / CR Stock in Transit at revaluation time, see capitaliseInTransitResidue). A durable mirror of what the
+/// GL received, so the in-transit valuation can add it back as of any date. Signed: a decrease is negative.
+model StockTransferTransitRevaluation {
+  id             String   @id @default(cuid())
+  transferLineId String
+  costLayerId    String
+  qty            Decimal  @db.Decimal(14, 6)
+  unitDelta      Decimal  @db.Decimal(18, 6)
+  deltaBase      Decimal  @db.Decimal(18, 6)
+  effectiveAt    DateTime @default(now())
+  createdAt      DateTime @default(now())
+
+  @@index([transferLineId, effectiveAt])
+  @@index([effectiveAt])
+  @@map("stock_transfer_transit_revaluations")
+}
+
 /// Daily coverage marker for sparse InventorySnapshot rows. If a run exists for a
 /// snapshotDate, absent product/warehouse rows represent a genuine zero on-hand
 /// position for that day, so an empty inventory_snapshots result for the date is a
@@ -1288,6 +1327,10 @@ model InventorySnapshotRun {
   source          String    @default("cron")
   checkMethod     String    @default("daily_current_state_v1")
   cutoffAt        DateTime?
+  /// True when this run also valued the stock on dispatched, not fully received transfers
+  /// (inventory_transit_snapshots). False for runs written before that line existed: their
+  /// in-transit value was never captured, so a reader must not read its absence as zero.
+  inTransitCovered Boolean   @default(false)
   createdAt       DateTime  @default(now())
   updatedAt       DateTime  @updatedAt
 
@@ -3062,6 +3105,7 @@ model StockTransfer {
   fromWarehouse   Warehouse           @relation("TransferFrom", fields: [fromWarehouseId], references: [id])
   toWarehouse     Warehouse           @relation("TransferTo", fields: [toWarehouseId], references: [id])
   lines           StockTransferLine[]
+  transitSnapshots InventoryTransitSnapshot[]
 
   @@index([fromWarehouseId])
   @@index([toWarehouseId])

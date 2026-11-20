@@ -276,6 +276,50 @@ The explicit, owner-accepted exclusion list. Always a canonical file.
 | `sku` | yes | A SKU listed here is deliberately not loaded and is exempt from the coverage check. |
 | `reason` | yes | Written reason. An exclusion without one is refused. |
 
+### Dataset: non-stock-skus
+
+Owner decision list: SKUs that are intangible or otherwise non-stock (inventory is disabled for them in the source, so the source gives them a type such as `Unknown`, which a closed type list refuses). A SKU listed here loads as **NON_INVENTORY** whatever the source type says: the map's `nonStock` entry overwrites the source's kind cell (for the Qoblex stock report, `Product Type` becomes `non-inventory`) as the row is read, so the product type is not required for it, and its stock-lot rows are skipped and counted like any other non-inventory row (any stock cell on it is ignored, never rejected). Matched on the trimmed, upper-cased SKU. Always a canonical file. A SKU that appears in no input is the warning `STALE_NON_STOCK_DECISION`.
+
+| Column | Required | Meaning |
+| --- | --- | --- |
+| `sku` | yes | The non-stock SKU (for example the EMU License Fee, the gift card and the fee product). |
+| `reason` | yes | Written reason. A decision without one is refused. |
+
+### Dataset: sku-name-overrides
+
+Owner decision list: the SKU of a source row whose SKU cell is blank, found by the **exact product name** (trimmed; the map names the header in `nameColumn`). Only a blank SKU cell is ever filled; a row that already has a SKU is not touched. Without an override, a row with a blank SKU is refused as `BLANK_SKU` and the reason **names the product**, so the operator can add the SKU here (or fix it in the source). Always a canonical file. The override supplies the SKU only: the row still has to pass the map's type and state lists.
+
+| Column | Required | Meaning |
+| --- | --- | --- |
+| `name` | yes | The product name exactly as the source states it. |
+| `sku` | yes | The SKU to use. |
+| `type` | no | `KIT` or `BOM`: the product type the row has (the source types such a row `Unknown`). For a **KIT** the on-hand quantity on a stock-report row is Qoblex's computed availability of the bundle, not stock: it is **not loaded**, and the report says so (INFO `KIT_STOCK_IGNORED`, naming the SKU, the line and the quantity). |
+| `reason` | yes | Written reason. |
+
+### Dataset: supplier-overrides
+
+Owner decision list: the currency and/or the purchase tax type of a supplier whose contact row leaves them blank (for example a supplier that has no currency and no tax class in the contact export). Matched on the trimmed supplier name, case-insensitively. **Only a blank cell is filled**: if the contact row states a different currency or tax type, the supplier is refused as `SUPPLIER_OVERRIDE_CONFLICT`; the override is never silently preferred. The filled values go through the same checks as a contact value (3-letter currency, the closed purchase tax type list, resolution against the IMS tax rates). An override that matches no supplier is `SUPPLIER_OVERRIDE_UNUSED` (excluded, no finding). Always a canonical file.
+
+| Column | Required | Meaning |
+| --- | --- | --- |
+| `name` | yes | The supplier name. |
+| `currency` | no | 3-letter currency code to use when the contact row has none. |
+| `purchaseTaxType` | no | `INPUT2`, `ZERORATEDINPUT` or `NONE` (no tax) to use when the contact row has none. At least one of `currency` and `purchaseTaxType` is required. |
+| `reason` | yes | Written reason. |
+
+### Dataset: recipe-overrides
+
+Owner decision list: the **complete recipe** of a KIT or BOM, one row per component line. It **replaces** every line the recipe export gives for that parent SKU (those export lines are set aside as `REPLACED_BY_RECIPE_OVERRIDE`, never merged), which is the way out when the flat bundles export loses a recipe (a header followed directly by another header, a recipe scattered or repeated in the file). The override rows are checked exactly like export lines: the parent must be a KIT or BOM in the catalogue, every component SKU must exist in the catalogue (or in IMS), every quantity must be above 0, a component repeated for one parent is refused, and cycles are still found. Always a canonical file. The real override data belongs in the run's decisions directory, not in the repository.
+
+| Column | Required | Meaning |
+| --- | --- | --- |
+| `parentSku` | yes | The KIT or BOM whose recipe this is. |
+| `componentSku` | yes | A component SKU. |
+| `qty` | yes | Quantity per parent, above 0. |
+| `sortOrder` | no | Position in the recipe. |
+| `type` | no | `KIT` or `BOM`: checked against the type the products file gives the parent; a difference is refused (`RECIPE_OVERRIDE_TYPE_MISMATCH`). |
+| `reason` | yes | Written reason. |
+
 ### Dataset: ims-suppliers
 
 Supplier names that already exist in the target IMS. Omit it for an empty database. Always a canonical file.
@@ -349,7 +393,10 @@ purchase-order-lines and transfers; the 3PL (today Mintsoft) feeds wms-products 
 | `decimalSeparator` | optional; only `.` is accepted |
 | `rowsAboveHeader` | `0` (default) or `1`: one row of labels above the header row (needed by `wide`; also set on a map that reads the same file without `wide`, so the label row is skipped) |
 | `wide` | the wide warehouse blocks layout (below) |
-| `rowSelect` | `{ "column", "keep": [...], "skip": [...] }`: a closed list of the values of one source column; see "Row kinds and grouped parents" |
+| `rowSelect` | `{ "column", "keep": [...], "skip": [...] }`: a closed list of the values of one source column, or a **list** of such objects (one per column, every one of which must pass); see "Row kinds and grouped parents" |
+| `nameColumn` | optional, products and stock-lots: the source header that holds the product name. It names a row with a blank SKU in its refusal and is the key of the `sku-name-overrides` decisions |
+| `ghostRows` | optional, products and stock-lots: `{ "column": <source header>, "ghost": <value>, "quantityColumn"?: <source header> }`. Of several rows for one SKU, when **exactly one** is not typed `ghost` in `column` (the Qoblex stock report: `Product Type` `Unknown`), that row is kept and the ghost rows are dropped, each reported as INFO `GHOST_ROW_DROPPED` ("ghost row dropped", with its quantity from the first header named `quantityColumn`) and counted under "Rows skipped by the map". Two typed rows, or only ghosts, are still refused as duplicates |
+| `nonStock` | optional, products and stock-lots: `{ "column": <source header>, "value": <source value> }`: for a SKU on the `non-stock-skus` decisions list that source cell is overwritten with `value` as the row is read |
 | `parentFrom` | `{ "column", "parentValues", "skuColumn", "into" }`: rows after a parent row inherit its SKU; see "Row kinds and grouped parents" |
 | `derived` | canonical column to the canonical column it is derived from, e.g. `{ "taxClass": "supplierName" }` (no shipped map uses it); each needs its own closed `valueMaps` entry |
 | `dateFormats` | canonical column to a source date format; the value is converted to `YYYY-MM-DD` |
@@ -400,7 +447,7 @@ repeats once per warehouse. `wide` reads such a file into ONE canonical record p
 
 ### Row kinds and grouped parents
 
-`rowSelect` makes the value of one source column decide whether a row belongs to the dataset. It is a **closed list**: a row whose value is in `keep` is read, one in `skip` is left out and **counted** (the report's "Rows skipped by the map"), and any other value is
+`rowSelect` makes the value of a source column decide whether a row belongs to the dataset. It is either one object, or a **list** of objects over different columns, and a row is read only when **every** selector passes (the stock lots of the Qoblex report skip kit and non-inventory rows by `Product Type` AND skip `Deleted` rows by `State`). A column may appear in one selector only. A deliberate `skip` on any selector leaves the row out before another selector's `keep` list is judged (a `Deleted` row of an unlisted type is skipped, not refused). Each selector is a **closed list**: a row whose value is in `keep` is read, one in `skip` is left out and **counted** (the report's "Rows skipped by the map"), and any other value is
 rejected as `UNLISTED_ROW_KIND`. That is how the Qoblex stock report's `Product Type` `Unknown` rows are refused rather than silently loaded or dropped.
 
 `parentFrom` is for files where a header row is followed by its component rows (the Qoblex bundles file: a `Bundle` or `BillOfMaterial` row, then its `Part` rows). A row whose `column` value is in `parentValues` sets the current parent to its `skuColumn`; every row that is read gets the current parent in the canonical column
@@ -482,7 +529,7 @@ Copy the maps, keep `expectedHeaders` as they are, and point the manifest at the
 
 How each fact the export states is read, and what is a decision for the owner:
 
-- **Products** come from the stock report: `Sku`, `Product`, `Product Type`, `Barcode`, `State`. `Product Type` is a closed list: `simple` is SIMPLE; `variable` is mapped to VARIANT; `kit` is KIT, `bom` is BOM and `non-inventory` is NON_INVENTORY (spellings the reconciliation pack's R14 needs and that no real export has carried yet); any other value (the real export has `Unknown`) is rejected for an owner decision. `State` is a closed list too: `Active` is TRUE and `Inactive` is FALSE; any other state is rejected. In the stock lots, `bom` rows are read like `simple` ones, while `kit` and `non-inventory` rows (which hold no stock of their own in IMS) are skipped and counted.
+- **Products** come from the stock report: `Sku`, `Product`, `Product Type`, `Barcode`, `State`. `Product Type` is a closed list: `simple` is SIMPLE; `variable` is mapped to VARIANT; `kit` is KIT, `bom` is BOM and `non-inventory` is NON_INVENTORY (spellings the reconciliation pack's R14 needs and that no real export has carried yet); any other value (the real export has `Unknown`) is rejected for an owner decision. `State` is a closed list too, read through the map's `lifecycleStatus` column (not `active`): `Active` is ACTIVE, `Inactive` is EOL, and **`Archived` is DRAFT** (owner ruling 2026-11-20: Qoblex archives a new product automatically while it is still a draft in WooCommerce and un-archives it when it is published, so `Archived` is "new, not yet sellable" and not end of life). DRAFT is purchasable and reorder-eligible (`isPurchasableProductStatus`: ACTIVE and DRAFT), so open purchase order lines on those products load; an EOL product refuses them (`PRODUCT_NOT_PURCHASABLE`). **`Deleted` is skipped** (the rows are not loaded, in products and in stock lots, and are counted under "Rows skipped by the map"); any other state is rejected. A map that still uses the older `active` column keeps its behaviour (FALSE is EOL). When a WooCommerce snapshot is supplied and a VARIABLE product's status disagrees with the products file (Archived/DRAFT against a published parent, or the reverse), the run says `LIFECYCLE_DISAGREES_WITH_WOO` (WARNING; WooCommerce's status is the one written; the snapshot covers variable products only). In the stock lots, `bom` rows are read like `simple` ones, while `kit` and `non-inventory` rows (which hold no stock of their own in IMS) are skipped and counted.
   **The stock report lists variants only, with no parent product**, so a VARIANT row is rejected as `VARIANT_WITHOUT_PARENT` unless the `variant-parents` dataset (read from WooCommerce, which holds the parents) supplies its parent: see "Dataset: variant-parents". The map is shipped honestly blocked, rather than
   loading variants as SIMPLE products and losing the parent link. To rehearse the rest of the load without WooCommerce, a private copy of the map can read `variable` as SIMPLE; do not load that.
 - **Bundles and manufactured products** come from the bundles file. `Line Type` is a closed list: `Bundle` is a KIT, `BillOfMaterial` is a BOM, `Part` is a component line whose `Bundled Quantity` is the component quantity. The header rows become products (second file, which supersedes the stock report's SIMPLE row for the same SKU); the `Part` rows become recipe lines
@@ -495,7 +542,7 @@ How each fact the export states is read, and what is a decision for the owner:
   The file has **no currency and no exchange rate**, and the pinned map carries no supplier-to-currency or currency-to-rate table (the reconciliation pack's copy is byte-identical). The order's currency is that of the supplier with the same name in the same run's contact export; an unknown supplier is `SUPPLIER_NOT_IN_FILE`. The rate of a foreign order is read from the `ims-fx-rates` list (IMS's `fx_rates`) as of the end of the `Created on` day (`createdOn`, converted from `Thu, Sep 24 2026`); no rate for that day is `FX_RATE_MISSING`. **Line discount.** The report's `Price` is the gross price and its per-line `Discount (%)` is read (canonical column `lineDiscountPercent`) but never applied. An **open** line (a quantity outstanding) with a non-zero discount is refused as `PO_LINE_DISCOUNT_NOT_SUPPORTED` (the reject report names the order and SKU), because it would otherwise import the gross price as the unit cost and overstate the order value, landed cost and stock valuation; resolve it in Qoblex (receive it, close it, or re-price it to the net price) and re-export. A blank discount is 0; a value that is not a plain number, is negative or is above 100 is `BAD_DISCOUNT`. A fully received, over-received or closed line is not imported, so its discount is not judged and does not refuse it. The reconciliation pack's R7 treats an open line with a non-zero discount as inconclusive (`VALUE_SHAPE_MISMATCH`), so it never compares a gross price with a gross price.
   `Due On` (`Thu, Oct 8 2026`) becomes `expectedDelivery`. The `Incoming Quantity` per warehouse in the stock report and these lines describe the same open orders: their per-SKU totals should agree, and a PO line for a SKU the catalogue lacks is rejected (`SKU_NOT_IN_CATALOGUE`).
 - **Supplier currency and tax rate.** `Currency` is required: a blank is `MISSING_CURRENCY` (the supplier importer's silent GBP default is refused; a GBP supplier must say GBP). `Purchase Tax Class Name` becomes the supplier's default tax rate through the **pinned** value map in `qoblex-contacts.map.json` (also pinned in code as `QOBLEX_PURCHASE_TAX_CLASS_TYPES` and by a test): `Purchase Tax` is `INPUT2` (20% VAT on expenses), `Zero Rated Purchase` is `ZERORATEDINPUT`, `No VAT` is `NONE` (Xero built-in tax types). Any other class is `UNMAPPED_VALUE`, a blank class is `MISSING_PURCHASE_TAX_TYPE`. Each type must then resolve to exactly one active purchase-capable IMS tax rate carrying it (`NO_IMS_PURCHASE_TAX_RATE` / `AMBIGUOUS_IMS_PURCHASE_TAX_RATE`; the rate is never chosen by name), so IMS tax rates must be mapped to Xero types (`INPUT2`, `ZERORATEDINPUT`, `NONE`) before the load.
-- **Suppliers** come from the contact export. **The export has no supplier/customer flag.** `Wholesale or Retail` is a closed list (`Wholesale` only): a `Retail` contact is rejected as `UNLISTED_ROW_KIND` for an owner decision. Every other contact is loaded as a supplier. Whether a contact is a supplier is read from its use: the suppliers named in the stock report's `Supplier` column and in the incoming-stock file's `Supplier` column should all be present (a purchase order line naming an absent supplier is rejected).
+- **Suppliers** come from the contact export. **The contact export holds suppliers only** (owner ruling 2026-11-20), so every contact row is a supplier; there is no supplier/customer flag. `Wholesale or Retail` is a closed list (`Wholesale` only): a `Retail` contact is rejected as `UNLISTED_ROW_KIND` for an owner decision. Every other contact is loaded as a supplier. Whether a contact is a supplier is read from its use: the suppliers named in the stock report's `Supplier` column and in the incoming-stock file's `Supplier` column should all be present (a purchase order line naming an absent supplier is rejected).
   Payment terms are a closed list (`NONE` and blank are no terms, `30 days net` is 30). The shipping address columns feed the supplier address; the billing columns are not read.
 
 ## WooCommerce snapshot command
