@@ -4,6 +4,8 @@ import { randomUUID } from 'crypto'
 import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
+import { getBaseCurrencyCode } from '@/lib/base-currency'
+import { resolveProductionOrderFx } from '@/lib/domain/manufacturing/production-order-fx'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
 import { queueAccountingSyncTx, getAccountingSettings, accountingPostingVerdictForChart, type AccountingSettings } from '@/lib/accounting'
@@ -370,6 +372,10 @@ type CreateInput = {
   qtyPlanned: number
   scheduledAt?: string | null
   notes?: string | null
+  /** Optional order currency for foreign-currency cost lines. Omitted keeps the base-currency / rate-1 defaults. The rate is never typed: it is the fx_rates table rate. */
+  currency?: string | null
+  /** The rate the form displayed; a different table rate at save is refused (FX_RATE_CHANGED). */
+  expectedFxRate?: number
 }
 
 export async function createManufacturingOrder(input: CreateInput): Promise<{ success: boolean; error?: string; id?: string }> {
@@ -388,6 +394,15 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
     if (preflight.productComponents.length === 0) return { success: false, error: 'Product has no components defined.' }
 
     if (input.qtyPlanned <= 0) return { success: false, error: 'Quantity must be greater than 0.' }
+
+    // Foreign-currency cost lines (o3d-hgcj1): the rate is the central fx_rates table rate or a blocking refusal, never a default of 1.
+    const fx = await resolveProductionOrderFx(db, {
+      currency: input.currency,
+      baseCurrency: await getBaseCurrencyCode(),
+      asOf: new Date(),
+      expectedFxRate: input.expectedFxRate,
+    })
+    if (!fx.ok) return { success: false, error: fx.error }
 
     // Find or create a BOM record for this product.
     //
@@ -486,6 +501,8 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
           qtyPlanned: input.qtyPlanned,
           scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null,
           notes: input.notes || null,
+          // Only written when a currency was chosen: an order raised without one keeps the schema defaults exactly as before.
+          ...(fx.chosen && { currency: fx.currency, fxRateToBase: fx.fxRateToBase }),
         },
         select: { id: true },
       })
@@ -518,7 +535,16 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
       // From the LOCKED read, not the preflight: the activity log must describe the product as it was
       // when the order was actually raised.
       description: `Created ${input.orderType.toLowerCase()} order ${reference} for ${claim.sku} — ${claim.name} (${input.qtyPlanned} units)`,
-      metadata: { reference, sku: claim.sku, orderType: input.orderType, qty: input.qtyPlanned },
+      metadata: {
+        reference, sku: claim.sku, orderType: input.orderType, qty: input.qtyPlanned,
+        ...(fx.chosen && {
+          currency: fx.currency,
+          fxRateToBase: fx.fxRateToBase.toString(),
+          fxRateSource: fx.source,
+          fxRateManualOverride: fx.manualOverride,
+          fxRateFetchedAt: fx.fetchedAt.toISOString(),
+        }),
+      },
     })
 
     revalidatePath('/manufacturing')
