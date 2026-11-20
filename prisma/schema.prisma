@@ -231,6 +231,9 @@ enum AccountingSyncType {
   CREDIT_NOTE
   // A refund recorded in error was deleted in IMS: void the sales credit note it posted (ACCRECCREDIT) in the ledger.
   CREDIT_NOTE_VOID
+  // o3d-hqvrp.39: settles a POSTED sales credit note against its POSTED invoice - allocates it to the invoice (an unpaid invoice) or posts the
+  // refund cash-out against the credit note (a paid one). Behind xero_credit_note_allocation_enabled; its own claim and outbox job.
+  CREDIT_NOTE_ALLOCATION
   // audit-g5u2: supplier (purchase) credit note — Xero ACCPAYCREDIT.
   PURCHASE_CREDIT_NOTE
   // audit-v08m: follow-up that allocates the ACCPAYCREDIT to the bill it offsets.
@@ -2578,6 +2581,10 @@ model SalesOrderRefund {
   /// can never be provenance-less, and cleared in the same statement when the claim is released.
   accountingCreditNoteConnector String? @map("accounting_credit_note_connector")
   externalRefundId Int?
+  /// o3d-hqvrp.39: WooCommerce's `refunded_payment` for a storefront refund: TRUE when the refund was paid back THROUGH THE PAYMENT GATEWAY (cash left the account),
+  /// FALSE for "refund manually" (a store-credit coupon, a payment made outside the gateway). NULL: unknown (every refund written before this column, and every
+  /// non-storefront refund). Only TRUE counts as cash for the Xero credit-note settlement; NULL and FALSE never post a bank refund payment.
+  refundedViaGateway Boolean? @map("refunded_via_gateway")
   /// A storefront refund that returns quantity owes the storefront a stock correction (the store raised its own
   /// stock for it before IMS heard). Written TRUE in the refund's own transaction, so a refund can never commit
   /// without the obligation; FALSE for every other refund (manual, money-only, chargeback) and every row that

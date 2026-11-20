@@ -152,7 +152,7 @@ function serializePaymentMap(rows: PaymentMapRow[]): string {
  * test — a type shown here that the server refuses would be a button that only ever errors, and a
  * type missing here would hide the only exit a wedged payment row has.
  */
-const MONEY_SYNC_TYPES = new Set(['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION'])
+const MONEY_SYNC_TYPES = new Set(['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION', 'CREDIT_NOTE_ALLOCATION'])
 
 export function XeroClient({ settings: init, connected: initConnected, tenantName: initTenant, blockedReason, hasStoredToken: initHasStoredToken, connectionTest, accounts, logs, paymentMethodCombos, paymentAccountMap, currencies, shoppingPaymentMethods, imsTaxRates, xeroTaxRates: initXeroTaxRates, readiness, dailyBatchPreview: initPreview, dailyBatchHistory }: AccountingConnectorClientProps) {
   const router = useRouter()

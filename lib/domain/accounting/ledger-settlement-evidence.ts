@@ -315,6 +315,7 @@ const MONEY_POST_DATE_FIELD: Readonly<Record<string, 'paymentDate' | 'date'>> = 
   INVOICE_PAYMENT: 'paymentDate',
   BILL_PAYMENT: 'paymentDate',
   PURCHASE_CREDIT_NOTE_ALLOCATION: 'date',
+  CREDIT_NOTE_ALLOCATION: 'date',
 }
 
 /** Exported for the test that keeps the table in step with the money-moving type set. */

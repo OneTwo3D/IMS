@@ -116,6 +116,12 @@ export const WRITER_OWNERSHIP_MAP = [
     accountingSyncTypes: ['CREDIT_NOTE_VOID'],
     note: 'o3d-ngmt.22: voiding the credit note of a refund deleted in IMS. As sales.credit-note: Xeroom owns sales credit notes, so IMS shadows the void in P1 and P2 like the document it undoes.',
   }),
+  row('xero', 'sales.credit-note-allocation', { P1: 'xeroom', P2: 'xeroom' }, {
+    step: 'never',
+    obligationTime: 'required',
+    accountingSyncTypes: ['CREDIT_NOTE_ALLOCATION'],
+    note: 'o3d-hqvrp.39: settling a sales credit note (allocating it to its invoice, or paying it out as a refund against it). As sales.credit-note: Xeroom owns sales credit notes in P1 and P2, so IMS shadows the settlement of a credit note it does not own; the producer hold and the claim-boundary seam govern it exactly like the credit note. Dated from the credit note.',
+  }),
   row('xero', 'sales.payment', { P1: 'nobody', P2: 'IMS' }, {
     step: 'xero',
     obligationTime: 'required',

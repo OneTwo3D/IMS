@@ -4080,6 +4080,8 @@ export async function createSalesOrderRefund(
     returnReasonId?: string | null
     returnWarehouseId?: string
     externalRefundId?: number
+    /** WooCommerce `refunded_payment` of a storefront refund: stored on the refund (SalesOrderRefund.refundedViaGateway). */
+    refundedViaGateway?: boolean
     creditNotePrefix: string
     accountingSettings?: AccountingSettings | null
     /**
@@ -5525,6 +5527,7 @@ export async function createSalesOrderRefund(
         orderId: input.orderId,
         creditNoteNumber,
         externalRefundId: input.externalRefundId ?? null,
+        refundedViaGateway: input.externalRefundId != null && typeof input.refundedViaGateway === 'boolean' ? input.refundedViaGateway : null,
         // A storefront refund that returns quantity owes the storefront a stock correction (it raised its own stock first).
         // Written here, in the refund's own transaction: the obligation exists exactly when the refund does. Cleared (queued)
         // by lib/connectors/woocommerce/sync/refund-stock-correction.ts once the stock job is durably recorded.

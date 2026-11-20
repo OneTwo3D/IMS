@@ -33,7 +33,8 @@ test('CENSUS: every order-scoped follow-up type the processor knows is classifie
   const followUpTypeLine = /type FollowUpSyncType = ([^\n]+)/.exec(readFileSync('lib/connectors/xero/sync-processor.ts', 'utf8'))![1]!
   const followUps = [...followUpTypeLine.matchAll(/'([A-Z_]+)'/g)].map((m) => m[1]!)
   for (const t of followUps) assert.ok(members.includes(t), `${t} is a sync type`)
-  const supplierScoped = ['BILL_ATTACHMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION']
+  // not ORDER follow-ups: the supplier-scoped ones, and the sales credit-note settlement, which is scoped to a refund (o3d-hqvrp.39)
+  const supplierScoped = ['BILL_ATTACHMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION', 'CREDIT_NOTE_ALLOCATION']
   const orderScoped = followUps.filter((t) => !supplierScoped.includes(t)).sort()
   assert.deepEqual(orderScoped, Object.keys(ORDER_SCOPED_FOLLOW_UP_DISPOSITION).sort(), 'a new order-scoped follow-up type must be classified here')
 })

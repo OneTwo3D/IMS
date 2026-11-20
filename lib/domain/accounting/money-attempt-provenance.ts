@@ -106,7 +106,7 @@ import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
  * would be resolved at runtime inside a money path. Pinned to the fence's own set by a test: a
  * money type missing from here is a type whose out-of-custody rows are never repaired.
  */
-export const STAMPED_MONEY_TYPES = ['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION'] as const
+export const STAMPED_MONEY_TYPES = ['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION', 'CREDIT_NOTE_ALLOCATION'] as const
 
 /** The two columns that, together, can prove a money row is PRE-CALL. Neither proves it alone. */
 export type MoneyAttemptProvenance = {

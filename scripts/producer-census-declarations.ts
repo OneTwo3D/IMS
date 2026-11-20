@@ -462,6 +462,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'POSTs a supplier credit note to Xero.'),
   d('lib/connectors/xero/credit-notes.ts::allocatePurchaseCreditNote::xeroPut#1', 'xero', 'purchase.supplier-credit', 'drain', 'required',
     'PUTs an allocation of a supplier credit note.'),
+  d('lib/connectors/xero/credit-notes.ts::refundSalesCreditNote::xeroPost#1', 'xero', 'sales.credit-note-allocation', 'drain', 'required',
+    'The drain of CREDIT_NOTE_ALLOCATION (REFUND_PAYMENT): POSTs a refund Payment against an already-posted sales credit note; only ever reached from a queued, hold-checked sync row, behind the claim fence and the money ledger fence. Its ALLOCATE operation reuses the allocation PUT declared above (allocatePurchaseCreditNote), which is document-agnostic.'),
   d('lib/connectors/xero/daily-sync.ts::createPendingSyncLog::createAccountingSyncLogRow#1', 'xero', 'daily-batch', 'queue-producer', 'required',
     'Daily batch rows (A1, A2, B and the reconciliations) are created here; the obligation time is the batch date.'),
   d('lib/connectors/xero/daily-sync.ts::createPendingSyncLog::scheduleXeroAccountingOutbox#1', 'xero', 'daily-batch', 'queue-producer', 'required',

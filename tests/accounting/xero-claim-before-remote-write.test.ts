@@ -299,7 +299,14 @@ test('r5 #1: EVERY remote mutation in processEntry is fenced immediately before 
   // catch the failure that matters — a NEW case added to the switch with no fence in front of it,
   // which no behavioural test of the existing cases would ever notice.
   const source = readFileSync(new URL('../../lib/connectors/xero/sync-processor.ts', import.meta.url), 'utf8')
-  const body = source.slice(source.indexOf('async function processEntry('), source.indexOf('async function updateBackReference('))
+  const wholeBody = source.slice(source.indexOf('async function processEntry('), source.indexOf('async function updateBackReference('))
+  // o3d-hqvrp.39: the credit-note settlement is its own function (processCreditNoteAllocation) inside this span. It is held to the same rule by the second half of
+  // this test; it is cut out of the first half because it shares two of the call names below (the allocation PUT) with the purchase branch.
+  const hostedStart = wholeBody.indexOf('async function processCreditNoteAllocation(')
+  const hostedEnd = wholeBody.indexOf('\nexport async function processClaimedEntry(', hostedStart)
+  assert.ok(hostedStart > 0 && hostedEnd > hostedStart, 'the hosted settlement function is found')
+  const hostedLines = wholeBody.slice(hostedStart, hostedEnd).split('\n')
+  const body = wholeBody.slice(0, hostedStart) + wholeBody.slice(hostedEnd)
   const lines = body.split('\n')
 
   // Every call in processEntry that MUTATES something outside this database.
@@ -353,6 +360,22 @@ test('r5 #1: EVERY remote mutation in processEntry is fenced immediately before 
     lines.filter((line) => line.includes('await lease.fenceBeforeRemoteWrite(')).length,
     sites.length,
     'every fence must belong to a mutation and every mutation to a fence — a spare one is a renewal protecting nothing',
+  )
+
+  // The hosted credit-note settlement: its two requests (an allocation PUT and a refund payment POST) each have their own fence directly above them.
+  const hostedMutations = ['await allocatePurchaseCreditNote(', 'await refundSalesCreditNote(']
+  for (const needle of hostedMutations) {
+    const found = hostedLines.flatMap((line, index) => (line.includes(needle) ? [index] : []))
+    assert.equal(found.length, 1, `expected exactly one call site for ${needle} in the hosted settlement`)
+    assert.ok(
+      hostedLines.slice(Math.max(0, found[0] - 2), found[0]).some((line) => line.includes('if (!fence.ok) return fence.result') || line.includes('if (!refundFence.ok) return refundFence.result')),
+      `${needle} in the hosted settlement is NOT fenced immediately before it`,
+    )
+  }
+  assert.equal(
+    hostedLines.filter((line) => line.includes('await lease.fenceBeforeRemoteWrite(')).length,
+    hostedMutations.length,
+    'the hosted settlement has one fence per request, and no spare one',
   )
 })
 

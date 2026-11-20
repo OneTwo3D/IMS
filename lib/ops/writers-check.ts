@@ -111,6 +111,8 @@ export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   { key: 'xero.sales.credit-note', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_credit_note' }] },
   // Queued by an operator deleting a refund; the void itself is sent by the drain under the same credit-note switch.
   { key: 'xero.sales.credit-note-void', trigger: 'operator', requires: [...XERO_MASTER, { mode: 'xero_sync_credit_note' }] },
+  // o3d-hqvrp.39: queued after a credit note posts and by the settlement sweep, only with its own switch on (default off), and only while credit-note posting is on.
+  { key: 'xero.sales.credit-note-allocation', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_credit_note' }, { settingTrue: 'xero_credit_note_allocation_enabled', defaultValue: 'false' }] },
   { key: 'xero.sales.payment', trigger: 'automatic', requires: [...XERO_MASTER] },
   { key: 'xero.purchase.bill', trigger: 'automatic', requires: [...XERO_MASTER, { mode: 'xero_sync_purchase_invoice' }] },
   { key: 'xero.purchase.bill-delete', trigger: 'operator', requires: [...XERO_MASTER, { mode: 'xero_sync_purchase_invoice' }, { settingTrue: 'xero_document_delete_enabled', defaultValue: 'false' }] },

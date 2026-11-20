@@ -126,6 +126,8 @@ const CASES: Record<string, Case> = {
   CREDIT_NOTE_VOID: doc('CREDIT_NOTE_VOID', 'SalesOrderRefundDeletion'),
   PURCHASE_CREDIT_NOTE: doc('PURCHASE_CREDIT_NOTE', 'SupplierCreditNote'),
   PURCHASE_CREDIT_NOTE_ALLOCATION: doc('PURCHASE_CREDIT_NOTE_ALLOCATION', 'SupplierCreditNote'),
+  // o3d-hqvrp.39: one settlement per refund.
+  CREDIT_NOTE_ALLOCATION: doc('CREDIT_NOTE_ALLOCATION', 'SalesOrderRefund'),
   BILL_PAYMENT: doc('BILL_PAYMENT', 'PurchaseInvoice'),
   INVOICE_PAYMENT: {
     a: { type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: 'so-1', payload: { paymentId: 'pay-A' } },

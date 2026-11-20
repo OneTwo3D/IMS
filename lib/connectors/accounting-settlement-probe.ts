@@ -1240,7 +1240,10 @@ export async function probeXeroSettlement(
   const payload = asRecord(target.payload)
   const invoiceId = str(payload.accountingInvoiceId)
 
-  if (target.type === 'PURCHASE_CREDIT_NOTE_ALLOCATION') {
+  // o3d-hqvrp.39: the SALES credit-note settlement reads the same document the same way. Its ALLOCATE operation is the allocation arm unchanged; its
+  // REFUND_PAYMENT operation answers from the credit note's refund payments instead of its allocations (see `records` at the bottom of the arm).
+  if (target.type === 'PURCHASE_CREDIT_NOTE_ALLOCATION' || target.type === 'CREDIT_NOTE_ALLOCATION') {
+    const refundMode = target.type === 'CREDIT_NOTE_ALLOCATION' && str(payload.operation) === 'REFUND_PAYMENT'
     const creditNoteId = str(payload.creditNoteId)
     if (!creditNoteId || !invoiceId) {
       return { ok: false, reason: 'the row records no credit note and invoice to check' }
@@ -1295,7 +1298,7 @@ export async function probeXeroSettlement(
     // OWN currency, which is what its allocation amounts are stated in.
     const noteCurrency = ledgerCurrencyCode(note.CurrencyCode)
     // Only allocations against THIS bill: the same credit note legitimately offsets others.
-    const records: LedgerSettlementRecord[] = allocations
+    const allocationRecords: LedgerSettlementRecord[] = allocations
       .filter((a) => str(a.Invoice?.InvoiceID).toLowerCase() === invoiceId.toLowerCase())
       // No reference field exists on a Xero credit-note allocation, so this type has no mark to
       // match and falls back to amount and date alone. Stated rather than left to be inferred from
@@ -1804,6 +1807,21 @@ export async function probeXeroSettlement(
       || (applied !== null
         && (allocated === null
           || exceeds(allocated, applied, noteCurrency)))
+    // A REFUND is a Payment ON the credit note, not an allocation: the record list the classifier matches against is the counted refund payments (the same
+    // entries the identity above subtracted, so an EXCLUDED - deleted - payment is never a record), and its completeness is the same proof: the note's own
+    // Total - RemainingCredit figure accounts for allocations and these refunds together. The nested projection may carry no Date or Reference; an absent one
+    // is null, and the classifier then matches on the exact amount alone.
+    const records: LedgerSettlementRecord[] = refundMode
+      ? countedEntries.map((entry) => {
+          const nested = entry.payment as { Date?: string; Reference?: string }
+          return {
+            ...statedAmount(entry.payment.Amount, noteCurrency),
+            date: normaliseXeroSettlementDate(nested.Date),
+            id: entry.id,
+            reference: str(nested.Reference) || null,
+          }
+        })
+      : allocationRecords
     return settlementAnswer(applied, allocationsDoNotProve, records,
       'Xero states no total or remaining credit on this credit note and IMS read no allocation '
       + 'of it to this bill, so it has nothing to tell from — an empty answer here would say that '

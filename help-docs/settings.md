@@ -429,8 +429,8 @@ This means an admin viewing the activity log can see who did what but not see se
   accounting document id): it is kept for the retry AND has its content cleared on schedule, which is
   safe because a document that already posted is never re-sent — only its follow-ups are re-driven.
   One further set of accounting sync rows is **never deleted by age at all**: registered invoice
-  payments, applied supplier-credit-note allocations and sent bill payments (`INVOICE_PAYMENT`,
-  `PURCHASE_CREDIT_NOTE_ALLOCATION`, `BILL_PAYMENT`). For those, the row's existence *is* the record
+  payments, applied supplier-credit-note allocations, sales credit-note settlements and sent bill payments (`INVOICE_PAYMENT`,
+  `PURCHASE_CREDIT_NOTE_ALLOCATION`, `CREDIT_NOTE_ALLOCATION`, `BILL_PAYMENT`). For those, the row's existence *is* the record
   that the money movement already happened — it is what stops the same payment or allocation being
   sent to the ledger a second time, and for an imported order it is the only such record anywhere.
   Xero's own duplicate protection expires six minutes after the original call, so nothing at the far

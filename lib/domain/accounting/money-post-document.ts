@@ -93,6 +93,7 @@ const DOCUMENT_ANCHOR_FIELDS: Record<string, readonly string[]> = {
   INVOICE_PAYMENT: ['accountingInvoiceId'],
   BILL_PAYMENT: ['accountingInvoiceId'],
   PURCHASE_CREDIT_NOTE_ALLOCATION: ['accountingInvoiceId', 'creditNoteId'],
+  CREDIT_NOTE_ALLOCATION: ['accountingInvoiceId', 'creditNoteId'],
 }
 
 const DEFAULT_DOCUMENT_ANCHOR_FIELDS: readonly string[] = ['accountingInvoiceId']
@@ -278,7 +279,7 @@ export function settlementDocumentKey(type: string, payload: unknown): string {
  */
 export function moneyPostIdempotencySource(type: string, payload: unknown, episode = 0): string | null {
   const kind = str(type).toUpperCase()
-  if (kind !== 'INVOICE_PAYMENT' && kind !== 'BILL_PAYMENT' && kind !== 'PURCHASE_CREDIT_NOTE_ALLOCATION') return null
+  if (kind !== 'INVOICE_PAYMENT' && kind !== 'BILL_PAYMENT' && kind !== 'PURCHASE_CREDIT_NOTE_ALLOCATION' && kind !== 'CREDIT_NOTE_ALLOCATION') return null
   const anchors = documentAnchorFields(type).map((field) => documentIdentity(anchorValue(payload, field)))
   if (anchors.some((anchor) => anchor === '')) return null
   const record = asRecord(payload)

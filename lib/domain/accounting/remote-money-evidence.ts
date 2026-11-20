@@ -64,5 +64,6 @@ import type { AccountingSyncType } from '@/app/generated/prisma/client'
 export const REMOTE_MONEY_EVIDENCE_TYPES: readonly AccountingSyncType[] = [
   'INVOICE_PAYMENT',
   'PURCHASE_CREDIT_NOTE_ALLOCATION',
+  'CREDIT_NOTE_ALLOCATION',
   'BILL_PAYMENT',
 ]

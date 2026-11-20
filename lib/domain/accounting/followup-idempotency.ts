@@ -88,7 +88,7 @@ export const FOLLOW_UP_IDEMPOTENCY_KEY = '_followUpIdempotencyKey'
  * needs a manual reversal in the ledger. These get the strict treatment: the request body
  * is pinned alongside the token, and an ambiguous history refuses rather than guesses.
  */
-const MONEY_MOVING_FOLLOW_UP_TYPES = new Set(['INVOICE_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION'])
+const MONEY_MOVING_FOLLOW_UP_TYPES = new Set(['INVOICE_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION', 'CREDIT_NOTE_ALLOCATION'])
 
 export function isMoneyMovingFollowUp(type: string): boolean {
   return MONEY_MOVING_FOLLOW_UP_TYPES.has(type)
@@ -337,6 +337,11 @@ const REQUIRED_BODY_FIELDS: Record<string, readonly { field: string; kind: 'id' 
     { field: 'creditNoteId', kind: 'id' },
     { field: 'accountingInvoiceId', kind: 'id' },
     { field: 'amount', kind: 'amount' },
+  ],
+  // `amount` is NOT required: it is decided under the claim and pinned onto the payload before the remote call, so a row without one has provably not posted.
+  CREDIT_NOTE_ALLOCATION: [
+    { field: 'creditNoteId', kind: 'id' },
+    { field: 'accountingInvoiceId', kind: 'id' },
   ],
 }
 
