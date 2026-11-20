@@ -114,8 +114,9 @@ const ODD_FILES: Record<ApplyStepId, StepRows> = {
     { sku: `${TAG}-VAR`, name: 'Variable parent', type: 'VARIABLE', description: ' a parent ', category: 'Tools > Hand tools', weight: '1.50', salesPriceBase: '10.50', salePriceBase: '9.0', widthCm: '10.00', heightCm: '5', depthCm: '2.50', salesPriceTaxInclusive: 'TRUE', oversellAllowed: 'false', stockUnit: 'm', imageUrl: 'https://example.test/p.png', countryOfOrigin: 'china', lifecycleStatus: 'ACTIVE' },
     { sku: `${TAG}-SIMPLE`, name: 'Simple', type: '', category: 'tools > HAND TOOLS', barcode: '0123456789012', mpn: 'MPN-1', preferredSupplierName: SUPPLIER_A.toUpperCase(), preferredSupplierLocked: '1', weight: '0.1000', salesPriceBase: '0010.50', salesPriceTaxInclusive: 'yes' },
     { sku: `${TAG}-VARIANT`, name: 'Variant', type: 'VARIANT', parentSku: `${TAG}-VAR`, lifecycleStatus: 'DRAFT', salesPriceBase: '12' },
-    // a manufactured WooCommerce variation: BOM under a VARIABLE parent (the parent is created first, the recipe after every product)
+    // a WooCommerce variation with a recipe: KIT and BOM under a VARIABLE parent (the parent is created first, the recipe after every product)
     { sku: `${TAG}-VBOM`, name: 'Variation BOM', type: 'BOM', parentSku: `${TAG}-VAR`, components: `${TAG}-SIMPLE:2` },
+    { sku: `${TAG}-VKIT`, name: 'Variation KIT', type: 'KIT', parentSku: `${TAG}-VAR`, components: `${TAG}-SIMPLE:1` },
     { sku: `${TAG}-EOL`, name: 'End of life by the legacy flag', type: 'SIMPLE', active: 'FALSE' },
     { sku: `${TAG}-ARCH`, name: 'Archived', type: 'SIMPLE', lifecycleStatus: 'ARCHIVED', active: 'TRUE' },
     { sku: `${TAG}-KIT`, name: 'Kit', type: 'KIT', components: `${TAG}-SIMPLE:2;${TAG}-EOL:1.5000`, category: 'Kits' },

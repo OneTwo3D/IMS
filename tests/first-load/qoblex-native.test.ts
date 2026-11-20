@@ -459,7 +459,7 @@ test('superseding: a later file fills what it lacks from the earlier row (barcod
   assert.equal(clash.rows.filter((row) => row.values.sku === 'SYN-5001').length, 0)
   const retyped = { ...stock, rows: stock.rows.map((row) => (row.values.sku === 'SYN-5001' ? { ...row, values: { ...row.values, type: 'KIT' } } : row)) }
   const bad = mergeIngested([retyped, bundles], [false, true])
-  assert.ok(bad.rejected.some((r) => r.code === 'SUPERSEDE_CONFLICT' && /only SIMPLE -> KIT or BOM/.test(r.reason)))
+  assert.ok(bad.rejected.some((r) => r.code === 'SUPERSEDE_CONFLICT' && /only SIMPLE or VARIANT -> KIT or BOM/.test(r.reason)))
   assert.equal(clash.recordsRead, stock.recordsRead + bundles.recordsRead, 'a conflict moves a row from rows to rejected; nothing is lost from the count')
 })
 

@@ -502,8 +502,8 @@ export interface CanonRow {
   line: number
   /** Every canonical column of the dataset, trimmed, NFC-normalised, '' when absent. */
   values: Record<string, string>
-  /** products only: a later file's BOM row superseded this SKU's earlier VARIANT row (a variation with a manufactured recipe). The type is BOM; this says it is a WooCommerce variation. */
-  variantBom?: true
+  /** products only: a later file's KIT or BOM row superseded this SKU's earlier VARIANT row (a variation with a recipe). The type is KIT or BOM; this says it is a WooCommerce variation. */
+  variantRecipe?: true
 }
 
 export interface IngestRejection {
@@ -582,13 +582,13 @@ export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = 
       const values = { ...row.values }
       const filled: string[] = []
       const problems: string[] = []
-      let variantBom = false
+      let variantRecipe = false
       for (const column of Object.keys(values)) {
         const earlierValues = [...new Set(list.map((match) => match.row.values[column] ?? '').filter((value) => value !== ''))]
         if (column === 'type') {
-          const ok = earlierValues.every((value) => value === values.type || (value === 'SIMPLE' && (values.type === 'KIT' || values.type === 'BOM')) || (value === 'VARIANT' && values.type === 'BOM'))
-          if (!ok) problems.push(`type ${JSON.stringify(earlierValues)} -> ${JSON.stringify(values.type)} (only SIMPLE -> KIT or BOM, and VARIANT -> BOM, may change)`)
-          else if (earlierValues.includes('VARIANT') && values.type === 'BOM') variantBom = true
+          const ok = earlierValues.every((value) => value === values.type || (value === 'SIMPLE' && (values.type === 'KIT' || values.type === 'BOM')) || (value === 'VARIANT' && (values.type === 'KIT' || values.type === 'BOM')))
+          if (!ok) problems.push(`type ${JSON.stringify(earlierValues)} -> ${JSON.stringify(values.type)} (only SIMPLE or VARIANT -> KIT or BOM may change)`)
+          else if (earlierValues.includes('VARIANT') && (values.type === 'KIT' || values.type === 'BOM')) variantRecipe = true
           continue
         }
         const all = [...new Set([...earlierValues, ...(values[column] !== '' ? [values[column]] : [])])]
@@ -612,7 +612,7 @@ export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = 
       }
       if (problems.length > 0) {
         conflicts.push({ line: at(row.line, index), code: 'SUPERSEDE_CONFLICT', reason: `the earlier row(s) for this SKU disagree with this one: ${problems.join('; ')}. Nothing is overwritten silently; fix the data or make the exports agree` })
-      } else rows.push({ line: row.line, values, ...(variantBom ? { variantBom: true as const } : {}) })
+      } else rows.push({ line: row.line, values, ...(variantRecipe ? { variantRecipe: true as const } : {}) })
     }
     kept[index] = rows
     for (let earlier = 0; earlier < index; earlier++) kept[earlier] = kept[earlier].filter((row) => !replaced.has(row))

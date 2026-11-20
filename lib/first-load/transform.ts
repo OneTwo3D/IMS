@@ -310,7 +310,7 @@ interface CatEntry {
    * A manufactured product that is a WooCommerce variation: the source typed it VARIANT and a later file (or a recipe override) gave it a BOM recipe. IMS holds it as
    * type BOM under its VARIABLE parent (`canTypeHaveVariableParent`), so it is joined to its parent exactly like a VARIANT and is refused without one.
    */
-  variantBom?: boolean
+  variantRecipe?: boolean
 }
 
 interface StockGroup {
@@ -701,7 +701,7 @@ function validateProductRow(row: CanonRow): { ok: true; entry: CatEntry } | { ok
   }
   // The importer's own derivation: a valid lifecycleStatus wins, otherwise active FALSE means EOL, otherwise ACTIVE.
   const lifecycle = cells.lifecycleStatus ?? (cells.active === 'FALSE' ? 'EOL' : 'ACTIVE')
-  return { ok: true, entry: { sku: sku.sku, key: sku.key, name: v.name, type: type as ProductType, parentSku, cells, lifecycle, ...(row.variantBom === true && type === 'BOM' ? { variantBom: true } : {}) } }
+  return { ok: true, entry: { sku: sku.sku, key: sku.key, name: v.name, type: type as ProductType, parentSku, cells, lifecycle, ...(row.variantRecipe === true && (type === 'BOM' || type === 'KIT') ? { variantRecipe: true } : {}) } }
 }
 
 function loadCatalogue(run: Run): void {
@@ -721,7 +721,7 @@ function loadCatalogue(run: Run): void {
 
   const survivors: Candidate[] = []
   for (const [key, list] of [...groups.entries()]) {
-    const signatures = new Set(list.map((c) => JSON.stringify([c.entry.sku, c.entry.name, c.entry.type, c.entry.parentSku, c.entry.cells, c.entry.variantBom === true])))
+    const signatures = new Set(list.map((c) => JSON.stringify([c.entry.sku, c.entry.name, c.entry.type, c.entry.parentSku, c.entry.cells, c.entry.variantRecipe === true])))
     const distinctSkus = new Set(list.map((c) => c.entry.sku))
     if (distinctSkus.size > 1) {
       for (const c of list) run.add('products', c.row.line, c.entry.sku, 'REJECTED', 'SKU_CASE_COLLISION', `SKUs ${[...distinctSkus].sort(cmp).map((s) => JSON.stringify(s)).join(' and ')} differ only by letter case; the opening-stock, transfer and purchase-order importers cannot tell them apart`)
@@ -789,11 +789,11 @@ function loadCatalogue(run: Run): void {
   const typeOf = new Map<string, ProductType>([...remaining.map((c) => [c.entry.key, c.entry.type] as const), ...[...run.syntheticParents].map((key) => [key, 'VARIABLE' as const] as const)])
   const unjoined: string[] = []
   const unconfirmed: string[] = []
-  const bomVariants: string[] = []
+  const recipeVariants: string[] = []
   const required = run.config.requireVariantParents === true || run.has('variant-parents')
   for (const c of remaining) {
     const { entry } = c
-    if (entry.type === 'VARIANT' || entry.variantBom === true) {
+    if (entry.type === 'VARIANT' || entry.variantRecipe === true) {
       if (entry.parentSku === '') {
         run.add('products', c.row.line, entry.sku, 'REJECTED', 'VARIANT_WITHOUT_PARENT', run.variantParentsRefused
           ? 'a VARIANT needs a parentSku, and the variant-parents dataset was refused because it is not bound to a verified WooCommerce snapshot'
@@ -829,10 +829,10 @@ function loadCatalogue(run: Run): void {
     run.cat.set(entry.key, entry)
     run.catStatus.set(entry.key, 'ok')
     run.add('products', c.row.line, entry.sku, 'EMITTED', 'PRODUCT', 'in the products import file')
-    if (entry.variantBom === true) bomVariants.push(`${entry.sku} (under ${entry.parentSku})`)
+    if (entry.variantRecipe === true) recipeVariants.push(`${entry.sku} (under ${entry.parentSku})`)
   }
-  if (bomVariants.length > 0) {
-    run.find('INFO', 'VARIANT_CARRIES_BOM', `${bomVariants.length} WooCommerce variation(s) are manufactured (a BOM recipe): each loads as a BOM product under its VARIABLE parent (IMS holds a variation with a recipe as type BOM with a parent)`, 'products', bomVariants)
+  if (recipeVariants.length > 0) {
+    run.find('INFO', 'VARIANT_CARRIES_RECIPE', `${recipeVariants.length} WooCommerce variation(s) carry a recipe (KIT or BOM): each loads as that type under its VARIABLE parent (IMS holds a variation with a recipe as a KIT or BOM product with a parent)`, 'products', recipeVariants)
   }
   if (unconfirmed.length > 0) {
     run.find('ERROR', 'VARIANT_PARENT_UNCONFIRMED', `${unconfirmed.length} VARIANT product(s) name a parent but WooCommerce does not confirm it by exact SKU (the join is required: a prefilled parentSku is not enough). Fix the SKU or exclude each with a reason.`, 'products', unconfirmed)
@@ -870,7 +870,7 @@ function joinVariantParentsInto(run: Run, candidates: CatEntry[]): void {
   const byKey = new Map(candidates.map((entry) => [entry.key, entry]))
   const catalogue = (key: string): CatalogueView => {
     const entry = byKey.get(key)
-    if (entry) return { state: 'candidate', sku: entry.sku, type: entry.variantBom ? 'VARIANT' : entry.type, parentSku: entry.parentSku }
+    if (entry) return { state: 'candidate', sku: entry.sku, type: entry.type, parentSku: entry.parentSku }
     const status = run.catStatus.get(key)
     if (status === 'rejected') return { state: 'rejected' }
     if (status === 'excluded') return { state: 'excluded' }
@@ -897,7 +897,12 @@ function joinVariantParentsInto(run: Run, candidates: CatEntry[]): void {
     run.catStatus.set(entry.key, 'ok')
     run.syntheticParents.add(entry.key)
   }
-  for (const key of result.confirmed) run.variantConfirmed.add(key)
+  for (const key of result.confirmed) {
+    run.variantConfirmed.add(key)
+    // A KIT or BOM that WooCommerce confirms as a variation by exact SKU is a variation with a recipe: it keeps the parent (IMS: type KIT/BOM with a VARIABLE parent).
+    const joined = byKey.get(key)
+    if (joined && (joined.type === 'KIT' || joined.type === 'BOM')) joined.variantRecipe = true
+  }
   // A VARIABLE parent the products file carries keeps its row, but WooCommerce decides its title and lifecycle (the parent title comes from WooCommerce).
   const differing: string[] = []
   const lifecycleDisagrees: string[] = []
@@ -950,12 +955,12 @@ function loadRecipes(run: Run): void {
     if (row.values.type !== '' && row.values.type !== 'KIT' && row.values.type !== 'BOM') { early('BAD_TYPE', `type ${JSON.stringify(row.values.type)} must be KIT or BOM (or blank)`); continue }
     if (parent.ok && row.values.type !== '') {
       const entry = run.cat.get(parent.key)
-      if (entry && entry.type === 'VARIANT' && row.values.type === 'BOM') {
-        entry.type = 'BOM'
-        entry.variantBom = true
+      if (entry && entry.type === 'VARIANT') {
+        entry.type = row.values.type as ProductType
+        entry.variantRecipe = true
         convertedVariants.set(parent.key, entry)
       } else if (entry && entry.type !== row.values.type) {
-        early('RECIPE_OVERRIDE_TYPE_MISMATCH', `the override says ${parent.sku} is a ${row.values.type} but the products file loads it as ${entry.type}${entry.type === 'VARIANT' ? ' (a variation can carry a BOM recipe, not a KIT one)' : ''}`)
+        early('RECIPE_OVERRIDE_TYPE_MISMATCH', `the override says ${parent.sku} is a ${row.values.type} but the products file loads it as ${entry.type}${entry.type === 'VARIANT' ? '' : ''}`)
         continue
       }
     }
@@ -1035,11 +1040,11 @@ function loadRecipes(run: Run): void {
   for (const [key, entry] of convertedVariants) {
     if (overrideFailed.has(key)) {
       entry.type = 'VARIANT'
-      delete entry.variantBom
+      delete entry.variantRecipe
     }
   }
   const convertedOk = [...convertedVariants.entries()].filter(([key]) => !overrideFailed.has(key)).map(([, entry]) => `${entry.sku} (under ${entry.parentSku})`)
-  if (convertedOk.length > 0) run.find('INFO', 'VARIANT_CARRIES_BOM', `${convertedOk.length} WooCommerce variation(s) get a BOM recipe from the recipe-overrides decisions: each loads as a BOM product under its VARIABLE parent`, 'recipe-overrides', convertedOk)
+  if (convertedOk.length > 0) run.find('INFO', 'VARIANT_CARRIES_RECIPE', `${convertedOk.length} WooCommerce variation(s) get a KIT or BOM recipe from the recipe-overrides decisions: each loads as that type under its VARIABLE parent`, 'recipe-overrides', convertedOk)
 
   const { cycles, cyclicParents } = findRecipeCycles(valid.map((line) => ({ parent: line.parentKey, component: line.componentKey })))
   const skuOf = (key: string) => run.cat.get(key)?.sku ?? run.ims.get(key)?.sku ?? key
@@ -1307,6 +1312,7 @@ function loadStock(run: Run): void {
   type Lot = { row: CanonRow; sku: string; key: string; warehouse: string; qty: Dec; unitCostBase: Dec; lotRef: string; date: string; evidence: LotEvidence }
   const lots: Lot[] = []
   const excludedHolding = new Map<string, Dec>()
+  const kitVariationStock: string[] = []
   for (const row of run.rows('stock-lots')) {
     const v = row.values
     const sku = parseSku(v.sku)
@@ -1334,6 +1340,12 @@ function loadStock(run: Run): void {
     if (res.kind !== 'ok') continue
     trackSku(run, 'stock-lots', sku, res.sku)
     if (res.type === null) { reject('TYPE_UNKNOWN', `SKU ${sku.sku} exists only in IMS and its type is not known; give the type in the ims-skus file`); continue }
+    if (res.type === 'KIT' && run.cat.get(sku.key)?.variantRecipe === true) {
+      // A KIT that is a WooCommerce variation: the stock report's on-hand is Qoblex's computed availability of the bundle, not stock, exactly as for any KIT. Said, never loaded.
+      run.add('stock-lots', row.line, sku.sku, 'EXCLUDED', 'KIT_STOCK_IGNORED', 'a KIT holds no stock of its own: the on-hand in the stock report is the computed availability of its components and is not loaded')
+      if (qty.value.gt(0)) kitVariationStock.push(`${sku.sku} (${fmt(qty.value)})`)
+      continue
+    }
     if (!STOCK_BEARING_TYPES.has(res.type)) {
       run.add('stock-lots', row.line, sku.sku, 'EXCLUDED', 'EXCLUDED_TYPE', `${res.type} products cannot receive opening stock (only SIMPLE, VARIANT and BOM hold stock and cost layers)`)
       if (qty.value.gt(0)) run.find('ERROR', 'EXCLUDED_TYPE_HOLDS_STOCK', `${res.type} SKU ${sku.sku} has quantity ${fmt(qty.value)} in the stock extract but ${res.type} products cannot hold opening stock, so those units would be absent from every import file. Resolve it in the source (correct the type, or remove the stock row once the quantity is written off).`, 'stock-lots', [`${sku.sku} (${fmt(qty.value)})`])
@@ -1468,6 +1480,7 @@ function loadStock(run: Run): void {
       evidence: list.map((l) => l.evidence),
     })
   }
+  if (kitVariationStock.length > 0) run.find('INFO', 'KIT_STOCK_IGNORED', `${kitVariationStock.length} KIT variation(s) show an on-hand quantity in the stock report: it is the computed availability of the bundle, not stock, and is not loaded`, 'stock-lots', kitVariationStock)
   const zeroCost = [...run.stockGroups.values()].filter((g) => g.average.isZero()).map((g) => `${g.sku} in ${g.warehouseCode}`)
   if (zeroCost.length > 0) {
     run.find('WARNING', 'ZERO_COST_OPENING_STOCK', 'opening stock with a weighted-average cost of zero is accepted by the importer but would sell at zero cost of goods: confirm the cost in Qoblex', 'stock-lots', zeroCost)

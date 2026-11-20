@@ -138,7 +138,7 @@ const merged = (second: string) => mergeIngested([ds('products', [product('V-01'
 const bomRecipe = ds('recipe-lines', [{ parentSku: 'V-01', componentSku: 'C1', qty: '10' }])
 
 // [mutation: VARIANT -> BOM is a SUPERSEDE_CONFLICT again, or the type becomes BOM with no parent]
-test('a VARIANT superseded by a BOM row keeps its WooCommerce parent, loads as BOM with a recipe and is reported; KIT stays refused', (t) => {
+test('a VARIANT superseded by a BOM (or KIT) row keeps its WooCommerce parent, loads as BOM (or KIT) with a recipe and is reported', (t) => {
   const ok = run({ products: merged('BOM'), 'recipe-lines': bomRecipe, 'variant-parents': ds('variant-parents', [wooRow('V-01', 'V')]) })
   const withComponent = run({ products: mergeIngested([ds('products', [product('V-01', 'VARIANT'), product('C1')], 'stock.csv'), ds('products', [product('V-01', 'BOM')], 'bundles.csv')], [false, true]), 'recipe-lines': bomRecipe, 'variant-parents': ds('variant-parents', [wooRow('V-01', 'V')]) })
   precondition(t, 'product rows', rowsOf(withComponent, 'products').length)
@@ -147,32 +147,39 @@ test('a VARIANT superseded by a BOM row keeps its WooCommerce parent, loads as B
   assert.deepEqual([row.type, row.parentSku, row.components], ['BOM', 'V', 'C1:10'])
   assert.ok(rowsOf(withComponent, 'products').some((r) => r.sku === 'V' && r.type === 'VARIABLE'), 'the parent is emitted once')
   assert.equal(withComponent.blocking, false)
-  assert.ok(withComponent.report.findings.some((f) => f.severity === 'INFO' && f.code === 'VARIANT_CARRIES_BOM' && f.keys?.[0] === 'V-01 (under V)'))
+  assert.ok(withComponent.report.findings.some((f) => f.severity === 'INFO' && f.code === 'VARIANT_CARRIES_RECIPE' && f.keys?.[0] === 'V-01 (under V)'))
   // never loaded without its parent
   const orphan = run({ products: mergeIngested([ds('products', [product('V-01', 'VARIANT'), product('C1')], 'stock.csv'), ds('products', [product('V-01', 'BOM')], 'bundles.csv')], [false, true]), 'recipe-lines': bomRecipe, 'variant-parents': ds('variant-parents', [wooRow('OTHER-01', 'OTHER')]) })
   assert.deepEqual(dispositionCodes(orphan, 'products', 'REJECTED'), ['VARIANT_WITHOUT_PARENT'])
-  // KIT on a variant is still refused
-  const kit = merged('KIT')
-  assert.deepEqual(kit.rejected.map((x) => x.code), ['SUPERSEDE_CONFLICT'])
+  // KIT on a variation is allowed too (owner ruling): same join, type KIT, parent kept
+  const kit = run({ products: mergeIngested([ds('products', [product('V-01', 'VARIANT'), product('C1')], 'stock.csv'), ds('products', [product('V-01', 'KIT')], 'bundles.csv')], [false, true]), 'recipe-lines': bomRecipe, 'variant-parents': ds('variant-parents', [wooRow('V-01', 'V')]) })
+  const kitRow = rowsOf(kit, 'products').find((r) => r.sku === 'V-01')!
+  assert.deepEqual([kitRow.type, kitRow.parentSku, kitRow.components], ['KIT', 'V', 'C1:10'])
+  assert.equal(kit.blocking, false)
+  // a SIMPLE row superseded by VARIANT is still a conflict
+  assert.deepEqual(mergeIngested([ds('products', [product('V-01', 'KIT')], 'a.csv'), ds('products', [product('V-01', 'VARIANT')], 'b.csv')], [false, true]).rejected.map((x) => x.code), ['SUPERSEDE_CONFLICT'])
   // a plain BOM row (not a variation) is not given a parent it never had
   const plain = run({ products: merged('BOM'), 'recipe-lines': bomRecipe })
   assert.ok(plain.blocking)
 })
 
 // [mutation: the type check only allows an override type equal to the products type]
-test('recipe-overrides type BOM on a variation gives it a BOM recipe under its parent; KIT on it, or a failed override, leaves it a VARIANT', (t) => {
+test('recipe-overrides type BOM or KIT on a variation gives it that recipe type under its parent; a mismatch on a SIMPLE, or a failed override, is refused', (t) => {
   const base = { products: ds('products', [product('V-01', 'VARIANT'), product('C1'), product('C2')]), 'variant-parents': ds('variant-parents', [wooRow('V-01', 'V')]) }
   const good = run({ ...base, 'recipe-overrides': ds('recipe-overrides', [{ parentSku: 'V-01', componentSku: 'C1', qty: '3', type: 'BOM', reason: 'owner' }]) })
   precondition(t, 'products emitted', rowsOf(good, 'products').length)
   const row = rowsOf(good, 'products').find((r) => r.sku === 'V-01')!
   assert.deepEqual([row.type, row.parentSku, row.components], ['BOM', 'V', 'C1:3'])
   assert.equal(good.blocking, false)
-  assert.ok(good.report.findings.some((f) => f.code === 'VARIANT_CARRIES_BOM' && f.severity === 'INFO'))
+  assert.ok(good.report.findings.some((f) => f.code === 'VARIANT_CARRIES_RECIPE' && f.severity === 'INFO'))
   const kit = run({ ...base, 'recipe-overrides': ds('recipe-overrides', [{ parentSku: 'V-01', componentSku: 'C1', qty: '3', type: 'KIT', reason: 'owner' }]) })
-  assert.deepEqual(dispositionCodes(kit, 'recipe-overrides', 'REJECTED'), ['RECIPE_OVERRIDE_TYPE_MISMATCH'])
+  const kitRow = rowsOf(kit, 'products').find((r) => r.sku === 'V-01')!
+  assert.deepEqual([kitRow.type, kitRow.parentSku, kitRow.components], ['KIT', 'V', 'C1:3'])
+  const simple = run({ ...base, 'recipe-overrides': ds('recipe-overrides', [{ parentSku: 'C2', componentSku: 'C1', qty: '3', type: 'KIT', reason: 'owner' }]) })
+  assert.deepEqual(dispositionCodes(simple, 'recipe-overrides', 'REJECTED'), ['RECIPE_OVERRIDE_TYPE_MISMATCH'])
   const failed = run({ ...base, 'recipe-overrides': ds('recipe-overrides', [{ parentSku: 'V-01', componentSku: 'C1', qty: '3', type: 'BOM', reason: 'owner' }, { parentSku: 'V-01', componentSku: 'NOPE', qty: '1', type: 'BOM', reason: 'owner' }]) })
   assert.equal(failed.blocking, true)
-  assert.ok(!findingCodes(failed).includes('VARIANT_CARRIES_BOM'))
+  assert.ok(!findingCodes(failed).includes('VARIANT_CARRIES_RECIPE'))
 })
 
 // ---------------------------------------------------------------------------
@@ -280,23 +287,24 @@ test('o3d-1th8a: a repeated component line in an override rejects the whole over
   assert.equal(dup.blocking, true)
 })
 
-// [mutation: the loader refuses a BOM with a parentSku again, or lets a KIT have one]
-test('apply: a prepared run holding a variant-BOM loads (BOM under a VARIABLE parent); a KIT with a parent, or a BOM whose parent is not VARIABLE, is refused', (t) => {
+// [mutation: the loader refuses a KIT or BOM with a parentSku again, or lets a SIMPLE have one]
+test('apply: a prepared run holding a variant-BOM and a variant-KIT loads (under a VARIABLE parent); a SIMPLE with a parent, or a KIT/BOM whose parent is not VARIABLE, is refused', (t) => {
   const d = syntheticDatasets()
   const products = mergeIngested([
-    ds('products', [...d.products!.rows.map((r) => r.values), product('ZQSENT-TSHIRT-X', 'VARIANT', { parentSku: 'ZQSENT-TSHIRT' })], 'a.csv'),
-    ds('products', [product('ZQSENT-TSHIRT-X', 'BOM')], 'b.csv'),
+    ds('products', [...d.products!.rows.map((r) => r.values), product('ZQSENT-TSHIRT-X', 'VARIANT', { parentSku: 'ZQSENT-TSHIRT' }), product('ZQSENT-TSHIRT-K', 'VARIANT', { parentSku: 'ZQSENT-TSHIRT' })], 'a.csv'),
+    ds('products', [product('ZQSENT-TSHIRT-X', 'BOM'), product('ZQSENT-TSHIRT-K', 'KIT')], 'b.csv'),
   ], [false, true])
-  const recipes = ds('recipe-lines', [...d['recipe-lines']!.rows.map((r) => r.values), { parentSku: 'ZQSENT-TSHIRT-X', componentSku: 'ZQSENT-OAK-BOARD', qty: '2' }])
+  const recipes = ds('recipe-lines', [...d['recipe-lines']!.rows.map((r) => r.values), { parentSku: 'ZQSENT-TSHIRT-X', componentSku: 'ZQSENT-OAK-BOARD', qty: '2' }, { parentSku: 'ZQSENT-TSHIRT-K', componentSku: 'ZQSENT-OAK-BOARD', qty: '1' }])
   const files = preparedFiles(prepareSynthetic({ ...d, products, 'recipe-lines': recipes }))
   const name = [...files.keys()].find((k) => k.includes('products'))!
   const loaded = loadOk(files)
   precondition(t, 'steps loaded', loaded.steps.length)
   const text = new TextDecoder().decode(files.get(name)!)
   assert.match(text, /ZQSENT-TSHIRT-X,[^\r]*,BOM,ZQSENT-TSHIRT,/)
+  assert.match(text, /ZQSENT-TSHIRT-K,[^\r]*,KIT,ZQSENT-TSHIRT,/)
   assert.ok(loadPreparedRun)
-  const kit = problemsOf(withConsistentFile(files, name, (x) => x.replace(/(ZQSENT-TSHIRT-X,[^\r]*,)BOM(,ZQSENT-TSHIRT,)/, '$1KIT$2')))
-  assert.ok(kit.some((p) => /only a VARIANT or a BOM variation may have a parentSku/.test(p)), JSON.stringify(kit))
+  const simple = problemsOf(withConsistentFile(files, name, (x) => x.replace(/(ZQSENT-TSHIRT-X,[^\r]*,)BOM(,ZQSENT-TSHIRT,)/, '$1SIMPLE$2')))
+  assert.ok(simple.some((p) => /only a VARIANT, KIT or BOM may have a parentSku/.test(p)), JSON.stringify(simple))
   const notVariable = problemsOf(withConsistentFile(files, name, (x) => x.replace(/(ZQSENT-TSHIRT-X,[^\r]*,BOM,)ZQSENT-TSHIRT,/, '$1ZQSENT-OAK-BOARD,')))
   assert.ok(notVariable.some((p) => /parent is not a VARIABLE/.test(p)), JSON.stringify(notVariable))
 })
@@ -340,4 +348,32 @@ test('BLANK_STOCK_AS_ZERO is reported only for rows actually emitted (not a ghos
   const notes = r.notes!.filter((n) => n.code === 'BLANK_STOCK_AS_ZERO')
   assert.equal(notes.length, 1)
   assert.match(notes[0].reason, /SYN-EMIT/)
+})
+
+// [mutation: a KIT/BOM that Woo has as an exact-SKU variation is left parentless again, or joined without Woo confirming it]
+test('a KIT or BOM typed so from the start joins its WooCommerce parent by exact SKU; one Woo does not list stays a plain KIT; its stock-report on-hand is ignored, not an error', (t) => {
+  const base = {
+    products: ds('products', [product('KV-01', 'KIT'), product('BV-01', 'BOM'), product('PLAIN-KIT', 'KIT'), product('PLAIN-1'), product('C1')]),
+    'recipe-lines': ds('recipe-lines', [
+      { parentSku: 'KV-01', componentSku: 'C1', qty: '1' }, { parentSku: 'BV-01', componentSku: 'C1', qty: '2' }, { parentSku: 'PLAIN-KIT', componentSku: 'C1', qty: '1' },
+    ]),
+    'stock-lots': ds('stock-lots', [lot('KV-01', '7', '0'), lot('BV-01', '3', '1')]),
+    'variant-parents': ds('variant-parents', [wooRow('KV-01', 'P'), wooRow('BV-01', 'P'), wooRow('PLAIN-1', 'P')]),
+  }
+  const result = run(base)
+  const rows = rowsOf(result, 'products')
+  precondition(t, 'product rows', rows.length)
+  assert.deepEqual(['KV-01', 'BV-01', 'PLAIN-KIT', 'PLAIN-1'].map((s) => { const r = rows.find((x) => x.sku === s)!; return [r.type, r.parentSku] }), [['KIT', 'P'], ['BOM', 'P'], ['KIT', ''], ['SIMPLE', '']])
+  const info = result.report.findings.find((f) => f.code === 'VARIANT_CARRIES_RECIPE')!
+  assert.equal(info.severity, 'INFO')
+  assert.deepEqual(info.keys, ['BV-01 (under P)', 'KV-01 (under P)'])
+  assert.deepEqual(result.report.findings.find((f) => f.code === 'QOBLEX_TYPE_NOT_VARIANT')?.keys, ['PLAIN-1'])
+  assert.equal(result.blocking, false, JSON.stringify(result.report.findings.filter((f) => f.severity === 'ERROR')))
+  // the KIT's on-hand is ignored (INFO, no ERROR); the BOM's stock loads
+  assert.deepEqual(dispositionCodes(result, 'stock-lots', 'EXCLUDED'), ['KIT_STOCK_IGNORED'])
+  assert.deepEqual(rowsOf(result, 'opening-stock').map((r) => r.sku), ['BV-01'])
+  assert.ok(result.report.findings.some((f) => f.severity === 'INFO' && f.code === 'KIT_STOCK_IGNORED' && f.keys?.[0] === 'KV-01 (7)'))
+  // exact-SKU confirmation stays mandatory when the join is required and Woo does not list it
+  const unconfirmed = run({ ...base, 'variant-parents': ds('variant-parents', [wooRow('PLAIN-1', 'P')]) }, { requireVariantParents: true })
+  assert.ok(!findingCodes(unconfirmed).includes('VARIANT_CARRIES_RECIPE'))
 })
