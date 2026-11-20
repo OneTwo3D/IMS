@@ -18,12 +18,13 @@ function readArg(name: string): string | null {
 
 function usage(): never {
   console.error([
-    'Usage: tsx scripts/backfill-inventory-snapshots.ts --from YYYY-MM-DD [--to YYYY-MM-DD] [--dry-run] [--yes] [--allow-production] [--include-reservations] [--strict-reservations]',
+    'Usage: tsx scripts/backfill-inventory-snapshots.ts --from YYYY-MM-DD [--to YYYY-MM-DD] [--dry-run] [--yes] [--allow-production] [--include-reservations] [--strict-reservations] [--lock-cap-hours N]',
     '',
     'Seeds daily inventory_snapshots from current StockLevel/CostLayer state,',
     'then replays StockMovement rows backwards by day using movement value fields.',
     'When --include-reservations is set, also writes reservation snapshots only',
     'for days whose reservation sources have not changed after that UTC day.',
+    'A writing run holds the despatch floor lock (warehouse-dated despatches wait) for at most 24 h, or N h with --lock-cap-hours.',
   ].join('\n'))
   process.exit(1)
 }
@@ -50,6 +51,11 @@ async function main(): Promise<void> {
   const allowProduction = hasFlag('allow-production')
   const includeReservationSnapshots = hasFlag('include-reservations')
   const strictReservations = hasFlag('strict-reservations')
+  const lockCapRaw = readArg('lock-cap-hours')
+  const lockCapHours = lockCapRaw === null ? null : Number(lockCapRaw)
+  if (lockCapHours !== null && !(Number.isFinite(lockCapHours) && lockCapHours > 0 && lockCapHours <= 72)) {
+    throw new Error('--lock-cap-hours must be a number of hours between 0 and 72')
+  }
 
   if (process.env.NODE_ENV === 'production' && !allowProduction) {
     throw new Error('Refusing to run inventory snapshot backfill in production without --allow-production')
@@ -76,6 +82,7 @@ async function main(): Promise<void> {
     toDate: readArg('to') ?? undefined,
     dryRun,
     includeReservationSnapshots,
+    ...(lockCapHours ? { lockHoldMaxMs: lockCapHours * 3_600_000 } : {}),
   })
 
   console.log(JSON.stringify(result, null, 2))

@@ -1379,7 +1379,7 @@ function applyFailureOutcome(result: { error?: string; refusal?: string; quantit
         detail: 'The warehouse holds different line quantities than IMS books for this order, so nothing was shipped in IMS (applying it would leave stock on hand wrong). '
           + 'If the warehouse has MORE than IMS: ship the shipment by hand once it is right, then post a stock adjustment (a removal) for the extra units that left. '
           + 'If the warehouse has FEWER: reduce the shipment\'s line to what really left, then ship it by hand. '
-          + 'Once IMS matches the quantities the warehouse last reported, the next pass applies the despatch by itself; shipping by hand instead means entering the tracking and despatch date yourself.',
+          + 'Once IMS matches the quantities the warehouse last reported, the next pass applies the despatch by itself, but only while the warehouse has not changed the order since (its last-changed stamp is stored with the quantities). If it has changed, or the stamp is missing (a merged order, a row from before stamps existed, a part whose record carried none), the order stays held until a read that lists its items arrives: then release it by hand. Shipping by hand means entering the tracking and despatch date yourself.',
       },
     }
   }
@@ -1455,13 +1455,50 @@ export function partsReadStamp(parts: ReadonlyArray<{ externalId: string; lastUp
   return { lastUpdated: null, parts: parts.map((part) => `${part.externalId}@${part.lastUpdated}`).sort() }
 }
 
-/** Identical, and non-empty on both sides. */
+/**
+ * Do two LastUpdated strings name the same moment? The delta read (Order/List) and the per-order read (Order/{id}) may write the same instant with a different
+ * number of fractional-second digits ('...22.7476691' and '...22.748'), so the strings are compared as instants: the same date and time to the second, a
+ * fraction that agrees at the COARSER of the two precisions (truncated or rounded), and the same zone treatment (both zoneless, or both with an offset, which is
+ * converted to UTC). Unparseable, or a zoneless against a zoned value, never matches (the hold stays, which is the safe direction).
+ */
+export function sameWmsInstant(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a || !b) return false
+  const parse = (value: string) => {
+    const m = /^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.(\d+))?\s*(Z|[+-]\d{2}:?\d{2})?$/i.exec(value.trim())
+    if (!m) return null
+    const zone = m[4] ? m[4].toUpperCase() : null
+    const base = `${m[1]}T${m[2]}`
+    const seconds = zone === null ? Date.parse(`${base}Z`) : Date.parse(`${base}${zone === 'Z' ? 'Z' : zone.includes(':') ? zone : `${zone.slice(0, 3)}:${zone.slice(3)}`}`)
+    return Number.isNaN(seconds) ? null : { seconds: seconds / 1000, zoned: zone !== null, fraction: m[3] ?? '' }
+  }
+  const x = parse(a)
+  const y = parse(b)
+  if (!x || !y || x.zoned !== y.zoned || x.seconds !== y.seconds) return false
+  const n = Math.min(x.fraction.length, y.fraction.length)
+  // One side has no fraction at all: it is the coarser reading of the same second.
+  if (n === 0) return true
+  const [short, long] = x.fraction.length <= y.fraction.length ? [x.fraction, y.fraction] : [y.fraction, x.fraction]
+  if (long.slice(0, n) === short) return true
+  // The shorter value may have been rounded rather than truncated.
+  if (Number(long[n] ?? '0') >= 5) {
+    const bumped = String(Number(long.slice(0, n)) + 1).padStart(n, '0')
+    return bumped.length === n && bumped === short
+  }
+  return false
+}
+
+/** Identical (as instants, see sameWmsInstant), and non-empty on both sides. */
 export function despatchStampsMatch(stored: DespatchReadStamp | null | undefined, current: DespatchReadStamp): boolean {
   if (!stored) return false
   if (stored.parts && stored.parts.length > 0) {
-    return Boolean(current.parts) && current.parts!.length === stored.parts.length && current.parts!.every((part, index) => part === stored.parts![index])
+    const split = (entry: string): [string, string] => { const at = entry.indexOf('@'); return at < 0 ? [entry, ''] : [entry.slice(0, at), entry.slice(at + 1)] }
+    return Boolean(current.parts) && current.parts!.length === stored.parts.length && current.parts!.every((part, index) => {
+      const [idA, stampA] = split(part)
+      const [idB, stampB] = split(stored.parts![index])
+      return idA === idB && sameWmsInstant(stampA, stampB)
+    })
   }
-  return Boolean(stored.lastUpdated) && stored.lastUpdated === current.lastUpdated
+  return sameWmsInstant(stored.lastUpdated, current.lastUpdated)
 }
 
 export type WmsDispatchOutcome = {

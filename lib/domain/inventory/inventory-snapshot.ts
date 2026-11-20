@@ -987,6 +987,8 @@ async function writeInventorySnapshotRun(
 const SNAPSHOT_LOCK_HOLD_MAX_MS = 4 * 60 * 60_000
 /** The holder transaction pings its pinned connection this often, so a killed backend (a DBA cancel, a pooler, an idle-in-transaction timeout) is noticed within about this long. */
 const SNAPSHOT_LOCK_HEARTBEAT_MS = 30_000
+/** A writing backfill's default cap (it pauses warehouse-dated despatches while it runs; the CLI can change it). */
+const BACKFILL_LOCK_HOLD_MAX_MS = 24 * 60 * 60_000
 
 /**
  * The exclusive floor lock was lost (or the run outlasted its cap) while the run was under it: a despatch may have committed unfenced, so the day's rows
@@ -1006,9 +1008,20 @@ type SnapshotLockOptions = {
   lockHeartbeatMs?: number
   /** Test seam: called at every fence point with its name, before the lock is checked. */
   onStage?: (stage: string) => Promise<void> | void
+  /** Test seam: replaces the strict "is the despatch-date switch effective" read (a throw means the read failed). */
+  effectiveReader?: () => Promise<boolean>
 }
 
 type SnapshotFence = (stage: string) => Promise<void>
+
+/** Is the despatch-date switch effective? A failed read answers TRUE (fail closed): the callers then lock or refuse, never run unprotected on a guess. */
+async function effectiveFailClosed(reader?: () => Promise<boolean>): Promise<boolean> {
+  try {
+    return await (reader ?? (await import('@/lib/domain/wms/despatch-flags')).isWmsDespatchDateEffectiveStrict)()
+  } catch {
+    return true
+  }
+}
 
 async function recordLockActivity(level: 'INFO' | 'WARNING' | 'ERROR', action: string, description: string, metadata: Record<string, unknown>): Promise<void> {
   try {
@@ -1020,9 +1033,8 @@ async function recordLockActivity(level: 'INFO' | 'WARNING' | 'ERROR', action: s
 }
 
 /**
- * Run `body` while a dedicated transaction holds the inventory snapshot floor lock EXCLUSIVELY. The lock is taken ALWAYS (whatever the switches say right now),
- * so an operator turning wms_despatch_date_enabled on mid-run, or one failed settings read at the start, can never leave a run unfenced: with the switch off
- * nobody takes the shared side, so the cost is one pinned pool connection for the run.
+ * Run `body` while a dedicated transaction holds the inventory snapshot floor lock EXCLUSIVELY. Callers use it only when the lock protects something (the
+ * despatch-date switch is effective, or that could not be read: see writeDailyInventorySnapshot); with the switches off the daily snapshot does not come here.
  *
  * The holder can fail AFTER it took the lock (the cap firing, a killed backend, a dropped socket). That is detected (a flag set by the holder's own rejection,
  * a heartbeat on its connection, and the elapsed time against the cap), and then:
@@ -1031,7 +1043,7 @@ async function recordLockActivity(level: 'INFO' | 'WARNING' | 'ERROR', action: s
  *   - an ERROR activity row says the run was unfenced, and the run throws, so the cron outcome is RED;
  *   - a run past half of the cap writes a WARNING row while it is still going.
  */
-async function runUnderSnapshotFloorLock<T>(label: string, options: SnapshotLockOptions, body: (fence: SnapshotFence) => Promise<T>): Promise<T> {
+async function runUnderSnapshotFloorLock<T>(label: string, options: SnapshotLockOptions & { announce?: boolean }, body: (fence: SnapshotFence) => Promise<T>): Promise<T> {
   const holdMaxMs = options.lockHoldMaxMs ?? SNAPSHOT_LOCK_HOLD_MAX_MS
   const heartbeatMs = options.lockHeartbeatMs ?? SNAPSHOT_LOCK_HEARTBEAT_MS
   const state: { released: boolean; lockHeld: boolean; lost: { error: unknown } | null } = { released: false, lockHeld: false, lost: null }
@@ -1057,6 +1069,14 @@ async function runUnderSnapshotFloorLock<T>(label: string, options: SnapshotLock
   })
   await lockTaken
   const startedAt = Date.now()
+  if (options.announce) {
+    // A long writing job (the backfill) keeps every warehouse-dated despatch waiting while the switch is effective: say so, so a stall can be explained.
+    if (await effectiveFailClosed(options.effectiveReader)) {
+      await recordLockActivity('WARNING', 'inventory_snapshot_lock_long_job',
+        `${label} holds the despatch floor lock until it finishes (at most ${Math.round(holdMaxMs / 3_600_000)} h). While it runs every warehouse-dated despatch is refused and retried on the next sweep pass, and the warehouse delta watermark does not advance.`,
+        { capMs: holdMaxMs })
+    }
+  }
   const warnTimer = setTimeout(() => {
     console.warn(`[inventory-snapshot] ${label} has held the despatch floor lock for over half of its ${Math.round(holdMaxMs / 60_000)} min cap`)
     void recordLockActivity('WARNING', 'inventory_snapshot_slow',
@@ -1117,7 +1137,21 @@ export async function writeDailyInventorySnapshot(options: {
   tolerance?: Decimal
 } & SnapshotLockOptions = {}): Promise<InventorySnapshotWriteResult> {
   if (options.client) return writeDailyInventorySnapshotOn(options.client, options)
-  return runUnderSnapshotFloorLock('Daily inventory snapshot', options, (fence) => writeDailyInventorySnapshotOn(db as SnapshotClient, options, fence))
+  // Decided at the start and FAILING CLOSED: a settings read that fails is "lock" (the other readers turn a failed read into "off").
+  const lockNeeded = await effectiveFailClosed(options.effectiveReader)
+  if (lockNeeded) return runUnderSnapshotFloorLock('Daily inventory snapshot', options, (fence) => writeDailyInventorySnapshotOn(db as SnapshotClient, options, fence))
+  // The switch is off: IDENTICAL to the unlocked snapshot (no lock, no extra transaction, no heartbeat, no cap). The one addition is a read just before the run
+  // row: if the switch became effective while this run was unlocked, a despatch may have been dated into the day after the state was read, so the run row is NOT
+  // written (the day is uncovered, never wrongly covered), the cron goes red, and the next run takes the lock.
+  const unlockedFence: SnapshotFence = async (stage) => {
+    await options.onStage?.(stage)
+    if (stage !== 'before-run-row') return
+    if (!(await effectiveFailClosed(options.effectiveReader))) return
+    const message = 'The despatch-date switch became effective while the daily inventory snapshot was running without the floor lock, so a despatch may have been dated into the day after its state was read. The run row was NOT written; the run is failed and the next run takes the lock.'
+    await recordLockActivity('ERROR', 'inventory_snapshot_switch_flipped', message, { snapshotDate: String(options.snapshotDate ?? '') })
+    throw new InventorySnapshotLockLostError(message)
+  }
+  return writeDailyInventorySnapshotOn(db as SnapshotClient, options, unlockedFence)
 }
 
 async function writeDailyInventorySnapshotOn(client: SnapshotClient, options: {
@@ -1234,7 +1268,8 @@ type BackfillOptions = {
  */
 export async function backfillInventorySnapshots(options: BackfillOptions & SnapshotLockOptions): Promise<InventorySnapshotBackfillResult> {
   if (options.client || options.dryRun) return backfillInventorySnapshotsOn(options)
-  return runUnderSnapshotFloorLock('Inventory snapshot backfill', options, (fence) => backfillInventorySnapshotsOn(options, fence))
+  // A long range legitimately runs for hours: its cap is its own (24 h by default, `--lock-cap-hours` on the CLI), not the daily run's 4 h.
+  return runUnderSnapshotFloorLock('Inventory snapshot backfill', { ...options, lockHoldMaxMs: options.lockHoldMaxMs ?? BACKFILL_LOCK_HOLD_MAX_MS, announce: true }, (fence) => backfillInventorySnapshotsOn(options, fence))
 }
 
 async function backfillInventorySnapshotsOn(options: BackfillOptions, fence?: SnapshotFence): Promise<InventorySnapshotBackfillResult> {

@@ -66,6 +66,22 @@ export async function isInventorySnapshotCronEnabled(): Promise<boolean> {
   }
 }
 
+/**
+ * Whether the despatch-date switch is effective, but a failed settings read THROWS (the other readers turn it into "off"). For the one caller that must
+ * fail closed: the daily inventory snapshot decides whether to take the floor lock from it, and "could not read" must mean "lock".
+ */
+export async function isWmsDespatchDateEffectiveStrict(): Promise<boolean> {
+  const [switchValue] = await Promise.all([getSettingValue(WMS_DESPATCH_DATE_SETTING)])
+  if (switchValue !== 'true') return false
+  await import('@/lib/cron-jobs/system')
+  const { getAllCronJobs } = await import('@/lib/cron-registry')
+  const job = getAllCronJobs().find((entry) => entry.slug === 'inventory-snapshot')
+  if (!job) throw new Error('the inventory-snapshot job is not registered')
+  const { canonicalKey, legacyKey } = cronEnablementKeys(job)
+  const [canonical, legacy] = await Promise.all([getSettingValue(canonicalKey), legacyKey ? getSettingValue(legacyKey) : Promise.resolve(null)])
+  return resolveCronEnablement({ canonical, legacy, hasLegacyKey: legacyKey !== null, defaultEnabled: job.defaultEnabled })
+}
+
 export async function getWmsDespatchDateStatus(): Promise<WmsDespatchDateStatus> {
   const [switchOn, snapshotCronEnabled] = await Promise.all([isOn(WMS_DESPATCH_DATE_SETTING), isInventorySnapshotCronEnabled()])
   const effective = switchOn && snapshotCronEnabled

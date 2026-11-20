@@ -79,6 +79,7 @@ test('[db] item 1: a lock holder that fails AFTER taking the lock stops the snap
     await assert.rejects(
       writeDailyInventorySnapshot({
         snapshotDate: SNAPSHOT_DAY,
+        effectiveReader: async () => true,
         lockHoldMaxMs: 700, // the 4 h cap, shrunk: the holder's transaction times out and releases the lock while the run is still going
         lockHeartbeatMs: 100,
         onStage: async (stage) => {
@@ -108,6 +109,7 @@ test('[db] item 1: a run that passes half of the cap writes a WARNING while it i
   try {
     const result = await writeDailyInventorySnapshot({
       snapshotDate: SNAPSHOT_DAY,
+      effectiveReader: async () => true,
       lockHoldMaxMs: 20_000,
       onStage: async (stage) => { if (stage === 'before-snapshot-rows') await sleep(10_800) },
     })
@@ -124,25 +126,80 @@ test('[db] item 1: a run that passes half of the cap writes a WARNING while it i
 
 // ---- item 2 ------------------------------------------------------------------------------------------------------------------------------------
 
-test('[db] item 2: the floor lock is held for the whole run with the despatch switch OFF and the cron OFF (a switch turned on mid-run is never unfenced)', { skip }, async () => {
+test('[db] item 2: with the switches OFF the snapshot takes NO lock, has no heartbeat or cap, and is not stopped by a foreign holder (identical to before)', { skip }, async () => {
+  const ctx = await load()
+  const { writeDailyInventorySnapshot } = await import('../../lib/domain/inventory/inventory-snapshot')
+  await cleanSnapshot(ctx)
+  const since = new Date()
+  const heldAt: number[] = []
+  let releaseHolder!: () => void
+  const mayRelease = new Promise<void>((resolve) => { releaseHolder = resolve })
+  let held!: () => void
+  const holding = new Promise<void>((resolve) => { held = resolve })
+  const holder = ctx.db.$transaction(async (tx) => { await tx.$executeRaw`SELECT pg_advisory_xact_lock(${ctx.KEY})`; held(); await mayRelease }, { timeout: 60_000 })
+  try {
+    await holding
+    await withSettings(ctx, { wms_despatch_date_enabled: 'false', cron_inventory_snapshot_enabled: 'false' }, async () => {
+      const result = await Promise.race([
+        writeDailyInventorySnapshot({ snapshotDate: SNAPSHOT_DAY, lockHoldMaxMs: 1, onStage: async () => { heldAt.push(await exclusiveHolders(ctx)) } }).then(() => 'done'),
+        sleep(15_000).then(() => 'blocked'),
+      ])
+      assert.equal(result, 'done', 'with the switches off the snapshot must not wait for the floor lock, and a 1 ms cap changes nothing')
+    })
+    assert.ok(heldAt.length > 0 && heldAt.every((n) => n === 1), 'only the FOREIGN holder holds it: the snapshot took none')
+    assert.equal(await ctx.db.activityLog.count({ where: { action: { in: ['inventory_snapshot_unfenced', 'inventory_snapshot_duration', 'inventory_snapshot_switch_flipped'] }, createdAt: { gte: since } } }), 0)
+  } finally {
+    releaseHolder()
+    await holder.catch(() => undefined)
+    await cleanSnapshot(ctx)
+  }
+})
+
+test('[db] item 2: a settings read that FAILS at the start fails closed: the lock is taken', { skip }, async () => {
   const ctx = await load()
   const { writeDailyInventorySnapshot } = await import('../../lib/domain/inventory/inventory-snapshot')
   await cleanSnapshot(ctx)
   const since = new Date()
   const heldAt: Record<string, number> = {}
   try {
-    await withSettings(ctx, { wms_despatch_date_enabled: 'false', cron_inventory_snapshot_enabled: 'false' }, async () => {
-      await writeDailyInventorySnapshot({
-        snapshotDate: SNAPSHOT_DAY,
-        onStage: async (stage) => { heldAt[stage] = await exclusiveHolders(ctx) },
-      })
+    await writeDailyInventorySnapshot({
+      snapshotDate: SNAPSHOT_DAY,
+      effectiveReader: async () => { throw new Error('settings unreadable') },
+      onStage: async (stage) => { heldAt[stage] = await exclusiveHolders(ctx) },
     })
     assert.equal(heldAt['before-state-read'], 1)
     assert.equal(heldAt['before-run-row'], 1)
-    assert.equal(await exclusiveHolders(ctx), 0, 'released afterwards')
+    assert.equal(await exclusiveHolders(ctx), 0)
   } finally {
     await cleanSnapshot(ctx)
     await ctx.db.activityLog.deleteMany({ where: { action: 'inventory_snapshot_duration', createdAt: { gte: since } } })
+  }
+})
+
+test('[db] item 2: a switch that becomes effective during an UNLOCKED run fails the run WITHOUT writing the run row, and says why', { skip }, async () => {
+  const ctx = await load()
+  const { writeDailyInventorySnapshot, InventorySnapshotLockLostError } = await import('../../lib/domain/inventory/inventory-snapshot')
+  await cleanSnapshot(ctx)
+  const since = new Date()
+  try {
+    await withSettings(ctx, { wms_despatch_date_enabled: 'false', cron_inventory_snapshot_enabled: 'true' }, async () => {
+      await assert.rejects(
+        writeDailyInventorySnapshot({
+          snapshotDate: SNAPSHOT_DAY,
+          onStage: async (stage) => {
+            if (stage === 'before-snapshot-rows') {
+              await ctx.db.setting.upsert({ where: { key: 'wms_despatch_date_enabled' }, create: { key: 'wms_despatch_date_enabled', value: 'true' }, update: { value: 'true' } })
+            }
+          },
+        }),
+        (error: unknown) => error instanceof InventorySnapshotLockLostError,
+      )
+    })
+    assert.equal(await ctx.db.inventorySnapshotRun.count({ where: { snapshotDate: new Date(`${SNAPSHOT_DAY}T00:00:00Z`) } }), 0, 'no run row for a day that was not fenced')
+    assert.equal(await ctx.db.activityLog.count({ where: { action: 'inventory_snapshot_switch_flipped', level: 'ERROR', createdAt: { gte: since } } }), 1)
+  } finally {
+    await cleanSnapshot(ctx)
+    await ctx.db.activityLog.deleteMany({ where: { action: 'inventory_snapshot_switch_flipped', createdAt: { gte: since } } })
   }
 })
 
@@ -163,6 +220,25 @@ test('[db] item 8c: a writing snapshot backfill takes the floor lock; a dry run 
   } finally {
     await cleanSnapshot(ctx)
     await ctx.db.activityLog.deleteMany({ where: { action: 'inventory_snapshot_duration', createdAt: { gte: since } } })
+  }
+})
+
+test('[db] backfill: with the despatch switch effective a writing backfill writes the long-job warning; its cap is its own (not the daily 4 h)', { skip }, async () => {
+  const ctx = await load()
+  const { backfillInventorySnapshots } = await import('../../lib/domain/inventory/inventory-snapshot')
+  await cleanSnapshot(ctx)
+  const since = new Date()
+  try {
+    await withSettings(ctx, { wms_despatch_date_enabled: 'true', cron_inventory_snapshot_enabled: 'true' }, async () => {
+      await backfillInventorySnapshots({ fromDate: SNAPSHOT_DAY, toDate: SNAPSHOT_DAY })
+    })
+    const rows = await ctx.db.activityLog.findMany({ where: { action: 'inventory_snapshot_lock_long_job', createdAt: { gte: since } } })
+    assert.equal(rows.length, 1)
+    assert.equal(rows[0].level, 'WARNING')
+    assert.match(rows[0].description, /at most 24 h/)
+  } finally {
+    await cleanSnapshot(ctx)
+    await ctx.db.activityLog.deleteMany({ where: { action: { in: ['inventory_snapshot_lock_long_job', 'inventory_snapshot_duration'] }, createdAt: { gte: since } } })
   }
 })
 

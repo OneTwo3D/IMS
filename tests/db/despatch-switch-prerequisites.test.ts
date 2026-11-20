@@ -102,37 +102,36 @@ test('[db] MED1: the daily snapshot waits for a backdated despatch in flight, so
   })
 })
 
-test('[db] MED2 (R1, revised by o3d-kbn7o): the snapshot takes the floor lock WHATEVER the switches say, so a switch turned on mid-run is never unfenced: it waits for a foreign holder in every switch state', { skip }, async () => {
+test('[db] MED2 (R1): with the despatch-date switch OFF the snapshot takes no lock and uses no wrapping transaction: it runs while the lock is held by someone else', { skip }, async () => {
   const ctx = await load()
   const { writeDailyInventorySnapshot } = await import('../../lib/domain/inventory/inventory-snapshot')
-  for (const values of [{ switchOn: false, cronOn: true }, { switchOn: true, cronOn: false }, { switchOn: false, cronOn: false }]) {
-    await cleanSnapshot(ctx)
-    let releaseHolder!: () => void
-    const mayRelease = new Promise<void>((resolve) => { releaseHolder = resolve })
-    let held!: () => void
-    const holding = new Promise<void>((resolve) => { held = resolve })
-    const holder = ctx.db.$transaction(async (tx) => {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${ctx.KEY})`
-      held()
-      await mayRelease
-    }, { timeout: 60_000 })
-    try {
-      await holding
+  await cleanSnapshot(ctx)
+  let releaseHolder!: () => void
+  const mayRelease = new Promise<void>((resolve) => { releaseHolder = resolve })
+  let held!: () => void
+  const holding = new Promise<void>((resolve) => { held = resolve })
+  const holder = ctx.db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${ctx.KEY})`
+    held()
+    await mayRelease
+  }, { timeout: 60_000 })
+  try {
+    await holding
+    for (const values of [{ switchOn: false, cronOn: true }, { switchOn: true, cronOn: false }, { switchOn: false, cronOn: false }]) {
       await withDateSwitch(ctx, values, async () => {
-        let settled = false
-        const snapshot = writeDailyInventorySnapshot({ snapshotDate: SNAPSHOT_DAY }).finally(() => { settled = true })
-        await waitForLockWaiter(ctx)
-        await sleep(200)
-        assert.equal(settled, false, `switch ${JSON.stringify(values)}: the snapshot must wait for the despatch floor lock`)
-        releaseHolder()
-        await holder
-        await snapshot
+        const result = await Promise.race([
+          writeDailyInventorySnapshot({ snapshotDate: SNAPSHOT_DAY }).then(() => 'done'),
+          sleep(20_000).then(() => 'blocked'),
+        ])
+        assert.equal(result, 'done', `switch ${JSON.stringify(values)}: the snapshot must not wait for the despatch floor lock`)
       })
-    } finally {
-      releaseHolder()
-      await holder.catch(() => undefined)
-      await cleanSnapshot(ctx)
     }
+    const waiting = await ctx.db.$queryRaw<Array<{ n: bigint }>>`SELECT count(*)::bigint AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND objid = ${ctx.KEY}`
+    assert.equal(Number(waiting[0].n), 0)
+  } finally {
+    releaseHolder()
+    await holder.catch(() => undefined)
+    await cleanSnapshot(ctx)
   }
 })
 

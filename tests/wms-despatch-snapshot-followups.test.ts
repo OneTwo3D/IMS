@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 
-import { reconcileOneOrder, despatchStampsMatch, partsReadStamp, type WmsDispatchSweepDeps } from '../lib/domain/wms/dispatch-sweep.ts'
+import { reconcileOneOrder, despatchStampsMatch, sameWmsInstant, partsReadStamp, type WmsDispatchSweepDeps } from '../lib/domain/wms/dispatch-sweep.ts'
 import { SNAPSHOT_RUNNING_MARK, tryLockInventorySnapshotFloorShared } from '../lib/domain/sales/despatch-instant.ts'
 import { classifyDespatchDatePrerequisite } from '../lib/ops/rollout-readiness.ts'
 import type { WmsOrderPart, WmsOrderStatus } from '../lib/connectors/wms/types.ts'
@@ -181,4 +181,22 @@ test('item 8b: the scoped (mixed-warehouse) despatch path carries the in-lock qu
   assert.match(body, /withQuantityFence\(update, order\.id, wmsWarehouseId, quantityCaptured\)/)
   assert.match(body, /shipFence: scopedFence/)
   assert.match(body, /startsWith\(QUANTITY_FENCE_MARK\)/)
+})
+
+test('stamp compare: the same moment with a different fractional precision (7 digits against 3) or an offset spelling compares equal; a different moment does not', () => {
+  // Order/List may write 7 digits, Order/{id} 3 (truncated or rounded).
+  assert.equal(sameWmsInstant('2026-09-24T11:20:22.7476691', '2026-09-24T11:20:22.747'), true)
+  assert.equal(sameWmsInstant('2026-09-24T11:20:22.7476691', '2026-09-24T11:20:22.748'), true, 'rounded')
+  assert.equal(sameWmsInstant('2026-09-24T11:20:22.7476691', '2026-09-24T11:20:22'), true)
+  assert.equal(sameWmsInstant('2026-09-24T11:20:22.7476691', '2026-09-24T11:20:22.7476691'), true)
+  assert.equal(sameWmsInstant('2026-09-24T11:20:22.7476691', '2026-09-24T11:20:22.749'), false)
+  assert.equal(sameWmsInstant('2026-09-24T11:20:22.7476691', '2026-09-24T11:20:23.747'), false)
+  assert.equal(sameWmsInstant('2026-09-24T12:20:22+01:00', '2026-09-24T11:20:22Z'), true)
+  assert.equal(sameWmsInstant('2026-09-24T11:20:22', '2026-09-24T11:20:22Z'), false, 'zoneless against zoned: cannot say')
+  assert.equal(sameWmsInstant('garbage', 'garbage'), false)
+  assert.equal(sameWmsInstant(null, '2026-09-24T11:20:22'), false)
+  // And through the stamp compare, for both a non-split and a per-part stamp.
+  assert.equal(despatchStampsMatch({ lastUpdated: '2026-09-24T11:20:22.7476691' }, { lastUpdated: '2026-09-24T11:20:22.747' }), true)
+  assert.equal(despatchStampsMatch({ parts: ['P1@2026-09-24T11:20:22.7476691'] }, { parts: ['P1@2026-09-24T11:20:22.747'] }), true)
+  assert.equal(despatchStampsMatch({ parts: ['P1@2026-09-24T11:20:22.7476691'] }, { parts: ['P2@2026-09-24T11:20:22.747'] }), false)
 })

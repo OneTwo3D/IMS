@@ -976,7 +976,10 @@ async function applyScopedWmsDespatch(
       }
       if (result.success && target === 'SHIPPED') processedInBatch.push(shipment.id)
       if (!result.success && result.error?.startsWith(SNAPSHOT_RUNNING_MARK)) {
-        // Refused before anything moved (the snapshot holds the floor lock): not a failure, nothing to log; the next pass applies it.
+        // Refused before anything moved FOR THIS SHIPMENT (the snapshot holds the floor lock): not a failure, nothing to log; the next pass applies it.
+        // ACCEPTED NARROW RACE: each shipment is its own transaction, so a snapshot that starts between shipment 1's commit and shipment 2's try-lock leaves
+        // shipment 1 shipped and the partial-shipment e-mail judgement of this batch discarded (the retry's open list excludes the shipped one, as for any
+        // transient failure, see the accepted limit below). The next pass ships the rest and flips the order; the customer gets the dispatched e-mail only.
         discardPartialEmails()
         return refuseExternalFulfillment('snapshot_in_progress', result.error)
       }
