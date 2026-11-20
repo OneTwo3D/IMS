@@ -243,6 +243,7 @@ type RefundLineTaxRow = {
   totalBase: DecimalInput
   postedTaxRate: DecimalInput | null
   lineKind?: string | null
+  productId?: string | null
   refund: { order: { shippingAddress: unknown } }
   salesOrderLine: {
     taxRateId: string | null
@@ -552,6 +553,12 @@ function settlementRateToBase(
 }
 
 /** Orders read per page of the shipping query. */
+/** A refund line's kind: the stored one, else the codebase's legacy rule (a product means a sale, a negative total a discount, otherwise shipping). */
+function refundLineKind(line: { lineKind?: string | null; productId?: string | null; totalBase: DecimalInput }): string {
+  if (line.lineKind) return line.lineKind
+  return line.productId ? 'sale' : toDecimal(line.totalBase).lt(0) ? 'discount' : 'shipping'
+}
+
 /** The label of the shipping row, which is its own row (never the "No tax rate" row). */
 export const SHIPPING_ROW_NAME = 'Shipping and order-level tax'
 const SHIPPING_PAGE_SIZE = 2000
@@ -686,6 +693,7 @@ export async function getVatReport(
         totalBase: true,
         postedTaxRate: true,
         lineKind: true,
+        productId: true,
         refund: { select: { order: { select: { shippingAddress: true } } } },
         salesOrderLine: {
           select: {
@@ -841,7 +849,7 @@ export async function getVatReport(
     const rate = line.postedTaxRate != null ? toDecimal(line.postedTaxRate) : toDecimal(taxRate?.rate ?? 0)
     const net = toDecimal(line.totalBase)
     // A shipping refund (a credit line with no order line, of kind shipping, or a legacy line with no kind) nets against the shipping row it was counted on, not the "No tax rate" row.
-    const isShippingRefund = line.salesOrderLine === null && (line.lineKind === 'shipping' || line.lineKind == null)
+    const isShippingRefund = line.salesOrderLine === null && refundLineKind(line) === 'shipping'
     const row = getOrCreateRow({
       side: 'sales',
       taxRateId: line.salesOrderLine?.taxRateId ?? null,

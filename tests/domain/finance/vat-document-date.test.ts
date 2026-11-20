@@ -154,7 +154,7 @@ test('the report says Xeroom-invoiced orders (no invoicedAt) are not included', 
 type ShipOrder = { id: string; shipping: number; orderTax: number; lineTax: number; address?: unknown }
 const GB = { country: 'GB' }
 /** A stand-in client with a no-tax-rate sales line (jurisdiction GB), the given orders for the shipping query (honouring take/cursor like the database), and refund lines. */
-function shippingDeps(orders: ShipOrder[], refundLines: Array<{ net: number; lineKind?: string | null; withOrderLine?: boolean }> = [], seen?: { pages: number }): FinanceAnalyticsDeps {
+function shippingDeps(orders: ShipOrder[], refundLines: Array<{ net: number; lineKind?: string | null; productId?: string | null; withOrderLine?: boolean }> = [], seen?: { pages: number }): FinanceAnalyticsDeps {
   return {
     now: () => NOW,
     baseCurrency: async () => 'GBP',
@@ -176,7 +176,7 @@ function shippingDeps(orders: ShipOrder[], refundLines: Array<{ net: number; lin
       purchaseInvoice: { findMany: async () => [] },
       salesOrderRefundLine: {
         findMany: async () => refundLines.map((r) => ({
-          totalBase: D(r.net), postedTaxRate: D(0.2), lineKind: r.lineKind ?? null, refund: { order: { shippingAddress: GB } },
+          totalBase: D(r.net), postedTaxRate: D(0.2), lineKind: r.lineKind ?? null, productId: r.productId ?? null, refund: { order: { shippingAddress: GB } },
           salesOrderLine: r.withOrderLine ? { taxRateId: null, taxRate: null } : null,
         })),
       },
@@ -239,4 +239,15 @@ test('the shipping query is paged: more orders than one page are all counted, an
 test('the notice says manual orders whose invoice number IMS minted are reported on the mint day while Xeroom posts them', async () => {
   const r = await run(Q3, deps({}))
   assert.ok(r.notices.some((n) => /Xeroom/.test(n) && /minted/.test(n) && /different period/.test(n)))
+})
+
+test('a kind-less legacy refund line follows the codebase legacy rule: a product is a sale, a negative total a discount, only the rest is shipping', async () => {
+  const orders = [{ id: 'a', shipping: 10, orderTax: 2, lineTax: 0 }]
+  const r = await run(Q3, shippingDeps(orders, [
+    { net: 10, lineKind: null },                    // shipping: nets the shipping row
+    { net: 5, lineKind: null, productId: 'p1' },    // legacy product refund: stays on "No tax rate"
+    { net: -4, lineKind: null },                    // legacy mirrored discount: stays on "No tax rate"
+  ]))
+  assert.equal(Number(r.rows.find((row) => row.taxRateName === SHIPPING_ROW_NAME)!.taxBase), 0, 'only the true shipping refund nets the shipping row')
+  assert.equal(Number(r.rows.find((row) => row.taxRateName === 'No tax rate')!.taxBase), -0.2, '5 at 20% off, minus a -4 at 20% = -1 + 0.8')
 })

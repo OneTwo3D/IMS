@@ -5911,7 +5911,7 @@ The statement "IMS changes nothing in Xero" for sales invoices, invoice updates 
 PRODUCER_HOLD_ENFORCED_DESTINATIONS=xero
 ```
 
-`all` also passes. A value that is not a list of known destinations enforces every destination (a misspelling cannot leave the hold off). Add it to the production reinstall checklist before the first start, and to the switchover runbook's global gates and step X preconditions (`docs/woocommerce-live-runbook.md`).
+`all` also passes. A value that is not a list of known destinations enforces every destination, Mintsoft and WooCommerce included, so a misspelled value holds everything (the preflight passes it with a warning). Add it to the production reinstall checklist before the first start, and to the switchover runbook's global gates and step X preconditions (`docs/woocommerce-live-runbook.md`).
 
 #### Retiring the held backlog
 

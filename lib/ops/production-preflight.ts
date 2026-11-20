@@ -531,11 +531,15 @@ function checkXeroProducerHold(checks: PreflightCheck[], env: Env): void {
   const enforcement = readProducerEnforcement(env)
   const enforcedForXero = enforcement.enforced && enforcement.destinations.has('xero')
   if (enforcedForXero) {
+    if (enforcement.enforced && !enforcement.readable) {
+      add(checks, 'warn', 'producer-hold-xero', PRODUCER_HOLD_ENFORCED_ENV, `${PRODUCER_HOLD_ENFORCED_ENV} is set but cannot be read as a list of destinations, so EVERY destination is held. Fix the spelling.`)
+      return
+    }
     add(checks, 'pass', 'producer-hold-xero', PRODUCER_HOLD_ENFORCED_ENV, 'The producer hold is enforced for Xero.')
     return
   }
   // The owner is the current phase's owner (the phase follows from the grant and the live-from instant, never a setting of its own).
-  const owned = XERO_INCUMBENT_OWNED_OPERATIONS.filter((operation) => explainProducerDisposition('xero', operation, undefined, { env }).owner === 'xeroom')
+  const owned = XERO_INCUMBENT_OWNED_OPERATIONS.filter((operation) => explainProducerDisposition('xero', operation, undefined, { env }).owner !== 'IMS')
   if (owned.length === 0) {
     add(checks, 'pass', 'producer-hold-xero', PRODUCER_HOLD_ENFORCED_ENV, 'The producer hold is not enforced for Xero, and the ownership map gives IMS every Xero sales invoice and credit note operation in the current phase.')
     return
@@ -545,7 +549,7 @@ function checkXeroProducerHold(checks: PreflightCheck[], env: Env): void {
     'fail',
     'producer-hold-xero',
     PRODUCER_HOLD_ENFORCED_ENV,
-    `The ownership map says Xeroom owns ${owned.join(', ')} in the current phase, but ${PRODUCER_HOLD_ENFORCED_ENV} does not name xero (or all), so IMS would post those documents live beside Xeroom. Set ${PRODUCER_HOLD_ENFORCED_ENV}=xero (or all) in the environment file; see "Producer hold readiness" in docs/installation.md.`,
+    `The ownership map says ${owned.join(', ')} ${owned.length === 1 ? 'is' : 'are'} not owned by IMS in the current phase (Xeroom owns sales invoices and credit notes), but ${PRODUCER_HOLD_ENFORCED_ENV} does not name xero (or all), so IMS would post those documents live beside Xeroom. Set ${PRODUCER_HOLD_ENFORCED_ENV}=xero (or all) in the environment file; see "Producer hold readiness" in docs/installation.md.`,
   )
 }
 

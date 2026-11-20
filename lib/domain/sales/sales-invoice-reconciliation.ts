@@ -141,7 +141,7 @@ export function assertInvoiceQueuedOrNotOwed(outcome: { queued: boolean; reason?
 export class SalesInvoiceOriginalDateUnknownError extends SalesInvoiceNotQueuedError {
   constructor() {
     super('the original date of the posted invoice is unknown')
-    this.message = 'The invoice already posted for this order has a date IMS cannot read (no posted record carries it and the order stores none), and sending today\'s date would re-date that invoice. The update was not queued and nothing was saved. Link or repair the invoice date (the accounting back-reference repair) or amend the invoice in the accounting system by hand.'
+    this.message = 'The invoice already posted for this order has a date IMS cannot read (no posted record carries it and the order stores none), and sending today\'s date would re-date that invoice. The update was not queued and nothing was saved. An administrator has to record the posted invoice date on the order in the database before it can be edited while Xero writes are live.'
     this.name = 'SalesInvoiceOriginalDateUnknownError'
   }
 }

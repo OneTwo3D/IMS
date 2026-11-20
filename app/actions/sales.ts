@@ -1,7 +1,7 @@
 'use server'
 
 import { businessDateYmd } from '@/lib/business-date'
-import { creditNoteDocumentDay, originalSalesInvoiceDay, readCreditNoteDocumentDay } from '@/lib/domain/accounting/document-date'
+import { creditNoteDocumentDay, originalDayDecision, originalSalesInvoiceDay, readCreditNoteDocumentDay } from '@/lib/domain/accounting/document-date'
 import { readPostedSalesInvoiceDate } from '@/lib/domain/accounting/posted-invoice-date'
 import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import type { InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
@@ -183,6 +183,7 @@ import {
   releaseOrderAllocationsInTx,
   updateSalesOrderStatusUnderLock,
 } from '@/lib/domain/sales/allocation-service'
+import { producerSeamVerdict } from '@/lib/security/producer-seam'
 import { wmsCreateObligationFloor } from '@/lib/connectors/wms/producer-seam'
 import { WMS_PRE_CUTOVER_NOTICE, WMS_PRE_CUTOVER_PUSH_STATE, wmsPushIsPreCutover } from '@/lib/domain/wms/create-eligibility'
 import { findSalesOrderDeleteBlocker } from '@/lib/domain/sales/order-delete-guard'
@@ -1906,6 +1907,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
   } catch (e) {
     if (e instanceof CustomerAnonymisedError) return { success: false, error: e.message }
     if (e instanceof EditedOrderAllocationError) return { success: false, error: `Stock could not be re-reserved for the edited order, so nothing was changed: ${e.message}` }
+    if (e instanceof SalesInvoiceOriginalDateUnknownError) return { success: false, error: `The edit was refused, so nothing was changed: ${e.message}` }
     if (e instanceof SalesInvoiceDoesNotReconcileError || e instanceof SalesInvoiceNotQueuedError) return { success: false, error: `The edit would leave the order's invoice out of step with its total, so nothing was changed: ${e.message}` }
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -2133,14 +2135,30 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   // None readable: the update is refused (never today's date, which would move the invoice into the period of the edit).
   const postedPayloadDate = so.accountingInvoiceId ? await readPostedSalesInvoiceDate(reader, so.id, so.accountingInvoiceId) : null
   const documentDay = originalSalesInvoiceDay({ accountingInvoiceId: so.accountingInvoiceId, postedPayloadDate, externalCreatedAt: so.externalCreatedAt, invoicedAt: so.invoicedAt })
-  if (documentDay === null) throw new SalesInvoiceOriginalDateUnknownError()
+  // Refused only when the update would really be SENT. Under the enforced Xero hold the update is only recorded as a shadow (nothing is delivered), so it is recorded with today's date and
+  // flagged `dateUnknown`, and the edit goes through: refusing it would block an edit that sends nothing, with no way out in IMS.
+  let dateUnknown = false
+  if (documentDay === null) {
+    if (originalDayDecision(documentDay, producerSeamVerdict('xero', 'sales.invoice-update').kind === 'shadow') === 'refuse') throw new SalesInvoiceOriginalDateUnknownError()
+    dateUnknown = true
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: so.id,
+      action: 'sales_invoice_update_date_unknown',
+      tag: 'accounting',
+      level: 'WARNING',
+      description: 'The original date of the posted invoice could not be read; the update was recorded as a shadow (nothing was sent) with today\'s date, flagged as unknown.',
+      metadata: { accountingInvoiceId: so.accountingInvoiceId },
+    })
+  }
 
   const payload = {
     invoiceNumber: accountingInvoiceNumber,
     contactName: so.customerName ?? 'Unknown',
     contactEmail: so.customerEmail ?? undefined,
     // An UPDATE of a posted invoice keeps the ORIGINAL document date (an edit or a return-exchange on 2 Oct must not move a 30 Sep invoice into the next VAT period); see originalSalesInvoiceDay.
-    date: documentDay,
+    date: documentDay ?? businessDateYmd(new Date()),
+    ...(dateUnknown ? { dateUnknown: true } : {}),
     currency: so.currency,
     // Stamp IMS's FX rate on the document so Xero/QuickBooks don't apply
     // their own daily rate (which causes 1-3 % drift on multi-currency
@@ -3984,6 +4002,7 @@ export async function createRefund(
     }
   } catch (e) {
     if (e instanceof CustomerAnonymisedError) return { success: false, error: e.message }
+    if (e instanceof SalesInvoiceOriginalDateUnknownError) return { success: false, error: `The exchange was refused, so nothing was recorded: ${e.message}` }
     if (e instanceof SalesInvoiceDoesNotReconcileError || e instanceof SalesInvoiceNotQueuedError) return { success: false, error: `The exchange would leave the order's invoice out of step with its total, so nothing was recorded: ${e.message}` }
     if (options?.externalRefundId && isExternalRefundIdUniqueConflict(e)) {
       // o3d-7yf: externalRefundId is globally unique, so this conflict may be a CROSS-ORDER race — the

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { creditNoteDocumentDay, originalSalesInvoiceDay, salesInvoiceDocumentDay } from '@/lib/domain/accounting/document-date'
+import { creditNoteDocumentDay, originalDayDecision, originalSalesInvoiceDay, salesInvoiceDocumentDay } from '@/lib/domain/accounting/document-date'
 import { postedInvoicedAt } from '@/lib/domain/accounting/posted-invoice-date'
 import { SalesInvoiceNotQueuedError, SalesInvoiceOriginalDateUnknownError } from '@/lib/domain/sales/sales-invoice-reconciliation'
 
@@ -56,4 +56,11 @@ test('the live stamp: a sales invoice of a SalesOrder is stamped with the payloa
   assert.equal(postedInvoicedAt('SALES_INVOICE', 'SalesOrder', { date: 'not a date' }), undefined)
   assert.equal(postedInvoicedAt('SALES_INVOICE', 'SalesOrder', null), undefined)
   assert.equal(postedInvoicedAt('SALES_INVOICE', 'SalesOrder', 'x'), undefined)
+})
+
+test('with no readable date the update is refused when it would be sent, and only recorded (flagged unknown) when the producer hold shadows it', () => {
+  assert.equal(originalDayDecision('2026-09-30', false), 'use')
+  assert.equal(originalDayDecision('2026-09-30', true), 'use')
+  assert.equal(originalDayDecision(null, false), 'refuse')
+  assert.equal(originalDayDecision(null, true), 'shadow-unknown')
 })

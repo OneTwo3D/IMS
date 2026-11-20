@@ -88,3 +88,12 @@ export function originalSalesInvoiceDay(input: {
   if (input.invoicedAt) return businessDateYmd(input.invoicedAt)
   return null
 }
+
+/**
+ * What an update does about its date: `use` a readable one; with none readable, `refuse` when the update would be SENT (never today's date), or `shadow-unknown` when the
+ * producer hold only records it (nothing is delivered, so refusing would block an edit that sends nothing): recorded with today's date, flagged as unknown.
+ */
+export function originalDayDecision(documentDay: string | null, wouldBeShadowed: boolean): 'use' | 'refuse' | 'shadow-unknown' {
+  if (documentDay !== null) return 'use'
+  return wouldBeShadowed ? 'shadow-unknown' : 'refuse'
+}
