@@ -993,6 +993,7 @@ test('[o3d-bjc.7] …but a real DespatchDate still outranks any grouping (physic
 // o3d-hqvrp.115: the despatched units come off the item rows the read already holds (no extra read), and "no item array" is unknown, never empty.
 test('[o3d-hqvrp.115] a row\'s OrderItems become the order status items (SKU + whole-unit qty); a row with no item array carries none', async () => {
   const fetchMintsoftOrderList = await loadFetch()
+  statusResponder = () => DEFAULT_STATUSES
   await resetStatusCache()
   listCalls = []
   listError = null
