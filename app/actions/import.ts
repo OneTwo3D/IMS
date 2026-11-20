@@ -1029,6 +1029,20 @@ async function importProductsCsvInner(formData: FormData, system?: SystemImportC
         }
       }
 
+      // o3d-hqvrp.105: the preview reports the kit-component refusal the real run will make.
+      if (preview && productById.get(productId)?.type === 'KIT') {
+        const componentTypes = await db.product.findMany({
+          where: { id: { in: components.map((c) => c.componentId) } },
+          select: { sku: true, type: true },
+        })
+        const refusal = findKitComponentRefusal(componentTypes)
+        if (refusal) {
+          result.errors.push(`Row ${cr.lineNum}: ${cr.sku} — ${refusal} Components were not written.`)
+          recordComponentRowFailure(result, cr)
+          continue
+        }
+      }
+
       try {
         if (!preview) {
           // o3d-w998: this pass runs LONG after the row that queued it, in its own

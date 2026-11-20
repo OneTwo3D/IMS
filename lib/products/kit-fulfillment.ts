@@ -379,6 +379,13 @@ export function expandFulfillmentRequirementsDecimal(
     if (stack.has(currentProductId)) {
       throw new Error(`Circular kit structure detected for product ${currentProductId}`)
     }
+    if (node.productComponents.every((c) => isKitIgnoredComponentType(c.componentType))) {
+      // A legacy kit made ONLY of non-inventory parts has nothing to allocate; the WooCommerce push
+      // values it at 0, so allocation must refuse it too (treated as an unfillable leaf) rather than
+      // allocate the outer kit's other components.
+      addRequirement(currentProductId, currentQty)
+      return
+    }
 
     stack.add(currentProductId)
     for (const component of node.productComponents) {
@@ -399,6 +406,40 @@ export function expandFulfillmentRequirementsDecimal(
 
   visit(productId, toDecimal(qty), new Set<string>())
   return totals
+}
+
+/**
+ * The "pack, not stock" companion to {@link expandFulfillmentRequirementsDecimal}: the NON_INVENTORY
+ * parts (gift wrap, leaflet) a packer must add for `qty` of `productId`. They carry no stock or cost,
+ * so they are absent from the stock requirements, but the customer paid for them, so the packing
+ * slip lists them. Keyed by component id; `sku` is for display.
+ */
+export function collectNonStockPackComponents(
+  productId: string,
+  qty: DecimalInput,
+  graph: Map<string, FulfillmentGraphNode>,
+): Map<string, { sku: string; qty: Prisma.Decimal }> {
+  const out = new Map<string, { sku: string; qty: Prisma.Decimal }>()
+  let visits = 0
+  function visit(id: string, q: Prisma.Decimal, stack: Set<string>) {
+    visits += 1
+    if (visits > MAX_FULFILLMENT_EXPANSION_VISITS) throw new FulfillmentGraphExpansionError(productId)
+    const node = graph.get(id)
+    if (!node || node.type !== 'KIT' || stack.has(id)) return
+    stack.add(id)
+    for (const component of node.productComponents) {
+      const required = q.mul(component.qty)
+      if (isKitIgnoredComponentType(component.componentType)) {
+        const prev = out.get(component.componentId)
+        out.set(component.componentId, { sku: component.componentSku, qty: (prev?.qty ?? new Prisma.Decimal(0)).add(required) })
+      } else if (component.componentType === 'KIT') {
+        visit(component.componentId, required, stack)
+      }
+    }
+    stack.delete(id)
+  }
+  visit(productId, toDecimal(qty), new Set<string>())
+  return out
 }
 
 export function listFulfillmentLeafProductIds(

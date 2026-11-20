@@ -34,6 +34,8 @@
  * ids into the freshly wiped cache. See `../sync-lock.ts`.
  */
 
+import { enabledWmsConnectorIds } from '@/lib/connectors/wms/enabled-connector'
+import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { isKitIgnoredComponentType } from '@/lib/products/kit-component-policy'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
@@ -1050,6 +1052,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
     productById,
     result.errors,
     exactProducts,
+    await nonInventoryPartsHoldKits(),
   )
 
   const previousStates = await db.stockSyncState.findMany({
@@ -1994,6 +1997,7 @@ export function computeAvailableByProduct(
   errors: string[],
   /** Components whose figures are exact because a location buffer applies (see buildStockMaps); their kit division is exact too. */
   exactProducts?: ReadonlySet<string>,
+  nonInventoryHoldsKit = false,
 ): Map<string, number> {
   const availableByProduct = new Map<string, number>()
   const kitAvailabilityMemo = new Map<string, number>()
@@ -2010,6 +2014,7 @@ export function computeAvailableByProduct(
           errors,
           kitAvailabilityErrors,
           exactProducts,
+          nonInventoryHoldsKit,
         )
       : (stockByProduct.get(product.id) ?? 0)
     availableByProduct.set(product.id, available)
@@ -2159,7 +2164,17 @@ async function computeFreshAvailableByProduct(
     productById,
     [],
     exactProducts,
+    await nonInventoryPartsHoldKits(),
   )
+}
+
+/**
+ * o3d-hqvrp.105: true when a warehouse connector is enabled. Kits with a NON_INVENTORY part then stay at 0:
+ * the warehouse bundle is built from linked products only and the warehouse reads no order comments, so a kit
+ * sold here could not be fulfilled there. With no connector enabled the part is simply ignored.
+ */
+async function nonInventoryPartsHoldKits(): Promise<boolean> {
+  return enabledWmsConnectorIds(await getIntegrationPluginState()).length > 0
 }
 
 function computeKitAvailability(
@@ -2172,6 +2187,7 @@ function computeKitAvailability(
   errors: string[],
   seenCycleErrors: Set<string>,
   exactProducts?: ReadonlySet<string>,
+  nonInventoryHoldsKit = false,
 ): number {
   // yi4m: the result depends on the warehouse set passed in — a nested KIT is evaluated
   // per single warehouse (computeKitAvailability(nested, [warehouseId], …)) while a
@@ -2181,6 +2197,13 @@ function computeKitAvailability(
   const memoKey = `${product.id}|${warehouseIds.join(',')}`
   if (memo.has(memoKey)) return memo.get(memoKey) ?? 0
   if (product.productComponents.length === 0) {
+    memo.set(memoKey, 0)
+    return 0
+  }
+  if (nonInventoryHoldsKit && product.productComponents.some((c) => isKitIgnoredComponentType(c.component.type))) {
+    // A warehouse connector is enabled and cannot yet be told about a non-stock part (a NON_INVENTORY part
+    // has no warehouse product link, so the bundle never syncs, and the warehouse does not read order comments).
+    // Selling the kit in WooCommerce would send the warehouse an order it cannot fulfil, so it stays at 0.
     memo.set(memoKey, 0)
     return 0
   }
@@ -2219,7 +2242,7 @@ function computeKitAvailability(
       if (component.component.type === 'KIT') {
         const nested = productById.get(component.componentId)
         available = nested
-          ? computeKitAvailability(nested, [warehouseId], stockByProductWarehouse, productById, memo, stack, errors, seenCycleErrors, exactProducts)
+          ? computeKitAvailability(nested, [warehouseId], stockByProductWarehouse, productById, memo, stack, errors, seenCycleErrors, exactProducts, nonInventoryHoldsKit)
           : 0
       }
       // A buffered component divides exactly (0.9 / 0.3 is 3), so the floor cannot lose a kit to binary rounding.

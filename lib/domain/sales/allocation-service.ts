@@ -3337,7 +3337,7 @@ export function allocationSetsMatch(
   return true
 }
 
-function collectNonOversellLeafComponents(
+export function collectNonOversellLeafComponents(
   productId: string,
   graph: Map<string, FulfillmentGraphNode>,
 ): string[] {

@@ -127,7 +127,7 @@ async function componentWriteBody(file: string, anchor: string): Promise<string>
   // Widened as the body grew (o3d-4kfh r4 added the in-flight sales guard). The window has to
   // reach the createMany, or the "all present" assertion below silently degrades into a claim
   // about a truncated slice.
-  return source.slice(at, at + 3600)
+  return source.slice(at, at + 4800)
 }
 
 test('saveProductComponents writes atomically, under the graph lock (o3d-t0zq)', async () => {

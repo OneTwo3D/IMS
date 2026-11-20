@@ -1,4 +1,5 @@
 import { ProductType, type Prisma } from '@/app/generated/prisma/client'
+import { findKitConversionRefusal } from '@/lib/products/kit-component-policy'
 import { db } from '@/lib/db'
 
 const OPEN_SALES_ORDER_STATUSES = ['DRAFT', 'PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED', 'PICKING', 'PACKING'] as const
@@ -22,7 +23,7 @@ const TRANSFORMABLE_TYPES = new Set<ProductType>([ProductType.SIMPLE, ProductTyp
  */
 export type ProductStructureClient = Pick<
   typeof db,
-  'product' | 'stockLevel' | 'salesOrderLine' | 'purchaseOrderLine' | 'productionOrder' | 'stockTransferLine'
+  'product' | 'productComponent' | 'stockLevel' | 'salesOrderLine' | 'purchaseOrderLine' | 'productionOrder' | 'stockTransferLine'
 >
 
 type ProductStructureInput = {
@@ -472,6 +473,14 @@ export async function validateProductStructureChange(
           },
           message: `Cannot change product type while this product has ${summary}`,
         }
+      }
+    }
+
+    // o3d-hqvrp.105: BOM -> KIT keeps the component rows, which no kit-save check has seen.
+    if (typeChanged && input.type === ProductType.KIT && current.type === ProductType.BOM) {
+      const refusal = await findKitConversionRefusal(client, current.id)
+      if (refusal) {
+        return { ok: false, fieldErrors: { type: [refusal] }, message: refusal }
       }
     }
 

@@ -35,3 +35,20 @@ export function findKitComponentRefusal(
   }
   return null
 }
+
+/**
+ * The same refusal for a product that is BECOMING a kit while keeping its component rows (BOM -> KIT).
+ * `saveProductComponents` and the CSV component pass only see a product that is already a KIT, so
+ * without this a BOM of labour/service lines or a variable parent could be converted into the kit
+ * those writers refuse.
+ */
+export async function findKitConversionRefusal(
+  client: { productComponent: { findMany: (args: { where: { productId: string }; select: { component: { select: { sku: true; type: true } } } }) => Promise<Array<{ component: { sku: string; type: string } }>> } },
+  productId: string,
+): Promise<string | null> {
+  const rows = await client.productComponent.findMany({
+    where: { productId },
+    select: { component: { select: { sku: true, type: true } } },
+  })
+  return findKitComponentRefusal(rows.map((r) => r.component))
+}

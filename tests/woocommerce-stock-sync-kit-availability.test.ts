@@ -108,3 +108,15 @@ test('an all-NON_INVENTORY kit fails closed at 0 rather than infinite', () => {
 
   assert.equal(available.get('K'), 0)
 })
+
+test('with a warehouse connector enabled, a kit with a NON_INVENTORY part is held at 0 (the warehouse cannot fulfil it)', () => {
+  const { stockByProduct, stockByProductWarehouse } = buildStockMaps(rows(['MUG', 'A', 50]))
+  const K = kit('K', [{ componentId: 'MUG', qty: 1 }, { componentId: 'WRAP', qty: 1, type: 'NON_INVENTORY' }])
+  const Plain = kit('PLAIN', [{ componentId: 'MUG', qty: 1 }])
+  const productById = new Map<string, CandidateProduct>([['K', K], ['PLAIN', Plain], ['MUG', simpleProduct('MUG')]])
+
+  const available = computeAvailableByProduct([K, Plain], ['A'], stockByProduct, stockByProductWarehouse, productById, [], undefined, true)
+
+  assert.equal(available.get('K'), 0)
+  assert.equal(available.get('PLAIN'), 50)
+})
