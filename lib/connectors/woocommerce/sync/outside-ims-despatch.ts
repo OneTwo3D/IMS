@@ -59,32 +59,43 @@ export function firstSeenOutsideIms(
   return { despatched, historical, refunded, any: despatched || historical || refunded, noInstant: historical && openingStockCutoff === null }
 }
 
-/** Release the partial allocation and the pending shipment an order that can never ship is holding. */
+/**
+ * Release the partial allocation and the pending shipment an order that can never ship is holding. A FAILED release is never swallowed: it is logged and then
+ * THROWN, so the booking fails visibly (the import is retried, the retry job counts it and the cron answers non-2xx) instead of leaving stock reserved for goods that already left.
+ * A failed stock-sync enqueue is recorded in the same activity entry (the release itself stands; the daily stock reconcile corrects the storefront level).
+ */
 async function releaseUnbookedAllocation(orderId: string, why: string): Promise<void> {
+  let releaseError: string | null = null
+  let stockSyncError: string | null = null
+  let released: { allocations: Array<{ productId: string }>; deletedPendingShipmentCount: number } | null = null
   try {
     const { lockSalesOrder, releaseOrderAllocationsForDeallocationInTx } = await import('@/lib/domain/sales/allocation-service')
-    const released = await db.$transaction(async (tx) => {
+    released = await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
       const result = await releaseOrderAllocationsForDeallocationInTx(tx, orderId, { cause: why, userId: null })
       await tx.salesOrder.updateMany({ where: { id: orderId, status: 'ALLOCATED', shipments: { none: { status: { not: 'PENDING' } } } }, data: { status: 'PROCESSING' } })
       return result
     }, { maxWait: 5000, timeout: 20000 })
+  } catch (error) {
+    releaseError = error instanceof Error ? error.message : String(error)
+  }
+  if (released) {
     try {
       const { enqueueStockSync } = await import('@/lib/shopping')
       await enqueueStockSync([...new Set(released.allocations.map((row) => row.productId))], 'IMS_CHANGE')
     } catch (error) {
-      console.error('[outside-ims-despatch] stock sync after release failed', error)
+      stockSyncError = error instanceof Error ? error.message : String(error)
     }
-    await logActivity({
-      entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_import_first_seen_allocation_released', tag: 'sync', level: 'WARNING', resolveUser: false,
-      description: `Released ${released.allocations.length} allocation(s) and ${released.deletedPendingShipmentCount} pending shipment(s) held by an order whose despatch cannot be booked (${why}); it is listed under Sync > Exceptions.`,
-    })
-  } catch (error) {
-    await logActivity({
-      entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_import_first_seen_allocation_release_failed', tag: 'sync', level: 'WARNING', resolveUser: false,
-      description: `Could not release the allocation held by an order whose despatch cannot be booked: ${error instanceof Error ? error.message : String(error)}`,
-    })
   }
+  await logActivity({
+    entityType: 'SALES_ORDER', entityId: orderId, tag: 'sync', level: 'WARNING', resolveUser: false,
+    action: releaseError ? 'wc_import_first_seen_allocation_release_failed' : 'wc_import_first_seen_allocation_released',
+    description: releaseError
+      ? `Could not release the allocation held by an order whose despatch cannot be booked yet (${why}): ${releaseError}`
+      : `Released ${released?.allocations.length ?? 0} allocation(s) and ${released?.deletedPendingShipmentCount ?? 0} pending shipment(s) held by an order whose despatch cannot be booked yet (${why}); it is listed under Sync > Exceptions.`
+        + (stockSyncError ? ` The storefront stock sync could not be queued (${stockSyncError}); the stock reconcile will correct it.` : ''),
+  })
+  if (releaseError) throw new Error(`Could not release the allocation held by order ${orderId}: ${releaseError}`)
 }
 
 export type OutsideImsBookingOutcome = 'booked' | 'owed' | 'refused'
