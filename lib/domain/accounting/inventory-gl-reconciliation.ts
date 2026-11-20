@@ -72,7 +72,7 @@ export type InventoryGlReconciliationUnavailableReason =
 
 export type InventoryGlReconciliationResult =
   | { available: false; reason: InventoryGlReconciliationUnavailableReason }
-  | ({ available: true; balanceDate: string; /** The snapshot's on-hand value (cost layers in warehouses) and, as its own line, the stock in transit on dispatched transfers; subledgerValue is their sum. */ onHandValue?: number; inTransitValue?: number; /** Where each of the two stored balances came from; `proven-absent` is a zero Xero never reported (an omitted account of a Trial Balance that proved itself complete), compared as the real zero it is. */ glProvenance?: Record<string, GlLegProvenance> } & InventoryGlReconciliation)
+  | ({ available: true; balanceDate: string; /** The snapshot's on-hand value (cost layers in warehouses) and, as its own line, the stock in transit on dispatched transfers; subledgerValue is their sum. */ onHandValue?: number; inTransitValue?: number; /** Transfers whose in-transit value could not be measured (a dispatch or receipt movement carries no value): left out of the sub-ledger, listed here. */ unvaluedTransitTransfers?: string[]; /** Set when the date's comparison must not be swept to the ledger: an unvalued transfer is outside it. */ sweepWithheld?: 'unvalued_transit_transfers'; /** Where each of the two stored balances came from; `proven-absent` is a zero Xero never reported (an omitted account of a Trial Balance that proved itself complete), compared as the real zero it is. */ glProvenance?: Record<string, GlLegProvenance> } & InventoryGlReconciliation)
 
 /**
  * Load the inventory GL reconciliation as of the latest synced GL balance date:
@@ -162,7 +162,7 @@ export async function loadInventoryGlReconciliation(options?: {
   })
   const run = await db.inventorySnapshotRun.findUnique({
     where: { snapshotDate: balanceDate },
-    select: { id: true, inTransitCovered: true, cutoffAt: true },
+    select: { id: true, inTransitCovered: true, cutoffAt: true, source: true },
   })
   if (snapshotRows.length === 0 && !run) return { available: false, reason: 'no_subledger_snapshot' }
   // (Covered zero-stock date: the on-hand value is genuinely 0; fall through to reconcile.)
@@ -172,24 +172,31 @@ export async function loadInventoryGlReconciliation(options?: {
   const onHandValue = snapshotRows.reduce((sum, row) => sum + Number(row.valueBase), 0)
 
   // STOCK IN TRANSIT (ACC-M12): units on a dispatched, not fully received transfer are in no warehouse row, but a transfer posts
-  // nothing, so the GL still carries them. They are the snapshot's own "in transit" line and part of the sub-ledger value. A run
-  // that captured the line (inTransitCovered) is read back; an older run never measured it, so it is valued from the movement
-  // ledger as of the run's cutoff, which is exact for any past instant. Neither "absent rows" nor a failed measure is read as zero.
-  let inTransitValue: number
+  // nothing, so the GL still carries them. They are the snapshot's own "in transit" line and part of the sub-ledger value.
+  //  - A run that captured the line (inTransitCovered) is read back.
+  //  - A BACKFILL run that predates the line has ledger-derived on-hand at its cutoff, so transit is valued from the movement ledger
+  //    at that same cutoff, which is exact.
+  //  - A CRON run that predates the line took its on-hand from current state at some unrecorded instant after the cutoff, so no
+  //    transit instant matches it: transit is NOT MEASURABLE for that date and the comparison is the on-hand one it always was.
+  //    Estimating it at midnight would double count a transfer received between midnight and the capture and could sweep a false
+  //    gap to the ledger.
+  // Neither "absent rows" nor a failed measure is read as zero for the covered and backfill routes.
+  let inTransitValue: number | undefined
+  let unvalued: string[] = []
   if (run?.inTransitCovered) {
     const transitRows = await db.inventoryTransitSnapshot.findMany({
       where: { snapshotDate: balanceDate },
-      select: { valueBase: true, valueReplayReliable: true },
+      select: { transferId: true, valueBase: true, valueReplayReliable: true },
     })
-    if (transitRows.some((row) => !row.valueReplayReliable)) return { available: false, reason: 'unreliable_subledger_snapshot' }
-    inTransitValue = transitRows.reduce((sum, row) => sum + Number(row.valueBase), 0)
-  } else {
-    const measured = await loadInTransitTransferValues(db, run?.cutoffAt ?? startOfNextBusinessDay(balanceDate))
+    unvalued = transitRows.filter((row) => !row.valueReplayReliable).map((row) => row.transferId)
+    inTransitValue = transitRows.filter((row) => row.valueReplayReliable).reduce((sum, row) => sum + Number(row.valueBase), 0)
+  } else if (run?.source === 'backfill') {
+    const measured = await loadInTransitTransferValues(db, run.cutoffAt ?? startOfNextBusinessDay(balanceDate))
     if (!measured) return { available: false, reason: 'no_subledger_snapshot' }
-    if (measured.some((row) => !row.reliable)) return { available: false, reason: 'unreliable_subledger_snapshot' }
-    inTransitValue = sumInTransitValue(measured).toNumber()
+    unvalued = measured.filter((row) => !row.reliable).map((row) => row.transferId)
+    inTransitValue = sumInTransitValue(measured.filter((row) => row.reliable)).toNumber()
   }
-  const subledgerValue = onHandValue + inTransitValue
+  const subledgerValue = onHandValue + (inTransitValue ?? 0)
   const glBalance = Number(inventorySnapshot.amountBase) + Number(allocatedSnapshot.amountBase)
 
   const evaluated = evaluateInventoryGlReconciliation({
@@ -206,7 +213,8 @@ export async function loadInventoryGlReconciliation(options?: {
     available: true,
     balanceDate: balanceDateString(balanceDate),
     onHandValue,
-    inTransitValue,
+    ...(inTransitValue !== undefined ? { inTransitValue } : {}),
+    ...(unvalued.length > 0 ? { unvaluedTransitTransfers: unvalued, sweepWithheld: 'unvalued_transit_transfers' as const } : {}),
     // Both legs passed the provenance check in the reader: each is a balance Xero reported or a proven-absent zero, and says which.
     glProvenance: { inventory: glLegProvenance(inventorySnapshot), allocated: glLegProvenance(allocatedSnapshot) },
     ...guarded,
@@ -251,6 +259,8 @@ export function buildInventoryReconciliationSweepJournal(
   reconciliation: InventoryGlReconciliationResult,
   opts: { inventoryAccount: string; roundingAccount: string; currency: string },
 ): InventoryReconciliationSweepJournal | null {
+  // A date with a transfer outside the comparison is not swept: the residue may be that transfer, not rounding.
+  if (reconciliation.available && reconciliation.sweepWithheld) return null
   return buildAccountReconciliationSweepJournal(reconciliation, {
     account: opts.inventoryAccount,
     roundingAccount: opts.roundingAccount,

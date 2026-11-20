@@ -1408,6 +1408,16 @@ export async function runAccountingInvariantReport(options: {
   const inventoryReconciliation = await loadInventoryGlReconciliation()
   const inventoryFinding = inventoryGlReconciliationFinding(inventoryReconciliation)
   if (inventoryFinding) findings.push(inventoryFinding)
+  // ACC-M12: a transfer with an unvalued dispatch or receipt movement is left out of the comparison (and the date is not swept), and
+  // named on its own finding, so one legacy transfer cannot switch the whole reconciliation off.
+  if (inventoryReconciliation.available && inventoryReconciliation.unvaluedTransitTransfers?.length) {
+    findings.push({
+      severity: 'warning',
+      code: 'inventory_transit_transfer_unvalued',
+      message: `${inventoryReconciliation.unvaluedTransitTransfers.length} transfer(s) in transit on ${inventoryReconciliation.balanceDate} have a dispatch or receipt movement with no value and are left out of the inventory reconciliation, which is not swept for that date`,
+      details: { balanceDate: inventoryReconciliation.balanceDate, transferIds: inventoryReconciliation.unvaluedTransitTransfers.slice(0, 50) },
+    })
+  }
 
   // khdw: reconcile the GL COGS account to its IMS subledger period movement
   // (Σ dispatch cogsBatchAmount − Σ refund cogsReversalBase). Only a gap beyond the

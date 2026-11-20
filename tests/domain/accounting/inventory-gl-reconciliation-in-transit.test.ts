@@ -9,8 +9,8 @@ import test, { mock } from 'node:test'
 const day = (iso: string) => new Date(`${iso}T00:00:00.000Z`)
 const BALANCE_DATE = '2026-07-10'
 let onHand = '600'
-let run: { id: string; inTransitCovered: boolean; cutoffAt: Date | null } | null = { id: 'r', inTransitCovered: true, cutoffAt: null }
-let transitRows: Array<{ valueBase: string; valueReplayReliable: boolean }> = []
+let run: { id: string; inTransitCovered: boolean; cutoffAt: Date | null; source: string } | null = { id: 'r', inTransitCovered: true, cutoffAt: null, source: 'cron' }
+let transitRows: Array<{ transferId?: string; valueBase: string; valueReplayReliable: boolean }> = []
 let measured: Array<{ transferId: string; value: string; nullValueMovements: number }> = []
 let ledgerAsked = false
 
@@ -40,7 +40,7 @@ mock.module('@/lib/accounting', { namedExports: { getActiveAccountingConnectorIn
 const load = async () => (await import('../../../lib/domain/accounting/inventory-gl-reconciliation.ts')).loadInventoryGlReconciliation({ now: day(BALANCE_DATE) })
 const reset = () => {
   onHand = '600'
-  run = { id: 'r', inTransitCovered: true, cutoffAt: null }
+  run = { id: 'r', inTransitCovered: true, cutoffAt: null, source: 'cron' }
   transitRows = []
   measured = []
   ledgerAsked = false
@@ -65,9 +65,9 @@ test('the same day without the in-transit line is a 400 gap the reconciliation f
   assert.equal(r.delta, -400)
 })
 
-test('a run from before the line existed is valued from the movement ledger as of its cutoff, never read as zero', async () => {
+test('a BACKFILL run from before the line existed is valued from the movement ledger at its cutoff, never read as zero', async () => {
   reset()
-  run = { id: 'r', inTransitCovered: false, cutoffAt: new Date('2026-07-10T23:00:00.000Z') }
+  run = { id: 'r', inTransitCovered: false, cutoffAt: new Date('2026-07-10T23:00:00.000Z'), source: 'backfill' }
   measured = [{ transferId: 't1', value: '400', nullValueMovements: 0 }]
   const r = await load()
   assert.ok(r.available)
@@ -76,8 +76,34 @@ test('a run from before the line existed is valued from the movement ledger as o
   assert.ok(ledgerAsked, 'the ledger was asked')
 })
 
-test('an in-transit figure that rests on valueless movements is withheld, not compared', async () => {
-  reset(); transitRows = [{ valueBase: '400', valueReplayReliable: false }]
+test('an OLD CRON run (on-hand read at an unrecorded instant after midnight) does not measure transit: a transfer received between midnight and the capture is no new gap and no sweep', async () => {
+  reset()
+  // The destination already holds the received units (on-hand 1000 = GL 1000); at midnight the same transfer, 400, was still in transit.
+  onHand = '1000.40'
+  run = { id: 'r', inTransitCovered: false, cutoffAt: new Date('2026-07-10T23:00:00.000Z'), source: 'cron' }
+  measured = [{ transferId: 't1', value: '400', nullValueMovements: 0 }]
+  const mod = await import('../../../lib/domain/accounting/inventory-gl-reconciliation.ts')
   const r = await load()
-  assert.deepEqual(r, { available: false, reason: 'unreliable_subledger_snapshot' })
+  assert.ok(r.available)
+  assert.equal(ledgerAsked, false, 'transit is not measurable for this date, so the ledger is not asked')
+  assert.equal(r.inTransitValue, undefined)
+  assert.equal(r.subledgerValue, 1000.4, 'the comparison is the on-hand one it always was')
+  assert.equal(r.action, 'sweep', 'exactly the pre-change behaviour: a sub-penny residue sweeps; there is no extra 400 gap')
+  assert.equal(r.delta, 0.4)
+  assert.ok(mod.buildInventoryReconciliationSweepJournal(r, { inventoryAccount: '630', roundingAccount: '999', currency: 'GBP' }), 'the rounding sweep is unchanged')
+})
+
+test('a transfer with a valueless movement is left out and named; the reconciliation still runs and the date is not swept', async () => {
+  reset()
+  onHand = '600.40'
+  transitRows = [{ transferId: 'ok', valueBase: '400', valueReplayReliable: true }, { transferId: 'legacy', valueBase: '25', valueReplayReliable: false }]
+  const mod = await import('../../../lib/domain/accounting/inventory-gl-reconciliation.ts')
+  const r = await load()
+  assert.ok(r.available, 'one legacy transfer does not switch the reconciliation off')
+  assert.equal(r.inTransitValue, 400)
+  assert.deepEqual(r.unvaluedTransitTransfers, ['legacy'])
+  assert.equal(r.sweepWithheld, 'unvalued_transit_transfers')
+  assert.equal(mod.buildInventoryReconciliationSweepJournal(r, { inventoryAccount: '630', roundingAccount: '999', currency: 'GBP' }), null)
+  const { inventoryGlReconciliationFinding } = await import('../../../lib/domain/accounting/invariants.ts')
+  assert.equal(inventoryGlReconciliationFinding(r), null, 'the gap itself is rounding scale: no critical')
 })

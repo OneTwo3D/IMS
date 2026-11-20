@@ -1080,16 +1080,37 @@ export async function writeDailyInventorySnapshot(options: {
   }
 }
 
+async function readStateAndInTransit(client: SnapshotClient): Promise<{
+  state: SnapshotState
+  costLayerQtyByKey: Map<string, Decimal>
+  inTransit: InTransitTransferValue[] | null
+}> {
+  const readOn = async (reader: SnapshotClient) => {
+    const current = await loadAggregatedCurrentSnapshotState(reader)
+    return { ...current, inTransit: await loadInTransitTransferValues(reader, new Date()) }
+  }
+  const transactional = client as unknown as {
+    $queryRaw?: unknown
+    $transaction?: (fn: (tx: SnapshotClient) => Promise<unknown>, options?: unknown) => Promise<unknown>
+  }
+  if (typeof transactional.$queryRaw === 'function' && typeof transactional.$transaction === 'function') {
+    return await transactional.$transaction((tx) => readOn(tx), {
+      isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead,
+      timeout: 10 * 60_000,
+    }) as Awaited<ReturnType<typeof readOn>>
+  }
+  return readOn(client)
+}
+
 async function writeDailyInventorySnapshotOn(client: SnapshotClient, options: {
   snapshotDate?: SnapshotDateInput
   tolerance?: Decimal
 }): Promise<InventorySnapshotWriteResult> {
   const snapshotDate = parseSnapshotDate(options.snapshotDate)
-  const { state, costLayerQtyByKey } = await loadAggregatedCurrentSnapshotState(client)
-  // The stock state above is CURRENT state, so stock in transit is measured at the same instant (not at the day's end): a transfer
-  // received between the day's end and this run is already in the destination's state and must not also be counted in transit.
-  const capturedAt = new Date()
-  const inTransit = await loadInTransitTransferValues(client, capturedAt)
+  // The stock state is CURRENT state, so stock in transit is measured at the same instant (not at the day's end): a transfer received
+  // between the day's end and this run is already in the destination's state and must not also be counted in transit. Both reads
+  // run in ONE REPEATABLE READ transaction, so a receipt or dispatch committing between them is in both or in neither.
+  const { state, costLayerQtyByKey, inTransit } = await readStateAndInTransit(client)
   const reservationSnapshot = await loadCurrentReservationSnapshotRows(client, snapshotDate)
   const drift = findDrift(state, costLayerQtyByKey, options.tolerance)
   // Captured from current state today → point-in-time reliable.
