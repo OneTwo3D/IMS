@@ -23,6 +23,8 @@
  *             nameColumn Product, nonStock Product Type=non-inventory  decisions hooks: the pack is never given a decisions list, so they do nothing here.
  *             ghostRows Product Type=Unknown  of several rows of one SKU exactly one of which is typed, the Unknown ones are dropped and reported (a ghost left behind in Qoblex); any other duplicate is still refused.
  *   stock-lots rowsAboveHeader 1                the same label row.
+ *             blankStockIsZero true             a row whose all-warehouses total AND every warehouse cell are blank is read as 0 on hand (owner ruling), reported per row
+ *                                               (BLANK_STOCK_AS_ZERO). A blank total next to any stated warehouse cell is still refused (WIDE_TOTAL_MISMATCH).
  *             columns sku, unitCost             header renames only (unit cost is the report's Moving Average Cost).
  *             constants.currency GBP            the report has no currency column; the manifest declares GBP and R5 refuses anything else. It cannot
  *                                               change a quantity, SKU or location. LIMIT: the currency is a declaration, not read from the file.
@@ -265,7 +267,8 @@ export const QOBLEX_NATIVE_COLUMN_MAP = `{
         "column": "Product Type",
         "ghost": "Unknown",
         "quantityColumn": "Quantity"
-      }
+      },
+      "blankStockIsZero": true
     }
   }
 }

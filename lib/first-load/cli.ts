@@ -245,7 +245,7 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
       }
     }
     // Pass 2: read the files. The decisions lists that act while a source file is read (non-stock SKUs, SKU by product name) are read FIRST.
-    const DECISION_FIRST = new Set<DatasetName>(['non-stock-skus', 'sku-name-overrides'])
+    const DECISION_FIRST = new Set<DatasetName>(['non-stock-skus', 'sku-name-overrides', 'sku-renames'])
     resolved.sort((a, b) => Number(DECISION_FIRST.has(b.input.dataset)) - Number(DECISION_FIRST.has(a.input.dataset)))
     let decisions: IngestDecisions | undefined
     const decisionsNow = (): IngestDecisions => {

@@ -58,6 +58,8 @@ export interface DatasetMapping {
   nonStock: { column: string; value: string } | null
   /** products and stock-lots: two or more rows of one SKU of which EXACTLY ONE is not typed `ghost` in `column` keep that one and drop the ghosts (reported with `quantityColumn`, the first header of that name). Anything else stays a duplicate. */
   ghostRows: { column: string; ghost: string; quantityColumn: string | null } | null
+  /** stock-lots with a `wide` layout only: a row whose all-warehouses total AND every warehouse cell are blank loads as 0 on hand (owner ruling), reported per row (BLANK_STOCK_AS_ZERO). A blank total next to any non-blank warehouse cell stays refused. */
+  blankStockIsZero: boolean
 }
 
 /** Owner decisions that act while a source file is read (they never alter a file on disk). Keys are the trimmed, upper-cased SKU / the trimmed product name. */
@@ -104,7 +106,7 @@ export interface ColumnMap {
 }
 
 const MAP_KEYS = new Set(['formatVersion', 'source', 'datasets'])
-const DATASET_MAP_KEYS = new Set(['columns', 'constants', 'valueMaps', 'expectedHeaders', 'delimiter', 'decimalSeparator', 'rowsAboveHeader', 'wide', 'rowSelect', 'parentFrom', 'derived', 'dateFormats', 'discountHeader', 'nameColumn', 'nonStock', 'ghostRows'])
+const DATASET_MAP_KEYS = new Set(['columns', 'constants', 'valueMaps', 'expectedHeaders', 'delimiter', 'decimalSeparator', 'rowsAboveHeader', 'wide', 'rowSelect', 'parentFrom', 'derived', 'dateFormats', 'discountHeader', 'nameColumn', 'nonStock', 'ghostRows', 'blankStockIsZero'])
 const DELIMITERS = new Set([',', ';', '\t', '|'])
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -480,7 +482,13 @@ export function parseColumnMap(jsonText: string, label: string): ColumnMap {
         else if (!isPlainObject(g) || typeof g.column !== 'string' || g.column.trim() === '' || typeof g.ghost !== 'string' || g.ghost === '' || (g.quantityColumn !== undefined && typeof g.quantityColumn !== 'string')) problems.push(`${where}.ghostRows must be { "column": <source header>, "ghost": <value>, "quantityColumn"?: <source header> }`)
         else ghostRows = { column: g.column, ghost: g.ghost, quantityColumn: typeof g.quantityColumn === 'string' ? g.quantityColumn : null }
       }
-      datasets[name as DatasetName] = { columns, constants, valueMaps, expectedHeaders, discountHeader, nameColumn, nonStock, ghostRows, delimiter: typeof delimiter === 'string' ? delimiter : ',', ...layout }
+      let blankStockIsZero = false
+      if (entry.blankStockIsZero !== undefined) {
+        if (name !== 'stock-lots' || layout.wide === null) problems.push(`${where}.blankStockIsZero: only a stock-lots map with a "wide" layout can state it`)
+        else if (typeof entry.blankStockIsZero !== 'boolean') problems.push(`${where}.blankStockIsZero must be true or false`)
+        else blankStockIsZero = entry.blankStockIsZero
+      }
+      datasets[name as DatasetName] = { columns, constants, valueMaps, expectedHeaders, discountHeader, nameColumn, nonStock, ghostRows, blankStockIsZero, delimiter: typeof delimiter === 'string' ? delimiter : ',', ...layout }
     }
   }
   if (problems.length > 0) throw new InputError(problems)
@@ -494,6 +502,8 @@ export interface CanonRow {
   line: number
   /** Every canonical column of the dataset, trimmed, NFC-normalised, '' when absent. */
   values: Record<string, string>
+  /** products only: a later file's BOM row superseded this SKU's earlier VARIANT row (a variation with a manufactured recipe). The type is BOM; this says it is a WooCommerce variation. */
+  variantBom?: true
 }
 
 export interface IngestRejection {
@@ -572,11 +582,13 @@ export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = 
       const values = { ...row.values }
       const filled: string[] = []
       const problems: string[] = []
+      let variantBom = false
       for (const column of Object.keys(values)) {
         const earlierValues = [...new Set(list.map((match) => match.row.values[column] ?? '').filter((value) => value !== ''))]
         if (column === 'type') {
-          const ok = earlierValues.every((value) => value === values.type || (value === 'SIMPLE' && (values.type === 'KIT' || values.type === 'BOM')))
-          if (!ok) problems.push(`type ${JSON.stringify(earlierValues)} -> ${JSON.stringify(values.type)} (only SIMPLE -> KIT or BOM may change)`)
+          const ok = earlierValues.every((value) => value === values.type || (value === 'SIMPLE' && (values.type === 'KIT' || values.type === 'BOM')) || (value === 'VARIANT' && values.type === 'BOM'))
+          if (!ok) problems.push(`type ${JSON.stringify(earlierValues)} -> ${JSON.stringify(values.type)} (only SIMPLE -> KIT or BOM, and VARIANT -> BOM, may change)`)
+          else if (earlierValues.includes('VARIANT') && values.type === 'BOM') variantBom = true
           continue
         }
         const all = [...new Set([...earlierValues, ...(values[column] !== '' ? [values[column]] : [])])]
@@ -600,7 +612,7 @@ export function mergeIngested(parts: IngestedDataset[], supersedes: boolean[] = 
       }
       if (problems.length > 0) {
         conflicts.push({ line: at(row.line, index), code: 'SUPERSEDE_CONFLICT', reason: `the earlier row(s) for this SKU disagree with this one: ${problems.join('; ')}. Nothing is overwritten silently; fix the data or make the exports agree` })
-      } else rows.push({ line: row.line, values })
+      } else rows.push({ line: row.line, values, ...(variantBom ? { variantBom: true as const } : {}) })
     }
     kept[index] = rows
     for (let earlier = 0; earlier < index; earlier++) kept[earlier] = kept[earlier].filter((row) => !replaced.has(row))
@@ -1003,7 +1015,16 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
         continue
       }
       let mismatch: string | null = null
-      for (const [column, totalAt] of totalIndex) {
+      // A row the map (or a decision, which rewrites the kind cell) SKIPS is not stock and is never total-checked: its stock cells are ignored, not refused.
+      const skippedRow = mapping.rowSelect !== null && mapping.rowSelect.some((selector, i) => selectIndexes[i]! >= 0 && selector.skip.includes(clean(record.cells[selectIndexes[i]!])))
+      for (const [column, totalAt] of skippedRow ? [] : totalIndex) {
+        if (mapping.blankStockIsZero && clean(record.cells[totalAt]) === '' && blocks.every((block) => clean(record.cells[block.index.get(column)!]) === '')) {
+          // Owner ruling: nothing stated anywhere on the row is zero on hand. Said per row; the cells are read as 0 so the sum check passes.
+          record.cells[totalAt] = '0'
+          for (const block of blocks) record.cells[block.index.get(column)!] = '0'
+          notes.push({ line: record.line, code: 'BLANK_STOCK_AS_ZERO', reason: `SKU ${skuAt !== undefined ? clean(record.cells[skuAt]) : '(no SKU)'} line ${record.line}: the all-warehouses ${column} and every warehouse ${column} cell are blank; loaded as 0 on hand by the map's blankStockIsZero (owner ruling)` })
+          continue
+        }
         const total = parseDecimal(clean(record.cells[totalAt]), column, { maxIntDigits: 12, maxDp: 6 }, { allowNegative: true })
         let blockSum = new D(0)
         let readable = total.ok

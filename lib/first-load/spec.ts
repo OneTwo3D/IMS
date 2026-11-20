@@ -228,6 +228,7 @@ export const DATASET_NAMES = [
   'sku-name-overrides',
   'supplier-overrides',
   'recipe-overrides',
+  'sku-renames',
   'ims-skus',
   'ims-suppliers',
   'ims-tax-rates',
@@ -350,6 +351,12 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     required: ['parentSku', 'componentSku', 'qty', 'reason'],
     sources: [],
     purpose: 'Owner decision: the COMPLETE recipe of a KIT or BOM, one row per component line. It REPLACES every line the source recipe export gives for that parent SKU. Always canonical.',
+  },
+  'sku-renames': {
+    columns: ['fromSku', 'toSku', 'reason'],
+    required: ['fromSku', 'toSku', 'reason'],
+    sources: [],
+    purpose: 'Owner decision: a source SKU that is loaded under another SKU (the source spelling differs from the WooCommerce one). Renames the SKU in every source dataset of the run (products, recipe lines and overrides, stock lots, purchase order lines, transfers) before any join. A rename whose fromSku is in no input, whose toSku already exists, that chains into another rename, or that is listed twice is refused. Always canonical.',
   },
   'ims-suppliers': {
     columns: ['name'],

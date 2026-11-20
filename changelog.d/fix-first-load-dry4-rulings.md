@@ -1,0 +1,6 @@
+### First load: dry run 4 rulings and two tool fixes (operator tooling)
+- Fixed: a SKU on `non-stock-skus` (or any row the column map skips) whose stock-report row has a blank all-warehouses total is no longer rejected `WIDE_TOTAL_MISMATCH`; rows the map or the decisions skip are not total-checked.
+- Fixed: a `recipe-overrides` parent with any rejected line is now rejected as a whole (`RECIPE_OVERRIDE_INCOMPLETE`, ERROR `RECIPE_OVERRIDE_REJECTED`); it no longer loads a partial recipe.
+- New map key `blankStockIsZero` (stock-lots, wide layout, set in the Qoblex stock-on-hand map): a stock row blank in the all-warehouses total and in every warehouse cell loads as 0 on hand, reported per row (INFO `BLANK_STOCK_AS_ZERO`) with a count. A blank total beside a stated cell is still refused.
+- A WooCommerce variation can carry a BOM recipe: a bundles row (or a `recipe-overrides` row with `type` BOM) on a SKU the stock report types VARIANT keeps its parent and loads as a BOM product under it (INFO `VARIANT_CARRIES_BOM`). KIT on a variation stays refused.
+- New canonical decision dataset `sku-renames` (`fromSku,toSku,reason`): renames a source SKU in every source dataset before the joins; refuses a missing source SKU, an existing target, a chain or cycle and a duplicate; reports `SKU_RENAMED` and warns on an unused rename.
