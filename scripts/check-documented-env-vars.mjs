@@ -5,7 +5,7 @@
  *
  * o3d-9tbz found one documented-but-unread setting; the o3d-esha sweep found 16
  * more. The shape recurs because nothing compares the two lists: a variable is
- * added to .env.example or the CLAUDE.md table during a change that ends up
+ * added to .env.example or a documented table (CLAUDE.md, docs/agent/env-vars.md, docs/installation.md) during a change that ends up
  * wired differently, and the operator who sets it believes a control exists.
  *
  * FALSE POSITIVES ARE THE FAILURE MODE HERE. A prior guard in this repo fired
@@ -58,6 +58,7 @@ export const ENV_VAR_NAME_RE = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/
 export const DOC_SOURCES = [
   { file: '.env.example', kind: 'env' },
   { file: 'CLAUDE.md', kind: 'markdown-table' },
+  { file: 'docs/agent/env-vars.md', kind: 'markdown-table' },
   { file: 'docs/installation.md', kind: 'markdown-table' },
   { file: 'scripts/install.sh', kind: 'shell-heredoc' },
 ]
@@ -581,8 +582,11 @@ export function collectDocumentedKeys(root = REPO_ROOT) {
     let text
     try {
       text = readFileSync(path.join(root, file), 'utf8')
-    } catch {
-      continue
+    } catch (error) {
+      throw new Error(
+        `check-documented-env-vars: documentation source ${file} is missing or unreadable `
+        + `(${error.code ?? error.message}). Restore it or update DOC_SOURCES; refusing to pass silently.`,
+      )
     }
     for (const key of extractDocumentedKeys(kind, text)) {
       const sources = documented.get(key) ?? []
