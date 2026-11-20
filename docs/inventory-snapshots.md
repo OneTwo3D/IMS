@@ -15,17 +15,28 @@ as-of helpers treat each `snapshotDate` as an end-of-day UTC position. The cron
 is disabled by default for new installs; enable it only after the migration has
 been deployed.
 
-While `wms_despatch_date_enabled` is effective (switch on and this cron on), the daily write holds
-the advisory lock `INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY` (exclusive; `lib/db/advisory-locks.ts`) from
-before the state read to after the run row, through a transaction that only holds the lock (the
-writes themselves are unchanged, uncapped, and a failure keeps the rows already written; the run
-duration is logged as `inventory_snapshot_duration`). With the switch off no lock is taken and the
-write is exactly as before. A warehouse despatch backdated into a business day
+Every real run of the daily write (whatever `wms_despatch_date_enabled` says at that moment, so a
+switch turned on mid-run can never leave a run unfenced) holds the advisory lock
+`INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY` (exclusive; `lib/db/advisory-locks.ts`) from before the state
+read to after the run row, through a transaction that only holds the lock (the writes themselves
+are unchanged and uncapped; the run duration is logged as `inventory_snapshot_duration`). With
+the switch off nobody takes the shared side, so the cost is one pooled connection for the run.
+The holder is capped at 4 h and pings its connection every 30 s. If it fails AFTER taking the lock
+(the cap, a killed backend, a dropped socket), the run STOPS writing (no run row is written for
+the day), an `inventory_snapshot_unfenced` ERROR activity row is written and the cron run is
+FAILED: re-run the snapshot for the day. A run past half of the cap writes an
+`inventory_snapshot_slow` WARNING. A writing `inventory:snapshots:backfill` takes the same lock
+(a dry run does not). A despatch that finds the lock held by the snapshot does not wait (it would
+hold the order lock and a pool connection for the whole run): it is refused at once, counted
+nowhere, and applied again on the next sweep pass. A warehouse despatch backdated into a business day
 takes the same lock (shared) before it reads the latest run row as its floor, so a despatch is
 either committed before the snapshot reads its state (and is in it) or reads the new floor (and
 is dated after the snapshot's `cutoffAt`). That run row is also the only day bound for backdated
 warehouse despatches, so `wms_despatch_date_enabled` takes effect only while this cron is
-enabled (see `docs/mintsoft.md`).
+enabled (see `docs/mintsoft.md`). The readiness report also warns (`wms-despatch-date:snapshot-stale`)
+when the switch is effective and the latest run row was written more than 26 hours ago, and
+(`wms-despatch-date:lock-date-stale`) when the stored accounting lock date is not trusted (stale,
+no read time, or unparseable).
 
 Inventory rows are idempotent on `(snapshotDate, productId, warehouseId)`.
 Re-running the same day updates the existing row, including explicit zero rows

@@ -19,6 +19,7 @@ import { isMixedWarehousePushEnabled } from '@/lib/domain/wms/mixed-scope-flag'
 import { loadMixedScopeForOrder } from '@/lib/domain/wms/mixed-scope-loader'
 import { sameScopeLines, warehouseShipmentsMatchAllocations } from '@/lib/domain/wms/scoped-despatch-checks'
 import { describeDespatchQuantityExit, describeDespatchQuantityMismatch, despatchQuantityMismatchKey, findDespatchQuantityMismatch, type DespatchQuantity, type DespatchQuantityMismatch } from '@/lib/fulfillment/despatch-quantity-check'
+import { SNAPSHOT_RUNNING_MARK } from '@/lib/domain/sales/despatch-instant'
 
 // A fulfillment update originates from either a storefront (shopping) connector
 // that owns the order's ShoppingOrderLink, or a WMS/3PL connector that
@@ -98,6 +99,8 @@ export type ExternalFulfillmentRefusal =
   | 'wms_part_open'
   /** The units the warehouse despatched differ (over or under) from the units IMS books. Nothing is shipped; retryable; raised for a person, not counted as a connector failure. */
   | 'despatch_quantity_mismatch'
+  /** The daily inventory snapshot holds the floor lock, so a warehouse-dated despatch was not attempted (it never waits for the lock). Nothing changed; retryable; not a failure of the link. */
+  | 'snapshot_in_progress'
 
 export type ExternalFulfillmentOutcome =
   | {
@@ -933,6 +936,10 @@ async function applyScopedWmsDespatch(
   if (quantityRefusal) return quantityRefusal
 
   const open = wmsShipments.filter((shipment) => shipment.status !== 'SHIPPED')
+  // The units are compared AGAIN inside each dispatch transaction, under the order lock and before any stock movement (the pre-check above is not enough: an operator
+  // edit between it and the shipping must be seen). The same fence as the unscoped path; it also carries the inherited verification fence.
+  const quantityCaptured: { mismatches: DespatchQuantityMismatch[] | null } = { mismatches: null }
+  const scopedFence = withQuantityFence(update, order.id, wmsWarehouseId, quantityCaptured)
   // The partial-shipment e-mail (storefront switch) is judged ONCE, after the whole batch is applied, never shipment by shipment (see queueStorefrontPartialShipmentEmailsAfterBatch).
   const processedInBatch: string[] = []
   const flushPartialEmails = async (): Promise<void> => {
@@ -955,12 +962,24 @@ async function applyScopedWmsDespatch(
           // The completion job is enqueued WITH the order flip, which happens only when every shipment has shipped (see promoteOrderIfFulfilledInTx).
           storefrontCompletion: update.storefrontAlreadyCompleted !== true,
           skipStorefrontPush: update.storefrontAlreadyCompleted === true,
-          ...(update.storefrontAlreadyCompleted === true && update.shipFence ? { shipFence: update.shipFence } : {}),
+          ...(scopedFence ? { shipFence: scopedFence } : {}),
           deferStorefrontPartialEmail: true,
           ...(isWmsConnectorId(update.source) && update.despatchedAt ? { despatchedAt: update.despatchedAt } : {}),
         },
       )
+      if (!result.success && quantityCaptured.mismatches && result.error?.startsWith(QUANTITY_FENCE_MARK)) {
+        // Caught under the order lock, before anything moved for this shipment (same as the unscoped path).
+        discardPartialEmails()
+        const error = quantityMismatchMessage(update.source, order.externalOrderNumber ?? order.orderNumber ?? order.id, quantityCaptured.mismatches)
+        await logQuantityMismatchIfChanged(update.source, order.id, error, quantityCaptured.mismatches)
+        return quantityMismatchOutcome(error, quantityCaptured.mismatches, update.despatchedQuantities)
+      }
       if (result.success && target === 'SHIPPED') processedInBatch.push(shipment.id)
+      if (!result.success && result.error?.startsWith(SNAPSHOT_RUNNING_MARK)) {
+        // Refused before anything moved (the snapshot holds the floor lock): not a failure, nothing to log; the next pass applies it.
+        discardPartialEmails()
+        return refuseExternalFulfillment('snapshot_in_progress', result.error)
+      }
       if (!result.success) {
         // A failed batch judges NO partial e-mail: the failure may be the fence refusing the order flip AFTER the last shipment shipped, in which case the
         // order is still PROCESSING while the store / WMS reported the whole order despatched. The retry either flips the order (dispatched e-mail, no
@@ -1289,6 +1308,11 @@ export async function applyExternalFulfillmentUpdate(
         const error = quantityMismatchMessage(update.source, order.externalOrderNumber ?? order.orderNumber ?? order.id, quantityCaptured.mismatches)
         await logQuantityMismatchIfChanged(update.source, order.id, error, quantityCaptured.mismatches)
         return quantityMismatchOutcome(error, quantityCaptured.mismatches, update.despatchedQuantities)
+      }
+      if (!result.success && result.error?.startsWith(SNAPSHOT_RUNNING_MARK)) {
+        // Refused before anything moved (the snapshot holds the floor lock): not a failure, nothing to log; the next pass applies it.
+        discardPartialEmails()
+        return refuseExternalFulfillment('snapshot_in_progress', result.error)
       }
       if (result.success && result.despatchedWhileNotReady) lockedNotReadyStatus = result.despatchedWhileNotReady
       if (result.success && target === 'SHIPPED') shippedInBatch.push(shipment.id)

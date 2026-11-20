@@ -593,6 +593,12 @@ export type WmsDispatchSweepDeps = {
    */
   standingDespatchedQuantities?(orderId: string): Promise<Array<{ sku: string; qty: number }> | null>
   /**
+   * The read stamp stored with those quantities (the WMS's LastUpdated of the order, or of each part and the part set for a split order). The stored units are
+   * re-applied ONLY while the current read's stamp is identical: a warehouse-side change since (a part added or changed, the order edited) means they may be
+   * stale, and the hold stays. Absent (test doubles): not checked. Null when the row carries none (written before stamps existed): never matches.
+   */
+  standingDespatchStamp?(orderId: string): Promise<DespatchReadStamp | null>
+  /**
    * The despatched-units check, read-only (nothing logged, nothing changed), for a split order BEFORE any partial shipment is pushed to the storefront.
    * Null: not held. Absent (test doubles, or the check is off): nothing is previewed.
    */
@@ -1159,9 +1165,12 @@ async function reconcileSplitOrder(
     // Only a complete set (every part despatched, every part's items read) is the despatch that would be applied, so only then is it compared.
     if (deps.passDespatchFacts && everyPartRead && dispatchedParts.length >= totalParts && deps.previewQuantityMismatch) {
       const held = await deps.previewQuantityMismatch(candidate.orderId, sumDespatchedQuantities(dispatchedParts.map((part) => itemsByPart.get(part) ?? [])))
-      if (held) return applyFailureOutcome({ error: held.error, refusal: 'despatch_quantity_mismatch', quantityMismatches: held.mismatches, despatchedQuantities: sumDespatchedQuantities(dispatchedParts.map((part) => itemsByPart.get(part) ?? [])) }, 'Dispatch held on a quantity mismatch')
+      if (held) return applyFailureOutcome({ error: held.error, refusal: 'despatch_quantity_mismatch', quantityMismatches: held.mismatches, despatchedQuantities: sumDespatchedQuantities(dispatchedParts.map((part) => itemsByPart.get(part) ?? [])) }, 'Dispatch held on a quantity mismatch', partsReadStamp(parts))
     }
   }
+  // While a despatched-units hold stands for this order NO partial shipment goes to the storefront (it e-mails the customer and cannot be taken back, for goods IMS
+  // has not accepted as despatched). The items are still collected, so a part set that now agrees with IMS releases the hold through the apply below.
+  const quantityHoldStands = recordPartials && deps.passDespatchFacts === true && Boolean(await deps.hasOpenQuantityHold?.(candidate.orderId))
   if (recordPartials) {
     for (const part of dispatchedParts) {
       const items = itemsByPart.get(part) ?? []
@@ -1170,6 +1179,7 @@ async function reconcileSplitOrder(
         continue
       }
       partItems.push(items)
+      if (quantityHoldStands) continue
       // The cancel intent is re-read IMMEDIATELY BEFORE each storefront write, so a cancel or refund that committed since the check at the
       // top of this order is honoured for every part not yet pushed. What remains is the window between this read and the POST itself: an
       // inter-system limit that cannot be closed from inside IMS (see docs/mintsoft.md).
@@ -1304,7 +1314,7 @@ async function reconcileSplitOrder(
   let despatchedQuantities = deps.passDespatchFacts && recordPartials && partItems.length === dispatchedParts.length && partItems.length > 0 ? sumDespatchedQuantities(partItems) : undefined
   // No comparable items (a merged survivor, or the parts carried none) while a quantity hold stands: stays held, never applied on IMS's own quantities.
   if (deps.passDespatchFacts && (despatchedQuantities === undefined || despatchedQuantities.length === 0)) {
-    const held = await resolveHeldQuantities(deps, candidate.orderId)
+    const held = await resolveHeldQuantities(deps, candidate.orderId, partsReadStamp(parts))
     if (held?.keep) return quantityHoldKept()
     if (held) despatchedQuantities = held.quantities
   }
@@ -1314,7 +1324,7 @@ async function reconcileSplitOrder(
     ...(despatchedQuantities ? { despatchedQuantities } : {}),
   }
   const result = await deps.applyDispatch(candidate.orderId, aggregated, Object.keys(applyOptions).length > 0 ? applyOptions : undefined)
-  if (!result.success) return applyFailureOutcome(result, 'Dispatch apply failed after all parts despatched')
+  if (!result.success) return applyFailureOutcome(result, 'Dispatch apply failed after all parts despatched', partsReadStamp(parts))
   return { action: 'dispatched', reason: `All ${totalParts} parts despatched` }
 }
 
@@ -1324,11 +1334,14 @@ async function reconcileSplitOrder(
  *   - none stored: keep holding.
  * Null: no hold stands, proceed as before.
  */
-async function resolveHeldQuantities(deps: WmsDispatchSweepDeps, orderId: string): Promise<{ keep: true } | { keep: false; quantities: Array<{ sku: string; qty: number }> } | null> {
+async function resolveHeldQuantities(deps: WmsDispatchSweepDeps, orderId: string, current: DespatchReadStamp): Promise<{ keep: true } | { keep: false; quantities: Array<{ sku: string; qty: number }> } | null> {
   if (!(await deps.hasOpenQuantityHold?.(orderId))) return null
   const stored = (await deps.standingDespatchedQuantities?.(orderId)) ?? null
-  if (stored && stored.length > 0) return { keep: false, quantities: stored }
-  return { keep: true }
+  if (!stored || stored.length === 0) return { keep: true }
+  // The stored units are the warehouse's as of an EARLIER read. Re-applied only while the warehouse's own change stamp is the one stored with them: otherwise the warehouse
+  // may have changed the despatch since (a part added or changed, the order edited) and a person who "corrected" IMS to the stored numbers would apply a stale despatch.
+  if (deps.standingDespatchStamp && !despatchStampsMatch(await deps.standingDespatchStamp(orderId), current)) return { keep: true }
+  return { keep: false, quantities: stored }
 }
 
 /** The hold is kept, not released: no refusal object (that would overwrite the standing row's quantities) and no error (nothing is counted against the link). */
@@ -1345,7 +1358,12 @@ function quantityHoldKept(): WmsDispatchOutcome {
  * breaker). The link stays a fully polled candidate, and a standing HIGH row
  * names it on Sync > Exceptions. Every other failure is an error, as before. The delta watermark is NOT held for it (see below): it must never block other orders.
  */
-function applyFailureOutcome(result: { error?: string; refusal?: string; quantityMismatches?: Array<{ sku: string; wmsQty: number; imsQty: number }>; despatchedQuantities?: Array<{ sku: string; qty: number }> }, fallback: string): WmsDispatchOutcome {
+function applyFailureOutcome(result: { error?: string; refusal?: string; quantityMismatches?: Array<{ sku: string; wmsQty: number; imsQty: number }>; despatchedQuantities?: Array<{ sku: string; qty: number }> }, fallback: string, stamp?: DespatchReadStamp): WmsDispatchOutcome {
+  // The daily inventory snapshot holds the floor lock: nothing was attempted. Not an error (nothing is counted against the link, never dead-lettered) and no refusal row
+  // (it clears in minutes by itself); the delta watermark is held so the order is read again once the snapshot is done.
+  if (result.refusal === 'snapshot_in_progress') {
+    return { action: 'pending', reason: result.error ?? 'The daily inventory snapshot is running; the despatch is applied on the next pass', holdWatermark: true }
+  }
   // o3d-hqvrp.115: the units the warehouse despatched differ from the units IMS books. Held, not applied, not an error: a person corrects the order in IMS
   // (or ships it by hand once it is right). Same shape as a scope mismatch: counted nowhere, never dead-lettered, the watermark is NOT held.
   if (result.refusal === 'despatch_quantity_mismatch') {
@@ -1357,7 +1375,7 @@ function applyFailureOutcome(result: { error?: string; refusal?: string; quantit
         gate: 'WMS_QUANTITY_MISMATCH',
         permanence: 'RETRYABLE',
         severity: 'HIGH',
-        intent: { mismatches: (result.quantityMismatches ?? []).slice(0, 50), ...(result.despatchedQuantities && result.despatchedQuantities.length > 0 ? { despatched: result.despatchedQuantities.slice(0, 200) } : {}) },
+        intent: { mismatches: (result.quantityMismatches ?? []).slice(0, 50), ...(result.despatchedQuantities && result.despatchedQuantities.length > 0 ? { despatched: result.despatchedQuantities.slice(0, 200) } : {}), ...(stamp && (stamp.lastUpdated || (stamp.parts && stamp.parts.length > 0)) ? { stamp } : {}) },
         detail: 'The warehouse holds different line quantities than IMS books for this order, so nothing was shipped in IMS (applying it would leave stock on hand wrong). '
           + 'If the warehouse has MORE than IMS: ship the shipment by hand once it is right, then post a stock adjustment (a removal) for the extra units that left. '
           + 'If the warehouse has FEWER: reduce the shipment\'s line to what really left, then ship it by hand. '
@@ -1420,6 +1438,32 @@ function dispatchStateEstablished(state: {
  * not despatched yet". Only the latter is safe to advance the delta watermark
  * over — an unresolved order must stay in the next delta window (o3d-bjc.2.1).
  */
+/**
+ * What the WMS said about an order when its despatched units were stored on a held despatch. `lastUpdated` is the order's own stamp (a non-split order);
+ * `parts` is each part as `id@lastUpdated` plus the part count, sorted (a split order). Both are compared for equality, never ordered or parsed.
+ */
+export type DespatchReadStamp = { lastUpdated?: string | null; parts?: string[] | null }
+
+/** The stamp of a non-split read. */
+export function orderReadStamp(status: { lastUpdated?: string | null }): DespatchReadStamp {
+  return { lastUpdated: status.lastUpdated ?? null, parts: null }
+}
+
+/** The stamp of a split read: every part's id and own stamp. A part with no stamp makes the whole stamp unusable (null parts), so it can never match. */
+export function partsReadStamp(parts: ReadonlyArray<{ externalId: string; lastUpdated?: string | null }>): DespatchReadStamp {
+  if (parts.some((part) => !part.lastUpdated)) return { lastUpdated: null, parts: null }
+  return { lastUpdated: null, parts: parts.map((part) => `${part.externalId}@${part.lastUpdated}`).sort() }
+}
+
+/** Identical, and non-empty on both sides. */
+export function despatchStampsMatch(stored: DespatchReadStamp | null | undefined, current: DespatchReadStamp): boolean {
+  if (!stored) return false
+  if (stored.parts && stored.parts.length > 0) {
+    return Boolean(current.parts) && current.parts!.length === stored.parts.length && current.parts!.every((part, index) => part === stored.parts![index])
+  }
+  return Boolean(stored.lastUpdated) && stored.lastUpdated === current.lastUpdated
+}
+
 export type WmsDispatchOutcome = {
   action: 'dispatched' | 'pending' | 'error'
   reason: string
@@ -1600,7 +1644,7 @@ export async function reconcileOneOrder(
   // An order whose despatch is held on a quantity mismatch is then checked against the quantities last reported (so a corrected order releases itself), or
   // stays held: it is never applied on IMS's own quantities, and its standing row is not closed.
   if (deps.passDespatchFacts && (despatchedQuantities === undefined || despatchedQuantities.length === 0)) {
-    const held = await resolveHeldQuantities(deps, candidate.orderId)
+    const held = await resolveHeldQuantities(deps, candidate.orderId, orderReadStamp(status))
     if (held?.keep) return quantityHoldKept()
     if (held) despatchedQuantities = held.quantities
   }
@@ -1610,7 +1654,7 @@ export async function reconcileOneOrder(
     ...(despatchedQuantities ? { despatchedQuantities } : {}),
   }
   const result = await deps.applyDispatch(candidate.orderId, toFulfillmentTracking(status.tracking), Object.keys(applyOptions).length > 0 ? applyOptions : undefined)
-  if (!result.success) return applyFailureOutcome(result, 'Dispatch apply failed')
+  if (!result.success) return applyFailureOutcome(result, 'Dispatch apply failed', orderReadStamp(status))
   return { action: 'dispatched', reason: status.status || 'DESPATCHED' }
 }
 
@@ -3517,6 +3561,18 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
         return typeof e.sku === 'string' && typeof e.qty === 'number' && e.qty > 0 ? [{ sku: e.sku, qty: e.qty }] : []
       })
       return rows.length > 0 ? rows : null
+    },
+    async standingDespatchStamp(orderId) {
+      const row = await db.refusedAction.findFirst({
+        where: { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action: 'WMS_DESPATCH_QUANTITY', resolvedAt: null },
+        select: { intent: true },
+      })
+      const stamp = (row?.intent as { stamp?: { lastUpdated?: unknown; parts?: unknown } } | null)?.stamp
+      if (!stamp || typeof stamp !== 'object') return null
+      return {
+        lastUpdated: typeof stamp.lastUpdated === 'string' ? stamp.lastUpdated : null,
+        parts: Array.isArray(stamp.parts) && stamp.parts.every((part) => typeof part === 'string') ? (stamp.parts as string[]) : null,
+      }
     },
     async previewQuantityMismatch(orderId, quantities) {
       if (!(await isWmsDespatchQuantityCheckEnabled())) return null

@@ -14,7 +14,7 @@ import {
   type PreflightResult,
   type PreflightStatus,
 } from '@/lib/ops/production-preflight'
-import { getWmsDespatchDateStatus, type WmsDespatchDateStatus } from '@/lib/domain/wms/despatch-flags'
+import { getWmsDespatchDateReadiness, type WmsDespatchDateStatus } from '@/lib/domain/wms/despatch-flags'
 import {
   evaluateReconciliationProof,
   mergeTiedNewestRuns,
@@ -159,7 +159,7 @@ export function createDefaultRolloutReadinessAdapters(): RolloutReadinessAdapter
     runPreflight: () => runProductionPreflight(),
     collectAdminHealth: () => collectAdminHealth(),
     accountingReconciliationSnapshot: () => getAccountingReconciliationSnapshot(),
-    despatchDateStatus: () => getWmsDespatchDateStatus(),
+    despatchDateStatus: () => getWmsDespatchDateReadiness(),
   }
 }
 
@@ -167,14 +167,26 @@ export function createDefaultRolloutReadinessAdapters(): RolloutReadinessAdapter
 export function classifyDespatchDatePrerequisite(status: WmsDespatchDateStatus | null): RolloutReadinessFinding[] {
   if (!status || !status.switchOn) return []
   if (status.snapshotCronEnabled) {
-    if (!status.lockDateStale) return []
-    return [{
-      id: 'wms-despatch-date:lock-date-stale',
-      severity: 'warning',
-      source: 'wms-despatch-date',
-      message: 'wms_despatch_date_enabled is on but the stored accounting lock date was last read more than 36 hours ago, so warehouse despatches are NOT backdated (they are dated at the moment IMS applies them) until the daily accounting batch refreshes it. Check the last accounting batch and the Xero connection.',
-      details: { lockDateStale: true },
-    }]
+    const findings: RolloutReadinessFinding[] = []
+    if (status.lockDateStale) {
+      findings.push({
+        id: 'wms-despatch-date:lock-date-stale',
+        severity: 'warning',
+        source: 'wms-despatch-date',
+        message: 'wms_despatch_date_enabled is on but the stored accounting lock date is not trusted (it was last read more than 36 hours ago, has no read time, or does not parse), so warehouse despatches are NOT backdated (they are dated at the moment IMS applies them) until the daily accounting batch refreshes it. Check the last accounting batch and the Xero connection.',
+        details: { lockDateStale: true },
+      })
+    }
+    if (status.snapshotRunStale) {
+      findings.push({
+        id: 'wms-despatch-date:snapshot-stale',
+        severity: 'warning',
+        source: 'wms-despatch-date',
+        message: 'wms_despatch_date_enabled is on and the Inventory Snapshot job is enabled, but the latest snapshot run is more than 26 hours old (or there is none). The job is failing or not running, so the despatch floor is an old day and backdated despatches may be moved forward to it. Check the Inventory Snapshot job history.',
+        details: { snapshotRunStale: true, latestSnapshotRunAt: status.latestSnapshotRunAt ?? null },
+      })
+    }
+    return findings
   }
   return [{
     id: 'wms-despatch-date:snapshot-cron-disabled',

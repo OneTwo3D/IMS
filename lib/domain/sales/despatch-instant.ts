@@ -173,6 +173,22 @@ export async function lockInventorySnapshotFloorShared(client: unknown): Promise
   await (client as FloorClient).$executeRaw`SELECT pg_advisory_xact_lock_shared(${INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY})`
 }
 
+/**
+ * The refusal text a despatch gives when the daily inventory snapshot holds the floor lock. It starts with this mark, so the layers above can tell "try again in a
+ * few minutes" from a real failure (it is not counted against the link, never dead-lettered, and raises nothing).
+ */
+export const SNAPSHOT_RUNNING_MARK = 'The daily inventory snapshot is running; '
+
+/**
+ * TRY to take the floor lock (shared) to the end of the caller's transaction, WITHOUT waiting. False when the snapshot holds it exclusively. Waiting would keep
+ * the caller's order lock and a pool connection for the whole run and then fail with a transaction timeout (the 20 s despatch cap cannot interrupt a blocked
+ * lock call), so the caller refuses at once with a retryable answer instead.
+ */
+export async function tryLockInventorySnapshotFloorShared(client: unknown): Promise<boolean> {
+  const rows = await (client as FloorClient).$queryRaw<Array<{ locked: boolean }>>`SELECT pg_try_advisory_xact_lock_shared(${INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY}) AS locked`
+  return rows[0]?.locked === true
+}
+
 type LayerNeed = { productId: string; warehouseId: string; qty: number }
 
 /** The latest receipt among the FIFO layers that cover each need (oldest first, as consumeFifoLayers takes them). Read-only; run after the stock levels are locked. */
