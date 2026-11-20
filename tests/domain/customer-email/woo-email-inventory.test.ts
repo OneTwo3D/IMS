@@ -21,7 +21,7 @@ const KINDS = [STOREFRONT_CONFIRMATION_KIND, STOREFRONT_DELIVERED_KIND, storefro
 
 test('every IMS customer e-mail kind maps to exactly one inventory entry', () => {
   for (const kind of KINDS) {
-    const matches = WOO_CUSTOMER_EMAIL_INVENTORY.filter((entry) => entry.imsKind !== null && (entry.kindIsPrefix ? kind.startsWith(`${entry.imsKind}:`) : kind === entry.imsKind))
+    const matches = WOO_CUSTOMER_EMAIL_INVENTORY.filter((entry) => 'imsKind' in entry && entry.imsKind !== null && ('kindIsPrefix' in entry && entry.kindIsPrefix ? kind.startsWith(`${entry.imsKind}:`) : kind === entry.imsKind))
     assert.equal(matches.length, 1, kind)
     assert.equal(inventoryEntryForKind(kind), matches[0], kind)
   }

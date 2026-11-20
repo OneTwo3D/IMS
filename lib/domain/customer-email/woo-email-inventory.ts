@@ -91,8 +91,8 @@ export function inventoryOwnershipKey(entry: WooEmailInventoryEntry): string {
 /** The inventory entry an IMS e-mail queue kind belongs to, or null when the kind is not a customer e-mail of the inventory. */
 export function inventoryEntryForKind(kind: string): WooEmailInventoryEntry | null {
   for (const entry of WOO_CUSTOMER_EMAIL_INVENTORY) {
-    if (entry.imsKind === null) continue
-    if (entry.kindIsPrefix ? kind.startsWith(`${entry.imsKind}:`) : kind === entry.imsKind) return entry
+    if (!('imsKind' in entry) || entry.imsKind === null) continue
+    if ('kindIsPrefix' in entry && entry.kindIsPrefix ? kind.startsWith(`${entry.imsKind}:`) : kind === entry.imsKind) return entry
   }
   return null
 }
