@@ -500,19 +500,25 @@ test('[db] a store order that is reopened is parked for an operator and stays fe
     if (!parked) { assert.equal(open, null, `${status}: row closed`); continue }
     assert.equal(open?.payload.refusal, WC_REOPENED_OPERATOR_DECISION_REFUSAL, `${status}: a visible open Exceptions row`)
     assert.match(open.errorMessage, /operator decision needed/)
-    assert.equal(open.payload.terminal, true, `${status}: not retried again`)
-    assert.equal((await retryOwedOutsideImsDespatches(20, async () => ({ order: p }))).scanned >= 0, true)
+    assert.notEqual(open.payload.terminal, true, `${status}: a parked row is never terminal`)
     if (status !== 'processing') continue
     // The operator release: refused for an order with no parked row, otherwise audited and clearing the fence.
     assert.equal((await releaseReopenedOrderFence(one.suffix, null)).success, false)
-    const released = await releaseReopenedOrderFence(orderId, 'operator-1')
+    const user = await db.user.create({ data: { email: `f92-${randomUUID()}@example.test`, name: 'op', passwordHash: 'x', role: 'ADMIN' } })
+    t.after(async () => { await db.activityLog.deleteMany({ where: { userId: user.id } }); await db.user.delete({ where: { id: user.id } }) })
+    // The store is re-read first: completed / shipped / cancelled / unreadable all refuse, and nothing changes.
+    for (const refused of [{ order: { ...p, status: 'completed' } }, { order: { ...p, status: 'cancelled', date_completed_gmt: null } }, { failed: true as const }]) {
+      assert.equal((await releaseReopenedOrderFence(orderId, user.id, async () => refused)).success, false)
+      assert.equal(await fenced(), true, 'still fenced after a refused release')
+    }
+    const released = await releaseReopenedOrderFence(orderId, user.id, async () => ({ order: { ...p, status: 'processing', date_completed_gmt: null } }))
     assert.deepEqual(released, { success: true })
     assert.equal(await fenced(), false, 'fence cleared by the operator')
     assert.equal(await db.shoppingSyncLog.count({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId } }), 0, 'row closed')
-    const audit = await db.activityLog.findFirstOrThrow({ where: { entityId: orderId, action: 'wc_import_first_seen_outside_ims_fence_released' }, select: { metadata: true } })
-    assert.equal(audit.metadata.userId, 'operator-1')
+    const audit = await db.activityLog.findFirstOrThrow({ where: { entityId: orderId, action: 'wc_import_first_seen_outside_ims_fence_released' }, select: { userId: true, metadata: true } })
+    assert.equal(audit.userId, user.id, 'the activity row carries who confirmed')
     assert.equal(await db.salesOrder.count({ where: { id: orderId, ...REALLOCATION_SWEEP_SELECTION } }), 1, 'now visible to the allocation sweep')
-    assert.equal((await releaseReopenedOrderFence(orderId, 'operator-1')).success, false, 'a second release finds nothing waiting')
+    assert.equal((await releaseReopenedOrderFence(orderId, user.id, async () => ({ order: p }))).success, false, 'a second release finds nothing waiting')
   }
 })
 
@@ -573,6 +579,52 @@ test('[db] an order short only because OTHER orders reserved the stock is retrie
   assert.equal(out.skipped, 0)
   assert.equal(out.booked, 1, JSON.stringify(out))
   assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { status: true } })).status, 'SHIPPED')
+})
+
+test('[db] a parked reopened row is re-read daily: completed again with no stock then stock arrives books once; a store cancel closes it and keeps the fence', { skip }, async (t) => {
+  const env = await load()
+  const { db, Prisma, importWcOrder } = env
+  const { retryOwedOutsideImsDespatches } = await import('../../lib/connectors/woocommerce/sync/outside-ims-despatch')
+  const { openWcCompletionRefusalWhere, WC_REOPENED_OPERATOR_DECISION_REFUSAL } = await import('../../lib/domain/sales/wc-sync-row-families')
+  const fx = await seed(env, 0)
+  t.after(() => cleanup(env, fx))
+  await withCutoff(env, t, CUTOFF)
+  const p = wcOrder(fx, 'completed', 2, { date_completed_gmt: AFTER_CUTOFF })
+  const orderId = (await importWcOrder(p, ADMITTED)).orderId as string
+  const reopened = { ...p, status: 'processing', date_completed_gmt: null }
+  const base = Date.now()
+  const at = (hours: number) => new Date(base + hours * 3_600_000)
+  const row = async () => (await db.shoppingSyncLog.findFirstOrThrow({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId }, select: { payload: true } })).payload
+  assert.equal((await retryOwedOutsideImsDespatches(20, async () => ({ order: reopened }), at(0.01))).reopened, 1)
+  assert.equal((await row()).refusal, WC_REOPENED_OPERATOR_DECISION_REFUSAL)
+  assert.notEqual((await row()).terminal, true)
+  assert.equal((await retryOwedOutsideImsDespatches(20, async () => ({ order: reopened }), at(1))).scanned, 0, 'not due again inside the day')
+  // Still reopened a day later: stays parked.
+  assert.equal((await retryOwedOutsideImsDespatches(20, async () => ({ order: reopened }), at(25))).reopened, 0)
+  assert.equal((await row()).refusal, WC_REOPENED_OPERATOR_DECISION_REFUSAL)
+  // The store completes it again; IMS has no stock: un-parked, owed again, fence kept.
+  const out = await retryOwedOutsideImsDespatches(20, async () => ({ order: p }), at(50))
+  assert.equal(out.stillOwed, 1, JSON.stringify(out))
+  assert.equal((await row()).refusal, 'insufficient_physical_stock', 'an ordinary owed row again')
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { outsideImsFulfilmentAt: true } })).outsideImsFulfilmentAt !== null, true)
+  // Stock arrives: booked once.
+  await db.stockLevel.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { quantity: new Prisma.Decimal('10') } })
+  await db.costLayer.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { remainingQty: new Prisma.Decimal('10'), receivedQty: new Prisma.Decimal('10') } })
+  const booked = await retryOwedOutsideImsDespatches(20, async () => ({ order: p }), at(80))
+  assert.equal(booked.booked, 1, JSON.stringify(booked))
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { status: true } })).status, 'SHIPPED')
+  assert.equal(Number((await db.stockLevel.findFirstOrThrow({ where: { productId: fx.productId, warehouseId: fx.warehouseId } })).quantity), 8, 'consumed exactly once')
+
+  // Park, then the store cancels: the row closes and the fence stays.
+  const other = await seed(env, 0)
+  t.after(() => cleanup(env, other))
+  const p2 = wcOrder(other, 'completed', 1, { date_completed_gmt: AFTER_CUTOFF })
+  const orderId2 = (await importWcOrder(p2, ADMITTED)).orderId as string
+  await retryOwedOutsideImsDespatches(20, async () => ({ order: { ...p2, status: 'processing', date_completed_gmt: null } }), at(100))
+  const cancelled = await retryOwedOutsideImsDespatches(20, async () => ({ order: { ...p2, status: 'cancelled', date_completed_gmt: null } }), at(130))
+  assert.equal(cancelled.resolved, 1, JSON.stringify(cancelled))
+  assert.equal(await db.shoppingSyncLog.count({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId2 } }), 0, 'closed')
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: orderId2 }, select: { outsideImsFulfilmentAt: true } })).outsideImsFulfilmentAt !== null, true, 'fence kept')
 })
 
 test('[db] the retry query has a supporting partial index on the open completion-refusal rows', { skip }, async () => {

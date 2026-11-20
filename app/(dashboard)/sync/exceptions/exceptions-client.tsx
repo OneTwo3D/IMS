@@ -1583,7 +1583,10 @@ export function ExceptionsClient({ data }: Props) {
                         variant="ghost"
                         size="sm"
                         disabled={isPending}
-                        onClick={() => runAction(() => confirmReopenedOrderFulfillableByIms(row.orderId), `IMS may now fulfil ${row.orderNumber ?? row.orderId}.`)}
+                        onClick={() => {
+                          if (!window.confirm(`Confirm that IMS may fulfil order ${row.orderNumber ?? row.orderId}? The store had reported it completed, so its goods may already have left. IMS re-reads the store first, and after you confirm the order can be allocated and sent from the warehouse. Only continue if you have checked that nothing has been despatched.`)) return
+                          runAction(() => confirmReopenedOrderFulfillableByIms(row.orderId), `IMS may now fulfil ${row.orderNumber ?? row.orderId}.`)
+                        }}
                       >
                         <CheckCircle2 className="h-3 w-3 mr-1" />Confirm IMS may fulfil
                       </Button>

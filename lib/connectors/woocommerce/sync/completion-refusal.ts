@@ -36,7 +36,7 @@ export type WcCompletionRefusalInput = {
 }
 
 /** The fields only the owed-despatch retry writes. A refusal re-record (a redelivery, the booking path) carries them over untouched. */
-const RETRY_STATE_KEYS = ['retryChecks', 'retryAttempts', 'lastAttemptAt', 'lastRealAttemptAt', 'nextAttemptAt', 'stockSignature', 'terminal'] as const
+const RETRY_STATE_KEYS = ['retryChecks', 'retryAttempts', 'lastAttemptAt', 'lastRealAttemptAt', 'nextAttemptAt', 'stockSignature'] as const
 
 /** The instant of a WooCommerce delivery (`date_modified_gmt`, else `date_modified`), or null when unreadable. */
 export function wcEventInstant(order: { date_modified_gmt?: string; date_modified?: string }): Date | null {
