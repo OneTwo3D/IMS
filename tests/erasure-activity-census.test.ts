@@ -21,7 +21,7 @@ const cwd = new URL('..', import.meta.url).pathname
 const IDENTITY_MENTION: Record<string, { calls: number; verdict: string }> = {
   'app/actions/customers.ts': { calls: 2, verdict: 'customer-row (created and updated, written in the same transaction as the customer row; the failure rows carry no name)' },
   'app/actions/accounting-ledger-check.ts': { calls: 1, verdict: 'staff-actor' },
-  'app/actions/sales.ts': { calls: 1, verdict: 'staff-actor (withdrawal hold released by)' },
+  'app/actions/sales.ts': { calls: 2, verdict: 'staff-actor (withdrawal hold released by); no-write (the invoice-update date-unknown warning: order id and the accounting invoice id only, the identity words in the scan window belong to the payload builder that follows it)' },
   'lib/connectors/xero/sync-processor.ts': { calls: 1, verdict: 'no-write (follow-up plan reads the customer email)' },
 }
 const CUSTOMER_ACTIONS: Record<string, string[]> = {
