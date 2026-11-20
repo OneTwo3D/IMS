@@ -1,4 +1,6 @@
 import { db } from '@/lib/db'
+import { startOfNextBusinessDay } from '@/lib/domain/inventory/inventory-snapshot'
+import { loadInTransitTransferValues, sumInTransitValue } from '@/lib/domain/inventory/transfer-in-transit-value'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { getAccountingSettings, getActiveAccountingConnectorInfo, getAccountingSettingsFor } from '@/lib/accounting'
 import { AccountBalanceMovementWithheldError, balanceDateString, findLatestConfiguredAccountBalanceSnapshot, glLegProvenance } from './account-balance-snapshots'
@@ -70,7 +72,7 @@ export type InventoryGlReconciliationUnavailableReason =
 
 export type InventoryGlReconciliationResult =
   | { available: false; reason: InventoryGlReconciliationUnavailableReason }
-  | ({ available: true; balanceDate: string; /** Where each of the two stored balances came from; `proven-absent` is a zero Xero never reported (an omitted account of a Trial Balance that proved itself complete), compared as the real zero it is. */ glProvenance?: Record<string, GlLegProvenance> } & InventoryGlReconciliation)
+  | ({ available: true; balanceDate: string; /** The snapshot's on-hand value (cost layers in warehouses) and, as its own line, the stock in transit on dispatched transfers; subledgerValue is their sum. */ onHandValue?: number; inTransitValue?: number; /** Where each of the two stored balances came from; `proven-absent` is a zero Xero never reported (an omitted account of a Trial Balance that proved itself complete), compared as the real zero it is. */ glProvenance?: Record<string, GlLegProvenance> } & InventoryGlReconciliation)
 
 /**
  * Load the inventory GL reconciliation as of the latest synced GL balance date:
@@ -158,18 +160,36 @@ export async function loadInventoryGlReconciliation(options?: {
     where: { snapshotDate: balanceDate },
     select: { valueBase: true, valueReplayReliable: true },
   })
-  if (snapshotRows.length === 0) {
-    const run = await db.inventorySnapshotRun.findUnique({
-      where: { snapshotDate: balanceDate },
-      select: { id: true },
-    })
-    if (!run) return { available: false, reason: 'no_subledger_snapshot' }
-    // Covered zero-stock date: subledgerValue is genuinely 0; fall through to reconcile.
-  }
+  const run = await db.inventorySnapshotRun.findUnique({
+    where: { snapshotDate: balanceDate },
+    select: { id: true, inTransitCovered: true, cutoffAt: true },
+  })
+  if (snapshotRows.length === 0 && !run) return { available: false, reason: 'no_subledger_snapshot' }
+  // (Covered zero-stock date: the on-hand value is genuinely 0; fall through to reconcile.)
   if (snapshotRows.some((row) => !row.valueReplayReliable)) {
     return { available: false, reason: 'unreliable_subledger_snapshot' }
   }
-  const subledgerValue = snapshotRows.reduce((sum, row) => sum + Number(row.valueBase), 0)
+  const onHandValue = snapshotRows.reduce((sum, row) => sum + Number(row.valueBase), 0)
+
+  // STOCK IN TRANSIT (ACC-M12): units on a dispatched, not fully received transfer are in no warehouse row, but a transfer posts
+  // nothing, so the GL still carries them. They are the snapshot's own "in transit" line and part of the sub-ledger value. A run
+  // that captured the line (inTransitCovered) is read back; an older run never measured it, so it is valued from the movement
+  // ledger as of the run's cutoff, which is exact for any past instant. Neither "absent rows" nor a failed measure is read as zero.
+  let inTransitValue: number
+  if (run?.inTransitCovered) {
+    const transitRows = await db.inventoryTransitSnapshot.findMany({
+      where: { snapshotDate: balanceDate },
+      select: { valueBase: true, valueReplayReliable: true },
+    })
+    if (transitRows.some((row) => !row.valueReplayReliable)) return { available: false, reason: 'unreliable_subledger_snapshot' }
+    inTransitValue = transitRows.reduce((sum, row) => sum + Number(row.valueBase), 0)
+  } else {
+    const measured = await loadInTransitTransferValues(db, run?.cutoffAt ?? startOfNextBusinessDay(balanceDate))
+    if (!measured) return { available: false, reason: 'no_subledger_snapshot' }
+    if (measured.some((row) => !row.reliable)) return { available: false, reason: 'unreliable_subledger_snapshot' }
+    inTransitValue = sumInTransitValue(measured).toNumber()
+  }
+  const subledgerValue = onHandValue + inTransitValue
   const glBalance = Number(inventorySnapshot.amountBase) + Number(allocatedSnapshot.amountBase)
 
   const evaluated = evaluateInventoryGlReconciliation({
@@ -185,6 +205,8 @@ export async function loadInventoryGlReconciliation(options?: {
   return {
     available: true,
     balanceDate: balanceDateString(balanceDate),
+    onHandValue,
+    inTransitValue,
     // Both legs passed the provenance check in the reader: each is a balance Xero reported or a proven-absent zero, and says which.
     glProvenance: { inventory: glLegProvenance(inventorySnapshot), allocated: glLegProvenance(allocatedSnapshot) },
     ...guarded,
