@@ -484,6 +484,10 @@ export async function updateAdjustmentMovement(
         return
       }
 
+      // The stock-level row lock goes FIRST, before the guards below read anything: a movement committing between a guard's read and the lock would otherwise pass it
+      // (the guards then judge a state that is already stale, and the edit re-books quantity, layers and COGS under it). The warehouse cannot change on an edit.
+      await lockStockLevelRow(tx, movement.productId, oldWarehouseId)
+
       const laterMovementCount = await tx.stockMovement.count({
         where: {
           id: { not: id },
