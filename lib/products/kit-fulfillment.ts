@@ -1,6 +1,7 @@
 import { db } from '@/lib/db'
 import { Prisma, type ProductType } from '@/app/generated/prisma/client'
 import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { isKitIgnoredComponentType } from '@/lib/products/kit-component-policy'
 
 type FulfillmentClient = Prisma.TransactionClient | typeof db
 
@@ -382,6 +383,11 @@ export function expandFulfillmentRequirementsDecimal(
     stack.add(currentProductId)
     for (const component of node.productComponents) {
       const requiredQty = currentQty.mul(component.qty)
+      if (isKitIgnoredComponentType(component.componentType)) {
+        // NON_INVENTORY (service, leaflet, gift wrap): not stock-tracked, so it neither limits nor
+        // consumes stock. Same rule as the WooCommerce availability calc (kit-component-policy).
+        continue
+      }
       if (component.componentType === 'KIT') {
         visit(component.componentId, requiredQty, stack)
       } else {

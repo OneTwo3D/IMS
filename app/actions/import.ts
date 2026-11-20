@@ -1,5 +1,6 @@
 'use server'
 
+import { findKitComponentRefusal } from '@/lib/products/kit-component-policy'
 import { parseComponentsCell } from '@/lib/domain/import/component-recipe-cell'
 import { parseTransferDispatchedAt } from '@/lib/domain/import/transfer-dispatch-date'
 import { revalidatePath } from 'next/cache'
@@ -1065,6 +1066,16 @@ async function importProductsCsvInner(formData: FormData, system?: SystemImportC
             const cycle = await detectComponentCycle(productId, components.map((c) => c.componentId), tx)
             if (cycle.kind !== 'ok') return false
 
+            // o3d-hqvrp.105: same kit-component rule as the editor (no variable parent, not all non-inventory).
+            if (current.type === 'KIT') {
+              const componentTypes = await tx.product.findMany({
+                where: { id: { in: components.map((c) => c.componentId) } },
+                select: { sku: true, type: true },
+              })
+              const refusal = findKitComponentRefusal(componentTypes)
+              if (refusal) return { refused: refusal }
+            }
+
             // o3d-4kfh r5: same in-flight sales refusal as the editor. A bulk CSV pass is not a
             // licence to retroactively rewrite what an already-allocated or already-picking order
             // requires — the corruption it produces (an incomplete kit dispatched, credited as a
@@ -1148,6 +1159,11 @@ async function importProductsCsvInner(formData: FormData, system?: SystemImportC
             }
             return true
           })
+          if (typeof wrote === 'object' && wrote !== null) {
+            result.errors.push(`Row ${cr.lineNum}: ${cr.sku} — ${wrote.refused} Components were not written.`)
+            recordComponentRowFailure(result, cr)
+            continue
+          }
           if (wrote === 'in-flight-sales') {
             result.errors.push(
               `Row ${cr.lineNum}: ${cr.sku} has sales orders still in flight against its component graph `

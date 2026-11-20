@@ -1,4 +1,5 @@
 import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
+import { isKitIgnoredComponentType } from '@/lib/products/kit-component-policy'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { randomUUID } from 'node:crypto'
 import { markWmsScopeDirtyInTx } from '@/lib/domain/wms/scope-dirty'
@@ -3353,6 +3354,7 @@ function collectNonOversellLeafComponents(
         visit(component.componentId, stack)
         continue
       }
+      if (isKitIgnoredComponentType(component.componentType)) continue
       if (!component.componentOversellAllowed) {
         blockers.add(component.componentSku || component.componentId)
       }

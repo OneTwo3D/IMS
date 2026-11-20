@@ -34,6 +34,7 @@
  * ids into the freshly wiped cache. See `../sync-lock.ts`.
  */
 
+import { isKitIgnoredComponentType } from '@/lib/products/kit-component-policy'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import type { Prisma } from '@/app/generated/prisma/client'
@@ -2198,7 +2199,13 @@ function computeKitAvailability(
   let total = 0
   for (const warehouseId of warehouseIds) {
     let kitsInWarehouse = Infinity
+    // o3d-hqvrp.105: a NON_INVENTORY component (service, leaflet, gift wrap) has no stock rows by design and
+    // imposes no limit; counting it as floor(0/qty) pinned every such kit at 0. A VARIABLE component is NOT
+    // skipped (it fails closed at 0 below: skipping made a kit look sellable while every variation was out).
+    let limitedByStockTracked = false
     for (const component of product.productComponents) {
+      if (isKitIgnoredComponentType(component.component.type)) continue
+      limitedByStockTracked = true
       const required = Number(component.qty)
       if (required <= 0) {
         kitsInWarehouse = 0
@@ -2221,7 +2228,8 @@ function computeKitAvailability(
         : Math.floor(available / required)
       kitsInWarehouse = Math.min(kitsInWarehouse, kitsFromComponent)
     }
-    total += kitsInWarehouse === Infinity ? 0 : kitsInWarehouse
+    // All components ignored (an all-NON_INVENTORY kit): nothing limits it, nothing consumes stock. Fail closed.
+    total += kitsInWarehouse === Infinity || !limitedByStockTracked ? 0 : kitsInWarehouse
   }
 
   stack.delete(product.id)
