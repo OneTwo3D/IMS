@@ -1,5 +1,6 @@
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { FulfillmentRequirementSnapshotError, parseFulfillmentRequirementSnapshot } from '@/lib/products/fulfillment-requirement-snapshot'
 
 /**
  * THE UNITS THE WAREHOUSE DESPATCHED, AGAINST THE UNITS IMS BOOKS.
@@ -10,15 +11,23 @@ import { db } from '@/lib/db'
  * customer is refunded 1 with no restock, the amendment is refused as NOT_NEW, the warehouse despatches 4. IMS demand net of the refund is 3,
  * the IMS shipment covers 3, the coverage check passes, and IMS relieves 3: on hand is overstated by 1.
  *
+ * WHAT THE WAREHOUSE'S NUMBER IS. It is the order line's quantity as the warehouse record holds it (the order item's `Quantity`), NOT a count of
+ * the units picked: the warehouse API has no despatched-quantity field on an order item (Quantity, Allocated, Commited, OnBackOrder). So this check
+ * catches an order whose lines the warehouse holds differently from IMS's (an amendment IMS could not make once the order left NEW, a refund IMS
+ * netted but the warehouse never saw, a line IMS does not book at all). It does NOT see a warehouse over-pick or a substitution made at the bench, and
+ * must never be described as if it did. A short despatch that is split carries the part's own quantities, which the split path sums.
+ *
  * THE RULE. EXACT, PER SKU, in the warehouse's own line terms: for every SKU the warehouse despatched, IMS must book the same number of units
- * (and book none that the warehouse did not send). There is no tolerance: units are whole and countable, and a tolerance would hide exactly the
+ * (and book none that the warehouse did not send). A SKU the warehouse sent that IMS books NOTHING of (a substitution, or an order line with no
+ * shipment row such as a fully refunded one) is a mismatch of N against 0. The exceptions are lines IMS can never book: NON_INVENTORY and VARIABLE. There is no tolerance: units are whole and countable, and a tolerance would hide exactly the
  * one-unit drift this exists to catch. Only decimal noise (1e-6) is ignored. Any difference, over or under, HOLDS the despatch: nothing is
  * shipped, and a standing refused action names the SKUs with both quantities (see the refusal `despatch_quantity_mismatch`).
  *
  * WHAT THE COMPARISON IS NOT FOR (it says "not comparable" and the despatch applies as it always did):
  *   - the warehouse listed no lines (nothing to compare with);
- *   - the order holds a KIT line: the warehouse may list the kit or its components while IMS books components, so the two are not in the same
- *     terms (the earlier attempt raised a false mismatch on every kit order);
+ *   - the order holds a line whose PINNED fulfilment recipe (the snapshot taken at allocation) expands to anything other than itself (a kit): the
+ *     warehouse may list the kit or its components while IMS books components, so the two are not in the same terms. A line with no pin falls back to
+ *     the product's current type. The pin is what IMS actually allocated and ships by, so it, not today's product type, decides;
  *   - a MERGED warehouse order: its lines mix several storefront orders;
  *   - every shipment IMS holds in the warehouse's warehouse is already SHIPPED (by hand): there is nothing left to apply, and this is the
  *     way out of a standing mismatch (ship the shipments in IMS by hand, then the despatch records itself).
@@ -44,6 +53,7 @@ const normaliseSku = (sku: string | null | undefined): string => (sku ?? '').tri
 export function compareDespatchQuantities(
   wms: ReadonlyArray<DespatchQuantity>,
   ims: ReadonlyArray<{ productId: string; skus: ReadonlyArray<string>; qty: number }>,
+  options: { ignoreSkus?: ReadonlySet<string> } = {},
 ): DespatchQuantityMismatch[] {
   const productBySku = new Map<string, string>()
   for (const row of ims) for (const sku of row.skus) { const key = normaliseSku(sku); if (key) productBySku.set(key, row.productId) }
@@ -53,6 +63,8 @@ export function compareDespatchQuantities(
   for (const item of wms) {
     const key = normaliseSku(item.sku)
     if (!key || !(item.qty > 0)) continue
+    // A SKU of a line IMS can never book (a service or a variable parent): nothing in IMS could ever match it, so it is not evidence of drift.
+    if (options.ignoreSkus?.has(key)) continue
     const productId = productBySku.get(key)
     const bucket = productId ? wmsByProduct : unknown
     const bucketKey = productId ?? key
@@ -76,6 +88,41 @@ export function describeDespatchQuantityMismatch(mismatches: ReadonlyArray<Despa
   return mismatches.map((entry) => `${entry.sku}: warehouse despatched ${entry.wmsQty}, IMS books ${entry.imsQty}`).join('; ')
 }
 
+/**
+ * Does this order line expand to anything other than itself, by its PINNED fulfilment recipe? A line that carries a pin is judged by the pin alone (the
+ * product's current type is not consulted, in either direction); a line with no pin falls back to the product's current type. A pin that cannot be read is
+ * "cannot say" and the order is not compared (never a guess).
+ */
+export function lineExpandsBeyondItself(line: { id?: string; productId: string | null; fulfillmentRequirements?: unknown; product?: { type?: string | null } | null }): boolean {
+  const snapshot = parseFulfillmentRequirementSnapshot(line.fulfillmentRequirements, line.id ?? null)
+  if (snapshot && snapshot.productId === line.productId) {
+    return !(snapshot.requirements.length === 1 && snapshot.requirements[0].productId === line.productId && snapshot.requirements[0].factor.eq(1))
+  }
+  return line.product?.type === 'KIT'
+}
+
+/**
+ * What an operator does about a standing mismatch, per direction, in fixed wording (used by the refusal text, the standing row and the help text).
+ *   - MORE units despatched than IMS books: IMS cannot book a unit past the order's demand, so the only exit is to ship the shipment by hand once it
+ *     is right, and then post a stock adjustment (a removal) for the extra units that left. Shipping by hand alone books the demand and leaves exactly
+ *     the drift this check exists to catch.
+ *   - FEWER units despatched than IMS books (or a SKU that was not sent): ship the shipment by hand at what really left (reduce its line first); the
+ *     despatch then records itself. Units that never left stay in stock.
+ */
+export function describeDespatchQuantityExit(mismatches: ReadonlyArray<DespatchQuantityMismatch>): string {
+  const over = mismatches.some((entry) => entry.wmsQty > entry.imsQty)
+  const under = mismatches.some((entry) => entry.wmsQty < entry.imsQty)
+  const parts: string[] = []
+  if (over) parts.push('If the warehouse sent MORE than IMS books: IMS cannot book units past the order\'s demand, so ship the shipment by hand once it is right and then post a stock adjustment (a removal) for the extra units that left')
+  if (under) parts.push('If the warehouse sent FEWER than IMS books (or did not send a SKU): reduce the shipment\'s line to what really left, then ship it by hand; the units that did not leave stay in stock')
+  return parts.join('. ') + (parts.length > 0 ? '.' : '')
+}
+
+/** A stable key for the mismatches, so "has anything changed since the standing row was written" is a string comparison (the stored JSON reorders keys). */
+export function despatchQuantityMismatchKey(mismatches: ReadonlyArray<DespatchQuantityMismatch>): string {
+  return [...mismatches].map((entry) => `${entry.sku}|${entry.wmsQty}|${entry.imsQty}`).sort().join(';')
+}
+
 type CheckInput = {
   orderId: string
   /** The warehouse the warehouse-order was sent for; null when unknown (every shipment of the order then counts). */
@@ -95,12 +142,17 @@ export async function findDespatchQuantityMismatch(input: CheckInput, client: Pi
     }),
     client.salesOrderLine.findMany({
       where: { orderId: input.orderId },
-      select: { productId: true, sku: true, product: { select: { type: true } } },
+      select: { id: true, productId: true, sku: true, fulfillmentRequirements: true, product: { select: { type: true } } },
     }),
   ])
   if (shipments.length === 0) return { status: 'NOT_COMPARABLE', reason: 'IMS holds no shipment in the warehouse yet' }
   if (shipments.every((shipment) => shipment.status === 'SHIPPED')) return { status: 'NOT_COMPARABLE', reason: 'every shipment is already shipped' }
-  if (orderLines.some((line) => line.product?.type === 'KIT')) return { status: 'NOT_COMPARABLE', reason: 'the order holds a kit line (the warehouse and IMS list kits in different terms)' }
+  try {
+    if (orderLines.some((line) => lineExpandsBeyondItself(line))) return { status: 'NOT_COMPARABLE', reason: 'the order holds a kit line (the warehouse and IMS list kits in different terms)' }
+  } catch (error) {
+    if (error instanceof FulfillmentRequirementSnapshotError) return { status: 'NOT_COMPARABLE', reason: 'a line\'s pinned fulfilment recipe cannot be read, so the units cannot be compared' }
+    throw error
+  }
 
   const skusByProduct = new Map<string, Set<string>>()
   const add = (productId: string | null | undefined, sku: string | null | undefined) => {
@@ -119,6 +171,14 @@ export async function findDespatchQuantityMismatch(input: CheckInput, client: Pi
   }
   const ims = [...qtyByProduct].map(([productId, qty]) => ({ productId, skus: [...(skusByProduct.get(productId) ?? [])], qty: qty.toNumber() }))
 
-  const mismatches = compareDespatchQuantities(wms, ims)
+  // Lines IMS can never book. Excluded by SKU (the line's own, and the product's), so a service line the warehouse lists is not a standing mismatch.
+  const ignoreSkus = new Set<string>()
+  for (const line of orderLines) {
+    if (line.product?.type === 'NON_INVENTORY' || line.product?.type === 'VARIABLE') {
+      const key = normaliseSku(line.sku)
+      if (key) ignoreSkus.add(key)
+    }
+  }
+  const mismatches = compareDespatchQuantities(wms, ims, { ignoreSkus })
   return mismatches.length === 0 ? { status: 'MATCH' } : { status: 'MISMATCH', mismatches }
 }

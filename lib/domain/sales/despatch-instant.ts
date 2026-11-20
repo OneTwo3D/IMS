@@ -1,4 +1,5 @@
 import { startOfNextBusinessDay } from '@/lib/domain/inventory/inventory-snapshot'
+import { INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY } from '@/lib/db/advisory-locks'
 
 /**
  * THE INSTANT A WAREHOUSE DESPATCH IS BOOKED AT.
@@ -22,6 +23,12 @@ import { startOfNextBusinessDay } from '@/lib/domain/inventory/inventory-snapsho
  *   LOCKED_PERIOD     on or before the Xero books lock date: the first instant after the lock (the daily batch does the same for a journal).
  *   SNAPSHOTTED_DAY   inside a business day whose inventory snapshot has already been taken: the first instant after that snapshot, so a
  *                     stored snapshot (and the replay anchored on it) is never made stale by a late movement.
+ *                     The floor is read UNDER the inventory snapshot floor lock (shared), which the daily snapshot holds exclusive from its state read to
+ *                     its run row: a despatch is wholly before the snapshot's read or reads the new floor (see lib/db/advisory-locks.ts).
+ *   BEFORE_RECEIPT    before the receipt of a FIFO layer the despatch consumes: COGS must never be dated before the stock it consumes arrived (and a
+ *                     negative-stock replay must not see the sale before the receipt): the latest receipt among the layers FIFO will take.
+ *   LOCK_UNKNOWN      the stored accounting lock date is unreadable or was last read more than DESPATCH_LOCK_DATE_MAX_AGE_HOURS ago: not backdated at all
+ *                     (booked at the apply instant), because a backdate into a period locked since could not be moved out of it.
  *   BEFORE_ALLOCATION before the stock was allocated to the shipment (Group B would be dated before Group A2: Allocated Inventory
  *                     would go negative at a period end): the allocation instant.
  *   BEFORE_ORDER      before the order existed in IMS: the order's creation instant.
@@ -35,6 +42,9 @@ export const DESPATCH_BACKDATE_MAX_DAYS = 31
 /** How far ahead of our own clock a warehouse timestamp may be before it counts as FUTURE (clock skew between systems). */
 export const DESPATCH_FUTURE_TOLERANCE_MS = 5 * 60_000
 
+/** A stored accounting lock date older than this is not trusted to bound a backdate (the daily batch refreshes it before every post). */
+export const DESPATCH_LOCK_DATE_MAX_AGE_HOURS = 24
+
 export type DespatchInstantAdjustment =
   | 'FUTURE'
   | 'TOO_OLD'
@@ -42,6 +52,8 @@ export type DespatchInstantAdjustment =
   | 'SNAPSHOTTED_DAY'
   | 'BEFORE_ALLOCATION'
   | 'BEFORE_ORDER'
+  | 'BEFORE_RECEIPT'
+  | 'LOCK_UNKNOWN'
 
 export type DespatchInstantFloors = {
   /** The first instant after the Xero books lock date, or null when no lock is known. */
@@ -52,6 +64,10 @@ export type DespatchInstantFloors = {
   allocatedAt?: Date | null
   /** When the order was created in IMS, or null when unknown. */
   orderCreatedAt?: Date | null
+  /** The latest receipt instant among the FIFO layers the despatch will consume, or null when unknown. */
+  afterLayerReceipt?: Date | null
+  /** True when the stored accounting lock date cannot be trusted (unparseable, or last read too long ago): the despatch is not backdated. */
+  lockUnknown?: boolean
 }
 
 export type DespatchInstantResolution = {
@@ -82,10 +98,15 @@ export function resolveDespatchInstant(input: {
   }
 
   const floors = input.floors ?? {}
+  if (floors.lockUnknown) {
+    // Not backdated at all: a period may have been locked since the stored date was read, and a journal dated inside it could not be moved out of it.
+    return { instant: now, requested, adjustedFor: 'LOCK_UNKNOWN' }
+  }
   const candidates: Array<[DespatchInstantAdjustment, Date | null | undefined]> = [
     ['BEFORE_ORDER', floors.orderCreatedAt],
     ['BEFORE_ALLOCATION', floors.allocatedAt],
     ['SNAPSHOTTED_DAY', floors.afterSnapshot],
+    ['BEFORE_RECEIPT', floors.afterLayerReceipt],
     ['LOCKED_PERIOD', floors.afterLock],
   ]
   let instant = requested
@@ -110,8 +131,31 @@ export function instantAfterLockDay(lockDay: string | null | undefined): Date | 
   return startOfNextBusinessDay(label)
 }
 
+export type LockDateReading = { afterLock: Date | null; lockUnknown: boolean }
+
+/**
+ * What the STORED accounting lock date says, with the freshness rule made explicit.
+ *   - No value stored and no read ever recorded: there is no accounting connector reading a lock, so there is NO lock (stated, not an accident of a falsy check).
+ *   - A value that does not parse, or a read older than DESPATCH_LOCK_DATE_MAX_AGE_HOURS (or a value with no read time): UNKNOWN, so the despatch is not backdated.
+ *   - An EMPTY value with a fresh read: the accounting system reported no lock.
+ *   - A parseable value with a fresh read: the lock.
+ */
+export function readStoredLockDate(input: { value: string | null | undefined; readAt: string | null | undefined; now: Date }): LockDateReading {
+  const value = (input.value ?? '').trim()
+  const readAtRaw = (input.readAt ?? '').trim()
+  if (value === '' && readAtRaw === '') return { afterLock: null, lockUnknown: false }
+  const readAt = readAtRaw === '' ? null : new Date(readAtRaw)
+  const fresh = readAt !== null && !Number.isNaN(readAt.getTime()) && input.now.getTime() - readAt.getTime() <= DESPATCH_LOCK_DATE_MAX_AGE_HOURS * 3_600_000
+  if (!fresh) return { afterLock: null, lockUnknown: true }
+  if (value === '') return { afterLock: null, lockUnknown: false }
+  const afterLock = instantAfterLockDay(value)
+  return afterLock === null ? { afterLock: null, lockUnknown: true } : { afterLock, lockUnknown: false }
+}
+
 type FloorClient = {
-  setting: { findUnique(args: { where: { key: string }; select: { value: true } }): Promise<{ value: string } | null> }
+  $executeRaw(strings: TemplateStringsArray, ...values: unknown[]): Promise<unknown>
+  $queryRaw<T>(strings: TemplateStringsArray, ...values: unknown[]): Promise<T>
+  setting: { findMany(args: { where: { key: { in: string[] } }; select: { key: true; value: true } }): Promise<Array<{ key: string; value: string }>> }
   inventorySnapshotRun: {
     findFirst(args: { orderBy: { snapshotDate: 'desc' }; select: { snapshotDate: true; cutoffAt: true } }): Promise<{ snapshotDate: Date; cutoffAt: Date | null } | null>
   }
@@ -121,26 +165,70 @@ type FloorClient = {
   salesOrder: { findUnique(args: { where: { id: string }; select: { createdAt: true } }): Promise<{ createdAt: Date } | null> }
 }
 
-/** The floors for one order, read on the dispatch transaction's own client (under the order lock). Read-only; no network. */
+/**
+ * TAKE THE INVENTORY SNAPSHOT FLOOR LOCK (SHARED), to the end of the caller's transaction. Taken BEFORE the snapshot floor is read, so the floor read here
+ * is the floor the daily snapshot has committed, or the snapshot waits for this transaction to commit before it reads its state.
+ */
+export async function lockInventorySnapshotFloorShared(client: unknown): Promise<void> {
+  await (client as FloorClient).$executeRaw`SELECT pg_advisory_xact_lock_shared(${INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY})`
+}
+
+type LayerNeed = { productId: string; warehouseId: string; qty: number }
+
+/** The latest receipt among the FIFO layers that cover each need (oldest first, as consumeFifoLayers takes them). Read-only; run after the stock levels are locked. */
+async function latestConsumedLayerReceipt(tx: FloorClient, needs: ReadonlyArray<LayerNeed>): Promise<Date | null> {
+  const byKey = new Map<string, LayerNeed>()
+  for (const need of needs) {
+    if (!(need.qty > 0)) continue
+    const key = `${need.productId}:${need.warehouseId}`
+    const current = byKey.get(key)
+    byKey.set(key, { ...need, qty: (current?.qty ?? 0) + need.qty })
+  }
+  let latest: Date | null = null
+  for (const need of byKey.values()) {
+    const layers = await tx.$queryRaw<Array<{ remainingQty: unknown; receivedAt: Date }>>`
+      SELECT "remainingQty", "receivedAt" FROM "cost_layers"
+       WHERE "productId" = ${need.productId} AND "warehouseId" = ${need.warehouseId} AND "remainingQty" > 0
+       ORDER BY "receivedAt" ASC, id ASC`
+    let remaining = need.qty
+    for (const layer of layers) {
+      if (remaining <= 0) break
+      remaining -= Number(layer.remainingQty)
+      if (latest === null || layer.receivedAt.getTime() > latest.getTime()) latest = layer.receivedAt
+    }
+  }
+  return latest
+}
+
+/**
+ * The floors for one order, read on the dispatch transaction's own client (under the order lock). Read-only; no network. Takes the inventory snapshot floor
+ * lock (shared) FIRST: call it only when a backdate was requested, and only inside the dispatch transaction.
+ */
 export async function loadDespatchInstantFloors(
   client: unknown,
-  input: { orderId: string; lineIds: string[] },
+  input: { orderId: string; lineIds: string[]; layerNeeds?: ReadonlyArray<LayerNeed>; now?: Date },
 ): Promise<DespatchInstantFloors> {
   const tx = client as FloorClient
-  const [lock, run, allocation, order] = await Promise.all([
-    tx.setting.findUnique({ where: { key: 'xero_books_lock_date' }, select: { value: true } }),
+  await lockInventorySnapshotFloorShared(tx)
+  const [settings, run, allocation, order, layerReceipt] = await Promise.all([
+    tx.setting.findMany({ where: { key: { in: ['xero_books_lock_date', 'xero_books_lock_date_read_at'] } }, select: { key: true, value: true } }),
     tx.inventorySnapshotRun.findFirst({ orderBy: { snapshotDate: 'desc' }, select: { snapshotDate: true, cutoffAt: true } }),
     tx.orderAllocation.aggregate({
       where: { orderId: input.orderId, ...(input.lineIds.length > 0 ? { lineId: { in: input.lineIds } } : {}) },
       _max: { createdAt: true },
     }),
     tx.salesOrder.findUnique({ where: { id: input.orderId }, select: { createdAt: true } }),
+    input.layerNeeds && input.layerNeeds.length > 0 ? latestConsumedLayerReceipt(tx, input.layerNeeds) : Promise.resolve(null),
   ])
+  const stored = new Map(settings.map((row) => [row.key, row.value]))
+  const lock = readStoredLockDate({ value: stored.get('xero_books_lock_date'), readAt: stored.get('xero_books_lock_date_read_at'), now: input.now ?? new Date() })
   return {
-    afterLock: instantAfterLockDay(lock?.value),
+    afterLock: lock.afterLock,
+    lockUnknown: lock.lockUnknown,
     afterSnapshot: run ? (run.cutoffAt ?? startOfNextBusinessDay(run.snapshotDate)) : null,
     allocatedAt: allocation._max.createdAt ?? null,
     orderCreatedAt: order?.createdAt ?? null,
+    afterLayerReceipt: layerReceipt,
   }
 }
 
@@ -153,6 +241,8 @@ export function describeDespatchAdjustment(resolution: DespatchInstantResolution
     SNAPSHOTTED_DAY: 'its day already has an inventory snapshot',
     BEFORE_ALLOCATION: 'it is earlier than the stock allocation behind the shipment',
     BEFORE_ORDER: 'it is earlier than the order itself',
+    BEFORE_RECEIPT: 'it is earlier than the receipt of the stock it consumed',
+    LOCK_UNKNOWN: 'the accounting system\'s locked period could not be confirmed recently, so it was not backdated',
   }
   return `The warehouse reported this despatch at ${resolution.requested.toISOString()}, but it was booked at ${resolution.instant.toISOString()} because ${reason[resolution.adjustedFor]}.`
 }

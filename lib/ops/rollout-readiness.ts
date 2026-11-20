@@ -14,6 +14,7 @@ import {
   type PreflightResult,
   type PreflightStatus,
 } from '@/lib/ops/production-preflight'
+import { getWmsDespatchDateStatus, type WmsDespatchDateStatus } from '@/lib/domain/wms/despatch-flags'
 import {
   evaluateReconciliationProof,
   mergeTiedNewestRuns,
@@ -133,6 +134,11 @@ export type RolloutReadinessAdapters = {
    * cover the run the first read called newest, which then reads as proven-incomplete with nothing to say why.
    */
   accountingReconciliationSnapshot: () => Promise<AccountingReconciliationSnapshot>
+  /**
+   * The warehouse despatch-date switch and the daily inventory snapshot cron it depends on. Optional: absent, nothing is judged. Switched on while the cron
+   * is off, the switch does not take effect (see lib/domain/wms/despatch-flags.ts), and the report says so.
+   */
+  despatchDateStatus?: () => Promise<WmsDespatchDateStatus>
 }
 
 export type CollectRolloutReadinessOptions = {
@@ -153,7 +159,20 @@ export function createDefaultRolloutReadinessAdapters(): RolloutReadinessAdapter
     runPreflight: () => runProductionPreflight(),
     collectAdminHealth: () => collectAdminHealth(),
     accountingReconciliationSnapshot: () => getAccountingReconciliationSnapshot(),
+    despatchDateStatus: () => getWmsDespatchDateStatus(),
   }
+}
+
+/** A warning when `wms_despatch_date_enabled` is on but the daily inventory snapshot cron is off: the switch is then ignored. Exported for its test. */
+export function classifyDespatchDatePrerequisite(status: WmsDespatchDateStatus | null): RolloutReadinessFinding[] {
+  if (!status || !status.switchOn || status.snapshotCronEnabled) return []
+  return [{
+    id: 'wms-despatch-date:snapshot-cron-disabled',
+    severity: 'warning',
+    source: 'wms-despatch-date',
+    message: 'wms_despatch_date_enabled is on but the daily inventory snapshot job is disabled, so the switch has NO EFFECT: warehouse despatches are dated at the moment IMS applies them. Enable the Inventory Snapshot scheduled job (its run rows bound how far a despatch may be backdated), or turn the switch off.',
+    details: { switchOn: status.switchOn, snapshotCronEnabled: status.snapshotCronEnabled },
+  }]
 }
 
 export async function collectCachedRolloutReadiness(
@@ -192,10 +211,11 @@ export async function collectRolloutReadiness(
   const timeoutMs = options.timeoutMs ?? DEFAULT_READINESS_TIMEOUT_MS
   const cacheTtlMs = options.cacheTtlMs ?? DEFAULT_READINESS_CACHE_TTL_MS
   const staleAfter = new Date(now.getTime() + cacheTtlMs).toISOString()
-  const [preflightResult, adminHealthResult, reconciliation] = await Promise.all([
+  const [preflightResult, adminHealthResult, reconciliation, despatchDateResult] = await Promise.all([
     settleReadinessAdapter('production-preflight', adapters.runPreflight(), timeoutMs),
     settleReadinessAdapter('admin-health', adapters.collectAdminHealth(), timeoutMs),
     collectAccountingReconciliationReadiness(adapters, now, timeoutMs),
+    adapters.despatchDateStatus ? settleReadinessAdapter('wms-despatch-date', adapters.despatchDateStatus(), timeoutMs) : Promise.resolve(null),
   ])
 
   const blockers: RolloutReadinessFinding[] = []
@@ -211,6 +231,10 @@ export async function collectRolloutReadiness(
   classifyAdminHealth(adminHealth, blockers, warnings)
   blockers.push(...reconciliation.blockers)
   warnings.push(...reconciliation.warnings)
+  if (despatchDateResult) {
+    if (despatchDateResult.ok) warnings.push(...classifyDespatchDatePrerequisite(despatchDateResult.value))
+    else warnings.push({ id: 'wms-despatch-date:unreadable', severity: 'warning', source: 'wms-despatch-date', message: 'The despatch-date switch and the inventory snapshot job could not be read, so their prerequisite was not checked.' })
+  }
   const latestAccountingReconciliationRun = reconciliation.latest
   const accountingReconciliationProof = reconciliation.proof
 

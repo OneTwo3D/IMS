@@ -1,5 +1,6 @@
 import { Prisma, type PrismaClient, type StockMovementType } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
+import { INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY } from '@/lib/db/advisory-locks'
 import { businessDateYmd } from '@/lib/business-date'
 import {
   loadReservationSourceRows,
@@ -977,12 +978,35 @@ async function writeInventorySnapshotRun(
   } as never)
 }
 
+/** The whole daily snapshot runs in one transaction (state read to run row), so it may be long on a large estate. */
+const DAILY_SNAPSHOT_TRANSACTION_TIMEOUT_MS = 10 * 60_000
+
+/**
+ * THE DAILY SNAPSHOT HOLDS THE INVENTORY SNAPSHOT FLOOR LOCK (EXCLUSIVE) FROM BEFORE ITS STATE READ TO THE COMMIT OF ITS RUN ROW.
+ *
+ * A warehouse despatch backdated into a business day is floored by the latest `inventory_snapshot_runs` row (lib/domain/sales/despatch-instant.ts) and holds the
+ * same lock SHARED while it reads that floor and commits its movement. So a despatch either commits BEFORE the snapshot reads its state (the snapshot waits for it
+ * and includes it) or reads the floor AFTER the run row exists (and is moved past the snapshot's cutoff). Without this lock a 23:50 despatch committed between
+ * the state read and the run row was missing from the snapshot and dated inside its day: every replay anchored on that snapshot overstated stock for ever.
+ *
+ * With an injected client (tests) the caller owns the transaction, as before.
+ */
 export async function writeDailyInventorySnapshot(options: {
   client?: SnapshotClient
   snapshotDate?: SnapshotDateInput
   tolerance?: Decimal
 } = {}): Promise<InventorySnapshotWriteResult> {
-  const client: SnapshotClient = options.client ?? db as SnapshotClient
+  if (options.client) return writeDailyInventorySnapshotOn(options.client, options)
+  return db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY})`
+    return writeDailyInventorySnapshotOn(tx as unknown as SnapshotClient, options)
+  }, { timeout: DAILY_SNAPSHOT_TRANSACTION_TIMEOUT_MS, maxWait: 60_000 })
+}
+
+async function writeDailyInventorySnapshotOn(client: SnapshotClient, options: {
+  snapshotDate?: SnapshotDateInput
+  tolerance?: Decimal
+}): Promise<InventorySnapshotWriteResult> {
   const snapshotDate = parseSnapshotDate(options.snapshotDate)
   const { state, costLayerQtyByKey } = await loadAggregatedCurrentSnapshotState(client)
   const reservationSnapshot = await loadCurrentReservationSnapshotRows(client, snapshotDate)

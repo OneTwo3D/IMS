@@ -181,6 +181,17 @@ export const WOO_TAX_RATE_WRITE_LOCK_KEY = 918_274_501
 export const INVARIANT_WARNING_BASELINE_LOCK_KEY = 918_274_601
 
 /**
+ * INVENTORY SNAPSHOT FLOOR domain (a warehouse despatch backdated against the daily inventory snapshot).
+ *
+ * A backdated despatch is bounded by the latest `inventory_snapshot_runs` row, so a stored snapshot is never made stale by a late movement. The snapshot writer
+ * reads the current state first and writes its run row afterwards, so without a lock a despatch committed in between is missing from the snapshot, dated inside
+ * its day, and never replayed. The writer therefore holds this lock EXCLUSIVE from before its state read to the commit of its run row, and a backdated despatch
+ * holds it SHARED from before it reads the floor to the commit of its movement: a despatch is wholly before the snapshot's read (the snapshot waits for it)
+ * or wholly after the run row (the despatch reads the new floor). Despatches share it with each other and never wait on one another.
+ */
+export const INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY = 918_274_701
+
+/**
  * Every single-bigint domain above, for the uniqueness test. A new lock MUST be
  * declared here — the test fails on any module that writes its own key literal.
  */
@@ -196,6 +207,7 @@ export const SINGLE_KEY_ADVISORY_LOCKS = {
   FX_TABLE_LOCK_KEY,
   WOO_TAX_RATE_WRITE_LOCK_KEY,
   INVARIANT_WARNING_BASELINE_LOCK_KEY,
+  INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY,
 } as const
 
 /**

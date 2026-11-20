@@ -18,7 +18,7 @@ import { isWmsConnectorId, resolveWmsOrderLookupConnector } from '@/lib/connecto
 import { isMixedWarehousePushEnabled } from '@/lib/domain/wms/mixed-scope-flag'
 import { loadMixedScopeForOrder } from '@/lib/domain/wms/mixed-scope-loader'
 import { sameScopeLines, warehouseShipmentsMatchAllocations } from '@/lib/domain/wms/scoped-despatch-checks'
-import { describeDespatchQuantityMismatch, findDespatchQuantityMismatch, type DespatchQuantity, type DespatchQuantityMismatch } from '@/lib/fulfillment/despatch-quantity-check'
+import { describeDespatchQuantityExit, describeDespatchQuantityMismatch, despatchQuantityMismatchKey, findDespatchQuantityMismatch, type DespatchQuantity, type DespatchQuantityMismatch } from '@/lib/fulfillment/despatch-quantity-check'
 
 // A fulfillment update originates from either a storefront (shopping) connector
 // that owns the order's ShoppingOrderLink, or a WMS/3PL connector that
@@ -721,9 +721,38 @@ async function refuseOnDespatchQuantityMismatch(
   if (update.targetShipmentStatus !== 'SHIPPED' || !isWmsConnectorId(update.source) || update.despatchedQuantities === undefined) return null
   const verdict = await findDespatchQuantityMismatch({ orderId, wmsWarehouseId, wmsQuantities: update.despatchedQuantities })
   if (verdict.status !== 'MISMATCH') return null
-  const detail = describeDespatchQuantityMismatch(verdict.mismatches)
-  const error = `${update.source} despatched order ${orderRef}, but the units differ from what IMS books (${detail}). Nothing was shipped, because applying it would leave stock on hand wrong. `
-    + 'To clear this, correct the order\'s allocation and shipment in IMS to the units that really left (or ship the shipment by hand once it is right); the despatch is retried on every pass.'
+  const error = quantityMismatchMessage(update.source, orderRef, verdict.mismatches)
+  await logQuantityMismatchIfChanged(update.source, orderId, error, verdict.mismatches)
+  return quantityMismatchOutcome(error, verdict.mismatches)
+}
+
+/** The refusal text: what differs, why nothing was shipped, and (per direction) what an operator does about it. */
+function quantityMismatchMessage(source: string, orderRef: string, mismatches: DespatchQuantityMismatch[]): string {
+  return `${source} despatched order ${orderRef}, but the units differ from what IMS books (${describeDespatchQuantityMismatch(mismatches)}). Nothing was shipped, because applying it would leave stock on hand wrong. `
+    + `${describeDespatchQuantityExit(mismatches)} The despatch is retried on every pass.`
+}
+
+function quantityMismatchOutcome(error: string, mismatches: DespatchQuantityMismatch[]): ExternalFulfillmentOutcome {
+  return { ...(refuseExternalFulfillment('despatch_quantity_mismatch', error) as Extract<ExternalFulfillmentOutcome, { success: false }>), quantityMismatches: mismatches }
+}
+
+/**
+ * ONE WARNING PER CHANGE, NOT ONE PER PASS. A held order is retried on every pass (about 96 a day), and each pass used to log the same WARNING. It is logged
+ * when the standing refusal is first seen or its mismatches change; an unchanged standing row (the sweep records one per refusal) means it was logged already.
+ * A failed read of the row logs (noise beats silence).
+ */
+async function logQuantityMismatchIfChanged(source: string, orderId: string, error: string, mismatches: DespatchQuantityMismatch[]): Promise<void> {
+  let standingRowUnreadable = false
+  try {
+    const standing = await db.refusedAction.findFirst({
+      where: { entityType: 'SALES_ORDER', entityId: orderId, action: 'WMS_DESPATCH_QUANTITY', resolvedAt: null },
+      select: { intent: true },
+    })
+    const stored = (standing?.intent as { mismatches?: Array<{ sku?: unknown; wmsQty?: unknown; imsQty?: unknown }> } | null)?.mismatches
+    if (Array.isArray(stored) && despatchQuantityMismatchKey(stored.map((entry) => ({ sku: String(entry.sku), wmsQty: Number(entry.wmsQty), imsQty: Number(entry.imsQty) }))) === despatchQuantityMismatchKey(mismatches)) return
+  } catch {
+    standingRowUnreadable = true
+  }
   await logActivity({
     entityType: 'SALES_ORDER',
     entityId: orderId,
@@ -731,10 +760,50 @@ async function refuseOnDespatchQuantityMismatch(
     tag: 'sync',
     level: 'WARNING',
     description: error,
-    metadata: { source: update.source, mismatches: verdict.mismatches },
+    metadata: { source, mismatches, ...(standingRowUnreadable ? { standingRowUnreadable: true } : {}) },
     resolveUser: false,
   })
-  return { ...(refuseExternalFulfillment('despatch_quantity_mismatch', error) as Extract<ExternalFulfillmentOutcome, { success: false }>), quantityMismatches: verdict.mismatches }
+}
+
+/**
+ * THE SAME CHECK, READ-ONLY, FOR THE SWEEP: before it pushes any partial shipment of a split order, it asks whether the despatch will be held. Logs nothing,
+ * changes nothing. Null: not held (no mismatch, or not comparable).
+ */
+export async function previewDespatchQuantityMismatch(
+  source: string,
+  orderId: string,
+  quantities: ReadonlyArray<DespatchQuantity>,
+): Promise<{ error: string; mismatches: DespatchQuantityMismatch[] } | null> {
+  if (!isWmsConnectorId(source)) return null
+  const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { externalOrderNumber: true, orderNumber: true } })
+  const verdict = await findDespatchQuantityMismatch({ orderId, wmsWarehouseId: await wmsDespatchWarehouseId(orderId), wmsQuantities: quantities })
+  if (verdict.status !== 'MISMATCH') return null
+  return { error: quantityMismatchMessage(source, order?.externalOrderNumber ?? order?.orderNumber ?? orderId, verdict.mismatches), mismatches: verdict.mismatches }
+}
+
+/**
+ * THE CHECK UNDER THE ORDER LOCK. Handed to the dispatch transaction as (part of) its fence, so the comparison is made on the shipment rows the transaction
+ * itself will ship (an operator edit between the pre-check and the shipping is seen) and BEFORE any stock movement is written. `captured` receives the
+ * mismatches so the caller can turn the refusal back into `despatch_quantity_mismatch`.
+ */
+const QUANTITY_FENCE_MARK = 'DESPATCH_QUANTITY_MISMATCH:'
+function withQuantityFence(
+  update: ExternalFulfillmentUpdate,
+  orderId: string,
+  wmsWarehouseId: string | null,
+  captured: { mismatches: DespatchQuantityMismatch[] | null },
+): ((tx: ShipmentServiceClient) => Promise<string | null>) | undefined {
+  const inherited = update.storefrontAlreadyCompleted === true ? update.shipFence : undefined
+  if (update.targetShipmentStatus !== 'SHIPPED' || !isWmsConnectorId(update.source) || update.despatchedQuantities === undefined) return inherited
+  const quantities = update.despatchedQuantities
+  return async (tx) => {
+    const verdict = await findDespatchQuantityMismatch({ orderId, wmsWarehouseId, wmsQuantities: quantities }, tx as unknown as Pick<typeof db, 'shipment' | 'salesOrderLine'>)
+    if (verdict.status === 'MISMATCH') {
+      captured.mismatches = verdict.mismatches
+      return `${QUANTITY_FENCE_MARK}${describeDespatchQuantityMismatch(verdict.mismatches)}`
+    }
+    return inherited ? inherited(tx) : null
+  }
 }
 
 /** The warehouse a WMS despatch is evidence about: the one the warehouse order was pushed for, else the order's ship-from warehouse; null when neither is known. */
@@ -1058,6 +1127,13 @@ export async function applyExternalFulfillmentUpdate(
     if (refusedEarly) return refusedEarly
   }
 
+  // The units are compared BEFORE any side effect too (auto-allocation, shipment creation): a standing mismatch is retried on every pass, and a retry must
+  // change nothing. With no shipment yet there is nothing to compare (not comparable), and the later check runs once the shipments exist.
+  if (update.targetShipmentStatus === 'SHIPPED' && update.despatchedQuantities !== undefined && isWmsConnectorId(update.source) && !orderNotReady) {
+    const refusedBeforeSideEffects = await refuseOnDespatchQuantityMismatch(update, order.id, orderRef, await wmsDespatchWarehouseId(order.id))
+    if (refusedBeforeSideEffects) return refusedBeforeSideEffects
+  }
+
   const allocationCount = await db.orderAllocation.count({ where: { orderId: order.id } })
   if (allocationCount === 0 && !orderNotReady) {
     const result = await autoAllocateOrder(order.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
@@ -1131,6 +1207,11 @@ export async function applyExternalFulfillmentUpdate(
     select: { id: true, status: true, warehouseId: true },
     orderBy: { createdAt: 'asc' },
   })
+  // The units are compared AGAIN inside each dispatch transaction, under the order lock and before any stock movement (see withQuantityFence).
+  const quantityCaptured: { mismatches: DespatchQuantityMismatch[] | null } = { mismatches: null }
+  const quantityFence = update.targetShipmentStatus === 'SHIPPED' && update.despatchedQuantities !== undefined && isWmsConnectorId(update.source)
+    ? withQuantityFence(update, order.id, await wmsDespatchWarehouseId(order.id), quantityCaptured)
+    : (update.storefrontAlreadyCompleted === true ? update.shipFence : undefined)
 
   // o3d-hqvrp.78: re-checked here as well, because the allocation above may just have created shipments in another warehouse.
   const refusedForeign = await refuseWmsForeignWarehouseShipments(update, order.id, orderRef, shipments)
@@ -1194,12 +1275,19 @@ export async function applyExternalFulfillmentUpdate(
           // completion must never push back, as it would only echo.
           storefrontCompletion: isWmsConnectorId(update.source) && update.storefrontAlreadyCompleted !== true,
           skipStorefrontPush: update.storefrontAlreadyCompleted === true,
-          ...(update.storefrontAlreadyCompleted === true && update.shipFence ? { shipFence: update.shipFence } : {}),
+          ...(quantityFence ? { shipFence: quantityFence } : {}),
           deferStorefrontPartialEmail: true,
           ...(isWmsConnectorId(update.source) && update.despatchedAt ? { despatchedAt: update.despatchedAt } : {}),
         },
       )
 
+      if (!result.success && quantityCaptured.mismatches && result.error?.startsWith(QUANTITY_FENCE_MARK)) {
+        // Caught under the order lock, before anything moved for this shipment: the same hold as the pre-check (an operator edit landed in between).
+        discardPartialEmails()
+        const error = quantityMismatchMessage(update.source, order.externalOrderNumber ?? order.orderNumber ?? order.id, quantityCaptured.mismatches)
+        await logQuantityMismatchIfChanged(update.source, order.id, error, quantityCaptured.mismatches)
+        return quantityMismatchOutcome(error, quantityCaptured.mismatches)
+      }
       if (result.success && result.despatchedWhileNotReady) lockedNotReadyStatus = result.despatchedWhileNotReady
       if (result.success && target === 'SHIPPED') shippedInBatch.push(shipment.id)
 
