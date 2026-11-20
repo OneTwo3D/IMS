@@ -11,8 +11,8 @@ import { canAccessManufacturingAnalytics } from '@/lib/security/manufacturing-an
 import { sourceLimitCsvResponse } from '@/lib/csv-source-limit'
 
 const EXPORT_COLUMNS: Record<string, string[]> = {
-  'production-variance': ['productionOrderReference', 'status', 'warehouseCode', 'outputSku', 'outputProductName', 'componentSku', 'componentName', 'plannedQty', 'actualQty', 'varianceQty', 'variancePct', 'overConsumedQty', 'overConsumedValueBase', 'orderYieldPct', 'outcome'],
-  'wip': ['productionOrderReference', 'status', 'warehouseCode', 'outputSku', 'outputProductName', 'startedAt', 'scheduledAt', 'daysSinceStart', 'plannedOutputQty', 'producedQty', 'remainingOutputQty', 'manufacturingCostBase', 'consumedComponentValueBase', 'reservedComponentValueBase', 'expectedOutputValueBase', 'wipValueBase', 'costLineCount'],
+  'production-variance': ['productionOrderReference', 'status', 'warehouseCode', 'outputSku', 'outputProductName', 'componentSku', 'componentName', 'plannedQty', 'actualQty', 'varianceQty', 'variancePct', 'overConsumedQty', 'overConsumedValueBase', 'orderYieldPct', 'outcome', 'scheduledAt', 'scheduledDate', 'completedAt', 'completedDate'],
+  'wip': ['productionOrderReference', 'status', 'warehouseCode', 'outputSku', 'outputProductName', 'startedAt', 'startedDate', 'scheduledAt', 'scheduledDate', 'daysSinceStart', 'plannedOutputQty', 'producedQty', 'remainingOutputQty', 'manufacturingCostBase', 'consumedComponentValueBase', 'reservedComponentValueBase', 'expectedOutputValueBase', 'wipValueBase', 'costLineCount'],
 }
 
 const MANUFACTURING_ANALYTICS_CSV_ROW_LIMIT = 50000

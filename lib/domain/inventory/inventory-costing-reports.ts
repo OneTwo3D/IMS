@@ -17,6 +17,7 @@ import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { calculateInventoryTurnover, normalizeVelocityWindow } from '@/lib/domain/inventory/velocity'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly as utcDateOnly, parseDateOnly as parseUtcDateOnly, subtractUtcDays } from '@/lib/domain/math/date-window'
+import { londonPeriod } from '@/lib/domain/math/london-period'
 import { assertSourceLimit, SourceScanTooLargeError, sourceLimitNotice } from '@/lib/security/source-scan-error'
 import { getActiveAccountingConnectorInfo, syncAccountingAccountBalanceSnapshots, getAccountingSettingsFor } from '@/lib/accounting'
 import { cache } from 'react'
@@ -2002,8 +2003,8 @@ async function cogsRefundProductScope(filters: InventoryCostingFilters): Promise
 export function emptyCogsReportForSourceLimit(filters: InventoryCostingFilters, error: SourceScanTooLargeError): CogsReport {
   const zero = ExactFigure.zero()
   return {
-    dateFrom: filters.dateFrom ?? daysAgo(30),
-    dateTo: filters.dateTo ?? today(),
+    dateFrom: cogsPeriod(filters).dateFrom,
+    dateTo: cogsPeriod(filters).dateTo,
     generatedAt: new Date().toISOString(),
     groupBy: isCogsGroupBy(filters.groupBy) ? filters.groupBy : 'product',
     rows: [],
@@ -2019,10 +2020,17 @@ export function emptyCogsReportForSourceLimit(filters: InventoryCostingFilters, 
   }
 }
 
+/**
+ * The COGS period, resolved by the SAME function the Gross Margin (sales analytics) report uses, so the two agree for every input: the default is the 30 London days
+ * ending London today (not 31), a From after the To collapses to the To day, and a To-only request whose default From is later than the To collapses the same way.
+ */
+function cogsPeriod(filters: { dateFrom?: string; dateTo?: string }): { dateFrom: string; dateTo: string; from: Date; toExclusive: Date } {
+  const period = londonPeriod(filters, new Date(), 30)
+  return { dateFrom: utcDateOnly(period.fromLabel), dateTo: utcDateOnly(period.toLabel), from: period.dateFrom, toExclusive: period.dateToExclusive }
+}
+
 export async function getCogsReport(filters: InventoryCostingFilters = {}, options: ReportOptions = {}): Promise<CogsReport> {
-  const dateFrom = filters.dateFrom ?? daysAgo(30)
-  const dateTo = filters.dateTo ?? today()
-  const { from, toExclusive } = businessWindow(dateFrom, dateTo, daysAgo(30), today())
+  const { dateFrom, dateTo, from, toExclusive } = cogsPeriod(filters)
   // The CREDIT window is the SAME London-day window as the cost/revenue window above (o3d-bo89l): it is the expression the Gross Margin report loads
   // (refundLinesRaisedInPeriodWhere over the sales-analytics London period), so the two agree on the credit they subtract
   // (tests/analytics/cogs-report-refund-basis.test.ts) and a refund raised in the boundary hour is netted against the revenue booked in the same period.

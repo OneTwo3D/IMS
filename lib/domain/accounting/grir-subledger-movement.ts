@@ -1,3 +1,4 @@
+import { businessDateYmd } from '@/lib/business-date'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { goodsUnitCostAfterHeaderDiscount, headerDiscountFactorForPo } from '@/lib/domain/purchasing/landed-cost-allocation'
@@ -40,9 +41,13 @@ export type GrirSourceType = GrirBalanceSourceType | typeof GRIR_PRICE_VARIANCE_
 
 export type GrirClient = Pick<Prisma.TransactionClient, 'grirSubledgerMovement' | 'purchaseOrder' | 'purchaseOrderLine' | 'purchaseInvoiceLine'>
 
-/** UTC date-only midnight, as the transit sub-ledger normalises its journal date (the reclass window is a date window). */
+/**
+ * The journal date as a date-only UTC midnight (the reclass window is a date window). A date-only string keeps its own day; an INSTANT is stamped with its LONDON
+ * business day, the day the ledger documents and the report windows use: a receipt at 23:30Z on 31 July is 1 August in London and must not be inside the 31 July balance.
+ * (A bill's date, stored as a day's UTC midnight, is the same London day in GMT and BST.)
+ */
 export function grirJournalDate(value: Date | string): Date {
-  const isoDay = (typeof value === 'string' ? value : value.toISOString()).slice(0, 10)
+  const isoDay = typeof value === 'string' ? value.slice(0, 10) : businessDateYmd(value)
   return new Date(`${isoDay}T00:00:00.000Z`)
 }
 

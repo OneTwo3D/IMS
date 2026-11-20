@@ -16,7 +16,7 @@ const columns: Array<PurchasingAnalyticsColumn<LeadTimeReportRow>> = [
   { key: 'p50', label: 'P50 days', align: 'right', render: (row) => row.p50LeadTimeDays },
   { key: 'p95', label: 'P95 days', align: 'right', render: (row) => row.p95LeadTimeDays },
   { key: 'configured', label: 'Configured days', align: 'right', render: (row) => row.configuredLeadTimeDays || 'Unset' },
-  { key: 'latest', label: 'Latest receipt', render: (row) => row.latestReceiptAt.slice(0, 10) },
+  { key: 'latest', label: 'Latest receipt', render: (row) => row.latestReceiptDate },
 ]
 
 export default async function LeadTimeAnalyticsPage({ searchParams }: Props) {

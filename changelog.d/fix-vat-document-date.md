@@ -1,0 +1,9 @@
+### VAT report follows the Xero document date and nets credit notes; London-day fixes (finance)
+
+- **Fixed: the VAT report places each sales invoice by the date Xero holds, not by the time it was posted.** The Xero invoice Date is the London day the WooCommerce order was created; the report used the instant the invoice was posted, so an invoice posted after London midnight on a quarter-end landed in the next quarter. Both now use one shared definition (`lib/domain/accounting/document-date.ts`); purchase bills were already placed by the bill date sent to Xero. This corrects the wording of the previous change, which said the report matched Xero: it agrees on dates by construction, not figure-for-figure (see `help-docs/analytics.md`).
+- **Added: sales credit notes and supplier credit notes are in the VAT report,** dated by the credit note date sent to Xero and netted off their side, so a period with refunds can be compared with the Xero VAT return. Supplier credit notes not tied to a bill are left out and counted in a notice.
+- **Documented: archived orders** are included in the VAT report (their invoices stand in Xero); the reconciliation pack's VAT reader excludes them.
+- **Fixed: the COGS Report period matches Gross Margin** on a From after the To, a To-only request and the default length (30 days, not 31).
+- **Fixed: the GR/IR sub-ledger stamps the London day** of a receipt or movement instead of the UTC day, so a receipt at 23:30Z on 31 July is no longer in the 31 July balance.
+- **Added: London date columns** beside the UTC instants in the FX Gain/Loss (`paidDate`), Lead Times (`latestReceiptDate`), Production Variance and WIP (`scheduledDate`, `completedDate`, `startedDate`) exports; the FX Gain/Loss and Lead Times pages show the London day.
+- **Fixed: the EU VAT shadow CLI help** says its `--from/--to` are London dates.

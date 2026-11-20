@@ -1,3 +1,4 @@
+import { businessDateYmd } from '@/lib/business-date'
 import { Prisma, SalesOrderStatus } from '@/app/generated/prisma/client'
 import { computeRealisedFx, describeFxRefusal, settlementAsOfFromStored, type FxSettlementSide } from '@/lib/accounting-fx'
 import { getAccountingSettings } from '@/lib/accounting'
@@ -12,6 +13,7 @@ import { londonPeriod, type LondonPeriod } from '@/lib/domain/math/london-period
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { REFUND_TURNOVER_SELECT, type TurnoverRefund } from '@/lib/domain/sales/customer-turnover'
 import { receivableBalance } from '@/lib/domain/sales/receivable-balance'
+import { salesInvoiceDocumentDateWhere } from '@/lib/domain/accounting/document-date'
 import { invoicedInPeriodWhere, invoicedPeriodDate, invoicedPeriodDateIsApproximate } from '@/lib/domain/sales/invoiced-revenue-basis'
 import { SourceScanTooLargeError, assertSourceLimit, sourceLimitNotice } from '@/lib/security/source-scan-error'
 
@@ -36,6 +38,9 @@ export type FinanceAnalyticsClient = {
   /** The GR/IR report's sources (a real client always has them). */
   grirSubledgerMovement?: FindManyDelegate & { groupBy(args: unknown): Promise<unknown[]> }
   purchaseOrder?: FindManyDelegate
+  /** The VAT report's credit-note sources (a real client always has them; a stand-in without them reads no credit notes). */
+  salesOrderRefundLine?: FindManyDelegate
+  supplierCreditNote?: FindManyDelegate
 }
 
 export type FinanceAnalyticsDeps = {
@@ -185,6 +190,8 @@ export type FxGainLossReportRow = {
   partyName: string
   currency: string
   paidAt: string
+  /** The London business day of `paidAt` (YYYY-MM-DD): the day the Xero payment and the period filter use. */
+  paidDate: string
   amountForeign: string
   bookedRateToBase: string
   settlementRateToBase: string
@@ -230,6 +237,23 @@ type SalesOrderLineTaxRow = {
     countryCode: string | null
     reportingCategory: string | null
   } | null
+}
+
+type RefundLineTaxRow = {
+  totalBase: DecimalInput
+  postedTaxRate: DecimalInput | null
+  refund: { order: { shippingAddress: unknown } }
+  salesOrderLine: {
+    taxRateId: string | null
+    taxRate: { name: string; rate: DecimalInput; accountingTaxType: string | null; countryCode: string | null; reportingCategory: string | null } | null
+  } | null
+}
+
+type SupplierCreditTaxRow = {
+  amountBase: DecimalInput
+  purchaseInvoiceId: string | null
+  purchaseInvoice: { totalBase: DecimalInput; lines: PurchaseInvoiceTaxRow['lines'] } | null
+  po: { supplier: { country: string | null } | null }
 }
 
 type PurchaseInvoiceTaxRow = {
@@ -528,11 +552,12 @@ export async function getVatReport(
   const baseCurrency = await baseCurrencyFromDeps(options.deps)
   const window = period(filters, generatedAt)
   const reportingCategoryFilter = filters.vatReportingCategory?.trim() || undefined
-  const [salesLines, purchaseInvoices] = await Promise.all([
+  const [salesLines, purchaseInvoices, refundLines, supplierCredits] = await Promise.all([
     client.salesOrderLine.findMany({
       where: {
         order: {
-          invoicedAt: { gte: window.dateFrom, lt: window.dateToExclusive },
+          // The period is the DOCUMENT date Xero holds (the London day the order was created), not the instant the invoice was posted (see document-date.ts).
+          ...salesInvoiceDocumentDateWhere({ gte: window.dateFrom, lt: window.dateToExclusive }),
           status: { not: SalesOrderStatus.CANCELLED },
           // No `archived` condition: retention archives old orders for list display only; their invoices stand, so a
           // statutory period figure must not drop once the order is archived (see INVOICED_ORDER_WHERE).
@@ -578,9 +603,67 @@ export async function getVatReport(
       },
       take: SOURCE_ROW_LIMIT + 1,
     }) as Promise<PurchaseInvoiceTaxRow[]>,
+    // SALES CREDIT NOTES: dated by the credit note date sent to Xero (the London day of the refund hand-off, document-date.ts), and only those Xero holds.
+    (client.salesOrderRefundLine?.findMany({
+      where: {
+        refund: {
+          createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
+          accountingCreditNoteId: { not: null },
+          order: { status: { not: SalesOrderStatus.CANCELLED } },
+        },
+        ...(reportingCategoryFilter && {
+          salesOrderLine: { taxRate: { reportingCategory: { equals: reportingCategoryFilter } } },
+        }),
+      },
+      select: {
+        totalBase: true,
+        postedTaxRate: true,
+        refund: { select: { order: { select: { shippingAddress: true } } } },
+        salesOrderLine: {
+          select: {
+            taxRateId: true,
+            taxRate: { select: { name: true, rate: true, accountingTaxType: true, countryCode: true, reportingCategory: true } },
+          },
+        },
+      },
+      take: SOURCE_ROW_LIMIT + 1,
+    }) ?? Promise.resolve([])) as Promise<RefundLineTaxRow[]>,
+    // SUPPLIER CREDIT NOTES: dated by the day posted (the date sent to Xero), and only those Xero holds.
+    (client.supplierCreditNote?.findMany({
+      where: {
+        status: 'POSTED',
+        postedAt: { gte: window.dateFrom, lt: window.dateToExclusive },
+        accountingCreditNoteId: { not: null },
+      },
+      select: {
+        amountBase: true,
+        purchaseInvoiceId: true,
+        purchaseInvoice: {
+          select: {
+            totalBase: true,
+            lines: {
+              select: {
+                qtyBilled: true,
+                totalBase: true,
+                poLine: {
+                  select: {
+                    qty: true,
+                    taxRateId: true,
+                    taxBase: true,
+                    taxRate: { select: { name: true, rate: true, accountingTaxType: true, countryCode: true, reportingCategory: true } },
+                  },
+                },
+              },
+            },
+          },
+        },
+        po: { select: { supplier: { select: { country: true } } } },
+      },
+      take: SOURCE_ROW_LIMIT + 1,
+    }) ?? Promise.resolve([])) as Promise<SupplierCreditTaxRow[]>,
   ])
   const purchaseLineCount = purchaseInvoices.reduce((sum, invoice) => sum + invoice.lines.length, 0)
-  assertSourceLimit(salesLines.length + purchaseLineCount, SOURCE_ROW_LIMIT, 'VAT report source rows')
+  assertSourceLimit(salesLines.length + purchaseLineCount + refundLines.length + supplierCredits.length, SOURCE_ROW_LIMIT, 'VAT report source rows')
 
   type Accumulator = {
     side: 'sales' | 'purchases'
@@ -662,6 +745,55 @@ export async function getVatReport(
     }
   }
 
+  // CREDIT NOTES reduce the side they credit, exactly as Xero's return nets them by credit-note date.
+  for (const line of refundLines) {
+    const taxRate = line.salesOrderLine?.taxRate ?? null
+    const rate = line.postedTaxRate != null ? toDecimal(line.postedTaxRate) : toDecimal(taxRate?.rate ?? 0).div(100)
+    const net = toDecimal(line.totalBase)
+    const row = getOrCreateRow({
+      side: 'sales',
+      taxRateId: line.salesOrderLine?.taxRateId ?? null,
+      taxRateName: taxRate?.name ?? 'No tax rate',
+      accountingTaxType: taxRate?.accountingTaxType ?? null,
+      reportingCategory: taxRate?.reportingCategory ?? null,
+      jurisdiction: taxRate?.countryCode ?? countryFromShippingAddress(line.refund.order.shippingAddress),
+      ratePct: pctString(taxRate?.rate ?? 0),
+    })
+    row.lineCount += 1
+    row.taxableBase = row.taxableBase.sub(net)
+    row.taxBase = row.taxBase.sub(net.mul(rate))
+  }
+  let untiedSupplierCredits = 0
+  for (const credit of supplierCredits) {
+    const bill = credit.purchaseInvoice
+    const billTotal = bill ? toDecimal(bill.totalBase) : new Prisma.Decimal(0)
+    if (!bill || billTotal.lte(0)) {
+      untiedSupplierCredits += 1
+      continue
+    }
+    // The credit mirrors the bill's booked treatment: each bill line's net and tax, scaled by the share of the bill the credit takes.
+    const share = Prisma.Decimal.min(new Prisma.Decimal(1), toDecimal(credit.amountBase).div(billTotal))
+    for (const line of bill.lines) {
+      const taxRate = line.poLine?.taxRate ?? null
+      if (reportingCategoryFilter && taxRate?.reportingCategory !== reportingCategoryFilter) continue
+      const poLineQty = toDecimal(line.poLine?.qty)
+      const ratio = poLineQty.gt(0) ? toDecimal(line.qtyBilled).div(poLineQty) : new Prisma.Decimal(0)
+      const lineTax = line.poLine ? toDecimal(line.poLine.taxBase).mul(ratio) : new Prisma.Decimal(0)
+      const row = getOrCreateRow({
+        side: 'purchases',
+        taxRateId: line.poLine?.taxRateId ?? null,
+        taxRateName: taxRate?.name ?? 'No tax rate',
+        accountingTaxType: taxRate?.accountingTaxType ?? null,
+        reportingCategory: taxRate?.reportingCategory ?? null,
+        jurisdiction: taxRate?.countryCode ?? credit.po.supplier?.country?.trim().toUpperCase() ?? 'Unknown',
+        ratePct: pctString(taxRate?.rate ?? 0),
+      })
+      row.lineCount += 1
+      row.taxableBase = row.taxableBase.sub(toDecimal(line.totalBase).mul(share))
+      row.taxBase = row.taxBase.sub(lineTax.mul(share))
+    }
+  }
+
   const rows = [...byKey.values()].map<VatReportRow>((row) => ({
     side: row.side,
     taxRateId: row.taxRateId,
@@ -692,7 +824,10 @@ export async function getVatReport(
     purchaseTaxBase: moneyString(totals.purchaseTaxBase, baseCurrency),
     taxBase: moneyString(netTaxBase, baseCurrency),
   }, [
-    'VAT totals use SalesOrderLine.taxBase for invoiced sales and proportional PurchaseOrderLine.taxBase for purchase invoice lines in the period; taxable base subtracts tax for tax-inclusive sales orders. Cancelled sales orders are excluded; archived orders are included (archiving only hides an order from operational lists).',
+    'VAT totals use SalesOrderLine.taxBase for invoiced sales and proportional PurchaseOrderLine.taxBase for purchase invoice lines in the period; taxable base subtracts tax for tax-inclusive sales orders. Cancelled sales orders are excluded; archived orders are included (archiving only hides an order from operational lists, while the invoice stands in the ledger).',
+    'Each document is placed in the period by the date it carries in the ledger, not by the moment it was posted: a sales invoice by the London day the order was created, a purchase bill by its bill date, a sales credit note by the London day it was raised, a supplier credit note by the London day it was posted. An order with no storefront creation date falls back to the stored invoice stamp.',
+    'Sales credit notes and supplier credit notes that Xero holds are netted off their side (shown as negative amounts on the matching rate row), so a period with refunds can be compared with the Xero VAT return. A supplier credit note shares the booked tax lines of the bill it offsets in proportion to its amount; a reverse-charge credit (booked net) is approximated by that share.',
+    ...(untiedSupplierCredits > 0 ? [`${untiedSupplierCredits} supplier credit note${untiedSupplierCredits === 1 ? '' : 's'} in the period ${untiedSupplierCredits === 1 ? 'is' : 'are'} not tied to a bill, so no tax treatment is recorded for ${untiedSupplierCredits === 1 ? 'it' : 'them'}: not included. Tie it to a bill to include it.`] : []),
     'Jurisdiction uses TaxRate.countryCode when configured, otherwise the sales shipping country or supplier country.',
   ], options.paginate !== false)
 }
@@ -1342,6 +1477,7 @@ export async function getFxGainLossReport(
         partyName: payment.order.customerName ?? payment.order.customerEmail ?? 'Unknown customer',
         currency: payment.currency,
         paidAt: payment.paidAt.toISOString(),
+        paidDate: businessDateYmd(payment.paidAt),
         amountForeign: qtyString(paymentForeign),
         bookedRateToBase: qtyString(payment.order.fxRateToBase),
         settlementRateToBase: '',
@@ -1375,6 +1511,7 @@ export async function getFxGainLossReport(
       partyName: payment.order.customerName ?? payment.order.customerEmail ?? 'Unknown customer',
       currency: payment.currency,
       paidAt: payment.paidAt.toISOString(),
+      paidDate: businessDateYmd(payment.paidAt),
       amountForeign: qtyString(toDecimal(payment.amount).abs()),
       bookedRateToBase: qtyString(payment.order.fxRateToBase),
       settlementRateToBase: qtyString(settlementRate),
@@ -1402,6 +1539,7 @@ export async function getFxGainLossReport(
         partyName: invoice.po.supplier.name,
         currency: invoice.po.currency,
         paidAt: invoice.paidAt.toISOString(),
+        paidDate: businessDateYmd(invoice.paidAt),
         amountForeign: qtyString(netForeign.abs()),
         bookedRateToBase: qtyString(invoice.fxRateToBase),
         settlementRateToBase: '',
@@ -1433,6 +1571,7 @@ export async function getFxGainLossReport(
       partyName: invoice.po.supplier.name,
       currency: invoice.po.currency,
       paidAt: invoice.paidAt.toISOString(),
+      paidDate: businessDateYmd(invoice.paidAt),
       amountForeign: qtyString(netForeign.abs()),
       bookedRateToBase: qtyString(invoice.fxRateToBase),
       settlementRateToBase: qtyString(settlementRate),

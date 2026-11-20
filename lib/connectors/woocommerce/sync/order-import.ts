@@ -3,6 +3,7 @@
  */
 
 import { businessDateYmd } from '@/lib/business-date'
+import { salesInvoiceDocumentDay } from '@/lib/domain/accounting/document-date'
 import { readWcLineCustomsUnitValue } from './duty-tax-mirror'
 import { mirrorIossFromRegime } from './duty-tax-regime-mirror'
 import { heldOrderInvoiceObligation } from './held-order-invoice-obligation'
@@ -2261,7 +2262,7 @@ async function buildFreshWcSalesInvoice(p: {
     : null
   const core = {
     currency,
-    date: businessDateYmd(parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created)),
+    date: salesInvoiceDocumentDay(parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created)),
     currencyRateToBase: usableStoredFxRate(stored?.fxRateToBase)?.toNumber(),
     _postingMode: 'submitted',
     _paymentMethod: wcOrder.payment_method || undefined,
@@ -4196,7 +4197,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
       const accountingPayload: Record<string, unknown> = {
           contactName: customerName,
           contactEmail: payloadAnonymised ? undefined : (wcOrder.billing.email || undefined),
-          date: businessDateYmd(parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created)),
+          date: salesInvoiceDocumentDay(parseWcGmtInstant(wcOrder.date_created_gmt || wcOrder.date_created)),
           currency,
           // Stamp IMS's FX rate so Xero doesn't apply its own daily rate on
           // imported WC orders — keeping WC, IMS, and Xero numerically aligned.

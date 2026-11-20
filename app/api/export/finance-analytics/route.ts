@@ -20,7 +20,7 @@ const EXPORT_COLUMNS: Record<string, string[]> = {
   'ap-aging': ['partyName', 'contact', 'documentCount', 'current', 'bucket1', 'bucket2', 'bucket3', 'bucket4', 'outstandingBase', 'lastPaymentDate'],
   'currency-summary': ['currency', 'salesDocumentCount', 'salesForeign', 'salesBase', 'arOutstandingForeign', 'arOutstandingBase', 'arOutstandingBound', 'purchaseDocumentCount', 'purchasesForeign', 'purchasesBase', 'apOutstandingForeign', 'apOutstandingBase'],
   'grir': ['supplierName', 'poReference', 'poStatus', 'receivedNotBilledBase', 'receivedNotBilledQty', 'billedNotReceivedBase', 'billedNotReceivedQty', 'creditNotesBase', 'netBase', 'priceVarianceBase', 'oldestOpenDate', 'ageDays'],
-  'fx-gain-loss': ['side', 'settlementId', 'documentId', 'reference', 'partyName', 'currency', 'paidAt', 'amountForeign', 'bookedRateToBase', 'settlementRateToBase', 'bookedBase', 'settlementBase', 'gainLossBase', 'outcome', 'notComputableReason', 'controlAccount', 'fxGainLossAccount'],
+  'fx-gain-loss': ['side', 'settlementId', 'documentId', 'reference', 'partyName', 'currency', 'paidAt', 'paidDate', 'amountForeign', 'bookedRateToBase', 'settlementRateToBase', 'bookedBase', 'settlementBase', 'gainLossBase', 'outcome', 'notComputableReason', 'controlAccount', 'fxGainLossAccount'],
 }
 
 const FINANCE_ANALYTICS_CSV_ROW_LIMIT = 50000

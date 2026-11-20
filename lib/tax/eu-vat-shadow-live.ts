@@ -136,7 +136,7 @@ export async function createLiveShadowPorts(now: Date = new Date()): Promise<Sha
 }
 
 /** The half-open instant range of the inclusive LONDON days from..to (YYYY-MM-DD): the days a VAT tax point and the Xero document use, not UTC days. */
-function londonDayRange(from: string, to: string): { gte: Date; lt: Date } {
+export function londonDayRange(from: string, to: string): { gte: Date; lt: Date } {
   const { gte, lt } = businessDayWindow(new Date(`${from}T00:00:00Z`), new Date(`${to}T00:00:00Z`))
   return { gte, lt }
 }

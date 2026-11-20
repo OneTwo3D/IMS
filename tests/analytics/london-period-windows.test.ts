@@ -82,14 +82,16 @@ test('Sales analytics windows the order createdAt on London days (BST July)', as
 })
 
 test('Returns analytics nets a 23:40Z refund in the SAME London period as the 23:15Z dispatch it reverses (o3d-bo89l scenario)', async () => {
-  const seen: Parameters<typeof salesClient>[0] = {}
-  await getReturnsAnalyticsReport({ dateFrom: '2026-07-01', dateTo: '2026-07-31' }, { client: salesClient(seen), now: NOW })
-  const clauses = JSON.stringify(seen.refunds)
-  // 2026-06-30T23:40Z is London 1 July: inside July's window, outside June's.
-  assert.match(clauses, /"gte":"2026-06-30T23:00:00.000Z"/)
-  assert.match(clauses, /"lt":"2026-07-31T23:00:00.000Z"/)
-  const refundAt = Date.parse('2026-06-30T23:40:00Z')
-  assert.ok(refundAt >= Date.parse('2026-06-30T23:00:00Z') && refundAt < Date.parse('2026-07-31T23:00:00Z'))
+  // Evaluate the where-clause the report emits against a fixture refund at 2026-06-30T23:40Z (London 1 July): in July's window, out of June's.
+  const refundAt = new Date('2026-06-30T23:40:00Z')
+  const included = async (range: { dateFrom: string; dateTo: string }) => {
+    const seen: Parameters<typeof salesClient>[0] = {}
+    await getReturnsAnalyticsReport(range, { client: salesClient(seen), now: NOW })
+    const window = (seen.refunds as { refund: { refundedAt: { gte: Date; lt: Date } } }).refund.refundedAt
+    return refundAt >= window.gte && refundAt < window.lt
+  }
+  assert.equal(await included({ dateFrom: '2026-07-01', dateTo: '2026-07-31' }), true, 'July holds the 23:40Z refund')
+  assert.equal(await included({ dateFrom: '2026-06-01', dateTo: '2026-06-30' }), false, 'June does not')
 })
 
 test('Throughput analytics windows shipments and activity on London days and buckets rows by London day', async () => {
@@ -105,16 +107,24 @@ test('Throughput analytics windows shipments and activity on London days and buc
 
 // ---- finance family (o3d-7a7z4) ---------------------------------------------------------------------------------------------------------------------------
 
-type InvoiceLine = { invoicedAt: Date; taxBase: number; totalBase: number }
+type InvoiceLine = { invoicedAt: Date; externalCreatedAt?: Date | null; taxBase: number; totalBase: number }
+type DateClause = { not?: null; gte?: Date; lt?: Date }
+type OrderDateWhere = { OR: Array<{ invoicedAt?: DateClause; externalCreatedAt?: DateClause | null }> }
+function inClause(value: Date | null, clause: DateClause | null | undefined): boolean {
+  if (clause === undefined) return true
+  if (clause === null) return value === null
+  if (clause.not === null) return value !== null
+  return value !== null && (!clause.gte || value >= clause.gte) && (!clause.lt || value < clause.lt)
+}
 function vatDeps(lines: InvoiceLine[], now: Date): FinanceAnalyticsDeps {
   return {
     now: () => now,
     baseCurrency: async () => 'GBP',
     client: {
       salesOrderLine: {
-        findMany: async (a: { where: { order: { invoicedAt: { gte: Date; lt: Date } } } }) => {
-          const w = a.where.order.invoicedAt
-          return lines.filter((l) => l.invoicedAt >= w.gte && l.invoicedAt < w.lt).map((l) => ({
+        findMany: async (a: { where: { order: OrderDateWhere } }) => {
+          // Evaluate the emitted where-clause against each fixture row: the document-date predicate is real behaviour, not re-implemented here.
+          return lines.filter((l) => a.where.order.OR.some((c) => inClause(l.invoicedAt, c.invoicedAt) && inClause(l.externalCreatedAt ?? null, c.externalCreatedAt))).map((l) => ({
             taxRateId: 'r20', taxForeign: new Prisma.Decimal(l.taxBase), taxBase: new Prisma.Decimal(l.taxBase), totalBase: new Prisma.Decimal(l.totalBase),
             order: { shippingAddress: null, pricesIncludeVat: false },
             taxRate: { name: 'VAT 20%', rate: new Prisma.Decimal(20), accountingTaxType: 'OUTPUT2', countryCode: 'GB', reportingCategory: null },
@@ -151,16 +161,38 @@ test('VAT: the default period is the London day (23:30Z in BST is already tomorr
 })
 
 test('Currency summary and FX gain/loss window paidAt/invoiceDate on London days (BST July)', async () => {
-  const seenWhere: Where[] = []
-  const spy = { findMany: async (a: { where: Where }) => { seenWhere.push(a.where); return [] } }
-  const client = { salesOrder: spy, salesOrderPayment: spy, payment: spy, purchaseInvoice: spy, purchaseOrder: spy, fxRate: spy, exchangeRate: spy, salesOrderRefund: spy } as never
-  const deps = { now: NOW, baseCurrency: async () => 'GBP', accountingSettings: async () => ({ accountsReceivableAccount: '200', accountsPayableAccount: '800', realisedFxGainLossAccount: '400' }), client: { ...(client as object), setting: spy } } as unknown as FinanceAnalyticsDeps
+  const seen: Array<{ model: string; where: Where }> = []
+  const spy = (model: string) => ({ findMany: async (a: { where: Where }) => { seen.push({ model, where: a.where }); return [] } })
+  const client = { salesOrder: spy('salesOrder'), salesOrderPayment: spy('salesOrderPayment'), payment: spy('payment'), purchaseInvoice: spy('purchaseInvoice'), purchaseOrder: spy('purchaseOrder'), fxRate: spy('fxRate'), exchangeRate: spy('exchangeRate'), salesOrderRefund: spy('salesOrderRefund'), setting: spy('setting') }
+  const deps = { now: NOW, baseCurrency: async () => 'GBP', accountingSettings: async () => ({ accountsReceivableAccount: '200', accountsPayableAccount: '800', realisedFxGainLossAccount: '400' }), client } as unknown as FinanceAnalyticsDeps
+  // No try/catch: a report that throws before its second query must fail this test, not be read as a partial pass.
+  const expectedModels = new Map([[getCurrencySummaryReport.name, ['salesOrder', 'purchaseInvoice']], [getFxGainLossReport.name, ['payment', 'purchaseInvoice']]])
   for (const run of [getCurrencySummaryReport, getFxGainLossReport]) {
-    seenWhere.length = 0
-    try { await run({ dateFrom: '2026-07-01', dateTo: '2026-07-31' }, { deps, paginate: false }) } catch { /* the spy client is not a full model; only the windows it saw matter */ }
-    const text = JSON.stringify(seenWhere)
-    assert.match(text, /2026-06-30T23:00:00.000Z/, `${run.name} lower bound`)
-    assert.match(text, /2026-07-31T23:00:00.000Z/, `${run.name} upper bound`)
-    assert.doesNotMatch(text, /2026-07-01T00:00:00.000Z|2026-08-01T00:00:00.000Z/, `${run.name} no UTC-day bound`)
+    seen.length = 0
+    await run({ dateFrom: '2026-07-01', dateTo: '2026-07-31' }, { deps, paginate: false })
+    for (const model of expectedModels.get(run.name)!) {
+      const call = seen.find((c) => c.model === model)
+      assert.ok(call, `${run.name} issued its ${model} query`)
+      const text = JSON.stringify(call.where)
+      assert.match(text, /2026-06-30T23:00:00.000Z/, `${run.name}/${model} lower bound`)
+      assert.match(text, /2026-07-31T23:00:00.000Z/, `${run.name}/${model} upper bound`)
+      assert.doesNotMatch(text, /2026-07-01T00:00:00.000Z|2026-08-01T00:00:00.000Z/, `${run.name}/${model} no UTC-day bound`)
+    }
   }
+})
+
+test('londonPeriod across the clock changes: 29 Mar 2026 is a 23-hour London day and 25 Oct 2026 a 25-hour one', () => {
+  // Hand-worked: London switches to BST at 01:00Z on 29 Mar (day = 00:00Z .. 23:00Z, 23 h) and back to GMT at 01:00Z on 25 Oct (day = 23:00Z on 24 Oct .. 00:00Z on 26 Oct, 25 h).
+  const spring = londonPeriod({ dateFrom: '2026-03-29', dateTo: '2026-03-29' }, new Date('2026-11-20T12:00:00Z'), 30)
+  assert.equal(iso(spring.dateFrom), '2026-03-29T00:00:00.000Z')
+  assert.equal(iso(spring.dateToExclusive), '2026-03-29T23:00:00.000Z')
+  const autumn = londonPeriod({ dateFrom: '2026-10-25', dateTo: '2026-10-25' }, new Date('2026-11-20T12:00:00Z'), 30)
+  assert.equal(iso(autumn.dateFrom), '2026-10-24T23:00:00.000Z')
+  assert.equal(iso(autumn.dateToExclusive), '2026-10-26T00:00:00.000Z')
+  // A range across the change: March 2026 runs from 00:00Z on 1 Mar (GMT) to 23:00Z on 31 Mar (BST); the day after 29 Mar starts at 23:00Z.
+  const march = londonPeriod({ dateFrom: '2026-03-01', dateTo: '2026-03-31' }, new Date('2026-11-20T12:00:00Z'), 30)
+  assert.equal(iso(march.dateFrom), '2026-03-01T00:00:00.000Z')
+  assert.equal(iso(march.dateToExclusive), '2026-03-31T23:00:00.000Z')
+  const monday = londonPeriod({ dateFrom: '2026-03-30', dateTo: '2026-03-30' }, new Date('2026-11-20T12:00:00Z'), 30)
+  assert.equal(iso(monday.dateFrom), '2026-03-29T23:00:00.000Z')
 })

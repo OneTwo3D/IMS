@@ -142,6 +142,8 @@ export type LeadTimeReportRow = {
   p95LeadTimeDays: string
   configuredLeadTimeDays: string
   latestReceiptAt: string
+  /** The London business day of `latestReceiptAt` (YYYY-MM-DD). */
+  latestReceiptDate: string
 }
 
 type OpenPoRow = {
@@ -851,6 +853,7 @@ export async function getLeadTimeReport(
       p95LeadTimeDays: daysString(percentile(row.leadTimes, 95)),
       configuredLeadTimeDays: configuredByKey.get(`${row.supplierId}:${row.productId}`)?.toString() ?? '',
       latestReceiptAt: row.latestReceiptAt.toISOString(),
+      latestReceiptDate: businessDateYmd(row.latestReceiptAt),
     }
   })
   rows.sort((a, b) => toDecimal(b.p95LeadTimeDays).cmp(a.p95LeadTimeDays) || a.supplierName.localeCompare(b.supplierName) || a.sku.localeCompare(b.sku))

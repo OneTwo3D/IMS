@@ -1,6 +1,7 @@
 'use server'
 
 import { businessDateYmd } from '@/lib/business-date'
+import { creditNoteDocumentDay } from '@/lib/domain/accounting/document-date'
 import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import type { InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
 import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
@@ -2982,7 +2983,7 @@ async function queueRefundAccountingActions(input: {
     creditNoteNumber: input.creditNoteNumber ?? undefined,
     contactName: cnContactName,
     contactEmail: orderForCN?.customer?.email ?? undefined,
-    date: businessDateYmd(new Date()),
+    date: creditNoteDocumentDay(new Date()),
     currency: orderForCN?.currency ?? baseCurrency,
     reference: input.externalOrderNumber ?? undefined,
     // o3d-hqvrp.389, behind `xero_round_to_order_total_enabled`: a credit note that FULLY reverses the invoice (a chargeback, or the one refund of an order now fully refunded) carries

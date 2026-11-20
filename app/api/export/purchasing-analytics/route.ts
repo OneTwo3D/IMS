@@ -18,7 +18,7 @@ const EXPORT_COLUMNS: Record<string, string[]> = {
   'supplier-performance': ['supplierName', 'receiptCount', 'onTimeReceiptCount', 'expectedReceiptCount', 'onTimeRatePct', 'orderedQty', 'receivedQty', 'qtyVariance', 'qtyVariancePct', 'returnedQty', 'returnRatePct', 'averageActualLeadTimeDays', 'averageConfiguredLeadTimeDays', 'averageRfqResponseDays'],
   'ppv': ['supplierName', 'sku', 'productName', 'categoryName', 'poReference', 'receivedAt', 'qty', 'actualLandedUnitCostBase', 'referenceUnitCostBase', 'variancePerUnitBase', 'varianceTotalBase', 'variancePct', 'referencePriceSource'],
   'spend': ['period', 'supplierName', 'categoryName', 'poCount', 'spendBase'],
-  'lead-times': ['supplierName', 'sku', 'productName', 'receiptCount', 'averageLeadTimeDays', 'p50LeadTimeDays', 'p95LeadTimeDays', 'configuredLeadTimeDays', 'latestReceiptAt'],
+  'lead-times': ['supplierName', 'sku', 'productName', 'receiptCount', 'averageLeadTimeDays', 'p50LeadTimeDays', 'p95LeadTimeDays', 'configuredLeadTimeDays', 'latestReceiptAt', 'latestReceiptDate'],
 }
 
 const PURCHASING_ANALYTICS_CSV_ROW_LIMIT = 50000
