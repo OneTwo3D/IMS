@@ -57,6 +57,7 @@ export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Read
     connection = await (deps.open ?? defaultOpen)(built.env.DATABASE_URL!)
     outcome = await runBackfill(connection.port, file.file, args)
   } catch (error) {
+    if (error instanceof Error && error.message === 'COMMIT_OUTCOME_UNKNOWN') return fail(ECB_BACKFILL_EXIT.TARGET, 'commit outcome unknown: the connection failed while committing; re-run with --dry-run to see what is already written (a re-run skips rows that are there)')
     return fail(ECB_BACKFILL_EXIT.TARGET, `the target could not be read or written; nothing was committed (${error instanceof Error ? error.name : 'error'})`)
   } finally {
     await connection?.close().catch(() => undefined)

@@ -11,18 +11,21 @@
  * ROWS. One row per ECB business day (a day present in the file) per currency, source 'ecb-history' (live rows are 'frankfurter' / 'aelia' / 'manual'), fetchedAt = the ECB's publication time, 16:00
  * Europe/Berlin, converted to UTC with the zone's own DST rules (15:00Z in winter, 14:00Z in summer), so the row sits on the ECB day in UTC and the end-of-day lookup rule finds it.
  *
- * IDEMPOTENT, NEVER OVERWRITES, NEVER TIES. A (currency, UTC day) that already holds ANY fx_rates row of that currency against the base (live, manual or an earlier backfill) is SKIPPED and counted.
- * The central lookup (lib/currencies/fx-select.ts) takes the latest row at or before the date, and a tie of different rates on one instant refuses; skipping the whole day means the backfill can
- * never create a tie, and a live Aelia / ECB row that exists at or after the backfilled day always wins (it is later or on a skipped day). Re-running the command is a no-op.
+ * THE BACKFILL WRITES ONLY INTO THE PAST OF THE TABLE. Backfilled rows are older than every live row, so they can never become "the latest row" of a pair, never un-pin a manual override, never fill a
+ * gap between live rows and never change a lookup that a live row already answers. Under the exclusive FX table lock the command reads, per (base, currency), the first row that is NOT 'ecb-history'
+ * (live, manual or Aelia) and REFUSES, listing the days, any planned day on or after that row's UTC day (it does not clamp, so the operator sees it and lowers --to or drops the currency). It also
+ * REFUSES any planned day on or after the UTC day the earliest Aelia interval of the source switch starts (inside an Aelia interval a lookup only accepts aelia rows and manual overrides, so an ECB
+ * row there would be ignored anyway). Since no planned day reaches a live row's day, the backfill can never tie a live row on one instant either.
  *
- * AELIA CAVEAT. Inside an Aelia interval of the source switch (lib/currencies/fx-source-regime.ts) a lookup only accepts source='aelia' rows and manual overrides, so a backfilled row is for dates
- * BEFORE the switch (the first-load history), which is what it is for.
+ * IDEMPOTENT. A (currency, UTC day) that already holds an 'ecb-history' row is skipped and counted; re-running the same window is a no-op. The backfill never overwrites or deletes a row.
  *
- * REFUSALS (nothing written): the base currency is missing from the file, a requested currency has a blank / N/A / non-positive cell on a day in the window (every such day is reported), a
- * requested currency is not a column of the file, --from/--to outside the file's date range, a requested currency that is not enabled, a malformed file.
+ * REFUSALS (exit 4, nothing written): a day on or after the first live row of a requested currency or the Aelia start, the base currency missing from the file, a requested currency with a blank / N/A /
+ * zero cell on a day in the window (every such day is reported), a requested currency that is not a column of the file, --from/--to outside the file's date range, a requested currency that is not
+ * enabled, a malformed file, a lock held by another writer for more than 30 s. A refusal names the currency; re-run with --currencies excluding it, or a smaller --to.
  */
 import { randomBytes } from 'node:crypto'
 import path from 'node:path'
+import { fxSourceRegimeFromSettings, FX_RATE_SOURCE_HISTORY_SETTING, FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING } from '../currencies/fx-source-regime'
 
 export const ECB_BACKFILL_SOURCE = 'ecb-history'
 export const ECB_BACKFILL_APPLICATION_NAME = 'fx-backfill-ecb'
@@ -147,8 +150,12 @@ export interface BackfillInputs {
   requested: readonly string[] | null
   from: string
   to: string
-  /** `${currency}|${YYYY-MM-DD UTC}` of every existing fx_rates row of the base against that currency inside the window. */
+  /** `${currency}|${YYYY-MM-DD UTC}` of every existing 'ecb-history' fx_rates row of the base against that currency inside the window. */
   existing: ReadonlySet<string>
+  /** currency -> UTC day (YYYY-MM-DD) of the FIRST row of the pair that is not 'ecb-history' (live, manual, Aelia). Absent: the pair has no live row. */
+  firstLiveDay?: ReadonlyMap<string, string>
+  /** UTC day (YYYY-MM-DD) the earliest Aelia interval starts, or null when there is none. */
+  aeliaFromDay?: string | null
 }
 
 export interface CurrencyCounts { currency: string; businessDays: number; toWrite: number; skippedExisting: number }
@@ -185,6 +192,8 @@ export function planBackfill(i: BackfillInputs): BackfillPlan {
   const days = [...i.file.days.keys()].filter((d) => d >= i.from && d <= i.to).sort()
   if (days.length === 0) return { ok: false, refusals: [`the ECB file has no business day inside ${i.from}..${i.to}`] }
   const rows: PlannedRow[] = []
+  const livePast = new Map<string, string[]>()
+  const aeliaPast: string[] = []
   const counts = new Map<string, CurrencyCounts>(currencies.map((c) => [c, { currency: c, businessDays: days.length, toWrite: 0, skippedExisting: 0 }]))
   for (const day of days) {
     const cells = i.file.days.get(day)!
@@ -199,9 +208,12 @@ export function planBackfill(i: BackfillInputs): BackfillPlan {
       if (c !== 'EUR') {
         const cell = cells.get(c) ?? null
         num = cell === null ? null : parseDec(cell)
-        if (num === null || num.n === B0) { refusals.push(`${day}: ${c} has a blank, N/A or zero cell`); continue }
+        if (num === null || num.n === B0) { refusals.push(`${day}: ${c} has a blank, N/A or zero cell (re-run with --currencies excluding ${c}, or a window without this day)`); continue }
       }
       const key = counts.get(c)!
+      const live = i.firstLiveDay?.get(c)
+      if (live !== undefined && day >= live) { livePast.set(c, [...(livePast.get(c) ?? []), day]); continue }
+      if (i.aeliaFromDay != null && day >= i.aeliaFromDay) { aeliaPast.push(`${c} ${day}`); continue }
       if (i.existing.has(`${c}|${day}`)) { key.skippedExisting += 1; continue }
       const rate = divideRounded(num, baseDec!)
       if (/^0\.0+$/.test(rate)) { refusals.push(`${day}: ${c} rounds to zero at 8 decimal places`); continue }
@@ -209,8 +221,18 @@ export function planBackfill(i: BackfillInputs): BackfillPlan {
       key.toWrite += 1
     }
   }
+  for (const [c, list] of livePast) {
+    const live = i.firstLiveDay!.get(c)!
+    const before = new Date(Date.parse(`${live}T00:00:00.000Z`) - 86_400_000).toISOString().slice(0, 10)
+    refusals.push(`${c}: ${list.length} planned day(s) on or after the first live row of ${c} (${live}): ${listDays(list)}. The backfill only writes before the first live row: lower --to to ${before} at most, or re-run with --currencies excluding ${c}`)
+  }
+  if (aeliaPast.length > 0) refusals.push(`${aeliaPast.length} planned currency/day(s) on or after the start of the Aelia period (${i.aeliaFromDay}): ${listDays(aeliaPast)}. Lower --to before that day`)
   if (refusals.length > 0) return { ok: false, refusals: capRefusals(refusals) }
   return { ok: true, rows, counts: [...counts.values()], businessDays: days.length }
+}
+
+function listDays(list: string[]): string {
+  return list.length <= 8 ? list.join(', ') : `${list.slice(0, 8).join(', ')}, ... (${list.length - 8} more)`
 }
 
 function capRefusals(list: string[]): string[] {
@@ -232,7 +254,10 @@ export const ECB_BACKFILL_STATEMENTS = {
   identity: `select current_database() as db, (select system_identifier::text from pg_control_system()) as sid`,
   base: `select coalesce((select "baseCurrency" from "organisations" order by "createdAt", "id" limit 1), 'GBP') as base`,
   enabled: `select "code" from "currencies" where "active" = true order by "code"`,
-  existing: `select "toCurrency" as cur, to_char("fetchedAt", 'YYYY-MM-DD') as day from "fx_rates" where "fromCurrency" = $1 and "toCurrency" = any($2::text[]) and "fetchedAt" >= $3::timestamp and "fetchedAt" < $4::timestamp group by 1, 2`,
+  existing: `select "toCurrency" as cur, to_char("fetchedAt", 'YYYY-MM-DD') as day from "fx_rates" where "fromCurrency" = $1 and "toCurrency" = any($2::text[]) and "source" = '${ECB_BACKFILL_SOURCE}' and "fetchedAt" >= $3::timestamp and "fetchedAt" < $4::timestamp group by 1, 2`,
+  lockTimeout: "SET LOCAL lock_timeout = '30s'",
+  firstLive: `select "toCurrency" as cur, to_char(min("fetchedAt"), 'YYYY-MM-DD') as day from "fx_rates" where "fromCurrency" = $1 and "toCurrency" = any($2::text[]) and "source" <> '${ECB_BACKFILL_SOURCE}' group by 1`,
+  fxSource: `select "key", "value" from "settings" where "key" = any($1::text[])`,
   commit: 'COMMIT',
   rollback: 'ROLLBACK',
 } as const
@@ -273,21 +298,37 @@ export async function runBackfill(port: BackfillPort, file: EcbFile, args: Backf
   await port.query(args.dryRun ? ECB_BACKFILL_STATEMENTS.beginDryRun : ECB_BACKFILL_STATEMENTS.beginWrite)
   let committed = false
   try {
-    if (!args.dryRun) await port.query(ECB_BACKFILL_STATEMENTS.lock, [ECB_BACKFILL_FX_TABLE_LOCK_KEY])
+    // The target is confirmed BEFORE the lock is asked for, so a wrong database never waits on, or takes, anything.
     const id = (await port.query<{ db: string; sid: string }>(ECB_BACKFILL_STATEMENTS.identity)).rows[0]
     if (!id || id.db !== args.expectDb) return { kind: 'target-refused', problem: '--expect-db does not equal the database the server reports; the target is not the database you named' }
     if (id.sid !== args.expectSystemId) return { kind: 'target-refused', problem: '--expect-system-id does not equal the cluster system identifier the server reports' }
+    if (!args.dryRun) {
+      await port.query(ECB_BACKFILL_STATEMENTS.lockTimeout)
+      try {
+        await port.query(ECB_BACKFILL_STATEMENTS.lock, [ECB_BACKFILL_FX_TABLE_LOCK_KEY])
+      } catch (error) {
+        if ((error as { code?: string }).code === '55P03') return { kind: 'target-refused', problem: 'the exchange-rate table is locked by another writer (waited 30 s); nothing was written. Try again in a moment.' }
+        throw error
+      }
+    }
     const baseCurrency = ((await port.query<{ base: string }>(ECB_BACKFILL_STATEMENTS.base)).rows[0]?.base ?? '').trim().toUpperCase()
     if (!CODE.test(baseCurrency)) return { kind: 'target-refused', problem: 'the database has no usable organisation base currency' }
     const enabled = (await port.query<{ code: string }>(ECB_BACKFILL_STATEMENTS.enabled)).rows.map((r) => r.code)
     const wanted = (args.currencies ?? enabled).filter((c) => c !== baseCurrency)
     const dayAfter = utcNaive(new Date(Date.parse(`${args.to}T00:00:00.000Z`) + 86_400_000))
     const existing = new Set<string>()
+    const firstLiveDay = new Map<string, string>()
     if (wanted.length > 0 && isRealDate(args.from) && isRealDate(args.to)) {
       const rows = (await port.query<{ cur: string; day: string }>(ECB_BACKFILL_STATEMENTS.existing, [baseCurrency, wanted, `${args.from}T00:00:00.000`, dayAfter])).rows
       for (const r of rows) existing.add(`${r.cur}|${r.day}`)
+      for (const r of (await port.query<{ cur: string; day: string }>(ECB_BACKFILL_STATEMENTS.firstLive, [baseCurrency, wanted])).rows) firstLiveDay.set(r.cur, r.day)
     }
-    const plan = planBackfill({ file, baseCurrency, enabledCurrencies: enabled, requested: args.currencies, from: args.from, to: args.to, existing })
+    const settings = (await port.query<{ key: string; value: string }>(ECB_BACKFILL_STATEMENTS.fxSource, [[FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING, FX_RATE_SOURCE_HISTORY_SETTING]])).rows
+    const setting = (k: string): string | null => settings.find((r) => r.key === k)?.value ?? null
+    const regime = fxSourceRegimeFromSettings(setting(FX_RATE_SOURCE_SETTING), setting(FX_RATE_SOURCE_SINCE_SETTING), setting(FX_RATE_SOURCE_HISTORY_SETTING))
+    if (regime?.unreadable) return { kind: 'refused', baseCurrency, refusals: ['the stored FX source switch history is unreadable, so the Aelia period cannot be known; repair it (docs/installation.md) before backfilling'] }
+    const aeliaFromDay = regime && regime.aelia.length > 0 ? new Date(Math.min(...regime.aelia.map((a) => a.since.getTime()))).toISOString().slice(0, 10) : null
+    const plan = planBackfill({ file, baseCurrency, enabledCurrencies: enabled, requested: args.currencies, from: args.from, to: args.to, existing, firstLiveDay, aeliaFromDay })
     if (!plan.ok) return { kind: 'refused', baseCurrency, refusals: plan.refusals }
     if (!args.dryRun) {
       for (let at = 0; at < plan.rows.length; at += INSERT_CHUNK) {
@@ -296,7 +337,12 @@ export async function runBackfill(port: BackfillPort, file: EcbFile, args: Backf
         for (const r of chunk) params.push(newId(), baseCurrency, r.currency, r.rate, utcNaive(r.fetchedAt))
         await port.query(insertStatement(chunk.length), params)
       }
-      await port.query(ECB_BACKFILL_STATEMENTS.commit)
+      try {
+        await port.query(ECB_BACKFILL_STATEMENTS.commit)
+      } catch {
+        committed = true // the connection may be gone: no rollback to send
+        throw new Error('COMMIT_OUTCOME_UNKNOWN')
+      }
       committed = true
     }
     return {

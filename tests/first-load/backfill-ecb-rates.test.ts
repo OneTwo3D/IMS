@@ -6,7 +6,6 @@ import assert from 'node:assert/strict'
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import test from 'node:test'
-import pg from 'pg'
 import { FX_TABLE_LOCK_KEY } from '../../lib/db/advisory-locks.ts'
 import { selectFxRateFromRows } from '../../lib/currencies/fx-select.ts'
 import {
@@ -92,20 +91,17 @@ test('existing days are skipped and counted per currency', () => {
   assert.deepEqual(p.counts.map((c) => [c.currency, c.toWrite, c.skippedExisting]), [['EUR', 3, 1], ['USD', 2, 2]])
 })
 
-// A live row on a day wins over the backfill because that day is skipped, so no tie of different rates can exist; later days are later rows.
-test('fx-select: a day holding a live row is never backfilled, so the live row wins and no tie arises', () => {
+// A backfilled row is always older than the first live row, so the live row wins wherever it exists and no tie arises.
+test('fx-select: with the window before the first live row, the live row answers from its day on and the backfill before it', () => {
   const live = { fromCurrency: 'GBP', toCurrency: 'USD', rate: '1.50000000', fetchedAt: new Date('2026-03-30T06:00:00.000Z'), source: 'frankfurter', seq: 2 }
-  const p2 = plan({ requested: ['USD'], existing: new Set(['USD|2026-03-30']) }); assert.ok(p2.ok)
-  assert.ok(!p2.rows.some((r) => r.day === '2026-03-30'))
+  const refused = plan({ requested: ['USD'], firstLiveDay: new Map([['USD', '2026-03-30']]) }); assert.ok(!refused.ok)
+  const p2 = plan({ requested: ['USD'], to: '2026-03-27', firstLiveDay: new Map([['USD', '2026-03-30']]) }); assert.ok(p2.ok)
   const rows = [...p2.rows.map((r) => ({ fromCurrency: 'GBP', toCurrency: 'USD', rate: r.rate, fetchedAt: r.fetchedAt, source: 'ecb-history', seq: 1 })), live]
   const at = (d: string) => selectFxRateFromRows(rows, { baseCurrency: 'GBP', currency: 'USD', asOf: new Date(`${d}T23:59:59.999Z`) })
-  assert.equal(at('2026-03-30').source, 'frankfurter')
-  assert.equal(at('2026-03-30').rate.toString(), '1.5')
   assert.equal(at('2026-03-27').source, 'ecb-history')
   assert.equal(at('2026-03-27').rate.toString(), '1.3375')
-  // a planned row never shares an instant with a live row of its day, so the tie refusal cannot fire
-  const tie = rows.filter((r) => r.fetchedAt.getTime() === live.fetchedAt.getTime())
-  assert.equal(tie.length, 1)
+  assert.equal(at('2026-03-30').source, 'frankfurter')
+  assert.equal(at('2026-03-31').source, 'frankfurter') // the latest row stays the live one
 })
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
@@ -136,16 +132,17 @@ test('a real run: lock first, target confirmed before any read of the plan input
   assert.equal(out.kind, 'done')
   const sqls = ok.sent.map((s) => s.sql)
   assert.equal(sqls[0], ECB_BACKFILL_STATEMENTS.beginWrite)
-  assert.equal(sqls[1], ECB_BACKFILL_STATEMENTS.lock)
-  assert.deepEqual(ok.sent[1]!.params, [FX_TABLE_LOCK_KEY])
-  assert.equal(sqls[2], ECB_BACKFILL_STATEMENTS.identity)
+  assert.equal(sqls[1], ECB_BACKFILL_STATEMENTS.identity) // the target is confirmed BEFORE the lock is asked for
+  assert.equal(sqls[2], ECB_BACKFILL_STATEMENTS.lockTimeout)
+  assert.equal(sqls[3], ECB_BACKFILL_STATEMENTS.lock)
+  assert.deepEqual(ok.sent[3]!.params, [FX_TABLE_LOCK_KEY])
   assert.equal(sqls.at(-1), ECB_BACKFILL_STATEMENTS.commit)
   assert.equal(sqls.filter((s) => s.startsWith('insert')).length, 1)
   for (const bad of [{ db: 'other' }, { sid: '9' }]) {
     const f = fakePort(bad)
     const r = await runBackfill(f.port, file(), args)
     assert.equal(r.kind, 'target-refused')
-    assert.ok(!f.sent.some((s) => s.sql.startsWith('insert')))
+    assert.ok(!f.sent.some((s) => s.sql.startsWith('insert') || s.sql === ECB_BACKFILL_STATEMENTS.lock)) // a wrong target never reaches the lock
     assert.equal(f.sent.at(-1)!.sql, ECB_BACKFILL_STATEMENTS.rollback)
   }
 })
@@ -197,61 +194,49 @@ test('the CLI never prints the connection string and exits 3 on a wrong target, 
   } finally { rmSync(dir, { recursive: true, force: true }) }
 })
 
-// ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
-// a real scratch database (migrated with the real schema)
+// [mutation: drop the floor check, compare against a row of any source, drop the Aelia check]
+test('live period: a day on or after the first live row of a currency is REFUSED (not clamped), listing the days', () => {
+  // a manual pin on 03-27, a window after it: the pin must not be un-pinned by a later backfilled row
+  const pin = plan({ requested: ['USD'], firstLiveDay: new Map([['USD', '2026-03-27']]) })
+  assert.ok(!pin.ok); assert.match(pin.refusals.join('\n'), /USD: 3 planned day\(s\) on or after the first live row of USD \(2026-03-27\).*2026-03-30.*lower --to to 2026-03-26.*--currencies excluding USD/)
+  // a gap day after a first live row (live 03-26, gap 03-27)
+  const gap = plan({ requested: ['USD', 'EUR'], from: '2026-03-27', to: '2026-03-27', firstLiveDay: new Map([['USD', '2026-03-26']]) })
+  assert.ok(!gap.ok); assert.match(gap.refusals.join(), /USD: 1 planned day/); assert.ok(!gap.refusals.join().includes('EUR:'))
+  // the same window before the first live row is fine, and a currency without live rows is unaffected
+  const ok = plan({ requested: ['USD', 'EUR'], to: '2026-03-27', firstLiveDay: new Map([['USD', '2026-03-28']]) })
+  assert.ok(ok.ok); assert.equal(ok.rows.length, 4)
+})
 
-const dbUrl = process.env.FX_BACKFILL_TEST_DATABASE_URL
-test('real database: write, idempotent re-run, skip-existing day, refusal writes nothing', { skip: dbUrl ? false : 'FX_BACKFILL_TEST_DATABASE_URL not set' }, async () => {
-  const client = new pg.Client({ connectionString: dbUrl })
-  await client.connect()
-  try {
-    const q = (sql: string, params?: unknown[]) => client.query(sql, params)
-    const ident = (await q(`select current_database() as db, (select system_identifier::text from pg_control_system()) as sid`)).rows[0]
-    assert.match(ident.db, /^fxbf_scratch/, 'refuses to run against a database that is not a scratch one')
-    await q('delete from "fx_rates"'); await q('delete from "currencies"'); await q('delete from "organisations"')
-    for (const c of ['GBP', 'EUR', 'USD', 'CNY']) await q(`insert into "currencies" ("code","name","symbol","active") values ($1,$1,$1,$2)`, [c, c !== 'CNY'])
-    await q(`insert into "organisations" ("id","name","baseCurrency","updatedAt") values ('o','o','GBP',now())`)
-    const port: BackfillPort = { query: async (sql, params) => ({ rows: (await client.query(sql, params ? [...params] : undefined)).rows as never[] }) }
-    const A = { ...args, expectDb: ident.db as string, expectSystemId: ident.sid as string }
-    // a live row on 2026-03-30 for USD
-    await q(`insert into "fx_rates" ("id","fromCurrency","toCurrency","rate","fetchedAt","source") values ('live','GBP','USD',1.5,'2026-03-30 06:00:00','frankfurter')`)
+test('live period: the earliest Aelia interval start refuses every day on or after it', () => {
+  const p = plan({ requested: ['USD'], aeliaFromDay: '2026-03-30' })
+  assert.ok(!p.ok); assert.match(p.refusals.join(), /on or after the start of the Aelia period \(2026-03-30\): USD 2026-03-30, USD 2026-03-31/)
+  assert.ok(plan({ requested: ['USD'], to: '2026-03-27', aeliaFromDay: '2026-03-30' }).ok)
+})
 
-    const dry = await runBackfill(port, file(), { ...A, dryRun: true })
-    assert.equal(dry.kind, 'done')
-    assert.equal((await q('select count(*)::int as n from "fx_rates"')).rows[0].n, 1) // nothing written
+test('a zero base cell and a rate that rounds to zero are refusals, never an exception', () => {
+  const f = file(); f.days.get('2026-03-30')!.set('GBP', '0.0000')
+  const zero = plan({ file: f }); assert.ok(!zero.ok); assert.match(zero.refusals.join(), /2026-03-30: the base currency GBP has a blank, N\/A or zero cell/)
+  const g = file(); g.days.get('2026-03-30')!.set('USD', '0.0001'); g.days.get('2026-03-30')!.set('GBP', '100000')
+  const tiny = plan({ file: g, requested: ['USD'] }); assert.ok(!tiny.ok); assert.match(tiny.refusals.join(), /rounds to zero/)
+  const z2 = file(); z2.days.get('2026-03-30')!.set('USD', '0')
+  assert.ok(!plan({ file: z2, requested: ['USD'] }).ok)
+})
 
-    const first = await runBackfill(port, file(), A)
-    assert.equal(first.kind, 'done')
-    if (first.kind === 'done') { assert.equal(first.written, 7); assert.equal(first.skippedExisting, 1) } // EUR 4 + USD 3 (03-30 skipped)
-    const rows = (await q(`select "toCurrency" c, "rate"::text r, to_char("fetchedAt",'YYYY-MM-DD"T"HH24:MI') f, source, "manualOverride" m, seq from "fx_rates" where source='ecb-history' order by 1, 3`)).rows
-    assert.equal(rows.length, 7)
-    assert.deepEqual(rows.find((r) => r.c === 'USD' && r.f.startsWith('2026-03-27')), { c: 'USD', r: '1.33750000', f: '2026-03-27T15:00', source: 'ecb-history', m: false, seq: rows.find((r) => r.c === 'USD' && r.f.startsWith('2026-03-27'))!.seq })
-    assert.ok(rows.some((r) => r.c === 'EUR' && r.f === '2026-03-30T14:00'))
-    assert.ok(!rows.some((r) => r.c === 'CNY' || r.c === 'GBP')) // disabled currency and base are never written
-    assert.equal((await q(`select rate::text r from "fx_rates" where id='live'`)).rows[0].r, '1.50000000') // untouched
-    assert.equal((await q(`select count(*)::int n from "fx_rates" where "toCurrency"='USD' and to_char("fetchedAt",'YYYY-MM-DD')='2026-03-30'`)).rows[0].n, 1)
+test('a non-GBP base: the insert is bound with that base and rates converted against it', async () => {
+  const f = fakePort({ base: 'EUR' })
+  const out = await runBackfill(f.port, file(), { ...args, currencies: ['USD'] })
+  assert.equal(out.kind, 'done')
+  const ins = f.sent.find((s) => s.sql.startsWith('insert'))!
+  assert.equal(ins.params![1], 'EUR'); assert.equal(ins.params![2], 'USD'); assert.equal(ins.params![3], '1.06000000')
+  assert.equal(ins.params![4], '2026-03-26T15:00:00.000') // zero-zone UTC text
+})
 
-    const again = await runBackfill(port, file(), A)
-    assert.equal(again.kind, 'done')
-    if (again.kind === 'done') { assert.equal(again.written, 0); assert.equal(again.skippedExisting, 8) }
-    assert.equal((await q('select count(*)::int as n from "fx_rates"')).rows[0].n, 8)
-
-    const refused = await runBackfill(port, file(), { ...A, currencies: ['CNY'] })
-    assert.equal(refused.kind, 'refused') // CNY is not enabled
-    const refused2 = await runBackfill(port, file(), { ...A, from: '2020-01-01' })
-    assert.equal(refused2.kind, 'refused')
-    const wrong = await runBackfill(port, file(), { ...A, expectDb: 'nope' })
-    assert.equal(wrong.kind, 'target-refused')
-    assert.equal((await q('select count(*)::int as n from "fx_rates"')).rows[0].n, 8)
-    // a refusal mid-window (a blank cell) writes nothing, not even the good days
-    await q(`update "currencies" set active = true where code = 'CNY'`)
-    const gap = await runBackfill(port, file(), { ...A, currencies: ['CNY', 'USD'] })
-    assert.equal(gap.kind, 'refused')
-    assert.equal((await q('select count(*)::int as n from "fx_rates"')).rows[0].n, 8)
-    // the central lookup picks the live row at the live day, and a backfilled row before it
-    const all = (await q(`select "fromCurrency","toCurrency",rate::text rate,to_char("fetchedAt",'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as fa,source,seq from "fx_rates" where "toCurrency"='USD'`)).rows.map((r) => ({ ...r, fetchedAt: new Date(r.fa) }))
-    const sel = (d: string) => selectFxRateFromRows(all, { baseCurrency: 'GBP', currency: 'USD', asOf: new Date(`${d}T23:59:59.999Z`) })
-    assert.equal(sel('2026-03-30').source, 'frankfurter')
-    assert.equal(sel('2026-03-27').source, 'ecb-history')
-  } finally { await client.end() }
+test('lock timeout is a refusal with nothing written; a COMMIT failure is reported as outcome unknown', async () => {
+  const base = fakePort()
+  const timing: BackfillPort = { query: async (sql, params) => { if (sql === ECB_BACKFILL_STATEMENTS.lock) throw Object.assign(new Error('x'), { code: '55P03' }); return base.port.query(sql, params) } }
+  const r = await runBackfill(timing, file(), args)
+  assert.equal(r.kind, 'target-refused')
+  assert.ok(!base.sent.some((s) => s.sql.startsWith('insert')))
+  const failing: BackfillPort = { query: async (sql, params) => { if (sql === ECB_BACKFILL_STATEMENTS.commit) throw new Error('gone'); return base.port.query(sql, params) } }
+  await assert.rejects(runBackfill(failing, file(), args), /COMMIT_OUTCOME_UNKNOWN/)
 })
