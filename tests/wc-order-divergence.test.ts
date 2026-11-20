@@ -153,11 +153,14 @@ test('the wording names the field and the currency, and carries only SKUs, quant
   assert.equal(divergenceFingerprint(v.differences), divergenceFingerprint(JSON.parse(JSON.stringify(v.differences))), 'stable')
 })
 
-test('every order sweep, the ordinary poll included, drains deferred comparisons BEFORE the cursor commit', () => {
+test('every order sweep, the ordinary poll included, drains deferred comparisons AFTER the cursor commit, never before it (o3d-7d84p)', () => {
   const src = readFileSync('lib/connectors/woocommerce/sync/order-import.ts', 'utf8')
+  assert.equal(src.split('await drainDeferredWcOrderDivergences()').length - 1, 1, 'called exactly once')
   const drain = src.indexOf('await drainDeferredWcOrderDivergences()')
   const commit = src.indexOf('await advancePullCursor(tx, cursorKey, cursorCandidate)')
-  assert.ok(drain > 0 && commit > drain, 'the drain is called once, before the cursor can advance, outside the `mode !== poll` refund block')
+  const committedDone = src.indexOf('if (!committed) {')
+  assert.ok(commit > 0 && committedDone > commit, 'the commit block is where expected')
+  assert.ok(drain > committedDone, 'the live reads of the drain run after the cursor transaction has committed, so a slow WooCommerce cannot block the cursor')
   const refundBlock = src.indexOf("if (mode !== 'poll' && !importResult.skipped)")
   assert.ok(drain > refundBlock + 600 || drain < refundBlock, 'not inside the refund-sweep block')
 })

@@ -278,6 +278,66 @@ test('[divergence] the deferral table is bounded: an unreadable or never-recorde
   assert.equal(await f.db.wcOrderDivergenceRecheck.count({ where: { orderId: f.orderId } }), 0)
 })
 
+test('[divergence] o3d-7d84p: a FAILED live read is not an attempt; it counts against its own cap and backs the row off', { skip }, async (t) => {
+  const f = await fixture(t)
+  await f.setFlag(true)
+  await f.deliver({})
+  await f.deliver({ qty: 3, refunds: [{ id: 888010, reason: '', total: '-5.00' }] })
+  f.div.divergenceSeams.readLiveOrder = async () => null
+  t.after(() => { f.div.divergenceSeams.readLiveOrder = undefined })
+  const before = await f.db.wcOrderDivergenceRecheck.findFirstOrThrow({ where: { orderId: f.orderId } })
+  for (let i = 0; i < 3; i++) await f.div.drainDeferredWcOrderDivergences()
+  const after = await f.db.wcOrderDivergenceRecheck.findFirstOrThrow({ where: { orderId: f.orderId } })
+  assert.equal(after.attempts, before.attempts, 'failed reads never use up the attempt limit')
+  assert.equal(after.failedReads, 3)
+  assert.ok(after.lastAttemptAt.getTime() >= before.lastAttemptAt.getTime(), 'backed off: sorted behind the rows not tried')
+  // A successful read counts an attempt and clears the failure streak.
+  f.div.divergenceSeams.readLiveOrder = async () => f.payload({ qty: 3, refunds: [{ id: 888010, reason: '', total: '-5.00' }] }) as never
+  await f.div.drainDeferredWcOrderDivergences()
+  const ok = await f.db.wcOrderDivergenceRecheck.findFirstOrThrow({ where: { orderId: f.orderId } })
+  assert.equal(ok.attempts, 1)
+  assert.equal(ok.failedReads, 0)
+})
+
+test('[divergence] o3d-7d84p: a PERMANENTLY failing read still ends in a refused action, however the row was queued', { skip }, async (t) => {
+  const f = await fixture(t)
+  await f.setFlag(true)
+  await f.deliver({})
+  await f.deliver({ qty: 3, refunds: [{ id: 888011, reason: '', total: '-5.00' }] })
+  f.div.divergenceSeams.readLiveOrder = async () => { throw new Error('woocommerce down') }
+  t.after(() => { f.div.divergenceSeams.readLiveOrder = undefined })
+  try {
+    await f.db.wcOrderDivergenceRecheck.update({ where: { orderId: f.orderId }, data: { failedReads: f.div.RECHECK_MAX_FAILED_READS - 1 } })
+    const last = await f.div.drainDeferredWcOrderDivergences()
+    assert.equal(last.dropped, 0, 'one failure short of the cap: still retrying')
+    assert.equal((await f.db.wcOrderDivergenceRecheck.findFirstOrThrow({ where: { orderId: f.orderId } })).failedReads, f.div.RECHECK_MAX_FAILED_READS)
+    const capped = await f.div.drainDeferredWcOrderDivergences()
+    assert.equal(capped.dropped, 1)
+    assert.equal(await f.db.wcOrderDivergenceRecheck.count({ where: { orderId: f.orderId } }), 0)
+    const raised = await f.db.refusedAction.findMany({ where: { entityId: f.orderId, gate: f.div.WC_AMENDMENT_RECHECK_GATE } })
+    assert.equal(raised.length, 1, 'the lost comparison is a visible refused action')
+  } finally {
+    await f.db.refusedAction.deleteMany({ where: { entityId: f.orderId } })
+    await f.db.wcOrderDivergenceRecheck.deleteMany({ where: { orderId: f.orderId } })
+  }
+})
+
+test('[divergence] o3d-7d84p: a hung live read cannot hold the drain past its budget', { skip }, async (t) => {
+  const f = await fixture(t)
+  await f.setFlag(true)
+  await f.deliver({})
+  await f.deliver({ qty: 3, refunds: [{ id: 888012, reason: '', total: '-5.00' }] })
+  f.div.divergenceSeams.readLiveOrder = () => new Promise<never>(() => undefined) // never settles
+  t.after(() => { f.div.divergenceSeams.readLiveOrder = undefined })
+  const started = Date.now()
+  const out = await f.div.drainDeferredWcOrderDivergences(25, { budgetMs: 1_000, readTimeoutMs: 100 })
+  assert.ok(Date.now() - started < 3_000, 'returned within the budget although the read never settled')
+  assert.equal(out.examined >= 1, true)
+  const row = await f.db.wcOrderDivergenceRecheck.findFirstOrThrow({ where: { orderId: f.orderId } })
+  assert.equal(row.attempts, 0)
+  assert.ok(row.failedReads >= 1)
+})
+
 test('[divergence] a detection failure never fails the import or stops the six-field update', { skip }, async (t) => {
   const f = await fixture(t)
   await f.setFlag(true)

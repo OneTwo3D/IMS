@@ -1,0 +1,3 @@
+### WooCommerce order divergence recheck: cursor and retry fixes (woocommerce)
+
+- Fixed the WooCommerce order-divergence recheck (detection stays behind `wc_order_divergence_detection_enabled`, off by default): the live re-reads of deferred comparisons now run after the order poll's cursor is committed and within a 25 second budget (each read capped at 8 seconds), so a slow WooCommerce can no longer hold the cursor or time the cron out; and a failed or timed-out read no longer uses up the 20-attempt limit. Failed reads have their own cap (48); a comparison lost that way now raises a Sync > Exceptions refused action instead of being dropped silently.
