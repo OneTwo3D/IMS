@@ -237,12 +237,8 @@ numbered `INWC-…` in Xero. IMS does not fill the blank for those either (logge
 `sales_invoice_number_capture_refused`): doing so would make the next invoice update try to renumber
 a live document onto the storefront's number.
 
-
-**An order IMS first sees as already finished.** The order poll and the hourly reconcile (which always adds `completed`) can meet an order IMS has never held that WooCommerce already shows as `completed`, or that your Status Mapping maps to Shipped, Completed or Delivered. Those orders left the warehouse by a route IMS did not run (the previous despatcher, or while IMS was not looking), so IMS **records the order in that status and does nothing else**: it reserves no stock, creates no shipment, moves no stock and posts no cost of goods sold, and it never pushes the order to the warehouse. On-hand stock is whatever your stock count says, not reduced for these orders. Each one gets an INFO `order_imported_post_dispatch_no_stock` activity entry. An order IMS already holds that later turns `completed` still goes through the completion flow above.
-
-**An order IMS first sees as `refunded`.** WooCommerce's `refunded` status means the order was refunded in full. IMS records such an order as **Cancelled** (never as a live Processing order): no stock is reserved, no sales invoice is owed and it is never pushed to the warehouse. The refund records themselves are brought in by the refund sweep (the reconcile runs it; the ordinary poll does not). An INFO `order_imported_refunded_as_cancelled` entry records the choice.
-
 **How the order poll and reconcile page through WooCommerce.** They ask for orders modified since the sweep position, **sorted by modification time**, one page at a time, and move the position by the last order's modified time rather than by page number, so an order that changes or leaves the selected statuses while a sweep is running is not skipped, and one that changes after its page was read is read again at its newer time. Dates are sent to WooCommerce as GMT (`dates_are_gmt=true`, no time-zone suffix), so the window is the same all year, including during British Summer Time. The sweep position itself is the time the run **started** (less a two-minute overlap), never the time it finished; a webhook never moves it. A run ends only when WooCommerce returns an empty page.
+
 **WooCommerce "completed" orders** receive special handling: the system auto-allocates stock, creates shipments, applies any tracking information from the WC order meta (AST plugin), and transitions the shipments through to Shipped status.
 
 This uses the same shared external-fulfillment path that future WMS plugins will use. WooCommerce does not bypass the IMS shipment model or dispatch stock directly at order level.

@@ -62,7 +62,6 @@ import {
 } from './held-sales-invoice'
 import { syncRefundsForOrder } from './refund-sync'
 import { refundDispositionForStatus } from '@/lib/domain/sales/refund-disposition'
-import type { SalesOrderStatus } from '@/lib/domain/workflows/status-types'
 import { recomputeSalesOrderInvoicingState, type InvoicingStateClient } from '@/lib/domain/sales/invoicing-state-sites'
 import { rateBinding, resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 import { previewTreatedSalesInvoice, treatImportedSalesInvoice, type EuVatTreatmentAccounts } from './eu-vat-invoice-treatment'
@@ -126,9 +125,6 @@ function wcModifiedGmtMs(order: WcFullOrder): number | null {
   const ms = parseWcGmtInstant(raw).getTime()
   return Number.isNaN(ms) ? null : ms
 }
-
-/** Statuses an order may only reach through a despatch. First seen in one, IMS records it without stock (o3d-hqvrp.92). */
-const POST_DISPATCH_IMPORT_STATUSES: ReadonlySet<string> = new Set(['SHIPPED', 'COMPLETED', 'DELIVERED'])
 
 export type ImportWcOrderOptions = {
   /** INTERNAL: set by the retry below when a customer erasure was found mid-import; the order is then created erased from the whole projection. */
@@ -3420,16 +3416,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
         ?? (await resolveWcOrderCreateAdmission(wcOrder)).configured
       return refuseWcOrderCreate(wcOrder, 'status_not_mapped', configured, options)
     }
-    // o3d-hqvrp.92: A WooCommerce `refunded` order first seen by IMS is a FULLY REFUNDED order, never a live one. The built-in
-    // mapping reads it as PROCESSING (refund state is the orthogonal refundStatus), which created it live, allocated stock for it and
-    // left it pushable to the warehouse. It is created CANCELLED instead: zero demand under the allocation rules, outside every WMS
-    // create fence, no invoice owed. The refund itself is NOT stamped here (FULL with no refund row trips the refund reconciliation and
-    // queues an invoice with no credit note): the refund rows arrive through the normal refund sweep.
-    const imsStatus: SalesOrderStatus = statusReading.slug === 'refunded' ? 'CANCELLED' : statusReading.imsStatus
-    // o3d-hqvrp.92: an order first seen already COMPLETED / SHIPPED / DELIVERED left the warehouse by a route IMS did not run (the
-    // incumbent despatcher, or while IMS was not looking). IMS records the order in that status but reserves nothing, creates no
-    // shipment and moves no stock: it did not despatch it, and the machine reaches these statuses only from a despatch.
-    const importedPostDispatch = POST_DISPATCH_IMPORT_STATUSES.has(imsStatus)
+    const imsStatus = statusReading.imsStatus
     // Refund state is orthogonal to the lifecycle status: never store
     // REFUNDED/PARTIALLY_REFUNDED as `status`. A refunded-at-import order keeps a base
     // lifecycle status plus a refundStatus; the allocation/invoice gates below still
@@ -4054,27 +4041,12 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     // Auto-allocate stock (skip for terminal statuses, and for an order written as a DRAFT: a status the operator mapped to Draft holds no stock — allocation
     // declines a draft, it is allocated and invoiced when the order is finalised — and the import is acknowledged as completed without it)
     const TERMINAL_STATUSES = ['CANCELLED']
-    if (!TERMINAL_STATUSES.includes(imsStatus) && !importedPostDispatch && lifecycleStatus !== 'DRAFT') {
+    if (!TERMINAL_STATUSES.includes(imsStatus) && lifecycleStatus !== 'DRAFT') {
       const { autoAllocateOrder } = await import('@/app/actions/allocation')
       const allocation = await autoAllocateOrder(so.id, { internalBypassToken: INTERNAL_ACTION_BYPASS })
       if (!allocation.success && allocation.error !== 'No stock available for allocation') {
         throw new Error(`WooCommerce order imported but auto-allocation failed: ${allocation.error ?? 'Unknown error'}`)
       }
-    }
-
-    if (importedPostDispatch || statusReading.slug === 'refunded') {
-      await logActivity({
-        entityType: 'SALES_ORDER',
-        entityId: so.id,
-        action: importedPostDispatch ? 'order_imported_post_dispatch_no_stock' : 'order_imported_refunded_as_cancelled',
-        tag: 'sync',
-        level: 'INFO',
-        description: importedPostDispatch
-          ? `WooCommerce order ${wcOrder.number} was first seen as ${wcOrder.status}, so IMS recorded it as ${lifecycleStatus} without reserving stock, creating a shipment or moving stock: it was despatched outside IMS.`
-          : `WooCommerce order ${wcOrder.number} was first seen as refunded, so IMS recorded it as CANCELLED with no reservation and no invoice; its refunds are recorded by the refund sweep.`,
-        metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id), wcStatus: wcOrder.status, imsStatus: lifecycleStatus },
-        resolveUser: false,
-      })
     }
 
     // o3d-z82a: the status written above is operator-configured via ShoppingStatusMapping, and
