@@ -1,0 +1,6 @@
+### Sent-SKU record: follow-ups from the review of the amendment fix (fix)
+- The record of the SKU sent per line (`sent_line_skus`) is now cleared whenever the link is bound to a different warehouse order without knowing what that order was sent: when the order is put on hold, when it is cancelled (including a cancel confirmed by an operator task), when a parked create is adopted, and when a released order is re-created. When a create reached the warehouse but IMS failed to record the link, the record now holds the SKUs that create actually sent. An old record can therefore no longer make the next change to a re-created order swap an item.
+- A line change that failed part-way now records the SKU of each line it had already added, so the retry no longer re-derives that SKU from the switch as it then stands.
+- The recorded SKU is compared with the same trimming as every other SKU comparison, so whitespace alone no longer drops the record for a line.
+- For a mixed-warehouse order the record is built from the exact lines sent, and a change that failed part-way stamps the warehouse the header was sent to (as a successful one already did).
+- Schema documentation: the new column's comment no longer sits on top of the line-snapshot column's.

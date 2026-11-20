@@ -922,6 +922,14 @@ async function snapshotMintsoftOrderItems(
   }
 }
 
+/** The line reconcile failed part-way: `addedSkus` are the SKUs of the lines it had already added to the warehouse order. */
+class MintsoftItemReconcileError extends Error {
+  constructor(message: string, readonly addedSkus: string[]) {
+    super(message)
+    this.name = 'MintsoftItemReconcileError'
+  }
+}
+
 /** Bring a NEW Mintsoft order's line items in line with the (refund-netted) desired set. */
 async function reconcileMintsoftOrderItems(externalOrderId: string, input: WmsOrderPushInput, clientId: number): Promise<void> {
   // Mintsoft item quantities are whole units. If any desired line is non-integer or
@@ -930,7 +938,9 @@ async function reconcileMintsoftOrderItems(externalOrderId: string, input: WmsOr
   if (input.lines.some((line) => !Number.isInteger(line.quantity) || line.quantity < 0)) return
 
   const plan = planMintsoftItemAmendments(await fetchMintsoftOrderItems(externalOrderId, clientId), input.lines)
+  const added: string[] = []
   const base = `/api/Order/${encodeURIComponent(externalOrderId)}/Items`
+  try {
   for (const amendment of plan) {
     let result
     if (amendment.kind === 'delete') {
@@ -949,6 +959,10 @@ async function reconcileMintsoftOrderItems(externalOrderId: string, input: WmsOr
       })
     }
     if (result.error) throw new Error(result.error)
+    if (amendment.kind === 'add') added.push(amendment.line.sku)
+  }
+  } catch (error) {
+    throw new MintsoftItemReconcileError(error instanceof Error ? error.message : String(error), added)
   }
 }
 
@@ -1092,7 +1106,7 @@ export async function updateMintsoftOrder(externalOrderId: string, input: WmsOrd
     try {
       await reconcileMintsoftOrderItems(externalOrderId, input, clientId)
     } catch (error) {
-      throw new WmsOrderUpdatePartialError(error instanceof Error ? error.message : String(error), applied)
+      throw new WmsOrderUpdatePartialError(error instanceof Error ? error.message : String(error), applied, error instanceof MintsoftItemReconcileError ? error.addedSkus : [])
     }
     // The amendment may have deleted, added or consolidated lines (new ids), so the stored line ids are re-read.
     const items = await snapshotMintsoftOrderItems(externalOrderId, clientId, input.lines, 'bySku')

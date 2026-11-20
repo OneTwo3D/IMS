@@ -112,7 +112,7 @@ export function parseSentLineSkus(value: unknown): SentLineSkus | undefined {
 export function sentSkuForLine(line: { id?: string | null; sku?: string | null; productId?: string | null }, remap: SkuRemap | undefined, recorded?: SentLineSkus): string {
   const own = line.sku ?? ''
   const sent = line.id && recorded ? recorded[line.id] : undefined
-  if (sent && sent.own === own) return sent.sent
+  if (sent && normaliseSkuForHold(sent.own) === normaliseSkuForHold(own)) return sent.sent
   const entry = line.productId && remap ? remap[line.productId] : undefined
   if (!entry) return own
   const snapshot = normaliseSkuForHold(own)

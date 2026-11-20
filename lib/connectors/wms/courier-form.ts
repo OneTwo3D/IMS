@@ -26,6 +26,8 @@ export class WmsOrderUpdatePartialError extends Error {
   constructor(
     message: string,
     readonly applied: { courierForm?: 'NAME' | 'LEGACY' | 'PLACEHOLDER'; courierFormName?: string | null; courierFallback?: boolean },
+    /** The SKU put on the wire for each line the failed line reconcile had ALREADY added to the warehouse order (the amendment's record of what was sent). */
+    readonly addedSkus: readonly string[] = [],
   ) {
     super(message)
     this.name = 'WmsOrderUpdatePartialError'
