@@ -340,8 +340,8 @@ export const WC_AMENDMENT_RECHECK_GATE = 'WC_AMENDMENT_RECHECK_EXHAUSTED'
 async function raiseRecheckExhausted(row: { orderId: string; externalOrderId: string; attempts: number; failedReads: number }): Promise<void> {
   const readsFailed = row.failedReads > 0
   const detail = readsFailed
-    ? `WooCommerce changed this order but IMS could not read it back from WooCommerce to compare (the last ${row.failedReads} live read(s) failed or timed out, with no successful read since), and has stopped retrying. IMS refunded and sent nothing: check the order in WooCommerce and decide.`
-    : `WooCommerce changed this order but IMS could not decide what to do (the warehouse state could not be read) ${row.attempts > 0 ? `after ${row.attempts} live re-read(s)` : 'before any live re-read could be made'}, and has stopped retrying. IMS refunded and sent nothing: check the order in WooCommerce and decide.`
+    ? `WooCommerce changed this order but IMS could not read it back from WooCommerce to compare (the last ${row.failedReads} live read(s) failed or timed out, with no successful read since), and has stopped retrying. IMS changed, refunded and sent nothing: check the order in WooCommerce and decide.`
+    : `WooCommerce changed this order but IMS could not decide what to do (the warehouse state could not be read) ${row.attempts > 0 ? `after ${row.attempts} live re-read(s)` : 'before any live re-read could be made'}, and has stopped retrying. IMS changed, refunded and sent nothing: check the order in WooCommerce and decide.`
   await recordRefusedAction(db, {
     entityType: REFUSED_ACTION_ENTITY_SALES_ORDER,
     entityId: row.orderId,
@@ -515,6 +515,9 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
         where: { orderId, resolvedAt: null },
         data: { resolvedAt: now, resolution: verdict.kind === 'not-comparable' ? `Not compared: ${verdict.reason}.` : 'A later WooCommerce delivery matched the IMS order again.' },
       })
+      // The order compares clean (or is not compared): the rewrite's and the paid-increase refusals no longer apply.
+      await resolveRefusedActions(db, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action: 'WC_ORDER_REWRITE' }, 'NO_LONGER_NEEDED').catch(() => undefined)
+      await resolveRefusedActions(db, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action: 'WC_ORDER_AMENDMENT', gate: 'WC_PAID_INCREASE' }, 'NO_LONGER_NEEDED').catch(() => undefined)
       // A REDUCTION WOOCOMMERCE UNDID leaves NO difference (the amendment refund changes neither the lines nor the stored total), so the write step would never run for it. Run it for an order that carries an amendment
       // refund, with no differences: it raises the "a person decides" task when WooCommerce shows more units than IMS holds after those refunds, and does nothing otherwise (off by default; never throws).
       if (verdict.kind === 'compared' && hasAmendmentRefund) await runStep([], 'restore')

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { applyWcOrderAmendment, planWcOrderAmendment, WC_PAID_INCREASE_GATE, WC_REWRITE_AFTER_PICKING_GATE, WC_REWRITE_REFUSED_GATE, type AmendmentDeps, type AmendmentFacts } from '@/lib/connectors/woocommerce/sync/order-amendment'
-import { planUnpaidRewrite, type RewriteInput, type RewriteOutcome, type RewritePlan, type RewriteRefusal } from '@/lib/connectors/woocommerce/sync/order-unpaid-rewrite'
+import { applyWcOrderAmendment, planWcOrderAmendment, wcChangedSinceBaseline, WC_PAID_INCREASE_GATE, WC_REWRITE_AFTER_PICKING_GATE, WC_REWRITE_REFUSED_GATE, type AmendmentDeps, type AmendmentFacts } from '@/lib/connectors/woocommerce/sync/order-amendment'
+import { invoiceEvidence, planUnpaidRewrite, type RewriteInput, type RewriteOutcome, type RewritePlan, type RewriteRefusal } from '@/lib/connectors/woocommerce/sync/order-unpaid-rewrite'
 import type { DivergenceDifference } from '@/lib/connectors/woocommerce/sync/order-divergence'
 import type { WcFullOrder } from '@/lib/connectors/woocommerce/sync/types'
 
@@ -305,11 +305,13 @@ test('PAID order, quantity UP: a task names the line and the difference; no refu
   assert.equal(calls.refunds, 0)
   assert.equal(calls.rewrites.length, 0)
   assert.equal(calls.tasks.length, 1)
-  assert.equal(calls.tasks[0]!.reason, 'WC_EDIT_AFTER_PICKING')
+  assert.equal(calls.tasks[0]!.reason, 'WC_PAID_INCREASE', 'its own reason: it is not a warehouse change')
   const text = String(calls.tasks[0]!.queryText)
   assert.match(text, /RED: quantity is 7 in WooCommerce against 5 in IMS \(2 more\)/)
   assert.match(text, /Order total \(including tax\) is 84\.00 in WooCommerce against 60\.00 in IMS \(24\.00 more\)/)
   assert.match(text, /IMS changed nothing/)
+  assert.match(text, /collect the difference/)
+  assert.doesNotMatch(text, /make the change there/, 'never tells the warehouse to apply it')
 })
 
 test('PAID order: an ADDED item and a HIGHER unit price are increases; a LOWER unit price is not', () => {
@@ -328,6 +330,7 @@ test('PAID increase, picking started: the same task path (nothing is sent), and 
   const picking = deps(facts({ paidAt: paid, status: 'PICKING' }), { writeOn: true })
   await applyWcOrderAmendment('o1', wcPaid(7), up, 'fp', picking.d)
   assert.equal(picking.calls.tasks.length, 1)
+  assert.equal(picking.calls.tasks[0]!.reason, 'WC_PAID_INCREASE', 'even when picking has started, an increase is never a "change it in the warehouse" task')
   assert.equal(picking.calls.refunds, 0)
 
   const noLink = deps(facts({ paidAt: paid }), { writeOn: true, hasLink: false })
@@ -349,4 +352,107 @@ test('PAID increase is raised once: the task dedupes on the lines, a repeat deli
   await applyWcOrderAmendment('o1', wcPaid(7), up, 'fp', d)
   assert.equal((await applyWcOrderAmendment('o1', wcPaid(7), up, 'fp', d)).kind, 'skipped')
   assert.equal(calls.tasks.length, 1)
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------------
+// R1 review: paid in WooCommerce, invoice evidence, latest edit wins, mutants
+// ---------------------------------------------------------------------------------------------------------------------------------------
+
+const wcPaidDate = (qty: number): WcFullOrder => ({ ...(wcPaid(qty) as object), date_paid_gmt: '2026-11-20T09:00:00' }) as unknown as WcFullOrder
+
+test('H1: paid in WooCommerce (a paid date) while IMS has no paid state: never rewritten; the increase is a task; with only the rewrite switch on nothing happens', async () => {
+  const { d, calls } = deps(facts({ paidAt: null }), { writeOn: true, rewriteOn: true })
+  await applyWcOrderAmendment('o1', wcPaidDate(7), up, 'fp', d)
+  assert.equal(calls.rewrites.length, 0)
+  assert.equal(calls.tasks.length, 1)
+  assert.equal(calls.tasks[0]!.reason, 'WC_PAID_INCREASE')
+  assert.equal(calls.refunds, 0, 'no refund: IMS has not recorded a payment')
+  const rewriteOnly = deps(facts({ paidAt: null }), { writeOn: false, rewriteOn: true })
+  assert.deepEqual(await applyWcOrderAmendment('o1', wcPaidDate(7), up, 'fp', rewriteOnly.d), { kind: 'off' })
+  assert.equal(rewriteOnly.calls.rewrites.length + rewriteOnly.calls.claims, 0)
+})
+
+test('H1: an open paid-block obligation counts as paid too (the receipt is still to be recorded at the gateway\'s total)', async () => {
+  const { d, calls } = deps(facts({ paidAt: null, paidBlockOpen: true }), { writeOn: true, rewriteOn: true })
+  await applyWcOrderAmendment('o1', wcPaid(7), up, 'fp', d)
+  assert.equal(calls.rewrites.length, 0)
+  assert.equal(calls.tasks[0]!.reason, 'WC_PAID_INCREASE')
+  const off = deps(facts({ paidAt: null, paidBlockOpen: true }), { writeOn: false, rewriteOn: true })
+  assert.deepEqual(await applyWcOrderAmendment('o1', wcPaid(7), up, 'fp', off.d), { kind: 'off' })
+})
+
+test('M5: every piece of invoice evidence is exactly one refusal, and nothing else is', () => {
+  const none: Parameters<typeof invoiceEvidence>[0] = { accountingInvoiceId: null, invoiceNumber: null, invoicedAt: null, salesInvoiceOwedAt: null, invoiceDocuments: 0, accountingSyncLogs: 0, heldInvoices: 0 }
+  assert.equal(invoiceEvidence(none), null)
+  const cases: Array<[Partial<Parameters<typeof invoiceEvidence>[0]>, RegExp]> = [
+    [{ accountingInvoiceId: 'x' }, /posted/], [{ accountingSyncLogs: 1 }, /queued or posted/], [{ heldInvoices: 1 }, /held/], [{ salesInvoiceOwedAt: new Date() }, /owed/],
+    [{ invoicedAt: new Date() }, /invoiced/], [{ invoiceNumber: 'INV-1' }, /invoiced/], [{ invoiceDocuments: 1 }, /document/],
+  ]
+  for (const [over, re] of cases) assert.match(invoiceEvidence({ ...none, ...over }) ?? '', re)
+})
+
+test('M2: an order edited in IMS is left alone quietly unless WooCommerce changed a line since the baseline', async () => {
+  const baseline = new Map([[77, 3]])
+  assert.equal(wcChangedSinceBaseline(wcOrder(), { baselineQtyByExternalLineId: baseline }), false, 'WooCommerce still shows what it showed at the IMS edit')
+  assert.equal(wcChangedSinceBaseline(wcOrder(), { baselineQtyByExternalLineId: new Map([[77, 5]]) }), true, 'a quantity changed')
+  assert.equal(wcChangedSinceBaseline(wcOrder(), { baselineQtyByExternalLineId: new Map([[77, 3], [78, 1]]) }), true, 'an item removed since')
+  assert.equal(wcChangedSinceBaseline(wcOrder(), { baselineQtyByExternalLineId: new Map() }), true, 'an item added since')
+  assert.equal(wcChangedSinceBaseline(wcOrder(), { baselineQtyByExternalLineId: null }), false, 'no baseline: IMS wins')
+  const quiet = deps(facts({ editedInImsAt: new Date(), baselineQtyByExternalLineId: baseline }))
+  const out = await applyWcOrderAmendment('o1', wcOrder(), diffs, 'fp', quiet.d)
+  assert.equal(out.kind, 'skipped')
+  assert.equal(quiet.calls.claims + quiet.calls.rewrites.length + quiet.calls.refusals.length + quiet.calls.gate, 0, 'no claim, no gate, no refused action')
+  const changed = deps(facts({ editedInImsAt: new Date(), baselineQtyByExternalLineId: new Map([[77, 5]]) }))
+  await applyWcOrderAmendment('o1', wcOrder(), diffs, 'fp', changed.d)
+  assert.equal(changed.calls.rewrites.length, 1, 'WooCommerce changed after the IMS edit: the rewrite decides (and refuses an IMS-edited order)')
+})
+
+test('M6: the nothing-differs early return acts on nothing (no claim, no gate, no rewrite)', async () => {
+  const { d, calls } = deps(facts())
+  const out = await applyWcOrderAmendment('o1', wcOrder(), [], 'fp', d)
+  assert.deepEqual(out, { kind: 'skipped', reason: 'nothing differs' })
+  assert.equal(calls.claims + calls.gate + calls.rewrites.length, 0)
+})
+
+test('M6: latest edit wins on a paid quantity increase (IMS wins when WooCommerce is unchanged since the baseline)', () => {
+  const edited = new Date('2026-11-19T09:00:00Z')
+  assert.equal(planWcOrderAmendment(wcPaid(7), up, facts({ paidAt: paid, editedInImsAt: edited, baselineQtyByExternalLineId: new Map([[77, 7]]) })).increases.length, 0, 'baseline equals WooCommerce: IMS edit stands')
+  assert.equal(planWcOrderAmendment(wcPaid(7), up, facts({ paidAt: paid, editedInImsAt: edited, baselineQtyByExternalLineId: new Map([[77, 5]]) })).increases.length >= 1, true)
+})
+
+test('M6: the WC_PAID_INCREASE refusal is resolved when a paid order no longer shows an increase, and not while it does', async () => {
+  const none = deps(facts({ paidAt: paid }), { writeOn: true })
+  await applyWcOrderAmendment('o1', wcPaid(3), diffs, 'fp', none.d)
+  assert.ok(none.calls.resolved.includes(WC_PAID_INCREASE_GATE))
+  assert.ok(none.calls.resolved.includes(WC_REWRITE_REFUSED_GATE), 'a paid order has left the rewrite\'s scope')
+  const some = deps(facts({ paidAt: paid }), { writeOn: true })
+  await applyWcOrderAmendment('o1', wcPaid(7), up, 'fp', some.d)
+  assert.equal(some.calls.resolved.includes(WC_PAID_INCREASE_GATE), false)
+})
+
+test('M6: the tax-total check (items + shipping tax against WooCommerce\'s tax total) refuses on its own, with the tax lines agreeing with the total', () => {
+  const r = refused(planUnpaidRewrite(input({ totalTax: '6.30', total: '35.30', taxLines: [{ tax_total: '5.50', shipping_tax_total: '0.80' }] })))
+  assert.equal(r.code, 'TAX_MISMATCH')
+  assert.match(r.detail, /items' and shipping's tax/)
+})
+
+test('M6: tax total with no tax lines; duplicate WooCommerce item ids; a mapped line that is not the payload item', () => {
+  const noLines = refused(planUnpaidRewrite(input({ taxLines: [] })))
+  assert.equal(noLines.code, 'TAX_MISMATCH')
+  assert.match(noLines.detail, /no tax lines/)
+  const dup = refused(planUnpaidRewrite(input({ items: [A, { ...B, id: A.id }] })))
+  assert.equal(dup.code, 'BAD_LINE')
+  const base = input()
+  const swapped = refused(planUnpaidRewrite({ ...base, mapped: [{ ...base.mapped[0]!, externalLineItemId: 99 }, base.mapped[1]!] }))
+  assert.equal(swapped.code, 'BAD_LINE')
+  const zeroQty = refused(planUnpaidRewrite({ ...base, mapped: [{ ...base.mapped[0]!, qty: 0 }, base.mapped[1]!] }))
+  assert.equal(zeroQty.code, 'BAD_LINE')
+})
+
+test('M3: a continued line whose product changed has its live pegs ended before the update (source pin; the peg service is exercised by its own tests)', async () => {
+  const { readFile } = await import('node:fs/promises')
+  const src = await readFile('lib/connectors/woocommerce/sync/order-unpaid-rewrite.ts', 'utf8')
+  const pegs = src.indexOf('recordPegsRemovedWithLines(tx, { salesOrderLineIds: productChangedIds }')
+  const update = src.indexOf('await tx.salesOrderLine.update({ where: { id: lineId }')
+  assert.ok(pegs > 0 && update > pegs, 'pegs of product-changed lines are ended before the lines are updated')
 })

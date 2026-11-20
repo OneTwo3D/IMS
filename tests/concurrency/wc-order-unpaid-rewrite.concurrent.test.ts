@@ -38,7 +38,7 @@ async function loadDb() {
 const ADDRESS = { first_name: 'A', last_name: 'B', company: '', address_1: '1 St', address_2: '', city: 'Leeds', state: '', postcode: 'LS1 1AA', country: 'GB', email: 'a@b.c', phone: '' }
 
 type Spec = { id: number; sku: string; qty: number; unit: number; discount?: number }
-type Over = { specs: Spec[]; shipping?: number; at: string; taxDelta?: number }
+type Over = { specs: Spec[]; shipping?: number; at: string; taxDelta?: number; paidAt?: string }
 const two = (n: number) => n.toFixed(2)
 
 // 20% VAT on every line and on the shipping. WooCommerce's figures: line total = subtotal - discount; tax = 20% of the line total.
@@ -58,7 +58,7 @@ function payload(externalId: number, wcRateId: number, o: Over) {
   return {
     id: externalId, number: String(externalId), order_key: `wc_order_${externalId}`, status: 'processing', currency: 'GBP',
     prices_include_tax: false, customer_note: '', customer_id: 0, payment_method: 'bacs', payment_method_title: 'Bank', transaction_id: '',
-    date_paid_gmt: null, date_created: '2026-11-02T09:00:00', date_created_gmt: '2026-11-02T09:00:00', date_modified: o.at, date_modified_gmt: o.at,
+    date_paid_gmt: o.paidAt ?? null, date_created: '2026-11-02T09:00:00', date_created_gmt: '2026-11-02T09:00:00', date_modified: o.at, date_modified_gmt: o.at,
     billing: ADDRESS, shipping: ADDRESS, meta_data: [],
     line_items: lines, fee_lines: [],
     tax_lines: [{ id: 21, rate_code: 'GB-VAT-1', rate_id: wcRateId, label: 'VAT', compound: false, tax_total: two(lineTax), shipping_tax_total: two(shipTax), meta_data: [] }],
@@ -95,6 +95,7 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
     orderId ??= (await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } }))?.orderId
     if (orderId) {
       await db.refusedAction.deleteMany({ where: { entityId: orderId } })
+      await db.shoppingSyncLog.deleteMany({ where: { entityId: orderId } })
       await db.wmsOperatorTask.deleteMany({ where: { orderId } })
       await db.wmsOrderPushLink.deleteMany({ where: { orderId } })
       await db.wcOrderDivergence.deleteMany({ where: { orderId } })
@@ -126,13 +127,21 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
     const result = await mod.importWcOrder(payload(externalId, wcRateId, o) as never)
     assert.equal(result.success, true, `delivery succeeded: ${JSON.stringify(result)}`)
     orderId ??= (await db.shoppingOrderLink.findFirstOrThrow({ where: { connector: 'woocommerce', externalOrderId: String(externalId) }, select: { orderId: true } })).orderId
+    // A processing order imported without a WooCommerce invoice number carries a HELD sales invoice and an "owed" mark (real invoice evidence: the rewrite refuses it). These tests model an order with no invoice
+    // behind it (pending payment); `keepInvoice` leaves what the import wrote.
+    if (!state.keepInvoice) await clearInvoiceTraces()
     return orderId
+  }
+  const state = { keepInvoice: false }
+  const clearInvoiceTraces = async () => {
+    await db.shoppingSyncLog.deleteMany({ where: { entityType: 'SalesOrder', entityId: orderId!, connector: 'woocommerce', recordKind: { not: null } } })
+    await db.salesOrder.update({ where: { id: orderId! }, data: { salesInvoiceOwedAt: null } })
   }
   const lines = () => db.salesOrderLine.findMany({ where: { orderId: orderId! }, orderBy: { externalLineItemId: 'asc' } })
   const order = () => db.salesOrder.findUniqueOrThrow({ where: { id: orderId! } })
   const refusals = () => db.refusedAction.findMany({ where: { entityId: orderId!, resolvedAt: null } })
   const rewrittenCount = () => db.activityLog.count({ where: { entityId: orderId!, action: 'wc_order_unpaid_rewritten' } })
-  return { db, mod, div, rewriteMod, tag, setSwitch, deliver, lines, order, refusals, rewrittenCount, makeProduct, payload: (o: Over) => payload(externalId, wcRateId, o), get orderId() { return orderId! }, externalId }
+  return { db, mod, div, rewriteMod, tag, state, clearInvoiceTraces, setSwitch, deliver, lines, order, refusals, rewrittenCount, makeProduct, payload: (o: Over) => payload(externalId, wcRateId, o), get orderId() { return orderId! }, externalId }
 }
 
 const T1 = '2026-11-20T10:00:01'
@@ -325,6 +334,7 @@ test('[paid increase] an increase on a PAID order raises a task naming the lines
   await f.deliver({ specs: [{ id: 1, sku: a, qty: 5, unit: 10 }], at: T3 })
   const tasks = await f.db.wmsOperatorTask.findMany({ where: { orderId: f.orderId } })
   assert.equal(tasks.length, 1)
+  assert.equal(tasks[0]!.reason, 'WC_PAID_INCREASE')
   assert.match(tasks[0]!.queryText, /quantity is 5 in WooCommerce against 2 in IMS \(3 more\)/)
   assert.match(tasks[0]!.queryText, /Order total \(including tax\) is .* in WooCommerce against .* in IMS/)
   const l = await f.lines()
@@ -333,6 +343,80 @@ test('[paid increase] an increase on a PAID order raises a task naming the lines
   assert.equal(await f.db.salesOrderRefund.count({ where: { orderId: f.orderId } }), 0)
   await f.deliver({ specs: [{ id: 1, sku: a, qty: 5, unit: 10 }], at: T4 })
   assert.equal(await f.db.wmsOperatorTask.count({ where: { orderId: f.orderId } }), 1, 'raised once')
+})
+
+test('[H1] paid in WooCommerce but not yet in IMS (a paid date on the payload; the receipt waits in a paid-block): lines changed, the order is NOT rewritten and the increase is a task', { skip }, async (t) => {
+  const f = await fixture(t)
+  const a = await f.makeProduct('A')
+  await f.setSwitch(SW.divergence, true)
+  await f.setSwitch(SW.rewrite, true)
+  await f.setSwitch(SW.write, true)
+  await f.deliver({ specs: [{ id: 1, sku: a, qty: 2, unit: 10 }], at: T1 })
+  await f.db.wmsOrderPushLink.create({ data: { orderId: f.orderId, connector: 'mintsoft', externalOrderId: 'MS-RW3', externalOrderNumber: 'W-RW3', state: 'SYNCED' } })
+  // WooCommerce shows the order PAID at a higher total (qty 5): IMS records no payment (the total differs, a paid-block obligation is written), paidAt stays null.
+  await f.deliver({ specs: [{ id: 1, sku: a, qty: 5, unit: 10 }], at: T2, paidAt: '2026-11-20T09:30:00' })
+  const o = await f.order()
+  assert.equal(o.paidAt, null, 'IMS has not recorded the payment')
+  assert.equal(Number((await f.lines())[0]!.qty), 2, 'NOT rewritten up under the paid-block retry')
+  assert.equal(await f.rewrittenCount(), 0)
+  assert.equal(await f.rewriteMod.hasOpenPaidBlock(f.db, String(f.externalId)), true, 'the paid-block obligation is open')
+  const tasks = await f.db.wmsOperatorTask.findMany({ where: { orderId: f.orderId } })
+  assert.equal(tasks.length, 1)
+  assert.equal(tasks[0]!.reason, 'WC_PAID_INCREASE')
+  // The rewrite itself, called directly under its lock, also refuses to act: a paid date on the payload, and an open obligation without one.
+  const direct = (p: unknown) => f.rewriteMod.rewriteUnpaidOrderFromWc(f.orderId, p as never, 'MS-RW3')
+  assert.equal((await direct(f.payload({ specs: [{ id: 1, sku: a, qty: 6, unit: 10 }], at: T3, paidAt: '2026-11-20T09:30:00' }))).kind, 'skipped')
+  assert.equal((await direct(f.payload({ specs: [{ id: 1, sku: a, qty: 6, unit: 10 }], at: T3 }))).kind, 'skipped', 'the open paid-block alone is enough')
+  assert.equal(Number((await f.lines())[0]!.qty), 2)
+  await f.db.shoppingSyncLog.deleteMany({ where: { connector: 'woocommerce', entityType: 'SalesOrder', externalId: String(f.externalId) } })
+})
+
+test('[M1] an order imported as processing carries a held invoice and an owed mark: the rewrite refuses it as INVOICED (the realistic case)', { skip }, async (t) => {
+  const f = await fixture(t)
+  const a = await f.makeProduct('A')
+  f.state.keepInvoice = true
+  await f.setSwitch(SW.divergence, true)
+  await f.setSwitch(SW.rewrite, true)
+  await f.deliver({ specs: [{ id: 1, sku: a, qty: 2, unit: 10 }], at: T1 })
+  const o = await f.order()
+  const held = await f.db.shoppingSyncLog.count({ where: { entityType: 'SalesOrder', entityId: f.orderId, recordKind: { not: null } } })
+  assert.equal(held > 0 || o.salesInvoiceOwedAt !== null, true, 'the import left invoice evidence')
+  const out = await f.rewriteMod.rewriteUnpaidOrderFromWc(f.orderId, f.payload({ specs: [{ id: 1, sku: a, qty: 3, unit: 10 }], at: T2 }) as never, null)
+  assert.equal(out.kind === 'refused' && out.code, 'INVOICED')
+  assert.equal(Number((await f.lines())[0]!.qty), 2)
+})
+
+test('[M5] each piece of invoice evidence refuses the rewrite as INVOICED, exactly', { skip }, async (t) => {
+  const f = await fixture(t)
+  const a = await f.makeProduct('A')
+  await f.setSwitch(SW.divergence, true)
+  await f.deliver({ specs: [{ id: 1, sku: a, qty: 2, unit: 10 }], at: T1 })
+  const edit = f.payload({ specs: [{ id: 1, sku: a, qty: 3, unit: 10 }], at: T2 })
+  const direct = () => f.rewriteMod.rewriteUnpaidOrderFromWc(f.orderId, edit as never, null)
+  const code = (o: Awaited<ReturnType<typeof direct>>) => (o.kind === 'refused' ? o.code : o.kind)
+  // Clear what the import left, so the cases below start from a rewritable order.
+  await f.db.salesOrder.update({ where: { id: f.orderId }, data: { salesInvoiceOwedAt: null, invoicedAt: null, invoiceNumber: null, accountingInvoiceId: null } })
+  await f.db.accountingSyncLog.deleteMany({ where: { referenceId: f.orderId } })
+  const upd = (data: Record<string, unknown>) => () => f.db.salesOrder.update({ where: { id: f.orderId }, data })
+  const cases: Array<[string, () => Promise<unknown>, () => Promise<unknown>]> = [
+    ['accountingInvoiceId', upd({ accountingInvoiceId: 'INV-X' }), upd({ accountingInvoiceId: null })],
+    ['SYNCED log', () => f.db.accountingSyncLog.create({ data: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: f.orderId, status: 'SYNCED', externalTransactionId: 'X-1', payload: {} } }), () => f.db.accountingSyncLog.deleteMany({ where: { referenceId: f.orderId } })],
+    ['invoiceNumber', upd({ invoiceNumber: 'INV-1' }), upd({ invoiceNumber: null })],
+    ['invoicedAt', upd({ invoicedAt: new Date() }), upd({ invoicedAt: null })],
+    ['salesInvoiceOwedAt', upd({ salesInvoiceOwedAt: new Date() }), upd({ salesInvoiceOwedAt: null })],
+    ['invoice document', () => f.db.salesOrderInvoiceDocument.create({ data: { orderId: f.orderId, kind: 'INVOICE', connector: 'woocommerce', externalDocumentId: `D-${f.tag}`, documentNumber: 'D1', externalStatus: 'x', sha256: f.tag, byteSize: 1, storedPath: 'x' } }), () => f.db.salesOrderInvoiceDocument.deleteMany({ where: { orderId: f.orderId } })],
+  ]
+  try {
+    for (const [name, set, clear] of cases) {
+      await set()
+      assert.equal(code(await direct()), 'INVOICED', name)
+      await clear()
+    }
+    assert.equal(Number((await f.lines())[0]!.qty), 2, 'nothing was written by any refusal')
+    assert.equal(code(await direct()), 'rewritten', 'with no evidence the same edit rewrites')
+  } finally {
+    await f.db.salesOrderInvoiceDocument.deleteMany({ where: { orderId: f.orderId } })
+  }
 })
 
 // ---- o3d-hu8g9: the recheck drain ----

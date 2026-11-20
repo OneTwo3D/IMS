@@ -38,7 +38,7 @@ export const REFUSED_ACTIONS = {
   WMS_ASN_SUPPLIER: { label: 'ASN not created: supplier not mapped in the warehouse', gates: ['WMS_SUPPLIER_UNMAPPED'] },
   /** A transfer's dispatch was cancelled in IMS and its warehouse ASN closed here: a person must ask the warehouse to cancel it (IMS writes nothing to the warehouse). Closes only when an operator presses Done (nothing in IMS can see the warehouse's ASN state). */
   WMS_ASN_CANCEL_REQUEST: { label: 'Ask the warehouse to cancel an ASN', gates: ['WMS_ASN_CANCEL_NOT_CONFIRMED'] },
-  /** A paid order WooCommerce changed that IMS could not decide about (the warehouse state stayed unreadable through every live re-read). Nothing was refunded or sent; a person decides. */
+  /** An order WooCommerce changed that IMS could not compare or decide about (live reads kept failing, or the warehouse state stayed unreadable through every live re-read), or a PAID order WooCommerce increased (WC_PAID_INCREASE: no warehouse order to carry the task). Nothing was changed, refunded or sent; a person decides. */
   WC_ORDER_AMENDMENT: { label: 'WooCommerce order change not acted on: IMS could not decide', gates: ['WC_AMENDMENT_RECHECK_EXHAUSTED', 'WC_PAID_INCREASE'] },
   /** An UNPAID order edited in WooCommerce that IMS could not rewrite exactly (an unknown SKU, a tax or total mismatch, a currency difference, ...), or that was edited after picking with no warehouse order to carry a task. Nothing was written; a person decides. */
   WC_ORDER_REWRITE: { label: 'WooCommerce order edit not applied: IMS could not take it exactly', gates: ['WC_REWRITE_REFUSED', 'WC_REWRITE_AFTER_PICKING'] },

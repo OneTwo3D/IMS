@@ -1142,7 +1142,7 @@ export function SyncClient({ settings: init, statusMappings, logs, shoppingCrede
               <input type="checkbox" checked={s.wc_order_amendment_write_enabled === 'true'} onChange={(e) => setS({ ...s, wc_order_amendment_write_enabled: e.target.checked ? 'true' : 'false' })} className="mt-1 rounded border-input" />
               <div>
                 <span className="text-sm font-medium">Act on orders reduced in WooCommerce</span>
-                <p className="text-xs text-muted-foreground">Off by default; needs the report above to be on. Latest edit wins, line by line. When a PAID order is reduced in WooCommerce, IMS records the reduction through the refund path (credit note, stock released) and never edits the paid amount. When the warehouse has started picking, IMS sends nothing and raises a warehouse task instead. A paid order that is INCREASED in WooCommerce (more units, an added item, a higher price) is not changed in IMS: a warehouse task names the lines and the difference. Other differences stay on the exceptions list.</p>
+                <p className="text-xs text-muted-foreground">Off by default; needs the report above to be on. Latest edit wins, line by line. When a PAID order is reduced in WooCommerce, IMS records the reduction through the refund path (credit note, stock released) and never edits the paid amount. When the warehouse has started picking, IMS sends nothing and raises a warehouse task instead. A paid order that is INCREASED in WooCommerce (more units, an added item, a higher price) is not changed in IMS: an operator task names the lines and the difference. Other differences stay on the exceptions list.</p>
               </div>
             </label>
 

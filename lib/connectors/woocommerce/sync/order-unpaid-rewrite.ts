@@ -12,7 +12,8 @@
  *     return behind it. A later delivery tries again (a product created in the meantime, a corrected tax mapping).
  *   - THE SAME LOCK, RELEASE AND RE-RESERVE AS AN IMS EDIT. One transaction under the order row lock: the stock reservations are released, continued lines are updated in place (matched on the
  *     WooCommerce item id, so a later itemised refund still finds them), removed lines are deleted, added lines created, the money written, the stock re-reserved. The order's `updatedAt` moves
- *     (an ordinary Prisma update), which is what makes it an amend candidate of the warehouse push sweep (order-push-sweep.ts `updatableLinks`); the sweep decides what is sent.
+ *     (an ordinary Prisma update), which makes it an amend candidate of the warehouse push sweep (order-push-sweep.ts `updatableLinks`) should a warehouse order exist; an unpaid order normally has none yet
+ *     (the push waits for payment), so there is usually nothing to amend, and the draft (pending) shipments drawn from the released reservations are retired with them.
  *   - IT NEVER TOUCHES A PAID ORDER (that is the refund path of order-amendment.ts), NEVER WRITES TO WOOCOMMERCE (no line or total writeback exists: WooCommerce stays authoritative), and is never
  *     asked at or after picking (order-amendment.ts asks the warehouse gate first and raises the operator task instead).
  *
@@ -26,6 +27,7 @@ import { lockSalesOrder, allocateSalesOrder, releaseOrderAllocationsForDeallocat
 import { recordPegsRemovedWithLines } from '@/lib/domain/sales/peg-service'
 import { lockOrderNamedTaxRate, resolveLinesTaxRates } from '@/lib/tax/writable-tax-rate'
 import { Prisma } from '@/app/generated/prisma/client'
+import { heldSalesInvoiceQueueWhere } from './held-sales-invoice'
 import type { MappedLine } from './field-mapping'
 import type { WcFullOrder } from './types'
 
@@ -272,6 +274,30 @@ export type RewriteOutcome =
   /** Nothing was done and nothing is wrong with the order: it is not (or no longer) an unpaid order the rewrite applies to, or the warehouse order moved while it was being checked. */
   | { kind: 'skipped'; reason: string; retry?: true }
 
+/** WooCommerce says the order is paid (a paid date), whatever IMS has recorded so far. */
+export function wcSaysPaid(wcOrder: Pick<WcFullOrder, 'date_paid_gmt'>): boolean {
+  return typeof wcOrder.date_paid_gmt === 'string' && wcOrder.date_paid_gmt.trim() !== ''
+}
+
+/** An open (pending or given-up) paid-block obligation for this WooCommerce order: the receipt is still to be recorded at the total the gateway charged. */
+export async function hasOpenPaidBlock(client: Pick<typeof db, 'shoppingSyncLog'>, externalOrderId: string): Promise<boolean> {
+  // The paid-block obligation is a row of the pending-FX family (it carries the order's payload and a `paidBlock` marker); a block that gave up is FAILED and still means the receipt was never recorded.
+  const { pendingFxQueueWhere } = await import('./order-import')
+  const rows = await client.shoppingSyncLog.findMany({ where: { ...pendingFxQueueWhere(externalOrderId), status: { in: ['PENDING', 'FAILED'] } }, select: { payload: true } })
+  return rows.some((r) => typeof r.payload === 'object' && r.payload !== null && (r.payload as { paidBlock?: unknown }).paidBlock !== undefined)
+}
+
+/** What says an invoice already exists (or is owed) for the order, so the rewrite refuses: pure, so each piece of evidence is pinned. Null when there is none. */
+export function invoiceEvidence(o: { accountingInvoiceId: string | null; invoiceNumber: string | null; invoicedAt: Date | null; salesInvoiceOwedAt: Date | null; invoiceDocuments: number; accountingSyncLogs: number; heldInvoices: number }): string | null {
+  if (o.accountingInvoiceId) return 'an accounting invoice is posted for the order'
+  if (o.accountingSyncLogs > 0) return 'an accounting entry is queued or posted for the order'
+  if (o.heldInvoices > 0) return 'a sales invoice is held for the order'
+  if (o.salesInvoiceOwedAt !== null) return 'a sales invoice is owed for the order'
+  if (o.invoicedAt !== null || o.invoiceNumber) return 'the order has been invoiced'
+  if (o.invoiceDocuments > 0) return 'an invoice document exists for the order'
+  return null
+}
+
 const NO_PICKING_YET = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED'])
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -295,7 +321,7 @@ export async function rewriteUnpaidOrderFromWc(orderId: string, wcOrder: WcFullO
         where: { id: orderId },
         select: {
           id: true, status: true, isQuote: true, erasedAt: true, currency: true, fxRateToBase: true, paidAt: true, unregisteredPaidAt: true, storeCreditForeign: true, discountModel: true, editedInImsAt: true,
-          totalForeign: true, shippingForeign: true, taxForeign: true, discountAmount: true, accountingInvoiceId: true, invoiceNumber: true, refundStatus: true, orderNumber: true,
+          totalForeign: true, shippingForeign: true, taxForeign: true, discountAmount: true, accountingInvoiceId: true, invoiceNumber: true, invoicedAt: true, salesInvoiceOwedAt: true, refundStatus: true, orderNumber: true,
           _count: { select: { allocations: true, shipments: true, shoppingLinks: true, lines: true, refunds: true, returnExpectations: true, payments: true, invoiceDocuments: true } },
           wmsOrderPush: { select: { externalOrderId: true } },
           lines: { select: { id: true, externalLineItemId: true, productId: true, sku: true, qty: true, unitPriceForeign: true, discountAmount: true, taxForeign: true, totalForeign: true, taxRateId: true }, orderBy: { id: 'asc' } },
@@ -303,6 +329,9 @@ export async function rewriteUnpaidOrderFromWc(orderId: string, wcOrder: WcFullO
       })
       if (!current || current.erasedAt || current.isQuote) return { kind: 'skipped', reason: 'the order is erased, a quote or gone' }
       if (current.paidAt !== null || current.unregisteredPaidAt !== null || current._count.payments > 0) return { kind: 'skipped', reason: 'the order is paid: a paid order is never rewritten' }
+      // PAID IN WOOCOMMERCE counts as paid even when IMS has not recorded it yet (a post-payment edit seen after a missed webhook; a receipt that could not be recorded and waits in a paid-block obligation): the
+      // receipt is registered at the TOTAL THE GATEWAY CHARGED, so the order must not be rewritten under it.
+      if (wcSaysPaid(wcOrder) || await hasOpenPaidBlock(tx, String(wcOrder.id))) return { kind: 'skipped', reason: 'WooCommerce shows the order as paid (or its receipt is still to be recorded): a paid order is never rewritten' }
       if (!NO_PICKING_YET.has(current.status)) return { kind: 'skipped', reason: `the order is ${current.status}` }
       if ((current.wmsOrderPush?.externalOrderId ?? null) !== expectedWarehouseOrderId) {
         return { kind: 'skipped', retry: true, reason: 'the warehouse order changed while the warehouse state was being checked' }
@@ -317,6 +346,10 @@ export async function rewriteUnpaidOrderFromWc(orderId: string, wcOrder: WcFullO
         tx.shipment.count({ where: { orderId, status: { not: 'PENDING' } } }),
         tx.shipment.count({ where: { orderId, status: 'SHIPPED' } }),
       ])
+      // INVOICE EVIDENCE FIRST (so it is reported as such, not as the edit rule's generic block): any invoice, held invoice, owed invoice or accounting entry refuses (an update of a posted invoice is not built).
+      const heldInvoices = await tx.shoppingSyncLog.count({ where: heldSalesInvoiceQueueWhere({ salesOrderId: orderId }) })
+      const evidence = invoiceEvidence({ accountingInvoiceId: current.accountingInvoiceId, invoiceNumber: current.invoiceNumber, invoicedAt: current.invoicedAt, salesInvoiceOwedAt: current.salesInvoiceOwedAt, invoiceDocuments: current._count.invoiceDocuments, accountingSyncLogs, heldInvoices })
+      if (evidence) return { kind: 'refused', code: 'INVOICED', detail: `${evidence}, and IMS does not rewrite an order that has one (it would have to update the posted document)` }
       const block = resolveSalesOrderEditBlock({
         status: current.status, allocations: current._count.allocations, shipments: current._count.shipments, committedShipments, shippedShipments, accountingInvoiceId: current.accountingInvoiceId,
         wmsPush: current.wmsOrderPush !== null, hasExternalSource: current._count.shoppingLinks > 0, erased: false, payments: current._count.payments, paid: false,
@@ -324,9 +357,6 @@ export async function rewriteUnpaidOrderFromWc(orderId: string, wcOrder: WcFullO
         refundStatus: current.refundStatus, returnExpectations: current._count.returnExpectations, invoiceNotPosted: unpostedInvoices > 0, productlessLines,
       })
       if (block) return { kind: 'refused', code: 'BLOCKED', detail: block.reason }
-      if (current.accountingInvoiceId || accountingSyncLogs > 0 || current.invoiceNumber || current._count.invoiceDocuments > 0) {
-        return { kind: 'refused', code: 'INVOICED', detail: 'an invoice or accounting entry already exists for the order, and IMS does not rewrite an order that has one (it would have to update the posted document)' }
-      }
 
       // THE IMPORTER'S OWN MAPPING of the payload (reads only): the same product match, the same per-line tax resolution, the same coupon classification as the creating import.
       const importer = await import('./order-import')
@@ -364,6 +394,9 @@ export async function rewriteUnpaidOrderFromWc(orderId: string, wcOrder: WcFullO
         await recordPegsRemovedWithLines(tx, { salesOrderLineIds: plan.lines.deleteIds }, null)
         await tx.salesOrderLine.deleteMany({ where: { orderId, id: { in: plan.lines.deleteIds } } })
       }
+      // A continued line whose PRODUCT changed keeps its row but not the pegs (a peg ties a sales line to a purchase line for the old product): they are ended, as for a removed line.
+      const productChangedIds = plan.lines.update.filter((l) => l.productChanged).map((l) => l.lineId)
+      if (productChangedIds.length > 0) await recordPegsRemovedWithLines(tx, { salesOrderLineIds: productChangedIds }, null)
       for (const { lineId, productChanged, data } of plan.lines.update) {
         await tx.salesOrderLine.update({ where: { id: lineId }, data: { ...data, ...(productChanged ? { fulfillmentRequirements: Prisma.DbNull } : {}) } })
       }
