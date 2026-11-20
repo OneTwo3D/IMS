@@ -109,6 +109,12 @@ async function seedAsn(db: Ctx['db'], s: Seed) {
 }
 
 async function cleanup(db: Ctx['db'], s: Seed) {
+  // The run rows go too: the despatch-date floor reads the LATEST inventory_snapshot_runs row, so one left behind for today
+  // would move every later despatch test in this database.
+  const labels = Array.from({ length: 9 }, (_, daysAgo) => new Date(`${dayLabel(daysAgo)}T00:00:00.000Z`))
+  await db.inventorySnapshotRun.deleteMany({ where: { snapshotDate: { in: labels } } })
+  await db.inventoryReservationSnapshotRun.deleteMany({ where: { snapshotDate: { in: labels } } })
+  await db.inventoryReservationSnapshot.deleteMany({ where: { snapshotDate: { in: labels }, productId: s.productId } })
   await db.inventoryTransitSnapshot.deleteMany({ where: { transferId: s.transferId } })
   await db.stockTransferTransitRevaluation.deleteMany({ where: { transferLineId: s.lineId } })
   await db.wmsAsnLineMap.deleteMany({ where: { productId: s.productId } })
