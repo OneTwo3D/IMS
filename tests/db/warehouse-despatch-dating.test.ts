@@ -46,14 +46,14 @@ const DAY = 86_400_000
 const daysAgo = (days: number) => new Date(Date.now() - days * DAY)
 
 /** An order of `ordered` units, `shipQty` of them on one PACKED shipment, allocated 10 days ago, the order itself created 20 days ago. */
-async function seed(tx: Tx, opts: { ordered?: number; shipQty?: number; sku?: string } = {}) {
+async function seed(tx: Tx, opts: { ordered?: number; shipQty?: number; sku?: string; layerReceivedDaysAgo?: number } = {}) {
   const suffix = randomUUID().slice(0, 8)
   const ordered = opts.ordered ?? 3
   const shipQty = opts.shipQty ?? ordered
   const product = await tx.product.create({ data: { sku: opts.sku ?? `WD-${suffix}`, name: `wd ${suffix}`, type: 'SIMPLE' }, select: { id: true, sku: true } })
   const wh = await tx.warehouse.create({ data: { code: `WD${suffix}`, name: `wd ${suffix}` }, select: { id: true } })
   await tx.stockLevel.create({ data: { productId: product.id, warehouseId: wh.id, quantity: D(10), reservedQty: D(shipQty) } })
-  await tx.costLayer.create({ data: { productId: product.id, warehouseId: wh.id, receivedQty: D(10), remainingQty: D(10), unitCostBase: D(3), receivedAt: daysAgo(40) } })
+  await tx.costLayer.create({ data: { productId: product.id, warehouseId: wh.id, receivedQty: D(10), remainingQty: D(10), unitCostBase: D(3), receivedAt: daysAgo(opts.layerReceivedDaysAgo ?? 40) } })
   const order = await tx.salesOrder.create({
     data: {
       orderNumber: `WD-${suffix}`, status: 'ALLOCATED', currency: 'GBP', fxRateToBase: D(1), createdAt: daysAgo(20),
@@ -87,6 +87,11 @@ async function booked(tx: Tx, fx: Awaited<ReturnType<typeof seed>>) {
   const movements = await tx.stockMovement.findMany({ where: { productId: fx.productId, type: 'SALE_DISPATCH' }, select: { id: true, createdAt: true } })
   const cogs = await tx.cogsEntry.findMany({ where: { movementId: { in: movements.map((m: { id: string }) => m.id) } }, select: { createdAt: true } })
   return { shipmentAt: shipment.shippedAt as Date, orderAt: order.shippedAt as Date, orderStatus: order.status as string, movementAt: movements.map((m: { createdAt: Date }) => m.createdAt), cogsAt: cogs.map((c: { createdAt: Date }) => c.createdAt) }
+}
+
+async function setLock(tx: Tx, day: string, readAt: string) {
+  await tx.setting.upsert({ where: { key: 'xero_books_lock_date' }, create: { key: 'xero_books_lock_date', value: day }, update: { value: day } })
+  await tx.setting.upsert({ where: { key: 'xero_books_lock_date_read_at' }, create: { key: 'xero_books_lock_date_read_at', value: readAt }, update: { value: readAt } })
 }
 
 test('[db] a despatch is booked at the warehouse time on the shipment, the stock movement, its COGS entries and the order flip (o3d-hqvrp.114)', { skip }, async () => {
@@ -156,7 +161,7 @@ test('[db] a locked accounting period is not re-opened: the despatch moves to th
   await withRollback(async (tx) => {
     const fx = await seed(tx)
     const lockDay = new Date(daysAgo(3)).toISOString().slice(0, 10)
-    await tx.setting.upsert({ where: { key: 'xero_books_lock_date' }, create: { key: 'xero_books_lock_date', value: lockDay }, update: { value: lockDay } })
+    await setLock(tx, lockDay, new Date().toISOString())
     const result = await dispatch(tx, fx, daysAgo(5))
     const b = await booked(tx, fx)
     assert.equal(result.despatchInstant?.adjustedFor, 'LOCKED_PERIOD')
@@ -194,5 +199,70 @@ test('[db] a kit order is not comparable (the warehouse and IMS list kits in dif
     await tx.product.update({ where: { id: fx.productId }, data: { type: 'KIT' } })
     const verdict = await findDespatchQuantityMismatch({ orderId: fx.orderId, wmsWarehouseId: fx.warehouseId, wmsQuantities: [{ sku: 'COMPONENT-X', qty: 4 }] }, tx)
     assert.equal(verdict.status, 'NOT_COMPARABLE')
+  })
+})
+
+test('[db] o3d-yw405 MED5: COGS is never dated before the receipt of the FIFO layer it consumes (movement, COGS, shipment and order flip move to the receipt)', { skip }, async () => {
+  await withRollback(async (tx) => {
+    // The stock this despatch consumes arrived 2 days ago; the warehouse says the goods left 5 days ago (after the allocation, 10 days ago).
+    const fx = await seed(tx, { layerReceivedDaysAgo: 2 })
+    const receivedAt = (await tx.costLayer.findFirstOrThrow({ where: { productId: fx.productId } })).receivedAt as Date
+    const result = await dispatch(tx, fx, daysAgo(5))
+    const b = await booked(tx, fx)
+    assert.equal(result.despatchInstant?.adjustedFor, 'BEFORE_RECEIPT')
+    assert.equal(b.shipmentAt.getTime(), receivedAt.getTime())
+    assert.deepEqual(b.movementAt.map((d: Date) => d.getTime()), [receivedAt.getTime()])
+    assert.deepEqual(b.cogsAt.map((d: Date) => d.getTime()), [receivedAt.getTime()], 'the COGS entry is never earlier than the layer it consumed')
+    assert.equal(b.orderAt.getTime(), receivedAt.getTime())
+  })
+})
+
+test('[db] o3d-yw405 MED5: a stored accounting lock date last read long ago is not trusted: the despatch is not backdated at all', { skip }, async () => {
+  await withRollback(async (tx) => {
+    const fx = await seed(tx)
+    const lockDay = daysAgo(30).toISOString().slice(0, 10)
+    await setLock(tx, lockDay, daysAgo(3).toISOString())
+    const before = Date.now()
+    const result = await dispatch(tx, fx, daysAgo(2))
+    assert.equal(result.despatchInstant?.adjustedFor, 'LOCK_UNKNOWN')
+    assert.ok((await booked(tx, fx)).shipmentAt.getTime() >= before - 1000, 'booked at the apply instant')
+  })
+})
+
+test('[db] o3d-yw405 MED5: an EMPTY stored lock date with a fresh read means the accounting system has no lock: backdating proceeds', { skip }, async () => {
+  await withRollback(async (tx) => {
+    const fx = await seed(tx)
+    await setLock(tx, '', new Date().toISOString())
+    const left = daysAgo(2)
+    const result = await dispatch(tx, fx, left)
+    assert.equal(result.despatchInstant?.adjustedFor, null)
+    assert.equal((await booked(tx, fx)).shipmentAt.getTime(), left.getTime())
+  })
+})
+
+test('[db] o3d-yw405 MED2: a fully refunded line (an order line with no shipment row) that the warehouse despatched is a mismatch of N against 0', { skip }, async () => {
+  await withRollback(async (tx) => {
+    const fx = await seed(tx, { ordered: 4, shipQty: 4, sku: `SKU-C-${randomUUID().slice(0, 6)}` })
+    const refunded = await tx.product.create({ data: { sku: `SKU-D-${randomUUID().slice(0, 6)}`, name: 'refunded line', type: 'SIMPLE' }, select: { id: true, sku: true } })
+    await tx.salesOrderLine.create({ data: { orderId: fx.orderId, productId: refunded.id, sku: refunded.sku, description: 'd', qty: D(2), unitPriceForeign: D(5), unitPriceBase: D(5), taxForeign: D(0), taxBase: D(0), totalForeign: D(10), totalBase: D(10) } })
+    const verdict = await findDespatchQuantityMismatch({ orderId: fx.orderId, wmsWarehouseId: fx.warehouseId, wmsQuantities: [{ sku: fx.sku, qty: 4 }, { sku: refunded.sku, qty: 2 }] }, tx)
+    assert.deepEqual(verdict, { status: 'MISMATCH', mismatches: [{ sku: refunded.sku, wmsQty: 2, imsQty: 0 }] })
+  })
+})
+
+test('[db] o3d-yw405: the kit exclusion follows the line\'s PINNED recipe, not the product\'s current type', { skip }, async () => {
+  await withRollback(async (tx) => {
+    // Pinned as a kit expanding to a component, though the product is SIMPLE now: not comparable.
+    const kit = await seed(tx, { ordered: 2, shipQty: 2 })
+    const pinKit = { version: 1, productId: kit.productId, graphVersion: 1, capturedAt: new Date().toISOString(), requirements: [{ productId: 'component-x', factor: '1' }] }
+    await tx.salesOrderLine.updateMany({ where: { orderId: kit.orderId }, data: { fulfillmentRequirements: pinKit } })
+    assert.equal((await findDespatchQuantityMismatch({ orderId: kit.orderId, wmsWarehouseId: kit.warehouseId, wmsQuantities: [{ sku: kit.sku, qty: 9 }] }, tx)).status, 'NOT_COMPARABLE')
+    // Pinned as itself, though the product has become a KIT since: comparable.
+    const simple = await seed(tx, { ordered: 2, shipQty: 2 })
+    const pinSelf = { version: 1, productId: simple.productId, graphVersion: 1, capturedAt: new Date().toISOString(), requirements: [{ productId: simple.productId, factor: '1' }] }
+    await tx.salesOrderLine.updateMany({ where: { orderId: simple.orderId }, data: { fulfillmentRequirements: pinSelf } })
+    await tx.product.update({ where: { id: simple.productId }, data: { type: 'KIT' } })
+    const verdict = await findDespatchQuantityMismatch({ orderId: simple.orderId, wmsWarehouseId: simple.warehouseId, wmsQuantities: [{ sku: simple.sku, qty: 3 }] }, tx)
+    assert.deepEqual(verdict, { status: 'MISMATCH', mismatches: [{ sku: simple.sku, wmsQty: 3, imsQty: 2 }] })
   })
 })

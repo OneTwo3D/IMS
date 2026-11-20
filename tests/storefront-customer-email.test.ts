@@ -306,7 +306,9 @@ test('BATCH wiring: applyExternalFulfillmentUpdate defers the per-shipment parti
   const source = readFileSync('lib/fulfillment/external-fulfillment.ts', 'utf8')
   assert.equal((source.match(/deferStorefrontPartialEmail: true/g) ?? []).length, 2, 'both external loops defer the per-shipment hook')
   assert.equal((source.match(/await flushPartialEmails\(\)/g) ?? []).length, 2, 'each loop flushes after the loop only')
-  assert.equal((source.match(/discardPartialEmails\(\)/g) ?? []).length, 2, 'each loop discards on failure (a failed batch judges no partial)')
+  // Three call sites: the scoped loop's transition failure, the ordinary loop's transition failure, and the ordinary loop's in-lock quantity fence refusal
+  // (nothing ships for that shipment, so the deferred partials must be dropped). A failed batch judges no partial.
+  assert.equal((source.match(/discardPartialEmails\(\)/g) ?? []).length, 3, 'each failure path discards (a failed batch judges no partial): scoped failure, ordinary failure, in-lock quantity fence refusal')
   const allocation = readFileSync('app/actions/allocation.ts', 'utf8')
   assert.match(allocation, /options\?\.deferStorefrontPartialEmail !== true/)
 })

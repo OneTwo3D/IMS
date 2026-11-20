@@ -42,7 +42,7 @@ import {
 import { loadNettedRefundLines } from '@/lib/domain/sales/refund-demand-netting'
 import { UNCOMMITTED_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 import { withSavepoint } from '@/lib/db/savepoint'
-import { loadDespatchInstantFloors, resolveDespatchInstant, type DespatchInstantResolution } from '@/lib/domain/sales/despatch-instant'
+import { loadDespatchInstantFloors, lockInventorySnapshotFloorShared, resolveDespatchInstant, type DespatchInstantResolution } from '@/lib/domain/sales/despatch-instant'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -1336,11 +1336,24 @@ export async function transitionShipmentStatus(
 
       // The instant this dispatch is booked at, read under the order lock: ONE instant for the shipment, the stock movement, its COGS entries and
       // the order flip (see lib/domain/sales/despatch-instant.ts). With no warehouse-reported time it is simply now, as it always was.
+      // The stock levels are locked FIRST, so the FIFO layers read for the receipt floor are the ones the dispatch below consumes (the same order of locks as before:
+      // order, then stock levels).
+      if (input.despatchedAt) {
+        // The snapshot floor lock (shared) goes BEFORE the stock-level row locks, so a despatch waiting on a running snapshot does not hold the stock rows meanwhile.
+        await lockInventorySnapshotFloorShared(tx)
+        await lockStockLevels(tx, lockedProductIds, [lockedShipment.warehouseId])
+      }
+      const despatchNow = new Date()
       const despatchInstant = resolveDespatchInstant({
         requested: input.despatchedAt ?? null,
-        now: new Date(),
+        now: despatchNow,
         floors: input.despatchedAt
-          ? await loadDespatchInstantFloors(tx, { orderId: lockedShipment.orderId, lineIds: [...new Set(lockedShipment.lines.map((line) => line.lineId))] })
+          ? await loadDespatchInstantFloors(tx, {
+            orderId: lockedShipment.orderId,
+            lineIds: [...new Set(lockedShipment.lines.map((line) => line.lineId))],
+            layerNeeds: lockedShipment.lines.map((line) => ({ productId: line.productId, warehouseId: lockedShipment.warehouseId, qty: shipmentBoundaryNumber(line.qty) })),
+            now: despatchNow,
+          })
           : undefined,
       })
       if (datedByDespatch) data.shippedAt = despatchInstant.instant
