@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test, { mock } from 'node:test'
 import { config } from 'dotenv'
+import { purge } from '../helpers/purge-rows'
 
 /**
  * o3d-hqvrp.92, on a real database: an order IMS first sees AFTER its sale was settled outside IMS.
@@ -55,6 +56,19 @@ async function seed(env: Awaited<ReturnType<typeof load>>, onHand = 10) {
   return { suffix, warehouseId: warehouse.id as string, productId: product.id as string, sku: product.sku as string, wcId }
 }
 
+/** Record (or, with null, leave absent) the instant the opening stock was taken, the way the first-load apply does. Removed after the test. */
+async function withCutoff(env: Awaited<ReturnType<typeof load>>, t: { after: (fn: () => Promise<void>) => void }, iso: string | null) {
+  const { db } = env
+  if (iso === null) return
+  await db.firstLoadApplyRun.deleteMany({ where: { manifestDigest: { startsWith: 'f92-' } } })
+  await db.firstLoadApplyRun.create({ data: { version: 1, manifestDigest: `f92-${randomUUID()}`, runId: `f92-${randomUUID()}`, status: 'APPLIED', facts: { openingStockCutoffAt: iso } } })
+  t.after(async () => { await db.firstLoadApplyRun.deleteMany({ where: { manifestDigest: { startsWith: 'f92-' } } }) })
+}
+
+const CUTOFF = '2026-11-05T00:00:00.000Z'
+const BEFORE_CUTOFF = '2026-11-01T09:00:00'
+const AFTER_CUTOFF = '2026-11-10T11:00:00'
+
 function wcOrder(fx: Fixture, status: string, qty = 2, extra: Record<string, unknown> = {}): Any {
   const stamp = '2026-11-10T10:00:00'
   return {
@@ -70,14 +84,17 @@ function wcOrder(fx: Fixture, status: string, qty = 2, extra: Record<string, unk
 
 async function cleanup(env: Awaited<ReturnType<typeof load>>, fx: Fixture) {
   const { db } = env
-  const link = await db.shoppingOrderLink.findFirst({ where: { connector: 'woocommerce', externalOrderId: String(fx.wcId) }, select: { orderId: true } })
-  if (link) {
-    const id = link.orderId as string
-    // Best effort: a scratch database, and every id here is this test's own.
-    await db.$executeRawUnsafe(`DELETE FROM cogs_entries WHERE movement_id IN (SELECT id FROM stock_movements WHERE product_id = '${fx.productId}')`).catch(() => {})
-    await db.$executeRawUnsafe(`DELETE FROM stock_movements WHERE product_id = '${fx.productId}'`).catch(() => {})
-    await db.salesOrder.delete({ where: { id } }).catch(() => {})
+  const links: Array<{ orderId: string }> = await db.shoppingOrderLink.findMany({ where: { connector: 'woocommerce', externalOrderId: String(fx.wcId) }, select: { orderId: true } })
+  const orderIds = links.map((row) => row.orderId)
+  if (orderIds.length > 0) {
+    await db.activityLog.deleteMany({ where: { entityId: { in: orderIds } } })
+    await db.shoppingSyncLog.deleteMany({ where: { OR: [{ entityId: { in: orderIds } }, { externalId: String(fx.wcId) }] } })
+    await purge(db, 'sales_orders', 'id', orderIds)
   }
+  const customers: Array<{ id: string }> = await db.customer.findMany({ where: { email: `f92-${fx.suffix}@example.invalid` }, select: { id: true } })
+  await purge(db, 'customers', 'id', customers.map((row) => row.id))
+  await purge(db, 'products', 'id', [fx.productId])
+  await purge(db, 'warehouses', 'id', [fx.warehouseId])
 }
 
 test('[db] a completed first-seen order consumes on-hand, books COGS, is never a WMS candidate, and the stock push level is the reduced one (o3d-hqvrp.92)', { skip }, async (t) => {
@@ -85,8 +102,9 @@ test('[db] a completed first-seen order consumes on-hand, books COGS, is never a
   const { db, importWcOrder, wmsCreateEligibleOrderWhere } = env
   const fx = await seed(env, 10)
   t.after(() => cleanup(env, fx))
+  await withCutoff(env, t, CUTOFF)
 
-  const result = await importWcOrder(wcOrder(fx, 'completed', 2, { date_completed_gmt: '2026-11-10T11:00:00' }), ADMITTED)
+  const result = await importWcOrder(wcOrder(fx, 'completed', 2, { date_completed_gmt: AFTER_CUTOFF }), ADMITTED)
   assert.ok(result.success && result.orderId, JSON.stringify(result))
   const orderId = result.orderId as string
 
@@ -110,8 +128,6 @@ test('[db] a completed first-seen order consumes on-hand, books COGS, is never a
   // Never a warehouse create candidate, and nothing was sent.
   assert.equal(await db.wmsOrderPushLink.count({ where: { orderId } }), 0, 'no warehouse push link')
   assert.equal(await db.salesOrder.count({ where: { id: orderId, ...wmsCreateEligibleOrderWhere([fx.warehouseId]) } }), 0, 'not selected by the create predicate')
-  // The fence is the column: the same order WITHOUT it would be a candidate were it still PROCESSING.
-  assert.equal(await db.salesOrder.count({ where: { id: orderId, ...wmsCreateEligibleOrderWhere([fx.warehouseId]), outsideImsFulfilmentAt: undefined, status: 'SHIPPED' } }), 0)
 
   // Replaying the delivery is idempotent: no second consumption.
   const again = await importWcOrder(wcOrder(fx, 'completed', 2, { date_completed_gmt: '2026-11-10T11:00:00' }), ADMITTED)
@@ -123,32 +139,143 @@ test('[db] a completed first-seen order consumes on-hand, books COGS, is never a
   assert.ok(logs.some((l: { action: string; level: string }) => l.action === 'wc_import_first_seen_despatched' && l.level === 'INFO'), 'logged at INFO on the order')
 })
 
-test('[db] with too little stock the first-seen completed order is NOT silently skipped: the import fails retryably, the order stays fenced, and a later delivery books it once stock exists', { skip }, async (t) => {
+test('[db] with no stock the first-seen completed order does NOT hold the sweep cursor: the import succeeds, the owed despatch is on the exceptions list, and the bounded retry books it once stock arrives', { skip }, async (t) => {
   const env = await load()
   const { db, Prisma, importWcOrder, wmsCreateEligibleOrderWhere } = env
   const fx = await seed(env, 0)
   t.after(() => cleanup(env, fx))
+  await withCutoff(env, t, CUTOFF)
+  const payload = wcOrder(fx, 'completed', 3, { date_completed_gmt: AFTER_CUTOFF })
 
-  const first = await importWcOrder(wcOrder(fx, 'completed', 3, { date_completed_gmt: '2026-11-10T11:00:00' }), ADMITTED)
-  assert.equal(first.success, false, 'refused, not acknowledged')
-  assert.match(String(first.error), /despatch could not be booked/)
+  const first = await importWcOrder(payload, ADMITTED)
+  assert.equal(first.success, true, 'acknowledged: an owed despatch must not hold the cursor')
   const orderId = first.orderId as string
-  assert.ok(orderId, 'the order exists')
-  const held = await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { status: true, outsideImsFulfilmentAt: true } })
-  assert.notEqual(held.status, 'SHIPPED')
-  assert.equal(await db.salesOrder.count({ where: { id: orderId, ...wmsCreateEligibleOrderWhere([fx.warehouseId]) } }), 0, 'unshipped but still never a WMS candidate (without the fence it would be pushed to the warehouse)')
+  assert.ok(orderId)
+  assert.notEqual((await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { status: true } })).status, 'SHIPPED')
+  assert.equal(await db.salesOrder.count({ where: { id: orderId, ...wmsCreateEligibleOrderWhere([fx.warehouseId]) } }), 0, 'never a WMS candidate')
+  const { openWcCompletionRefusalWhere } = await import('../../lib/domain/sales/wc-sync-row-families')
+  const rows = await db.shoppingSyncLog.findMany({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId }, select: { payload: true } })
+  assert.equal(rows.length, 1, 'one open Sync > Exceptions entry')
+  assert.equal(rows[0].payload.refusal, 'insufficient_physical_stock')
 
-  // Stock arrives; the next delivery of the same order books the despatch.
+  // Redelivery does not re-run the booking or stack rows: the retry job owns it.
+  await importWcOrder(payload, ADMITTED)
+  assert.equal(await db.shoppingSyncLog.count({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId } }), 1)
+  assert.equal((await db.shoppingSyncLog.findFirstOrThrow({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId }, select: { payload: true } })).payload.occurrences, 1)
+
+  // Still no stock: the retry counts an attempt and leaves it owed.
+  const { retryOwedOutsideImsDespatches } = await import('../../lib/connectors/woocommerce/sync/outside-ims-despatch')
+  const live = async () => ({ order: payload })
+  const stillNone = await retryOwedOutsideImsDespatches(20, live)
+  assert.equal(stillNone.stillOwed >= 1, true, JSON.stringify(stillNone))
+
+  // Stock arrives: the next pass books it.
   await db.stockLevel.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { quantity: new Prisma.Decimal('10') } })
   await db.costLayer.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { remainingQty: new Prisma.Decimal('10'), receivedQty: new Prisma.Decimal('10') } })
-  // A receipt re-runs allocation for the backorder in production; here the same effect, directly.
-  const { autoAllocateOrder } = await import('../../app/actions/allocation')
-  const { INTERNAL_ACTION_BYPASS } = await import('../../lib/internal-action-bypass')
-  await autoAllocateOrder(orderId, { internalBypassToken: INTERNAL_ACTION_BYPASS })
-  const second = await importWcOrder(wcOrder(fx, 'completed', 3, { date_completed_gmt: '2026-11-10T11:00:00' }), ADMITTED)
-  assert.equal(second.success, true, JSON.stringify(second))
+  const booked = await retryOwedOutsideImsDespatches(20, live)
+  assert.equal(booked.booked >= 1, true, JSON.stringify(booked))
   assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { status: true } })).status, 'SHIPPED')
   assert.equal(Number((await db.stockLevel.findFirstOrThrow({ where: { productId: fx.productId, warehouseId: fx.warehouseId } })).quantity), 7)
+  assert.equal(await db.shoppingSyncLog.count({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId } }), 0, 'the exceptions entry closed itself')
+})
+
+test('[db] an owed despatch that never gets stock ends in a visible terminal state after the attempt cap', { skip }, async (t) => {
+  const env = await load()
+  const { db, importWcOrder } = env
+  const fx = await seed(env, 0)
+  t.after(() => cleanup(env, fx))
+  await withCutoff(env, t, CUTOFF)
+  const payload = wcOrder(fx, 'completed', 1, { date_completed_gmt: AFTER_CUTOFF })
+  const first = await importWcOrder(payload, ADMITTED)
+  const orderId = first.orderId as string
+  const { openWcCompletionRefusalWhere } = await import('../../lib/domain/sales/wc-sync-row-families')
+  const { retryOwedOutsideImsDespatches, OUTSIDE_IMS_DESPATCH_MAX_ATTEMPTS } = await import('../../lib/connectors/woocommerce/sync/outside-ims-despatch')
+  const row = await db.shoppingSyncLog.findFirstOrThrow({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId }, select: { id: true, payload: true } })
+  await db.shoppingSyncLog.update({ where: { id: row.id }, data: { payload: { ...row.payload, occurrences: OUTSIDE_IMS_DESPATCH_MAX_ATTEMPTS } } })
+  const out = await retryOwedOutsideImsDespatches(20, async () => ({ order: payload }))
+  assert.equal(out.terminal >= 1, true, JSON.stringify(out))
+  const after = await db.shoppingSyncLog.findFirstOrThrow({ where: { id: row.id }, select: { payload: true, errorMessage: true } })
+  assert.equal(after.payload.terminal, true)
+  assert.match(after.errorMessage, /Gave up retrying/)
+  // No longer retried.
+  const again = await retryOwedOutsideImsDespatches(20, async () => ({ order: payload }))
+  assert.equal(again.scanned, 0)
+})
+
+test('[db] a completed order dated BEFORE the opening-stock instant has no stock effect; one with no instant on record has none either (fail closed)', { skip }, async (t) => {
+  const env = await load()
+  const { db, importWcOrder, wmsCreateEligibleOrderWhere } = env
+  for (const scenario of [{ name: 'before the instant', cutoff: CUTOFF as string | null, completed: BEFORE_CUTOFF }, { name: 'no instant recorded', cutoff: null, completed: AFTER_CUTOFF }]) {
+    const fx = await seed(env, 10)
+    const cleanupLater = () => cleanup(env, fx)
+    try {
+      const cut = await db.firstLoadApplyRun.count()
+      assert.equal(cut, 0, 'precondition: no run record')
+      if (scenario.cutoff) await db.firstLoadApplyRun.create({ data: { version: 1, manifestDigest: `f92-${randomUUID()}`, runId: `f92-${randomUUID()}`, status: 'APPLIED', facts: { openingStockCutoffAt: scenario.cutoff } } })
+      const result = await importWcOrder(wcOrder(fx, 'completed', 2, { date_completed_gmt: scenario.completed, date_paid_gmt: scenario.completed, date_created_gmt: scenario.completed }), ADMITTED)
+      assert.ok(result.success && result.orderId, `${scenario.name}: ${JSON.stringify(result)}`)
+      const orderId = result.orderId as string
+      const order = await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { status: true, outsideImsFulfilmentAt: true } })
+      assert.equal(order.status, 'COMPLETED', `${scenario.name}: recorded with its own status`)
+      assert.ok(order.outsideImsFulfilmentAt)
+      const level = await db.stockLevel.findFirstOrThrow({ where: { productId: fx.productId, warehouseId: fx.warehouseId } })
+      assert.equal(Number(level.quantity), 10, `${scenario.name}: on-hand untouched`)
+      assert.equal(Number(level.reservedQty), 0, `${scenario.name}: nothing reserved`)
+      assert.equal(await db.orderAllocation.count({ where: { orderId } }), 0)
+      assert.equal(await db.stockMovement.count({ where: { productId: fx.productId } }), 0, `${scenario.name}: no movement`)
+      assert.equal(await db.shipment.count({ where: { orderId } }), 0)
+      assert.equal(Number((await db.costLayer.findFirstOrThrow({ where: { productId: fx.productId } })).remainingQty), 10, `${scenario.name}: FIFO untouched`)
+      assert.equal(await db.salesOrder.count({ where: { id: orderId, ...wmsCreateEligibleOrderWhere([fx.warehouseId]) } }), 0)
+      // And a replay does not consume either.
+      await importWcOrder(wcOrder(fx, 'completed', 2, { date_completed_gmt: scenario.completed, date_paid_gmt: scenario.completed, date_created_gmt: scenario.completed }), ADMITTED)
+      assert.equal(Number((await db.stockLevel.findFirstOrThrow({ where: { productId: fx.productId, warehouseId: fx.warehouseId } })).quantity), 10)
+    } finally {
+      await cleanupLater()
+      await db.firstLoadApplyRun.deleteMany({ where: { manifestDigest: { startsWith: 'f92-' } } })
+    }
+  }
+  void t
+})
+
+test('[db] the reallocation sweep and the backorder allocator never select an order settled outside IMS (refunded, historical or awaiting its booking)', { skip }, async (t) => {
+  const env = await load()
+  const { db, importWcOrder } = env
+  const fx = await seed(env, 10)
+  t.after(() => cleanup(env, fx))
+  const result = await importWcOrder(wcOrder(fx, 'refunded', 2), ADMITTED)
+  const orderId = result.orderId as string
+  const { REALLOCATION_SWEEP_SELECTION } = await import('../../lib/fulfillment/reallocation-sweep-selection')
+  assert.equal(await db.salesOrder.count({ where: { id: orderId, ...REALLOCATION_SWEEP_SELECTION } }), 0, 'not selected by the reallocation sweep')
+  // CONTROL: the same order without the marker is selected, so the exclusion is what the test measures.
+  await db.salesOrder.update({ where: { id: orderId }, data: { outsideImsFulfilmentAt: null } })
+  assert.equal(await db.salesOrder.count({ where: { id: orderId, ...REALLOCATION_SWEEP_SELECTION } }), 1, 'CONTROL: selected without the marker')
+  await db.salesOrder.update({ where: { id: orderId }, data: { outsideImsFulfilmentAt: new Date() } })
+  // The backorder allocator: replenishing the product allocates nothing to it.
+  const { allocateBackordersForProducts } = await import('../../lib/fulfillment/backorder-allocator')
+  await allocateBackordersForProducts([fx.productId], { source: 'purchase_receipt' })
+  assert.equal(await db.orderAllocation.count({ where: { orderId } }), 0, 'the backorder allocator left it alone')
+  // CONTROL: without the marker the allocator does allocate it.
+  await db.salesOrder.update({ where: { id: orderId }, data: { outsideImsFulfilmentAt: null } })
+  await allocateBackordersForProducts([fx.productId], { source: 'purchase_receipt' })
+  assert.ok(await db.orderAllocation.count({ where: { orderId } }) > 0, 'CONTROL: allocated without the marker')
+})
+
+test('[db] a permanent coverage refusal releases the partial allocation and the pending shipment', { skip }, async (t) => {
+  const env = await load()
+  const { db, importWcOrder } = env
+  const fx = await seed(env, 1)
+  t.after(() => cleanup(env, fx))
+  await withCutoff(env, t, CUTOFF)
+  const result = await importWcOrder(wcOrder(fx, 'completed', 3, { date_completed_gmt: AFTER_CUTOFF }), ADMITTED)
+  assert.equal(result.success, true, JSON.stringify(result))
+  const orderId = result.orderId as string
+  assert.equal(await db.orderAllocation.count({ where: { orderId } }), 0, 'no allocation left')
+  assert.equal(await db.shipment.count({ where: { orderId } }), 0, 'no pending shipment left')
+  const level = await db.stockLevel.findFirstOrThrow({ where: { productId: fx.productId, warehouseId: fx.warehouseId } })
+  assert.equal(Number(level.reservedQty), 0, 'nothing reserved for goods that already left')
+  assert.equal(Number(level.quantity), 1, 'on-hand untouched')
+  const { openWcCompletionRefusalWhere } = await import('../../lib/domain/sales/wc-sync-row-families')
+  assert.equal(await db.shoppingSyncLog.count({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId } }), 1, 'listed for an operator')
 })
 
 test('[db] a SHIPPED-mapped first-seen order is despatched the same way, and the later WooCommerce completion does not refuse it', { skip }, async (t) => {
@@ -157,6 +284,7 @@ test('[db] a SHIPPED-mapped first-seen order is despatched the same way, and the
   const fx = await seed(env, 10)
   t.after(async () => { await db.shoppingStatusMapping.deleteMany({ where: { connector: 'woocommerce', externalStatus: `shipped-f92-${fx.suffix}` } }); await cleanup(env, fx) })
   const slug = `shipped-f92-${fx.suffix}`
+  await withCutoff(env, t, CUTOFF)
   await db.shoppingStatusMapping.create({ data: { connector: 'woocommerce', externalStatus: slug, imsStatus: 'SHIPPED' } })
 
   const result = await importWcOrder(wcOrder(fx, slug, 1), ADMITTED)

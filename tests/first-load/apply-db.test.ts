@@ -960,6 +960,9 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       assert.equal(await count('cost_layers'), prepared.steps.find((s) => s.step === 'opening-stock')!.units.length)
       assert.equal(Number((await sql<{ n: string }>(`select count(*)::text as n from cost_layers where "unitCostBase" = 0`))[0]!.n), prepared.zeroCostPairs.length)
       assert.equal(await count('first_load_apply_runs'), 1)
+      // o3d-hqvrp.92: the instant the opening stock was taken is recorded once, on the run record, for the storefront order import to read.
+      const cutoff = (await sql<{ facts: { openingStockCutoffAt?: string } }>('select facts from first_load_apply_runs'))[0]!.facts.openingStockCutoffAt
+      assert.ok(cutoff && !Number.isNaN(Date.parse(cutoff)), `the opening-stock instant is recorded (${String(cutoff)})`)
       const record = await m.journal.createJournal().load()
       assert.equal(record!.status, 'APPLIED')
       assert.equal(record!.manifestDigest, prepared.manifestDigest)

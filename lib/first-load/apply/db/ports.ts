@@ -17,6 +17,7 @@ import type { ApplyPorts, RailTally } from '../orchestrate'
 import type { PreparedRun } from '../prepared'
 import { createExecutor } from './execute'
 import { createJournal, setFactOnce } from './journal'
+import { OPENING_STOCK_CUTOFF_FACT } from '@/lib/first-load/opening-stock-cutoff'
 import { db } from '@/lib/db'
 import { StepLockError, type StepLock } from '../orchestrate'
 import { withRunLease, withStepLock } from './lock'
@@ -114,6 +115,11 @@ export function createDbPorts(prepared: PreparedRun, options: DbPortsOptions): A
         } catch {
           throw new ObservationError(DATABASE_READ_FAILED)
         }
+      }
+      // Just before the first OPENING-STOCK write, with every rail holding: the instant the opening stock is taken, recorded once (o3d-hqvrp.92). Sales completed before it are already in the quantities this step loads;
+      // the storefront order import consumes stock only for orders completed at or after it. The first recording counts.
+      if (problems.length === 0 && step === 'opening-stock' && phase === 'before-first-write') {
+        try { await setFactOnce(OPENING_STOCK_CUTOFF_FACT, new Date().toISOString()) } catch { throw new ObservationError(DATABASE_READ_FAILED) }
       }
       // Just before the first SUPPLIER write, with every rail holding: a purchase tax type with no IMS rate is imported from the stored Xero list (tax-import.ts; the rates and the run fact
       // `purchaseTaxImport` commit in ONE transaction), then the supplier tax rail is evaluated again WITHOUT the import allowance - the rates must now exist and be unique. The step lock is held and the run record exists; tax_rates is a table the runner may write.

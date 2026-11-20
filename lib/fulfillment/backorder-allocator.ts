@@ -93,6 +93,8 @@ export async function allocateBackordersForProducts(
       status: { in: [...BACKORDER_ELIGIBLE_STATUSES] },
       lines: { some: { productId: { in: expanded } } },
       shipments: { none: { status: { not: 'PENDING' } } },
+      // o3d-hqvrp.92: settled outside IMS: never backorder-allocated.
+      outsideImsFulfilmentAt: null,
     },
     select: {
       id: true,
