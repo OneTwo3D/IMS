@@ -14,7 +14,7 @@ import {
   withAccountingEgressAuthorization,
   type AccountingEgressRequest,
 } from '@/lib/connectors/accounting-egress-authorization'
-import { connectorEmitsDiscount, connectorEmitsShipping, salesDocumentTaxTypeRefusal } from '@/lib/domain/accounting/sales-document-tax-types'
+import { connectorEmitsDiscount, discountPartsOf, connectorEmitsShipping, salesDocumentTaxTypeRefusal } from '@/lib/domain/accounting/sales-document-tax-types'
 import type { InvoiceData, InvoiceLine } from '../types'
 
 /**
@@ -121,7 +121,11 @@ export function isXeroSalesDocumentTaxTypeError(error: unknown): error is XeroSa
 export function salesInvoiceRoundingInput(data: InvoiceData): Omit<XeroRoundingPlanInput, 'account' | 'rateOf' | 'what'> {
   const extraLines: XeroTotalLine[] = []
   if (connectorEmitsShipping(data)) extraLines.push({ quantity: 1, unitAmount: data.shippingAmount, taxType: data.shippingTaxType })
-  if (connectorEmitsDiscount(data)) extraLines.push({ quantity: 1, unitAmount: -data.discountAmount, taxType: data.discountTaxType })
+  if (connectorEmitsDiscount(data)) {
+    const parts = discountPartsOf(data)
+    if (parts) for (const part of parts) extraLines.push({ quantity: 1, unitAmount: -part.amount, taxType: part.taxType })
+    else extraLines.push({ quantity: 1, unitAmount: -data.discountAmount, taxType: data.discountTaxType })
+  }
   return { lines: data.lines, extraLines, lineAmountsIncludeTax: Boolean(data.lineAmountsIncludeTax), orderTotal: data.orderTotal ?? null }
 }
 
@@ -195,13 +199,22 @@ export function buildSalesInvoicePayload(
   // tax type (matching the order's VAT rate) so the discount reduces the
   // taxable base correctly. No fallback: an omitted type refuses (above).
   if (connectorEmitsDiscount(data)) {
-    lineItems.push({
-      Description: 'Order discount',
-      Quantity: 1,
-      UnitAmount: -data.discountAmount,
-      AccountCode: data.discountAccountCode,
-      TaxType: data.discountTaxType,
-    })
+    // An order whose discount tax was apportioned across its line rates sends one negative line per tax code (the same discount account), so the ledger's VAT per rate is the order's.
+    // Without parts: the single line at the order's header code, as ever.
+    const parts = discountPartsOf(data)
+    if (parts) {
+      for (const part of parts) {
+        lineItems.push({ Description: 'Order discount', Quantity: 1, UnitAmount: -part.amount, AccountCode: data.discountAccountCode, TaxType: part.taxType })
+      }
+    } else {
+      lineItems.push({
+        Description: 'Order discount',
+        Quantity: 1,
+        UnitAmount: -data.discountAmount,
+        AccountCode: data.discountAccountCode,
+        TaxType: data.discountTaxType,
+      })
+    }
   }
 
   // The difference a 4dp unit price makes to Xero's total WITH tax, posted on its own untaxed line so every line keeps its real quantity (see write-path.ts). Throws when it cannot be reconciled.

@@ -15,6 +15,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { expectedSalesOrderLineTaxForeign } from '@/lib/domain/sales/sales-order-tax-validation'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { allocateOrderDiscountBase } from '@/lib/sales-currency'
+import { buildDiscountTaxSplit, type DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
 
 function roundDecimalNumber(value: DecimalInput, precision: number): number {
   return roundQuantity(value, precision).toNumber()
@@ -43,7 +44,7 @@ export type WriteModelInput = {
   vatRate: number
   pricesIncludeVat: boolean
   /** Each line with the rate it resolved to (manual override, resolver, or the order default). */
-  lines: { input: WriteModelLineInput; rate: number; taxRateId: string | null }[]
+  lines: { input: WriteModelLineInput; rate: number; taxRateId: string | null; /** Only read when apportionDiscountTax is on: the code the line posts under, for the discount's per-rate split. */ accountingTaxType?: string | null; reverseCharge?: boolean }[]
   /** Gross when pricesIncludeVat. */
   shippingForeign?: number
   fees?: { description: string; amount: number }[]
@@ -87,7 +88,12 @@ export type WriteModelTotals = {
   discountAmount: number
 }
 
-export type SalesOrderWriteModel = { lines: WriteModelLine[]; totals: WriteModelTotals }
+export type SalesOrderWriteModel = {
+  lines: WriteModelLine[]
+  totals: WriteModelTotals
+  /** The discount's tax by line rate. Present ONLY when `apportionDiscountTax` was on and there was a discount, so the model of a header-rate order is unchanged. */
+  discountTaxSplit?: DiscountTaxSplitEntry[]
+}
 
 export function buildSalesOrderWriteModel(args: WriteModelInput): SalesOrderWriteModel {
   const { fxRate, vatRate } = args
@@ -163,6 +169,7 @@ export function buildSalesOrderWriteModel(args: WriteModelInput): SalesOrderWrit
   let orderDiscForeign: Prisma.Decimal
   let discNetForeign: Prisma.Decimal
   let discTaxForeign: Prisma.Decimal
+  let discountShares: number[] | null = null
   if (args.apportionDiscountTax && lineData.length > 0) {
     // Each line's share of the discount is taxed at that line's own rate (the header rate does not apply to goods that carry another one).
     const grossCap = lineData.reduce((sum, l, i) => sum.add(inclVat ? toDecimal(l.totalForeign).mul(toDecimal(1).add(args.lines[i]!.rate)) : toDecimal(l.totalForeign)), toDecimal(0))
@@ -171,6 +178,7 @@ export function buildSalesOrderWriteModel(args: WriteModelInput): SalesOrderWrit
       { fxRateToBase: 1, pricesIncludeVat: inclVat, taxRatePercent: vatRate, discountAmount: orderDiscForeign.toNumber() },
       lineData.map((l, i) => ({ totalBase: l.totalForeign, totalForeign: l.totalForeign, taxRatePercent: args.lines[i]!.rate })),
     )
+    discountShares = shares
     discNetForeign = shares.reduce((sum, share) => sum.add(share), toDecimal(0))
     discTaxForeign = shares.reduce((sum, share, i) => sum.add(toDecimal(share).mul(args.lines[i]!.rate)), toDecimal(0))
   } else {
@@ -201,7 +209,20 @@ export function buildSalesOrderWriteModel(args: WriteModelInput): SalesOrderWrit
   const grandTotalForeign = round4(toDecimal(subtotalForeign).sub(discNetForeignR).add(shippingNetForeignR).add(totalTaxForeignRounded))
   const grandTotalBase = round4(toDecimal(subtotalBase).sub(discNetBase).add(shippingNetBase).add(totalTaxBaseRounded))
 
+  const discountTaxSplit = discountShares && discNetForeignR > 0
+    ? buildDiscountTaxSplit({
+        lines: args.lines.map((l) => ({ taxRateId: l.taxRateId, accountingTaxType: l.accountingTaxType ?? null, reverseCharge: l.reverseCharge === true, rate: l.rate })),
+        shares: discountShares,
+        fxRate,
+        totalNetForeign: discNetForeignR,
+        totalTaxForeign: discTaxForeignR,
+        totalNetBase: discNetBase,
+        totalTaxBase: discTaxBase,
+      })
+    : undefined
+
   return {
+    ...(discountTaxSplit && discountTaxSplit.length > 0 ? { discountTaxSplit } : {}),
     lines: lineData,
     totals: {
       subtotalForeign,

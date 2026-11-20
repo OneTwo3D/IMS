@@ -19,6 +19,7 @@ import {
   WC_COMPLETION_REFUSAL_OPEN_STATUS,
   WC_COMPLETION_REFUSAL_RECORD_KIND,
   WC_COMPLETION_REFUSAL_SETTLED_ORDER_STATUSES,
+  WC_REOPENED_OPERATOR_DECISION_REFUSAL,
   openWcCompletionRefusalWhere,
 } from '@/lib/domain/sales/wc-sync-row-families'
 
@@ -30,7 +31,12 @@ export type WcCompletionRefusalInput = {
   error: string
   /** The refusing delivery's `date_modified_gmt` (parsed), or null when it carried none. Fences later settlement by a stale event. */
   eventAt?: Date | null
+  /** false: refresh the row WITHOUT counting this call as another occurrence (the same refusal, recorded a second time by the booking path). Default true. */
+  countOccurrence?: boolean
 }
+
+/** The fields only the owed-despatch retry writes. A refusal re-record (a redelivery, the booking path) carries them over untouched. */
+const RETRY_STATE_KEYS = ['retryChecks', 'retryAttempts', 'lastAttemptAt', 'lastRealAttemptAt', 'nextAttemptAt', 'stockSignature'] as const
 
 /** The instant of a WooCommerce delivery (`date_modified_gmt`, else `date_modified`), or null when unreadable. */
 export function wcEventInstant(order: { date_modified_gmt?: string; date_modified?: string }): Date | null {
@@ -50,11 +56,14 @@ export async function recordWcCompletionRefusal(input: WcCompletionRefusalInput)
       where: { ...openWcCompletionRefusalWhere(), entityId: input.orderId },
       select: { id: true, payload: true },
     })
-    const previous = existing?.payload as { firstRefusedAt?: string; occurrences?: number; refusedEventAt?: string | null } | null
+    const previous = existing?.payload as ({ firstRefusedAt?: string; occurrences?: number; refusedEventAt?: string | null } & Record<string, unknown>) | null
     // The fence keeps the NEWEST refusing event seen: a late redelivery of an older refusal must not move it back.
     const priorEvent = previous?.refusedEventAt ? new Date(previous.refusedEventAt) : null
     const eventAt = input.eventAt && (!priorEvent || input.eventAt > priorEvent) ? input.eventAt : priorEvent
+    const carried: Record<string, unknown> = {}
+    for (const key of RETRY_STATE_KEYS) if (previous && previous[key] !== undefined) carried[key] = previous[key]
     const payload = {
+      ...carried,
       externalOrderId: String(input.externalOrderId),
       wcStatus: input.wcStatus,
       refusal: input.refusal,
@@ -62,7 +71,7 @@ export async function recordWcCompletionRefusal(input: WcCompletionRefusalInput)
       firstRefusedAt: previous?.firstRefusedAt ?? now.toISOString(),
       lastRefusedAt: now.toISOString(),
       refusedEventAt: eventAt ? eventAt.toISOString() : null,
-      occurrences: (previous?.occurrences ?? 0) + 1,
+      occurrences: (previous?.occurrences ?? 0) + (input.countOccurrence === false && existing ? 0 : 1),
     }
     if (existing) {
       await tx.shoppingSyncLog.update({ where: { id: existing.id }, data: { payload, errorMessage: input.error } })
@@ -102,7 +111,10 @@ export async function resolveWcCompletionRefusalIfNewer(orderId: string, eventAt
   if (!eventAt) return 0
   const row = await db.shoppingSyncLog.findFirst({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId }, select: { id: true, payload: true } })
   if (!row) return 0
-  const refused = (row.payload as { refusedEventAt?: string | null } | null)?.refusedEventAt
+  const parked = row.payload as { refusedEventAt?: string | null; refusal?: string } | null
+  // A reopen the retry parked for an OPERATOR is never settled by a later store event: the goods are still recorded as having left, and only the operator may release the fence.
+  if (parked?.refusal === WC_REOPENED_OPERATOR_DECISION_REFUSAL) return 0
+  const refused = parked?.refusedEventAt
   if (refused && !(eventAt > new Date(refused))) return 0
   const result = await db.shoppingSyncLog.updateMany({ where: { id: row.id, ...openWcCompletionRefusalWhere() }, data: { status: 'SYNCED', syncedAt: new Date() } })
   return result.count

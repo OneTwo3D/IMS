@@ -36,6 +36,8 @@ import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
 import { findGrossOverPaidBalance, findOverAllocatedRefundTarget, invalidQuantityRefusal, nonSaleRowRefusal, overAllocatedRefundTargetMessage, publicRefundLineRefusal } from '@/lib/domain/sales/refund-target-balances'
 import { orderDiscountReversal, refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
+import { parseDiscountTaxSplit } from '@/lib/domain/sales/discount-tax-split'
+import { planSplitDiscountReversal } from '@/lib/domain/sales/discount-tax-split-plan'
 import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basis'
 import { resolveSchemePostingSnapshot } from '@/lib/domain/sales/refund-scheme-posting'
 import {
@@ -173,6 +175,11 @@ export type RefundRequestLine = {
   totalForeign?: number | null
   totalBase: number
   lineKind?: 'sale' | 'shipping' | 'discount'
+  /**
+   * Set by the SERVER only, on the discount reversal of an order whose discount tax was apportioned across its line rates (SalesOrder.discountTaxSplit): the rate whose share this line reverses
+   * and the code it posts under (its rate's own, the reverse-charge swap already applied by the line it mirrors). A caller's discount line is refused before this is ever read.
+   */
+  discountTaxIdentity?: { taxRateId: string; accountingTaxType: string | null; reverseCharge: boolean; /** The rate the order's discount share was charged at (a fraction). */ rate: number }
   /**
    * o3d-w00 (Codex r7 #1): the VAT the SOURCE OF THIS REFUND states it returned on this very line, in
    * the order's currency, against `totalForeign` as its net.
@@ -4240,6 +4247,7 @@ export async function createSalesOrderRefund(
         taxRatePercent: true,
         pricesIncludeVat: true,
         discountRestatement: true,
+        discountTaxSplit: true,
         revenueDeferredDate: true,
         unearnedRevenueAmount: true,
         inventoryAllocatedDate: true,
@@ -4271,6 +4279,7 @@ export async function createSalesOrderRefund(
             totalBase: true,
             // The VAT this line actually bore, as the order recorded it once at creation/import.
             taxForeign: true,
+            taxRateId: true,
             taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
           },
         },
@@ -4405,7 +4414,57 @@ export async function createSalesOrderRefund(
       const refundedSaleNet = refundLines
         .filter((l) => l.lineId && l.qty > 0 && (l.lineKind ?? 'sale') === 'sale')
         .reduce((sum, l) => sum + (l.totalForeign ?? 0), 0)
-      if (rawDiscount > 0 && refundedSaleNet > 0) {
+      const discountSplit = parseDiscountTaxSplit(so.discountTaxSplit)
+      if (rawDiscount > 0 && refundedSaleNet > 0 && discountSplit) {
+        // The discount was taxed at its lines' rates and posted as one negative line per rate: it is reversed per rate too, each share under its own rate's code, so the credit note credits the right VAT per rate.
+        if (so.discountRestatement != null) {
+          return { error: 'This order\'s discount was restated after it was invoiced, so its reversal cannot be worked out automatically, and no refund was created.' } as const
+        }
+        const priorRows = await tx.salesOrderRefundLine.findMany({
+          where: { refund: { orderId: input.orderId } },
+          select: { salesOrderLineId: true, lineKind: true, totalForeign: true, totalBase: true, discountTaxRateId: true },
+        })
+        const refundedNetByLine = new Map<string, number>()
+        for (const l of refundLines) if (l.lineId && l.qty > 0 && (l.lineKind ?? 'sale') === 'sale') refundedNetByLine.set(l.lineId, (refundedNetByLine.get(l.lineId) ?? 0) + (l.totalForeign ?? 0))
+        const plan = planSplitDiscountReversal({
+          split: discountSplit,
+          lines: so.lines.map((l) => ({ id: l.id, taxRateId: l.taxRateId, totalForeign: refundBoundaryNumber(l.totalForeign) })),
+          refundedNetByLine,
+          prior: priorRows.map((row) => ({ lineKind: row.lineKind, salesOrderLineId: row.salesOrderLineId, discountTaxRateId: row.discountTaxRateId, totalForeign: refundBoundaryNumber(row.totalForeign), totalBase: refundBoundaryNumber(row.totalBase) })),
+          fxRateToBase: fxRate,
+          minorUnits: currencyMinorUnits(so.currency),
+          reversal: (r) => orderDiscountReversal({
+            discountAmount: r.discountNet,
+            amountsIncludeVat: false,
+            vatRate: 0,
+            orderSaleNet: r.orderSaleNet,
+            priorSaleNet: r.priorSaleNet,
+            priorDiscountForeign: r.priorDiscountForeign,
+            priorDiscountBase: r.priorDiscountBase,
+            refundedSaleNet: r.refundedSaleNet,
+            fxRateToBase: fxRate,
+            minorUnits: currencyMinorUnits(so.currency),
+          }),
+        })
+        for (const part of plan) {
+          refundLines.push({
+            lineId: null,
+            productId: null,
+            description: 'Order discount',
+            qty: 0,
+            totalForeign: -part.foreign,
+            totalBase: -part.base,
+            lineKind: 'discount',
+            discountTaxIdentity: {
+              taxRateId: part.entry.taxRateId ?? '',
+              accountingTaxType: resolveSalesLineTaxType({ baseTaxType: part.entry.accountingTaxType ?? null, reverseCharge: part.entry.reverseCharge, reverseChargeSalesTaxType: input.accountingSettings?.reverseChargeSalesTaxType }) ?? null,
+              reverseCharge: part.entry.reverseCharge,
+              rate: part.entry.rate,
+            },
+          })
+        }
+        totalBase = refundLines.reduce((sum, line) => sum + line.totalBase, 0)
+      } else if (rawDiscount > 0 && refundedSaleNet > 0) {
         if (so.discountRestatement != null) {
           return { error: 'This order\'s discount was restated after it was invoiced, so its reversal cannot be worked out automatically, and no refund was created.' } as const
         }
@@ -4466,7 +4525,7 @@ export async function createSalesOrderRefund(
     const reverseChargeSalesTaxType = input.accountingSettings?.reverseChargeSalesTaxType
 
     // A public refund's credit note, GROSSED UP at the rate it posts under, must stay within what the customer paid for each line.
-    let publicGrossRateOf: ((lineId: string | null, net: number) => number) | null = null
+    let publicGrossRateOf: ((lineId: string | null, net: number, discountCode?: string | null) => number) | null = null
     // The rate an EARLIER refund line was actually posted at: its persisted tax code (else the code the credit note falls back to), priced like the payload; null when it cannot be.
     let publicPriorRateOf: ((row: { salesOrderLineId: string | null; accountingTaxType: string | null }) => number | null) | null = null
     if (input.deriveSaleLineNetsFromStoredBalance) {
@@ -4505,8 +4564,9 @@ export async function createSalesOrderRefund(
       // Each NEW row is valued at the rate it will actually POST at: the tax code the credit note payload resolves for it (a line's own code, else the order
       // default), priced from the sales tax table. Only when that cannot be priced is a conservative stand-in used, and its direction depends on the sign: a
       // credit counts at the higher of the line's charged rate and the order's rate, a reversal (negative net, e.g. the discount) at no VAT, so neither is understated.
-      publicGrossRateOf = (lineId, net) => {
-        const type = lineId ? taxTypeOfLine({ accountingTaxType: null, lineId }) : orderDefaultTaxType
+      publicGrossRateOf = (lineId, net, discountCode) => {
+        // A discount reversal of an apportioned order posts under its own rate's code, so that is the rate it is valued at (not the order default's).
+        const type = lineId ? taxTypeOfLine({ accountingTaxType: null, lineId }) : (discountCode ?? orderDefaultTaxType)
         const priced = type ? priceSnapshottedTaxIdentity({ accountingTaxType: type, rateByTaxType: salesRates, label: 'refund line' }) : null
         if (priced?.ok) return priced.rate.toNumber()
         if (net < 0) return 0
@@ -4556,7 +4616,12 @@ export async function createSalesOrderRefund(
     const resolveRefundLineTaxIdentity = (
       lineId: string | null | undefined,
       lineKind: 'sale' | 'shipping' | 'discount',
+      discountTaxIdentity?: RefundRequestLine['discountTaxIdentity'],
     ) => {
+      // A discount reversal of an apportioned order posts under the code of the rate whose share it reverses, never the order default.
+      if (lineKind === 'discount' && discountTaxIdentity) {
+        return { accountingTaxType: discountTaxIdentity.accountingTaxType, reverseCharge: discountTaxIdentity.reverseCharge }
+      }
       // A line-linked refund carries its OWN rate (read via the relation, so a rate deactivated after the
       // sale still resolves).
       const linked = lineId ? salesLineTaxById.get(lineId) : undefined
@@ -4960,7 +5025,7 @@ export async function createSalesOrderRefund(
         usedFallbackRate = true
         return sum + net * (1 + (net >= 0 ? Math.max(blendedRate, maxLineRate) : 0))
       }, 0)
-      const newGrossForeign = refundLines.reduce((sum, line) => sum + storedForeign(line) * (1 + publicGrossRateOf!(line.lineId ?? null, storedForeign(line))), 0)
+      const newGrossForeign = refundLines.reduce((sum, line) => sum + storedForeign(line) * (1 + publicGrossRateOf!(line.lineId ?? null, storedForeign(line), line.discountTaxIdentity?.accountingTaxType)), 0)
       if (priorGrossForeign + newGrossForeign > paidForeign + 0.005) {
         return { error: `The credit note, including VAT, would exceed what the order was paid in its own currency.${usedFallbackRate ? ' (An earlier refund\'s VAT rate could not be established, so it was counted at the highest rate on the order.)' : ''}`, quarantine: true as const } as const
       }
@@ -5219,6 +5284,19 @@ export async function createSalesOrderRefund(
           // o3d-hqvrp.323: the server-derived order-discount reversal of a PUBLIC refund (priced as 'shipping': both post under the order default's code; never caller-supplied, and not the chargeback pair, which is checked together with shipping below): its posting rate must be the rate the order's discount was charged at.
           if (input.deriveSaleLineNetsFromStoredBalance && !input.chargeback && !creditsNothing(refundLine)) {
             const discountLabel = 'The order discount reversal'
+            // An apportioned order's reversal posts under its own rate's code; that code must still price at the rate the discount share was charged at, which the stored split records.
+            if (refundLine.discountTaxIdentity) {
+              const code = refundLine.discountTaxIdentity.accountingTaxType
+              const priced = code ? priceSnapshottedTaxIdentity({ accountingTaxType: code, rateByTaxType: postingRates, label: discountLabel }) : null
+              if (priced && !priced.ok) return refuse(priced.reason)
+              // A reverse-charged share posts under the swap code, which prices at no VAT, as its share was charged.
+              const chargedRate = refundLine.discountTaxIdentity.reverseCharge ? 0 : refundLine.discountTaxIdentity.rate
+              if (priced?.ok) {
+                const rateRefusal = orderDiscountReversalRateRefusal({ postedRate: priced.rate, chargedRate: chargedRate > 0 ? chargedRate : null, label: discountLabel })
+                if (rateRefusal) return refuse(rateRefusal)
+              }
+              continue
+            }
             const pricedDiscount = priceRefundTaxIdentity({ kind: 'shipping', orderDefaultTaxType, reverseChargeSalesTaxType, rateByTaxType: postingRates, label: discountLabel })
             // A default code that cannot be priced is not refused here: the leg is left to the cumulative ceiling and the post-time refusal, as before.
             if (pricedDiscount.ok) {
@@ -5419,7 +5497,7 @@ export async function createSalesOrderRefund(
       let complete = true
       frozenRates = refundLines.map((refundLine) => {
         const kind: 'sale' | 'shipping' | 'discount' = refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale'
-        const code = resolveRefundLineTaxIdentity(refundLine.lineId, kind).accountingTaxType
+        const code = resolveRefundLineTaxIdentity(refundLine.lineId, kind, refundLine.discountTaxIdentity).accountingTaxType
         const priced = code ? priceSnapshottedTaxIdentity({ accountingTaxType: code, rateByTaxType: index, label: 'refund line' }) : null
         const lineTotal = toDecimal(refundLine.totalForeign != null ? Math.round(refundLine.totalForeign * 10000) / 10000 : Math.round(refundLine.totalBase * fxRate * 10000) / 10000)
         if (priced === null || !priced.ok) { complete = false; return null }
@@ -5437,7 +5515,7 @@ export async function createSalesOrderRefund(
       const postedIndex = buildTaxTypeRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))
       postedLineRates = refundLines.map((refundLine) => {
         const kind: 'sale' | 'shipping' | 'discount' = refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale'
-        const code = resolveRefundLineTaxIdentity(refundLine.lineId, kind).accountingTaxType
+        const code = resolveRefundLineTaxIdentity(refundLine.lineId, kind, refundLine.discountTaxIdentity).accountingTaxType
         const priced = code ? priceSnapshottedTaxIdentity({ accountingTaxType: code, rateByTaxType: postedIndex, label: 'refund line' }) : null
         return priced !== null && priced.ok ? priced.rate.toString() : null
       })
@@ -5521,7 +5599,7 @@ export async function createSalesOrderRefund(
       // identity (a monetary SALE line uses the order's single safe type; shipping/discount the default).
       const lineKind: 'sale' | 'shipping' | 'discount' =
         refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale'
-      const taxIdentity = resolveRefundLineTaxIdentity(refundLine.lineId, lineKind)
+      const taxIdentity = resolveRefundLineTaxIdentity(refundLine.lineId, lineKind, refundLine.discountTaxIdentity)
       const createdLine = await tx.salesOrderRefundLine.create({
         data: {
           refundId: createdRefund.id,
@@ -5536,6 +5614,7 @@ export async function createSalesOrderRefund(
           accountingTaxType: taxIdentity.accountingTaxType,
           reverseCharge: taxIdentity.reverseCharge,
           lineKind,
+          ...(lineKind === 'discount' && refundLine.discountTaxIdentity ? { discountTaxRateId: refundLine.discountTaxIdentity.taxRateId } : {}),
           postedTaxRate: postedLineRates[refundLineIndex] ?? null,
           ...(refundLine.chargedTaxForeign != null && Number.isFinite(refundLine.chargedTaxForeign) ? { chargedTaxForeign: Math.round(Math.abs(refundLine.chargedTaxForeign) * 10000) / 10000 } : {}),
           ...(schemeSnapshot?.scheme === true ? { postingTaxType: schemeSnapshot.postingTaxType, schemeTaxRateValue: frozenRates?.[refundLineIndex] ?? null } : {}),

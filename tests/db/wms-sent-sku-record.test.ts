@@ -74,7 +74,7 @@ const resolveRow = (d: Deps, s: Seeded) => d.db.wmsStockDiscrepancy.updateMany({
 const touchOrder = (d: Deps, s: Seeded) => d.db.$executeRawUnsafe(`UPDATE sales_orders SET "updatedAt" = now() + interval '1 hour' WHERE id = '${s.orderId}'`)
 
 function connectorDouble() {
-  const sent = { created: [] as Array<{ sku: string; quantity: number }>, amended: [] as Array<Array<{ sku: string; quantity: number }>> }
+  const sent = { created: [] as Array<{ sku: string; quantity: number }>, amended: [] as Array<Array<{ sku: string; quantity: number }>>, adopt: false }
   return {
     sent,
     connector: {
@@ -84,6 +84,8 @@ function connectorDouble() {
       addOrderComment: async () => {},
       verifyPushedOrder: async () => 'ours' as const,
       probeOrderPresence: async () => 'MISSING' as const,
+      // o3d-jtfy7: a connector that can be asked whether it holds the order under IMS's reference (set `adopt` to have it answer ADOPT).
+      reconcileAmbiguousCreate: async () => (sent.adopt ? { kind: 'ADOPT' as const, externalOrderId: 'wms-adopted', externalOrderNumber: 'WN-ADOPTED' } : { kind: 'NONE' as const }),
     },
   }
 }
@@ -157,4 +159,99 @@ test('ship-from change to a warehouse with NO rename history: the amendment stil
   assert.deepEqual(planFor(d, double.sent.created, double.sent.amended[0]!), [])
   const link = await d.db.wmsOrderPushLink.findUnique({ where: { orderId: s.orderId }, select: { pushWarehouseId: true } })
   assert.equal(link?.pushWarehouseId, s.w2, 'the applied amendment stamps the warehouse it was sent to')
+})
+
+// ---- o3d-jtfy7: the record is dropped / re-written whenever the link is bound to a different warehouse order ----------------------------------------------
+const setStatus = (d: Deps, s: Seeded, status: string) => d.db.salesOrder.update({ where: { id: s.orderId }, data: { status: status as never } })
+
+test('o3d-jtfy7: HOLD clears the record; the order is released and re-created with the flag OFF as A; the next amendment sends A (no delete/add)', { skip }, async (t) => {
+  const d = await deps()
+  const s = await seed(d, `skr${randomUUID().slice(0, 8)}`)
+  t.after(() => cleanup(d, s))
+  await setFlag(d, true)
+  await renameRow(d, s, 'RESOLVED')
+  await setWarehouseSku(d, s, s.b)
+  const double = connectorDouble()
+  await run(d, double.connector)
+  assert.deepEqual(Object.values((await recordOf(d, s))?.sentLineSkus as Record<string, { own: string; sent: string }>), [{ own: s.a, sent: s.b }], 'precondition: A was sent as B')
+  await setFlag(d, false)
+  await setStatus(d, s, 'ON_HOLD')
+  await run(d, double.connector)
+  const held = await recordOf(d, s)
+  assert.equal(held?.state, 'HELD', 'precondition: the hold pass moved the link')
+  assert.equal(held?.sentLineSkus, null, 'a held link no longer describes any warehouse order')
+  await setStatus(d, s, 'PROCESSING')
+  for (let i = 0; i < 3; i += 1) await run(d, double.connector)
+  assert.equal((await recordOf(d, s))?.state, 'SYNCED', 'precondition: released and re-created')
+  assert.deepEqual(double.sent.created.map((l) => l.sku), [s.a], 'precondition: the re-create ran with the flag OFF')
+  await touchOrder(d, s)
+  await run(d, double.connector)
+  assert.deepEqual(double.sent.amended.at(-1)!.map((l) => l.sku), [s.a])
+  assert.deepEqual(planFor(d, double.sent.created, double.sent.amended.at(-1)!), [])
+})
+
+test('o3d-jtfy7: CANCEL clears the record', { skip }, async (t) => {
+  const d = await deps()
+  const s = await seed(d, `skr${randomUUID().slice(0, 8)}`)
+  t.after(() => cleanup(d, s))
+  await setFlag(d, true)
+  await renameRow(d, s, 'RESOLVED')
+  await setWarehouseSku(d, s, s.b)
+  const double = connectorDouble()
+  await run(d, double.connector)
+  assert.notEqual((await recordOf(d, s))?.sentLineSkus, null, 'precondition: a record exists')
+  await setStatus(d, s, 'CANCELLED')
+  await run(d, double.connector)
+  const link = await recordOf(d, s)
+  assert.equal(link?.state, 'CANCELLED', 'precondition: the cancel pass moved the link')
+  assert.equal(link?.sentLineSkus, null)
+})
+
+test('o3d-jtfy7: an ADOPTED warehouse order carries no stale record: with the flag OFF the next amendment sends A, not the old {A:B}', { skip }, async (t) => {
+  const d = await deps()
+  const s = await seed(d, `skr${randomUUID().slice(0, 8)}`)
+  t.after(() => cleanup(d, s))
+  await setFlag(d, false)
+  await setWarehouseSku(d, s, s.a)
+  // A link parked AMBIGUOUS_CREATE that still carries the record of an earlier (flag ON) warehouse order for this order.
+  await d.db.wmsOrderPushLink.create({
+    data: { orderId: s.orderId, connector: 'mintsoft', state: 'AMBIGUOUS_CREATE', attempts: 5, lastAttemptAt: new Date(Date.now() - 3_600_000), lastError: 'parked', claimHistoryTracked: true, sentLineSkus: { [(await d.db.salesOrderLine.findFirstOrThrow({ where: { orderId: s.orderId }, select: { id: true } })).id]: { own: s.a, sent: s.b } } },
+  })
+  const double = connectorDouble()
+  double.sent.adopt = true
+  await run(d, double.connector)
+  // The same sweep adopts it (PENDING_VERIFY) and the verify pass proves it (SYNCED).
+  const adopted = await recordOf(d, s)
+  assert.equal(adopted?.state, 'SYNCED', 'precondition: the parked create was adopted and verified')
+  assert.equal(adopted?.sentLineSkus, null, 'the adopted order is not the one the record described')
+  await touchOrder(d, s)
+  await run(d, double.connector)
+  assert.deepEqual(double.sent.amended.at(-1)!.map((l) => l.sku), [s.a])
+  assert.deepEqual(planFor(d, [{ sku: s.a, quantity: 1 }], double.sent.amended.at(-1)!), [])
+})
+
+test('o3d-jtfy7: a create that landed but whose link write failed is recorded with what it sent (PENDING_VERIFY), so the verified link amends as B with the flag OFF', { skip }, async (t) => {
+  const d = await deps()
+  const s = await seed(d, `skr${randomUUID().slice(0, 8)}`)
+  t.after(() => cleanup(d, s))
+  await setFlag(d, true)
+  await renameRow(d, s, 'RESOLVED')
+  await setWarehouseSku(d, s, s.b)
+  const double = connectorDouble()
+  const port = d.sweep.createPrismaWmsOrderPushPort()
+  let failedWrites = 0
+  port.upsertCreatedLinkWithItems = async () => { failedWrites += 1; throw new Error('link write failed') }
+  const original = console.error
+  console.error = () => {}
+  try { await d.sweep.runWmsOrderPushSweepCore(double.connector as never, 'mintsoft', port, { batchSize: 1000 }) } finally { console.error = original }
+  assert.deepEqual(double.sent.created.map((l) => l.sku), [s.b], 'precondition: sent as B')
+  const link = await recordOf(d, s)
+  assert.equal(failedWrites, 1, 'precondition: the create write failed, so the fallback bound the id')
+  assert.deepEqual(Object.values(link?.sentLineSkus as Record<string, { own: string; sent: string }>), [{ own: s.a, sent: s.b }])
+  assert.equal(link?.state, 'SYNCED', 'precondition: the verify pass of the same sweep promoted it')
+  await setFlag(d, false)
+  await touchOrder(d, s)
+  await run(d, double.connector)
+  assert.deepEqual(double.sent.amended.at(-1)!.map((l) => l.sku), [s.b])
+  assert.deepEqual(planFor(d, double.sent.created, double.sent.amended.at(-1)!), [])
 })

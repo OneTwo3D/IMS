@@ -58,7 +58,7 @@ export function isNoTaxType(taxType: string | null | undefined): boolean {
 export type SalesDocumentTaxTypeProblem = {
   /** Where on the document: `line 2 "Widget"`, `shipping`, `order discount`. */
   where: string
-  kind: 'missing' | 'explicit-none'
+  kind: 'missing' | 'explicit-none' | 'inconsistent'
 }
 
 type TaxTypedLine = { description?: unknown; taxType?: unknown; noTaxKind?: unknown }
@@ -71,6 +71,8 @@ export type SalesDocumentTaxTypeInput = {
   discountAmount?: unknown
   discountAccountCode?: unknown
   discountTaxType?: unknown
+  /** The order discount split by tax code (its tax was apportioned across the line rates): when present each part carries its own code and they add up to `discountAmount`. */
+  discountParts?: ReadonlyArray<{ amount?: unknown; taxType?: unknown }> | null
 }
 
 function isBlank(value: unknown): boolean {
@@ -105,6 +107,21 @@ export function connectorEmitsShipping<T extends SalesDocumentExtras>(doc: T): d
   return isPositive(doc.shippingAmount) && !isBlank(doc.shippingAccountCode)
 }
 
+/** The valid parts of an order discount split by tax code, or null when the document carries none (the single discount line then). A malformed or non-adding set is reported by findSalesDocumentTaxTypeProblems, never silently dropped. */
+export function discountPartsOf(doc: Pick<SalesDocumentTaxTypeInput, 'discountParts'>): ReadonlyArray<{ amount: number; taxType?: string }> | null {
+  const parts = doc.discountParts
+  if (!Array.isArray(parts) || parts.length === 0) return null
+  return parts as ReadonlyArray<{ amount: number; taxType?: string }>
+}
+
+function discountPartsAddUp(doc: SalesDocumentTaxTypeInput): boolean {
+  const parts = discountPartsOf(doc)
+  if (!parts) return true
+  if (parts.some((p) => !isPositive(p.amount))) return false
+  const sum = parts.reduce((t, p) => t + Number(p.amount), 0)
+  return Math.abs(sum - Number(doc.discountAmount)) < 0.005 + 1e-9
+}
+
 export function connectorEmitsDiscount<T extends SalesDocumentExtras>(doc: T): doc is T & { discountAmount: number; discountAccountCode: string } {
   return isPositive(doc.discountAmount) && !isBlank(doc.discountAccountCode)
 }
@@ -126,14 +143,22 @@ export function findSalesDocumentTaxTypeProblems(doc: SalesDocumentTaxTypeInput)
       problems.push({ where: lineLabel(line, index), kind: 'explicit-none' })
     }
   })
+  const parts = connectorEmitsDiscount(doc) ? discountPartsOf(doc) : null
+  if (parts && !discountPartsAddUp(doc)) problems.push({ where: 'order discount (its per-rate parts do not add up to the discount)', kind: 'inconsistent' })
   for (const [where, emitted, taxType] of [
     ['shipping', connectorEmitsShipping(doc), doc.shippingTaxType],
-    ['order discount', connectorEmitsDiscount(doc), doc.discountTaxType],
+    // With per-rate parts the discount is sent on the parts' codes, so those are what is checked; the header code is then not sent.
+    ...(parts ? [] : [['order discount', connectorEmitsDiscount(doc), doc.discountTaxType] as const]),
   ] as const) {
     if (!emitted) continue
     if (isBlank(taxType)) problems.push({ where, kind: 'missing' })
     else if (isNoTaxType(taxType as string)) problems.push({ where, kind: 'explicit-none' })
   }
+  parts?.forEach((part, index) => {
+    const where = `order discount part ${index + 1}`
+    if (isBlank(part.taxType)) problems.push({ where, kind: 'missing' })
+    else if (isNoTaxType(part.taxType as string)) problems.push({ where, kind: 'explicit-none' })
+  })
   return problems
 }
 
@@ -151,6 +176,8 @@ export function describeSalesDocumentTaxTypeRefusal(
   const parts: string[] = []
   if (missing.length > 0) parts.push(`no tax type on ${missing.join(', ')}`)
   if (none.length > 0) parts.push(`"No VAT" (NONE) on ${none.join(', ')}, which is not a line kind allowed to carry it`)
+  const inconsistent = problems.filter((p) => p.kind === 'inconsistent').map((p) => p.where)
+  if (inconsistent.length > 0) parts.push(`${inconsistent.join(', ')}`)
   return (
     `NOTHING WAS SENT. ${document} was refused: ${parts.join('; ')}. IMS never posts a sales line on "No VAT" by default - `
     + `a missing code is a mapping fault, and an explicit "No VAT" is only accepted on a line that names why it carries no tax. `

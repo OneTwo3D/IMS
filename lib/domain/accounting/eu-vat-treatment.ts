@@ -208,6 +208,10 @@ export function applyEuVatTreatment<P extends TreatablePayload>(payload: P, plan
   if (retype !== null) {
     if (shippingEmitted) next = { ...withoutKeys(next, BINDING_KEYS.shipping), shippingTaxType: retype }
     if (discountEmitted) next = { ...withoutKeys(next, BINDING_KEYS.discount), discountTaxType: retype }
+    // A discount split by tax code (apportioned order): every part moves to the scheme's code too, or the parts would keep posting at the rates the scheme replaces.
+    if (discountEmitted && Array.isArray(next.discountParts)) {
+      next = { ...next, discountParts: (next.discountParts as Array<Record<string, unknown>>).map((part) => ({ ...withoutKeys(part, BINDING_KEYS.line), taxType: retype })) }
+    }
   }
 
   if (route.kind === 'none') {
