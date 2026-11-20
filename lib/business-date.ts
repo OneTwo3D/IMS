@@ -11,6 +11,12 @@ export function businessDateYmd(instant: Date, timeZone: string = DEFAULT_TIMEZO
   return `${get('year')}-${get('month')}-${get('day')}`
 }
 
+/** The business day (YYYY-MM-DD) of an ISO instant string, as a report row carries it (`2026-07-31T23:30:00.000Z` is 1 August in London). Unreadable input is returned as its first ten characters. */
+export function businessDateOfIso(iso: string, timeZone: string = DEFAULT_TIMEZONE): string {
+  const instant = new Date(iso)
+  return Number.isNaN(instant.getTime()) ? iso.slice(0, 10) : businessDateYmd(instant, timeZone)
+}
+
 /**
  * The business day of a WooCommerce date stamp that carries a time (`2026-06-30T23:30:00`: GMT with no suffix, or with Z / an offset), so the receipt registered
  * with an invoice is dated on the same London day the invoice is. Null for anything that is not a full timestamp (a bare day is already a day) or is unreadable.

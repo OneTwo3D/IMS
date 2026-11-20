@@ -8,7 +8,9 @@ import {
 } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay } from '@/lib/domain/math/date-window'
+import { businessDateYmd } from '@/lib/business-date'
+import { dateOnly } from '@/lib/domain/math/date-window'
+import { londonPeriod, type LondonPeriod } from '@/lib/domain/math/london-period'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { SourceScanTooLargeError, assertSourceLimit, sourceLimitNotice } from '@/lib/security/source-scan-error'
@@ -531,13 +533,8 @@ async function baseCurrencyFromDeps(deps?: SalesFulfillmentAnalyticsDeps): Promi
   return deps?.client ? DEFAULT_BASE_CURRENCY : getBaseCurrencyCode()
 }
 
-function period(filters: SalesAnalyticsFilters, now: Date): { dateFrom: Date; dateTo: Date; dateToExclusive: Date } {
-  const { dateFrom: defaultFrom, dateTo: defaultTo } = defaultUtcDateWindow(now, DEFAULT_PERIOD_DAYS)
-  const dateTo = parseDateOnly(filters.dateTo, defaultTo, { endOfDay: true })
-  const dateFrom = parseDateOnly(filters.dateFrom, defaultFrom)
-  return dateFrom.getTime() <= dateTo.getTime()
-    ? { dateFrom, dateTo, dateToExclusive: exclusiveEndOfUtcDay(dateTo) }
-    : { dateFrom: startOfUtcDay(dateTo), dateTo, dateToExclusive: exclusiveEndOfUtcDay(dateTo) }
+function period(filters: SalesAnalyticsFilters, now: Date): LondonPeriod {
+  return londonPeriod(filters, now, DEFAULT_PERIOD_DAYS)
 }
 
 function clampPageSize(value: number | undefined): number {
@@ -568,8 +565,8 @@ export function emptySalesAnalyticsReportForSourceLimit<Row>(
   const pageSize = clampPageSize(filters.pageSize)
   return {
     generatedAt: now.toISOString(),
-    dateFrom: dateOnly(window.dateFrom),
-    dateTo: dateOnly(window.dateTo),
+    dateFrom: dateOnly(window.fromLabel),
+    dateTo: dateOnly(window.toLabel),
     rows: [],
     pageInfo: pageInfo(0, filters.page, pageSize),
     totals,
@@ -616,7 +613,7 @@ function currencyMode(filters: SalesAnalyticsFilters): SalesCurrencyMode {
   return filters.currencyMode === 'foreign' ? 'foreign' : 'base'
 }
 
-async function loadSalesOrders(client: SalesFulfillmentAnalyticsClient, filters: SalesAnalyticsFilters, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }): Promise<SalesOrderRow[]> {
+async function loadSalesOrders(client: SalesFulfillmentAnalyticsClient, filters: SalesAnalyticsFilters, window: LondonPeriod): Promise<SalesOrderRow[]> {
   return client.salesOrder.findMany({
     where: {
       ...INVOICED_ORDER_WHERE,
@@ -905,8 +902,8 @@ export async function getSalesAnalyticsReport(filters: SalesAnalyticsFilters = {
 
   return {
     generatedAt: generatedAt.toISOString(),
-    dateFrom: dateOnly(window.dateFrom),
-    dateTo: dateOnly(window.dateTo),
+    dateFrom: dateOnly(window.fromLabel),
+    dateTo: dateOnly(window.toLabel),
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {
@@ -949,7 +946,7 @@ type OrderDispatchCostEvidence = {
   costedQtyByMovement: Map<string, Prisma.Decimal>
 }
 
-async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date }): Promise<OrderDispatchCostEvidence> {
+async function loadCogsByOrder(client: SalesFulfillmentAnalyticsClient, window: LondonPeriod): Promise<OrderDispatchCostEvidence> {
   const rows = await client.cogsEntry.findMany({
     where: {
       movement: {
@@ -1608,8 +1605,8 @@ export async function getCustomerAnalyticsReport(filters: SalesAnalyticsFilters 
   const paged = paginate(rows, filters, deps?.paginate !== false)
   return {
     generatedAt: generatedAt.toISOString(),
-    dateFrom: dateOnly(window.dateFrom),
-    dateTo: dateOnly(window.dateTo),
+    dateFrom: dateOnly(window.fromLabel),
+    dateTo: dateOnly(window.toLabel),
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {
@@ -1782,7 +1779,7 @@ type InWindowDispatchMovement = { id: string; orderId: string | null; qty: Decim
 
 async function loadInWindowDispatchedQtyByLine(
   client: SalesFulfillmentAnalyticsClient,
-  window: { dateFrom: Date; dateTo: Date; dateToExclusive: Date },
+  window: LondonPeriod,
   orders: SalesOrderRow[],
   sourceLabel: string,
 ): Promise<{ byLine: Map<string, Prisma.Decimal>; dispatchMovements: InWindowDispatchMovement[] }> {
@@ -2154,8 +2151,8 @@ export async function getMarginAnalyticsReport(filters: SalesAnalyticsFilters = 
   })
   return {
     generatedAt: generatedAt.toISOString(),
-    dateFrom: dateOnly(window.dateFrom),
-    dateTo: dateOnly(window.dateTo),
+    dateFrom: dateOnly(window.fromLabel),
+    dateTo: dateOnly(window.toLabel),
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {
@@ -2455,8 +2452,8 @@ export async function getReturnsAnalyticsReport(filters: SalesAnalyticsFilters =
   const totalReplacementQty = [...replacementQtyByRefund.values()].reduce((sum, qty) => sum.add(qty), new Prisma.Decimal(0))
   return {
     generatedAt: generatedAt.toISOString(),
-    dateFrom: dateOnly(window.dateFrom),
-    dateTo: dateOnly(window.dateTo),
+    dateFrom: dateOnly(window.fromLabel),
+    dateTo: dateOnly(window.toLabel),
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {
@@ -2671,8 +2668,8 @@ export async function getFulfillmentAnalyticsReport(filters: SalesAnalyticsFilte
   ]
   return {
     generatedAt: generatedAt.toISOString(),
-    dateFrom: dateOnly(window.dateFrom),
-    dateTo: dateOnly(window.dateTo),
+    dateFrom: dateOnly(window.fromLabel),
+    dateTo: dateOnly(window.toLabel),
     rows,
     pageInfo: pageInfo(rows.length, 1, rows.length || 1),
     totals: {
@@ -2729,7 +2726,7 @@ export async function getThroughputAnalyticsReport(filters: SalesAnalyticsFilter
   for (const activity of activities) {
     const shipmentId = activityShipmentId(activity.metadata)
     const shipment = shipmentId ? shipmentById.get(shipmentId) : undefined
-    const date = dateOnly(activity.createdAt)
+    const date = businessDateYmd(activity.createdAt)
     const userName = activity.user?.name ?? 'System'
     const key = `${date}:${activity.userId ?? 'system'}`
     const current = groups.get(key) ?? {
@@ -2764,8 +2761,8 @@ export async function getThroughputAnalyticsReport(filters: SalesAnalyticsFilter
   const paged = paginate(rows, filters, deps?.paginate !== false)
   return {
     generatedAt: generatedAt.toISOString(),
-    dateFrom: dateOnly(window.dateFrom),
-    dateTo: dateOnly(window.dateTo),
+    dateFrom: dateOnly(window.fromLabel),
+    dateTo: dateOnly(window.toLabel),
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals: {

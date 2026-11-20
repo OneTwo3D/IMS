@@ -148,8 +148,9 @@ test('production variance compares BOM planned quantities with PRODUCTION_OUT co
         orderType: 'ASSEMBLY',
         status: { in: ['IN_PROGRESS', 'COMPLETED'] },
         completedAt: {
-          gte: new Date('2026-05-01T00:00:00Z'),
-          lt: new Date('2026-06-01T00:00:00Z'),
+          // May 2026 is BST: the London day starts at 23:00Z the evening before (o3d-bo89l).
+          gte: new Date('2026-04-30T23:00:00Z'),
+          lt: new Date('2026-05-31T23:00:00Z'),
         },
       },
       orderBy: [{ completedAt: 'desc' }, { reference: 'asc' }],
@@ -498,8 +499,9 @@ test('production variance scopes by completedAt and consumption-capable statuses
     orderType: 'ASSEMBLY',
     status: { in: ['IN_PROGRESS', 'COMPLETED'] },
     completedAt: {
+      // 1 March is GMT, 31 March is BST (clocks go forward on 29 March): London midnight is 00:00Z at the start and 23:00Z at the end (o3d-bo89l).
       gte: new Date('2026-03-01T00:00:00Z'),
-      lt: new Date('2026-04-01T00:00:00Z'),
+      lt: new Date('2026-03-31T23:00:00Z'),
     },
   })
   assert.deepEqual((stockMovementArgs[0] as { where: { referenceId: { in: string[] } } }).where.referenceId.in, ['po-completed'])

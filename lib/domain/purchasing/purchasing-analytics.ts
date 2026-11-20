@@ -4,7 +4,9 @@ import { INCOMING_PO_STATUSES } from '@/lib/domain/inventory/po-status-sets'
 import { DEFAULT_BASE_CURRENCY, getBaseCurrencyCode } from '@/lib/base-currency'
 import { db } from '@/lib/db'
 import { roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { dateOnly, defaultUtcDateWindow, elapsedDaysDecimal, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, subtractUtcDays } from '@/lib/domain/math/date-window'
+import { businessDateYmd } from '@/lib/business-date'
+import { dateOnly, elapsedDaysDecimal, exclusiveEndOfUtcDay, startOfUtcDay } from '@/lib/domain/math/date-window'
+import { londonPeriod, type LondonPeriod } from '@/lib/domain/math/london-period'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { SourceScanTooLargeError, assertSourceLimit, sourceLimitNotice } from '@/lib/security/source-scan-error'
 
@@ -257,17 +259,13 @@ async function baseCurrencyFromDeps(deps?: PurchasingAnalyticsDeps): Promise<str
   return deps?.client ? DEFAULT_BASE_CURRENCY : getBaseCurrencyCode()
 }
 
-function period(filters: PurchasingAnalyticsFilters, now: Date): { dateFrom: Date; dateTo: Date; dateToExclusive: Date } {
-  const { dateFrom: defaultFrom, dateTo: defaultTo } = defaultUtcDateWindow(now, DEFAULT_PERIOD_DAYS)
-  const dateTo = parseDateOnly(filters.dateTo, defaultTo, { endOfDay: true })
-  const dateFrom = parseDateOnly(filters.dateFrom, defaultFrom)
-  return dateFrom.getTime() <= dateTo.getTime()
-    ? { dateFrom, dateTo, dateToExclusive: exclusiveEndOfUtcDay(dateTo) }
-    : { dateFrom: startOfUtcDay(dateTo), dateTo, dateToExclusive: exclusiveEndOfUtcDay(dateTo) }
+function period(filters: PurchasingAnalyticsFilters, now: Date): LondonPeriod {
+  return londonPeriod(filters, now, DEFAULT_PERIOD_DAYS)
 }
 
+/** The LONDON calendar month of an instant (YYYY-MM), so a PO received at 23:30Z on 31 July (BST) is August's spend, as the London-day period filter treats it. */
 function monthKey(date: Date): string {
-  return `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, '0')}`
+  return businessDateYmd(date).slice(0, 7)
 }
 
 function clampPageSize(value: number | undefined): number {
@@ -298,8 +296,8 @@ export function emptyPurchasingAnalyticsReportForSourceLimit<Row>(
   const pageSize = clampPageSize(filters.pageSize)
   return {
     generatedAt: now.toISOString(),
-    dateFrom: dateOnly(window.dateFrom),
-    dateTo: dateOnly(window.dateTo),
+    dateFrom: dateOnly(window.fromLabel),
+    dateTo: dateOnly(window.toLabel),
     rows: [],
     pageInfo: pageInfo(0, filters.page, pageSize),
     totals,
@@ -347,7 +345,7 @@ function percentile(values: Prisma.Decimal[], percentileRank: number): Prisma.De
 function generatedReport<Row>(
   rows: Row[],
   filters: PurchasingAnalyticsFilters,
-  window: { dateFrom: Date; dateTo: Date },
+  window: Pick<LondonPeriod, 'fromLabel' | 'toLabel'>,
   generatedAt: Date,
   totals: Record<string, string>,
   notices: string[],
@@ -356,8 +354,8 @@ function generatedReport<Row>(
   const paged = paginate(rows, filters, paginateRows)
   return {
     generatedAt: generatedAt.toISOString(),
-    dateFrom: dateOnly(window.dateFrom),
-    dateTo: dateOnly(window.dateTo),
+    dateFrom: dateOnly(window.fromLabel),
+    dateTo: dateOnly(window.toLabel),
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals,
@@ -431,7 +429,7 @@ export async function getOpenPurchaseOrdersReport(
       supplierId: order.supplierId,
       supplierName: order.supplier.name,
       status: order.status,
-      poSentAt: order.poSentAt ? dateOnly(order.poSentAt) : null,
+      poSentAt: order.poSentAt ? businessDateYmd(order.poSentAt) : null,
       expectedDelivery: earliestEta ? dateOnly(earliestEta) : null,
       overdue: Boolean(earliestEta && (earliestEta as Date).getTime() < startOfUtcDay(generatedAt).getTime() && outstandingQty.gt(0)),
       daysSinceSent: daysString(daysBetween(sentAt, generatedAt)),
@@ -695,7 +693,7 @@ export async function getPurchasePriceVarianceReport(
         productName: line.product.name,
         categoryName: line.product.category?.name ?? null,
         poReference: line.po.reference,
-        receivedAt: line.po.receivedAt ? dateOnly(line.po.receivedAt) : null,
+        receivedAt: line.po.receivedAt ? businessDateYmd(line.po.receivedAt) : null,
         qty: qtyString(line.qty),
         actualLandedUnitCostBase: moneyString(actual, baseCurrency),
         referenceUnitCostBase: prior ? moneyString(prior, baseCurrency) : '0',
@@ -876,11 +874,13 @@ export async function getObservedLeadTimeP95ByProduct(
 ): Promise<Map<string, number>> {
   const client = (options.client ?? db) as unknown as Pick<PurchasingAnalyticsClient, 'purchaseReceipt'>
   const generatedAt = options.now?.() ?? new Date()
-  const window = {
-    dateFrom: options.dateFrom ?? subtractUtcDays(startOfUtcDay(generatedAt), 365),
-    dateTo: options.dateTo ?? defaultUtcDateWindow(generatedAt, 1).dateTo,
+  // Trailing 365 London days by default (the window the other purchasing reports use); explicit instants are honoured as given.
+  const defaultWindow = londonPeriod({}, generatedAt, 366)
+  const receiptWindow = {
+    dateFrom: options.dateFrom ?? defaultWindow.dateFrom,
+    dateTo: options.dateTo ?? defaultWindow.dateTo,
+    dateToExclusive: options.dateTo ? exclusiveEndOfUtcDay(options.dateTo) : defaultWindow.dateToExclusive,
   }
-  const receiptWindow = { ...window, dateToExclusive: exclusiveEndOfUtcDay(window.dateTo) }
   const receipts = await loadReceipts(client as PurchasingAnalyticsClient, receiptWindow)
   const byProduct = new Map<string, Prisma.Decimal[]>()
   for (const receipt of receipts) {
