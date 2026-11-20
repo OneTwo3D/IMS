@@ -5041,6 +5041,8 @@ model WcOrderDivergenceRecheck {
   lastAttemptAt   DateTime @default(now()) @map("last_attempt_at")
   /// True when the write step queued this row because it could not decide (warehouse unreadable, same-second conflict). Such a row that runs out of attempts raises a refused action instead of being dropped silently.
   fromRetry       Boolean  @default(false) @map("from_retry")
+  /// Live reads that failed, timed out or hung since the last successful one. Not an attempt: at the cap the row is dropped and a refused action raised.
+  failedReads     Int      @default(0) @map("failed_reads")
 
   @@index([lastAttemptAt], map: "wc_order_divergence_rechecks_attempt_idx")
   @@map("wc_order_divergence_rechecks")

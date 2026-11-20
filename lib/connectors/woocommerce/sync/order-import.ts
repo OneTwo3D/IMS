@@ -5405,10 +5405,6 @@ export async function syncNewWcOrders(
     ? await walkOrders(statuses, lastSync)
     : { endedOnEmptyPage: false, page: 1 }
   const { endedOnEmptyPage, page } = walked
-  // Comparisons deferred for an unrecorded refund are resolved here in EVERY mode, the ordinary poll included (it sweeps no refunds): the deferral is a durable row, so this is a retry that survives a restart,
-  // and it runs before the cursor below can advance. It never throws and never holds the cursor.
-  await drainDeferredWcOrderDivergences()
-
   // A truncated read is a fetch error by another name, so it goes in `errors` and the cursor below
   // is held (o3d-xnwu). The `break` on a fetch error above pushed its own, so this only fires on a
   // clean walk that RAN OUT OF CEILING.
@@ -5538,6 +5534,11 @@ export async function syncNewWcOrders(
       }).catch(() => undefined)
     }
   }
+
+  // Comparisons deferred for an unrecorded refund are resolved here in EVERY mode, the ordinary poll included (it sweeps no refunds): the deferral is a durable row, so this is a retry that survives a restart.
+  // It runs AFTER the cursor commit, never before: each live read is a WooCommerce request, and a slow or hung one must not stand between a finished walk and its cursor. It has its own wall-clock budget
+  // (under the proxy's 60 s read timeout), never throws and never holds the cursor.
+  await drainDeferredWcOrderDivergences()
 
   if (result.synced > 0) {
     await logActivity({
