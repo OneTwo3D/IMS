@@ -312,7 +312,7 @@ test('a non-money post is never gated (o3d-0m56)', async () => {
  * protected, it is unprotected, so the list is enumerated rather than spot-checked.
  */
 const MONEY_POSTS = [
-  { file: 'lib/connectors/xero/sync-processor.ts', branches: ['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION'] },
+  { file: 'lib/connectors/xero/sync-processor.ts', branches: ['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION'], hosted: ['processCreditNoteAllocation'] },
   // o3d-remove-parked-connectors: `lib/connectors/quickbooks/sync-processor.ts` (INVOICE_PAYMENT,
   // BILL_PAYMENT) was the second entry and is archived. A second processor is added here in the same
   // commit that writes it, or its money branches are unfenced with nothing to say so.
@@ -322,8 +322,10 @@ for (const target of MONEY_POSTS) {
   test(`${target.file}: every money branch posts INSIDE the fence (o3d-0m56)`, async () => {
     const source = await readFile(path.join(process.cwd(), target.file), 'utf8')
     const guards = source.split('return postMoneyUnderLedgerFence({').length - 1
-    assert.equal(guards, target.branches.length,
-      `expected one fenced post per money branch (${target.branches.join(', ')})`)
+    // o3d-hqvrp.39: a money branch whose `case` delegates to a function of its own (CREDIT_NOTE_ALLOCATION -> processCreditNoteAllocation) counts here and is held to
+    // the same shape by the dedicated test below.
+    assert.equal(guards, target.branches.length + target.hosted.length,
+      `expected one fenced post per money branch (${target.branches.join(', ')}) and per hosted money function (${target.hosted.join(', ')})`)
 
     // Codex round 4, CRITICAL #2: the bare fence returns a verdict and leaves the caller to post,
     // which is a decision and a write with a network round trip and no lock between them. A
@@ -362,6 +364,31 @@ for (const target of MONEY_POSTS) {
     }
   })
 }
+
+test('CREDIT_NOTE_ALLOCATION posts inside the fence, dated and fenced like the other money branches (o3d-hqvrp.39)', async () => {
+  const source = await readFile(path.join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8')
+  assert.ok(source.includes("case 'CREDIT_NOTE_ALLOCATION':\n      return processCreditNoteAllocation("), 'the case delegates to the hosted function')
+  const at = source.indexOf('async function processCreditNoteAllocation(')
+  assert.notEqual(at, -1)
+  const body = source.slice(at, source.indexOf('\nexport async function processClaimedEntry(', at))
+  const guardAt = body.indexOf('postMoneyUnderLedgerFence({')
+  assert.notEqual(guardAt, -1, 'posts under the fence')
+  const callbackMatch = /\}, async \((?:\{ requireConnection \})?\) => \{/.exec(body.slice(guardAt))
+  const callbackAt = callbackMatch ? guardAt + callbackMatch.index : -1
+  assert.notEqual(callbackAt, -1, 'the post is the fence\'s callback')
+  const allocateAt = body.indexOf('allocatePurchaseCreditNote(')
+  const refundAt = body.indexOf('refundSalesCreditNote(')
+  assert.ok(allocateAt > callbackAt && refundAt > callbackAt, 'both requests are made inside the fence, not after it')
+  // The CLAIM fence is the statement immediately before EACH request, inside the ledger fence's callback.
+  const lines = body.split('\n')
+  for (const needle of ['await allocatePurchaseCreditNote(', 'await refundSalesCreditNote(']) {
+    const at = lines.findIndex((line) => line.includes(needle))
+    assert.ok(at > 0, `${needle} is called`)
+    assert.ok(lines.slice(Math.max(0, at - 2), at).some((line) => line.includes('if (!fence.ok) return fence.result') || line.includes('if (!refundFence.ok) return refundFence.result')), `${needle} is fenced immediately before it`)
+  }
+  assert.ok(/const settlementDate = posting\.date/.test(body), 'the date comes from moneyPostDateToSend')
+  assert.ok(body.slice(guardAt, callbackAt).includes('postingDate: settlementDate,'), 'the fence is handed the very date the request carries')
+})
 
 test('a FRESH row in a scope where something has ALREADY been sent is checked too (o3d-0m56)', async () => {
   // Codex round 3. A receipt recorded beside an older failed attempt queues a brand-new row, whose

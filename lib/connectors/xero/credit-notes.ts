@@ -5,7 +5,7 @@
 import { withSalesInvoiceAuthorization, type BeforeRemoteWrite, type ContactGate } from './invoices'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { createHash } from 'node:crypto'
-import { xeroGet, xeroPost, xeroPut } from './api'
+import { xeroGet, xeroPost, xeroPut, type RequiredXeroConnection } from './api'
 import { assertXeroLineQuantitiesKept, planXeroRoundingLine, xeroUnitDpFields, type XeroTaxRateOf } from './write-path'
 import { resolveUnitDpRoundingAccount } from './unit-dp-rounding'
 import { findOrCreateContact } from './contacts'
@@ -763,4 +763,84 @@ export async function allocatePurchaseCreditNote(
       + `(${remainingCredit.toFixed(2)}) or the bill's amount due (${amountDue.toFixed(2)}) was smaller than the request. Allocate the rest in Xero or add credit, `
       + 'then retry: a retry sends only the remainder.'),
   }
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// o3d-hqvrp.39 - SETTLING A POSTED SALES CREDIT NOTE (behind xero_credit_note_allocation_enabled; see lib/domain/accounting/credit-note-allocation.ts).
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+
+export type CreditNoteSettlementBalances =
+  | { ok: true; remainingCredit: number; amountDue: number | null; creditNoteStatus: string | null }
+  | { ok: false; error: string }
+
+/**
+ * What a settlement is sized from, READ FROM XERO: the credit note's RemainingCredit (and Status) and, for an allocation, the invoice's AmountDue. Both
+ * documents are read through `readSingleXeroDocument`, so a response about some OTHER document, or two of them, is UNKNOWN and nothing is sent - never a zero.
+ * Reads only; it is called before the claim fence and writes nothing.
+ */
+export async function readCreditNoteSettlementBalances(creditNoteId: string, invoiceId: string | null): Promise<CreditNoteSettlementBalances> {
+  const cnRes = await xeroGet<{ CreditNotes?: Array<{ CreditNoteID?: string; RemainingCredit?: unknown; Status?: unknown }> }>(`CreditNotes/${creditNoteId}`)
+  if (!cnRes.ok) return { ok: false, error: cnRes.error ?? 'Credit note not found in Xero for allocation' }
+  const cnRead = readSingleXeroDocument<{ CreditNoteID?: string; RemainingCredit?: unknown; Status?: unknown }>(cnRes.data, 'CreditNotes', 'CreditNoteID', creditNoteId)
+  if (cnRead.status === 'unreadable') return { ok: false, error: `Credit note not read from Xero for settlement: ${cnRead.reason}` }
+  const remainingCredit = readXeroBalance(cnRead.document.RemainingCredit)
+  if (remainingCredit === null) return { ok: false, error: 'Credit note read from Xero states no readable RemainingCredit, so IMS cannot tell how much can be settled' }
+  const creditNoteStatus = typeof cnRead.document.Status === 'string' ? cnRead.document.Status : null
+  let amountDue: number | null = null
+  if (invoiceId) {
+    const invRes = await xeroGet<XeroInvoiceDueResponse>(`Invoices/${invoiceId}`)
+    if (!invRes.ok) return { ok: false, error: invRes.error ?? 'Invoice not found in Xero for settlement' }
+    const invRead = readSingleXeroDocument<{ InvoiceID?: string; AmountDue?: unknown }>(invRes.data, 'Invoices', 'InvoiceID', invoiceId)
+    if (invRead.status === 'unreadable') return { ok: false, error: `Invoice not read from Xero for settlement: ${invRead.reason}` }
+    amountDue = readXeroBalance(invRead.document.AmountDue)
+    if (amountDue === null) return { ok: false, error: 'Invoice read from Xero states no readable AmountDue, so IMS cannot tell how much can be allocated' }
+  }
+  return { ok: true, remainingCredit, amountDue, creditNoteStatus }
+}
+
+/** The Idempotency-Key for ONE refund payment (<= 128 chars): the row's key plus the exact request, so a changed request never reuses a key. */
+export function deriveCreditNoteRefundIdempotencyKey(rowKey: string, creditNoteId: string, accountId: string, amountCents: number): string {
+  const digest = createHash('sha256').update([rowKey, creditNoteId.toLowerCase(), accountId.toLowerCase(), amountCents].join('|')).digest('hex')
+  return `ims-cnrf-${digest}`
+}
+
+/**
+ * Pay a posted sales credit note OUT as a refund: a Xero Payment against the credit note (`CreditNote.CreditNoteID`, the refund shape of the Payments
+ * API) from the bank or clearing account the original receipt used. `currencyRate` is IMS's settlement rate for the cash-out (1 / rate, 6 dp, absent
+ * for a base-currency refund), so Xero books the realised FX gain or loss at IMS's rate - the same field and the same rate source a receipt carries.
+ *
+ * Idempotent: the credit note's RemainingCredit is read first and a refund larger than it is REFUSED (nothing sent). A retry of a refund that
+ * landed is answered by the ledger fence's probe before this runs, and carries the row's Idempotency-Key and IMS's own `Reference` mark besides.
+ * The CALLER proves the claim immediately before this call (`lease.fenceBeforeRemoteWrite`).
+ */
+export async function refundSalesCreditNote(
+  params: { creditNoteId: string; accountId: string; amount: number; date: string; currencyRate?: number; reference: string },
+  opts: { idempotencyKey: string; requireConnection?: RequiredXeroConnection },
+): Promise<{ success: boolean; paymentId?: string; error?: string }> {
+  const amount = Math.round(params.amount * 100) / 100
+  if (!Number.isFinite(amount) || amount <= 0) return { success: false, error: `The refund amount (${params.amount}) is not a positive amount, so nothing was paid` }
+  const balances = await readCreditNoteSettlementBalances(params.creditNoteId, null)
+  if (!balances.ok) return { success: false, error: balances.error }
+  if (balances.creditNoteStatus !== 'AUTHORISED') {
+    return { success: false, error: withLedgerCheck(`Nothing was paid: the credit note is ${balances.creditNoteStatus ?? 'in an unreadable status'} in Xero, and only an authorised credit note can be refunded. Authorise it in Xero, then retry.`) }
+  }
+  const amountCents = Math.round(amount * 100)
+  if (Math.round(balances.remainingCredit * 100) < amountCents) {
+    return { success: false, error: withLedgerCheck(`Nothing was paid: the credit note has ${balances.remainingCredit.toFixed(2)} credit remaining in Xero, less than the ${amount.toFixed(2)} refund (it was allocated or refunded already). Resolve in Xero, then retry.`) }
+  }
+  const res = await xeroPost<{ Payments?: Array<{ PaymentID: string }> }>('Payments', {
+    CreditNote: { CreditNoteID: params.creditNoteId },
+    Account: { AccountID: params.accountId },
+    Date: params.date,
+    Amount: amount,
+    ...(params.currencyRate !== undefined ? { CurrencyRate: params.currencyRate } : {}),
+    Reference: params.reference,
+  }, {
+    idempotencyKey: deriveCreditNoteRefundIdempotencyKey(opts.idempotencyKey, params.creditNoteId, params.accountId, amountCents),
+    ...(opts.requireConnection ? { requireConnection: opts.requireConnection } : {}),
+  })
+  if (!res.ok) return { success: false, error: res.error ?? 'Failed to post the refund payment against the credit note' }
+  const paymentId = res.data?.Payments?.[0]?.PaymentID
+  if (!paymentId) return { success: false, error: 'Xero answered OK but returned no payment id for the refund, so IMS cannot tell whether it was applied. No completion is claimed; retry re-reads the credit note and the ledger probe looks for the payment first.' }
+  return { success: true, paymentId }
 }

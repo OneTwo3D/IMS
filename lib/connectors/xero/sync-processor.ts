@@ -39,7 +39,17 @@ import {
 import { logActivity, logActivityInTransaction, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
-import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote, voidCreditNote } from './credit-notes'
+import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote, readCreditNoteSettlementBalances, refundSalesCreditNote, resolveCreditNoteAllocationAmount, voidCreditNote } from './credit-notes'
+import {
+  CREDIT_NOTE_ALLOCATION_CONNECTOR,
+  isCreditNoteAllocationEnabled,
+  planCreditNoteSettlement,
+  readCreditNoteSettlementFacts,
+  refundPaymentMethodOf,
+  type CreditNoteSettlementOperation,
+} from '@/lib/domain/accounting/credit-note-allocation'
+import { computeRealisedFx, describeFxRefusal, resolveSettlementFxRateToBase, settlementAsOfFromInput } from '@/lib/accounting-fx'
+import { isMissingFxRateError } from '@/lib/currencies/fx-select'
 import { prepareManualJournal, postPreparedManualJournal } from './journals'
 import { getGrantedScopes } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
@@ -327,7 +337,7 @@ export function noteHeldFailure(result: ProcessResult, error: unknown): void {
 }
 
 type SyncPayload = Record<string, unknown>
-type FollowUpSyncType = 'INVOICE_PAYMENT' | 'BILL_ATTACHMENT' | 'INVOICE_PDF' | 'INVOICE_EMAIL' | 'WC_INVOICE_NOTE' | 'PURCHASE_CREDIT_NOTE_ALLOCATION'
+type FollowUpSyncType = 'INVOICE_PAYMENT' | 'BILL_ATTACHMENT' | 'INVOICE_PDF' | 'INVOICE_EMAIL' | 'WC_INVOICE_NOTE' | 'PURCHASE_CREDIT_NOTE_ALLOCATION' | 'CREDIT_NOTE_ALLOCATION'
 type InvoicePaymentOrderingEntry = {
   id: string
   type: AccountingSyncType
@@ -3904,6 +3914,12 @@ const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }
   UNREALISED_FX_JOURNAL: POST_EFFECT_JOURNAL,
   MANUFACTURING_JOURNAL: POST_EFFECT_JOURNAL,
   MANUFACTURING_RECLASS: POST_EFFECT_JOURNAL,
+  CREDIT_NOTE_ALLOCATION: {
+    effect: 'SETTLED an existing sales credit note in Xero (applied it to its invoice, or paid it out as a refund against the credit note)',
+    remedy: withLedgerCheck('NO document was created - the settlement is an allocation on, or a refund payment against, a credit note that already existed. '
+      + 'Undo the allocation, or delete the refund payment, on that credit note in Xero if it should not stand; there is nothing to reverse or '
+      + 'credit-note.'),
+  },
   PURCHASE_CREDIT_NOTE_ALLOCATION: {
     effect: 'ALLOCATED an existing supplier credit note against a bill in Xero',
     remedy: withLedgerCheck('NO document was created — the allocation is a sub-resource of a credit note that already existed. '
@@ -5233,7 +5249,7 @@ function xeroPostingMode(payload: SyncPayload): LedgerPostingMode {
  *   - a foreign payment without a usable rate is refused, before anything is claimed, fenced or sent.
  */
 async function xeroPaymentCurrencyRate(
-  type: 'INVOICE_PAYMENT' | 'BILL_PAYMENT',
+  type: 'INVOICE_PAYMENT' | 'BILL_PAYMENT' | 'CREDIT_NOTE_ALLOCATION',
   payload: SyncPayload,
 ): Promise<{ ok: true; currencyRate: number | undefined } | { ok: false; error: string }> {
   const currency = payload.currency
@@ -6221,6 +6237,198 @@ async function processEntry(
   )
 }
 
+/**
+ * CREDIT_NOTE_ALLOCATION (o3d-hqvrp.39): settle a POSTED sales credit note - allocate it to its posted invoice, or pay it out as a refund against the
+ * credit note. Behind `xero_credit_note_allocation_enabled`. Reached through `processClaimedEntry`, which BOTH runners (direct and outbox) call for every
+ * type, so neither can miss it, and which asks the producer-hold seam before anything below runs (Xeroom owns sales credit notes in P1 and P2: shadowed).
+ *
+ * WHAT #1039 R2 FOUND, AND WHERE EACH FIX IS:
+ *   1. it fenced on a claim the SYNCED write had already released -> this is its OWN row with its OWN claim, fenced as the last statement before the call.
+ *   2. only the direct runner called it -> it is a sync type, so it is in the one place both runners dispatch from.
+ *   3. the receipt gate was check-then-act -> the receipts, the documents and the eligibility are read in ONE transaction under the order lock, inside
+ *      the claim, and what that reading decides (operation, amount, account, rate) is pinned onto the row before anything is sent.
+ *
+ * ONE ROW IS ONE SETTLEMENT. The operation is decided here and pinned; a retry replays the pinned request (the same Idempotency-Key, the same body), and a
+ * retry whose reading would now decide differently - after an attempt may have landed - refuses rather than posting the other kind of settlement as well.
+ */
+async function processCreditNoteAllocation(args: {
+  entryId: string
+  type: AccountingSyncType
+  referenceType: string
+  referenceId: string
+  payload: SyncPayload
+  lease: RemoteWriteLease
+}): Promise<EntryResult> {
+  const { entryId, type, referenceType, referenceId, lease } = args
+  let payload = args.payload
+  if (referenceType !== 'SalesOrderRefund') return { success: false, error: `CREDIT_NOTE_ALLOCATION is raised for a SalesOrderRefund, not a ${referenceType}` }
+  const creditNoteId = typeof payload.creditNoteId === 'string' ? payload.creditNoteId : ''
+  const accountingInvoiceId = typeof payload.accountingInvoiceId === 'string' ? payload.accountingInvoiceId : ''
+  if (!creditNoteId || !accountingInvoiceId) return { success: false, error: 'Missing creditNoteId or accountingInvoiceId for CREDIT_NOTE_ALLOCATION' }
+
+  // The retirement: CANCELLED, claim-fenced, before any request - so it is accurate (nothing was sent) and terminal. `skipped` tells the runner the row is
+  // already terminal. A lost claim retires nothing and the new holder decides.
+  const retire = async (reason: string, code: string): Promise<EntryResult> => {
+    const retired = await db.$transaction((tx) => retireOverSettlingInvoicePayment(tx, { entryId, claim: lease, reason }))
+    await logActivity({
+      entityType: 'SALES_ORDER', entityId: referenceId, action: 'credit_note_allocation_retired', tag: 'accounting', level: 'INFO',
+      description: `Credit note settlement not sent: ${reason}`,
+      metadata: { syncLogId: entryId, refundId: referenceId, creditNoteId, accountingInvoiceId, code, retired },
+    }).catch(() => { /* logging must never turn a safe retirement into a failure */ })
+    return { success: true, skipped: true }
+  }
+
+  // Switched off since it was queued: retired, never sent. Turning it back on lets the sweep raise a fresh row.
+  if (!(await isCreditNoteAllocationEnabled(db))) return retire('the xero_credit_note_allocation_enabled switch is off', 'SWITCH_OFF')
+
+  // THE RECEIPT AND ELIGIBILITY READING, INSIDE THE CLAIM, UNDER THE ORDER LOCK, IN ONE TRANSACTION.
+  const refundRow = await db.salesOrderRefund.findUnique({ where: { id: referenceId }, select: { orderId: true } })
+  if (!refundRow) return retire('the refund no longer exists', 'REFUND_GONE')
+  const reading = await db.$transaction(async (tx) => {
+    await lockSalesOrder(tx, refundRow.orderId)
+    const facts = await readCreditNoteSettlementFacts(tx, referenceId, entryId)
+    const row = await tx.accountingSyncLog.findUnique({ where: { id: entryId }, select: { remoteAttemptedAt: true } })
+    return { facts, attempted: row?.remoteAttemptedAt != null }
+  })
+  const facts = reading.facts
+  if (!facts) return retire('the refund or its order could not be read', 'REFUND_UNREADABLE')
+  const plan = planCreditNoteSettlement(facts)
+  if (plan.kind === 'NOT_NOW') return retire(plan.message, plan.reason)
+  // The row was raised for these two documents; if either has moved since (a deleted and re-posted invoice or credit note), it settles nothing.
+  if (facts.refund.creditNoteId !== creditNoteId || facts.order.invoiceId !== accountingInvoiceId) {
+    return retire('the credit note or the invoice named on this row is no longer the one IMS records for the refund', 'DOCUMENT_MOVED')
+  }
+  const pinnedOperation = payload.operation === 'ALLOCATE' || payload.operation === 'REFUND_PAYMENT' ? payload.operation : null
+  if (pinnedOperation !== null && pinnedOperation !== plan.kind) {
+    if (reading.attempted) {
+      // An attempt of the OTHER kind may have landed. Posting this kind as well would settle the credit note twice, so nothing is sent.
+      return {
+        success: false,
+        error: withLedgerCheck(`Not sent: an earlier attempt of this row was a ${pinnedOperation}, but IMS now reads the invoice as one that needs a ${plan.kind} (a receipt was recorded or removed since). `
+          + 'Open the credit note in Xero: if the earlier attempt landed, settle this row as posted; if it did not, cancel it and the sweep raises the settlement again.'),
+      }
+    }
+    payload = { ...payload, operation: undefined, amount: undefined } as SyncPayload
+  }
+  const operation: CreditNoteSettlementOperation = plan.kind
+  const refundPlan = plan.kind === 'REFUND_PAYMENT' ? plan : null
+  const scopeRequired = operation === 'REFUND_PAYMENT' ? blockingScopeFor('INVOICE_PAYMENT', await getGrantedScopes()) : null
+  if (scopeRequired) return { success: false, error: scopeBlockedError('INVOICE_PAYMENT', scopeRequired) }
+
+  const posting = moneyPostDateToSend(type, payload, new Date())
+  if (!posting.ok) return { success: false, error: `Cannot date this settlement: ${posting.reason}` }
+  const settlementDate = posting.date
+
+  // What Xero says is left on the documents sizes the settlement. READS ONLY, before the fence.
+  const balances = await readCreditNoteSettlementBalances(creditNoteId, operation === 'ALLOCATE' ? accountingInvoiceId : null)
+  if (!balances.ok) return { success: false, error: balances.error }
+  if (balances.creditNoteStatus !== 'AUTHORISED') {
+    return { success: false, error: withLedgerCheck(`Nothing was settled: the credit note is ${balances.creditNoteStatus ?? 'in an unreadable status'} in Xero (posting mode draft?), and only an authorised credit note can be allocated or refunded. Authorise it in Xero, then retry.`) }
+  }
+
+  const pin: Record<string, unknown> = { operation, currency: facts.order.currency, orderId: facts.order.id }
+  if (operation === 'ALLOCATE') {
+    const pinnedAmount = typeof payload.amount === 'number' ? payload.amount : null
+    const amount = pinnedAmount ?? resolveCreditNoteAllocationAmount({ requested: Number.MAX_SAFE_INTEGER, remainingCredit: balances.remainingCredit, amountDue: balances.amountDue ?? 0 })
+    if (amount <= 0) {
+      // Nothing to apply: the credit is spent or the invoice owes nothing (an allocation that already landed reads like this). Settled as a no-op.
+      await logActivity({
+        entityType: 'SALES_ORDER', entityId: referenceId, action: 'credit_note_allocation_nothing_to_apply', tag: 'accounting', level: 'WARNING',
+        description: withLedgerCheck(`The credit note has ${balances.remainingCredit.toFixed(2)} credit remaining and the invoice has ${(balances.amountDue ?? 0).toFixed(2)} due in Xero, so there is nothing to allocate. If the credit note should still be applied, do it in Xero.`),
+        metadata: { syncLogId: entryId, refundId: referenceId, creditNoteId, accountingInvoiceId },
+      }).catch(() => { /* advisory */ })
+      return { success: true }
+    }
+    pin.amount = amount
+  } else {
+    const method = refundPaymentMethodOf(facts)
+    if (!method) return { success: false, error: 'No payment method is known for this refund (no receipt, refund payment or order payment method), so IMS cannot tell which bank or clearing account it goes out of. Record the refund payment with its method, then retry.' }
+    const mapped = lookupPaymentAccount(await getPaymentAccountMap(), method, facts.order.currency)
+    if (!mapped) return { success: false, error: `No bank account is mapped for payment method "${method}" in ${facts.order.currency}, so the refund cannot be paid out. Add it to the payment account map in Settings, then retry.` }
+    if (!(await accountingBankAccountBelongsTo(XERO_CONNECTOR, mapped))) {
+      return { success: false, error: `The account mapped for "${method}:${facts.order.currency}" is not in the synced Xero chart of accounts, so the refund cannot be paid out. Correct the payment account map, then re-sync the chart.` }
+    }
+    const account = await db.accountingAccount.findFirst({ where: { connector: XERO_CONNECTOR, OR: [{ externalAccountId: mapped }, { code: mapped }] }, select: { externalAccountId: true } })
+    if (!account) return { success: false, error: `Bank account ${mapped} not found in synced Xero chart of accounts` }
+    const recorded = refundPlan?.recordedAmount != null ? Math.round(refundPlan.recordedAmount.toNumber() * 100) / 100 : null
+    const pinnedAmount = typeof payload.amount === 'number' ? payload.amount : null
+    // A recorded refund payment is the figure; a shop refund is paid back whole, so it is the credit left on the note. Never more than Xero says is left.
+    const amount = pinnedAmount ?? Math.min(recorded ?? balances.remainingCredit, balances.remainingCredit)
+    if (!(amount > 0)) {
+      return { success: false, error: withLedgerCheck(`Nothing was paid: the credit note has ${balances.remainingCredit.toFixed(2)} credit remaining in Xero (it was allocated or refunded already). Resolve in Xero, then retry.`) }
+    }
+    pin.amount = Math.round(amount * 100) / 100
+    pin.bankAccountId = account.externalAccountId
+    pin.paymentMethod = method
+    pin.cashEvidence = refundPlan?.cashEvidence
+    // IMS's settlement rate for the cash-out, resolved ONCE here and carried on the row: the realised FX is booked by Xero at this rate (as for a receipt).
+    const baseCurrency = await getBaseCurrencyCode()
+    if (facts.order.currency !== baseCurrency) {
+      try {
+        const rate = await db.$transaction((tx) => resolveSettlementFxRateToBase(tx, {
+          currency: facts.order.currency, baseCurrency, asOf: settlementAsOfFromInput(settlementDate, new Date()),
+        }))
+        pin.settlementRateToBase = Math.round(rate * 1e8) / 1e8
+      } catch (error) {
+        if (isMissingFxRateError(error)) return { success: false, error: `Refund payment not sent: ${describeFxRefusal(error)}` }
+        throw error
+      }
+    }
+  }
+  const pinnedPayload = { ...payload, ...pin } as SyncPayload
+  const pinnedWrite = await db.accountingSyncLog.updateMany({
+    where: { ...heldClaimWhere(entryId, lease), connector: XERO_CONNECTOR },
+    data: { payload: pinnedPayload as unknown as Prisma.InputJsonValue },
+  })
+  if (pinnedWrite.count !== 1) {
+    const message = lostClaimMessage(entryId, 'credit-note-allocation-decision')
+    return { success: false, error: message, notPosted: { reason: 'claim-lost', operation: 'credit-note-allocation-decision', message } }
+  }
+  payload = pinnedPayload
+
+  const amount = pin.amount as number
+  const rate = operation === 'REFUND_PAYMENT' ? await xeroPaymentCurrencyRate('CREDIT_NOTE_ALLOCATION', payload) : null
+  if (rate && !rate.ok) return { success: false, error: rate.error }
+  const moneyPostKey = await resolveXeroMoneyPostIdempotencyKey(db, { entryId, type: 'CREDIT_NOTE_ALLOCATION', payload, operation: 'credit-note-allocation' })
+  return postMoneyUnderLedgerFence({
+    connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
+    postingDate: settlementDate,
+  }, async ({ requireConnection }) => {
+    try {
+      // BOTH FENCES, CLAIM FENCE LAST: the ledger fence above answers "has this settlement reached the ledger?", the claim fence answers "do I still hold the
+      // claim?", and it is the statement immediately before the request leaves - one fence per request, each directly above its call.
+      if (operation === 'ALLOCATE') {
+        const fence = await lease.fenceBeforeRemoteWrite('credit-note-allocation')
+        if (!fence.ok) return fence.result
+        const result = await allocatePurchaseCreditNote({ creditNoteId, invoiceId: accountingInvoiceId, amount, date: settlementDate }, { idempotencyKey: moneyPostKey })
+        return { success: result.success, error: result.error }
+      }
+      const refundFence = await lease.fenceBeforeRemoteWrite('credit-note-refund-payment')
+      if (!refundFence.ok) return refundFence.result
+      const result = await refundSalesCreditNote({
+        creditNoteId,
+        accountId: String(payload.bankAccountId),
+        amount,
+        date: settlementDate,
+        ...(rate && rate.ok && rate.currencyRate !== undefined ? { currencyRate: rate.currencyRate } : {}),
+        reference: settlementMarkerFor(followUpIdempotencySource(entryId, payload)),
+      }, { idempotencyKey: moneyPostKey, ...(requireConnection ? { requireConnection } : {}) })
+      if (result.success && typeof payload.settlementRateToBase === 'number') {
+        // Informational: the gain or loss Xero books at IMS's rate (a refund pays foreign money out, so it is the payable side of the same arithmetic).
+        const realised = computeRealisedFx({ side: 'payable', amountForeign: amount, bookedRateToBase: Number(facts.order.fxRateToBase), settlementRateToBase: payload.settlementRateToBase })
+        await logActivity({
+          entityType: 'SALES_ORDER', entityId: referenceId, action: 'credit_note_refund_payment_posted', tag: 'accounting', level: 'INFO',
+          description: `Refund payment of ${facts.order.currency} ${amount.toFixed(2)} posted against credit note ${creditNoteId}; realised FX ${realised.outcome} ${realised.gainLossBase.toFixed(2)} (booked by Xero at IMS's rate ${payload.settlementRateToBase}).`,
+          metadata: { syncLogId: entryId, refundId: referenceId, creditNoteId, amount, currency: facts.order.currency, ...realised },
+        }).catch(() => { /* advisory */ })
+      }
+      return { success: result.success, externalId: result.paymentId, error: result.error }
+    } catch (e) {
+      return { success: false, error: String(e) }
+    }
+  })
+}
+
 export async function processClaimedEntry(
   entryId: string,
   type: AccountingSyncType,
@@ -6958,6 +7166,9 @@ export async function processClaimedEntry(
       }).then(r => ({ success: r.success, externalId: r.creditNoteId, error: r.error }))
     }
 
+    case 'CREDIT_NOTE_ALLOCATION':
+      return processCreditNoteAllocation({ entryId, type, referenceType, referenceId, payload, lease })
+
     case 'PURCHASE_CREDIT_NOTE_ALLOCATION': {
       // audit-v08m: follow-up that applies a posted ACCPAYCREDIT to the freight
       // bill it offsets, so the bill stops showing as outstanding in Xero's AP
@@ -7618,6 +7829,21 @@ function creditNoteAllocationOriginRemedy(item: { creditNoteId: string; accounti
  * the same shape `Product.accountingItemProvenance` already has; it is not closed here.
  */
 export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promise<CreditNoteAllocationReenqueueResult> {
+  const supplier = await reenqueueMissingSupplierCreditNoteAllocations(limit)
+  // o3d-hqvrp.39: the SALES credit-note settlement sweep rides this tick (cron and the manual sync both call this function), behind its switch. With the
+  // switch off - or unreadable - nothing more happens than before: the result is the supplier sweep's, unchanged.
+  let enabled = false
+  try {
+    enabled = await isCreditNoteAllocationEnabled(db)
+  } catch {
+    return supplier
+  }
+  if (!enabled) return supplier
+  const sales = await reenqueueMissingSalesCreditNoteSettlements(limit)
+  return { checked: supplier.checked + sales.checked, enqueued: supplier.enqueued + sales.enqueued, failed: supplier.failed + sales.failed }
+}
+
+async function reenqueueMissingSupplierCreditNoteAllocations(limit = 200): Promise<CreditNoteAllocationReenqueueResult> {
   const result: CreditNoteAllocationReenqueueResult = { checked: 0, enqueued: 0, failed: 0 }
   const candidates = await db.supplierCreditNote.findMany({
     where: {
@@ -7816,6 +8042,137 @@ export async function reenqueueMissingCreditNoteAllocations(limit = 200): Promis
     } catch (error) {
       result.failed++
       console.error('reenqueueMissingCreditNoteAllocations: enqueue failed', item.supplierCreditNoteId, error)
+    }
+  }
+  return result
+}
+
+/**
+ * o3d-hqvrp.39: queue the settlement of a POSTED sales credit note (its allocation to the invoice, or its refund payment), behind
+ * `xero_credit_note_allocation_enabled`. ONE row per refund, carrying only WHICH documents - what to do (allocate or refund, how much, from which account, at
+ * which rate) is decided under the claim, from what IMS holds then (processCreditNoteAllocation), never here.
+ *
+ * Nothing is queued while the settlement is not owed yet (a document still unposted, a cash refund no one has recorded): the sweep below raises it
+ * the moment it is, from the same plan. The row is created through `enqueueFollowUpSyncLog`, so it takes the producer hold and the obligation date
+ * (the credit note's own date) like any other Xero follow-up: while Xeroom owns sales credit notes it is shadowed.
+ */
+async function enqueueSalesCreditNoteSettlement(
+  refundId: string,
+  opts: { sourceEntryId: string; date: string | undefined; origin: FollowUpOriginEvidence },
+): Promise<FollowUpEnqueueOutcome & { owed: boolean }> {
+  const facts = await readCreditNoteSettlementFacts(db, refundId, null)
+  if (!facts) return { ...FOLLOW_UPS_ENQUEUED, owed: false }
+  const plan = planCreditNoteSettlement(facts)
+  if (plan.kind === 'NOT_NOW') return { ...FOLLOW_UPS_ENQUEUED, owed: false }
+  const creditNoteId = facts.refund.creditNoteId
+  const accountingInvoiceId = facts.order.invoiceId
+  if (!creditNoteId || !accountingInvoiceId) return { ...FOLLOW_UPS_ENQUEUED, owed: false }
+  return { ...(await enqueueFollowUpSyncLog('CREDIT_NOTE_ALLOCATION', 'SalesOrderRefund', refundId, {
+    creditNoteId,
+    accountingInvoiceId,
+    refundId,
+    orderId: facts.order.id,
+    // The credit note's own date: the obligation date the producer hold is judged against, and the date the settlement posts under.
+    date: (opts.date ?? '').slice(0, 10) || businessDateYmd(facts.refund.createdAt),
+    sourceEntryId: opts.sourceEntryId,
+  }, opts.origin)), owed: true }
+}
+
+async function enqueueCreditNoteSettlementFollowUp(
+  entryId: string,
+  referenceType: string,
+  referenceId: string,
+  payload: SyncPayload,
+  syncResult: { externalId?: string },
+  origin: AccountingOriginRecord,
+): Promise<FollowUpEnqueueOutcome> {
+  // Switch off (the default): not a statement executed beyond the one read, and nothing queued - exactly the behaviour before this existed.
+  if (referenceType !== 'SalesOrderRefund' || !syncResult.externalId) return FOLLOW_UPS_ENQUEUED
+  // An unreadable switch is "not on", and never a reason to fail the credit note's own follow-ups: the settlement sweep re-raises the work once the read works.
+  let enabled = false
+  try {
+    enabled = await isCreditNoteAllocationEnabled(db)
+  } catch (error) {
+    console.error('enqueueCreditNoteSettlementFollowUp: the credit-note settlement switch could not be read; the sweep will retry', error)
+    return FOLLOW_UPS_ENQUEUED
+  }
+  if (!enabled) return FOLLOW_UPS_ENQUEUED
+  return await enqueueSalesCreditNoteSettlement(referenceId, {
+    sourceEntryId: entryId,
+    date: typeof payload.date === 'string' ? payload.date : undefined,
+    origin: { from: 'postedRow', record: origin },
+  })
+}
+
+/**
+ * The sweep for the settlements the post-time hook did not queue: the invoice posted after the credit note, a refund payment recorded later, a retired row
+ * whose reading has changed. Candidates are refunds with a credit note AND an invoice recorded as Xero's and no live or posted settlement row; each is put
+ * through the SAME plan as the processor, so a refund that is not owed yet queues nothing and costs one read. Scans a bounded window per tick.
+ */
+export async function reenqueueMissingSalesCreditNoteSettlements(limit = 200): Promise<CreditNoteAllocationReenqueueResult> {
+  const result: CreditNoteAllocationReenqueueResult = { checked: 0, enqueued: 0, failed: 0 }
+  const pageSize = Math.max(1, Math.min(limit, 200))
+  const maxScanned = pageSize * 5
+  for (let offset = 0; offset < maxScanned && result.enqueued < limit; offset += pageSize) {
+    const page = await db.$queryRaw<Array<{ id: string }>>`
+      SELECT r.id
+        FROM sales_order_refunds r
+        JOIN sales_orders o ON o.id = r."orderId"
+       WHERE r.deleted_at IS NULL
+         AND r.accounting_credit_note_id IS NOT NULL
+         AND r.accounting_credit_note_connector = ${CREDIT_NOTE_ALLOCATION_CONNECTOR}
+         AND o.accounting_invoice_id IS NOT NULL
+         AND o.accounting_invoice_connector = ${CREDIT_NOTE_ALLOCATION_CONNECTOR}
+         AND NOT EXISTS (
+           SELECT 1 FROM accounting_sync_logs l
+            WHERE l.connector = ${XERO_CONNECTOR}
+              AND l.type::text = 'CREDIT_NOTE_ALLOCATION'
+              AND l."referenceType" = 'SalesOrderRefund'
+              AND l."referenceId" = r.id
+              AND l.status::text IN ('PENDING', 'PROCESSING', 'SYNCED', 'FAILED'))
+       ORDER BY r."createdAt" ASC
+       LIMIT ${pageSize} OFFSET ${offset}`
+    if (page.length === 0) break
+    const refunds = await db.salesOrderRefund.findMany({
+      where: { id: { in: page.map((row) => row.id) } },
+      select: { id: true, accountingCreditNoteId: true, createdAt: true },
+    })
+    const issuingRows = await db.accountingSyncLog.findMany({
+      where: {
+        connector: XERO_CONNECTOR, type: 'CREDIT_NOTE', referenceType: 'SalesOrderRefund',
+        referenceId: { in: refunds.map((refund) => refund.id) },
+        externalTransactionId: { in: refunds.flatMap((refund) => (refund.accountingCreditNoteId ? [refund.accountingCreditNoteId] : [])) },
+      },
+      orderBy: [{ syncedAt: 'desc' }, { createdAt: 'desc' }],
+      select: { referenceId: true, payload: true, ...LEDGER_STANDING_SELECT },
+    })
+    for (const refund of refunds) {
+      if (result.enqueued >= limit) break
+      result.checked++
+      try {
+        const creditNoteId = refund.accountingCreditNoteId
+        if (!creditNoteId) continue
+        const origin = selectIssuingPostOriginRecord(issuingRows.filter((row) => row.referenceId === refund.id), creditNoteId)
+        const issuing = origin.outcome === 'inherited' ? origin.payload : null
+        const outcome = await enqueueSalesCreditNoteSettlement(refund.id, {
+          sourceEntryId: 'reenqueue-sweep',
+          date: issuing && typeof (issuing as { date?: unknown }).date === 'string' ? (issuing as { date: string }).date : undefined,
+          // INHERITED, NEVER MINTED: the organisation recorded by the row that posted the credit note, or none (and the settlement then refuses at post time).
+          origin: origin.outcome === 'inherited'
+            ? { from: 'postedRow' as const, record: { payload: origin.payload, connectionProvenance: null } }
+            : { from: 'unobserved' as const },
+        })
+        if (!outcome.enqueued) {
+          result.failed++
+          console.error('reenqueueMissingSalesCreditNoteSettlements: enqueue refused', refund.id, describeFollowUpEnqueueRefusals(outcome))
+          continue
+        }
+        // A refund that is not owed yet returns "enqueued" without writing a row; only one that was owed is counted.
+        if (outcome.owed) result.enqueued++
+      } catch (error) {
+        result.failed++
+        console.error('reenqueueMissingSalesCreditNoteSettlements: enqueue failed', refund.id, error)
+      }
     }
   }
   return result
@@ -8490,6 +8847,14 @@ async function enqueueFollowUps(
   if (type === 'PURCHASE_CREDIT_NOTE') {
     return {
       ...await enqueuePurchaseCreditNoteFollowUps(entryId, referenceType, referenceId, payload, syncResult, origin),
+      deferredReceiptsSettled: true,
+      obligationFenced: false,
+    }
+  }
+
+  if (type === 'CREDIT_NOTE') {
+    return {
+      ...await enqueueCreditNoteSettlementFollowUp(entryId, referenceType, referenceId, payload, syncResult, origin),
       deferredReceiptsSettled: true,
       obligationFenced: false,
     }

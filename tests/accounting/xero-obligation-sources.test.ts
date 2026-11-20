@@ -127,6 +127,7 @@ const INLINE_SITES: Array<{ types: string[]; file: string; pattern: RegExp }> = 
   { types: ['BILL_PAYMENT'], file: 'app/actions/purchase-orders.ts', pattern: /paymentDate: input\.paymentDate,/ },
   { types: ['INVOICE_PAYMENT'], file: 'lib/domain/accounting/invoice-payment-enqueue.ts', pattern: /paymentDate: businessDateYmd\(params\.paidAt\),/ },
   { types: ['PURCHASE_CREDIT_NOTE_ALLOCATION'], file: 'lib/connectors/xero/sync-processor.ts', pattern: /date: \(payload\.date as string \| undefined\)\?\.slice\(0, 10\)/ },
+  { types: ['CREDIT_NOTE_ALLOCATION'], file: 'lib/connectors/xero/sync-processor.ts', pattern: /date: \(opts\.date \?\? ''\)\.slice\(0, 10\) \|\| businessDateYmd\(facts\.refund\.createdAt\),/ },
   { types: ['ALLOCATION_REVERSAL'], file: 'lib/domain/sales/allocation-service.ts', pattern: /date: businessDateYmd\(new Date\(\)\),\n\s*reference: `Allocation reversal: \$\{orderRef\}`/ },
   { types: ['MANUFACTURING_JOURNAL'], file: 'app/actions/manufacturing.ts', pattern: /date: businessDateYmd\(now\),\n\s*reference,/ },
   { types: ['MANUFACTURING_RECLASS'], file: 'app/actions/manufacturing.ts', pattern: /date: reclassDate,\n\s*reference: `MFG-RECLASS: \$\{po\.reference\}`/ },
@@ -298,7 +299,7 @@ test('CONFLICTING DATE FIELDS across the cut-off: every payload-sourced type is 
 })
 
 test('THE THREE MONEY-POST TYPES: the declared field is the one the posting path dates the Xero payment or allocation from (ledger-settlement-evidence MONEY_POST_DATE_FIELD)', () => {
-  for (const type of ['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION']) {
+  for (const type of ['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION', 'CREDIT_NOTE_ALLOCATION']) {
     const source = XERO_OBLIGATION_SOURCES[type as AccountingSyncType]
     assert.equal(source.kind, 'payload', type)
     assert.equal((source as { field: string }).field, moneyPostDateFieldFor(type), `${type}: declared field equals the posting path's date field`)
@@ -348,7 +349,7 @@ test('A HOP MUST BE THE SAME DOCUMENT: a parent of the right type from another r
  */
 const POSTING_PATH_FIELD: Record<string, 'date' | 'paymentDate'> = {
   PURCHASE_INVOICE: 'date', PURCHASE_INVOICE_UPDATE: 'date', COGS_JOURNAL: 'date', INVENTORY_ADJUSTMENT: 'date', SALES_INVOICE: 'date', SALES_INVOICE_UPDATE: 'date', SALES_INVOICE_DELETE: 'date', PURCHASE_INVOICE_DELETE: 'date',
-  INVOICE_PAYMENT: 'paymentDate', CREDIT_NOTE: 'date', CREDIT_NOTE_VOID: 'date', PURCHASE_CREDIT_NOTE: 'date', PURCHASE_CREDIT_NOTE_ALLOCATION: 'date', STOCK_IN_TRANSIT: 'date',
+  INVOICE_PAYMENT: 'paymentDate', CREDIT_NOTE: 'date', CREDIT_NOTE_VOID: 'date', PURCHASE_CREDIT_NOTE: 'date', PURCHASE_CREDIT_NOTE_ALLOCATION: 'date', CREDIT_NOTE_ALLOCATION: 'date', STOCK_IN_TRANSIT: 'date',
   STOCK_RECEIPT: 'date', COGS_REVERSAL: 'date', DAILY_BATCH_REVENUE_DEFERRAL: 'date', DAILY_BATCH_INVENTORY_ALLOC: 'date', DAILY_BATCH_GROUP_B: 'date',
   DAILY_BATCH_INVENTORY_RECONCILIATION: 'date', DAILY_BATCH_COGS_RECONCILIATION: 'date', DAILY_BATCH_TRANSIT_RECONCILIATION: 'date', DAILY_BATCH_GRIR_RECLASS: 'date', UNEARNED_REV_REVERSAL: 'date',
   ALLOCATION_REVERSAL: 'date', BILL_PAYMENT: 'paymentDate', MANUFACTURING_JOURNAL: 'date', MANUFACTURING_RECLASS: 'date',

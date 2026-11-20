@@ -129,7 +129,7 @@ test('a key already stored on the row is returned as it is: no derivation query,
 
 test('WIRING: every Xero money post sends the stored/resolved key, and none builds it from the row at the call site', async () => {
   const source = await readFile(new URL('../../lib/connectors/xero/sync-processor.ts', import.meta.url), 'utf8')
-  for (const [type, operation] of [['INVOICE_PAYMENT', 'invoice-payment'], ['BILL_PAYMENT', 'bill-payment'], ['PURCHASE_CREDIT_NOTE_ALLOCATION', 'purchase-credit-note-allocation']]) {
+  for (const [type, operation] of [['INVOICE_PAYMENT', 'invoice-payment'], ['BILL_PAYMENT', 'bill-payment'], ['PURCHASE_CREDIT_NOTE_ALLOCATION', 'purchase-credit-note-allocation'], ['CREDIT_NOTE_ALLOCATION', 'credit-note-allocation']]) {
     const resolve = `resolveXeroMoneyPostIdempotencyKey(db, { entryId, type: '${type}', payload, operation: '${operation}' })`
     const at = source.indexOf(resolve)
     assert.ok(at > 0, `the ${type} branch resolves its key`)
@@ -137,5 +137,6 @@ test('WIRING: every Xero money post sends the stored/resolved key, and none buil
     assert.ok(source.indexOf('return postMoneyUnderLedgerFence({', at) > at && source.indexOf('return postMoneyUnderLedgerFence({', at) - at < 200, `${type}: resolved immediately before the fence`)
     assert.ok(!source.includes(`buildXeroIdempotencyKey(followUpIdempotencySource(entryId, payload), '${operation}')`), `the ${type} post does not key on the row`)
   }
-  assert.equal(source.split('idempotencyKey: moneyPostKey').length - 1, 3)
+  // invoice payment, bill payment, purchase allocation, and the sales credit-note settlement's two requests (an allocation and a refund payment)
+  assert.equal(source.split('idempotencyKey: moneyPostKey').length - 1, 5)
 })

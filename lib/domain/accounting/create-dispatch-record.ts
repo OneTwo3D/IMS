@@ -177,6 +177,7 @@ export const CREATE_REPLAY_POLICY: Record<AccountingSyncType, CreateReplayPolicy
   INVOICE_PAYMENT: 'money-fenced',
   BILL_PAYMENT: 'money-fenced',
   PURCHASE_CREDIT_NOTE_ALLOCATION: 'money-fenced',
+  CREDIT_NOTE_ALLOCATION: 'money-fenced',
 
   SALES_INVOICE_UPDATE: 'not-a-create',
   PURCHASE_INVOICE_UPDATE: 'not-a-create',

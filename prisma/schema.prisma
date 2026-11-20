@@ -231,6 +231,9 @@ enum AccountingSyncType {
   CREDIT_NOTE
   // A refund recorded in error was deleted in IMS: void the sales credit note it posted (ACCRECCREDIT) in the ledger.
   CREDIT_NOTE_VOID
+  // o3d-hqvrp.39: settles a POSTED sales credit note against its POSTED invoice - allocates it to the invoice (an unpaid invoice) or posts the
+  // refund cash-out against the credit note (a paid one). Behind xero_credit_note_allocation_enabled; its own claim and outbox job.
+  CREDIT_NOTE_ALLOCATION
   // audit-g5u2: supplier (purchase) credit note — Xero ACCPAYCREDIT.
   PURCHASE_CREDIT_NOTE
   // audit-v08m: follow-up that allocates the ACCPAYCREDIT to the bill it offsets.

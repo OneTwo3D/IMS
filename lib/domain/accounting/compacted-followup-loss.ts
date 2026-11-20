@@ -169,6 +169,8 @@ export const COMPACTION_FOLLOW_UP_LOSS: Record<AccountingSyncType, CompactedFoll
   // A SALES credit note. It is a back-reference type — so it IS compacted, and it was warned about
   // — but neither connector's `enqueueFollowUps` has a `CREDIT_NOTE` branch, so a compacted one has
   // never owed anything. This entry is the whole of o3d-bqw7's live false-alarm population.
+  // (o3d-hqvrp.39: behind its switch the post now queues the credit note's settlement, but that row is rebuilt from the REFUND and the documents it
+  // names - never from this payload's body - by the settlement sweep, so a compacted credit note still owes nothing it cannot rebuild.)
   CREDIT_NOTE: NO_FOLLOW_UPS,
   // Its nested follow-ups are read off the SALES ORDER row (customer email, WooCommerce link) and
   // addressed by `referenceId`. Nothing about them comes from this row's payload.
@@ -199,6 +201,7 @@ export const COMPACTION_FOLLOW_UP_LOSS: Record<AccountingSyncType, CompactedFoll
   INVOICE_EMAIL: NO_FOLLOW_UPS,
   WC_INVOICE_NOTE: NO_FOLLOW_UPS,
   PURCHASE_CREDIT_NOTE_ALLOCATION: NO_FOLLOW_UPS,
+  CREDIT_NOTE_ALLOCATION: NO_FOLLOW_UPS,
   COGS_JOURNAL: NO_FOLLOW_UPS,
   COGS_REVERSAL: NO_FOLLOW_UPS,
   INVENTORY_ADJUSTMENT: NO_FOLLOW_UPS,

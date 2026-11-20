@@ -918,6 +918,9 @@ export const OPERATION_SEMANTIC_BY_TYPE =
     // A PAYMENT id, applied against a document nobody created here.
     INVOICE_PAYMENT: 'APPLY_PAYMENT',
     BILL_PAYMENT: 'APPLY_PAYMENT',
+    // o3d-hqvrp.39: the settlement of a sales credit note - mostly a refund PAYMENT (it returns a payment id) applied against a credit note nobody created here; its other
+    // operation, an allocation, is applied against documents that already stood as well. Neither creates a document, so the payment wording is the one that fits.
+    CREDIT_NOTE_ALLOCATION: 'APPLY_PAYMENT',
     // Manual journals — one shared branch on both connectors, returning `journalId`. A journal is
     // not voidable or credit-notable; it is reversed, unless it is a DRAFT, when it is deleted.
     COGS_JOURNAL: 'POST_JOURNAL',

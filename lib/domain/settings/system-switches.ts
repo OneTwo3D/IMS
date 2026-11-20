@@ -96,6 +96,8 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   booleanSwitch('wc_invoice_document_enabled'),
   booleanSwitch('wms_refund_remainder_task_enabled'),
   booleanSwitch('wc_order_amendment_write_enabled'),
+  // Literal, not an import of the Xero allocation module (it imports the database client); tests hold it equal to CREDIT_NOTE_ALLOCATION_SETTING_KEY.
+  booleanSwitch('xero_credit_note_allocation_enabled'),
   booleanSwitch(SUPPLIER_CREATE_KEY, undefined, true),
   booleanSwitch(ASN_SEND_SUPPLIER_KEY, undefined, true),
   booleanSwitch(ASN_SUPPLIER_REQUIRED_KEY, [ASN_REQUIRED_NEEDS_SEND], true),

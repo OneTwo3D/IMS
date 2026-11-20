@@ -117,6 +117,8 @@ export const XERO_OBLIGATION_SOURCES: Readonly<Record<AccountingSyncType, XeroOb
   CREDIT_NOTE_VOID: { kind: 'payload', field: 'date' },
   PURCHASE_CREDIT_NOTE: { kind: 'payload', field: 'date' },
   PURCHASE_CREDIT_NOTE_ALLOCATION: { kind: 'payload', field: 'date' },
+  // o3d-hqvrp.39: dated from the credit note's own date, carried on the payload by the producer (the settlement follows the document it settles).
+  CREDIT_NOTE_ALLOCATION: { kind: 'payload', field: 'date' },
   STOCK_IN_TRANSIT: { kind: 'payload', field: 'date' },
   STOCK_RECEIPT: { kind: 'payload', field: 'date' },
   COGS_REVERSAL: { kind: 'payload', field: 'date' },

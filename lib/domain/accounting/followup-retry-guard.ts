@@ -116,6 +116,7 @@ export const MONEY_MOVING_SYNC_TYPES = new Set([
   'INVOICE_PAYMENT',
   'BILL_PAYMENT',
   'PURCHASE_CREDIT_NOTE_ALLOCATION',
+  'CREDIT_NOTE_ALLOCATION',
 ])
 
 export function isMoneyMovingSyncType(type: string): boolean {
@@ -184,6 +185,11 @@ const REQUIRED_BODY_FIELDS: Record<string, readonly { field: string; kind: 'id' 
     { field: 'creditNoteId', kind: 'id' },
     { field: 'accountingInvoiceId', kind: 'id' },
     { field: 'amount', kind: 'amount' },
+  ],
+  // `amount` is decided under the claim and pinned before the call (see followup-idempotency.ts), so only the two ids are required here.
+  CREDIT_NOTE_ALLOCATION: [
+    { field: 'creditNoteId', kind: 'id' },
+    { field: 'accountingInvoiceId', kind: 'id' },
   ],
 }
 

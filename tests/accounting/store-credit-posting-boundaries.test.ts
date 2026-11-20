@@ -38,6 +38,7 @@ const CENSUS: Record<string, Row> = {
   BILL_PAYMENT: PURCHASING,
   PURCHASE_CREDIT_NOTE: PURCHASING,
   PURCHASE_CREDIT_NOTE_ALLOCATION: PURCHASING,
+  CREDIT_NOTE_ALLOCATION: E('settles a credit note and an invoice that are BOTH already posted by IMS (the plan refuses until each is a connector-confirmed document); a store-credit order never has a posted IMS invoice, so it never reaches a settlement, and the settlement creates no document'),
   TAX_RATE_SYNC: E('tax-rate reference data: no order'),
   COGS_JOURNAL: JOURNAL, INVENTORY_ADJUSTMENT: JOURNAL, STOCK_IN_TRANSIT: JOURNAL, STOCK_RECEIPT: JOURNAL,
   COGS_REVERSAL: JOURNAL, STOCK_ALLOCATION: JOURNAL, DAILY_BATCH_REVENUE_DEFERRAL: JOURNAL,
