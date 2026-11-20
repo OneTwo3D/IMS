@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
+  addedSkuRecord,
   buildPushInput,
+  sentLineSkusOf,
   runWmsOrderPushSweepCore,
   type WmsOrderPushPort,
   type WmsPushCandidate,
@@ -10,6 +12,7 @@ import {
 } from '../lib/domain/wms/order-push-sweep.ts'
 import type { MixedScope } from '../lib/domain/wms/mixed-scope.ts'
 import type { RefusedActionInput } from '../lib/domain/refused-actions.ts'
+import { WmsOrderUpdatePartialError } from '../lib/connectors/wms/courier-form.ts'
 import type { WmsOrderPushInput, WmsOrderPushResult, WmsOrderUpdateResult } from '../lib/connectors/wms/types.ts'
 import { recordingTaskPort } from './helpers/operator-task-port.ts'
 
@@ -327,6 +330,52 @@ test('revalidation: once the scope is sendable the order is re-queued for the cr
   assert.equal(updates.some((u) => u.data.state === 'PENDING_CREATE'), true)
 })
 
+// ---- o3d-jtfy7: #1096 review follow-ups -------------------------------------------------------------------------------------------------------------
+const REMAP = { p1: { sku: 'B', earlier: ['A'] } }
+const remapCandidate = (over: Partial<WmsPushCandidate> = {}) => candidate({ skuRemap: REMAP, lines: [{ id: 'l1', sku: 'A', productId: 'p1', qty: 1, taxForeign: 0, totalForeign: 10, description: 'Widget' }], ...over })
+
+test('o3d-jtfy7: a MIXED record is built from the lines of the scope that was sent (their SKU), not from the order lines re-read since', () => {
+  // The line's SKU was edited between the scope read (A) and the order reload (A2): the wire carried A.
+  const order = candidate({ lines: [{ id: 'l1', sku: 'A2', qty: 2, taxForeign: 4, totalForeign: 20, description: 'Widget' }, { id: 'l2', sku: 'B', qty: 1, taxForeign: 2, totalForeign: 10, description: 'Gadget' }] })
+  assert.deepEqual(sentLineSkusOf(order as never, MIXED), { l1: { own: 'A', sent: 'A' } })
+  assert.deepEqual(buildPushInput(order as never, '301', MIXED).lines.map((l) => l.sku), ['A'])
+})
+
+test('o3d-jtfy7: a failed create write that followed an accepted push records the SKUs that push sent (PENDING_VERIFY), not nothing', async () => {
+  const { port, upserts } = makePort({ createCandidates: [remapCandidate()] })
+  let calls = 0
+  port.upsertByOrder = async (orderId, create, update) => { calls += 1; upserts.push({ orderId, create, update }); if (calls === 1) throw new Error('db down') }
+  await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(upserts.length, 2)
+  assert.equal(upserts[1].create.state, 'PENDING_VERIFY')
+  assert.deepEqual(upserts[1].create.sentLineSkus, { l1: { own: 'A', sent: 'B' } })
+  assert.deepEqual(upserts[1].update.sentLineSkus, { l1: { own: 'A', sent: 'B' } })
+})
+
+test('o3d-jtfy7: a partially applied amendment records the SKU of each line it had already added, so the retry does not re-derive it from the flag', async () => {
+  const link: WmsPushUpdateLink = { id: 'link-1', externalOrderId: 'wms-1', order: { ...remapCandidate(), shipFromWarehouseId: 'wh-1' } }
+  const { port, updates } = makePort({ updatable: [link] })
+  const r = await runWmsOrderPushSweepCore(connector({ updateOrder: async () => { throw new WmsOrderUpdatePartialError('items failed', {}, ['B']) } }), 'mintsoft', port, { now: NOW })
+  assert.equal(r.failed, 1)
+  const failure = updates.find((u) => typeof u.data.lastError === 'string' && /items failed/.test(u.data.lastError))
+  assert.deepEqual(failure?.data.sentLineSkus, { l1: { own: 'A', sent: 'B' } })
+})
+
+test('o3d-jtfy7: the partial-amendment record keeps the entries already held, adds only absent lines whose SKU was added, and is null when nothing was added', () => {
+  const order = remapCandidate({ lines: [{ id: 'l1', sku: 'A', productId: 'p1', qty: 1, taxForeign: 0, totalForeign: 10, description: 'W' }, { id: 'l2', sku: 'C', productId: 'p2', qty: 1, taxForeign: 0, totalForeign: 10, description: 'X' }], sentSkuByLine: { l2: { own: 'C', sent: 'C' } } })
+  assert.deepEqual(addedSkuRecord(order as never, undefined, [' B ']), { l1: { own: 'A', sent: 'B' }, l2: { own: 'C', sent: 'C' } })
+  assert.equal(addedSkuRecord(order as never, undefined, []), null)
+  assert.equal(addedSkuRecord(order as never, undefined, ['C']), null, 'a line the record already holds is not touched')
+})
+
+test('o3d-jtfy7: a MIXED link whose amendment failed part-way is stamped with the warehouse the header was SENT to (a mapped push warehouse), not the ship-from', async () => {
+  const { port, updates } = makePort({ updatable: [dirtyLink({ pushWarehouseId: 'wh-2' })], bindings: [...BINDINGS, { warehouseId: 'wh-2', externalWarehouseId: '302' }], loadMixedScope: async () => MIXED })
+  const r = await runWmsOrderPushSweepCore(connector({ updateOrder: async () => { throw new WmsOrderUpdatePartialError('items failed', { courierFallback: true }) } }), 'mintsoft', port, { now: NOW })
+  assert.equal(r.failed, 1)
+  const failure = updates.find((u) => typeof u.data.lastError === 'string' && /items failed/.test(u.data.lastError))
+  assert.equal(failure?.data.pushWarehouseId, 'wh-2')
+})
+
 // ---- harness ---------------------------------------------------------------------------------------------------------------------------------------
 type Seed = {
   revalidatable?: { links: WmsPushRevalidateLink[]; total: number }
@@ -433,4 +482,25 @@ test('o3d-k6x6m: a post-claim reload that no longer builds is a VALIDATION hold 
   assert.equal(writes[0]!.state, 'VALIDATION_FAILED')
   assert.equal(writes[0]!.attempts, 0)
   assert.match(String(writes[0]!.lastError), /Order held: SKU NEW was renamed/)
+})
+
+test('o3d-gzszk: the post-claim VALIDATION_FAILED park writes an audit event (like the candidate-build park)', async () => {
+  const events: Array<Record<string, unknown>> = []
+  const { port } = makePort({ createCandidates: [candidate()] })
+  port.reloadOrderForPush = async () => ({ ...candidate(), lines: [{ id: 'l1', sku: 'NEW', productId: 'p1', qty: 1, taxForeign: 0, totalForeign: 10, description: 'W' }], skuRenameHolds: [{ productId: 'p1', wmsValue: 'OLD' }] }) as never
+  port.recordEvent = async (event) => { events.push(event as unknown as Record<string, unknown>) }
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.validationFailed, 1)
+  const audited = events.filter((e) => e.action === 'order_validate')
+  assert.equal(audited.length, 1)
+  assert.equal(audited[0]!.outcome, 'FAILED')
+  assert.equal(audited[0]!.entityId, 'so-1')
+  assert.match(String(audited[0]!.error), /Order held: SKU NEW was renamed/)
+})
+
+test('o3d-gzszk: a MIXED amendment whose push warehouse is UNMAPPED stamps the warehouse it was actually sent to (the ship-from), not the stale push warehouse', async () => {
+  const { port, updates } = makePort({ updatable: [dirtyLink({ pushWarehouseId: 'wh-2' })], loadMixedScope: async () => MIXED })
+  const r = await runWmsOrderPushSweepCore(connector({ updateOrder: async () => ({ updated: true, status: 'NEW' }) }), 'mintsoft', port, { now: NOW })
+  assert.equal(r.updated, 1)
+  assert.equal(updates[0].data.pushWarehouseId, 'wh-1')
 })

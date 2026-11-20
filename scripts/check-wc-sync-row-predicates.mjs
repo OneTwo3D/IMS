@@ -229,6 +229,12 @@ const SQL_FAMILY_LITERAL_THRESHOLD = 2
  */
 const MIGRATION_OWNERS = new Map([
   [
+    '20261121130000_wc_completion_refusal_open_index/migration.sql',
+    'Partial index over the open completion-refusal rows, for the owed-despatch retry. Its WHERE predicate is the string '
+    + 'openWcCompletionRefusalIndexPredicateSql() renders, asserted character for character by '
+    + 'tests/prisma/wc-completion-refusal-open-index-migration.test.ts.',
+  ],
+  [
     '20260721150000_refund_park_unique_index/migration.sql',
     'Builds the partial unique index, in the pre-recordKind shape. Applied everywhere and therefore '
     + 'immutable; 20260909090000 replaces its predicate.',

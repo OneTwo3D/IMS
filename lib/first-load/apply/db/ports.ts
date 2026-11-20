@@ -16,7 +16,7 @@ import type { ApplyStepId } from '../constants'
 import type { ApplyPorts, RailTally } from '../orchestrate'
 import type { PreparedRun } from '../prepared'
 import { createExecutor } from './execute'
-import { createJournal, setFactOnce } from './journal'
+import { createJournal, loadFacts, setFactOnce } from './journal'
 import { judgeStockExtractedAt } from '../manifest'
 import { OPENING_STOCK_CUTOFF_FACT } from '@/lib/first-load/opening-stock-cutoff'
 import { db } from '@/lib/db'
@@ -106,10 +106,14 @@ export function createDbPorts(prepared: PreparedRun, options: DbPortsOptions): A
     preflight: async ({ resuming }) => {
       const problems = note(await evaluateRailResults(prepared, { phase: 'preflight', resuming, step: null }, options.preload))
       // The stock extract instant is judged against THIS apply instant before anything is written (a plan reports it too).
+      // Judged here only while the cut-off is NOT yet on the run record, so a verification-only resume of an APPLIED run (and any resume of a run that got past the first opening-stock
+      // write) after 45 days is not refused over a digest-bound value that cannot be corrected. A resume that still has opening-stock writes to make is also judged by the
+      // before-first-write recheck below, on purpose: the fact records the instant, not that the stock was loaded. The refusal is filed under its own rail so the report names it.
       const extractedAt = prepared.manifest.stockExtractedAt
-      if (prepared.steps.some((st) => st.step === 'opening-stock') && extractedAt !== null) {
+      if (prepared.steps.some((st) => st.step === 'opening-stock') && extractedAt !== null && (await loadFacts())[OPENING_STOCK_CUTOFF_FACT] === undefined) {
         const refusal = judgeStockExtractedAt(extractedAt, Date.now())
-        if (refusal !== null) problems.push(refusal)
+        const found = note([{ id: 'stock-extract-age', problems: refusal === null ? [] : [refusal], detail: '' }])
+        problems.push(...found)
       }
       return problems
     },
@@ -132,7 +136,7 @@ export function createDbPorts(prepared: PreparedRun, options: DbPortsOptions): A
       if (problems.length === 0 && step === 'opening-stock' && phase === 'before-first-write') {
         const extractedAt = prepared.manifest.stockExtractedAt
         const refusal = extractedAt === null ? 'apply manifest stockExtractedAt is required when opening-stock is a step' : judgeStockExtractedAt(extractedAt, Date.now())
-        if (refusal !== null || extractedAt === null) return note([{ id: 'data-classes', problems: [refusal ?? 'stockExtractedAt missing'], detail: '' }])
+        if (refusal !== null || extractedAt === null) return note([{ id: 'stock-extract-age', problems: [refusal ?? 'stockExtractedAt missing'], detail: '' }])
         try { await setFactOnce(OPENING_STOCK_CUTOFF_FACT, new Date(extractedAt).toISOString()) } catch { throw new ObservationError(DATABASE_READ_FAILED) }
       }
       // Just before the first SUPPLIER write, with every rail holding: a purchase tax type with no IMS rate is imported from the stored Xero list (tax-import.ts; the rates and the run fact

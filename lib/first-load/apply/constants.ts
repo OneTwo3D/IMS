@@ -172,7 +172,7 @@ export const RESUMABLE_STATUSES: ReadonlySet<RunStatus> = new Set<RunStatus>(['R
 export const STEP_STATUSES = ['PENDING', 'RUNNING', 'DONE', 'FAILED', 'CONFLICT'] as const
 export type StepStatus = (typeof STEP_STATUSES)[number]
 
-export const APPLY_REPORT_FORMAT_VERSION = 2
+export const APPLY_REPORT_FORMAT_VERSION = 3
 
 /**
  * WHAT A REPORT ROW MAY CARRY (docs/first-load-apply.md, "What a report contains"). A report is a private operator artefact. Per unit it holds the
@@ -252,7 +252,7 @@ export const RUNNER_APPLICATION_NAME = 'ims-first-load-apply'
  *   crons            no scheduled job that could write is installed in the crontab of the account running the load.
  */
 export const RAIL_IDS = [
-  'quiesce', 'data-classes', 'base-currency', 'forbidden-skus', 'currency-lock', 'warehouses', 'fx-rates', 'tax-rates', 'outbound-grants', 'producer-hold', 'connectors', 'crons',
+  'quiesce', 'data-classes', 'base-currency', 'forbidden-skus', 'currency-lock', 'stock-extract-age', 'warehouses', 'fx-rates', 'tax-rates', 'outbound-grants', 'producer-hold', 'connectors', 'crons',
 ] as const
 export type RailId = (typeof RAIL_IDS)[number]
 

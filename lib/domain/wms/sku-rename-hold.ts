@@ -24,8 +24,9 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * AFTER THE EPISODE ENDS (no open row), a NEW order (create paths only) whose line carries an older snapshot is not pushed with it: when product sync has
  * confirmed that the warehouse holds the product's CURRENT IMS SKU (the SKU in the link's saved Mintsoft record equals it, see confirmedWarehouseSku), the line
  * is sent with that SKU (`skuRemap`). Chosen over holding every line whose SKU differs from the warehouse's current one because it needs no operator exit
- * (no row to ignore), cannot strand an order on stale data, and sends only a SKU the warehouse was last seen to hold. Amendments are never remapped: the
- * warehouse order exists under its recorded SKUs and a remap would read as a line change. When the warehouse's current SKU is not confirmed (no link, never
+ * (no row to ignore), cannot strand an order on stale data, and sends only a SKU the warehouse was last seen to hold. Amendments never re-decide a line that was already sent: the
+ * SKU sent at create is recorded per line (WmsOrderPushLink.sentLineSkus) and every amendment and verify is built from it, whatever the setting is now; only a line
+ * never sent before (or an order created before the record existed, which falls back to the setting) is remapped. When the warehouse's current SKU is not confirmed (no link, never
  * read, or the SKU was renamed again before sync noticed), the open-row hold (if any) decides and otherwise the snapshot is sent as before.
  *
  * SCOPE. The hold applies only to the discrepancy of the warehouse the order is actually sent to: the link's push warehouse for a mixed-warehouse
@@ -81,14 +82,40 @@ export function confirmedWarehouseSku(productSku: string | null | undefined, lin
 export type SkuRemapEntry = { sku: string; earlier: string[] }
 export type SkuRemap = Readonly<Record<string, SkuRemapEntry>>
 
+/** The SKU actually sent for each order line (WmsOrderPushLink.sentLineSkus): per line id, the snapshot SKU it carried and the SKU put on the wire. */
+export type SentLineSkus = Readonly<Record<string, { own: string; sent: string }>>
+
+/** Read the stored JSON back; anything malformed is dropped entry by entry (a missing record means "fall back to the remap"). */
+export function parseSentLineSkus(value: unknown): SentLineSkus | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return undefined
+  const out: Record<string, { own: string; sent: string }> = {}
+  for (const [lineId, entry] of Object.entries(value as Record<string, unknown>)) {
+    if (!entry || typeof entry !== 'object') continue
+    const { own, sent } = entry as Record<string, unknown>
+    if (typeof own === 'string' && typeof sent === 'string' && sent !== '') out[lineId] = { own, sent }
+  }
+  return Object.keys(out).length > 0 ? out : undefined
+}
+
 /**
  * THE ONE PLACE a line's SKU on the wire is decided (create, amendment, the amendment comparisons and the warehouse query text all go through it, so
- * they can never disagree about a line). A line is sent as the warehouse's current SKU only when it is bound to a product with a remap entry AND its
- * snapshot SKU (trimmed, exact) is a KNOWN earlier SKU of that product (from the product's rename history). A case variant, a `wc-<id>` fallback or a
- * Woo SKU IMS has never known for the product is never remapped. With no remap (the setting is off) it returns the line's own SKU.
+ * they can never disagree about a line).
+ *
+ * 1. A line whose SKU was already SENT (`recorded`, from the link; used on amendments only) is sent as it was, whatever the remap setting is now and
+ *    whatever the rename history says since. The record applies only while the line still carries the snapshot SKU it was recorded under (an edited
+ *    line is a new line as far as the warehouse is concerned).
+ * 2. Otherwise (a line never sent, or an order created before the record existed) the remap decides: a line is sent as the warehouse's current SKU only
+ *    when it is bound to a product with a remap entry AND its snapshot SKU (trimmed, exact) is a KNOWN earlier SKU of that product (from the product's
+ *    rename history). A case variant, a `wc-<id>` fallback or a Woo SKU IMS has never known for the product is never remapped. With no remap (the
+ *    setting is off) it returns the line's own SKU.
  */
-export function sentSkuForLine(line: { sku?: string | null; productId?: string | null }, remap: SkuRemap | undefined): string {
+export function sentSkuForLine(line: { id?: string | null; sku?: string | null; productId?: string | null }, remap: SkuRemap | undefined, recorded?: SentLineSkus): string {
   const own = line.sku ?? ''
+  const sent = line.id && recorded ? recorded[line.id] : undefined
+  if (sent && normaliseSkuForHold(sent.own) === normaliseSkuForHold(own)) {
+    // Byte-identical to development when nothing was remapped: the line's own current SKU, not the recorded spelling.
+    return normaliseSkuForHold(sent.sent) === normaliseSkuForHold(sent.own) ? own : normaliseSkuForHold(sent.sent)
+  }
   const entry = line.productId && remap ? remap[line.productId] : undefined
   if (!entry) return own
   const snapshot = normaliseSkuForHold(own)
@@ -105,13 +132,13 @@ export async function withSkuRenameHolds<T extends OrderWithLines>(
   orders: ReadonlyArray<T>,
   warehouseOf: (order: T) => string | null | undefined = (order) => order.shipFromWarehouseId,
   options: { remapForConnector?: string } = {},
-): Promise<Array<T & { skuRenameHolds: SkuRenameHold[]; skuRemap?: SkuRemap }>> {
+): Promise<Array<T & { skuRenameHolds: SkuRenameHold[]; skuRemap: SkuRemap | undefined }>> {
   const productIds = [...new Set(orders.flatMap((order) => order.lines.flatMap((line) => (line.productId ? [line.productId] : []))))]
   const rows = productIds.length === 0 ? [] : await client.wmsStockDiscrepancy.findMany({
     where: { category: 'PRODUCT_SKU_RENAMED', status: 'OPEN', productId: { in: productIds } },
     select: { productId: true, warehouseId: true, wmsValue: true },
   })
-  // Remap inputs: the warehouse SKU product sync confirmed, and the product's rename history (rows of any status).
+  // Remap inputs: the warehouse SKU product sync confirmed, and the product's rename history (rows of any status, of EVERY warehouse: the confirmed SKU and the Mintsoft product are per connector, so a binding added after a rename must not lose the history).
   const warehouseSkuByProduct = new Map<string, string>()
   let history: Array<{ productId: string | null; warehouseId: string; imsValue: string | null; wmsValue: string | null }> = []
   if (options.remapForConnector && productIds.length > 0 && client.wmsProductLink && client.product) {
@@ -133,13 +160,14 @@ export async function withSkuRenameHolds<T extends OrderWithLines>(
     const skuRenameHolds = rows.flatMap((row) => (
       row.productId && own.has(row.productId) && (!warehouseId || row.warehouseId === warehouseId) ? [{ productId: row.productId, wmsValue: row.wmsValue }] : []
     ))
-    if (!options.remapForConnector) return { ...order, skuRenameHolds }
+    // Explicitly undefined (not absent) when the remap is off: callers spread a reload over an earlier list read, and an absent key would keep a stale remap.
+    if (!options.remapForConnector) return { ...order, skuRenameHolds, skuRemap: undefined }
     const skuRemap: Record<string, SkuRemapEntry> = {}
     for (const id of own) {
       const sku = warehouseSkuByProduct.get(id)
       if (!sku) continue
       const earlier = new Set(history.flatMap((row) => (
-        row.productId === id && (!warehouseId || row.warehouseId === warehouseId) ? [normaliseSkuForHold(row.imsValue), normaliseSkuForHold(row.wmsValue)] : []
+        row.productId === id ? [normaliseSkuForHold(row.imsValue), normaliseSkuForHold(row.wmsValue)] : []
       )))
       earlier.delete('')
       earlier.delete(sku)

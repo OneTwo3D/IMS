@@ -38,7 +38,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   // wcSeenLines (JSON): the WooCommerce line item ids and quantities of the last compared delivery, plus its modified time and a digest. Product figures only.
   SalesOrder: {
     erased: ['customerName', 'customerEmail', 'customerVatNumber', 'billingAddress', 'shippingAddress', 'notes', 'internalNotes', 'trackingNumber'],
-    notPersonal: ['id', 'externalOrderNumber', 'withdrawalLastWcStatus', 'withdrawalRequestId', 'currency', 'customerId', 'shippingService', 'courierKey', 'shippingMethodId', 'taxRateName', 'shipFromWarehouseId', 'salesRep', 'discountStr', 'discountRestatement', 'euVatLineAccount', 'euVatRegimeBasis', 'orderNumber', 'iossNumber', 'deliveryTerm', 'paymentMethod', 'paymentMethodTitle', 'revenueDeferredBatchRef', 'inventoryAllocatedBatchRef', 'allocationBatchSyncLogId', 'allocationBatchConnector', 'allocationBatchAccountCode', 'allocationBatchPasses', 'wcLineBaseline', 'wcSeenLines'],
+    notPersonal: ['id', 'externalOrderNumber', 'withdrawalLastWcStatus', 'withdrawalRequestId', 'currency', 'customerId', 'shippingService', 'courierKey', 'shippingMethodId', 'taxRateName', 'shipFromWarehouseId', 'salesRep', 'discountStr', 'discountRestatement', 'discountTaxSplit', 'euVatLineAccount', 'euVatRegimeBasis', 'orderNumber', 'iossNumber', 'deliveryTerm', 'paymentMethod', 'paymentMethodTitle', 'revenueDeferredBatchRef', 'inventoryAllocatedBatchRef', 'allocationBatchSyncLogId', 'allocationBatchConnector', 'allocationBatchAccountCode', 'allocationBatchPasses', 'wcLineBaseline', 'wcSeenLines'],
     retained: {
       invoiceNumber: 'issued invoice number, statutory record',
       accountingInvoiceId: 'ledger document id, statutory record',
@@ -150,7 +150,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   },
   SalesOrderRefundLine: {
     erased: [],
-    notPersonal: ['costLayerSnapshot', 'accountingTaxType', 'lineKind', 'postingTaxType'],
+    notPersonal: ['costLayerSnapshot', 'accountingTaxType', 'lineKind', 'postingTaxType', 'discountTaxRateId'],
     retained: { description: 'the text on a refunded line: part of the retained credit-note record' },
   },
   ShipmentLine: { erased: [], notPersonal: ['costLayerSnapshot'], retained: {} },
@@ -165,7 +165,9 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
     // doublePostageDetail: order numbers, currency and amounts only (built by decideDoublePostage); no name, address or contact.
     notPersonal: ['connector', 'courierForm', 'courierFormName', 'pushWarehouseId', 'lineSnapshotToken', 'amendLeaseOwner', 'courierTaskService', 'doublePostageDetail',
       // Mixed-warehouse scope: a mode, a version, a hash of the lines sent, stamps, a fixed-vocabulary freeze reason and minor-unit amounts. No person is named.
-      'scopeHash', 'scopeFrozenReason'],
+      'scopeHash', 'scopeFrozenReason',
+      // The SKU actually sent per order line ({ lineId: { own, sent } }): line ids and SKUs only. No person is named.
+      'sentLineSkus'],
     retained: {
       externalOrderId: 'the warehouse order id reconciles the order with the warehouse',
       externalOrderNumber: 'the warehouse order number reconciles the order with the warehouse',
