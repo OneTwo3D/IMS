@@ -36,6 +36,8 @@ import {
   type InTransitConvention,
   type ProductType,
 } from './spec'
+import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
+import { isPurchasableProductStatus } from '@/lib/products/lifecycle'
 import { joinVariantParents, type CatalogueView } from './variant-parents'
 import { boundProblems, type VariantParentsBinding } from './snapshot'
 import {
@@ -393,6 +395,9 @@ class Run {
     return this.input.datasets[name] !== undefined
   }
 
+  /** SKUs the owner declared non-stock (non-stock-skus): key -> SKU. */
+  nonStockDecisions = new Map<string, string>()
+
   rows(name: DatasetName): CanonRow[] {
     return fileOrderRows(this.input.datasets[name])
   }
@@ -465,6 +470,40 @@ function loadExclusions(run: Run): void {
     run.exclusions.set(key, { sku: list[0].sku, reason: list[0].reason })
     run.add('sku-exclusions', list[0].row.line, list[0].sku, 'EMITTED', 'EXCLUSION_REGISTERED', 'registered on the accepted exclusion list')
     for (const extra of list.slice(1)) run.add('sku-exclusions', extra.row.line, extra.sku, 'EXCLUDED', 'DUPLICATE_EXCLUSION', 'exact duplicate of another exclusion row')
+  }
+}
+
+/**
+ * The owner decisions lists that act at read time (the ingest applied them to the cells): non-stock-skus and sku-name-overrides. Here every row gets its
+ * disposition and the lists are checked: a bad or conflicting row is refused (it would otherwise have been applied by the ingest, which only reads the
+ * trimmed values), and a decision that matched nothing is a warning.
+ */
+function loadReadTimeDecisions(run: Run): void {
+  const seenSkus = new Map<string, string>()
+  for (const row of run.rows('non-stock-skus')) {
+    const sku = parseSku(row.values.sku)
+    if (!sku.ok) { run.add('non-stock-skus', row.line, row.values.sku, 'REJECTED', 'BAD_SKU', sku.reason); continue }
+    if (row.values.reason === '') { run.add('non-stock-skus', row.line, sku.sku, 'REJECTED', 'MISSING_REASON', 'a non-stock decision needs a written reason'); continue }
+    if (seenSkus.has(sku.key)) { run.add('non-stock-skus', row.line, sku.sku, 'EXCLUDED', 'DUPLICATE_ROW', 'repeat of an earlier non-stock row'); continue }
+    seenSkus.set(sku.key, sku.sku)
+    run.nonStockDecisions.set(sku.key, sku.sku)
+    run.add('non-stock-skus', row.line, sku.sku, 'EMITTED', 'NON_STOCK_REGISTERED', 'loaded as NON_INVENTORY whatever the source type says; stock cells ignored')
+  }
+  const byName = new Map<string, string>()
+  for (const row of run.rows('sku-name-overrides')) {
+    const name = row.values.name.trim()
+    const sku = parseSku(row.values.sku)
+    if (name === '') { run.add('sku-name-overrides', row.line, '(blank)', 'REJECTED', 'MISSING_NAME', 'name is empty'); continue }
+    if (!sku.ok) { run.add('sku-name-overrides', row.line, name, 'REJECTED', 'BAD_SKU', sku.reason); continue }
+    if (row.values.reason === '') { run.add('sku-name-overrides', row.line, name, 'REJECTED', 'MISSING_REASON', 'a SKU override needs a written reason'); continue }
+    if (row.values.type !== '' && row.values.type !== 'KIT' && row.values.type !== 'BOM') { run.add('sku-name-overrides', row.line, name, 'REJECTED', 'BAD_TYPE', `type ${JSON.stringify(row.values.type)} must be KIT or BOM (or blank)`); continue }
+    const earlier = byName.get(name)
+    if (earlier !== undefined) {
+      run.add('sku-name-overrides', row.line, name, earlier === sku.sku ? 'EXCLUDED' : 'REJECTED', earlier === sku.sku ? 'DUPLICATE_ROW' : 'CONFLICTING_SKU_OVERRIDE', earlier === sku.sku ? 'repeat of an earlier override' : `the name is given two different SKUs (${earlier} and ${sku.sku})`)
+      continue
+    }
+    byName.set(name, sku.sku)
+    run.add('sku-name-overrides', row.line, name, 'EMITTED', 'SKU_OVERRIDE_REGISTERED', `fills a blank SKU of the product of that name with ${sku.sku}`)
   }
 }
 
@@ -742,15 +781,18 @@ function joinVariantParentsInto(run: Run, candidates: CatEntry[]): void {
   for (const key of result.confirmed) run.variantConfirmed.add(key)
   // A VARIABLE parent the products file carries keeps its row, but WooCommerce decides its title and lifecycle (the parent title comes from WooCommerce).
   const differing: string[] = []
+  const lifecycleDisagrees: string[] = []
   for (const p of result.providedParents) {
     const entry = run.cat.get(p.key) ?? byKey.get(p.key)
     if (!entry) continue
     if (entry.name !== p.name || entry.lifecycle !== p.lifecycle) differing.push(`${entry.sku}: ${JSON.stringify(entry.name)}/${entry.lifecycle} -> ${JSON.stringify(p.name)}/${p.lifecycle}`)
+    if (entry.lifecycle !== p.lifecycle) lifecycleDisagrees.push(`${entry.sku}: the products file says ${entry.lifecycle}, WooCommerce says ${p.lifecycle}`)
     entry.name = p.name
     entry.cells.lifecycleStatus = p.lifecycle
     entry.lifecycle = p.lifecycle
   }
   if (differing.length > 0) run.find('INFO', 'PARENT_ATTRIBUTES_FROM_WOO', `${differing.length} VARIABLE product(s) in the products file carry a title or lifecycle that differs from WooCommerce: WooCommerce's title and mapped status are written`, 'variant-parents', differing)
+  if (lifecycleDisagrees.length > 0) run.find('WARNING', 'LIFECYCLE_DISAGREES_WITH_WOO', `${lifecycleDisagrees.length} VARIABLE product(s) have a lifecycle in the products file (for Qoblex: Archived is DRAFT, Active is ACTIVE) that disagrees with the WooCommerce status (publish is ACTIVE, draft/pending/private is DRAFT): WooCommerce's is written; check which side is right (the snapshot covers variable products only)`, 'variant-parents', lifecycleDisagrees)
   for (const key of result.namedKeys) run.variantParentKeys.add(key)
   run.variantParentSummary = { supplied: true, ...result.summary }
 }
@@ -760,14 +802,40 @@ function joinVariantParentsInto(run: Run, candidates: CatEntry[]): void {
 // ---------------------------------------------------------------------------
 
 function loadRecipes(run: Run): void {
-  type Line = { row: CanonRow; parent: string; parentKey: string; component: string; componentKey: string; qty: Dec; sortOrder: number | null }
+  type Line = { ds: DatasetName; row: CanonRow; parent: string; parentKey: string; component: string; componentKey: string; qty: Dec; sortOrder: number | null }
   const candidates: Line[] = []
+  // OWNER DECISIONS (recipe-overrides): the complete recipe of a parent REPLACES whatever the export gives for it. The export's lines for that
+  // parent are set aside (EXCLUDED, counted), never merged. The override rows go through exactly the same checks as an export line (the component
+  // must exist in the catalogue, the quantity must be above zero, a repeated component is refused).
+  const overrideParents = new Set<string>()
+  const overrideItems: Array<{ ds: DatasetName; row: CanonRow }> = []
+  for (const row of run.rows('recipe-overrides')) {
+    if (row.values.reason === '') { run.add('recipe-overrides', row.line, row.values.parentSku, 'REJECTED', 'MISSING_REASON', 'a recipe override needs a written reason'); continue }
+    if (row.values.type !== '' && row.values.type !== 'KIT' && row.values.type !== 'BOM') { run.add('recipe-overrides', row.line, row.values.parentSku, 'REJECTED', 'BAD_TYPE', `type ${JSON.stringify(row.values.type)} must be KIT or BOM (or blank)`); continue }
+    const parent = parseSku(row.values.parentSku, 'parentSku')
+    if (parent.ok && row.values.type !== '') {
+      const entry = run.cat.get(parent.key)
+      if (entry && entry.type !== row.values.type) { run.add('recipe-overrides', row.line, parent.sku, 'REJECTED', 'RECIPE_OVERRIDE_TYPE_MISMATCH', `the override says ${parent.sku} is a ${row.values.type} but the products file loads it as ${entry.type}`); continue }
+    }
+    if (parent.ok) overrideParents.add(parent.key)
+    overrideItems.push({ ds: 'recipe-overrides', row })
+  }
+  const items: Array<{ ds: DatasetName; row: CanonRow }> = []
   for (const row of run.rows('recipe-lines')) {
+    const parent = parseSku(row.values.parentSku, 'parentSku')
+    if (parent.ok && overrideParents.has(parent.key)) {
+      run.add('recipe-lines', row.line, parent.sku, 'EXCLUDED', 'REPLACED_BY_RECIPE_OVERRIDE', `the recipe of ${parent.sku} is given by the recipe-overrides decisions; this export line is not used`)
+      continue
+    }
+    items.push({ ds: 'recipe-lines', row })
+  }
+  items.push(...overrideItems)
+  for (const { ds, row } of items) {
     const v = row.values
     const parent = parseSku(v.parentSku, 'parentSku')
     const component = parseSku(v.componentSku, 'componentSku')
     const label = parent.ok ? parent.sku : v.parentSku
-    const reject = (code: string, reason: string) => run.add('recipe-lines', row.line, label, 'REJECTED', code, reason)
+    const reject = (code: string, reason: string) => run.add(ds, row.line, label, 'REJECTED', code, reason)
     if (!parent.ok) { reject('BAD_SKU', parent.reason); continue }
     if (!component.ok) { reject('BAD_SKU', component.reason); continue }
     if (/[;:]/.test(component.sku)) { reject('COMPONENT_SKU_HAS_DELIMITER', `component SKU ${JSON.stringify(component.sku)} contains ":" or ";", which the importer's components cell uses as separators`); continue }
@@ -782,7 +850,7 @@ function loadRecipes(run: Run): void {
 
     const parentRes = resolveProduct(run, parent.key)
     if (parentRes.kind === 'excluded') {
-      run.add('recipe-lines', row.line, parent.sku, 'EXCLUDED', 'PARENT_EXCLUDED_BY_LIST', `parent is on the accepted exclusion list: ${parentRes.reason}`)
+      run.add(ds, row.line, parent.sku, 'EXCLUDED', 'PARENT_EXCLUDED_BY_LIST', `parent is on the accepted exclusion list: ${parentRes.reason}`)
       continue
     }
     const parentProblem = skuProblem(parentRes, `parent ${parent.sku}`)
@@ -793,9 +861,9 @@ function loadRecipes(run: Run): void {
     if (componentRes.kind === 'excluded') { reject('COMPONENT_EXCLUDED_BY_LIST', `component ${component.sku} is on the exclusion list (${componentRes.reason}) but its parent ${parent.sku} is loaded: the recipe would be incomplete`); continue }
     const componentProblem = skuProblem(componentRes, `component ${component.sku}`)
     if (componentProblem) { reject(componentProblem.code, componentProblem.reason); continue }
-    if (parentRes.kind === 'ok') trackSku(run, 'recipe-lines', parent, parentRes.sku)
-    if (componentRes.kind === 'ok') trackSku(run, 'recipe-lines', component, componentRes.sku)
-    candidates.push({ row, parent: parent.sku, parentKey: parent.key, component: component.sku, componentKey: component.key, qty: qty.value, sortOrder })
+    if (parentRes.kind === 'ok') trackSku(run, ds, parent, parentRes.sku)
+    if (componentRes.kind === 'ok') trackSku(run, ds, component, componentRes.sku)
+    candidates.push({ ds, row, parent: parent.sku, parentKey: parent.key, component: component.sku, componentKey: component.key, qty: qty.value, sortOrder })
   }
 
   const byPair = new Map<string, Line[]>()
@@ -803,7 +871,7 @@ function loadRecipes(run: Run): void {
   const valid: Line[] = []
   for (const [, list] of [...byPair.entries()]) {
     if (list.length > 1) {
-      for (const line of list) run.add('recipe-lines', line.row.line, line.parent, 'REJECTED', 'DUPLICATE_RECIPE_LINE', `component ${line.component} is listed ${list.length} times for ${line.parent}; whether to add the quantities cannot be decided`)
+      for (const line of list) run.add(line.ds, line.row.line, line.parent, 'REJECTED', 'DUPLICATE_RECIPE_LINE', `component ${line.component} is listed ${list.length} times for ${line.parent}; whether to add the quantities cannot be decided`)
     } else valid.push(list[0])
   }
 
@@ -816,10 +884,10 @@ function loadRecipes(run: Run): void {
   for (const line of valid) {
     if (cyclicParents.has(line.parentKey)) {
       const path = run.recipeCycles.find((cycle) => cycle.some((sku) => skuKey(sku) === line.parentKey))
-      run.add('recipe-lines', line.row.line, line.parent, 'REJECTED', 'RECIPE_CYCLE', `${line.parent} is on a recipe cycle (${path ? path.join(' -> ') : 'see findings'})`)
+      run.add(line.ds, line.row.line, line.parent, 'REJECTED', 'RECIPE_CYCLE', `${line.parent} is on a recipe cycle (${path ? path.join(' -> ') : 'see findings'})`)
       continue
     }
-    run.add('recipe-lines', line.row.line, line.parent, 'EMITTED', 'RECIPE_LINE', 'in the components cell of its parent')
+    run.add(line.ds, line.row.line, line.parent, 'EMITTED', 'RECIPE_LINE', 'in the components cell of its parent')
     run.recipeComponents.set(line.parentKey, [
       ...(run.recipeComponents.get(line.parentKey) ?? []),
       { componentSku: line.component, componentKey: line.componentKey, qty: line.qty, sortOrder: line.sortOrder },
@@ -833,7 +901,7 @@ function loadRecipes(run: Run): void {
 function checkRecipesPresent(run: Run): void {
   const parents = [...run.cat.values()].filter((entry) => RECIPE_TYPES.has(entry.type))
   if (parents.length === 0) return
-  if (!run.has('recipe-lines')) {
+  if (!run.has('recipe-lines') && !run.has('recipe-overrides')) {
     run.find('ERROR', 'RECIPES_NOT_SUPPLIED', `the products dataset has ${parents.length} KIT/BOM product(s) but no recipe-lines dataset was supplied: they would load without components`, 'recipe-lines', parents.map((p) => p.sku))
     return
   }
@@ -935,9 +1003,35 @@ function loadImsFxRates(run: Run): void {
 function loadSuppliers(run: Run): void {
   type Candidate = { row: CanonRow; name: string; cells: Record<string, string> }
   const groups = new Map<string, Candidate[]>()
+  // OWNER DECISIONS (supplier-overrides): a currency / purchase tax type for a supplier whose contact row leaves it blank. Only a blank cell is filled;
+  // a different value than the contact row states is refused, never silently picked.
+  const overrides = new Map<string, { row: CanonRow; name: string; currency: string; purchaseTaxType: string; used: boolean }>()
+  for (const row of run.rows('supplier-overrides')) {
+    const name = row.values.name.normalize('NFC').trim()
+    const reject = (code: string, reason: string) => run.add('supplier-overrides', row.line, name || '(blank)', 'REJECTED', code, reason)
+    if (name === '') { reject('MISSING_NAME', 'name is empty'); continue }
+    if (row.values.reason === '') { reject('MISSING_REASON', 'a supplier override needs a written reason'); continue }
+    if (row.values.currency.trim() === '' && row.values.purchaseTaxType.trim() === '') { reject('EMPTY_OVERRIDE', 'the override states neither a currency nor a purchaseTaxType'); continue }
+    if (overrides.has(name.toUpperCase())) { reject('DUPLICATE_SUPPLIER_OVERRIDE', 'the supplier has more than one override row'); continue }
+    overrides.set(name.toUpperCase(), { row, name, currency: row.values.currency.trim(), purchaseTaxType: row.values.purchaseTaxType.trim(), used: false })
+  }
   for (const row of run.rows('suppliers')) {
-    const v = row.values
+    const v = { ...row.values }
     const name = v.name.normalize('NFC').trim()
+    const override = overrides.get(name.toUpperCase())
+    if (override) {
+      override.used = true
+      const conflicts: string[] = []
+      for (const column of ['currency', 'purchaseTaxType'] as const) {
+        if (override[column] === '') continue
+        if (v[column].trim() === '') v[column] = override[column]
+        else if (v[column].trim().toUpperCase() !== override[column].toUpperCase()) conflicts.push(`${column} is ${JSON.stringify(v[column])} in the contact row but ${JSON.stringify(override[column])} in the override`)
+      }
+      if (conflicts.length > 0) {
+        run.add('suppliers', row.line, name, 'REJECTED', 'SUPPLIER_OVERRIDE_CONFLICT', `the override only fills blank cells: ${conflicts.join('; ')}`)
+        continue
+      }
+    }
     const reject = (code: string, reason: string) => run.add('suppliers', row.line, name || '(blank)', 'REJECTED', code, reason)
     if (name === '') { reject('MISSING_NAME', 'name is empty'); continue }
     if (name.startsWith('#')) { reject('NAME_STARTS_WITH_HASH', 'the importers\' CSV reader silently skips a row whose first value starts with "#"'); continue }
@@ -1005,6 +1099,10 @@ function loadSuppliers(run: Run): void {
     run.supplierStatus.set(key, 'ok')
     run.add('suppliers', list[0].row.line, list[0].name, 'EMITTED', 'SUPPLIER', 'in the suppliers import file')
     for (const extra of list.slice(1)) run.add('suppliers', extra.row.line, extra.name, 'EXCLUDED', 'DUPLICATE_ROW', 'exact duplicate of another supplier row')
+  }
+  for (const override of overrides.values()) {
+    if (override.used) run.add('supplier-overrides', override.row.line, override.name, 'EMITTED', 'SUPPLIER_OVERRIDE_APPLIED', 'blank currency / purchase tax type of the contact row filled from this decision')
+    else run.add('supplier-overrides', override.row.line, override.name, 'EXCLUDED', 'SUPPLIER_OVERRIDE_UNUSED', 'no supplier of that name in the suppliers dataset')
   }
   if (run.suppliers.size > 0 && !run.has('ims-tax-rates')) {
     run.find('WARNING', 'SUPPLIER_TAX_RATES_UNCHECKED', 'no ims-tax-rates list was supplied, so it was NOT checked that each supplier purchase tax type resolves to exactly one IMS tax rate. The apply-time rail tax-rates refuses a run where it does not, and the supplier importer refuses the row.', 'suppliers', [...run.suppliers.values()].map((s) => s.name))
@@ -1513,7 +1611,7 @@ function loadPurchaseOrders(run: Run): void {
     if (problem) { reject(problem.code, problem.reason); continue }
     if (res.kind !== 'ok') continue
     trackSku(run, 'purchase-order-lines', sku, res.sku)
-    if (res.lifecycle !== null && res.lifecycle !== 'ACTIVE' && res.lifecycle !== 'DRAFT') { reject('PRODUCT_NOT_PURCHASABLE', `SKU ${sku.sku} will be created as ${res.lifecycle}; createPurchaseOrder only accepts ACTIVE or DRAFT products`); continue }
+    if (res.lifecycle !== null && !isPurchasableProductStatus(res.lifecycle as ProductLifecycleStatus)) { reject('PRODUCT_NOT_PURCHASABLE', `SKU ${sku.sku} will be created as ${res.lifecycle}; createPurchaseOrder only accepts ACTIVE or DRAFT products`); continue }
     if (res.type === 'KIT' || res.type === 'VARIABLE') { reject('TYPE_CANNOT_BE_PURCHASED', `SKU ${sku.sku} is ${res.type}; it can never be received into stock`); continue }
 
     // THE ORDER'S CURRENCY IS ITS SUPPLIER'S (owner ruling 2026-10-25). The Qoblex Incoming report has no currency column, and the pinned map carries no
@@ -1688,6 +1786,8 @@ function checkCoverage(run: Run): CoverageResult | null {
   const everything = new Set<string>([...run.catAnyParsed.keys(), ...run.wmsSkus.keys(), ...run.wooSkus.keys(), ...run.ims.keys(), ...run.variantParentKeys])
   const stale = [...run.exclusions.entries()].filter(([key]) => !everything.has(key)).map(([, v]) => v.sku)
   if (stale.length > 0) run.find('WARNING', 'STALE_EXCLUSION', 'SKU(s) on the exclusion list appear in no input: the exclusion does nothing', 'sku-exclusions', stale)
+  const staleNonStock = [...run.nonStockDecisions.entries()].filter(([key]) => !everything.has(key)).map(([, sku]) => sku)
+  if (staleNonStock.length > 0) run.find('WARNING', 'STALE_NON_STOCK_DECISION', 'SKU(s) on the non-stock-skus list appear in no input: the decision does nothing', 'non-stock-skus', staleNonStock)
   const sourceKeys = new Set<string>([...run.catAnyParsed.keys(), ...run.wmsSkus.keys(), ...run.wooSkus.keys()])
   const imsOnly = [...run.ims.entries()].filter(([key]) => !sourceKeys.has(key)).map(([, v]) => v.sku)
   if (imsOnly.length > 0) run.find('WARNING', 'IMS_ONLY_SKU', 'SKU(s) already in IMS are in none of Qoblex, the 3PL (WMS) or WooCommerce', 'ims-skus', imsOnly)
@@ -1915,10 +2015,12 @@ export function prepare(input: PrepareInput): PrepareResult {
     for (const rejection of dataset.rejected) {
       run.add(name, rejection.line, `line ${rejection.line}`, 'REJECTED', rejection.code, rejection.reason)
     }
+    for (const note of dataset.notes ?? []) run.find('INFO', note.code, `${name}: ${note.reason}`, name)
     for (const replaced of dataset.superseded) run.add(name, replaced.line, replaced.key, 'EXCLUDED', 'SUPERSEDED_BY_LATER_FILE', replaced.reason)
   }
 
   loadExclusions(run)
+  loadReadTimeDecisions(run)
   loadImsSkus(run)
   loadCatalogue(run)
   loadRecipes(run)

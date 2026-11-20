@@ -6,20 +6,20 @@
       "rowsAboveHeader": 1,
       "expectedHeaders": [
         "Product",
-        "Barcode",
         "Sku",
+        "Barcode",
+        "State",
         "Brand",
         "Product Type",
-        "State",
         "Supplier",
         "Updated At",
         "Moving Average Cost",
-        "Total Cost",
         "Purchase Price",
         "Wholesale Price",
         "Retail Price",
         "Retail Compare Price",
         "Wholesale Compare Price",
+        "Total Cost",
         "Quantity",
         "Allocated Quantity",
         "Available Quantity",
@@ -67,7 +67,7 @@
         "name": "Product",
         "type": "Product Type",
         "barcode": "Barcode",
-        "active": "State"
+        "lifecycleStatus": "State"
       },
       "valueMaps": {
         "type": {
@@ -77,30 +77,52 @@
           "bom": "BOM",
           "non-inventory": "NON_INVENTORY"
         },
-        "active": {
-          "Active": "TRUE",
-          "Inactive": "FALSE"
+        "lifecycleStatus": {
+          "Active": "ACTIVE",
+          "Inactive": "EOL",
+          "Archived": "DRAFT"
         }
+      },
+      "rowSelect": {
+        "column": "State",
+        "keep": [
+          "Active",
+          "Inactive",
+          "Archived"
+        ],
+        "skip": [
+          "Deleted"
+        ]
+      },
+      "nameColumn": "Product",
+      "nonStock": {
+        "column": "Product Type",
+        "value": "non-inventory"
+      },
+      "ghostRows": {
+        "column": "Product Type",
+        "ghost": "Unknown",
+        "quantityColumn": "Quantity"
       }
     },
     "stock-lots": {
       "rowsAboveHeader": 1,
       "expectedHeaders": [
         "Product",
-        "Barcode",
         "Sku",
+        "Barcode",
+        "State",
         "Brand",
         "Product Type",
-        "State",
         "Supplier",
         "Updated At",
         "Moving Average Cost",
-        "Total Cost",
         "Purchase Price",
         "Wholesale Price",
         "Retail Price",
         "Retail Compare Price",
         "Wholesale Compare Price",
+        "Total Cost",
         "Quantity",
         "Allocated Quantity",
         "Available Quantity",
@@ -150,18 +172,31 @@
       "constants": {
         "currency": "GBP"
       },
-      "rowSelect": {
-        "column": "Product Type",
-        "keep": [
-          "simple",
-          "variable",
-          "bom"
-        ],
-        "skip": [
-          "kit",
-          "non-inventory"
-        ]
-      },
+      "rowSelect": [
+        {
+          "column": "Product Type",
+          "keep": [
+            "simple",
+            "variable",
+            "bom"
+          ],
+          "skip": [
+            "kit",
+            "non-inventory"
+          ]
+        },
+        {
+          "column": "State",
+          "keep": [
+            "Active",
+            "Inactive",
+            "Archived"
+          ],
+          "skip": [
+            "Deleted"
+          ]
+        }
+      ],
       "wide": {
         "blockStart": "after-label",
         "warehouses": {
@@ -178,6 +213,16 @@
           "qty": "Quantity"
         },
         "uniqueBy": "sku"
+      },
+      "nameColumn": "Product",
+      "nonStock": {
+        "column": "Product Type",
+        "value": "non-inventory"
+      },
+      "ghostRows": {
+        "column": "Product Type",
+        "ghost": "Unknown",
+        "quantityColumn": "Quantity"
       }
     }
   }
