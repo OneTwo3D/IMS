@@ -1,0 +1,3 @@
+### Security: partial-shipment signature covers the order id and cannot be replayed
+- The helper plugin's partial-shipment route (plugin 1.5.3) now requires `X-OTI-Signature-V2`: an HMAC over timestamp, method, path (so the order id), a single-use nonce and the body, inside a 300 second window. A captured request can no longer be replayed or pointed at another order.
+- IMS sends the new headers AND the legacy body-only signature, so it keeps working against a store whose plugin is not upgraded. The plugin change is NOT deployed by this release: it needs the owner's OK (stage store first, then live in a quiet window). Deploy order and when the legacy signature can be dropped are in help-docs/woocommerce.md ("Partial-shipment signature").

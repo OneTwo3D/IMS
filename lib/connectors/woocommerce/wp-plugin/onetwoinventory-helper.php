@@ -6,7 +6,7 @@
  *              buttons to WooCommerce, and accepts FX rate pushes from IMS so
  *              the storefront's multi-currency display matches the rates used
  *              in IMS and Xero.
- * Version:     1.5.2
+ * Version:     1.5.3
  * Author:      One Two Enterprises Ltd
  * Requires PHP: 7.4
  * Requires at least: 6.0
@@ -315,8 +315,9 @@ add_action('rest_api_init', function () {
     ]);
     register_rest_route(OTI_FX_NAMESPACE, '/order/(?P<order_id>\d+)/partial-shipment', [
         'methods'             => 'POST',
-        // Same HMAC-of-raw-body check as the FX route (the verifier is generic).
-        'permission_callback' => 'oti_verify_fx_signature',
+        // Its own verifier (1.5.3): the signature binds timestamp, method, path (so the order id), a single-use nonce and the body. The body-only
+        // X-OTI-Signature an older IMS sends is NOT accepted any more.
+        'permission_callback' => 'oti_verify_partial_shipment_signature',
         'callback'            => 'oti_handle_partial_shipment',
         'args'                => [
             'order_id' => [
@@ -772,6 +773,42 @@ if (!function_exists('oti_verify_trackship_refire_signature')) {
     }
 }
 
+if (!function_exists('oti_verify_partial_shipment_signature')) {
+    /**
+     * Signature of the partial-shipment route (1.5.3): HMAC-SHA256, hex, of "timestamp \n METHOD \n path \n nonce \n raw body" with the shared secret,
+     * in the header X-OTI-Signature-V2; timestamp in X-OTI-Timestamp, nonce (16 to 64 hex characters) in X-OTI-Nonce. The path carries the order id, so a
+     * captured request cannot be pointed at another order. It is refused outside a 300 second window and a nonce is accepted once (claimed atomically,
+     * after the signature has passed so an unsigned caller cannot fill the table). The body-only X-OTI-Signature header is deliberately ignored.
+     */
+    function oti_verify_partial_shipment_signature(WP_REST_Request $request)
+    {
+        $secret = get_option(OTI_FX_SECRET_OPT, '');
+        if (!is_string($secret) || $secret === '') {
+            return new WP_Error('oti_fx_no_secret', 'onetwoInventory shared secret not configured', ['status' => 401]);
+        }
+        $signature = $request->get_header('x-oti-signature-v2');
+        $ts_header = $request->get_header('x-oti-timestamp');
+        $nonce     = $request->get_header('x-oti-nonce');
+        if (!is_string($signature) || $signature === '' || !$ts_header || !ctype_digit((string) $ts_header) || !is_string($nonce) || !preg_match('/^[0-9a-f]{16,64}$/', $nonce)) {
+            return new WP_Error('oti_ps_missing_sig', 'Missing signature, timestamp or nonce', ['status' => 401]);
+        }
+        $timestamp = (int) $ts_header;
+        if (abs(time() - $timestamp) > OTI_TS_REPLAY_WINDOW) {
+            return new WP_Error('oti_ps_stale', 'Timestamp outside the replay window', ['status' => 401]);
+        }
+        $order_id = absint($request['order_id']);
+        $path = '/wp-json/oti/v1/order/' . $order_id . '/partial-shipment';
+        $expected = hash_hmac('sha256', $timestamp . "\n" . strtoupper($request->get_method()) . "\n" . $path . "\n" . $nonce . "\n" . (string) $request->get_body(), $secret);
+        if (!hash_equals($expected, $signature)) {
+            return new WP_Error('oti_ps_bad_sig', 'Invalid signature', ['status' => 401]);
+        }
+        if (!oti_claim_nonce('ps', $nonce, OTI_TS_REPLAY_WINDOW)) {
+            return new WP_Error('oti_ps_replayed', 'Request already used', ['status' => 401]);
+        }
+        return true;
+    }
+}
+
 if (!function_exists('oti_handle_trackship_refire')) {
     /**
      * POST /wp-json/oti/v1/order/{id}/trackship-refire   (signed: see oti_verify_trackship_refire_signature)
@@ -1125,7 +1162,7 @@ if (!function_exists('oti_handle_incumbents')) {
         }
         return new WP_REST_Response([
             'ok'            => true,
-            'plugin_version' => '1.5.2',
+            'plugin_version' => '1.5.3',
             'generated_at'  => time(),
             'bridge'        => [
                 'slug'                   => OTI_BRIDGE_PLUGIN_SLUG,

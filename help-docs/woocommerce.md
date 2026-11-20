@@ -762,6 +762,19 @@ A single companion WordPress plugin provides every WC-side hook IMS uses. The pl
 - **FX rate receiver (RETIRED in plugin 1.3.0)** — `POST /wp-json/oti/v1/fx-rates` still exists and is still signature-checked (an unsigned request is a 401, which is what **Check helper plugin** relies on), but a signed push is refused with **HTTP 410 and the code `oti_fx_push_retired`** and NOTHING is written (no Aelia option, no `oti_fx_*` option). Aelia is the exchange-rate master (owner ruling 2026-10-24), so the store itself fences every IMS push, whatever state IMS's own lock is in. Plugin 1.3.0 also **no longer hooks the `wc_aelia_currencyswitcher_exchange_rate` filter** (the hook is removed, not made a pass-through), so IMS-stored rates can never override Aelia's on the store, stale or not; it no longer flushes Aelia's caches either. The options earlier versions left (`oti_fx_rates`, `oti_fx_base_currency`, `oti_fx_last_push`) are untouched and nothing writes them any more; a site admin can delete those three options (for example `wp option delete oti_fx_rates`) whenever they like, or leave them. IMS treats the refusal as terminal: one request, no retry, a `SKIPPED` row in the push log (never FAILED, no WARNING), and **Push Now** reports it.
 - **Aelia rate read (plugin 1.3.0)** — exposes `GET /wp-json/oti/v1/aelia-rates`, a READ-ONLY endpoint (it writes nothing) signed the same way as the other endpoints (HMAC-SHA256 of the empty body in `X-OTI-Signature`). It returns Aelia's base currency and, per currency, `rate`, `markup` (Aelia's `rate_markup`), `set_manually`, `decimals` when Aelia holds one, and Aelia's own last-update time. It reads Aelia's settings option `wc_aelia_currency_switcher` (`exchange_rates`) and the store currency (`woocommerce_currency`).
 
+### Partial-shipment signature (plugin 1.5.3)
+
+The partial-shipment route used to check an HMAC of the request body only. The order id (in the URL) was not covered and there was no timestamp or nonce, so a captured signed request could be replayed for ever, or pointed at a different order. Plugin **1.5.3** closes that: it **requires** `X-OTI-Signature-V2`, an HMAC-SHA256 of `timestamp \n POST \n /wp-json/oti/v1/order/{id}/partial-shipment \n nonce \n body` (headers `X-OTI-Timestamp` and `X-OTI-Nonce`), refuses a timestamp more than 300 seconds from the store's clock, and accepts each nonce once. The old body-only `X-OTI-Signature` is ignored by 1.5.3.
+
+**This is a change to the store's WooCommerce plugin: deploying it needs the owner's explicit OK, and the IMS release does not deploy it.** Owner decision 2026-11-18: the stage store first, verified, then live in a quiet window. IMS sends BOTH signatures from this release on, so it works against a plugin of either age:
+
+1. Release IMS (it sends the new headers and still the legacy `X-OTI-Signature`; an un-upgraded plugin keeps accepting the legacy one and ignores the rest).
+2. Owner-approved: install plugin 1.5.3 on the **stage** store. Send a partial shipment from IMS (stage) and check it is accepted and a repeat of the same request (same nonce) is refused with `oti_ps_replayed`.
+3. Owner-approved, in a quiet window: install plugin 1.5.3 on the **live** store and repeat the check with a real partial shipment.
+4. Only when every store runs 1.5.3 or later: remove the legacy `X-OTI-Signature` from the IMS sender (`signPartialShipmentLegacy`). Until then the old signature is still sent and an un-upgraded plugin stays replayable.
+
+Install 1.5.3 on the store before relying on the protection: IMS cannot tell which version the store runs. A store on 1.5.3 with an IMS that predates this release refuses every partial shipment (401 `oti_ps_missing_sig`), so release IMS first.
+
 ### Aelia as the FX master (flag, default OFF)
 
 Owner ruling 2026-10-26: Aelia, the WooCommerce currency switcher, is the exchange-rate master and `fx_rates` is IMS's central copy.
