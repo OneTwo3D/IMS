@@ -41,7 +41,23 @@ async function waitForLockWaiter(ctx: Ctx, timeoutMs = 15_000): Promise<void> {
   }
 }
 
-const SNAPSHOT_DAY = '2001-03-04'
+// A real past day (a snapshot row's date is range-checked), far enough back to be older than any run another test leaves.
+const SNAPSHOT_DAY = new Date(Date.now() - 400 * 86_400_000).toISOString().slice(0, 10)
+
+/** Run `fn` with the despatch-date switch and the snapshot cron set to the given values, restoring the rows afterwards. */
+async function withDateSwitch<T>(ctx: Ctx, values: { switchOn: boolean; cronOn: boolean }, fn: () => Promise<T>): Promise<T> {
+  const keys = ['wms_despatch_date_enabled', 'cron_inventory_snapshot_enabled']
+  const previous = await ctx.db.setting.findMany({ where: { key: { in: keys } } })
+  const put = (key: string, value: string) => ctx.db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+  await put(keys[0], String(values.switchOn))
+  await put(keys[1], String(values.cronOn))
+  try {
+    return await fn()
+  } finally {
+    await ctx.db.setting.deleteMany({ where: { key: { in: keys } } })
+    for (const row of previous) await ctx.db.setting.create({ data: { key: row.key, value: row.value } })
+  }
+}
 
 async function cleanSnapshot(ctx: Ctx) {
   const date = new Date(`${SNAPSHOT_DAY}T00:00:00Z`)
@@ -56,6 +72,7 @@ test('[db] MED1: the daily snapshot waits for a backdated despatch in flight, so
   const { loadDespatchInstantFloors } = await import('../../lib/domain/sales/despatch-instant')
   const { writeDailyInventorySnapshot } = await import('../../lib/domain/inventory/inventory-snapshot')
   await cleanSnapshot(ctx)
+  await withDateSwitch(ctx, { switchOn: true, cronOn: true }, async () => {
   let releaseDespatch!: () => void
   const despatchMayCommit = new Promise<void>((resolve) => { releaseDespatch = resolve })
   let despatchHoldsLock!: () => void
@@ -82,6 +99,40 @@ test('[db] MED1: the daily snapshot waits for a backdated despatch in flight, so
     await despatch.catch(() => undefined)
     await cleanSnapshot(ctx)
   }
+  })
+})
+
+test('[db] MED2 (R1): with the despatch-date switch OFF the snapshot takes no lock and uses no wrapping transaction: it runs while the lock is held by someone else', { skip }, async () => {
+  const ctx = await load()
+  const { writeDailyInventorySnapshot } = await import('../../lib/domain/inventory/inventory-snapshot')
+  await cleanSnapshot(ctx)
+  let releaseHolder!: () => void
+  const mayRelease = new Promise<void>((resolve) => { releaseHolder = resolve })
+  let held!: () => void
+  const holding = new Promise<void>((resolve) => { held = resolve })
+  const holder = ctx.db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${ctx.KEY})`
+    held()
+    await mayRelease
+  }, { timeout: 60_000 })
+  try {
+    await holding
+    for (const values of [{ switchOn: false, cronOn: true }, { switchOn: true, cronOn: false }, { switchOn: false, cronOn: false }]) {
+      await withDateSwitch(ctx, values, async () => {
+        const result = await Promise.race([
+          writeDailyInventorySnapshot({ snapshotDate: SNAPSHOT_DAY }).then(() => 'done'),
+          sleep(20_000).then(() => 'blocked'),
+        ])
+        assert.equal(result, 'done', `switch ${JSON.stringify(values)}: the snapshot must not wait for the despatch floor lock`)
+      })
+    }
+    const waiting = await ctx.db.$queryRaw<Array<{ n: bigint }>>`SELECT count(*)::bigint AS n FROM pg_locks WHERE locktype = 'advisory' AND NOT granted AND objid = ${ctx.KEY}`
+    assert.equal(Number(waiting[0].n), 0)
+  } finally {
+    releaseHolder()
+    await holder.catch(() => undefined)
+    await cleanSnapshot(ctx)
+  }
 })
 
 test('[db] MED1: a backdated despatch that arrives while the snapshot is writing reads the floor the snapshot COMMITS, not the one before it', { skip }, async () => {
@@ -90,7 +141,7 @@ test('[db] MED1: a backdated despatch that arrives while the snapshot is writing
   const { INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY } = await import('../../lib/db/advisory-locks')
   await cleanSnapshot(ctx)
   const date = new Date(`${SNAPSHOT_DAY}T00:00:00Z`)
-  const cutoffAt = new Date('2001-03-05T00:00:00Z')
+  const cutoffAt = new Date(date.getTime() + 86_400_000)
   let snapshotLockHeld!: () => void
   const held = new Promise<void>((resolve) => { snapshotLockHeld = resolve })
   let commitSnapshot!: () => void
@@ -175,7 +226,7 @@ test('[db] MED5: wms_despatch_date_enabled has no effect while the inventory sna
     await put(keys[1], 'false')
     assert.equal(await isWmsDespatchDateEnabled(), false, 'the switch is on but the snapshot job is off: no effect')
     const off = await getWmsDespatchDateStatus()
-    assert.deepEqual(off, { switchOn: true, snapshotCronEnabled: false, effective: false })
+    assert.equal(off.switchOn, true); assert.equal(off.snapshotCronEnabled, false); assert.equal(off.effective, false)
     const warnings = classifyDespatchDatePrerequisite(off)
     assert.equal(warnings.length, 1)
     assert.equal(warnings[0].severity, 'warning')

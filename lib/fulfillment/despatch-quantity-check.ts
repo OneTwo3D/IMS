@@ -63,8 +63,8 @@ export function compareDespatchQuantities(
   for (const item of wms) {
     const key = normaliseSku(item.sku)
     if (!key || !(item.qty > 0)) continue
-    // A SKU of a line IMS can never book (a service or a variable parent): nothing in IMS could ever match it, so it is not evidence of drift.
-    if (options.ignoreSkus?.has(key)) continue
+    // A SKU of a line IMS can never book (a service or a variable parent) and that is NOT also the SKU of a product IMS books on a shipment: nothing in IMS could match it, so it is not evidence of drift.
+    if (options.ignoreSkus?.has(key) && !productBySku.has(key)) continue
     const productId = productBySku.get(key)
     const bucket = productId ? wmsByProduct : unknown
     const bucketKey = productId ?? key
@@ -142,7 +142,7 @@ export async function findDespatchQuantityMismatch(input: CheckInput, client: Pi
     }),
     client.salesOrderLine.findMany({
       where: { orderId: input.orderId },
-      select: { id: true, productId: true, sku: true, fulfillmentRequirements: true, product: { select: { type: true } } },
+      select: { id: true, productId: true, sku: true, fulfillmentRequirements: true, product: { select: { type: true, sku: true } } },
     }),
   ])
   if (shipments.length === 0) return { status: 'NOT_COMPARABLE', reason: 'IMS holds no shipment in the warehouse yet' }
@@ -175,8 +175,10 @@ export async function findDespatchQuantityMismatch(input: CheckInput, client: Pi
   const ignoreSkus = new Set<string>()
   for (const line of orderLines) {
     if (line.product?.type === 'NON_INVENTORY' || line.product?.type === 'VARIABLE') {
-      const key = normaliseSku(line.sku)
-      if (key) ignoreSkus.add(key)
+      for (const sku of [line.sku, line.product?.sku]) {
+        const key = normaliseSku(sku)
+        if (key) ignoreSkus.add(key)
+      }
     }
   }
   const mismatches = compareDespatchQuantities(wms, ims, { ignoreSkus })

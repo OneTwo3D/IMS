@@ -140,6 +140,8 @@ export type ExternalFulfillmentOutcome =
       permanent: boolean
       /** Only for `despatch_quantity_mismatch`: each SKU whose despatched quantity differs, with both quantities (SKUs and numbers only). */
       quantityMismatches?: DespatchQuantityMismatch[]
+      /** Only for `despatch_quantity_mismatch`: the warehouse's despatched units per SKU, stored on the standing row so a later read with no items can re-check against them. */
+      despatchedQuantities?: DespatchQuantity[]
     }
 
 /** The refusals a retry can never resolve. Everything unlisted stays retryable, which is the safe direction. */
@@ -723,7 +725,7 @@ async function refuseOnDespatchQuantityMismatch(
   if (verdict.status !== 'MISMATCH') return null
   const error = quantityMismatchMessage(update.source, orderRef, verdict.mismatches)
   await logQuantityMismatchIfChanged(update.source, orderId, error, verdict.mismatches)
-  return quantityMismatchOutcome(error, verdict.mismatches)
+  return quantityMismatchOutcome(error, verdict.mismatches, update.despatchedQuantities)
 }
 
 /** The refusal text: what differs, why nothing was shipped, and (per direction) what an operator does about it. */
@@ -732,8 +734,8 @@ function quantityMismatchMessage(source: string, orderRef: string, mismatches: D
     + `${describeDespatchQuantityExit(mismatches)} The despatch is retried on every pass.`
 }
 
-function quantityMismatchOutcome(error: string, mismatches: DespatchQuantityMismatch[]): ExternalFulfillmentOutcome {
-  return { ...(refuseExternalFulfillment('despatch_quantity_mismatch', error) as Extract<ExternalFulfillmentOutcome, { success: false }>), quantityMismatches: mismatches }
+function quantityMismatchOutcome(error: string, mismatches: DespatchQuantityMismatch[], despatchedQuantities?: ReadonlyArray<DespatchQuantity>): ExternalFulfillmentOutcome {
+  return { ...(refuseExternalFulfillment('despatch_quantity_mismatch', error) as Extract<ExternalFulfillmentOutcome, { success: false }>), quantityMismatches: mismatches, ...(despatchedQuantities ? { despatchedQuantities: [...despatchedQuantities] } : {}) }
 }
 
 /**
@@ -1282,11 +1284,11 @@ export async function applyExternalFulfillmentUpdate(
       )
 
       if (!result.success && quantityCaptured.mismatches && result.error?.startsWith(QUANTITY_FENCE_MARK)) {
-        // Caught under the order lock, before anything moved for this shipment: the same hold as the pre-check (an operator edit landed in between).
+        // Caught under the order lock, before anything moved for this shipment: the same hold as the pre-check (an operator edit landed in between). ACCEPTED NARROW RACE: each shipment is its own transaction, so an edit landing between shipment 1's commit and shipment 2's fence leaves shipment 1 shipped and the order part-despatched (the hold is still reported); the pre-check above already covered every shipment of the order.
         discardPartialEmails()
         const error = quantityMismatchMessage(update.source, order.externalOrderNumber ?? order.orderNumber ?? order.id, quantityCaptured.mismatches)
         await logQuantityMismatchIfChanged(update.source, order.id, error, quantityCaptured.mismatches)
-        return quantityMismatchOutcome(error, quantityCaptured.mismatches)
+        return quantityMismatchOutcome(error, quantityCaptured.mismatches, update.despatchedQuantities)
       }
       if (result.success && result.despatchedWhileNotReady) lockedNotReadyStatus = result.despatchedWhileNotReady
       if (result.success && target === 'SHIPPED') shippedInBatch.push(shipment.id)

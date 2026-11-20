@@ -15,9 +15,12 @@ as-of helpers treat each `snapshotDate` as an end-of-day UTC position. The cron
 is disabled by default for new installs; enable it only after the migration has
 been deployed.
 
-The whole daily write runs in one transaction that first takes the advisory lock
-`INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY` (exclusive; `lib/db/advisory-locks.ts`), from before the
-state read to the commit of the run row. A warehouse despatch backdated into a business day
+While `wms_despatch_date_enabled` is effective (switch on and this cron on), the daily write holds
+the advisory lock `INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY` (exclusive; `lib/db/advisory-locks.ts`) from
+before the state read to after the run row, through a transaction that only holds the lock (the
+writes themselves are unchanged, uncapped, and a failure keeps the rows already written; the run
+duration is logged as `inventory_snapshot_duration`). With the switch off no lock is taken and the
+write is exactly as before. A warehouse despatch backdated into a business day
 takes the same lock (shared) before it reads the latest run row as its floor, so a despatch is
 either committed before the snapshot reads its state (and is in it) or reads the new floor (and
 is dated after the snapshot's `cutoffAt`). That run row is also the only day bound for backdated

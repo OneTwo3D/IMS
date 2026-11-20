@@ -223,3 +223,59 @@ test('MED5: readiness warns when the despatch-date switch is on and the snapshot
   assert.deepEqual(classifyDespatchDatePrerequisite({ switchOn: false, snapshotCronEnabled: false, effective: false }), [])
   assert.deepEqual(classifyDespatchDatePrerequisite(null), [])
 })
+
+// ---- #1095 R1 ---------------------------------------------------------------------------------------------------------------------------------
+
+test('R1 MED1: an EMPTY item list, or all-zero quantities, is read like no items while a hold stands: never applied on IMS quantities', async () => {
+  for (const items of [[], [{ sku: 'SKU-C', qty: 0 }]]) {
+    const log: string[] = []
+    const outcome = await reconcileOneOrder(deps(log, { hasOpenQuantityHold: async () => true }), candidate, status({ items }))
+    assert.equal(outcome.action, 'pending', JSON.stringify(items))
+    assert.deepEqual(log, [])
+  }
+})
+
+test('R1 MED3: a hold whose IMS side was corrected releases itself: the next read with no items re-checks against the quantities last reported', async () => {
+  const seen: unknown[] = []
+  const withStored = deps([], {
+    hasOpenQuantityHold: async () => true,
+    standingDespatchedQuantities: async () => [{ sku: 'SKU-C', qty: 3 }],
+    applyDispatch: async (_o, _t, options) => { seen.push(options?.despatchedQuantities); return { success: true } },
+  })
+  const outcome = await reconcileOneOrder(withStored, candidate, status({ items: undefined }))
+  assert.equal(outcome.action, 'dispatched')
+  assert.deepEqual(seen, [[{ sku: 'SKU-C', qty: 3 }]], 'the apply compares IMS with what the warehouse last reported, so it applies only when they now match')
+  // Nothing stored (a row from before they were): stays held.
+  const log: string[] = []
+  assert.equal((await reconcileOneOrder(deps(log, { hasOpenQuantityHold: async () => true, standingDespatchedQuantities: async () => null }), candidate, status({ items: undefined }))).action, 'pending')
+  assert.deepEqual(log, [])
+  // The standing row keeps the despatched quantities.
+  const refusals: Array<{ intent: unknown }> = []
+  await runWmsDispatchSweepCore(deps([], {
+    fetchOrderStatus: async () => status({}),
+    applyDispatch: async () => ({ success: false, error: 'x', refusal: 'despatch_quantity_mismatch', quantityMismatches: [{ sku: 'SKU-C', wmsQty: 4, imsQty: 3 }], despatchedQuantities: [{ sku: 'SKU-C', qty: 4 }] }),
+    recordRefusedAction: async (_c, refusal) => { refusals.push(refusal as never) },
+  }))
+  assert.deepEqual((refusals[0].intent as { despatched?: unknown }).despatched, [{ sku: 'SKU-C', qty: 4 }])
+})
+
+test('R1 LOW: a line on the ignore list never hides the SKU of a product IMS really books; the product SKU is added to the list', async () => {
+  // A VARIABLE line whose sku equals the booked product's sku: the warehouse units for that SKU are still compared.
+  const verdict = await findDespatchQuantityMismatch(
+    { orderId: 'o', wmsWarehouseId: null, wmsQuantities: [{ sku: 'SKU-C', qty: 4 }] },
+    client([simple('pc', 'SKU-C'), simple('pv', 'SKU-C', { product: { type: 'VARIABLE' } })], [shipmentOf('pc', 'SKU-C', 3)]),
+  )
+  assert.deepEqual(verdict, { status: 'MISMATCH', mismatches: [{ sku: 'SKU-C', wmsQty: 4, imsQty: 3 }] })
+  // A service line the warehouse lists under the PRODUCT's sku (not the line's) is ignored too.
+  const service = await findDespatchQuantityMismatch(
+    { orderId: 'o', wmsWarehouseId: null, wmsQuantities: [{ sku: 'SKU-C', qty: 3 }, { sku: 'FEE-PRODUCT', qty: 1 }] },
+    client([simple('pc', 'SKU-C'), { ...simple('pf', 'FEE-LINE', { product: { type: 'NON_INVENTORY', sku: 'FEE-PRODUCT' } as never }) }], [shipmentOf('pc', 'SKU-C', 3)]),
+  )
+  assert.deepEqual(service, { status: 'MATCH' })
+})
+
+test('R1 LOW: a stale lock date read raises its own readiness warning while the switch is effective', () => {
+  const warned = classifyDespatchDatePrerequisite({ switchOn: true, snapshotCronEnabled: true, effective: true, lockDateStale: true })
+  assert.equal(warned[0]?.id, 'wms-despatch-date:lock-date-stale')
+  assert.deepEqual(classifyDespatchDatePrerequisite({ switchOn: true, snapshotCronEnabled: true, effective: true, lockDateStale: false }), [])
+})

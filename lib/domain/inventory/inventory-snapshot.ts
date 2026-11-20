@@ -978,18 +978,23 @@ async function writeInventorySnapshotRun(
   } as never)
 }
 
-/** The whole daily snapshot runs in one transaction (state read to run row), so it may be long on a large estate. */
-const DAILY_SNAPSHOT_TRANSACTION_TIMEOUT_MS = 10 * 60_000
+/**
+ * The lock is held by a transaction that does NOTHING but hold it, for at most this long (the lock then falls away and the writes are unaffected). The
+ * snapshot's own writes go through the normal path with no transaction around them and no cap, so a long run never rolls back.
+ */
+const SNAPSHOT_LOCK_HOLD_MAX_MS = 4 * 60 * 60_000
 
 /**
- * THE DAILY SNAPSHOT HOLDS THE INVENTORY SNAPSHOT FLOOR LOCK (EXCLUSIVE) FROM BEFORE ITS STATE READ TO THE COMMIT OF ITS RUN ROW.
+ * THE DAILY SNAPSHOT AND A BACKDATED WAREHOUSE DESPATCH EXCLUDE EACH OTHER, but ONLY while the despatch-date switch is effective (switch on, snapshot cron on).
  *
  * A warehouse despatch backdated into a business day is floored by the latest `inventory_snapshot_runs` row (lib/domain/sales/despatch-instant.ts) and holds the
- * same lock SHARED while it reads that floor and commits its movement. So a despatch either commits BEFORE the snapshot reads its state (the snapshot waits for it
- * and includes it) or reads the floor AFTER the run row exists (and is moved past the snapshot's cutoff). Without this lock a 23:50 despatch committed between
- * the state read and the run row was missing from the snapshot and dated inside its day: every replay anchored on that snapshot overstated stock for ever.
+ * inventory snapshot floor lock SHARED while it reads that floor and commits its movement. While the switch is effective the snapshot holds the same lock
+ * EXCLUSIVE from before its state read to after its run row is written, so a despatch is wholly before the snapshot's read (the snapshot waits for it) or reads
+ * the new floor. Without this a 23:50 despatch committed between the state read and the run row was missing from the snapshot and dated inside its day.
  *
- * With an injected client (tests) the caller owns the transaction, as before.
+ * The lock is held by a dedicated transaction that only holds the lock; the snapshot itself runs on the normal client exactly as it always did (same writes,
+ * same batching, no time cap, a failure keeps the rows already written). With the switch OFF nothing here runs: no lock, no extra transaction, no cap. The run
+ * duration is recorded (activity log) when the lock was taken. With an injected client (tests) the caller owns everything, as before.
  */
 export async function writeDailyInventorySnapshot(options: {
   client?: SnapshotClient
@@ -997,10 +1002,43 @@ export async function writeDailyInventorySnapshot(options: {
   tolerance?: Decimal
 } = {}): Promise<InventorySnapshotWriteResult> {
   if (options.client) return writeDailyInventorySnapshotOn(options.client, options)
-  return db.$transaction(async (tx) => {
+  const { getWmsDespatchDateStatus } = await import('@/lib/domain/wms/despatch-flags')
+  if (!(await getWmsDespatchDateStatus()).effective) return writeDailyInventorySnapshotOn(db as SnapshotClient, options)
+
+  let release!: () => void
+  const mayRelease = new Promise<void>((resolve) => { release = resolve })
+  let acquired!: () => void
+  let failedToAcquire!: (error: unknown) => void
+  const lockTaken = new Promise<void>((resolve, reject) => { acquired = resolve; failedToAcquire = reject })
+  const holder = db.$transaction(async (tx) => {
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(${INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY})`
-    return writeDailyInventorySnapshotOn(tx as unknown as SnapshotClient, options)
-  }, { timeout: DAILY_SNAPSHOT_TRANSACTION_TIMEOUT_MS, maxWait: 60_000 })
+    acquired()
+    await mayRelease
+  }, { timeout: SNAPSHOT_LOCK_HOLD_MAX_MS, maxWait: 60_000 }).catch((error) => { failedToAcquire(error) })
+  await lockTaken
+  const startedAt = Date.now()
+  try {
+    return await writeDailyInventorySnapshotOn(db as SnapshotClient, options)
+  } finally {
+    release()
+    await holder
+    const durationMs = Date.now() - startedAt
+    console.info(`[inventory-snapshot] run took ${durationMs} ms (under the despatch floor lock)`)
+    try {
+      const { logActivity } = await import('@/lib/activity-log')
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'inventory_snapshot_duration',
+        tag: 'sync',
+        level: 'INFO',
+        description: `Daily inventory snapshot took ${Math.round(durationMs / 1000)} s while holding the despatch floor lock (despatches wait for it).`,
+        metadata: { durationMs },
+        resolveUser: false,
+      })
+    } catch (error) {
+      console.warn('[inventory-snapshot] could not record the run duration', error)
+    }
+  }
 }
 
 async function writeDailyInventorySnapshotOn(client: SnapshotClient, options: {

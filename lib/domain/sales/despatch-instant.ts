@@ -1,4 +1,5 @@
 import { startOfNextBusinessDay } from '@/lib/domain/inventory/inventory-snapshot'
+import { DESPATCH_LOCK_DATE_MAX_AGE_HOURS } from '@/lib/domain/wms/despatch-flags'
 import { INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY } from '@/lib/db/advisory-locks'
 
 /**
@@ -42,8 +43,7 @@ export const DESPATCH_BACKDATE_MAX_DAYS = 31
 /** How far ahead of our own clock a warehouse timestamp may be before it counts as FUTURE (clock skew between systems). */
 export const DESPATCH_FUTURE_TOLERANCE_MS = 5 * 60_000
 
-/** A stored accounting lock date older than this is not trusted to bound a backdate (the daily batch refreshes it before every post). */
-export const DESPATCH_LOCK_DATE_MAX_AGE_HOURS = 24
+export { DESPATCH_LOCK_DATE_MAX_AGE_HOURS }
 
 export type DespatchInstantAdjustment =
   | 'FUTURE'

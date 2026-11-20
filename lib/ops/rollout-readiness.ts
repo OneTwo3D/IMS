@@ -165,7 +165,17 @@ export function createDefaultRolloutReadinessAdapters(): RolloutReadinessAdapter
 
 /** A warning when `wms_despatch_date_enabled` is on but the daily inventory snapshot cron is off: the switch is then ignored. Exported for its test. */
 export function classifyDespatchDatePrerequisite(status: WmsDespatchDateStatus | null): RolloutReadinessFinding[] {
-  if (!status || !status.switchOn || status.snapshotCronEnabled) return []
+  if (!status || !status.switchOn) return []
+  if (status.snapshotCronEnabled) {
+    if (!status.lockDateStale) return []
+    return [{
+      id: 'wms-despatch-date:lock-date-stale',
+      severity: 'warning',
+      source: 'wms-despatch-date',
+      message: 'wms_despatch_date_enabled is on but the stored accounting lock date was last read more than 36 hours ago, so warehouse despatches are NOT backdated (they are dated at the moment IMS applies them) until the daily accounting batch refreshes it. Check the last accounting batch and the Xero connection.',
+      details: { lockDateStale: true },
+    }]
+  }
   return [{
     id: 'wms-despatch-date:snapshot-cron-disabled',
     severity: 'warning',
