@@ -54,6 +54,7 @@ export const APPLY_PRECONDITION_IDS = [
   'rail:base-currency',
   'rail:forbidden-skus',
   'rail:currency-lock',
+  'rail:stock-extract-age',
   'rail:warehouses',
   'rail:fx-rates',
   'rail:tax-rates',

@@ -172,7 +172,7 @@ test('[db] with no stock the first-seen completed order does NOT hold the sweep 
   // Stock arrives: the next pass books it.
   await db.stockLevel.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { quantity: new Prisma.Decimal('10') } })
   await db.costLayer.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { remainingQty: new Prisma.Decimal('10'), receivedQty: new Prisma.Decimal('10') } })
-  const booked = await retryOwedOutsideImsDespatches(20, live)
+  const booked = await retryOwedOutsideImsDespatches(20, live, new Date(Date.now() + 2 * 3_600_000))
   assert.equal(booked.booked >= 1, true, JSON.stringify(booked))
   assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { status: true } })).status, 'SHIPPED')
   assert.equal(Number((await db.stockLevel.findFirstOrThrow({ where: { productId: fx.productId, warehouseId: fx.warehouseId } })).quantity), 7)
@@ -191,7 +191,7 @@ test('[db] an owed despatch that never gets stock ends in a visible terminal sta
   const { openWcCompletionRefusalWhere } = await import('../../lib/domain/sales/wc-sync-row-families')
   const { retryOwedOutsideImsDespatches, OUTSIDE_IMS_DESPATCH_MAX_ATTEMPTS } = await import('../../lib/connectors/woocommerce/sync/outside-ims-despatch')
   const row = await db.shoppingSyncLog.findFirstOrThrow({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId }, select: { id: true, payload: true } })
-  await db.shoppingSyncLog.update({ where: { id: row.id }, data: { payload: { ...row.payload, occurrences: OUTSIDE_IMS_DESPATCH_MAX_ATTEMPTS } } })
+  await db.shoppingSyncLog.update({ where: { id: row.id }, data: { payload: { ...row.payload, retryAttempts: OUTSIDE_IMS_DESPATCH_MAX_ATTEMPTS } } })
   const out = await retryOwedOutsideImsDespatches(20, async () => ({ order: payload }))
   assert.equal(out.terminal >= 1, true, JSON.stringify(out))
   const after = await db.shoppingSyncLog.findFirstOrThrow({ where: { id: row.id }, select: { payload: true, errorMessage: true } })
@@ -283,13 +283,13 @@ test('[db] partial stock is owed, not permanent: the reservation is released, th
   // A first PARTIAL receipt (2 of 3 units): still owed.
   await db.stockLevel.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { quantity: new Prisma.Decimal('2') } })
   await db.costLayer.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { remainingQty: new Prisma.Decimal('2'), receivedQty: new Prisma.Decimal('2') } })
-  const partial = await retryOwedOutsideImsDespatches(20, live)
+  const partial = await retryOwedOutsideImsDespatches(20, live, new Date(Date.now() + 30 * 60_000))
   assert.equal(partial.stillOwed >= 1, true, JSON.stringify(partial))
   assert.equal(Number((await level()).reservedQty), 0)
   // Full stock: booked.
   await db.stockLevel.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { quantity: new Prisma.Decimal('10') } })
   await db.costLayer.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { remainingQty: new Prisma.Decimal('10'), receivedQty: new Prisma.Decimal('10') } })
-  const full = await retryOwedOutsideImsDespatches(20, live)
+  const full = await retryOwedOutsideImsDespatches(20, live, new Date(Date.now() + 2 * 3_600_000))
   assert.equal(full.booked >= 1, true, JSON.stringify(full))
   assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { status: true } })).status, 'SHIPPED')
   assert.equal(Number((await level()).quantity), 7)
@@ -395,4 +395,126 @@ test('[db] a refunded first-seen order is not cancelled, holds no allocation, is
   assert.equal(after.refundStatus, 'FULL')
   assert.notEqual(after.status, 'CANCELLED')
   assert.equal(await db.salesOrderRefund.count({ where: { orderId } }), 1)
+})
+
+const REFUSAL_PAYLOAD = async (env: Awaited<ReturnType<typeof load>>, orderId: string) => {
+  const { openWcCompletionRefusalWhere } = await import('../../lib/domain/sales/wc-sync-row-families')
+  return env.db.shoppingSyncLog.findFirstOrThrow({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId }, select: { id: true, payload: true } }) as Promise<{ id: string; payload: Any }>
+}
+
+test('[db] each retry attempt is counted exactly once, and the back-off reaches the 14-day age bound instead of giving up in hours', { skip }, async (t) => {
+  const env = await load()
+  const { importWcOrder } = env
+  const fx = await seed(env, 1)
+  t.after(() => cleanup(env, fx))
+  await withCutoff(env, t, CUTOFF)
+  const payload = wcOrder(fx, 'completed', 3, { date_completed_gmt: AFTER_CUTOFF })
+  const orderId = (await importWcOrder(payload, ADMITTED)).orderId as string
+  const first = await REFUSAL_PAYLOAD(env, orderId)
+  assert.equal(first.payload.occurrences, 1, 'the import recorded the partial-stock refusal once (the completion flow and the booking path share one count)')
+  const { retryOwedOutsideImsDespatches } = await import('../../lib/connectors/woocommerce/sync/outside-ims-despatch')
+  const live = async () => ({ order: payload })
+  const t0 = new Date(Date.parse(first.payload.firstRefusedAt) + 60_000)
+  const one = await retryOwedOutsideImsDespatches(20, live, t0)
+  assert.equal(one.stillOwed, 1, JSON.stringify(one))
+  const afterOne = await REFUSAL_PAYLOAD(env, orderId)
+  assert.equal(afterOne.payload.retryAttempts, 1, 'one attempt')
+  assert.equal(afterOne.payload.occurrences, 2, 'ONE more occurrence for the attempt (it was counted twice before: the completion flow and the booking path)')
+  assert.equal((await retryOwedOutsideImsDespatches(20, live, new Date(t0.getTime() + 60_000))).scanned, 0, 'not due again inside the back-off')
+  // Walk the clock: each pass runs when the row says it is next due. The stock never changes, so only the first pass is an attempt.
+  let now = t0
+  let passes = 1
+  const delays: number[] = []
+  for (; passes < 60; passes++) {
+    const row = await REFUSAL_PAYLOAD(env, orderId)
+    if (row.payload.terminal) break
+    const due = new Date(row.payload.nextAttemptAt)
+    delays.push(due.getTime() - now.getTime())
+    now = due
+    await retryOwedOutsideImsDespatches(20, live, now)
+  }
+  const done = await REFUSAL_PAYLOAD(env, orderId)
+  assert.equal(done.payload.terminal, true, 'reaches the terminal state')
+  const ageDays = (now.getTime() - Date.parse(done.payload.firstRefusedAt)) / 86_400_000
+  assert.ok(ageDays > 14 && ageDays < 16.1, `gave up at the 14-day age bound, not hours in: ${ageDays}`)
+  assert.ok(passes >= 14 && passes <= 22, `about 17 checks in 14 days, not 30 attempts in hours: ${passes}`)
+  assert.deepEqual(delays.slice(0, 3).map((ms) => ms / 60_000), [15, 60, 240], 'back off 15 minutes, 1 hour, 4 hours, then daily')
+  assert.equal(done.payload.retryAttempts, 1, 'unchanged stock made no further attempt')
+})
+
+test('[db] a retry with no stock level changed since the last attempt does not reserve, release, sync stock or log; a changed level does attempt', { skip }, async (t) => {
+  const env = await load()
+  const { db, Prisma, importWcOrder } = env
+  const fx = await seed(env, 1)
+  t.after(() => cleanup(env, fx))
+  await withCutoff(env, t, CUTOFF)
+  const payload = wcOrder(fx, 'completed', 3, { date_completed_gmt: AFTER_CUTOFF })
+  const orderId = (await importWcOrder(payload, ADMITTED)).orderId as string
+  const { retryOwedOutsideImsDespatches } = await import('../../lib/connectors/woocommerce/sync/outside-ims-despatch')
+  const live = async () => ({ order: payload })
+  const base = Date.now()
+  const at = (minutes: number) => new Date(base + minutes * 60_000)
+  const first = await retryOwedOutsideImsDespatches(20, live, at(1))
+  assert.equal(first.skipped, 0, 'the first retry has nothing to compare with: it attempts')
+  const logs = () => db.activityLog.count({ where: { entityId: orderId } })
+  const syncs = () => db.shoppingSyncLog.count({ where: { entityType: 'StockLevel', createdAt: { gte: new Date(base - 5000) } } })
+  const before = { logs: await logs(), syncs: await syncs(), row: (await REFUSAL_PAYLOAD(env, orderId)).payload }
+  const quiet = await retryOwedOutsideImsDespatches(20, live, at(30))
+  assert.equal(quiet.skipped, 1, JSON.stringify(quiet))
+  assert.equal(quiet.stillOwed, 1)
+  assert.equal(await logs(), before.logs, 'no activity rows on an unchanged retry')
+  assert.equal(await syncs(), before.syncs, 'no stock sync enqueued')
+  const after = (await REFUSAL_PAYLOAD(env, orderId)).payload
+  assert.equal(after.retryAttempts, before.row.retryAttempts, 'not counted as an attempt')
+  assert.equal(after.occurrences, before.row.occurrences)
+  // A stock level moves (a partial receipt): the next due check attempts again.
+  await db.stockLevel.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { quantity: new Prisma.Decimal('2') } })
+  await db.costLayer.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { remainingQty: new Prisma.Decimal('2'), receivedQty: new Prisma.Decimal('2') } })
+  const changed = await retryOwedOutsideImsDespatches(20, live, at(24 * 60))
+  assert.equal(changed.skipped, 0, JSON.stringify(changed))
+  assert.equal((await REFUSAL_PAYLOAD(env, orderId)).payload.retryAttempts, 2)
+})
+
+test('[db] a store order that is back to processing clears the outside-IMS fence with an audit entry; a cancelled or refunded one stays fenced', { skip }, async (t) => {
+  const env = await load()
+  const { db, importWcOrder } = env
+  const { REALLOCATION_SWEEP_SELECTION } = await import('../../lib/fulfillment/reallocation-sweep-selection')
+  const { retryOwedOutsideImsDespatches } = await import('../../lib/connectors/woocommerce/sync/outside-ims-despatch')
+  await (async () => {
+    const fx = await seed(env, 0)
+    t.after(() => cleanup(env, fx))
+    await withCutoff(env, t, CUTOFF)
+    for (const [status, reopened] of [['cancelled', false], ['refunded', false], ['processing', true]] as const) {
+      const one = await seed(env, 0)
+      t.after(() => cleanup(env, one))
+      const p = wcOrder(one, 'completed', 1, { date_completed_gmt: AFTER_CUTOFF })
+      const orderId = (await importWcOrder(p, ADMITTED)).orderId as string
+      assert.ok((await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { outsideImsFulfilmentAt: true } })).outsideImsFulfilmentAt, 'precondition: fenced')
+      const out = await retryOwedOutsideImsDespatches(20, async () => ({ order: { ...p, status, date_completed_gmt: null } }))
+      assert.equal(out.resolved >= 1, true, `${status}: ${JSON.stringify(out)}`)
+      const order = await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { outsideImsFulfilmentAt: true } })
+      assert.equal(order.outsideImsFulfilmentAt === null, reopened, `${status}: fence ${reopened ? 'cleared' : 'kept'}`)
+      const audit = await db.activityLog.count({ where: { entityId: orderId, action: 'wc_import_first_seen_outside_ims_fence_cleared' } })
+      assert.equal(audit, reopened ? 1 : 0, `${status}: audit entry`)
+      assert.equal(await db.salesOrder.count({ where: { id: orderId, ...REALLOCATION_SWEEP_SELECTION } }), reopened ? 1 : 0, `${status}: the allocation sweep ${reopened ? 'sees' : 'still ignores'} it`)
+    }
+  })()
+})
+
+test('[db] the retry query has a supporting partial index on the open completion-refusal rows', { skip }, async () => {
+  const env = await load()
+  const rows = await env.db.$queryRaw`SELECT indexdef FROM pg_indexes WHERE tablename = 'shopping_sync_logs' AND indexname = 'shopping_sync_logs_open_wc_completion_refusal_idx'` as Array<{ indexdef: string }>
+  assert.equal(rows.length, 1, 'the index exists')
+  assert.match(rows[0].indexdef, /WHERE/)
+  assert.match(rows[0].indexdef, /WC_COMPLETION_REFUSAL/)
+  assert.match(rows[0].indexdef, /QUARANTINED/)
+  // And the retry's own query is one the planner can serve from it (it states the plain conjuncts, not only the COALESCE form).
+  const { Prisma } = env
+  const { openWcCompletionRefusalRowSql, openWcCompletionRefusalIndexPredicateSql } = await import('../../lib/domain/sales/wc-sync-row-families')
+  const plan = await env.db.$transaction(async (tx: Any) => {
+    await tx.$executeRawUnsafe('SET LOCAL enable_seqscan = off')
+    return tx.$queryRaw(Prisma.sql`EXPLAIN SELECT "shopping_sync_logs".id FROM "shopping_sync_logs" JOIN "sales_orders" so ON so.id = "shopping_sync_logs"."entityId"
+      WHERE ${openWcCompletionRefusalRowSql()} AND ${Prisma.raw(openWcCompletionRefusalIndexPredicateSql('"shopping_sync_logs"'))}`)
+  }) as Array<Record<string, string>>
+  assert.match(plan.map((row) => Object.values(row)[0]).join('\n'), /shopping_sync_logs_open_wc_completion_refusal_idx/, 'the retry query uses the partial index')
 })

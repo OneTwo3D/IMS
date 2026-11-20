@@ -252,7 +252,7 @@ export const RUNNER_APPLICATION_NAME = 'ims-first-load-apply'
  *   crons            no scheduled job that could write is installed in the crontab of the account running the load.
  */
 export const RAIL_IDS = [
-  'quiesce', 'data-classes', 'base-currency', 'forbidden-skus', 'currency-lock', 'warehouses', 'fx-rates', 'tax-rates', 'outbound-grants', 'producer-hold', 'connectors', 'crons',
+  'quiesce', 'data-classes', 'base-currency', 'forbidden-skus', 'currency-lock', 'stock-extract-age', 'warehouses', 'fx-rates', 'tax-rates', 'outbound-grants', 'producer-hold', 'connectors', 'crons',
 ] as const
 export type RailId = (typeof RAIL_IDS)[number]
 

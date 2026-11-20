@@ -30,7 +30,12 @@ export type WcCompletionRefusalInput = {
   error: string
   /** The refusing delivery's `date_modified_gmt` (parsed), or null when it carried none. Fences later settlement by a stale event. */
   eventAt?: Date | null
+  /** false: refresh the row WITHOUT counting this call as another occurrence (the same refusal, recorded a second time by the booking path). Default true. */
+  countOccurrence?: boolean
 }
+
+/** The fields only the owed-despatch retry writes. A refusal re-record (a redelivery, the booking path) carries them over untouched. */
+const RETRY_STATE_KEYS = ['retryChecks', 'retryAttempts', 'lastAttemptAt', 'nextAttemptAt', 'stockSignature'] as const
 
 /** The instant of a WooCommerce delivery (`date_modified_gmt`, else `date_modified`), or null when unreadable. */
 export function wcEventInstant(order: { date_modified_gmt?: string; date_modified?: string }): Date | null {
@@ -50,11 +55,14 @@ export async function recordWcCompletionRefusal(input: WcCompletionRefusalInput)
       where: { ...openWcCompletionRefusalWhere(), entityId: input.orderId },
       select: { id: true, payload: true },
     })
-    const previous = existing?.payload as { firstRefusedAt?: string; occurrences?: number; refusedEventAt?: string | null } | null
+    const previous = existing?.payload as ({ firstRefusedAt?: string; occurrences?: number; refusedEventAt?: string | null } & Record<string, unknown>) | null
     // The fence keeps the NEWEST refusing event seen: a late redelivery of an older refusal must not move it back.
     const priorEvent = previous?.refusedEventAt ? new Date(previous.refusedEventAt) : null
     const eventAt = input.eventAt && (!priorEvent || input.eventAt > priorEvent) ? input.eventAt : priorEvent
+    const carried: Record<string, unknown> = {}
+    for (const key of RETRY_STATE_KEYS) if (previous && previous[key] !== undefined) carried[key] = previous[key]
     const payload = {
+      ...carried,
       externalOrderId: String(input.externalOrderId),
       wcStatus: input.wcStatus,
       refusal: input.refusal,
@@ -62,7 +70,7 @@ export async function recordWcCompletionRefusal(input: WcCompletionRefusalInput)
       firstRefusedAt: previous?.firstRefusedAt ?? now.toISOString(),
       lastRefusedAt: now.toISOString(),
       refusedEventAt: eventAt ? eventAt.toISOString() : null,
-      occurrences: (previous?.occurrences ?? 0) + 1,
+      occurrences: (previous?.occurrences ?? 0) + (input.countOccurrence === false && existing ? 0 : 1),
     }
     if (existing) {
       await tx.shoppingSyncLog.update({ where: { id: existing.id }, data: { payload, errorMessage: input.error } })

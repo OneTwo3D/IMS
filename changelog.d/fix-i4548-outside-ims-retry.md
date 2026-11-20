@@ -1,0 +1,7 @@
+### Owed first-seen despatch retry: real 14-day window, no churn, reopened orders unfenced (WooCommerce)
+- The retry of a despatch owed for want of stock now backs off (15 minutes, 1 hour, 4 hours, then daily) and counts each real attempt exactly once, so the 14-day bound is actually reached (it gave up after about 7.5 hours, about 3.75 hours with partial stock). The help-docs now say what the code does.
+- A retry with no stock level changed since the last attempt is skipped: no reserve/release, no stock syncs, no activity rows.
+- When the store shows an owed order back in processing / on hold / pending payment, the retry closes the entry and clears the "settled outside IMS" fence (audit entry `wc_import_first_seen_outside_ims_fence_cleared`), so the order can be allocated and sent from the warehouse. Cancelled and refunded orders stay fenced.
+- First-load apply: the 45-day extract-age check applies only until the cut-off is recorded (a resume or APPLIED verification is no longer refused for it), and a refusal is reported under its own rail `stock-extract-age` instead of `data-classes`.
+- Additive migration: a partial index on the open completion-refusal rows the retry scans.
+- Documented limits: `stockExtractedAt` is operator-typed and cannot be cross-checked (the stock files carry no extract time); WooCommerce exposes no status-change time, so a custom shipped/delivered status with no completion date falls back to the paid date.

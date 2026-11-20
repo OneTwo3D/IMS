@@ -419,6 +419,23 @@ export function openWcCompletionRefusalRowSql(): Prisma.Sql {
 }
 
 /**
+ * The open completion-refusal family as plain conjuncts, for the partial index the owed-despatch retry scans (migration 20261121130000) and for the
+ * retry query itself. The partial index is only used by a query whose WHERE visibly IMPLIES its predicate, and the TOTAL form above
+ * (`COALESCE(..., FALSE)`) hides that from the planner, so the retry states these conjuncts too. The migration contains this text verbatim
+ * (held by tests/prisma/wc-completion-refusal-open-index-migration.test.ts). `qualifier` prefixes the columns when the query joins another table.
+ */
+export function openWcCompletionRefusalIndexPredicateSql(qualifier = ''): string {
+  const col = (name: string): string => `${qualifier === '' ? '' : `${qualifier}.`}${name}`
+  return [
+    `${col('connector')} = 'woocommerce'`,
+    `${col('direction')} = 'FROM_CONNECTOR'`,
+    `${col('"entityType"')} = 'SalesOrder'`,
+    `${col('"recordKind"')} = '${WC_COMPLETION_REFUSAL_RECORD_KIND}'`,
+    `${col('status')} = '${WC_COMPLETION_REFUSAL_OPEN_STATUS}'`,
+  ].join('\n  AND ')
+}
+
+/**
  * The payload discriminator of the by-id ADMISSION-REFUSAL QUEUE (`order-admission.ts` re-exports it as
  * `WC_ADMISSION_REFUSAL_QUEUE`). It lives here, in the pure module, so the retention sweep can render the
  * family without importing a module that holds a database handle.
