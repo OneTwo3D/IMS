@@ -75,7 +75,7 @@ test('an invoice posted after London midnight on a quarter-end lands in the SAME
   assert.ok(xeroDate >= Q3.dateFrom && xeroDate <= Q3.dateTo)
 })
 
-test('the reverse: an order created after London midnight but posted before it cannot happen; a Q4 Xero date stays in Q4 whatever the post time', async () => {
+test('an order dated 1 October in Xero stays in Q4 however late it is posted', async () => {
   const order: Order = { externalCreatedAt: new Date('2026-09-30T23:10:00Z'), invoicedAt: new Date('2026-11-02T09:00:00Z'), tax: 8, net: 40 }
   assert.equal(salesInvoiceDocumentDay(order.externalCreatedAt!), '2026-10-01')
   assert.equal(Number((await run(Q3, deps({ orders: [order] }))).totals.salesTaxBase), 0)
