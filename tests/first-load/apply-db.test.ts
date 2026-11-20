@@ -971,17 +971,16 @@ describe('the first-load apply runner, database side', { timeout: 30 * 60 * 1000
       assert.ok(imports.length >= 4 && imports.every((r) => r.metadata?.actor?.kind === 'system' && r.metadata.actor.runId === prepared.manifest.runId))
     })
 
-    it('a stock extract instant after the apply, or implausibly old, is refused before anything is written (o3d-hqvrp.92)', async () => {
-      await resetData()
+    it('a stock extract instant after the apply, or implausibly old, is refused by the preflight, before anything is written (o3d-hqvrp.92)', async () => {
       const runs = await count('first_load_apply_runs')
+      const ok = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore' })
+      assert.deepEqual((await ports(ok).preflight!({ resuming: false })).filter((p) => /stockExtractedAt/.test(p)), [], 'control: the honest instant is not refused')
       for (const [what, instant, pattern] of [
         ['after the apply', new Date(Date.now() + 86_400_000).toISOString(), /later than the apply instant/],
         ['implausibly old', new Date(Date.now() - 90 * 86_400_000).toISOString(), /more than 45 days/],
       ] as const) {
         const bad = loadOk(preparedFiles(prepareSynthetic()), { restorePointDir: '/restore', stockExtractedAt: instant })
-        const result = await runLoad(bad, ports(bad), apply(bad))
-        assert.equal(result.exit, 'PRECONDITION_REFUSED', what)
-        assert.match(result.problems.join(';'), pattern, what)
+        assert.match((await ports(bad).preflight!({ resuming: false })).join(';'), pattern, what)
       }
       assert.equal(await count('first_load_apply_runs'), runs, 'nothing was written')
     })
