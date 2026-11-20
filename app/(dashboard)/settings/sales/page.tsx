@@ -102,7 +102,7 @@ export default async function SalesSettingsPage() {
           <h2 className="text-base font-semibold">Emails on the customer timeline</h2>
         </div>
         <p className="text-sm text-muted-foreground mb-4">
-          Show the emails IMS sent for a customer's orders on the customer page timeline.
+          Show the emails IMS sent for a customer&apos;s orders on the customer page timeline.
         </p>
         <CrmTimelineEmailsSetting currentValue={crmTimelineEmailsEnabled ?? 'false'} />
       </Card>
