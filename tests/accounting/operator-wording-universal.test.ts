@@ -614,6 +614,7 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/domain/sales/sales-invoice-update-sync.ts', prefix: 'An operator has taken this posting to settle it BY HAND', verdict: 'DESCRIPTION', why: 'states the claim state and the enqueue result' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'Compare it against IMS and correct it in Xero', verdict: 'CHECKS_FIRST', why: 'compares the Xero document with IMS first and alters nothing posted by IMS', count: 2 },
   { file: 'lib/domain/sales/sales-invoice-update-sync.ts', prefix: 'Only if it is absent: correct the invoice by hand', verdict: 'CHECKS_FIRST', why: 'conditional on the ledger check and forbids a re-post' },
+  { file: 'lib/connectors/mintsoft/sync/product-sync.ts', prefix: 'Fix the content in WooCommerce (a value Mintsoft will take)', verdict: 'NON_ACCOUNTING', why: 'PRODUCT_CONTENT_REFUSED discrepancy text: the operator corrects product content in WooCommerce or uses the IMS Reset button so the next product sync offers it to Mintsoft again; a warehouse product description/picture, nothing is posted to or read from a ledger' },
 ]
 
 test('[o3d-1e7sl Codex r17] every instruction site in the tree is guarded by construction or declared per sentence (verdict + justification), exactly (shrink-only)', () => {
