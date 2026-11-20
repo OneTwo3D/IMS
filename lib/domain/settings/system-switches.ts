@@ -85,6 +85,8 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   { key: WMS_MERGE_CANDIDATE_MODE_SETTING, kind: 'enum', allowed: WMS_MERGE_CANDIDATE_MODES, defaultValue: 'off' },
   booleanSwitch('wms_mixed_warehouse_push_enabled'),
   booleanSwitch('wms_sku_rename_remap_enabled'),
+  booleanSwitch('wms_despatch_date_enabled'),
+  booleanSwitch('wms_despatch_quantity_check_enabled'),
   booleanSwitch('wc_invoice_note_enabled'),
   booleanSwitch('wc_invoice_document_enabled'),
   booleanSwitch('wms_refund_remainder_task_enabled'),

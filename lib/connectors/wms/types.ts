@@ -439,6 +439,13 @@ export type WmsOrderStatus = {
   /** Deep link to the order in the WMS web UI, if available. */
   deepLinkUrl: string | null
   tracking: WmsOrderTracking[]
+  /**
+   * The order's line items (SKU + whole-unit qty) as the WMS holds them, when the record the connector already read carries them
+   * (no extra read is ever made for this). Undefined when it does not. For a despatched order these are the units that left; the dispatch
+   * sweep compares them with the units IMS books (lib/fulfillment/despatch-quantity-check.ts). Not read for a split order (its parts' own
+   * items are used) and not meaningful for a merged survivor (its lines mix several orders).
+   */
+  items?: Array<{ sku: string; qty: number }>
   /** Normalised "the goods have left the warehouse" flag — the connector decides the
    *  semantics from its own status names/tracking, so core dispatch reconciliation stays
    *  connector-agnostic. */

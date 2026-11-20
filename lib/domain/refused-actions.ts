@@ -30,6 +30,8 @@ export const REFUSED_ACTIONS = {
   WMS_ORDER_AMEND: { label: 'Order change not applied in the warehouse', gates: ['WMS_ORDER_NOT_NEW', 'WMS_AMEND_UNBUILDABLE', 'WMS_SCOPE_UNSENDABLE', 'WMS_MERGE_HELD'] },
   /** A warehouse despatch for a mixed-warehouse order that IMS could not apply because the part it sent no longer matches the order's allocation and shipments. */
   WMS_DESPATCH_SCOPE: { label: 'Despatch does not match the part sent to the warehouse', gates: ['WMS_SCOPE_MISMATCH'] },
+  /** A warehouse despatch held because the units it despatched differ (over or under) from the units IMS books. Closes when the order despatches. */
+  WMS_DESPATCH_QUANTITY: { label: 'Despatched units differ from what IMS books', gates: ['WMS_QUANTITY_MISMATCH'] },
   /** A split warehouse order that can never complete in IMS because a part was cancelled. */
   WMS_SPLIT_ORDER_COMPLETE: { label: 'Split order cannot complete', gates: ['WMS_SPLIT_PART_CANCELLED'] },
   /** An ASN create refused because the purchase order's (or the transfer's) supplier has no warehouse supplier mapped. An operator maps it on the connector's supplier mapping screen. */

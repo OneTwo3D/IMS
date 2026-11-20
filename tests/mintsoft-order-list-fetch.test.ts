@@ -989,3 +989,21 @@ test('[o3d-bjc.7] …but a real DespatchDate still outranks any grouping (physic
   const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT })
   assert.equal(out[0].dispatched, true, 'the goods demonstrably left')
 })
+
+// o3d-hqvrp.115: the despatched units come off the item rows the read already holds (no extra read), and "no item array" is unknown, never empty.
+test('[o3d-hqvrp.115] a row\'s OrderItems become the order status items (SKU + whole-unit qty); a row with no item array carries none', async () => {
+  const fetchMintsoftOrderList = await loadFetch()
+  statusResponder = () => DEFAULT_STATUSES
+  await resetStatusCache()
+  listCalls = []
+  listError = null
+  listResponder = (pageNo) => (pageNo === 1
+    ? [
+        row(1, { OrderItems: [{ SKU: 'SKU-C', Quantity: 4 }, { SKU: 'SKU-D', Quantity: 0 }, { SKU: '', Quantity: 2 }] }),
+        row(2),
+      ]
+    : [])
+  const out = await fetchMintsoftOrderList({ sinceLastUpdated: '2026-07-15T12:00:00', clientId: CLIENT, limit: 100 })
+  assert.deepEqual(out.find((o) => o.externalOrderId === '1')?.items, [{ sku: 'SKU-C', qty: 4 }])
+  assert.equal(out.find((o) => o.externalOrderId === '2')?.items, undefined)
+})

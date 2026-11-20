@@ -42,6 +42,7 @@ import {
 import { loadNettedRefundLines } from '@/lib/domain/sales/refund-demand-netting'
 import { UNCOMMITTED_SHIPMENT_STATUS } from '@/lib/domain/inventory/reservation-residual'
 import { withSavepoint } from '@/lib/db/savepoint'
+import { loadDespatchInstantFloors, resolveDespatchInstant, type DespatchInstantResolution } from '@/lib/domain/sales/despatch-instant'
 import { isStockTrackedProductType } from '@/lib/domain/inventory/backorder-policy'
 
 export const SHIPMENT_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
@@ -94,6 +95,8 @@ export type ShipmentTransitionResult =
       reconciliation?: ShipmentReconciliationResult
       /** The order status found under the lock when a warehouse-reported dispatch was recorded against an unreleased order. */
       despatchedWhileNotReady?: string
+      /** Present on a dispatch: the instant it was booked at, the instant the warehouse reported (when it did), and why they differ. */
+      despatchInstant?: DespatchInstantResolution
     }
 
 /**
@@ -1136,6 +1139,12 @@ export async function transitionShipmentStatus(
      * `completion`. Never set by an in-app dispatch, which refuses those statuses.
      */
     allowRecordWhenNotReady?: boolean
+    /**
+     * A WAREHOUSE-reported dispatch: when the goods left, as the warehouse said. The dispatch is booked at this instant (bounded: see
+     * resolveDespatchInstant) instead of the moment this runs, on the shipment, the stock movement, its COGS entries and the order flip alike.
+     * Absent: booked now, as for every in-app dispatch.
+     */
+    despatchedAt?: Date | null
   },
 ): Promise<ShipmentTransitionResult> {
   const { shipmentId, targetStatus, extra } = input
@@ -1165,7 +1174,11 @@ export async function transitionShipmentStatus(
   if (extra?.shippingService) data.shippingService = extra.shippingService
 
   if (targetStatus === 'SHIPPED') {
-    data.shippedAt = new Date()
+    // Only a warehouse-reported despatch time changes how the dispatch is dated. Without one (every in-app dispatch, and a warehouse despatch
+    // while the dating switch is off) the dates are taken exactly as they always were: shippedAt before the transaction, the movement and COGS
+    // createdAt from the column default, the order flip's own clock.
+    const datedByDespatch = Boolean(input.despatchedAt)
+    if (!datedByDespatch) data.shippedAt = new Date()
 
     const dispatchResult = await runInTransaction(client, async (tx) => {
       await lockSalesOrder(tx, shipment.orderId)
@@ -1321,6 +1334,17 @@ export async function transitionShipmentStatus(
 
       const lockedProductIds = [...new Set(lockedShipment.lines.map((line) => line.productId))]
 
+      // The instant this dispatch is booked at, read under the order lock: ONE instant for the shipment, the stock movement, its COGS entries and
+      // the order flip (see lib/domain/sales/despatch-instant.ts). With no warehouse-reported time it is simply now, as it always was.
+      const despatchInstant = resolveDespatchInstant({
+        requested: input.despatchedAt ?? null,
+        now: new Date(),
+        floors: input.despatchedAt
+          ? await loadDespatchInstantFloors(tx, { orderId: lockedShipment.orderId, lineIds: [...new Set(lockedShipment.lines.map((line) => line.lineId))] })
+          : undefined,
+      })
+      if (datedByDespatch) data.shippedAt = despatchInstant.instant
+
       await markWmsScopeDirtyInTx(tx, lockedShipment.orderId)
       await tx.shipment.update({ where: { id: shipmentId }, data })
       const updatedShipment = await loadShipmentTransitionContext(tx, shipmentId)
@@ -1347,6 +1371,8 @@ export async function transitionShipmentStatus(
               referenceId: lockedShipment.orderId,
               shipmentLineId: line.id,
               idempotencyKey,
+              // Booked at the despatch instant, so every ledger, as-of valuation and snapshot replay windows it with the shipment.
+              ...(datedByDespatch ? { createdAt: despatchInstant.instant } : {}),
             },
             select: { id: true },
           }))
@@ -1388,7 +1414,7 @@ export async function transitionShipmentStatus(
         })
         if (consumed.length > 0) {
           await tx.cogsEntry.createMany({
-            data: consumed.map((entry) => cogsEntryDataFromConsumed(movement.id, entry)),
+            data: consumed.map((entry) => ({ ...cogsEntryDataFromConsumed(movement.id, entry), ...(datedByDespatch ? { createdAt: despatchInstant.instant } : {}) })),
           })
           // Decorate the dispatch snapshot with its order allocation (one per
           // line+warehouse+product) so the Group B daily batch can relieve the
@@ -1441,7 +1467,7 @@ export async function transitionShipmentStatus(
       let reconciliation: ShipmentReconciliationResult | undefined
       if (input.completion && !lockedNotReady) {
         const outcome = await promoteOrderIfFulfilledInTx(
-          tx, lockedShipment.orderId, extra, input.completion,
+          tx, lockedShipment.orderId, extra, datedByDespatch ? { ...input.completion, shippedAt: despatchInstant.instant } : input.completion,
         )
         reconciliation = await reconciliationResultFor(tx, lockedShipment.orderId, outcome)
       }
@@ -1452,6 +1478,7 @@ export async function transitionShipmentStatus(
         stockSyncProductIds: lockedProductIds,
         reconciliation,
         despatchedWhileNotReady: lockedNotReady && withdrawn ? String(withdrawn.status) : undefined,
+        ...(datedByDespatch ? { despatchInstant } : {}),
       }
     })
 
@@ -1469,6 +1496,7 @@ export async function transitionShipmentStatus(
       stockSyncProductIds: dispatchResult.stockSyncProductIds,
       ...(dispatchResult.reconciliation ? { reconciliation: dispatchResult.reconciliation } : {}),
       ...(dispatchResult.despatchedWhileNotReady ? { despatchedWhileNotReady: dispatchResult.despatchedWhileNotReady } : {}),
+      ...(dispatchResult.despatchInstant ? { despatchInstant: dispatchResult.despatchInstant } : {}),
     }
   }
 
@@ -1565,6 +1593,8 @@ type OrderPromotionOptions = {
   completionAuthority?: OrderCompletionAuthority
   storefrontCompletion?: boolean
   fence?: (tx: ShipmentServiceClient) => Promise<string | null>
+  /** The instant the order is flipped to SHIPPED at (the dispatch's own instant); absent: now. */
+  shippedAt?: Date
 }
 
 /**
@@ -1669,7 +1699,7 @@ export async function promoteOrderIfFulfilledInTx(
     const promotion = resolveShippedPromotion(currentOrder.status as SalesOrderStatus)
     if (!promotion.success) throw new Error(promotion.error)
     if (promotion.viaAllocated) promotedFromStatus = currentOrder.status
-    const shippedAt = new Date()
+    const shippedAt = options?.shippedAt ?? new Date()
     await tx.salesOrder.update({
       where: { id: orderId },
       data: {
