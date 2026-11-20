@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   checkWcStoreCreditReconciles,
+  wcRoundedTaxByRate,
   classifyWcCouponLines,
   describeWcCouponRefusal,
   planWcOrderCoupons,
@@ -463,8 +464,40 @@ test('ROUND TAX AT SUBTOTAL: unrounded line taxes that sum half a penny off the 
   // 0.665 x 3 = 1.995 tax: components 9.99 + 1.995 + 1.00 + 0.20 = 13.185, Woo rounds the total to 13.19 (a half-penny gap); and 13.18 the other way.
   const half = { ...base, taxForeign: toDecimal('2.195') }
   assert.equal(checkWcStoreCreditReconciles({ ...half, storeCreditForeign: toDecimal(0), orderTotalForeign: toDecimal('13.19'), shortfallOnly: true }).ok, true)
-  assert.equal(checkWcStoreCreditReconciles({ ...half, storeCreditForeign: toDecimal(2), orderTotalForeign: toDecimal('11.19') }).ok, true, 'credit order, total rounded up')
-  assert.equal(checkWcStoreCreditReconciles({ ...half, storeCreditForeign: toDecimal(2), orderTotalForeign: toDecimal('11.18') }).ok, true, 'credit order, total rounded down')
+  assert.equal(checkWcStoreCreditReconciles({ ...half, storeCreditForeign: toDecimal(2), orderTotalForeign: toDecimal('11.19') }).ok, true, 'credit order, total rounded up (WooCommerce rounds half up)')
+  // EXACT, not a half-unit allowance: at an exact x.xx5 WooCommerce rounds UP, so the total is 13.19 / 11.19 and nothing else. A total a penny lower is money taken off by a means IMS cannot see (or a
+  // credit counted twice) and is refused; the old half-unit tolerance accepted it ([mutation: restore tolerance = minorUnit / 2 for an unrounded tax: red]).
+  assert.equal(checkWcStoreCreditReconciles({ ...half, storeCreditForeign: toDecimal(2), orderTotalForeign: toDecimal('11.18') }).ok, false, 'credit order: a penny under the half-up total is refused')
+  assert.equal(checkWcStoreCreditReconciles({ ...half, storeCreditForeign: toDecimal(0), orderTotalForeign: toDecimal('13.18'), shortfallOnly: true }).ok, false, 'no credit: a hidden one-penny shortfall at an exact .xx5 is refused')
+})
+
+test('ROUND TAX AT SUBTOTAL, MULTI-RATE: tax is rounded per rate (items, then shipping) as WooCommerce does, so an honest two-rate order with shipping tax reconciles; an unprovable one stays refused', () => {
+  // 20% on 3.33 (0.666) and 5% on 3.33 (0.1665) items, shipping 1.00 at 20% (0.20) and... per-rate items: 0.666 -> 0.67, 0.1665 -> 0.17; shipping 0.20. Order tax 1.04, not the single rounded sum 1.0325 -> 1.03.
+  const order = {
+    line_items: [
+      { total: '3.33', total_tax: '0.666', taxes: [{ id: 1, total: '0.666' }] },
+      { total: '3.33', total_tax: '0.1665', taxes: [{ id: 2, total: '0.1665' }] },
+    ],
+    fee_lines: [],
+    shipping_lines: [{ total: '1.00', total_tax: '0.20', taxes: [{ id: 1, total: '0.20' }] }],
+    tax_lines: [
+      { id: 10, rate_id: 1, rate_code: 'A', label: 'A', compound: false, tax_total: '0.67', shipping_tax_total: '0.20' },
+      { id: 11, rate_id: 2, rate_code: 'B', label: 'B', compound: false, tax_total: '0.17', shipping_tax_total: '0.00' },
+    ],
+  } as unknown as Parameters<typeof wcRoundedTaxByRate>[0]
+  const reported = wcReportedOrderAmounts(order)
+  const rounded = wcRoundedTaxByRate(order, 'GBP')
+  assert.equal(num(rounded!), 1.04)
+  const base = { subtotalForeign: reported.goodsNet, taxForeign: reported.tax, shippingForeign: reported.shipping, orderLevelDiscountForeign: toDecimal(0), storeCreditForeign: toDecimal(0), currency: 'GBP' }
+  // 6.66 + 1.00 + 1.04 = 8.70. Without the per-rate figure the single rounded sum (1.0325 -> 1.03) is a penny out and the honest order is refused.
+  assert.equal(checkWcStoreCreditReconciles({ ...base, orderTotalForeign: toDecimal('8.70') }).ok, false, 'single-figure rule refuses the honest multi-rate total')
+  assert.equal(checkWcStoreCreditReconciles({ ...base, roundedTaxForeign: rounded, orderTotalForeign: toDecimal('8.70') }).ok, true)
+  assert.equal(checkWcStoreCreditReconciles({ ...base, roundedTaxForeign: rounded, orderTotalForeign: toDecimal('8.69') }).ok, false, 'and a penny short is still refused')
+  // A tax line that disagrees with the lines (or a line whose taxes are not attributed) proves nothing: null, so the caller keeps the single-figure rule.
+  const tampered = { ...order, tax_lines: [{ ...(order.tax_lines[0]!), tax_total: '0.69' }, order.tax_lines[1]!] } as typeof order
+  assert.equal(wcRoundedTaxByRate(tampered, 'GBP'), null)
+  const unattributed = { ...order, line_items: [{ total: '3.33', total_tax: '0.666', taxes: [] }] } as unknown as typeof order
+  assert.equal(wcRoundedTaxByRate(unattributed, 'GBP'), null)
 })
 
 test('ROUND TAX AT SUBTOTAL: a whole penny is still refused, and rounded taxes keep the quarter-penny rule', () => {

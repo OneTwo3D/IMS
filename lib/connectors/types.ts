@@ -234,6 +234,11 @@ export type InvoiceData = {
    */
   discountTaxType?: string
   /**
+   * The order-level discount split by tax code, when its tax was apportioned across the lines' rates: the connector posts one negative discount line per part (same account) instead of one at
+   * `discountTaxType`. The amounts add up to `discountAmount`. Absent = the single line, exactly as before.
+   */
+  discountParts?: Array<{ amount: number; taxType?: string }>
+  /**
    * When true, unit amounts on all lines (products, shipping, discount) are
    * treated as tax-inclusive by the accounting system. Defaults to exclusive.
    * Each connector maps this to its own native flag.

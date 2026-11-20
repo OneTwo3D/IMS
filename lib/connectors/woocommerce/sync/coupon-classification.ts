@@ -528,9 +528,20 @@ export function checkWcStoreCreditReconciles(input: {
    * see) fails; a higher total is not credit-shaped and is left to the existing document checks.
    */
   shortfallOnly?: boolean
+  /** The tax as WooCommerce rounds it with "round tax at subtotal" (wcRoundedTaxByRate): used instead of the unrounded `taxForeign` when that carries more decimals than the currency's minor unit. */
+  roundedTaxForeign?: Decimal | null
 }): { ok: true } | { ok: false; difference: Decimal; tolerance: Decimal } {
+  // "ROUND TAX AT SUBTOTAL" (WooCommerce > Tax): the line and shipping taxes are reported UNROUNDED and WooCommerce rounds the tax only when it totals the order. A tax figure with more decimals than
+  // the currency's minor unit is the evidence. The honest total is then reproduced EXACTLY, not allowed a half-unit of slack (which hid a one-minor-unit shortfall at an exact x.xx5, and a credit
+  // that is also inside the lines): the tax is rounded the way WooCommerce rounds it (half up, per rate for items and for shipping when the per-rate figures are known, else the summed figure), and the
+  // comparison stays the strict quarter-unit one that absorbs only the four-decimal storage.
+  const minorUnit = toDecimal(10).pow(-currencyMinorUnits(input.currency))
+  const taxUnrounded = input.taxForeign.decimalPlaces() > currencyMinorUnits(input.currency)
+  const tax = taxUnrounded
+    ? (input.roundedTaxForeign ?? roundQuantity(input.taxForeign, currencyMinorUnits(input.currency)))
+    : input.taxForeign
   const expected = input.subtotalForeign
-    .add(input.taxForeign)
+    .add(tax)
     .add(input.shippingForeign)
     .sub(input.orderLevelDiscountForeign)
     .sub(input.storeCreditForeign)
@@ -541,15 +552,9 @@ export function checkWcStoreCreditReconciles(input: {
   // minor unit could not be told apart from a credit of one or two minor units that is ALSO already in the
   // line totals (it would be subtracted twice and land inside the allowance), which sends the warehouse a
   // reduced goods value. An order that is genuinely a minor unit out is refused for an operator to look at.
-  const minorUnit = toDecimal(10).pow(-currencyMinorUnits(input.currency))
-  // "ROUND TAX AT SUBTOTAL" (WooCommerce > Tax): the line and shipping taxes are reported UNROUNDED and only the order's total tax is rounded, once. The components
-  // then sum to a figure that sits up to HALF a minor unit from the total Woo reports, which the quarter-unit tolerance refused (an honest order, or one with no
-  // credit at all). That is evidenced by the tax itself: a tax figure with more decimals than the currency's minor unit. Then, and only then, the allowance is half a
-  // minor unit (inclusive: a total that rounded up from exactly x.xx5 is that far out); a whole minor unit, a credit that is also inside the lines, is still refused.
-  const taxUnrounded = input.taxForeign.decimalPlaces() > currencyMinorUnits(input.currency)
-  const tolerance = taxUnrounded ? minorUnit.div(2) : minorUnit.div(4)
+  const tolerance = minorUnit.div(4)
   const gap = input.shortfallOnly ? difference : difference.abs()
-  const within = taxUnrounded ? gap.lte(tolerance) : gap.lt(tolerance)
+  const within = gap.lt(tolerance)
   return within ? { ok: true } : { ok: false, difference, tolerance }
 }
 
@@ -583,4 +588,53 @@ export function wcReportedOrderAmounts(order: Pick<WcFullOrder, 'line_items' | '
     tax = addMoney(tax, money(sh.total_tax))
   }
   return { goodsNet, tax, shipping }
+}
+
+/**
+ * The order's tax the way WooCommerce totals it with "round tax at subtotal": the item and fee taxes of each rate are summed and rounded (half up) once, the shipping taxes of each rate likewise, and
+ * the order's tax is the sum of those rounded figures. Null unless that can be PROVEN from the order's own data: every taxed line names its per-rate taxes, they add up to the line's tax, and the
+ * rounded per-rate figures equal the order's `tax_lines` (tax_total and shipping_tax_total) to within the quarter-unit storage noise. Anything it cannot prove stays null, and the caller keeps the
+ * single-figure rule; a multi-rate or shipping-tax order it cannot attribute is then still refused for an operator to look at.
+ */
+export function wcRoundedTaxByRate(order: Pick<WcFullOrder, 'line_items' | 'fee_lines' | 'shipping_lines' | 'tax_lines'>, currency: string): Decimal | null {
+  const minorUnits = currencyMinorUnits(currency)
+  const quarter = toDecimal(10).pow(-minorUnits).div(4)
+  const items = new Map<number, Decimal>()
+  const shipping = new Map<number, Decimal>()
+  const fold = (lines: ReadonlyArray<{ total_tax?: unknown; taxes?: ReadonlyArray<{ id: number; total: string }> }> | undefined, into: Map<number, Decimal>): boolean => {
+    for (const line of lines ?? []) {
+      const lineTax = parseMoney(line.total_tax) ?? toDecimal(0)
+      const taxes = line.taxes ?? []
+      let sum = toDecimal(0)
+      for (const t of taxes) {
+        const amount = parseMoney(t.total)
+        if (amount === null || typeof t.id !== 'number') return false
+        sum = addMoney(sum, amount)
+        into.set(t.id, addMoney(into.get(t.id) ?? toDecimal(0), amount))
+      }
+      if (taxes.length === 0 ? !lineTax.isZero() : sum.sub(lineTax).abs().gt(toDecimal('0.000001'))) return false
+    }
+    return true
+  }
+  if (!fold(order.line_items, items) || !fold(order.fee_lines, items) || !fold(order.shipping_lines, shipping)) return null
+  const taxLines = order.tax_lines ?? []
+  const rounded = (value: Decimal): Decimal => roundQuantity(value, minorUnits)
+  // Every rate named by a tax line must agree with the figures derived from the lines, and every derived rate must have its tax line.
+  const claimedItems = new Set<number>()
+  const claimedShipping = new Set<number>()
+  for (const line of taxLines) {
+    const reportedItems = parseMoney(line.tax_total)
+    const reportedShipping = parseMoney(line.shipping_tax_total)
+    if (reportedItems === null || reportedShipping === null || typeof line.rate_id !== 'number') return null
+    if (rounded(items.get(line.rate_id) ?? toDecimal(0)).sub(reportedItems).abs().gt(quarter)) return null
+    if (rounded(shipping.get(line.rate_id) ?? toDecimal(0)).sub(reportedShipping).abs().gt(quarter)) return null
+    claimedItems.add(line.rate_id)
+    claimedShipping.add(line.rate_id)
+  }
+  for (const [rateId, amount] of items) if (!claimedItems.has(rateId) && !amount.isZero()) return null
+  for (const [rateId, amount] of shipping) if (!claimedShipping.has(rateId) && !amount.isZero()) return null
+  let total = toDecimal(0)
+  for (const amount of items.values()) total = addMoney(total, rounded(amount))
+  for (const amount of shipping.values()) total = addMoney(total, rounded(amount))
+  return total
 }

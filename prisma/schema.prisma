@@ -2154,6 +2154,10 @@ model SalesOrder {
   // DELETES the sync log, so all three can vanish while a real Xero invoice stands. This column is
   // the only statement about that moment that nothing prunes.
   discountRestatement Json?         @map("discount_restatement")
+  /// The order discount's tax split by line rate, written ONLY when a manual order was priced with `sales_order_discount_tax_apportion_enabled` on (the discount taxed at its lines' rates, not the header rate):
+  /// an array of { taxRateId, accountingTaxType, reverseCharge, rate, netForeign, taxForeign, netBase, taxBase } (lib/domain/sales/discount-tax-split.ts). NULL on every other order, which keeps the header-rate treatment the invoice, the refund and the VAT report already apply.
+  /// It is what the Xero invoice, the reconciliation, the refund reversal and the VAT report read, so they all agree with the tax stored on the order. Additive; never backfilled.
+  discountTaxSplit    Json?         @map("discount_tax_split")
   /// THE EU VAT REGIME STAMP (lib/domain/accounting/eu-vat-regime-stamp.ts). Decided once, from the facts and the order-date exchange rate, and never re-derived: a credit note
   /// reads these columns instead of deciding again, so a later rate cannot move an order from one regime to the other.
   /// `euVatRegimeStampedAt` is set by every successful decision and is the "decided" marker; the regime is NULL on an order that was decided to be outside the scheme
@@ -2984,6 +2988,8 @@ model SalesOrderRefundLine {
   chargedTaxForeign Decimal? @db.Decimal(18, 4) @map("charged_tax_foreign")
   /// The VAT rate (a fraction, 0.2 = 20%) of the line's tax code AT THE MOMENT THE REFUND WAS CREATED, for every refund (schemeTaxRateValue above is the scheme-only freeze and marks a refund as a scheme one, so it cannot carry this). The credit-note history shows VAT and gross from this, so editing a tax mapping afterwards cannot change what a posted credit note displays. NULL when the code could not be priced then and on every older row: the display falls back to the current table and says the figure is estimated.
   postedTaxRate Decimal? @db.Decimal(9, 6) @map("posted_tax_rate")
+  /// On an order-level DISCOUNT reversal of an order whose discount tax was apportioned across its line rates (SalesOrder.discountTaxSplit): the tax rate whose share of the discount this line reverses. NULL on every other line.
+  discountTaxRateId String? @map("discount_tax_rate_id")
 
   refund          SalesOrderRefund @relation(fields: [refundId], references: [id])
   salesOrderLine  SalesOrderLine?  @relation(fields: [salesOrderLineId], references: [id], onDelete: SetNull)

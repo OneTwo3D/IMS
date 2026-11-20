@@ -24,6 +24,7 @@
  * Pure numbers, no database or Decimal runtime: the order page (a client component), the PDFs and the refund dialog all read this.
  */
 import { orderDiscountReversal, refundableNet } from '@/lib/domain/sales/refund-line-net'
+import { planSplitDiscountReversal, type DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
 import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basis'
 
 // decimal-boundary-ok: display-only (these are rendering figures, rounded to the minor unit; the stored Decimals are never written back from them)
@@ -154,7 +155,7 @@ export function lineVatRate(line: Pick<MoneyViewLine, 'totalForeign' | 'taxForei
 }
 
 /** An earlier refund line against an order line, as stored. */
-export type PriorRefundLine = { salesOrderLineId: string | null; qty: number; totalForeign: number; totalBase: number; lineKind?: string | null }
+export type PriorRefundLine = { salesOrderLineId: string | null; qty: number; totalForeign: number; totalBase: number; lineKind?: string | null; discountTaxRateId?: string | null }
 
 /**
  * What refunding `qty` units of an order line credits: cut from what the line has LEFT (the same function the refund service runs under
@@ -203,8 +204,8 @@ export function buildRefundRequest(
     currencyMinorUnits?: number
     priorRefundLines?: ReadonlyArray<PriorRefundLine>
     /** The order's discount (its own convention) so the preview includes the share the server reverses. */
-    discount?: { amount: number; amountsIncludeVat: boolean }
-    lines: ReadonlyArray<MoneyViewLine & { id: string; productId: string | null; description: string; totalBase?: number }>
+    discount?: { amount: number; amountsIncludeVat: boolean; /** The discount's tax split by line rate (an order priced with the apportionment on): the reversal is then cut and taxed per rate, as the server does. */ split?: ReadonlyArray<DiscountTaxSplitEntry> | null }
+    lines: ReadonlyArray<MoneyViewLine & { id: string; productId: string | null; description: string; totalBase?: number; taxRateId?: string | null }>
   },
   selections: ReadonlyArray<RefundSelection>,
 ): {
@@ -233,7 +234,25 @@ export function buildRefundRequest(
   }
   // The share of the order discount the server reverses, from the same function it uses under the lock.
   let discountReversal: RefundAmounts = { net: 0, vat: 0, gross: 0 }
-  if (order.discount && order.discount.amount > 0) {
+  if (order.discount && order.discount.amount > 0 && order.discount.split && order.discount.split.length > 0) {
+    const prior = order.priorRefundLines ?? []
+    const fx = order.fxRateToBase
+    const refundedNetByLine = new Map(lines.map((l) => [l.lineId, l.totalForeign]))
+    const plan = planSplitDiscountReversal({
+      split: order.discount.split,
+      lines: order.lines.map((l) => ({ id: l.id, taxRateId: l.taxRateId ?? null, totalForeign: l.totalForeign })),
+      refundedNetByLine,
+      prior: prior.map((p) => ({ lineKind: p.lineKind ?? null, salesOrderLineId: p.salesOrderLineId, discountTaxRateId: p.discountTaxRateId ?? null, totalForeign: p.totalForeign, totalBase: p.totalBase })),
+      fxRateToBase: fx,
+      minorUnits: order.currencyMinorUnits ?? 2,
+      reversal: (r) => orderDiscountReversal({ discountAmount: r.discountNet, amountsIncludeVat: false, vatRate: 0, orderSaleNet: r.orderSaleNet, priorSaleNet: r.priorSaleNet, priorDiscountForeign: r.priorDiscountForeign, priorDiscountBase: r.priorDiscountBase, refundedSaleNet: r.refundedSaleNet, fxRateToBase: fx, minorUnits: order.currencyMinorUnits ?? 2 }),
+    })
+    const parts = plan.map((part) => {
+      const credit = creditAmounts(part.foreign, part.entry.reverseCharge ? 0 : part.entry.rate)
+      return { net: -credit.net, vat: -credit.vat, gross: -credit.gross }
+    })
+    discountReversal = sumRefundAmounts(parts)
+  } else if (order.discount && order.discount.amount > 0) {
     const prior = order.priorRefundLines ?? []
     const reversal = orderDiscountReversal({
       discountAmount: order.discount.amount,

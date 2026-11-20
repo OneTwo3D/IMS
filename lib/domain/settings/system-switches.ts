@@ -70,6 +70,9 @@ const PARENT_SKU_DELETE_NEEDS_PARITY = {
   why: 'deleting a parent SKU does nothing unless product parity is also on',
 }
 
+// The reader is prepareSalesOrderWrite in app/actions/sales.ts (a literal there too, pinned by tests/domain/sales/sales-order-write-model.test.ts).
+export const SALES_DISCOUNT_APPORTION_KEY = 'sales_order_discount_tax_apportion_enabled'
+
 // Literals for the same reason; tests/settings-cli.test.ts holds them equal to lib/domain/storefront-customer-email/constants.ts.
 export const STOREFRONT_EMAIL_SWITCH_KEY = 'storefront_customer_email_enabled'
 export const STOREFRONT_EMAIL_ENABLED_AT_KEY = 'storefront_customer_email_enabled_at'
@@ -77,6 +80,8 @@ export const STOREFRONT_EMAIL_ENABLED_AT_KEY = 'storefront_customer_email_enable
 export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   booleanSwitch('trackship_refire_enabled'),
   booleanSwitch('wc_withdrawal_outcome_enabled'),
+  // The order discount of a manual order is taxed at its lines' rates (and the invoice, refund and VAT report follow). ADMIN: it changes the tax IMS stores on new orders and the lines it posts to the LIVE ledger. Off keeps the header-rate treatment byte for byte.
+  booleanSwitch(SALES_DISCOUNT_APPORTION_KEY, undefined, true),
   booleanSwitch('mintsoft_product_parity_enabled'), // wms-connector-boundary-ok: 2026-11-19: operator switch registry names the setting key, as the owning connector does
   booleanSwitch('mintsoft_parent_sku_delete_enabled', [PARENT_SKU_DELETE_NEEDS_PARITY]), // wms-connector-boundary-ok: 2026-11-19: operator switch registry names the setting key
   booleanSwitch('wms_merge_hold_enabled', [

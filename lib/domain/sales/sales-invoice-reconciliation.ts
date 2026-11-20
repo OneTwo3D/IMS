@@ -31,6 +31,11 @@ export type ReconcilableInvoice = {
   /** As sent: gross when `lineAmountsIncludeTax`, else net. */
   shippingAmount?: number | null
   discountAmount?: number | null
+  /**
+   * The order discount as the invoice posts it when its tax was apportioned across the line rates: one amount per tax code, each with the rate of the code it is SENT on (null when no rate is
+   * known for it: the header rate then). When present the discount's VAT is the sum over the parts, not `discountAmount` at one rate; `discountAmount` stays the total the parts add up to.
+   */
+  discountParts?: ReadonlyArray<{ amount: number; rate: number | null }>
 }
 
 /**
@@ -59,7 +64,10 @@ export function expectedLedgerTotal(invoice: ReconcilableInvoice): number {
   // Inclusive: every amount already carries its tax, so the document books to the sum of what it sends whatever the codes are.
   if (invoice.lineAmountsIncludeTax) return netLines.reduce((t, n) => t + n, 0) + shipping - discount
   const lines = invoice.lines.reduce((t, l, i) => t + netLines[i]! + (l.rate === null ? l.storedTax : netLines[i]! * l.rate), 0)
-  return lines + shipping * (1 + (invoice.shippingRate ?? invoice.headerRate)) - discount * (1 + (invoice.discountRate ?? invoice.headerRate))
+  const discountWithTax = invoice.discountParts && invoice.discountParts.length > 0
+    ? invoice.discountParts.reduce((t, part) => t + part.amount * (1 + (part.rate ?? invoice.discountRate ?? invoice.headerRate)), 0)
+    : discount * (1 + (invoice.discountRate ?? invoice.headerRate))
+  return lines + shipping * (1 + (invoice.shippingRate ?? invoice.headerRate)) - discountWithTax
 }
 
 /** null when the invoice reconciles to the order total; otherwise the figures, for the refusal. */

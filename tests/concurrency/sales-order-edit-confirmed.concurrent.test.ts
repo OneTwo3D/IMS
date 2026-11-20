@@ -260,6 +260,42 @@ test('a posted invoice: the edit queues an update of it in the same transaction;
   assert.equal(payload.lines[0].quantity, 4)
 })
 
+test('sales_order_discount_tax_apportion_enabled ON: a mixed-rate order with a discount queues its invoice with the discount split by tax code and reconciles; OFF queues the single header-rate line', SKIP, async (t) => {
+  process.env.SETTINGS_ENCRYPTION_KEY ??= 'a1'.repeat(32)
+  const w = await seedWorld()
+  const { db } = await import('@/lib/db')
+  const KEY = 'sales_order_discount_tax_apportion_enabled'
+  const extraRates: string[] = []
+  t.after(async () => { await db.setting.deleteMany({ where: { key: KEY } }); await db.taxRate.deleteMany({ where: { id: { in: extraRates } } }); await w.teardown() })
+  await enableXeroInvoicing(w)
+  for (const [key, value] of [['xero_discount_account', '270']] as const) { await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } }); w.settingKeys.push(key) }
+  const mkRate = async (name: string, rate: string, code: string) => { const r = await db.taxRate.create({ data: { name: `${name} ${w.tag}`, rate, usedFor: 'SALES', taxCategory: 'STANDARD', accountingTaxType: code, active: true }, select: { id: true } }); extraRates.push(r.id); return r.id }
+  const five = await mkRate('ZQEC Red 5', '0.05', 'ADRED5')
+  const zero = await mkRate('ZQEC Zero', '0', 'ADZERO')
+  const { createSalesOrder } = await import('@/app/actions/sales')
+  const input = (extra: Record<string, unknown>) => inputFor(w, [{ p: 'p1', qty: 1, price: 100 }, { p: 'p2', qty: 1, price: 100 }, { p: 'p1', qty: 1, price: 100 }], { orderDiscountForeign: 60, ...extra })
+  const withRates = (i: ReturnType<typeof inputFor>) => ({ ...i, lines: i.lines.map((l, idx) => ({ ...l, taxRateId: [undefined, five, zero][idx] })) })
+  const payloadOf = async (id: string) => (await db.accountingSyncLog.findFirstOrThrow({ where: { referenceId: id, type: 'SALES_INVOICE' } })).payload as { discountAmount: number; discountTaxType: string; discountParts?: Array<{ amount: number; taxType: string }> }
+
+  const off = await createSalesOrder(withRates(input({})) as never)
+  assert.equal(off.success, true, off.error)
+  w.orderIds.push(off.order!.id)
+  const offPayload = await payloadOf(off.order!.id)
+  assert.equal(offPayload.discountParts, undefined, 'switch off: the payload carries no parts')
+  assert.equal(offPayload.discountAmount, 60)
+
+  await db.setting.upsert({ where: { key: KEY }, create: { key: KEY, value: 'true' }, update: { value: 'true' } })
+  const on = await createSalesOrder(withRates(input({})) as never)
+  assert.equal(on.success, true, `the order reconciles with its parts: ${on.error}`)
+  w.orderIds.push(on.order!.id)
+  const payload = await payloadOf(on.order!.id)
+  assert.equal(payload.discountAmount, 60)
+  assert.deepEqual(payload.discountParts!.map((p) => [p.taxType, p.amount]), [['OUTPUT2', 20], ['ADRED5', 20], ['ADZERO', 20]])
+  const stored = await db.salesOrder.findUniqueOrThrow({ where: { id: on.order!.id }, select: { taxForeign: true, discountTaxSplit: true } })
+  assert.equal(Number(stored.taxForeign), 25 + 1 - 5, 'lines 20 + 5 + 0, shipping 1, less 4 + 1 + 0 of discount VAT')
+  assert.equal((stored.discountTaxSplit as unknown[]).length, 3)
+})
+
 test('an invoice that is queued but not posted refuses the edit and writes nothing', SKIP, async (t) => {
   process.env.SETTINGS_ENCRYPTION_KEY ??= 'a1'.repeat(32)
   const w = await seedWorld()
