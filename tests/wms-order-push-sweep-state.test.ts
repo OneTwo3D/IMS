@@ -1194,7 +1194,7 @@ test('update: a changed order is amended; pushedAt bumped, error cleared', async
   assert.equal(r.updated, 1)
   assert.equal(updates[0].data.lastError, null)
   assert.equal((updates[0].data.pushedAt as Date).toISOString(), NOW().toISOString())
-  assert.deepEqual(Object.keys(updates[0].data).sort(), ['lastAttemptAt', 'lastError', 'pushWarehouseId', 'pushedAt'], 'an amendment never rewrites the first-claim stamp')
+  assert.deepEqual(Object.keys(updates[0].data).sort(), ['lastAttemptAt', 'lastError', 'pushWarehouseId', 'pushedAt', 'sentLineSkus'], 'an amendment never rewrites the first-claim stamp')
 })
 
 test('update: an applied amendment (header POST carries WarehouseId) stamps pushWarehouseId in the same write; a refused one does not', async () => {
