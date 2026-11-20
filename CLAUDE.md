@@ -1,779 +1,96 @@
 # One Two Inventory (OTI)
 
-Complete inventory management system with sales, purchasing, stock control, manufacturing, and financial integration. Built for product companies managing inventory across multiple warehouses with multi-currency support, FIFO costing, and real-time synchronization with WooCommerce and accounting systems (Xero, QuickBooks).
+Inventory management for product companies: sales, purchasing, stock control, manufacturing, FIFO costing, multi-currency, sync with WooCommerce and Xero. Repo: `git@github.com:OneTwo3D/IMS.git`. Owner: One Two Enterprises Ltd.
 
-For the current production-readiness backlog and execution grouping, see `docs/plan.md`.
+Reference detail lives in `docs/agent/` (read only when the task touches that area):
+- `docs/agent/overview.md` — project tree, core modules, data flow, DB model list, module-to-file map (snapshot, partly stale).
+- `docs/agent/code-patterns.md` — worked code examples for the rules below, full naming/import/error-handling text.
+- `docs/agent/env-vars.md` — every environment variable table plus the WooCommerce status-filter, Xero tenant and install-time-seed notes. Read before adding or changing an env var or a setting that has an env fallback.
+- `docs/agent/debugging-and-skills.md` — debugging recipes, support contacts, skill list.
+- `docs/agent/history.md` — stale "recent features" list.
+Also: `docs/agent-workflow.md` (branching and session startup), `docs/architecture.md`, `docs/development.md`, `docs/migration-conventions.md`, `deploy/README.md`, `README.md`, `docs/getting-started.md`. The "plan", "configuration" and "deployment" docs this file used to cite do not exist.
 
-## Tech Stack
+## Stack
 
-| Layer | Technology | Version | Purpose |
-|-------|------------|---------|---------|
-| Runtime | Node.js | 26+ | JavaScript execution |
-| Framework | Next.js | 16.2 | Full-stack React with App Router, Server Components, Server Actions, Turbopack |
-| Language | TypeScript | 5.x | Strict type checking throughout (strict mode enabled) |
-| Database | PostgreSQL | 14+ | Relational database for complex inventory models |
-| ORM | Prisma | 7.6 | Type-safe database access with 59 models |
-| UI Framework | React | 19.2 | Component rendering and state management |
-| UI Components | Shadcn/UI + Base-UI | Latest | Pre-built accessible component library |
-| Styling | Tailwind CSS | 4.x | Utility-first CSS |
-| Authentication | NextAuth.js | 5.0-beta | Session management with TOTP 2FA, Passkey/WebAuthn |
-| PDF Generation | PDFKit | 0.18 | Server-side PDF rendering with branding |
-| Package Manager | npm | Latest | Dependency management |
-| Linting | ESLint | 9.x | Code quality with Next.js/TypeScript rules |
+Node 26+, Next.js 16 (App Router, Server Components, Server Actions, Turbopack), React 19, TypeScript 5 strict, PostgreSQL 14+ with Prisma 7 (`prisma/schema.prisma`), NextAuth.js 5 beta (TOTP 2FA, Passkey/WebAuthn), Tailwind 4, Shadcn/UI + Base-UI, PDFKit, ESLint 9, npm. `AGENTS.md` warns that this Next.js has breaking changes: read the relevant guide in `node_modules/next/dist/docs/` before writing Next code.
 
-## Quick Start
+## Commands
 
 ```bash
-# Prerequisites
-- Node.js 26+ installed
-- PostgreSQL 14+ database running
-- Environment variables configured (.env)
-
-# Installation & Development
-git clone git@github.com:OneTwo3D/IMS.git
-cd onetwo3d-ims
-npm install
-cp .env.example .env          # Edit with your database URL and secrets
-
-# Database setup
-npx prisma migrate deploy     # Apply all pending migrations
-npx prisma generate           # Generate Prisma client types
-
-# Create initial admin user
-npm run cli -- create-user    # Interactive user creation
-
-# Development server (hot reload on localhost:3000)
-npm run dev
-
-# Production build & start
-npm run build
-npm start                     # Runs on port 3000
+npm install && cp .env.example .env     # then edit DATABASE_URL and secrets
+npx prisma migrate deploy && npx prisma generate
+npm run cli -- create-user              # interactive admin/staff/supplier user
+npm run dev                             # localhost:3000, hot reload
+npm run build && npm start              # production bundle, port 3000
+npm run lint | type-check | db:seed | db:studio
 ```
 
-## Project Structure
+## Rules for every change
 
-```
-onetwo3d-ims/
-├── app/
-│   ├── (auth)/               # Login, 2FA, passkey pages (public routes)
-│   ├── (dashboard)/          # All authenticated pages (30+ modules)
-│   │   ├── dashboard/
-│   │   ├── inventory/        # Product management, stock levels
-│   │   ├── stock-control/    # Transfers, adjustments, counts
-│   │   ├── sales/            # Orders, shipments, invoices
-│   │   ├── purchase-orders/  # POs, RFQs, suppliers
-│   │   ├── manufacturing/    # Production orders, BOMs
-│   │   ├── sync/             # WooCommerce, Xero integration
-│   │   ├── analytics/        # Reports and forecasting
-│   │   ├── settings/         # Company, users, integrations
-│   │   ├── activity/         # Activity log (audit trail)
-│   │   ├── profile/          # User profile and preferences
-│   │   ├── supplier/         # Supplier portal (separate RBAC)
-│   │   └── help/             # Help documentation portal
-│   ├── actions/              # Server actions (business logic, 31+ files)
-│   │   ├── products.ts       # Product CRUD, variants, BOMs
-│   │   ├── sales.ts          # Sales order lifecycle, allocation, invoicing
-│   │   ├── purchase-orders.ts # Purchase order workflow
-│   │   ├── stock.ts          # Stock movements, adjustments
-│   │   ├── transfers.ts      # Warehouse transfers
-│   │   ├── manufacturing.ts  # Production orders
-│   │   ├── wc-sync.ts        # WooCommerce order/product sync
-│   │   ├── xero-sync.ts      # Xero integration, journal posting
-│   │   ├── settings.ts       # Company, user, integration settings
-│   │   └── [other actions]   # Email, auth, backup, permissions, etc.
-│   ├── api/                  # API routes and webhooks
-│   │   ├── auth/             # NextAuth routes, TOTP, passkey setup
-│   │   ├── cron/             # Scheduled jobs
-│   │   │   ├── fx-rates      # Daily FX rate fetch (frankfurter.dev)
-│   │   │   ├── wc-sync       # WooCommerce polling sync (if webhooks disabled)
-│   │   │   ├── xero-daily-batch # Daily Xero sub-ledger batch sync
-│   │   │   ├── xero-sync     # Real-time Xero sync (deprecated, use daily-batch)
-│   │   │   ├── xero-payment-poll # Payment status polling from Xero
-│   │   │   ├── delivery-status # Update delivery status on SalesOrders
-│   │   │   ├── activity-cleanup # Archive old activity logs
-│   │   │   └── backup        # Automated database backups
-│   │   ├── webhooks/woocommerce/ # WC order, product, refund webhooks
-│   │   ├── export/           # CSV exports (products, sales, POs, stock, etc.)
-│   │   ├── import/           # CSV imports and historical order import
-│   │   ├── invoice/          # Invoice PDF generation and preview
-│   │   ├── packing-slip/     # Packing slip PDF (picking/packing checklist)
-│   │   ├── sales-order/      # Sales order confirmation PDF
-│   │   ├── rfq/              # RFQ PDF generation
-│   │   ├── manufacturing-order/ # Production order PDF
-│   │   ├── upload/           # Avatar, logo, invoice PDF uploads
-│   │   ├── uploads/          # Serve uploaded branding/invoice files
-│   │   ├── backup/           # Manual backup creation and restore
-│   │   ├── xero/             # Xero OAuth callback
-│   │   ├── notifications/    # Email notification delivery
-│   │   └── preview/          # Document preview (email templates, documents)
-│   └── generated/prisma/     # Auto-generated Prisma client types
-├── components/
-│   ├── ui/                   # Shadcn/Base-UI primitives (20+ components)
-│   │   ├── button.tsx, card.tsx, dialog.tsx, dropdown-menu.tsx
-│   │   ├── input.tsx, select.tsx, table.tsx, skeleton.tsx, etc.
-│   ├── layout/               # Sidebar, topbar, navigation, breadcrumbs
-│   ├── inventory/            # Product-specific components (forms, lists)
-│   ├── settings/             # Settings-specific components (forms)
-│   ├── auth/                 # Login/auth/2FA/passkey components
-│   ├── profile/              # User profile components
-│   └── providers/            # Context providers (auth, theme, etc.)
-├── lib/
-│   ├── auth/                 # NextAuth.js configuration, session helpers
-│   │   ├── config.ts         # NextAuth providers and callbacks
-│   │   ├── server.ts         # requireAuth() helper
-│   ├── db.ts                 # Prisma client singleton
-│   ├── permissions.ts        # Role-based access control (RBAC) helpers
-│   ├── activity-log.ts       # Audit trail logging
-│   ├── mailer.ts             # Nodemailer SMTP configuration
-│   ├── pdf.ts                # PDF generation with branding system
-│   ├── csv.ts                # CSV parse and export utilities
-│   ├── utils.ts              # Shared utility functions
-│   ├── connectors/           # Integration modules
-│   │   ├── woocommerce/      # WC sync logic, webhooks, tax mapping
-│   │   │   ├── sync.ts       # Order/product sync engine
-│   │   │   ├── webhooks.ts   # Webhook parsing and validation
-│   │   │   ├── tax-mapping.ts # WC tax rate → Xero tax type mapping
-│   │   │   └── api.ts        # WC REST API client
-│   │   └── xero/             # Xero API, journal posting, reconciliation
-│   │       ├── api.ts        # Xero OAuth and API client
-│   │       ├── sync.ts       # Journal entry posting
-│   │       ├── batch.ts      # Daily batch sync logic
-│   │       └── reconciliation.ts # Payment/invoice reconciliation
-│   └── [service files]       # Notifications, FX rates, tracking
-├── prisma/
-│   ├── schema.prisma         # Database schema (59 models, full OTI spec)
-│   ├── migrations/           # Migration history
-│   ├── seed.ts               # Database seeding
-│   └── prod-seed/            # Production data fixtures
-├── scripts/
-│   ├── cli.ts                # CLI tool (create-user, etc.)
-│   └── [deployment scripts]
-├── public/                   # Static assets (favicon, branding)
-├── docs/                     # Additional documentation
-├── .env.example              # Template for environment variables
-├── .eslintrc.mjs             # ESLint configuration
-├── tsconfig.json             # TypeScript strict mode
-├── next.config.ts            # Next.js config
-├── tailwind.config.ts        # Tailwind CSS config
-└── package.json              # Dependencies and scripts
-```
+### Naming and imports
+- Files: `kebab-case` (components, actions, routes, utilities, config); UI primitives lowercase; hooks `useX.ts`.
+- Identifiers: PascalCase components/classes/types; camelCase functions (verb prefix) and variables; `SCREAMING_SNAKE_CASE` constants; hooks `useX`; booleans `is`/`has`/`should`; state hooks `[x, setX]`.
+- Import order: React/Next, external packages, internal `@/` imports, component imports, `import type`.
 
-## Architecture Overview
+### Code
+- TypeScript strict: no ambiguous `any`; `import type` for type-only imports; explicit return types on public functions.
+- Server Actions: start with `'use server'`; `await requireAuth()` (or a permission guard) first; validate input with an explicit Zod schema; call `logActivity()` on every state mutation (create, update, delete) with a descriptive message, tag (inventory/sales/sync/...) and entity id; `revalidatePath()`/`revalidateTag()` to refresh UI cache. `requireAuth`/`requirePermission` live in `@/lib/auth/server`; `hasPermission`/`getPermissions` in `@/lib/permissions`; `logActivity` in `@/lib/activity-log`.
+- Client components: `'use client'` only where interactivity is needed; pages stay server components and hand data to extracted client components.
+- Permissions: enforce server-side with `requirePermission('x.y')` (throws 403) or `hasPermission(session.user.role, 'x.y')`; validate role on the server to prevent privilege escalation.
+- Forms: modal/dialog style (never separate pages), Zod in the server action, React server-action submission, loading and error states.
+- Errors, API routes: JSON with status code and message; log errors to the activity log; never expose stack traces; 401 auth, 403 permission, 400 validation, 500 server.
+- Errors, Server Actions: throw (`new Error('User message')` for user-facing); always catch database errors and log to the activity log; include context.
+- Errors, client: wrap server-action calls in try-catch, show friendly messages, log technical detail, show loading skeletons.
 
-**One Two Inventory** is a modular, role-based inventory management platform with real-time financial integration:
+### Security checklist (every change)
+- Authentication: endpoints require a session (`requireAuth()`). Authorization: role checks (`requirePermission()`/`hasPermission()`). Input: Zod validates all server-action input.
+- SQL: Prisma parameterised queries only. XSS: avoid `dangerouslySetInnerHTML`. CSRF: NextAuth tokens. Data exposure: no passwords/secrets in responses.
+- Cron endpoints are protected by the `CRON_SECRET` header. File uploads: validate MIME type, enforce size limits, sanitise filenames. Consider rate limiting public endpoints (webhooks).
+- Never commit secrets; `.env.example` is the template; `NEXT_PUBLIC_*` variables must not contain secrets.
 
-### Core Modules
-
-1. **Inventory Module** — Product master data with:
-   - FIFO costing with multi-layer cost tracking per warehouse
-   - Multi-warehouse stock with available/reserved/on-hand tracking
-   - Product types: SIMPLE, VARIABLE (parent), VARIANT (child), KIT (virtual bundle), BOM (manufactured), NON_INVENTORY (service)
-   - Real-time COGS calculation on stock movements
-   - CSV import/export with BOM and variant support
-
-2. **Order-to-Cash** — Sales order full lifecycle:
-   - Workflow: DRAFT → PENDING_PAYMENT → ON_HOLD → PROCESSING → ALLOCATED → PICKING → PACKING → SHIPPED → COMPLETED/DELIVERED
-   - Multi-warehouse auto-allocation with intelligent allocation rules
-   - Shipment management with tracking
-   - Auto/manual invoice generation (configurable trigger)
-   - Payment tracking against invoices and credit notes
-   - Multi-currency with VAT handling and order/line discounts
-   - PDF generation and email delivery
-
-3. **Procure-to-Pay** — Purchase order full lifecycle:
-   - Workflow: DRAFT → RFQ_SENT → PO_SENT → PARTIALLY_RECEIVED → RECEIVED → INVOICED
-   - Multi-currency with live FX rates (frankfurter.dev ECB data)
-   - RFQ PDF generation and supplier management
-   - Goods receipt with FIFO costing integration
-   - Landed cost distribution (by value/weight/quantity/equal split)
-   - Freight/cost POs linked to primary POs
-   - Retrospective landed cost recalculation (updates FIFO layers and COGS)
-   - Supplier returns and billing workflow
-
-4. **Manufacturing** — Production order management:
-   - Production order types: ASSEMBLY, DISASSEMBLY
-   - BOM management with component allocation
-   - Stock movements on completion (production receipts)
-   - Links to sales orders for made-to-order workflows
-
-5. **Integrations** — Connector modules for data sync:
-   - **WooCommerce** — Order sync via webhooks (or polling), product sync, tax rate mapping to Xero
-   - **Xero** — Daily batch journal entry posting, sub-ledger sync, COGS calculation, payment reconciliation
-   - **QuickBooks** — Coming soon
-
-6. **Financial Module** — Multi-currency and reporting:
-   - Daily FX rates auto-fetch from frankfurter.dev (ECB data)
-   - VAT handling (inclusive/exclusive) with named tax rates
-   - Xero account mapping for stock, COGS, and revenue recognition
-   - COGS/margin analytics and reporting
-   - Cash bridge forecasting
-   - Payment account mapping (payment method → bank account)
-
-7. **Administration** — Multi-tenant roles and controls:
-   - 6 RBAC roles: ADMIN, MANAGER, WAREHOUSE, FINANCE, READONLY, SUPPLIER (each with specific permissions)
-   - Activity logging with searchable audit trail
-   - Scheduled backups (local file or SFTP)
-   - System settings (company info, integrations, preferences)
-   - Email notifications for orders, shipments, sync events
-
-### Data Flow
-
-```
-WooCommerce → IMS (allocate stock, reserve) → Shipments (track)
-  ↓
-Xero sub-ledger (batch sync daily) → Accounts (GL posting)
-  ↓
-FX rates (daily via frankfurter.dev) → Multi-currency conversions
-```
-
-## Database
-
-**59 Prisma models** (managed with migrations):
-
-**Product & Inventory:**
-- Product, ProductVariant, ProductPrice, ProductBundle
-- Stock, StockMovement, StockCount, StockTransfer, CostLayer
-
-**Sales:**
-- SalesOrder, SalesOrderLine, OrderAllocation, Shipment, ShipmentLine
-- Invoice, InvoiceLine, CreditNote, CreditNoteLine, Payment, PaymentAllocation
-
-**Purchases:**
-- PurchaseOrder, PurchaseOrderLine, PurchaseReceipt, PurchaseReceiptLine
-- SupplierRfq, PurchaseReturn, PurchaseReturnLine, Supplier
-
-**Manufacturing:**
-- ManufacturingOrder, ManufacturingOrderLine, Bom, BomItem
-
-**Financials:**
-- TaxRate, Currency, FxRate, LandedCost, CostLine
-- AccountingSync (journal entries, COGS tracking)
-
-**Integrations:**
-- WooCommerceConfig, WooCommerceProduct, WooCommerceSyncJob, WooCommerceTaxMap
-- XeroMapping, XeroSyncLog, XeroPaymentPoll
-
-**Administration:**
-- User, Role, Session (NextAuth)
-- Setting, ActivityLog, AuditTrail, Notification
-- DocumentTemplate, AdjustmentReason, PurchaseUnit, Warehouse
-
-See `@prisma/schema.prisma` for complete schema with relationships and constraints.
-
-## Development Guidelines
-
-### File & Code Naming Conventions
-
-**File Names** (on disk):
-- Components: `kebab-case` → `user-profile.tsx`, `product-list.tsx`, `add-to-stock-dialog.tsx`
-- Server actions: `kebab-case` → `products.ts`, `sales-orders.ts`
-- API routes: `kebab-case` → `create-order.ts`, `webhook-woocommerce.ts`
-- Utilities: `kebab-case` → `pdf-helpers.ts`, `format-currency.ts`
-- Hooks: `use` + camelCase (in file name) → `useAuth.ts`, `usePermissions.ts`
-- UI components: `lowercase` → `button.tsx`, `dialog.tsx`, `dropdown-menu.tsx`
-- Config files: `kebab-case` → `next.config.ts`, `.env.example`
-
-**Code Naming** (identifiers inside files):
-- **Components/Classes:** PascalCase → `export function UserProfile()`, `export class ApiClient`
-- **Functions:** camelCase with verb prefix → `function handleSubmit()`, `const fetchUsers = async ()`
-- **Variables:** camelCase → `const userData`, `let totalStock`
-- **State hooks:** camelCase, semantic prefix → `const [loading, setLoading] = useState(false)`, `const [error, setError] = useState('')`
-- **Custom hooks:** `use` + PascalCase → `useAuth()`, `usePermissions()`, `useInventory()`
-- **Constants:** SCREAMING_SNAKE_CASE → `const MAX_RETRIES = 3`, `const XERO_BASE_URL = '...'`
-- **Type/Interface exports:** PascalCase → `export type ProductRow = {...}`, `export interface UserSession {...}`
-- **Boolean variables:** `is`/`has`/`should` prefix → `const isLoading`, `const hasPermission`, `const shouldRefetch`
-
-### Import Order
-
-Follow this order in all files:
-
-```typescript
-// 1. React and Next.js
-import type { Metadata } from 'next'
-import { useState, useEffect } from 'react'
-import { useRouter } from 'next/navigation'
-
-// 2. External packages
-import { z } from 'zod'
-import { signIn } from 'next-auth/react'
-
-// 3. Internal absolute imports (@/)
-import { db } from '@/lib/db'
-import { logActivity } from '@/lib/activity-log'
-import { requireAuth } from '@/lib/auth/server'
-
-// 4. Component imports
-import { Button } from '@/components/ui/button'
-import { Card } from '@/components/ui/card'
-
-// 5. Type imports (if separate)
-import type { ProductRow } from '@/app/actions/products'
-```
-
-### Code Style & Patterns
-
-**TypeScript Strict Mode:**
-- All files are TypeScript. No ambiguous `any` types.
-- Use `type` for type-only imports to enable tree-shaking
-- Define explicit return types on public functions
-
-```typescript
-// ✓ Good
-export async function getProduct(id: string): Promise<ProductRow | null> {
-  return db.product.findUnique({ where: { id } })
-}
-
-// ✗ Bad - no return type
-export async function getProduct(id: string) {
-  return db.product.findUnique({ where: { id } })
-}
-```
-
-**Server Actions:**
-- Always start with `'use server'` directive
-- Include `await requireAuth()` at the top
-- Use Zod for input validation with explicit schema
-- Call `logActivity()` for all state mutations
-- Use `revalidatePath()` or `revalidateTag()` to update UI cache
-
-```typescript
-// app/actions/products.ts
-'use server'
-
-import { revalidatePath } from 'next/cache'
-import { z } from 'zod'
-import { db } from '@/lib/db'
-import { logActivity } from '@/lib/activity-log'
-import { requireAuth } from '@/lib/auth/server'
-
-const CreateProductSchema = z.object({
-  sku: z.string().min(1),
-  name: z.string().min(1),
-})
-
-export async function createProduct(input: unknown) {
-  const session = await requireAuth()
-
-  const data = CreateProductSchema.parse(input)
-
-  const product = await db.product.create({
-    data: { ...data, createdBy: session.user.id }
-  })
-
-  await logActivity({
-    tag: 'inventory',
-    action: 'create',
-    description: `Created product: ${product.name}`,
-    entityId: product.id,
-  })
-
-  revalidatePath('/inventory')
-  return product
-}
-```
-
-**Client Components:**
-- Use `'use client'` only where interactivity is needed
-- Separate server (async) and client (interactive) components
-- Page components stay on server, extract interactive parts to clients
-
-```typescript
-// app/(dashboard)/products/[id]/page.tsx (Server Component)
-export default async function Page({ params }: { params: { id: string } }) {
-  const product = await getProduct(params.id)
-  return <ProductClient product={product} />
-}
-
-// components/product-client.tsx (Client Component)
-'use client'
-export function ProductClient({ product }: { product: Product }) {
-  const [editing, setEditing] = useState(false)
-  return (...)
-}
-```
-
-**Permissions & RBAC:**
-- Enforce permissions server-side in actions via `requirePermission('permission')` (throws on failure) or check with `hasPermission(session.user.role, 'permission')`
-- `requireAuth`/`requirePermission` are in `@/lib/auth/server`; `hasPermission`/`getPermissions` are in `@/lib/permissions`
-- Prevent privilege escalation by validating user role on server
-
-```typescript
-import { requirePermission } from '@/lib/auth/server'
-import { hasPermission } from '@/lib/permissions'
-
-export async function updateProduct(id: string, input: unknown) {
-  // Throws (403) if the current role lacks the permission:
-  const session = await requirePermission('products.edit')
-
-  // ...or branch without throwing:
-  if (!hasPermission(session.user.role, 'products.edit')) {
-    throw new Error('Unauthorized')
-  }
-
-  // proceed...
-}
-```
-
-**Activity Logging:**
-- Every mutation (create, update, delete) must call `logActivity()`
-- Include descriptive messages, tags (inventory/sales/sync/etc.), and entity IDs
-- Located in `@/lib/activity-log.ts`
-
-**Form Patterns:**
-- All forms use modal/dialog style (floating, not separate pages)
-- Use Zod validation in server actions
-- Leverage React's form submission with server actions
-- Include loading states and error handling
-
-### Error Handling
-
-**API Routes:**
-- Return JSON with HTTP status code and error message
-- Log errors to activity log for audit
-- Never expose internal stack traces to client
-- Return 401 for auth, 403 for permission, 400 for validation, 500 for server errors
-
-**Server Actions:**
-- Throw errors; Next.js serializes them to client
-- User-facing errors: throw `new Error('User message')`
-- Always catch database errors and log to activity log
-- Include context in error messages
-
-**Client Side:**
-- Wrap server action calls in try-catch
-- Display user-friendly error messages
-- Log technical errors for debugging
-- Show loading skeletons during async operations
+### Server Action authorization guards
+`npm run check:server-action-guards` runs `check:server-action-auth-bypass` (no Server Action may take a serializable option that suppresses its permission check), `check:server-action-guard-coverage` (every exported async function in a `'use server'` module enforces a guard, delegates to a verified one, or is allowlisted with a reason that must still suppress something) and `check:server-action-authorization` (executable proofs that each gate refuses the principal it claims to, including that no read ran on the refused path). They run in `scripts/validate-local.sh` and in `.github/workflows/server-action-auth-guard.yml` (one independent job per half). Rules the guards encode:
+- A `'use server'` export is a public HTTP endpoint. Not being imported by any UI, and being on an allowlist, are both irrelevant to who can call it.
+- Authentication is not an authorization answer. `requireAuth` says someone is signed in; use `requirePermission` / `requireInternalUser` to say who. Endpoints left on `requireAuth` are pinned, with the Prisma models they reach, in `tests/security/server-action-guard-coverage.test.ts`; adding one means arguing in the diff that it is self-scoped to the caller.
+- SUPPLIER is an EXTERNAL principal with no `internal` permission: internal reads gate on `requireInternalUser` (or a real permission), never `requireAuth`. On the supplier's own surface scope the query to `session.user.supplierId` and re-check ownership of anything fetched by id.
+- The guards resolve identifiers (`tests/security/module-graph.ts`), so a local helper shadowing a guard's name, or an aliased import, is judged by what it is.
 
 ### Testing
+- New business logic ships with a test in `npm run test:unit` (node:test + tsx over `tests/**/*.test.ts`). Export pure builders/helpers so they can be tested directly (see `tests/wms-order-push-payload.test.ts`).
+- `npm run test:concurrency` needs a DB and `RUN_DB_CONCURRENCY_TESTS=1`. `npm run e2e` is Playwright (tags `@wc` / `@xero` / `@external`).
+- Static gates: `npm run type-check`, `npm run lint`, `npm run check:all` (decimal, connector-fetch, WMS-connector, migration-convention, documented-env-vars and other boundary guards, plus `check:server-action-guards`).
 
-- **Unit/business-logic suite:** `npm run test:unit` (node:test + tsx over `tests/**/*.test.ts`) — 1,840+ tests covering FIFO/COGS cost layers, tax/FX, Xero sync/batch/outbox, Woo/Shopify webhooks + stock sync, Mintsoft connector phases, manufacturing, transfers, security, and the WMS order push/status logic. New business logic should ship with a test here; export pure builders/helpers so they can be unit-tested directly (see `tests/wms-order-push-payload.test.ts`).
-- **DB concurrency:** `npm run test:concurrency` (needs a DB; `RUN_DB_CONCURRENCY_TESTS=1`).
-- **E2E:** `npm run e2e` (Playwright; tagged `@wc` / `@xero` / `@external`).
-- **Static gates:** `npm run type-check`, `npm run lint`, and `npm run check:all` (decimal / connector-fetch / WMS-connector / migration-convention boundary guards, plus `check:server-action-guards`).
-- **Server Action authorization guards:** `npm run check:server-action-guards` runs three halves — `check:server-action-auth-bypass` (no Server Action may take a serializable option that suppresses its permission check), `check:server-action-guard-coverage` (every exported async function in a `'use server'` module enforces a guard, delegates to a verified one, or is allowlisted with a reason that must still suppress something) and `check:server-action-authorization` (executable proofs that each gate refuses the principal it claims to: which role, which named permission, and — provably — that no read ran on the refused path). They run in `scripts/validate-local.sh` (as the composite) and in their own ungated workflow, `.github/workflows/server-action-auth-guard.yml`, one independent job per half so a failing half cannot hide the others. Three rules of thumb the guards encode:
-  - A `'use server'` export is a public HTTP endpoint. Not being imported by any UI, and being covered by an allowlist entry, are both irrelevant to who can call it.
-  - **Authentication is not an answer to an authorization question.** `requireAuth` says someone is signed in; use `requirePermission` / `requireInternalUser` to say *who*. Endpoints left on `requireAuth` are pinned, with the Prisma models they reach, in `tests/security/server-action-guard-coverage.test.ts` — adding one means arguing in the diff that it is self-scoped to the caller.
-  - **SUPPLIER is an EXTERNAL principal.** It holds no `internal` permission, so internal reads must gate on `requireInternalUser` (or a real permission) rather than `requireAuth`; and on the supplier's own surface a permission is not the control at all — scope the query to `session.user.supplierId` and re-check ownership of anything fetched by id.
-  - The guards RESOLVE identifiers rather than matching names (`tests/security/module-graph.ts`), so a local helper that shadows a guard's name, or an aliased import of one, is judged by what it actually is.
-- Manual smoke in dev via `npm run dev`.
+### Environment variables and settings
+- Add every env var to `.env.example`; `check:documented-env-vars` fails a documented variable that nothing reads. Tables and notes: `docs/agent/env-vars.md`.
+- Install-time seeds only (insert-only into the `settings` table by `scripts/provision-instance.mjs`, editing `.env` afterwards changes nothing): `WC_STORE_URL`, `WC_CONSUMER_KEY`, `WC_CONSUMER_SECRET` and the `SMTP_*` variables. `WC_CONSUMER_KEY`/`WC_CONSUMER_SECRET`/`WC_WEBHOOK_SECRET`/`WC_INVOICE_PDF_SECRET` are runtime overrides. `WC_STORE_URL` must NOT be added to `SETTING_ENV_FALLBACKS`.
+- Not env vars: Xero OAuth client id/secret (Settings -> Integrations -> Xero, encrypted in `settings`), Xero tokens (encrypted in Postgres, no token file), base currency (`Organisation.baseCurrency`), WC order statuses (`wc_sync_order_statuses`), WC poll cadence (`wc-reconcile` cron schedule). Do not document or add variables for these.
+- Keep the Sync page copy, `docs/installation.md` and `lib/connectors/woocommerce/webhooks.ts` in step with the `wc_sync_order_statuses` behaviour described in `docs/agent/env-vars.md`.
+- Set an id-based Xero tenant control (`XERO_ALLOWED_TENANT_IDS`, `XERO_BLOCKED_TENANT_IDS` or `XERO_REQUIRE_DEMO_ORG`) on every non-production instance.
 
-## Available Commands
+## Deployment
 
-| Command | Description |
-|---------|-------------|
-| `npm run dev` | Start development server (hot reload, localhost:3000) |
-| `npm run build` | Build for production (optimized Next.js bundle) |
-| `npm start` | Start production server (requires `npm run build` first) |
-| `npm run lint` | Run ESLint to check code style and quality |
-| `npm run type-check` | Run TypeScript compiler (no emit) to verify all types |
-| `npm run db:seed` | Seed database with initial data (see prisma/seed.ts) |
-| `npm run db:studio` | Open Prisma Studio (visual database explorer on localhost:5555) |
-| `npm run cli -- create-user` | Interactive CLI to create admin/staff/supplier users |
+The stage instance runs as the non-root `ims` user from `/opt/ims/onetwo3d-ims` (`/root/ims/onetwo3d-ims` symlinks to it) under systemd on port 3000. Live unit: `ims-stage-dev.service` (`next dev`, hot reload, `development` branch). Its intended replacement is the hardened `ims-stage.service` (`next start`, loopback-only, sandboxed); see `deploy/README.md`.
 
-## Environment Variables
-
-Copy `.env.example` to `.env` and configure. Uses **NextAuth.js v5** variable naming:
-
-### Application & Authentication
-
-| Variable | Required | Description | Example |
-|----------|----------|-------------|---------|
-| `NEXT_PUBLIC_APP_URL` | Yes | Full public app URL (no trailing slash) | `https://ims.yourdomain.com` |
-| `NODE_ENV` | Yes | Environment mode | `production` or `development` |
-| `AUTH_SECRET` | Yes | Encryption key for Auth.js sessions (min 32 chars) | Generate with `openssl rand -base64 32` |
-| `AUTH_URL` | Yes | Auth.js base URL (same as NEXT_PUBLIC_APP_URL) | `https://ims.yourdomain.com` |
-
-### Database
-
-| Variable | Required | Description | Example |
-|----------|----------|-------------|---------|
-| `DATABASE_URL` | Yes | PostgreSQL connection string | `postgresql://user:pass@localhost:5432/oti` |
-
-### WooCommerce Integration
-
-| Variable | Required | Description | Example |
-|----------|----------|-------------|---------|
-| `WC_STORE_URL` | No | WooCommerce store base URL (no trailing slash). **Install-time seed only** — `scripts/provision-instance.mjs` writes it into the `wc_url` setting on a fresh install (insert-only); it never overrides what Settings → Sync → WooCommerce holds | `https://yourstore.com` |
-| `WC_CONSUMER_KEY` | No | WC REST API consumer key. **Install-time seed only** — seeded into the `wc_consumer_key` setting once, then owned by Settings → Sync → WooCommerce | From WC admin → Settings → Advanced → REST API |
-| `WC_CONSUMER_SECRET` | No | WC REST API consumer secret. **Install-time seed only** — seeded into the `wc_consumer_secret` setting once, then owned by Settings → Sync → WooCommerce. Editing it in `.env` after install changes nothing (o3d-ecbj) | From WC admin → Settings → Advanced → REST API |
-| `WC_WEBHOOK_SECRET` | No | WC webhook signing key | Any random string (set same in WC webhooks config) |
-
-> `WC_STORE_URL` is an **install-time seed only**. `scripts/provision-instance.mjs` writes it into
-> the `wc_url` setting on a fresh install, insert-only, and it is deliberately **not** in
-> `SETTING_ENV_FALLBACKS`: the installer writes the line into every `.env`, so an override would
-> repoint an installation that had since been moved to a different store back to the old one on its
-> next upgrade — and only half of the code reads `wc_url` through the settings store, so the two
-> halves would target different stores (o3d-esha). `WC_CONSUMER_KEY` / `WC_CONSUMER_SECRET` /
-> `WC_WEBHOOK_SECRET` / `WC_INVOICE_PDF_SECRET` **are** runtime overrides; the Connection tab shows
-> an "overridden by" banner while one is set.
-
-> Which order statuses import is **not** an environment variable. It is an application setting
-> edited in Settings -> Sync -> WooCommerce and stored in the `settings` table
-> (`wc_sync_order_statuses`); the importer reads it from the database. The POLL CADENCE is neither
-> an env var nor a sync setting: it is the `wc-reconcile` cron schedule
-> (`cron_wc_reconcile_schedule`, default `0 4 * * *`), edited in Settings -> System -> Scheduler.
-> `wc_sync_interval_minutes` was a settings field offering a minutes box that no code read, and was
-> removed for that reason (o3d-potv). `WC_SYNC_STATUSES`, `WC_USE_WEBHOOKS` and `WC_POLL_INTERVAL_MINUTES` were
-> documented here and read by nothing (o3d-tj6v) - setting them silently changed nothing.
-
-> `wc_sync_order_statuses` decides which orders IMS **takes on**. It governs every route that
-> **fetches** orders from WooCommerce - the initial "Import Active Orders" backfill, the polling
-> sweep and the reconcile sweeps - because each turns the selection into a `?status=` query. The
-> rules live in one place, `lib/connectors/woocommerce/order-status-filter.ts`, shared by the
-> importer and the Sync page.
-> It governs the order **webhook** too, as an **admission** rule rather than a fetch filter
-> (`isWcOrderAdmittedByStatus`): a pushed order IMS has never seen is created only if its current
-> status is selected, and one that later moves into a selected status is created by THAT update from
-> its own full payload. An order IMS already holds is never gated - it keeps following the store
-> whatever status it moves to afterwards, which is what stops IMS disagreeing with the store about an
-> order it owns. Withdrawal statuses are always admitted; an empty selection admits nothing. Refused
-> deliveries are ACKed (never retried) and logged as `wc_order_webhook_status_not_admitted`, at most
-> hourly. The status still governs what an imported order does, via `shopping_status_mappings`. Keep
-> the Sync page copy, `docs/installation.md` and `lib/connectors/woocommerce/webhooks.ts` in step.
-
-### Xero Integration (OAuth 2.0)
-
-| Variable | Required | Description | Example |
-|----------|----------|-------------|---------|
-| `XERO_TENANT_ID` | No | **Deprecated** — a single-organisation spelling of `XERO_ALLOWED_TENANT_IDS`, enforced identically. It is *not* auto-populated (it never was, and for years nothing read it at all). Setting it alongside `XERO_ALLOWED_TENANT_IDS` with a different value refuses every Xero connection rather than preferring one; setting it alongside `XERO_ALLOWED_TENANT_NAMES` is fine, because a name only narrows what the id already chose. | `5c949ed5-…` |
-| `XERO_ALLOWED_TENANT_IDS` | No | Comma-separated allow-list of Xero tenant ids this instance may connect to or keep a stored token for. Blank = unrestricted. The only key that can **allow** an organisation. | `5c949ed5-…` |
-| `XERO_BLOCKED_TENANT_IDS` | No | Comma-separated tenant ids refused everywhere, applied before every other check. On a test rig, block the **live** organisation: its id never changes, so unlike an allow-list this needs no edit when the connected test organisation is re-created with a new tenantId. Listing an id on both this and the allow-list is a refused contradiction, not a silent deny-wins. | `e7fb4378-…` |
-| `XERO_REQUIRE_DEMO_ORG` | No | `true`/`false`. Restricts this instance to a Xero **demo** organisation, proven from Xero's own `IsDemoCompany` on `GET /Organisation` — identity-strength without an id, so it survives the Demo company's ~28-day re-creation with no edit and, unlike a deny-list, does not have to enumerate the organisations it forbids. Enforced at the callback and on the stored token; a stored token whose demo status was never recorded is refused as unverified. A value that is neither yes nor no refuses every Xero connection instead of silently meaning off. | `true` |
-| `XERO_ALLOWED_TENANT_NAMES` | No | Organisation names that **narrow** the ids — case-insensitive, never a union. A Xero name is not an identity (not unique, and renameable by whoever administers the org), so it can never admit an organisation the ids exclude, a name matching two organisations on one consent is refused rather than used to choose, and a name-only configuration is logged as weaker than it looks. Set an **id-based** control on every non-production instance. | `Demo Company (UK)` |
-
-> The OAuth client id and secret are **not** environment variables. They are entered in
-> Settings -> Integrations -> Xero and stored in the `settings` table (`xero_client_id`,
-> `xero_client_secret`, encrypted at rest); `lib/connectors/xero/auth.ts` reads them from there.
-> `XERO_CLIENT_ID` / `XERO_CLIENT_SECRET` were documented here and read by nothing (o3d-esha).
-
-> Xero OAuth tokens are **not** stored in a file. There is no `XERO_TOKEN_PATH`: the access/refresh
-> tokens are persisted **encrypted in Postgres** (settings/connector rows, decrypted with
-> `SETTINGS_ENCRYPTION_KEY`).
-
-### Foreign Exchange Rates
-
-> The base currency is `Organisation.baseCurrency`, set once in Settings -> Company and read by
-> `lib/base-currency.ts` (default `GBP`). `FX_BASE_CURRENCY` was documented here and read by
-> nothing, including the installer (o3d-esha).
-
-Note: FX rates are fetched daily via cron job (`/api/cron/fx-rates`) using free [frankfurter.dev](https://frankfurter.dev) API (ECB data, no API key required).
-
-### Email (SMTP)
-
-These are an **install-time seed only**. `scripts/provision-instance.mjs` reads them once and
-writes them into the `settings` table (`email_smtp_*`); at runtime `lib/mailer.ts` reads those
-settings and never the environment. Editing them on a running install changes nothing - change
-mail settings in Settings -> Email.
-
-| Variable | Required | Description | Example |
-|----------|----------|-------------|---------|
-| `SMTP_HOST` | No | Email server hostname | `smtp.gmail.com` |
-| `SMTP_PORT` | No | Email server port | `587` |
-| `SMTP_SECURE` | No | Encryption type | `tls`, `ssl`, or `none` |
-| `SMTP_USER` | No | SMTP username | `noreply@company.com` |
-| `SMTP_PASS` | No | SMTP password (spelled `SMTP_PASS`, not `SMTP_PASSWORD`) | App-specific password (not your account password) |
-| `SMTP_FROM_EMAIL` | No | From address on emails | `ims@yourdomain.com` |
-| `SMTP_FROM_NAME` | No | From name on emails | `onetwoInventory` |
-| `SMTP_REPLY_TO` | No | Reply-to address on emails | `support@yourdomain.com` |
-
-### File Storage & Uploads
-
-See `.env.example` for the storage roots that are actually read (`UPLOAD_STORAGE_DIR`,
-`PUBLIC_UPLOAD_STORAGE_DIR`, `INVOICE_PDF_STORAGE_DIR`, `BACKUP_DIR`).
-
-> `PDF_TEMP_DIR`, `UPLOAD_TEMP_DIR` and `UPLOAD_MAX_SIZE_MB` were documented here and read by
-> nothing (o3d-esha). Generated PDFs are never written to disk (`lib/pdf.ts` buffers them),
-> temporary scan/upload paths come from `os.tmpdir()`, and the size caps are per-kind constants:
-> 10 MB CSV import (`app/actions/import.ts`), 2 MB avatar / 5 MB logo / 20 MB supplier invoice
-> (`lib/security/upload-validation.ts`).
-
-### Logging
-
-There is no logger module and no log configuration: output is plain `console.*` at fixed severity.
-`LOG_LEVEL` and `LOG_FORMAT` were documented here and read by nothing (o3d-esha).
-
-See `.env.example` for complete list and additional settings.
-
-## Key Modules & Responsibilities
-
-| Module | Location | Purpose | Owner |
-|--------|----------|---------|-------|
-| **Product Management** | `app/actions/products.ts`, `components/inventory/` | CRUD for products, variants, BOMs, pricing, stock units | Inventory team |
-| **Stock Control** | `app/actions/stock.ts`, `app/(dashboard)/stock-control/` | Adjustments, transfers, counts, movements, audit | Warehouse team |
-| **Sales Orders** | `app/actions/sales.ts`, `app/(dashboard)/sales/` | Order workflow, allocation, shipment, invoicing, credit notes | Sales team |
-| **Purchase Orders** | `app/actions/purchase-orders.ts`, `app/(dashboard)/purchase-orders/` | PO creation, RFQ, receipt, landed costs, returns | Procurement team |
-| **Manufacturing** | `app/actions/manufacturing.ts`, `app/(dashboard)/manufacturing/` | Production orders, BOM, component allocation, output | Production team |
-| **WooCommerce Sync** | `lib/connectors/woocommerce/`, `app/actions/wc-sync.ts` | Order/product sync, tax mapping, webhooks, cron polling | Dev team |
-| **Xero Integration** | `lib/connectors/xero/`, `app/actions/xero-sync.ts` | Sub-ledger batch sync, journal posting, COGS, reconciliation | Finance/Dev team |
-| **Authentication** | `lib/auth/`, `app/(auth)/`, `app/actions/auth.ts` | Login, 2FA, passkeys, roles, sessions, RBAC | Dev team |
-| **PDF Generation** | `lib/pdf.ts`, `app/api/*/[id]/route.ts` | Branded PDFs (order, invoice, RFQ, PO, shipment) | Dev team |
-| **Notifications** | `lib/mailer.ts`, `app/api/notifications/` | Email delivery, notification history, preferences | Dev team |
-| **Activity Log** | `lib/activity-log.ts`, `app/(dashboard)/activity/` | Audit trail, searchable logs, compliance | Compliance team |
-| **Settings** | `app/(dashboard)/settings/`, `app/actions/settings.ts` | Company config, users, integrations, backup, tax rates | Admin |
-
-## Production Deployment
-
-**Current Setup:** The stage instance runs as the non-root **`ims`** user from
-`/opt/ims/onetwo3d-ims` (the tree `/root/ims/onetwo3d-ims` is a symlink to it) under systemd on
-port **3000**. The live unit is `ims-stage-dev.service` (`next dev`, hot-reload, on the
-`development` branch); the hardened `ims-stage.service` (`next start`, loopback-only, sandboxed)
-is its intended replacement — see [`deploy/README.md`](deploy/README.md) for the units and the
-migration. Xero tokens live encrypted in Postgres, not a token file (see the env note above).
-
-**After Code Changes** (live stage tree, hot-reloaded — usually no rebuild needed):
+After code changes (hot-reloaded, usually no rebuild):
 1. Merge to `development` (IMS PRs target `development`, not `main`).
-2. On the host, as the `ims` user: `git -C /opt/ims/onetwo3d-ims pull` (never run git in this tree as root).
+2. On the host, as `ims`: `git -C /opt/ims/onetwo3d-ims pull`. Never run git in this tree as root.
 3. If dependencies/schema changed: `npm install`, `prisma migrate deploy`, `prisma generate`.
-4. `next dev` hot-reloads code edits; restart only when needed:
-   `systemctl restart ims-stage-dev.service` (or `ims-stage.service` once migrated).
-5. Verify locally on `http://127.0.0.1:3000` (behind nginx at the stage hostname).
+4. Restart only when needed: `systemctl restart ims-stage-dev.service` (or `ims-stage.service` once migrated).
+5. Verify on `http://127.0.0.1:3000` (nginx fronts the stage hostname).
 
-**Deploy order:** the old process must be fully stopped before the new one is started — never run
-two versions against the same database at once (no rolling restart, no blue/green overlap).
+Deploy order: the old process must be fully stopped before the new one starts. Never run two versions against the same database (no rolling restart, no blue/green overlap).
 
-Money posts stamp `accounting_sync_logs.remoteAttemptedAt` before the remote call, and an unstamped
-row is treated as proof that nothing was ever sent from it. Whether that proof holds is recorded on
-the row itself, in `attemptStampingCustodyAt`: a version that does not write the column leaves it
-NULL when it creates a row, and a database trigger nulls it when such a version claims one. Rows
-outside custody are never recycled, and the first sync run of a version that does stamp marks them
-as attempted. So an overlap — or a **rollback**, which no deploy order can prevent, since rolling
-back is a sequential deploy — is self-declaring and heals at the next sync run: no operator step, no
-setting to clear. See `lib/domain/accounting/money-attempt-provenance.ts`.
+Money posts stamp `accounting_sync_logs.remoteAttemptedAt` before the remote call, and an unstamped row is proof nothing was sent from it. Whether that proof holds is recorded on the row in `attemptStampingCustodyAt`: a version that does not write the column leaves it NULL when it creates a row, and a database trigger nulls it when such a version claims one. Rows outside custody are never recycled, and the first sync run of a version that stamps marks them as attempted. So an overlap, or a rollback (which no deploy order can prevent, since rolling back is a sequential deploy), is self-declaring and heals at the next sync run: no operator step, no setting to clear. See `lib/domain/accounting/money-attempt-provenance.ts`.
 
-**Database migrations:**
-- Migrations are applied during `npm run build` via `prisma migrate deploy` in postinstall hook
-- Always review schema.prisma changes before deployment
-- Follow `docs/migration-conventions.md` for NOT NULL add-columns, NOT VALID constraints, column renames, large-table indexes, and column drops
-- Test migrations on staging first
-- **Expand-only rule for the production blue/green deploy:** a migration that ships in a normal deploy must work with the previous release, which keeps serving while it runs. Mark it with `-- expand-only` as the FIRST line of its `migration.sql` (additive changes only). `deploy/bin/deploy.sh` refuses any pending migration without the marker, and `rollback.sh` refuses to roll back across one. A contract (destructive) migration goes out alone as a maintenance deploy (`--allow-contract-migration --maintenance`). See `deploy/README.md`, "Production host: blue/green deploy".
+Database migrations:
+- Applied during `npm run build` via `prisma migrate deploy` (postinstall hook). Review `schema.prisma` changes before deploying; test migrations on staging first.
+- Follow `docs/migration-conventions.md` (NOT NULL add-columns, NOT VALID constraints, column renames, large-table indexes, column drops).
+- Expand-only rule for the production blue/green deploy: a migration in a normal deploy must work with the previous release, which keeps serving while it runs. Make `-- expand-only` the FIRST line of its `migration.sql` (additive changes only). `deploy/bin/deploy.sh` refuses any pending migration without the marker and `rollback.sh` refuses to roll back across one. A contract (destructive) migration ships alone as a maintenance deploy (`--allow-contract-migration --maintenance`). See `deploy/README.md`, "Production host: blue/green deploy".
 
-See `@docs/deployment.md` for full deployment guide including backups, monitoring, and rollback procedures.
-
-## Security Checklist
-
-Every change must verify:
-- [ ] **Authentication:** Endpoints require valid session (use `requireAuth()`)
-- [ ] **Authorization:** Role checks in place (use `requirePermission()` / `hasPermission()`)
-- [ ] **Input Validation:** Zod schema validates all server action inputs
-- [ ] **SQL Injection:** Prisma parameterized queries prevent injection
-- [ ] **XSS:** React auto-escapes, but avoid `dangerouslySetInnerHTML`
-- [ ] **CSRF:** NextAuth provides automatic CSRF tokens
-- [ ] **Data Exposure:** No sensitive data (passwords, secrets) in responses
-- [ ] **Cron Security:** Cron endpoints protected by CRON_SECRET header
-- [ ] **File Upload Security:** Validate MIME types, enforce size limits, sanitize filenames
-- [ ] **API Rate Limiting:** Consider rate limiting on public endpoints (webhooks)
-
-## Recent Features (Latest Commits)
-
-- **Partial Fulfillment:** Ship available items now, allocate and ship the rest later. Allocation panel reappears for unfulfilled lines after partial shipment.
-- **PICKING Guard:** Blocks transition to Picking status when no allocations exist, preventing empty picks.
-- **Packing Slip Legacy Support:** Packing slip PDF works for orders without shipments (legacy flow) using order lines directly.
-- **Xero Sub-Ledger Batch Sync:** Daily batch sync of journal entries to Xero GL (replaces real-time sync for performance)
-- **WooCommerce Tax Rate Mapping:** Automatic tax type mapping from WC to Xero during order sync
-- **Payment Account Mapping:** UI for configuring payment method → bank account mapping for reconciliation
-- **Notifications System:** Email notifications for orders, shipments, and sync events with preference management
-- **Invoice Delegation:** Support for delegated invoice generation workflows (finance team can approve before sending)
-- **Passkey/WebAuthn Support:** FIDO2 passwordless authentication alongside TOTP 2FA
-- **Supplier Portal:** Separate RBAC role for suppliers to view orders and delivery status
-
-## Documentation References
-
-- `@README.md` — Project overview and quick links
-- `@docs/architecture.md` — Detailed architectural decisions and data flow
-- `@docs/configuration.md` — Integration setup guides (WooCommerce, Xero, SMTP)
-- `@docs/development.md` — Development workflow, branching strategy, PR process
-- `@docs/deployment.md` — Production deployment procedures and monitoring
-- `@CLAUDE.md` — This file (primary project documentation)
-- `@docs/getting-started.md` — User onboarding and feature overview
-
-## Git Workflow
-
-- **Main branch:** Always production-ready, reflects live environment
-- **Feature branches:** `feature/description` from main
-- **Bug fix branches:** `fix/description` from main
-- **Commit messages:** Clear and descriptive (e.g., "Add COGS recalculation on landed cost edit")
-- **Push:** Commit + push after completing features
-- **PR:** Direct commits to main after local testing (no PR process currently)
-
-See `@docs/development.md` for full workflow details.
-
-## Debugging Tips
-
-**Check Prisma Schema:**
-```bash
-npx prisma studio    # Visual DB explorer on localhost:5555
-npx prisma db pull   # Sync schema from database
-```
-
-**Debug Server Actions:**
-- Add console.log statements (visible in server logs)
-- Check NextAuth session: `const session = await requireAuth()`
-- Verify role permissions: `hasPermission(session.user.role, 'permission')`
-- Check activity log for errors: `app/(dashboard)/activity/`
-
-**Debug Database Queries:**
-- Enable Prisma debug logs: `DEBUG="prisma:*" npm run dev`
-- Use Prisma Studio to inspect data
-
-**Debug Integrations:**
-- WooCommerce: Check sync job logs in `app/(dashboard)/sync/`
-- Xero: Check sync status and journal entries in `app/(dashboard)/sync/`
-- Check email delivery in SMTP logs or notification history
-
-**Check Environment Variables:**
-- Verify `.env` file exists and is not in `.gitignore`
-- Never commit secrets; use `.env.example` as template
-- Check `NEXT_PUBLIC_*` variables don't contain secrets
-
-**TypeScript Errors:**
-```bash
-npm run type-check    # Full TypeScript check across entire project
-npm run lint          # ESLint style and quality checks
-```
-
-## Contact & Support
-
-- **Product Owner:** One Two Enterprises Ltd
-- **Repository:** git@github.com:OneTwo3D/IMS.git
-- **Issues:** Document in activity log + GitHub issues
-- **Questions:** Reference docs first, then contact dev team
-- **Reporting Bugs:** Include relevant activity log entries and environment details
-
-## Skill Usage Guide
-
-When working on tasks involving these technologies, invoke the corresponding skill:
-
-| Skill | Use When |
-|-------|----------|
-| typescript | Enforcing TypeScript strict mode with type safety across all code |
-| node | Executing JavaScript on server with Node.js runtime |
-| react | Managing React components, hooks, and client-side state patterns |
-| postgresql | Managing PostgreSQL schemas and database migrations |
-| prisma | Accessing databases with type-safe Prisma ORM queries |
-| tailwind | Applying utility-first CSS styling with Tailwind CSS 4.x |
-| zod | Validating input data with Zod schema definitions |
-| nextauth | Implementing authentication with NextAuth.js sessions and RBAC |
-| shadcn-ui | Implementing accessible UI components from Shadcn/UI library |
-| frontend-design | Designing UI with Tailwind CSS, components, and accessibility patterns |
-| nodemailer | Sending SMTP emails through Nodemailer integration |
-| nextjs | Building full-stack apps with App Router and Server Components |
-| designing-onboarding-paths | Designing onboarding paths, checklists, and first-run UI |
-| writing-release-notes | Drafting release notes tied to shipped features |
-| designing-inapp-guidance | Building tooltips, tours, and contextual guidance |
-| eslint | Enforcing code quality with ESLint configuration |
-| orchestrating-feature-adoption | Planning feature discovery, nudges, and adoption flows |
-| structuring-offer-ladders | Framing plan tiers, value ladders, and upgrade logic |
-| framing-release-stories | Building launch narratives, assets, and rollout checklists |
-| mapping-user-journeys | Mapping in-app journeys and identifying friction points in code |
-| streamlining-signup-steps | Reducing friction in signup and trial activation flows |
-| accelerating-first-run | Improving onboarding sequence and time-to-value |
-| tuning-landing-journeys | Improving landing page flow, hierarchy, and conversion paths |
-| inspecting-search-coverage | Auditing technical and on-page search coverage |
-| adding-structured-signals | Adding structured data for rich results |
-| pdfkit | Generating branded PDF documents with PDFKit for invoices and reports |
-| crafting-page-messaging | Writing conversion-focused messaging for pages and key CTAs |
-| instrumenting-product-metrics | Defining product events, funnels, and activation metrics |
+## Git workflow
+- IMS PRs target `development` (`gh pr create --base development`); branch details in `docs/agent-workflow.md` and `docs/development.md`.
+- Commit messages clear and descriptive (e.g. "Add COGS recalculation on landed cost edit"). Commit and push after completing features.
+- Legacy rules still in this file, which conflict with the `development` rule above (owner to resolve): main is always production-ready and reflects the live environment; feature branches `feature/description` and bug fixes `fix/description` from main; direct commits to main after local testing (no PR process).
 
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->

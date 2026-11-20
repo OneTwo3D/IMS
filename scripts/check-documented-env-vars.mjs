@@ -58,6 +58,7 @@ export const ENV_VAR_NAME_RE = /^[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)+$/
 export const DOC_SOURCES = [
   { file: '.env.example', kind: 'env' },
   { file: 'CLAUDE.md', kind: 'markdown-table' },
+  { file: 'docs/agent/env-vars.md', kind: 'markdown-table' },
   { file: 'docs/installation.md', kind: 'markdown-table' },
   { file: 'scripts/install.sh', kind: 'shell-heredoc' },
 ]
