@@ -287,7 +287,7 @@ test('a posted invoice: the update is queued in the same transaction; HELD only 
   const post = async () => {
     const id = await createConfirmed(w, [{ p: 'p1', qty: 2 }])
     await db.accountingSyncLog.deleteMany({ where: { referenceId: id } })
-    await db.salesOrder.update({ where: { id }, data: { accountingInvoiceId: `XERO-${uid()}`, accountingInvoiceConnector: 'xero', invoiceNumber: `INV-${uid()}` } })
+    await db.salesOrder.update({ where: { id }, data: { accountingInvoiceId: `XERO-${uid()}`, accountingInvoiceConnector: 'xero', invoiceNumber: `INV-${uid()}`, invoicedAt: new Date('2026-09-30T00:00:00Z') } })
     return id
   }
 
