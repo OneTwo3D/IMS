@@ -375,6 +375,12 @@ export function unresolvedWcOrderRowSql(): Prisma.Sql {
  */
 export const WC_COMPLETION_REFUSAL_RECORD_KIND = 'WC_COMPLETION_REFUSAL'
 
+/**
+ * The refusal code of an OPEN completion-refusal row that the owed-despatch retry parked because the store reopened an order it had reported completed.
+ * It is never retried and never auto-closed: only an operator confirms the order may be fulfilled by IMS (which clears the outside-IMS fence).
+ */
+export const WC_REOPENED_OPERATOR_DECISION_REFUSAL = 'store_reopened_operator_decision'
+
 /** The status an OPEN completion refusal carries. */
 export const WC_COMPLETION_REFUSAL_OPEN_STATUS = 'QUARANTINED' as const
 

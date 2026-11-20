@@ -15,10 +15,12 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { readOpeningStockCutoff } from './opening-stock-cutoff'
 import { Prisma } from '@/app/generated/prisma/client'
-import { openWcCompletionRefusalWhere, openWcCompletionRefusalRowSql, openWcCompletionRefusalIndexPredicateSql } from '@/lib/domain/sales/wc-sync-row-families'
+import { openWcCompletionRefusalWhere, openWcCompletionRefusalRowSql, openWcCompletionRefusalIndexPredicateSql, WC_REOPENED_OPERATOR_DECISION_REFUSAL } from '@/lib/domain/sales/wc-sync-row-families'
 import { parseWcGmtInstant } from './pre-cutover-order-read'
 import { readWcOrderStatus } from './status-mapping'
 import { recordWcCompletionRefusal, wcEventInstant } from './completion-refusal'
+import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
+import { lineFulfillmentLeafProductIds } from '@/lib/products/fulfillment-requirement-snapshot'
 
 const POST_DISPATCH_IMPORT_STATUSES: ReadonlySet<string> = new Set(['SHIPPED', 'COMPLETED', 'DELIVERED'])
 
@@ -41,17 +43,26 @@ export function outsideImsRetryDelayMs(checks: number): number {
   return OUTSIDE_IMS_DESPATCH_BACKOFF_MS[checks - 1] ?? OUTSIDE_IMS_DESPATCH_DAILY_BACKOFF_MS
 }
 
-/** On-hand per stocked line product of the order, as one comparable string: what an attempt could only change if a stock level moved. Reservations are excluded on purpose (an attempt itself moves them). */
+/** A real attempt is forced at least this often whatever the stock signature says (a backstop for anything the signature cannot see). */
+export const OUTSIDE_IMS_DESPATCH_FORCED_ATTEMPT_MS = 23 * 60 * 60_000
+
+/**
+ * What an attempt DRAWS ON, as one comparable string: for every leaf product allocation would reserve for the order (KITs and BOMs expanded to their components with
+ * the same graph and pins allocation uses), the on-hand AND reserved quantity per warehouse. Receipts move the first, other orders releasing reservations move the second. An attempt's own
+ * reserve and release nets to zero between checks, so it does not move the signature.
+ */
 async function readStockSignature(orderId: string): Promise<string> {
-  const lines = await db.salesOrderLine.findMany({ where: { orderId, productId: { not: null } }, select: { productId: true } })
-  const productIds = [...new Set(lines.map((line) => line.productId as string))]
-  if (productIds.length === 0) return ''
-  const levels = await db.stockLevel.findMany({ where: { productId: { in: productIds } }, select: { productId: true, warehouseId: true, quantity: true } })
-  return levels.map((level) => `${level.productId}:${level.warehouseId}:${level.quantity.toString()}`).sort().join('|')
+  const lines = await db.salesOrderLine.findMany({ where: { orderId, productId: { not: null } }, select: { id: true, productId: true, fulfillmentRequirements: true } })
+  if (lines.length === 0) return ''
+  const graph = await loadFulfillmentProductGraph(db, [...new Set(lines.map((line) => line.productId as string))])
+  const leafIds = lineFulfillmentLeafProductIds(lines.map((line) => ({ id: line.id, productId: line.productId, fulfillmentRequirements: line.fulfillmentRequirements })), graph)
+  if (leafIds.length === 0) return ''
+  const levels = await db.stockLevel.findMany({ where: { productId: { in: leafIds } }, select: { productId: true, warehouseId: true, quantity: true, reservedQty: true } })
+  return levels.map((level) => `${level.productId}:${level.warehouseId}:${level.quantity.toString()}:${level.reservedQty.toString()}`).sort().join('|')
 }
 
-/** The store statuses in which an order is genuinely back to an unfulfilled, live state (it can still be sent from the warehouse). Cancelled and refunded are not. */
-const UNFULFILLED_LIVE_STATUSES: ReadonlySet<string> = new Set(['PROCESSING', 'ON_HOLD', 'PENDING_PAYMENT'])
+/** The store statuses in which an order has been REOPENED (it reads as unfulfilled). The goods may still have left, so this only parks the row for an operator; cancelled and refunded are closed as before. */
+const REOPENED_LIVE_STATUSES: ReadonlySet<string> = new Set(['PROCESSING', 'ON_HOLD', 'PENDING_PAYMENT'])
 
 type Reading = { slug: string; imsStatus: string | null }
 type Dated = Pick<WcFullOrder, 'date_completed_gmt' | 'date_paid_gmt' | 'date_created_gmt'>
@@ -203,7 +214,7 @@ export type OwedDespatchRetryResult = { scanned: number; booked: number; stillOw
 
 type RetryPayload = {
   terminal?: boolean; occurrences?: number; firstRefusedAt?: string; refusal?: string
-  retryChecks?: number; retryAttempts?: number; lastAttemptAt?: string; nextAttemptAt?: string; stockSignature?: string
+  retryChecks?: number; retryAttempts?: number; lastAttemptAt?: string; lastRealAttemptAt?: string; nextAttemptAt?: string; stockSignature?: string
 }
 
 /**
@@ -213,9 +224,12 @@ type RetryPayload = {
  *              1 hour, 4 hours, then daily. So the 14-day age bound is the one that binds, not the attempt count.
  *   ATTEMPT    counted ONCE, here, in `retryAttempts` (the row's `occurrences` is the refusal counter shown to operators and no longer bounds anything).
  *   UNCHANGED  when no on-hand level of the order's stocked products has changed since the last attempt, nothing could differ: the booking is skipped
- *              (no reserve, release, stock sync or activity row) and is not counted as an attempt.
+ *              (no reserve, release, stock sync or activity row) and is not counted as an attempt. The signature is kept only after an attempt that ended in a genuine stock shortfall.
  *   TERMINAL   past `OUTSIDE_IMS_DESPATCH_MAX_ATTEMPTS` attempts or `OUTSIDE_IMS_DESPATCH_MAX_AGE_MS` the row is marked terminal (it stays open under Sync > Exceptions, says so, and is no longer retried).
- *   REOPENED   a store order that is no longer despatched closes the row; when it is back in an unfulfilled live state the outside-IMS fence is cleared too.
+ *   REOPENED   a store order that is no longer despatched closes the row; when it is cancelled or refunded the fence stays. When the store shows it reopened (processing, on hold,
+ *              pending payment) the row is PARKED for an operator (refusal `store_reopened_operator_decision`, listed under Sync > Exceptions) and the fence is left set: the store said the goods
+ *              left, and a reopen (a dispute hold, an edit) is not proof they did not. Only `releaseReopenedOrderFence` (an audited operator action) clears it.
+ *   FORCED     whatever the signature says, a real attempt is made at least every 23 hours.
  */
 export async function retryOwedOutsideImsDespatches(
   limit = 20,
@@ -245,68 +259,104 @@ export async function retryOwedOutsideImsDespatches(
     const ageMs = payload.firstRefusedAt ? now.getTime() - Date.parse(payload.firstRefusedAt) : 0
     const attempts = payload.retryAttempts ?? 0
     if (attempts >= OUTSIDE_IMS_DESPATCH_MAX_ATTEMPTS || ageMs > OUTSIDE_IMS_DESPATCH_MAX_AGE_MS) {
-      await db.shoppingSyncLog.update({
-        where: { id: row.id },
-        data: {
-          payload: { ...payload, terminal: true } as never,
-          errorMessage: `Gave up retrying this despatch after ${attempts} attempt(s) / ${Math.round(ageMs / 86_400_000)} day(s): IMS still has no stock to consume for an order that was first seen already completed. Receive the stock and ship the order by hand, or cancel it.`,
-        },
-      })
+      await mergeRowPayload(row.id, { terminal: true }, [],
+        `Gave up retrying this despatch after ${attempts} attempt(s) / ${Math.round(ageMs / 86_400_000)} day(s): IMS still has no stock to consume for an order that was first seen already completed. Receive the stock and ship the order by hand, or cancel it.`)
       await logActivity({ entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_import_first_seen_despatch_gave_up', tag: 'sync', level: 'WARNING', resolveUser: false, description: 'IMS gave up retrying the despatch of an order first seen already completed; it stays listed under Sync > Exceptions.' })
       result.terminal++
       continue
     }
+    const checks = (payload.retryChecks ?? 0) + 1
+    const schedule = { retryChecks: checks, lastAttemptAt: now.toISOString(), nextAttemptAt: new Date(now.getTime() + outsideImsRetryDelayMs(checks)).toISOString() }
     const live = await read(String(row.externalId ?? ''))
-    if (!('order' in live)) { result.failed++; continue }
+    if (!('order' in live)) {
+      // A failed or gone read is scheduled like any check, so it cannot stay due (and first in line) every tick.
+      await mergeRowPayload(row.id, schedule)
+      result.failed++
+      continue
+    }
     try {
       // The store may have moved on since the refusal (back to processing, refunded, cancelled): book only what it STILL says was despatched at or after the cut-off.
       const reading = await readWcOrderStatus(live.order.status)
       if (!firstSeenOutsideIms(reading, live.order, await readOpeningStockCutoffIfNeeded(reading, live.order)).despatched) {
-        const clearFence = reading.slug !== 'refunded' && reading.imsStatus !== null && UNFULFILLED_LIVE_STATUSES.has(reading.imsStatus)
-        // ONE transaction: the row closes and (for a genuinely reopened order) the fence comes off, so neither can stand without the other.
-        const cleared = await db.$transaction(async (tx) => {
-          await tx.shoppingSyncLog.update({ where: { id: row.id }, data: { status: 'SYNCED', syncedAt: now, errorMessage: `Closed without booking: the store order is now "${String(live.order.status)}", no longer a despatch IMS owes.` } })
-          if (!clearFence) return false
-          const updated = await tx.salesOrder.updateMany({ where: { id: orderId, outsideImsFulfilmentAt: { not: null }, status: { in: ['PROCESSING', 'ALLOCATED'] } }, data: { outsideImsFulfilmentAt: null } })
-          return updated.count > 0
-        })
-        if (cleared) {
+        const reopened = reading.slug !== 'refunded' && reading.imsStatus !== null && REOPENED_LIVE_STATUSES.has(reading.imsStatus)
+        if (reopened) {
+          // PARKED FOR AN OPERATOR, FENCE LEFT SET: nothing here may make the order eligible for a warehouse push or an allocation sweep.
+          await mergeRowPayload(row.id, { ...schedule, terminal: true, refusal: WC_REOPENED_OPERATOR_DECISION_REFUSAL, wcStatus: String(live.order.status), reopenedAt: now.toISOString() }, [],
+            `Store reopened (now "${String(live.order.status)}") - operator decision needed. The store had reported this order completed, so its goods may already have left; IMS keeps it fenced from the warehouse and from allocation. `
+            + 'If the goods really did not leave and IMS should fulfil it, confirm that here; otherwise leave it, or complete or cancel the order.')
           await logActivity({
-            entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_import_first_seen_outside_ims_fence_cleared', tag: 'sync', level: 'INFO', resolveUser: false,
-            description: `The store reports order ${String(live.order.number ?? '')} as "${String(live.order.status)}" again, so it is no longer a despatch made outside IMS: the outside-IMS fence was removed and the order can be allocated and sent from the warehouse as normal.`,
+            entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_import_first_seen_store_reopened', tag: 'sync', level: 'WARNING', resolveUser: false,
+            description: `The store reports order ${String(live.order.number ?? '')} as "${String(live.order.status)}" again after it was first seen completed (a despatch made outside IMS). IMS did not book the despatch and left the order fenced from the warehouse and allocation; it is listed under Sync > Exceptions for an operator decision.`,
             metadata: { externalOrderId: live.order.id, wcStatus: live.order.status },
           })
           result.reopened++
+          continue
         }
+        await db.shoppingSyncLog.update({ where: { id: row.id }, data: { status: 'SYNCED', syncedAt: now, errorMessage: `Closed without booking: the store order is now "${String(live.order.status)}", no longer a despatch IMS owes.` } })
         result.resolved++
         continue
       }
       const stockSignature = await readStockSignature(orderId)
-      const checks = (payload.retryChecks ?? 0) + 1
-      const schedule = { retryChecks: checks, lastAttemptAt: now.toISOString(), nextAttemptAt: new Date(now.getTime() + outsideImsRetryDelayMs(checks)).toISOString() }
-      if (payload.stockSignature !== undefined && payload.stockSignature === stockSignature) {
-        // Nothing an attempt depends on has changed since the last one: no attempt, no churn, no log. Only the schedule moves.
-        await persistRetryState(row.id, { ...schedule })
+      const forced = !payload.lastRealAttemptAt || now.getTime() - Date.parse(payload.lastRealAttemptAt) >= OUTSIDE_IMS_DESPATCH_FORCED_ATTEMPT_MS
+      if (!forced && payload.stockSignature !== undefined && payload.stockSignature === stockSignature) {
+        // Nothing an attempt draws on has changed since the last one: no attempt, no churn, no log. Only the schedule moves.
+        await mergeRowPayload(row.id, schedule)
         result.skipped++
         result.stillOwed++
         continue
       }
-      await persistRetryState(row.id, { ...schedule, retryAttempts: attempts + 1, stockSignature })
+      // The signature is dropped for the attempt and put back only if it ends in a genuine stock shortfall.
+      await mergeRowPayload(row.id, { ...schedule, retryAttempts: attempts + 1, lastRealAttemptAt: now.toISOString() }, ['stockSignature'])
       const outcome = await bookOutsideImsDespatch(orderId, live.order)
-      if (outcome === 'booked') result.booked++
-      else result.stillOwed++
+      if (outcome === 'booked') { result.booked++; continue }
+      result.stillOwed++
+      const after = await db.shoppingSyncLog.findFirst({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId }, select: { payload: true } })
+      // Any other refusal (allocation or shipment creation failed, a lock timeout, a coverage shortfall waiting on refunds) clears when its cause does, with no stock level moving: never skip on it.
+      if ((after?.payload as { refusal?: string } | null)?.refusal === 'insufficient_physical_stock') await mergeRowPayload(row.id, { stockSignature })
     } catch {
-      // A failed attempt says nothing about stock: forget the signature so the next due check really tries again.
-      await persistRetryState(row.id, { stockSignature: undefined }).catch(() => undefined)
+      // A failed attempt says nothing about stock: the signature stays dropped, so the next due check really tries again.
+      await mergeRowPayload(row.id, {}, ['stockSignature']).catch(() => undefined)
       result.failed++
     }
   }
   return result
 }
 
-/** Merge retry bookkeeping into the row's payload, touching only the open row (a row the booking just resolved is left alone). */
-async function persistRetryState(rowId: string, patch: Partial<RetryPayload>): Promise<void> {
-  const current = await db.shoppingSyncLog.findFirst({ where: { id: rowId, ...openWcCompletionRefusalWhere() }, select: { payload: true } })
-  if (!current) return
-  await db.shoppingSyncLog.updateMany({ where: { id: rowId, ...openWcCompletionRefusalWhere() }, data: { payload: { ...((current.payload ?? {}) as object), ...patch } as never } })
+/**
+ * Merge keys into (and remove keys from) the payload of an OPEN completion-refusal row, IN SQL (`payload || patch`), so a concurrent refusal re-record (a webhook delivery moving
+ * `refusedEventAt`, `lastRefusedAt`, `error`) is never overwritten with a stale copy. A row that is no longer open is left alone.
+ */
+async function mergeRowPayload(rowId: string, patch: Record<string, unknown>, remove: string[] = [], errorMessage?: string): Promise<void> {
+  const cleaned = JSON.parse(JSON.stringify(patch)) as Record<string, unknown>
+  await db.$executeRaw(Prisma.sql`
+    UPDATE "shopping_sync_logs"
+       SET payload = (COALESCE(payload, '{}'::jsonb) || ${JSON.stringify(cleaned)}::jsonb) - ${remove}::text[]
+           ${errorMessage === undefined ? Prisma.empty : Prisma.sql`, "errorMessage" = ${errorMessage}`}
+     WHERE id = ${rowId} AND ${Prisma.raw(openWcCompletionRefusalIndexPredicateSql())}`)
+}
+
+/**
+ * The audited OPERATOR action that releases the outside-IMS fence of an order the store reopened (the row the retry parked as `store_reopened_operator_decision`). Only after this
+ * can IMS allocate the order and a warehouse push include it: the caller must hold the sync permission and a fresh sign-in (app/actions/sync-exceptions.ts). One transaction under the order lock:
+ * the parked row must still be open and the order unshipped and still fenced, the fence comes off, the row closes.
+ */
+export async function releaseReopenedOrderFence(orderId: string, userId: string | null): Promise<{ success: true } | { success: false; error: string }> {
+  const outcome = await db.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM sales_orders WHERE id = ${orderId} FOR UPDATE`
+    const row = await tx.shoppingSyncLog.findFirst({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId }, select: { id: true, payload: true } })
+    if ((row?.payload as { refusal?: string } | null)?.refusal !== WC_REOPENED_OPERATOR_DECISION_REFUSAL) return { ok: false as const, error: 'This order has no store-reopened decision waiting (already handled).' }
+    const order = await tx.salesOrder.findUnique({ where: { id: orderId }, select: { status: true, outsideImsFulfilmentAt: true, orderNumber: true } })
+    if (!order) return { ok: false as const, error: 'The order no longer exists.' }
+    if (order.status !== 'PROCESSING' && order.status !== 'ALLOCATED') return { ok: false as const, error: `The order is ${order.status}: it is no longer waiting for a fulfilment decision.` }
+    if (order.outsideImsFulfilmentAt) await tx.salesOrder.update({ where: { id: orderId }, data: { outsideImsFulfilmentAt: null } })
+    await tx.$executeRaw(Prisma.sql`UPDATE "shopping_sync_logs" SET status = 'SYNCED'::"ShoppingSyncStatus", "syncedAt" = now(), "errorMessage" = 'Operator confirmed IMS may fulfil this reopened order.' WHERE id = ${row!.id}`)
+    return { ok: true as const, orderNumber: order.orderNumber }
+  })
+  if (!outcome.ok) return { success: false, error: outcome.error }
+  await logActivity({
+    entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_import_first_seen_outside_ims_fence_released', tag: 'sync', level: 'WARNING', resolveUser: false,
+    description: `An operator confirmed that order ${outcome.orderNumber ?? orderId}, reopened in the store after it was first seen completed, may be fulfilled by IMS: the outside-IMS fence was removed, so it can now be allocated and sent from the warehouse. The operator is responsible for checking the goods have not already left.`,
+    metadata: { orderId, userId },
+  })
+  return { success: true }
 }

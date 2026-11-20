@@ -172,7 +172,7 @@ export const RESUMABLE_STATUSES: ReadonlySet<RunStatus> = new Set<RunStatus>(['R
 export const STEP_STATUSES = ['PENDING', 'RUNNING', 'DONE', 'FAILED', 'CONFLICT'] as const
 export type StepStatus = (typeof STEP_STATUSES)[number]
 
-export const APPLY_REPORT_FORMAT_VERSION = 2
+export const APPLY_REPORT_FORMAT_VERSION = 3
 
 /**
  * WHAT A REPORT ROW MAY CARRY (docs/first-load-apply.md, "What a report contains"). A report is a private operator artefact. Per unit it holds the

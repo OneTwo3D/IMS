@@ -50,6 +50,7 @@ import {
   clearPennyMismatchFlag,
   clearDoublePostageFlag,
   dismissWithdrawnDispatch,
+  confirmReopenedOrderFulfillableByIms,
   acknowledgeWmsAmendNotice,
   claimAccountingPostingRefusalForHandPostingAction,
   listAccountingHandPostClaimsAction,
@@ -1552,7 +1553,7 @@ export function ExceptionsClient({ data }: Props) {
         <Card className="p-4 space-y-3">
           <SectionHeading
             title={`WooCommerce orders — completed in the store but not fulfilled in IMS (${data.summary.wcCompletionRefusals})`}
-            detail="WooCommerce says these orders are completed, but IMS refused to turn that into shipments (for example the shipment lines do not cover what was ordered, net of refunds). The store's notification was acknowledged and will not be sent again, so nothing brings the order back on its own. Open the order, put the shortfall right (or fulfil it in IMS), and the row clears by itself once the order is shipped, completed or cancelled; there is nothing to acknowledge here."
+            detail="WooCommerce says these orders are completed, but IMS refused to turn that into shipments (for example the shipment lines do not cover what was ordered, net of refunds). The store's notification was acknowledged and will not be sent again, so nothing brings the order back on its own. Open the order, put the shortfall right (or fulfil it in IMS), and the row clears by itself once the order is shipped, completed or cancelled. The exception is an order the store has REOPENED after it was completed: IMS keeps it fenced from the warehouse (the goods may already have left) and shows a Confirm button, which asks you to sign in again and records who confirmed that IMS may fulfil it."
             shown={data.wcCompletionRefusals.length}
             total={data.summary.wcCompletionRefusals}
           />
@@ -1563,6 +1564,7 @@ export function ExceptionsClient({ data }: Props) {
                 <TableHead>Why IMS refused</TableHead>
                 <TableHead>Refused</TableHead>
                 <TableHead>Since</TableHead>
+                <TableHead className="text-right">Action</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -1574,6 +1576,19 @@ export function ExceptionsClient({ data }: Props) {
                   <TableCell className="text-xs text-muted-foreground max-w-[520px]" title={row.detail}>{row.detail || row.refusal}</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{row.occurrences}x</TableCell>
                   <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.raisedAt)}</TableCell>
+                  <TableCell className="text-right">
+                    {row.refusal === 'store_reopened_operator_decision' ? (
+                      <Button
+                        type="button"
+                        variant="ghost"
+                        size="sm"
+                        disabled={isPending}
+                        onClick={() => runAction(() => confirmReopenedOrderFulfillableByIms(row.orderId), `IMS may now fulfil ${row.orderNumber ?? row.orderId}.`)}
+                      >
+                        <CheckCircle2 className="h-3 w-3 mr-1" />Confirm IMS may fulfil
+                      </Button>
+                    ) : null}
+                  </TableCell>
                 </TableRow>
               ))}
             </TableBody>

@@ -106,8 +106,9 @@ export function createDbPorts(prepared: PreparedRun, options: DbPortsOptions): A
     preflight: async ({ resuming }) => {
       const problems = note(await evaluateRailResults(prepared, { phase: 'preflight', resuming, step: null }, options.preload))
       // The stock extract instant is judged against THIS apply instant before anything is written (a plan reports it too).
-      // Judged only while the cut-off is NOT yet on the run record: once it is recorded the age bound protects nothing, and a resume (or the verification-only resume of an APPLIED
-      // run) after 45 days must not be refused over a digest-bound value that cannot be corrected. The refusal is filed under its own rail so the report names it.
+      // Judged here only while the cut-off is NOT yet on the run record, so a verification-only resume of an APPLIED run (and any resume of a run that got past the first opening-stock
+      // write) after 45 days is not refused over a digest-bound value that cannot be corrected. A resume that still has opening-stock writes to make is also judged by the
+      // before-first-write recheck below, on purpose: the fact records the instant, not that the stock was loaded. The refusal is filed under its own rail so the report names it.
       const extractedAt = prepared.manifest.stockExtractedAt
       if (prepared.steps.some((st) => st.step === 'opening-stock') && extractedAt !== null && (await loadFacts())[OPENING_STOCK_CUTOFF_FACT] === undefined) {
         const refusal = judgeStockExtractedAt(extractedAt, Date.now())
