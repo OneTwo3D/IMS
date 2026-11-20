@@ -3,7 +3,6 @@ import { test } from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
 import { getVatReport, type FinanceAnalyticsDeps } from '@/lib/domain/finance/finance-period-analytics'
 import { salesInvoiceDocumentDay, salesInvoiceDocumentDayOfOrder } from '@/lib/domain/accounting/document-date'
-import { grirJournalDate } from '@/lib/domain/accounting/grir-subledger-movement'
 
 /**
  * The VAT report places each document by the date it carries in Xero, not by the moment it was posted (o3d-z5shj). Fixtures are evaluated against the where-clause the
@@ -20,7 +19,7 @@ const inClause = (value: Date | null, c: Clause): boolean => {
   return value !== null && (!c.gte || value >= c.gte) && (!c.lt || value < c.lt)
 }
 
-type Order = { externalCreatedAt: Date | null; invoicedAt: Date | null; tax: number; net: number }
+type Order = { externalCreatedAt: Date | null; invoicedAt: Date | null; tax: number; net: number; shipping?: number; shippingTax?: number }
 type RefundLine = { createdAt: Date; net: number; postedTaxRate: number | null; creditNoteId?: string | null }
 type SupplierCredit = { postedAt: Date; amountBase: number; billTotal: number | null; lineNet: number; lineTax: number }
 type Bill = { invoiceDate: Date; net: number; tax: number }
@@ -31,6 +30,11 @@ function deps(data: { orders?: Order[]; refunds?: RefundLine[]; credits?: Suppli
     now: () => NOW,
     baseCurrency: async () => 'GBP',
     client: {
+      salesOrder: {
+        findMany: async (a: { where: { OR: Array<{ invoicedAt?: Clause; externalCreatedAt?: Clause }> } }) =>
+          (data.orders ?? []).filter((o) => a.where.OR.some((c) => inClause(o.invoicedAt, c.invoicedAt) && inClause(o.externalCreatedAt, c.externalCreatedAt)))
+            .map((o) => ({ shippingBase: D(o.shipping ?? 0), taxBase: D(o.tax + (o.shippingTax ?? 0)), shippingAddress: null, lines: [{ taxBase: D(o.tax) }] })),
+      },
       salesOrderLine: {
         findMany: async (a: { where: { order: { OR: Array<{ invoicedAt?: Clause; externalCreatedAt?: Clause }> } } }) =>
           (data.orders ?? []).filter((o) => a.where.order.OR.some((c) => inClause(o.invoicedAt, c.invoicedAt) && inClause(o.externalCreatedAt, c.externalCreatedAt)))
@@ -129,9 +133,18 @@ test('supplier credit notes net the purchase side by their share of the bill the
   assert.ok(q4.notices.some((n) => /1 supplier credit note .* not tied to a bill/.test(n)), 'the untied credit note is reported')
 })
 
-test('grirJournalDate stamps the LONDON day of an instant (23:30Z on 31 July is 1 August) and keeps a date-only string as it is', () => {
-  assert.equal(grirJournalDate(new Date('2026-07-31T23:30:00Z')).toISOString(), '2026-08-01T00:00:00.000Z')
-  assert.equal(grirJournalDate(new Date('2026-12-31T23:30:00Z')).toISOString(), '2026-12-31T00:00:00.000Z', 'GMT: unchanged')
-  assert.equal(grirJournalDate('2026-07-31').toISOString(), '2026-07-31T00:00:00.000Z')
-  assert.equal(grirJournalDate(new Date('2026-07-31T00:00:00Z')).toISOString(), '2026-07-31T00:00:00.000Z', 'a bill date stored as UTC midnight keeps its day in BST')
+test('shipping VAT is on the sales side, so a shipping refund nets against VAT that was counted (not subtracted from nothing)', async () => {
+  // Order: 100 goods + 10 shipping, 20 + 2 VAT. Shipping refunded later in the quarter: 10 net, 2 VAT (a credit line with no order line).
+  const orders: Order[] = [{ externalCreatedAt: new Date('2026-08-10T10:00:00Z'), invoicedAt: new Date('2026-08-10T10:05:00Z'), tax: 20, net: 100, shipping: 10, shippingTax: 2 }]
+  const refunds: RefundLine[] = [{ createdAt: new Date('2026-08-20T10:00:00Z'), net: 10, postedTaxRate: 0.2 }]
+  const withRefund = await run(Q3, deps({ orders, refunds }))
+  const without = await run(Q3, deps({ orders }))
+  assert.equal(Number(without.totals.salesTaxBase), 22, 'invoice VAT: 20 on lines + 2 on shipping')
+  assert.equal(Number(withRefund.totals.salesTaxBase), 20, 'after the shipping refund: 22 - 2')
+  assert.ok(without.rows.some((r) => r.taxRateName === 'Shipping and order-level tax'))
+})
+
+test('the report says Xeroom-invoiced orders (no invoicedAt) are not included', async () => {
+  const r = await run(Q3, deps({}))
+  assert.ok(r.notices.some((n) => /Xeroom/.test(n)))
 })

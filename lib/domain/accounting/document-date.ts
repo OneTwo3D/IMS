@@ -11,8 +11,12 @@ import { businessDateYmd } from '@/lib/business-date'
  *    `date` with `salesInvoiceDocumentDay` (lib/connectors/woocommerce/sync/order-import.ts, both the live and the held-order builder).
  *  - PURCHASE BILL: the `invoiceDate` the operator typed, sent verbatim as the bill `date` (app/actions/purchase-orders.ts) and stored as that day's UTC midnight in
  *    `PurchaseInvoice.invoiceDate`, which is inside the same London day in both GMT and BST. The report already windows on it.
- *  - SALES CREDIT NOTE: the London day of the refund hand-off (`businessDateYmd(new Date())` in app/actions/sales.ts), i.e. of `SalesOrderRefund.createdAt`.
- *  - SUPPLIER CREDIT NOTE: the London day it was posted (`businessDateYmd(new Date())` in app/actions/purchase-orders.ts), i.e. of `SupplierCreditNote.postedAt`.
+ *  - SALES CREDIT NOTE: the London day of `SalesOrderRefund.createdAt`, on the first hand-off AND on every retry (queueRefundAccountingActions in app/actions/sales.ts reads the refund's own creation).
+ *  - SUPPLIER CREDIT NOTE: the London day of `SupplierCreditNote.postedAt`: one clock read gives both the date sent and `postedAt` (app/actions/purchase-orders.ts).
+ *  - AN UPDATE of a posted sales invoice (order edit, return-exchange) keeps the ORIGINAL document date (`originalSalesInvoiceDay`), so an edit never re-dates the invoice.
+ *
+ * NOTE ON WHO POSTS: the writer-ownership map gives sales invoices, their updates and sales credit notes to Xeroom in P1 and P2 (IMS shadows them), so these dates describe the
+ * documents IMS would send and the ones Xeroom holds; purchase bills and supplier credit notes are Qoblex-native in P1 and IMS in P2.
  */
 
 /** The date (YYYY-MM-DD) sent to the ledger as a sales invoice's Date: the London day of the order's creation instant. */
@@ -50,4 +54,14 @@ export function salesInvoiceDocumentDateWhere(window: { gte: Date; lt: Date }): 
       { externalCreatedAt: null, invoicedAt: { gte: window.gte, lt: window.lt } },
     ],
   }
+}
+
+/**
+ * The date an UPDATE of an already-posted sales invoice must carry: the date the invoice already has. In order: the London day of the storefront creation (what the importer sent),
+ * else the London day of the stored invoice stamp (the live post writes it from the payload date it sent; a repair does the same), else today (nothing posted yet).
+ */
+export function originalSalesInvoiceDay(input: { externalCreatedAt: Date | null; invoicedAt: Date | null; now?: Date }): string {
+  if (input.externalCreatedAt) return businessDateYmd(input.externalCreatedAt)
+  if (input.invoicedAt) return businessDateYmd(input.invoicedAt)
+  return businessDateYmd(input.now ?? new Date())
 }

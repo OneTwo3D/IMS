@@ -249,6 +249,13 @@ type RefundLineTaxRow = {
   } | null
 }
 
+type ShippingOrderTaxRow = {
+  shippingBase: DecimalInput
+  taxBase: DecimalInput
+  shippingAddress: unknown
+  lines: Array<{ taxBase: DecimalInput }>
+}
+
 type SupplierCreditTaxRow = {
   amountBase: DecimalInput
   purchaseInvoiceId: string | null
@@ -552,7 +559,7 @@ export async function getVatReport(
   const baseCurrency = await baseCurrencyFromDeps(options.deps)
   const window = period(filters, generatedAt)
   const reportingCategoryFilter = filters.vatReportingCategory?.trim() || undefined
-  const [salesLines, purchaseInvoices, refundLines, supplierCredits] = await Promise.all([
+  const [salesLines, purchaseInvoices, refundLines, supplierCredits, shippingOrders] = await Promise.all([
     client.salesOrderLine.findMany({
       where: {
         order: {
@@ -663,9 +670,19 @@ export async function getVatReport(
       },
       take: SOURCE_ROW_LIMIT + 1,
     }) ?? Promise.resolve([])) as Promise<SupplierCreditTaxRow[]>,
+    // SHIPPING AND OTHER ORDER-LEVEL TAX: shipping is stored on the order, not on a line, so its VAT is the order's tax less its lines' tax. Read so the sales side carries the
+    // shipping VAT a shipping refund (a credit line with no order line) takes off. Skipped under a reporting-category filter: the category of an order-level amount is not recorded.
+    reportingCategoryFilter ? Promise.resolve([]) : (client.salesOrder.findMany({
+      where: {
+        ...salesInvoiceDocumentDateWhere({ gte: window.dateFrom, lt: window.dateToExclusive }),
+        status: { not: SalesOrderStatus.CANCELLED },
+      },
+      select: { shippingBase: true, taxBase: true, shippingAddress: true, lines: { select: { taxBase: true } } },
+      take: SOURCE_ROW_LIMIT + 1,
+    }) as Promise<ShippingOrderTaxRow[]>),
   ])
   const purchaseLineCount = purchaseInvoices.reduce((sum, invoice) => sum + invoice.lines.length, 0)
-  assertSourceLimit(salesLines.length + purchaseLineCount + refundLines.length + supplierCredits.length, SOURCE_ROW_LIMIT, 'VAT report source rows')
+  assertSourceLimit(salesLines.length + purchaseLineCount + refundLines.length + supplierCredits.length + shippingOrders.length, SOURCE_ROW_LIMIT, 'VAT report source rows')
 
   type Accumulator = {
     side: 'sales' | 'purchases'
@@ -747,6 +764,24 @@ export async function getVatReport(
     }
   }
 
+  for (const order of shippingOrders) {
+    const lineTax = order.lines.reduce((sum, l) => sum.add(toDecimal(l.taxBase)), new Prisma.Decimal(0))
+    const orderLevelTax = toDecimal(order.taxBase).sub(lineTax)
+    const shipping = toDecimal(order.shippingBase)
+    if (orderLevelTax.isZero() && shipping.isZero()) continue
+    const row = getOrCreateRow({
+      side: 'sales',
+      taxRateId: null,
+      taxRateName: 'Shipping and order-level tax',
+      accountingTaxType: null,
+      reportingCategory: null,
+      jurisdiction: countryFromShippingAddress(order.shippingAddress),
+      ratePct: '0',
+    })
+    row.lineCount += 1
+    row.taxableBase = row.taxableBase.add(shipping)
+    row.taxBase = row.taxBase.add(orderLevelTax)
+  }
   // CREDIT NOTES reduce the side they credit, exactly as Xero's return nets them by credit-note date.
   for (const line of refundLines) {
     const taxRate = line.salesOrderLine?.taxRate ?? null
@@ -828,8 +863,9 @@ export async function getVatReport(
   }, [
     'VAT totals use SalesOrderLine.taxBase for invoiced sales and proportional PurchaseOrderLine.taxBase for purchase invoice lines in the period; taxable base subtracts tax for tax-inclusive sales orders. Cancelled sales orders are excluded; archived orders are included (archiving only hides an order from operational lists, while the invoice stands in the ledger).',
     'Each document is placed in the period by the date it carries in the ledger, not by the moment it was posted: a sales invoice by the London day the order was created, a purchase bill by its bill date, a sales credit note by the London day it was raised, a supplier credit note by the London day it was posted. An order with no storefront creation date falls back to the stored invoice stamp.',
-    'Sales credit notes and supplier credit notes that Xero holds are netted off their side (shown as negative amounts on the matching rate row), so a period with refunds can be compared with the Xero VAT return. A supplier credit note shares the booked tax lines of the bill it offsets in proportion to its amount; a reverse-charge credit (booked net) is approximated by that share.',
+    'Shipping and other order-level tax (the order tax less the line tax) is included on the sales side, on its own row, so a shipping refund nets against shipping VAT that was counted; it is left out when a reporting-category filter is set. Sales credit notes and supplier credit notes that Xero holds are netted off their side (shown as negative amounts on the matching rate row), so a period with refunds can be compared with the Xero VAT return. A supplier credit note shares the booked tax lines of the bill it offsets in proportion to its amount; a reverse-charge credit (booked net) is approximated by that share.',
     ...(untiedSupplierCredits > 0 ? [`${untiedSupplierCredits} supplier credit note${untiedSupplierCredits === 1 ? '' : 's'} in the period ${untiedSupplierCredits === 1 ? 'is' : 'are'} not tied to a bill, so no tax treatment is recorded for ${untiedSupplierCredits === 1 ? 'it' : 'them'}: not included. Tie it to a bill to include it.`] : []),
+    'Orders invoiced by Xeroom (an invoice number but no IMS posting date, `invoicedAt` empty) are not included: the document date Xeroom used cannot be read from IMS.',
     'Jurisdiction uses TaxRate.countryCode when configured, otherwise the sales shipping country or supplier country.',
   ], options.paginate !== false)
 }

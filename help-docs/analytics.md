@@ -255,6 +255,8 @@ Xero's VAT return is built from each document's **date**, not from the moment IM
 - **Sales credit note:** the London day the refund was raised (the credit note Date IMS sends).
 - **Supplier credit note:** the London day it was posted (the credit note Date IMS sends).
 
+An edit or return-exchange of an already-posted sales invoice keeps the invoice's original date (it never moves the invoice to the day of the edit), and a retried credit note keeps the refund's own day. Shipping VAT (order tax less line tax) is on its own sales row, so a refunded shipping charge nets against VAT that was counted. Orders invoiced by Xeroom, which have no IMS posting date, are not included.
+
 Credit notes **reduce** the side they credit (shown as negative amounts on the matching rate row), so a period with refunds can be compared with the Xero VAT return. A supplier credit note takes the booked tax lines of the bill it offsets, in proportion to its amount; a reverse-charge credit (booked net) is therefore approximate, and a supplier credit note that is not tied to a bill is left out and counted in a notice. Only credit notes Xero holds are included.
 
 What this does and does not promise: the report agrees with Xero **by construction on dates** (one shared definition), not figure-for-figure. Documents posted under the older UTC-day convention, rounding in Xero's own calculation, and the approximations above can still leave a small difference, so compare it with the Xero VAT return rather than treating it as that return. Archived orders are **included** here: archiving only hides an order from lists, its invoice stands in Xero. (The reconciliation pack's VAT reader excludes archived orders; the two can differ for a period that contains one.)

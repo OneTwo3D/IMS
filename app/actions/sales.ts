@@ -1,7 +1,7 @@
 'use server'
 
 import { businessDateYmd } from '@/lib/business-date'
-import { creditNoteDocumentDay } from '@/lib/domain/accounting/document-date'
+import { creditNoteDocumentDay, originalSalesInvoiceDay } from '@/lib/domain/accounting/document-date'
 import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import type { InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
 import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
@@ -2040,6 +2040,9 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
       discountAmount: true,
       totalForeign: true,
       accountingInvoiceId: true,
+      // The invoice's document date is the storefront creation day (else the stamp written when the first post went out): an UPDATE keeps it.
+      externalCreatedAt: true,
+      invoicedAt: true,
       // o3d-j625 r3 (Codex HIGH 2): and whose invoice it is, for the UPDATE arm below — the id survives a
       // connector switch and the chart cannot speak for it.
       accountingInvoiceConnector: true,
@@ -2125,11 +2128,15 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     orderReference: orderNumber,
   })
 
+  // An update keeps the first post's document date: the storefront creation day, else the stored invoice stamp (which the live post writes from the payload date it sent).
+  const originalInvoiceDay = originalSalesInvoiceDay({ externalCreatedAt: so.externalCreatedAt, invoicedAt: so.invoicedAt })
+
   const payload = {
     invoiceNumber: accountingInvoiceNumber,
     contactName: so.customerName ?? 'Unknown',
     contactEmail: so.customerEmail ?? undefined,
-    date: businessDateYmd(new Date()),
+    // A first post is dated today; an UPDATE of a posted invoice keeps the ORIGINAL document date (an edit or a return-exchange on 2 Oct must not move a 30 Sep invoice into the next VAT period).
+    date: so.accountingInvoiceId ? originalInvoiceDay : businessDateYmd(new Date()),
     currency: so.currency,
     // Stamp IMS's FX rate on the document so Xero/QuickBooks don't apply
     // their own daily rate (which causes 1-3 % drift on multi-currency
@@ -2904,7 +2911,7 @@ async function queueRefundAccountingActions(input: {
   accountingSyncs: RefundAccountingSyncRequest[]
   accountingSettings?: AccountingSettings
 }): Promise<RefundAccountingSettlement> {
-  const [settings, orderForCN, baseCurrency, salesTaxRatesForCn] = await Promise.all([
+  const [settings, orderForCN, baseCurrency, salesTaxRatesForCn, refundRow] = await Promise.all([
     input.accountingSettings ? Promise.resolve(input.accountingSettings) : getAccountingSettings(),
     db.salesOrder.findUnique({
       where: { id: input.orderId },
@@ -2925,6 +2932,8 @@ async function queueRefundAccountingActions(input: {
     }),
     getBaseCurrencyCode(),
     db.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }),
+    // The credit note's OWN document day: the refund's creation, on the first hand-off and on every retry (a retry rebuilds the credit note, and must not re-date it to the retry day).
+    db.salesOrderRefund.findUnique({ where: { id: input.refundId }, select: { createdAt: true } }),
   ])
   const salesRateByTaxType = buildTaxTypeRateIndex(salesTaxRatesForCn)
   const cnContactName = orderForCN?.customer
@@ -2983,7 +2992,7 @@ async function queueRefundAccountingActions(input: {
     creditNoteNumber: input.creditNoteNumber ?? undefined,
     contactName: cnContactName,
     contactEmail: orderForCN?.customer?.email ?? undefined,
-    date: creditNoteDocumentDay(new Date()),
+    date: creditNoteDocumentDay(refundRow?.createdAt ?? new Date()),
     currency: orderForCN?.currency ?? baseCurrency,
     reference: input.externalOrderNumber ?? undefined,
     // o3d-hqvrp.389, behind `xero_round_to_order_total_enabled`: a credit note that FULLY reverses the invoice (a chargeback, or the one refund of an order now fully refunded) carries

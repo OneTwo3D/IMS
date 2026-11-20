@@ -131,6 +131,7 @@ function vatDeps(lines: InvoiceLine[], now: Date): FinanceAnalyticsDeps {
           }))
         },
       },
+      salesOrder: { findMany: async () => [] },
       purchaseInvoice: { findMany: async () => [] },
     } as never,
   }
