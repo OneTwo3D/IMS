@@ -1,0 +1,2 @@
+### Manufacturing: foreign-currency production orders
+- The New Manufacturing Order form has a Currency / FX Rate field. A foreign currency gets the central fx_rates table rate (Aelia is the master), stored on the order; a currency with no rate is refused, never defaulted to 1 (same rule as PO and sales-order forms). Cost lines convert to base as amount / rate in exact Decimal arithmetic. The rate, its source and date are recorded in the order's created activity entry. Orders raised without a currency are unchanged (base currency, rate 1). No migration.

@@ -179,6 +179,8 @@ The PDF document includes:
 
 Each manufacturing order can carry a list of **per-run overhead lines** — labour, machine time, utilities, packaging, or any other indirect cost incurred to produce the run. Cost lines are managed from the order detail page in the **Manufacturing costs** card.
 
+**Order currency.** When you raise an order, **Currency / FX Rate** defaults to your base currency. Pick a foreign currency to enter labour or other costs in it: the rate shown is the rate from Settings, Accounting, FX Rates (fed by the store's Aelia rates, or a rate an admin pinned there), read when the order is created and stored on the order. You cannot type a rate. If the currency has no rate yet, the form blocks with a message and a link to FX Rates instead of assuming 1; sync or pin a rate, then pick the currency again. If the rate moves while the form is open, the create is refused once, the form shows the new rate, and you submit again. Cost lines on the order are then converted to your base currency as amount / rate, and the stored rate is not re-read later. Orders raised without choosing a currency behave exactly as before.
+
 Each line records:
 
 - **Description** (e.g. "Labour", "Machine time")
