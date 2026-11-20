@@ -1,6 +1,6 @@
 /**
- * Bead o3d-q0x56.33: the one-off ECB history backfill. Fixture CSV only, never the network. Every arm names the mutation that turns it red.
- * The database arms need a scratch Postgres migrated with the real schema: set FX_BACKFILL_TEST_DATABASE_URL to a database whose name starts with "fxbf_scratch" (skipped otherwise).
+ * The one-off ECB history backfill (fx:backfill-ecb). Fixture CSV and a recording fake port, never the network. Every arm names the mutation that turns it red.
+ * The SQL runs against a real migrated database in tests/db/fx-backfill-ecb.test.ts.
  */
 import assert from 'node:assert/strict'
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
@@ -9,7 +9,7 @@ import test from 'node:test'
 import { FX_TABLE_LOCK_KEY } from '../../lib/db/advisory-locks.ts'
 import { selectFxRateFromRows } from '../../lib/currencies/fx-select.ts'
 import {
-  ECB_BACKFILL_FX_TABLE_LOCK_KEY, ECB_BACKFILL_STATEMENTS, divideRounded, ecbPublicationInstant, parseBackfillArgs, parseEcbCsv, planBackfill, runBackfill, insertStatement, type BackfillPort, type EcbFile,
+  ECB_BACKFILL_STATEMENTS, divideRounded, ecbPublicationInstant, parseBackfillArgs, parseEcbCsv, planBackfill, runBackfill, insertStatement, type BackfillPort, type EcbFile,
 } from '../../lib/first-load/backfill-ecb-rates.ts'
 import { runCli } from '../../scripts/fx-backfill-ecb.ts'
 import { scratchRoot } from '../helpers/scratch-root'
@@ -19,10 +19,6 @@ const file = (): EcbFile => { const p = parseEcbCsv(FIXTURE); assert.ok(p.ok); r
 const none: ReadonlySet<string> = new Set()
 const base = { file: undefined as unknown as EcbFile, baseCurrency: 'GBP', enabledCurrencies: ['GBP', 'EUR', 'USD', 'JPY'], requested: null, from: '2026-03-26', to: '2026-03-31', existing: none }
 const plan = (over: Partial<Parameters<typeof planBackfill>[0]> = {}) => planBackfill({ ...base, file: file(), ...over })
-
-test('the lock key is the one every fx_rates writer takes', () => {
-  assert.equal(ECB_BACKFILL_FX_TABLE_LOCK_KEY, FX_TABLE_LOCK_KEY) // [mutation: change either constant]
-})
 
 test('parse: trailing comma, N/A, range; refuses malformed', () => {
   const f = file()
@@ -107,7 +103,7 @@ test('fx-select: with the window before the first live row, the live row answers
 // ---------------------------------------------------------------------------------------------------------------------------------------------------------------------
 // the transaction, against a recording fake port
 
-function fakePort(opts: { db?: string; sid?: string; base?: string; existing?: Array<{ cur: string; day: string }> } = {}): { port: BackfillPort; sent: Array<{ sql: string; params?: readonly unknown[] }> } {
+function fakePort(opts: { db?: string; sid?: string; base?: string; existing?: Array<{ cur: string; day: string }>; firstLive?: Array<{ cur: string; day: string }>; settings?: Array<{ key: string; value: string }> } = {}): { port: BackfillPort; sent: Array<{ sql: string; params?: readonly unknown[] }> } {
   const sent: Array<{ sql: string; params?: readonly unknown[] }> = []
   return {
     sent,
@@ -117,6 +113,9 @@ function fakePort(opts: { db?: string; sid?: string; base?: string; existing?: A
         if (sql === ECB_BACKFILL_STATEMENTS.identity) return { rows: [{ db: opts.db ?? 'ims', sid: opts.sid ?? '7001' }] as T[] }
         if (sql === ECB_BACKFILL_STATEMENTS.base) return { rows: [{ base: opts.base ?? 'GBP' }] as T[] }
         if (sql === ECB_BACKFILL_STATEMENTS.enabled) return { rows: [{ code: 'EUR' }, { code: 'GBP' }, { code: 'USD' }] as T[] }
+        // by default every currency has a first live row well after the window
+        if (sql === ECB_BACKFILL_STATEMENTS.firstLive) return { rows: (opts.firstLive ?? [{ cur: 'EUR', day: '2026-04-15' }, { cur: 'USD', day: '2026-04-15' }]) as T[] }
+        if (sql === ECB_BACKFILL_STATEMENTS.fxSource) return { rows: (opts.settings ?? []) as T[] }
         if (sql === ECB_BACKFILL_STATEMENTS.existing) return { rows: (opts.existing ?? []) as T[] }
         return { rows: [] as T[] }
       },
@@ -126,7 +125,7 @@ function fakePort(opts: { db?: string; sid?: string; base?: string; existing?: A
 const args = { from: '2026-03-26', to: '2026-03-31', currencies: null, expectDb: 'ims', expectSystemId: '7001', dryRun: false }
 
 // [mutation: skip the identity check, check after the insert, drop the lock, drop the rollback]
-test('a real run: lock first, target confirmed before any read of the plan inputs, one insert, COMMIT; a wrong target writes nothing', async () => {
+test('a real run: target confirmed first, then the lock, then the reads, one insert, COMMIT; a wrong target writes nothing', async () => {
   const ok = fakePort()
   const out = await runBackfill(ok.port, file(), args)
   assert.equal(out.kind, 'done')
@@ -200,10 +199,10 @@ test('live period: a day on or after the first live row of a currency is REFUSED
   const pin = plan({ requested: ['USD'], firstLiveDay: new Map([['USD', '2026-03-27']]) })
   assert.ok(!pin.ok); assert.match(pin.refusals.join('\n'), /USD: 3 planned day\(s\) on or after the first live row of USD \(2026-03-27\).*2026-03-30.*lower --to to 2026-03-26.*--currencies excluding USD/)
   // a gap day after a first live row (live 03-26, gap 03-27)
-  const gap = plan({ requested: ['USD', 'EUR'], from: '2026-03-27', to: '2026-03-27', firstLiveDay: new Map([['USD', '2026-03-26']]) })
+  const gap = plan({ requested: ['USD', 'EUR'], from: '2026-03-27', to: '2026-03-27', firstLiveDay: new Map([['USD', '2026-03-26'], ['EUR', '2026-04-15']]) })
   assert.ok(!gap.ok); assert.match(gap.refusals.join(), /USD: 1 planned day/); assert.ok(!gap.refusals.join().includes('EUR:'))
   // the same window before the first live row is fine, and a currency without live rows is unaffected
-  const ok = plan({ requested: ['USD', 'EUR'], to: '2026-03-27', firstLiveDay: new Map([['USD', '2026-03-28']]) })
+  const ok = plan({ requested: ['USD', 'EUR'], to: '2026-03-27', firstLiveDay: new Map([['USD', '2026-03-28'], ['EUR', '2026-04-15']]) })
   assert.ok(ok.ok); assert.equal(ok.rows.length, 4)
 })
 
@@ -239,4 +238,36 @@ test('lock timeout is a refusal with nothing written; a COMMIT failure is report
   assert.ok(!base.sent.some((s) => s.sql.startsWith('insert')))
   const failing: BackfillPort = { query: async (sql, params) => { if (sql === ECB_BACKFILL_STATEMENTS.commit) throw new Error('gone'); return base.port.query(sql, params) } }
   await assert.rejects(runBackfill(failing, file(), args), /COMMIT_OUTCOME_UNKNOWN/)
+})
+
+// [mutation: drop the no-live-row refusal]
+test('a currency with NO live row is refused: a backfilled row would become its latest rate', async () => {
+  const p = plan({ requested: ['USD', 'EUR'], firstLiveDay: new Map([['EUR', '2026-04-15']]) })
+  assert.ok(!p.ok); assert.match(p.refusals.join(), /USD: there is no live \(non-ecb-history\) GBP\/USD row.*run the FX refresh first, or exclude it with --currencies/)
+  assert.ok(!p.refusals.join().includes('EUR:'))
+  const f = fakePort({ firstLive: [{ cur: 'EUR', day: '2026-04-15' }] })
+  const out = await runBackfill(f.port, file(), args)
+  assert.equal(out.kind, 'refused')
+  assert.ok(!f.sent.some((x) => x.sql.startsWith('insert')))
+})
+
+test('a malformed FX source history refuses the run and writes nothing', async () => {
+  const f = fakePort({ settings: [{ key: 'fx_rate_source_history', value: 'not json' }] })
+  const out = await runBackfill(f.port, file(), args)
+  assert.equal(out.kind, 'refused')
+  if (out.kind === 'refused') assert.match(out.refusals.join(), /history is unreadable/)
+  assert.ok(!f.sent.some((x) => x.sql.startsWith('insert') || x.sql === ECB_BACKFILL_STATEMENTS.commit))
+})
+
+test('a dry run refuses the live period too (CLI exit 4)', async () => {
+  const dir = mkdtempSync(path.join(scratchRoot(), 'fxbf-'))
+  try {
+    const env = path.join(dir, 'env'); writeFileSync(env, 'DATABASE_URL=postgres://user:pw@127.0.0.1:1/ims\n'); chmodSync(env, 0o600)
+    const csv = path.join(dir, 'ecb.csv'); writeFileSync(csv, FIXTURE)
+    const argv = ['--env-file', env, '--expect-db', 'ims', '--expect-system-id', '7001', '--ecb-csv', csv, '--from', '2026-03-26', '--to', '2026-03-31', '--dry-run']
+    let err = ''
+    const f = fakePort({ firstLive: [{ cur: 'EUR', day: '2026-03-30' }, { cur: 'USD', day: '2026-03-30' }] })
+    const code = await runCli(argv, { out: () => undefined, err: (t) => { err += t } }, {}, { open: async () => ({ port: f.port, close: async () => undefined }) })
+    assert.equal(code, 4); assert.match(err, /on or after the first live row/)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
 })

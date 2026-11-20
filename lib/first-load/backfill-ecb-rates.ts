@@ -21,17 +21,16 @@
  *
  * REFUSALS (exit 4, nothing written): a day on or after the first live row of a requested currency or the Aelia start, the base currency missing from the file, a requested currency with a blank / N/A /
  * zero cell on a day in the window (every such day is reported), a requested currency that is not a column of the file, --from/--to outside the file's date range, a requested currency that is not
- * enabled, a malformed file, a lock held by another writer for more than 30 s. A refusal names the currency; re-run with --currencies excluding it, or a smaller --to.
+ * enabled, a malformed file, a requested currency with no live row (run the FX refresh first). A lock held by another writer for more than 30 s is exit 3 (nothing written). A refusal names the currency; re-run with --currencies excluding it, or a smaller --to.
  */
 import { randomBytes } from 'node:crypto'
 import path from 'node:path'
+import { FX_TABLE_LOCK_KEY } from '../db/advisory-locks'
 import { fxSourceRegimeFromSettings, FX_RATE_SOURCE_HISTORY_SETTING, FX_RATE_SOURCE_SETTING, FX_RATE_SOURCE_SINCE_SETTING } from '../currencies/fx-source-regime'
 
 export const ECB_BACKFILL_SOURCE = 'ecb-history'
 export const ECB_BACKFILL_APPLICATION_NAME = 'fx-backfill-ecb'
 export const ECB_BACKFILL_EXIT = { OK: 0, USAGE: 2, TARGET: 3, REFUSED: 4, INTERNAL: 6 } as const
-/** The advisory lock every fx_rates writer takes exclusively (lib/db/advisory-locks.ts FX_TABLE_LOCK_KEY). A test pins that the two are equal. */
-export const ECB_BACKFILL_FX_TABLE_LOCK_KEY = 918_274_401
 const MAX_FILE_BYTES = 8 * 1024 * 1024
 const DATE = /^\d{4}-\d{2}-\d{2}$/
 const CODE = /^[A-Z]{3}$/
@@ -189,6 +188,13 @@ export function planBackfill(i: BackfillInputs): BackfillPlan {
   for (const c of currencies) if (c !== 'EUR' && !i.file.currencies.includes(c)) refusals.push(`${c} is not a column of the ECB file`)
   if (refusals.length > 0) return { ok: false, refusals }
 
+  // A currency with NO live row has no upper bound: a backfilled row would become its LATEST row and today's documents would silently get an old rate. Refused (only when the live rows were read).
+  if (i.firstLiveDay) {
+    for (const c of currencies) {
+      if (!i.firstLiveDay.has(c)) refusals.push(`${c}: there is no live (non-ecb-history) ${base}/${c} row, so a backfilled row would become its latest rate; run the FX refresh first, or exclude it with --currencies`)
+    }
+    if (refusals.length > 0) return { ok: false, refusals: capRefusals(refusals) }
+  }
   const days = [...i.file.days.keys()].filter((d) => d >= i.from && d <= i.to).sort()
   if (days.length === 0) return { ok: false, refusals: [`the ECB file has no business day inside ${i.from}..${i.to}`] }
   const rows: PlannedRow[] = []
@@ -291,8 +297,9 @@ export type BackfillOutcome =
   | { kind: 'done'; baseCurrency: string; dryRun: boolean; businessDays: number; counts: CurrencyCounts[]; written: number; skippedExisting: number }
 
 /**
- * One transaction. A real run: BEGIN, exclusive FX table lock, the target is confirmed twice from inside the transaction BEFORE anything is read for the plan or written, the existing days are read
- * under the lock (so a live writer cannot add a row between the read and the insert), the plan is computed, refusal rolls back, otherwise insert and COMMIT. A dry run is READ ONLY and takes no lock.
+ * One transaction. A real run: BEGIN, the target is confirmed twice (database name, cluster id) BEFORE the lock is asked for, SET LOCAL lock_timeout 30 s, the exclusive FX table lock, then the existing
+ * days, the first live row per currency and the FX source settings are read under the lock (so a live writer cannot add a row between the read and the insert), the plan is computed, a refusal rolls back,
+ * otherwise insert and COMMIT. A dry run is READ ONLY, takes no lock, but reads and refuses the same things (the live period included).
  */
 export async function runBackfill(port: BackfillPort, file: EcbFile, args: BackfillArgs): Promise<BackfillOutcome> {
   await port.query(args.dryRun ? ECB_BACKFILL_STATEMENTS.beginDryRun : ECB_BACKFILL_STATEMENTS.beginWrite)
@@ -305,7 +312,7 @@ export async function runBackfill(port: BackfillPort, file: EcbFile, args: Backf
     if (!args.dryRun) {
       await port.query(ECB_BACKFILL_STATEMENTS.lockTimeout)
       try {
-        await port.query(ECB_BACKFILL_STATEMENTS.lock, [ECB_BACKFILL_FX_TABLE_LOCK_KEY])
+        await port.query(ECB_BACKFILL_STATEMENTS.lock, [FX_TABLE_LOCK_KEY])
       } catch (error) {
         if ((error as { code?: string }).code === '55P03') return { kind: 'target-refused', problem: 'the exchange-rate table is locked by another writer (waited 30 s); nothing was written. Try again in a moment.' }
         throw error
@@ -372,10 +379,12 @@ export const ECB_BACKFILL_HELP = [
   '  --dry-run                  prints the counts per currency and writes nothing (a read-only transaction).',
   '  --help                     this text',
   '',
-  'A currency/day that already has ANY fx_rates row (live, manual, earlier backfill) is skipped and counted; re-running is a no-op. A blank or N/A ECB cell for a requested currency, a window outside',
-  'the file, or a base currency missing from the file refuses the run and writes nothing. A real run is one transaction under the exclusive FX table lock.',
+  'It only writes BEFORE the live period: per currency, any planned day on or after the first fx_rates row that is not source ecb-history (live fetch, manual pin, Aelia), or on or after the start of the',
+  'earliest Aelia period, is REFUSED (days listed, nothing written; lower --to or exclude the currency with --currencies). A currency with no such live row is refused too (run the FX refresh first).',
+  'Rows already written by an earlier backfill are skipped and counted, so re-running the same window is a no-op. A blank or N/A ECB cell for a requested currency, a window outside the file, or a base',
+  'currency missing from the file also refuses and writes nothing. A real run is one transaction under the exclusive FX table lock (30 s wait limit).',
   '',
-  'Exit codes: 0 done (or dry run); 2 usage; 3 target not confirmed or unreadable; 4 refused (gaps, window, currencies, malformed file); 6 internal error.',
+  'Exit codes: 0 done (or dry run); 2 usage; 3 target not confirmed, lock busy, database unreadable or commit outcome unknown; 4 refused (live period, no live row, gaps, window, currencies, malformed file); 6 internal error.',
   '',
 ].join('\n')
 

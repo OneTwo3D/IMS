@@ -9,7 +9,7 @@ import { ECB_BACKFILL_STATEMENTS, parseEcbCsv, runBackfill, type BackfillPort } 
 import { selectFxRateFromRows } from '../../lib/currencies/fx-select'
 
 /**
- * o3d-q0x56.33: the ECB history backfill against a real, migrated database (the SQL of the existing-day read, the first-live-row read, the settings read, the insert and the lock).
+ * The ECB history backfill against a real, migrated database (the SQL of the existing-day read, the first-live-row read, the settings read, the insert and the lock).
  * ROLLED BACK, ALWAYS: everything runs inside one outer transaction; the command's own BEGIN / COMMIT / ROLLBACK become savepoints, and the outer transaction is rolled back at the end, so no row of
  * the shared tier database is changed. GATED on RUN_DB_RETENTION_TESTS with the REQUIRE_DB_RETENTION_TESTS tripwire (npm run test:db).
  */
@@ -49,37 +49,46 @@ test('ecb backfill on a real database: write, idempotent re-run, first-live-row 
     for (const c of ['GBP', 'EUR', 'USD', 'CNY']) await q(`insert into "currencies" ("code","name","symbol","active") values ($1,$1,$1,$2)`, [c, c !== 'CNY'])
     await q(`insert into "organisations" ("id","name","baseCurrency","updatedAt") values ('o','o','GBP',now())`)
 
+    // a currency with no live row is refused (its backfilled row would become the latest rate); nothing is written
+    const noLive = await runBackfill(port, file, args)
+    assert.equal(noLive.kind, 'refused')
+    if (noLive.kind === 'refused') assert.match(noLive.refusals.join(), /EUR: there is no live .*USD: there is no live/)
+    assert.equal(await count(), 0)
+    // a live row for each currency AFTER the window bounds the backfill
+    for (const c of ['EUR', 'USD']) await q(`insert into "fx_rates" ("id","fromCurrency","toCurrency","rate","fetchedAt","source") values ($1,'GBP',$2,1.2,'2026-04-15 06:00:00','frankfurter')`, [`live-${c}`, c])
+
     // dry run writes nothing
     assert.equal((await runBackfill(port, file, { ...args, dryRun: true })).kind, 'done')
-    assert.equal(await count(), 0)
+    assert.equal(await count(), 2)
 
     // a real write: EUR and USD, 4 business days each, source ecb-history, 16:00 Berlin in UTC, 8 dp
     const first = await runBackfill(port, file, args)
     assert.equal(first.kind, 'done')
     if (first.kind === 'done') { assert.equal(first.written, 8); assert.equal(first.skippedExisting, 0) }
-    const usd = (await q(`select rate::text r, to_char("fetchedAt",'YYYY-MM-DD"T"HH24:MI') f, source, "manualOverride" m from "fx_rates" where "toCurrency"='USD' order by "fetchedAt"`)).rows
+    const usd = (await q(`select rate::text r, to_char("fetchedAt",'YYYY-MM-DD"T"HH24:MI') f, source, "manualOverride" m from "fx_rates" where "toCurrency"='USD' and source='ecb-history' order by "fetchedAt"`)).rows
     assert.deepEqual(usd.map((r) => [r.f, r.r, r.source, r.m]), [
       ['2026-03-26T15:00', '1.32500000', 'ecb-history', false], ['2026-03-27T15:00', '1.33750000', 'ecb-history', false],
       ['2026-03-30T14:00', '1.27058824', 'ecb-history', false], ['2026-03-31T14:00', '1.27906977', 'ecb-history', false],
     ])
-    assert.equal(await count(`"toCurrency" in ('CNY','GBP')`), 0) // disabled currency and the base are never written
+    assert.equal(await count(`"toCurrency" in ('CNY','GBP')`), 0); assert.equal(await count(), 10) // disabled currency and the base are never written
 
     // an idempotent re-run: its own rows are not "live", so the same window is a no-op
     const again = await runBackfill(port, file, args)
     assert.equal(again.kind, 'done')
     if (again.kind === 'done') { assert.equal(again.written, 0); assert.equal(again.skippedExisting, 8) }
-    assert.equal(await count(), 8)
+    assert.equal(await count(), 10)
 
     // a first LIVE row on 03-30 for USD: a window reaching it is refused (nothing written), a window before it is a no-op
     await q(`delete from "fx_rates"`)
     await q(`insert into "fx_rates" ("id","fromCurrency","toCurrency","rate","fetchedAt","source") values ('live','GBP','USD',1.5,'2026-03-30 06:00:00','frankfurter')`)
+    await q(`insert into "fx_rates" ("id","fromCurrency","toCurrency","rate","fetchedAt","source") values ('liveEUR','GBP','EUR',1.2,'2026-04-15 06:00:00','frankfurter')`)
     const reach = await runBackfill(port, file, { ...args, currencies: ['USD'] })
     assert.equal(reach.kind, 'refused')
     if (reach.kind === 'refused') assert.match(reach.refusals.join(), /on or after the first live row of USD \(2026-03-30\)/)
-    assert.equal(await count(), 1)
+    assert.equal(await count(), 2)
     const before = await runBackfill(port, file, { ...args, currencies: ['USD'], to: '2026-03-27' })
     assert.equal(before.kind, 'done')
-    assert.equal(await count(), 3)
+    assert.equal(await count(), 4)
     const rows = (await q(`select "fromCurrency","toCurrency",rate::text rate,to_char("fetchedAt",'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as fa,source,seq from "fx_rates" where "toCurrency"='USD'`)).rows.map((r) => ({ ...r, fetchedAt: new Date(r.fa) }))
     const sel = (d: string) => selectFxRateFromRows(rows, { baseCurrency: 'GBP', currency: 'USD', asOf: new Date(`${d}T23:59:59.999Z`) })
     assert.equal(sel('2026-03-30').source, 'frankfurter'); assert.equal(sel('2026-03-27').source, 'ecb-history'); assert.equal(sel('2026-03-31').source, 'frankfurter')
@@ -93,13 +102,14 @@ test('ecb backfill on a real database: write, idempotent re-run, first-live-row 
 
     // an Aelia interval starting 03-29: a window reaching it is refused for every currency, one before it is fine
     await q(`delete from "fx_rates"`)
+    for (const c of ['EUR', 'USD']) await q(`insert into "fx_rates" ("id","fromCurrency","toCurrency","rate","fetchedAt","source") values ($1,'GBP',$2,1.2,'2026-04-15 06:00:00','aelia')`, [`a-${c}`, c])
     await q(`insert into "settings" ("key","value","updatedAt") values ('fx_rate_source','aelia',now()),('fx_rate_source_since','2026-03-29T10:00:00.000Z',now())`)
     const aelia = await runBackfill(port, file, args)
     assert.equal(aelia.kind, 'refused')
     if (aelia.kind === 'refused') assert.match(aelia.refusals.join(), /Aelia period \(2026-03-29\)/)
-    assert.equal(await count(), 0)
+    assert.equal(await count(), 2)
     assert.equal((await runBackfill(port, file, { ...args, to: '2026-03-27' })).kind, 'done')
-    assert.equal(await count(), 4)
+    assert.equal(await count(), 6)
 
     // a wrong target never reaches the lock or the data
     assert.equal((await runBackfill(port, file, { ...args, expectDb: 'nope' })).kind, 'target-refused')
