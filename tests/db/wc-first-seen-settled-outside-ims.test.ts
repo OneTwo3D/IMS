@@ -48,7 +48,7 @@ async function seed(env: Awaited<ReturnType<typeof load>>, onHand = 10) {
   const D = (v: number | string) => new Prisma.Decimal(String(v))
   const suffix = randomUUID().slice(0, 8)
   // Only this test's warehouse may be the store's default, so the import ships from it.
-  const warehouse = await db.warehouse.create({ data: { code: `F92${suffix}`, name: `f92 ${suffix}`, active: true, syncToStore: true, isDefault: true }, select: { id: true } })
+  const warehouse = await db.warehouse.create({ data: { code: `F92${suffix}`, name: `f92 ${suffix}`, active: true, syncToStore: true, isDefault: false }, select: { id: true } })
   const product = await db.product.create({ data: { sku: `F92-${suffix}`, name: `f92 ${suffix}`, type: 'SIMPLE' }, select: { id: true, sku: true } })
   await db.stockLevel.create({ data: { productId: product.id, warehouseId: warehouse.id, quantity: D(onHand), reservedQty: D(0) } })
   await db.costLayer.create({ data: { productId: product.id, warehouseId: warehouse.id, receivedQty: D(onHand), remainingQty: D(onHand), unitCostBase: D(3), receivedAt: new Date(Date.now() - 40 * 86_400_000) } })
@@ -260,22 +260,85 @@ test('[db] the reallocation sweep and the backorder allocator never select an or
   assert.ok(await db.orderAllocation.count({ where: { orderId } }) > 0, 'CONTROL: allocated without the marker')
 })
 
-test('[db] a permanent coverage refusal releases the partial allocation and the pending shipment', { skip }, async (t) => {
+test('[db] partial stock is owed, not permanent: the reservation is released, the row stays retryable, and a first partial receipt does not abandon the order', { skip }, async (t) => {
   const env = await load()
-  const { db, importWcOrder } = env
+  const { db, Prisma, importWcOrder } = env
   const fx = await seed(env, 1)
   t.after(() => cleanup(env, fx))
   await withCutoff(env, t, CUTOFF)
-  const result = await importWcOrder(wcOrder(fx, 'completed', 3, { date_completed_gmt: AFTER_CUTOFF }), ADMITTED)
+  const payload = wcOrder(fx, 'completed', 3, { date_completed_gmt: AFTER_CUTOFF })
+  const result = await importWcOrder(payload, ADMITTED)
   assert.equal(result.success, true, JSON.stringify(result))
   const orderId = result.orderId as string
   assert.equal(await db.orderAllocation.count({ where: { orderId } }), 0, 'no allocation left')
   assert.equal(await db.shipment.count({ where: { orderId } }), 0, 'no pending shipment left')
-  const level = await db.stockLevel.findFirstOrThrow({ where: { productId: fx.productId, warehouseId: fx.warehouseId } })
-  assert.equal(Number(level.reservedQty), 0, 'nothing reserved for goods that already left')
-  assert.equal(Number(level.quantity), 1, 'on-hand untouched')
+  const level = async () => db.stockLevel.findFirstOrThrow({ where: { productId: fx.productId, warehouseId: fx.warehouseId } })
+  assert.equal(Number((await level()).reservedQty), 0, 'nothing reserved for goods that already left')
+  assert.equal(Number((await level()).quantity), 1, 'on-hand untouched')
   const { openWcCompletionRefusalWhere } = await import('../../lib/domain/sales/wc-sync-row-families')
-  assert.equal(await db.shoppingSyncLog.count({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId } }), 1, 'listed for an operator')
+  const row = await db.shoppingSyncLog.findFirstOrThrow({ where: { ...openWcCompletionRefusalWhere(), entityId: orderId }, select: { payload: true } })
+  assert.equal(row.payload.refusal, 'insufficient_physical_stock', 'owed (retryable), not a permanent coverage refusal')
+  const { retryOwedOutsideImsDespatches } = await import('../../lib/connectors/woocommerce/sync/outside-ims-despatch')
+  const live = async () => ({ order: payload })
+  // A first PARTIAL receipt (2 of 3 units): still owed.
+  await db.stockLevel.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { quantity: new Prisma.Decimal('2') } })
+  await db.costLayer.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { remainingQty: new Prisma.Decimal('2'), receivedQty: new Prisma.Decimal('2') } })
+  const partial = await retryOwedOutsideImsDespatches(20, live)
+  assert.equal(partial.stillOwed >= 1, true, JSON.stringify(partial))
+  assert.equal(Number((await level()).reservedQty), 0)
+  // Full stock: booked.
+  await db.stockLevel.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { quantity: new Prisma.Decimal('10') } })
+  await db.costLayer.updateMany({ where: { productId: fx.productId, warehouseId: fx.warehouseId }, data: { remainingQty: new Prisma.Decimal('10'), receivedQty: new Prisma.Decimal('10') } })
+  const full = await retryOwedOutsideImsDespatches(20, live)
+  assert.equal(full.booked >= 1, true, JSON.stringify(full))
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { status: true } })).status, 'SHIPPED')
+  assert.equal(Number((await level()).quantity), 7)
+})
+
+test('[db] terminal and unrelated open rows never starve a newer owed despatch; a store order that is no longer a despatch is closed, not booked', { skip }, async (t) => {
+  const env = await load()
+  const { db, importWcOrder } = env
+  const first = await seed(env, 0)
+  t.after(() => cleanup(env, first))
+  await withCutoff(env, t, CUTOFF)
+  const p1 = wcOrder(first, 'completed', 1, { date_completed_gmt: AFTER_CUTOFF })
+  const r1 = await importWcOrder(p1, ADMITTED)
+  const { openWcCompletionRefusalWhere } = await import('../../lib/domain/sales/wc-sync-row-families')
+  const row1 = await db.shoppingSyncLog.findFirstOrThrow({ where: { ...openWcCompletionRefusalWhere(), entityId: r1.orderId as string }, select: { id: true, payload: true } })
+  await db.shoppingSyncLog.update({ where: { id: row1.id }, data: { payload: { ...row1.payload, terminal: true } } })
+  const second = await seed(env, 0)
+  t.after(() => cleanup(env, second))
+  const p2 = wcOrder(second, 'completed', 1, { date_completed_gmt: AFTER_CUTOFF })
+  const r2 = await importWcOrder(p2, ADMITTED)
+  const { retryOwedOutsideImsDespatches } = await import('../../lib/connectors/woocommerce/sync/outside-ims-despatch')
+  const seen: string[] = []
+  const out = await retryOwedOutsideImsDespatches(1, async (id) => { seen.push(id); return { order: id === String(second.wcId) ? { ...p2, status: 'processing', date_completed_gmt: null } : p1 } })
+  assert.deepEqual(seen, [String(second.wcId)], 'the newer owed row is reached although a terminal row is older')
+  assert.equal(out.resolved, 1, JSON.stringify(out))
+  assert.equal(await db.shoppingSyncLog.count({ where: { ...openWcCompletionRefusalWhere(), entityId: r2.orderId as string } }), 0, 'closed without booking')
+  assert.equal(await db.stockMovement.count({ where: { productId: second.productId } }), 0)
+})
+
+test('[db] an order completed between the stock extract and the apply consumes stock; the reader fails on a read error or a malformed instant and is null only when absent', { skip }, async (t) => {
+  const env = await load()
+  const { db, importWcOrder } = env
+  const fx = await seed(env, 10)
+  t.after(() => cleanup(env, fx))
+  // Extract two days ago, apply an hour ago: the order was completed yesterday, between the two.
+  const extracted = new Date(Date.now() - 2 * 86_400_000)
+  await withCutoff(env, t, extracted.toISOString())
+  const completed = new Date(Date.now() - 86_400_000).toISOString().replace(/\.\d{3}Z$/, '')
+  const result = await importWcOrder(wcOrder(fx, 'completed', 2, { date_completed_gmt: completed, date_paid_gmt: completed, date_created_gmt: completed }), ADMITTED)
+  assert.ok(result.success && result.orderId, JSON.stringify(result))
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id: result.orderId as string }, select: { status: true } })).status, 'SHIPPED')
+  assert.equal(Number((await db.stockLevel.findFirstOrThrow({ where: { productId: fx.productId, warehouseId: fx.warehouseId } })).quantity), 8)
+
+  const { readOpeningStockCutoff } = await import('../../lib/connectors/woocommerce/sync/opening-stock-cutoff')
+  assert.equal((await readOpeningStockCutoff())?.toISOString(), extracted.toISOString())
+  await db.firstLoadApplyRun.updateMany({ where: { manifestDigest: { startsWith: 'f92-' } }, data: { facts: { openingStockCutoffAt: 'not a date' } } })
+  await assert.rejects(readOpeningStockCutoff(), /not a readable date/)
+  await db.firstLoadApplyRun.updateMany({ where: { manifestDigest: { startsWith: 'f92-' } }, data: { facts: {} } })
+  assert.equal(await readOpeningStockCutoff(), null, 'absent: null')
 })
 
 test('[db] a SHIPPED-mapped first-seen order is despatched the same way, and the later WooCommerce completion does not refuse it', { skip }, async (t) => {

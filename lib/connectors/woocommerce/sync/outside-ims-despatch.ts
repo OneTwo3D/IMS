@@ -13,8 +13,9 @@
 import type { WcFullOrder } from './types'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
-import { readOpeningStockCutoff } from '@/lib/first-load/opening-stock-cutoff'
-import { openWcCompletionRefusalWhere } from '@/lib/domain/sales/wc-sync-row-families'
+import { readOpeningStockCutoff } from './opening-stock-cutoff'
+import { Prisma } from '@/app/generated/prisma/client'
+import { openWcCompletionRefusalWhere, openWcCompletionRefusalRowSql } from '@/lib/domain/sales/wc-sync-row-families'
 import { parseWcGmtInstant } from './pre-cutover-order-read'
 import { readWcOrderStatus } from './status-mapping'
 import { recordWcCompletionRefusal, wcEventInstant } from './completion-refusal'
@@ -48,14 +49,14 @@ export function firstSeenOutsideIms(
   reading: Reading,
   order: Partial<Dated>,
   openingStockCutoff: Date | null,
-): { despatched: boolean; historical: boolean; refunded: boolean; any: boolean } {
+): { despatched: boolean; historical: boolean; refunded: boolean; any: boolean; noInstant: boolean } {
   const { refunded, candidate } = isCandidate(reading, order)
   const settled = wcSaleSettledInstant(order)
   const consumes = candidate && openingStockCutoff !== null && settled !== null && settled.getTime() >= openingStockCutoff.getTime()
   const despatched = consumes
   // A refunded order that was not despatched after the cut-off is simply refunded (PROCESSING, no allocation); any other candidate that does not consume is historical.
   const historical = candidate && !consumes && !refunded
-  return { despatched, historical, refunded, any: despatched || historical || refunded }
+  return { despatched, historical, refunded, any: despatched || historical || refunded, noInstant: historical && openingStockCutoff === null }
 }
 
 /** Release the partial allocation and the pending shipment an order that can never ship is holding. */
@@ -118,7 +119,16 @@ export async function bookOutsideImsDespatch(orderId: string, wcOrder: WcFullOrd
     return 'owed'
   }
   if (outcome.kind === 'refused' && outcome.refusal === 'coverage_shortfall') {
-    await releaseUnbookedAllocation(orderId, 'the shipment lines cannot cover the order')
+    // For an order IMS built only to book a despatch that already happened, the shipment lines come from IMS's own allocation, so a shortfall means IMS has
+    // stock for only PART of it. That is owed, not permanent: release what was reserved (nothing may stay held for goods that already left) and retry as
+    // stock is received, under the same attempt and age caps. A first partial receipt must not make the order permanent.
+    await releaseUnbookedAllocation(orderId, 'IMS has stock for only part of the order')
+    await recordWcCompletionRefusal({
+      orderId, externalOrderId: wcOrder.id, wcStatus: wcOrder.status, refusal: 'insufficient_physical_stock',
+      error: `IMS has physical stock for only part of this order (it was first seen already ${wcOrder.status}), so the despatch could not be booked yet. IMS will retry automatically as stock is received; the order is not sent to a warehouse.`,
+      eventAt: wcEventInstant(wcOrder),
+    })
+    return 'owed'
   }
   return 'refused'
 }
@@ -149,7 +159,7 @@ export async function bookOutsideImsDespatchIfOwed<T extends { success: boolean;
   }
 }
 
-export type OwedDespatchRetryResult = { scanned: number; booked: number; stillOwed: number; terminal: number; failed: number }
+export type OwedDespatchRetryResult = { scanned: number; booked: number; stillOwed: number; terminal: number; failed: number; resolved: number }
 
 /**
  * The bounded driver for despatches owed for want of stock. Runs off the open completion-refusal rows of orders that carry the marker. Each pass re-reads
@@ -157,21 +167,23 @@ export type OwedDespatchRetryResult = { scanned: number; booked: number; stillOw
  * `OUTSIDE_IMS_DESPATCH_MAX_AGE_MS` the row is marked terminal (it stays open under Sync > Exceptions, says so, and is no longer retried).
  */
 export async function retryOwedOutsideImsDespatches(limit = 20, readLive?: (externalOrderId: string) => Promise<{ order: WcFullOrder } | { gone: true } | { failed: true }>): Promise<OwedDespatchRetryResult> {
-  const result: OwedDespatchRetryResult = { scanned: 0, booked: 0, stillOwed: 0, terminal: 0, failed: 0 }
-  const rows = await db.shoppingSyncLog.findMany({
-    where: openWcCompletionRefusalWhere(),
-    orderBy: { createdAt: 'asc' },
-    take: 200,
-    select: { id: true, entityId: true, externalId: true, payload: true },
-  })
+  const result: OwedDespatchRetryResult = { scanned: 0, booked: 0, stillOwed: 0, terminal: 0, failed: 0, resolved: 0 }
+  // FILTERED IN SQL: only OWED rows of orders that carry the marker and are still unshipped, never a terminal row, least recently attempted first. Filtering a page of
+  // the oldest open refusals in memory would let terminal and ordinary refusals starve every newer owed despatch.
+  const rows = await db.$queryRaw<Array<{ id: string; orderId: string; externalId: string | null; payload: unknown }>>(Prisma.sql`
+    SELECT "shopping_sync_logs".id, "shopping_sync_logs"."entityId" AS "orderId", "shopping_sync_logs"."externalId" AS "externalId", "shopping_sync_logs".payload AS payload
+      FROM "shopping_sync_logs"
+      JOIN "sales_orders" so ON so.id = "shopping_sync_logs"."entityId"
+     WHERE ${openWcCompletionRefusalRowSql()}
+       AND so.outside_ims_fulfilment_at IS NOT NULL
+       AND so.status::text IN ('PROCESSING', 'ALLOCATED')
+       AND COALESCE("shopping_sync_logs".payload->>'terminal', '') <> 'true'
+     ORDER BY COALESCE("shopping_sync_logs".payload->>'lastRefusedAt', '') ASC, "shopping_sync_logs"."createdAt" ASC
+     LIMIT ${limit}`)
   const read = readLive ?? (await import('./order-admission')).readLiveWcOrder
   for (const row of rows) {
-    if (result.scanned >= limit) break
     const payload = (row.payload ?? {}) as { terminal?: boolean; occurrences?: number; firstRefusedAt?: string; refusal?: string }
-    if (payload.terminal === true || payload.refusal === 'coverage_shortfall') continue
-    const orderId = row.entityId as string
-    const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { status: true, outsideImsFulfilmentAt: true } })
-    if (!order?.outsideImsFulfilmentAt || (order.status !== 'PROCESSING' && order.status !== 'ALLOCATED')) continue
+    const orderId = row.orderId
     result.scanned++
     const ageMs = payload.firstRefusedAt ? Date.now() - Date.parse(payload.firstRefusedAt) : 0
     if ((payload.occurrences ?? 0) >= OUTSIDE_IMS_DESPATCH_MAX_ATTEMPTS || ageMs > OUTSIDE_IMS_DESPATCH_MAX_AGE_MS) {
@@ -189,6 +201,13 @@ export async function retryOwedOutsideImsDespatches(limit = 20, readLive?: (exte
     const live = await read(String(row.externalId ?? ''))
     if (!('order' in live)) { result.failed++; continue }
     try {
+      // The store may have moved on since the refusal (back to processing, refunded, cancelled): book only what it STILL says was despatched at or after the cut-off.
+      const reading = await readWcOrderStatus(live.order.status)
+      if (!firstSeenOutsideIms(reading, live.order, await readOpeningStockCutoffIfNeeded(reading, live.order)).despatched) {
+        await db.shoppingSyncLog.update({ where: { id: row.id }, data: { status: 'SYNCED', syncedAt: new Date(), errorMessage: `Closed without booking: the store order is now "${String(live.order.status)}", no longer a despatch IMS owes.` } })
+        result.resolved++
+        continue
+      }
       const outcome = await bookOutsideImsDespatch(orderId, live.order)
       if (outcome === 'booked') result.booked++
       else result.stillOwed++

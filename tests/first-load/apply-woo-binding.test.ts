@@ -16,7 +16,7 @@ import { runSnapshotCli } from '../../lib/first-load/woo-snapshot/cli.ts'
 import { parseApplyManifest } from '../../lib/first-load/apply/manifest.ts'
 import { loadPreparedRun } from '../../lib/first-load/apply/prepared.ts'
 import { startFakeCatalogue } from '../helpers/fake-woocommerce-catalogue.ts'
-import { WAREHOUSES, preparedFiles, withReport, type FileMap } from './apply-helpers.ts'
+import { STOCK_EXTRACTED_AT, WAREHOUSES, preparedFiles, withReport, type FileMap } from './apply-helpers.ts'
 import { config, ds, lot, precondition, product } from './helpers.ts'
 
 const KEY = 'ck_test_readonly_key_0000'
@@ -77,6 +77,7 @@ function preparedWithParents(bundle: { snapshot: Uint8Array; provenance: Uint8Ar
 function manifestFor(bundle: { origin: string }, over: Record<string, unknown> = {}, woo: Record<string, unknown> | null = {}) {
   return parseApplyManifest(JSON.stringify({
     formatVersion: 1, runId: 'woo-run', preparedDir: '/p', baseCurrency: 'GBP', steps: ['products', 'opening-stock'],
+    ...(((over.steps as string[] | undefined) ?? ['opening-stock']).includes('opening-stock') ? { stockExtractedAt: STOCK_EXTRACTED_AT } : {}),
     expectWarehouses: { MAIN: WAREHOUSES['ZQSENT-MAIN'] }, restorePointDir: '/r',
     ...(woo === null ? {} : { wooSnapshot: { snapshot: '/s', provenance: '/p', variantParents: '/v', origin: bundle.origin, visibilityChecked: ATTESTED, ...woo } }),
     ...over,

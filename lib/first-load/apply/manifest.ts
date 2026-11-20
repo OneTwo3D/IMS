@@ -42,6 +42,31 @@ export interface ApplyManifest {
   /** Location only: not part of the digest. */
   restorePointDir: string
   wooSnapshot: ApplyWooSnapshot | null
+  /**
+   * The instant the Qoblex stock figures were READ, ISO-8601 UTC ("2026-11-20T09:00:00Z"). Required when opening-stock is a step. It is what the storefront order
+   * import uses to tell a sale already in the opening stock (completed before it) from one that is not (completed at or after it). Part of the digest.
+   */
+  stockExtractedAt: string | null
+}
+
+/** The longest a stock extract may pre-date the apply before the manifest is refused as implausible (a stale extract, or a mistyped date). */
+export const STOCK_EXTRACT_MAX_AGE_DAYS = 45
+const EXTRACT_INSTANT = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,3})?Z$/
+
+/** Is this a well-formed ISO-8601 UTC instant? (Shape only: no clock is read here; the apply instant is judged by the database side's preflight.) */
+export function stockExtractedAtShapeRefusal(value: string): string | null {
+  if (!EXTRACT_INSTANT.test(value) || Number.isNaN(Date.parse(value))) return 'apply manifest stockExtractedAt must be an ISO-8601 UTC instant ending in Z (for example 2026-11-20T09:00:00Z): the moment the Qoblex stock figures were read'
+  return null
+}
+
+/** Judge a well-formed extract instant against the apply instant `nowMs`. Returns the refusal text, or null when acceptable. */
+export function judgeStockExtractedAt(value: string, nowMs: number): string | null {
+  const shape = stockExtractedAtShapeRefusal(value)
+  if (shape) return shape
+  const atMs = Date.parse(value)
+  if (atMs > nowMs) return 'apply manifest stockExtractedAt is later than the apply instant: the stock cannot have been extracted in the future'
+  if (nowMs - atMs > STOCK_EXTRACT_MAX_AGE_DAYS * 86_400_000) return `apply manifest stockExtractedAt is more than ${STOCK_EXTRACT_MAX_AGE_DAYS} days before the apply instant: re-extract the stock, or correct the date`
+  return null
 }
 
 export class ApplyManifestError extends Error {
@@ -190,6 +215,17 @@ export function parseApplyManifest(text: string): ApplyManifest {
     }
   }
 
+  let stockExtractedAt: string | null = null
+  if (raw.stockExtractedAt !== undefined) {
+    if (!usesStock) fail('apply manifest stockExtractedAt is given but opening-stock is not a step: an assertion nothing uses')
+    else if (typeof raw.stockExtractedAt !== 'string') fail('apply manifest stockExtractedAt must be a string (an ISO-8601 UTC instant)')
+    else {
+      const refusal = stockExtractedAtShapeRefusal(raw.stockExtractedAt)
+      if (refusal) fail(refusal)
+      else stockExtractedAt = raw.stockExtractedAt
+    }
+  } else if (usesStock) fail('apply manifest stockExtractedAt is required when opening-stock is a step: the instant the Qoblex stock was extracted decides which storefront sales the opening stock already contains, and it is never defaulted')
+
   if (problems.length > 0) throw new ApplyManifestError(problems)
   return {
     runId: runId as string,
@@ -201,6 +237,7 @@ export function parseApplyManifest(text: string): ApplyManifest {
     forbidSkus,
     restorePointDir: restorePointDir as string,
     wooSnapshot,
+    stockExtractedAt,
   }
 }
 
@@ -213,6 +250,7 @@ export function digestableManifest(manifest: ApplyManifest): unknown {
     expectWarehouses: manifest.expectWarehouses,
     acceptZeroCost: manifest.acceptZeroCost,
     forbidSkus: manifest.forbidSkus,
+    stockExtractedAt: manifest.stockExtractedAt,
     wooSnapshot: manifest.wooSnapshot === null ? null : { origin: manifest.wooSnapshot.origin, visibilityChecked: manifest.wooSnapshot.visibilityChecked },
   }
 }

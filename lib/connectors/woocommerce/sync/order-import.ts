@@ -4090,10 +4090,10 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
 
     if (outsideIms.despatched || outsideIms.historical || outsideIms.refunded) {
       await logActivity({
-        entityType: 'SALES_ORDER', entityId: so.id, tag: 'sync', level: 'INFO', resolveUser: false,
+        entityType: 'SALES_ORDER', entityId: so.id, tag: 'sync', level: outsideIms.noInstant ? 'WARNING' : 'INFO', resolveUser: false,
         action: outsideIms.historical ? 'wc_import_first_seen_historical' : outsideIms.despatched ? 'wc_import_first_seen_despatched_pending' : 'wc_import_first_seen_refunded',
         description: outsideIms.historical
-          ? `WooCommerce order ${wcOrder.number} was first seen already ${wcOrder.status}, completed before the opening stock was taken (or with no opening-stock instant on record): recorded as ${lifecycleStatus} with no allocation, stock movement or cost, and never pushed to a warehouse.`
+          ? `WooCommerce order ${wcOrder.number} was first seen already ${wcOrder.status}, completed before the opening stock was taken (or with no opening-stock instant on record: this install's opening stock was not loaded through the first-load apply, so no completed order is ever consumed here): recorded as ${lifecycleStatus} with no allocation, stock movement or cost, and never pushed to a warehouse.`
           : outsideIms.despatched
             ? `WooCommerce order ${wcOrder.number} was first seen already ${wcOrder.status}: created PROCESSING and fenced from the warehouse; its despatch is booked as made outside IMS.`
             : `WooCommerce order ${wcOrder.number} was first seen already refunded: imported as ${lifecycleStatus} with no allocation and never pushed to a warehouse; its refunds are recorded by the refund sweep.`,

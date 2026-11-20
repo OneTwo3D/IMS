@@ -7,8 +7,17 @@ type Any = any
  * the order id. Nothing is swallowed: a table the import started writing that this does not reach fails the run, so no test residue is left to disturb
  * a later test (the reconciliation tests count findings over the whole database).
  */
+/** Refuse to delete anything unless the connected database is plainly disposable: its name says scratch / test / ci, or IMS_SCRATCH_DB=1 says so. */
+async function assertDisposableDatabase(db: Any): Promise<void> {
+  if (process.env.IMS_SCRATCH_DB === '1') return
+  const rows: Array<{ name: string }> = await db.$queryRawUnsafe('SELECT current_database() AS name')
+  const name = rows[0]?.name ?? ''
+  if (!/(scratch|_ci$|_test|^test_)/i.test(name)) throw new Error(`purge-rows refuses to delete from database "${name}": it is not recognisably a scratch database (set IMS_SCRATCH_DB=1 to override)`)
+}
+
 export async function purge(db: Any, table: string, column: string, ids: string[], seen = new Set<string>()): Promise<void> {
   if (ids.length === 0) return
+  await assertDisposableDatabase(db)
   const key = `${table}.${column}:${[...ids].sort().join(',')}`
   if (seen.has(key)) return
   seen.add(key)

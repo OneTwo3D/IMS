@@ -47,15 +47,17 @@ test('[db] a full-history first reconcile walk over pre-cut-off completed orders
   const D = (v: number) => new Prisma.Decimal(String(v))
   const suffix = randomUUID().slice(0, 8)
 
-  const warehouse = await db.warehouse.create({ data: { code: `H92${suffix}`, name: `h92 ${suffix}`, active: true, syncToStore: true, isDefault: true }, select: { id: true } })
+  const warehouse = await db.warehouse.create({ data: { code: `H92${suffix}`, name: `h92 ${suffix}`, active: true, syncToStore: true, isDefault: false }, select: { id: true } })
   const product = await db.product.create({ data: { sku: `H92-${suffix}`, name: `h92 ${suffix}`, type: 'SIMPLE' }, select: { id: true, sku: true } })
   await db.stockLevel.create({ data: { productId: product.id, warehouseId: warehouse.id, quantity: D(50), reservedQty: D(0) } })
   await db.costLayer.create({ data: { productId: product.id, warehouseId: warehouse.id, receivedQty: D(50), remainingQty: D(50), unitCostBase: D(3), receivedAt: new Date('2026-10-01T00:00:00Z') } })
   await db.firstLoadApplyRun.deleteMany({ where: { manifestDigest: { startsWith: 'h92-' } } })
   await db.firstLoadApplyRun.create({ data: { version: 1, manifestDigest: `h92-${randomUUID()}`, runId: `h92-${randomUUID()}`, status: 'APPLIED', facts: { openingStockCutoffAt: '2026-11-05T00:00:00.000Z' } } })
-  const keys = ['wc_initial_import_completed', 'wc_sync_order_statuses', 'last_wc_order_reconcile_at']
-  const before = await db.setting.findMany({ where: { key: { in: keys } } })
-  await db.setting.deleteMany({ where: { key: { in: keys } } })
+  const keys = ['wc_initial_import_completed', 'wc_sync_order_statuses', 'last_wc_order_reconcile_at', 'wc_order_sync_reconcile_cursor']
+  // Every setting the walk may read or write: the named keys and every cursor (and its fingerprint / outage marker) of the order sweep. Snapshot, clear, and restore afterwards.
+  const touched = { OR: [{ key: { in: keys } }, { key: { startsWith: 'last_wc_order_' } }, { key: { startsWith: 'wc_order_sync' } }] }
+  const before = await db.setting.findMany({ where: touched })
+  await db.setting.deleteMany({ where: touched })
   await db.setting.create({ data: { key: 'wc_initial_import_completed', value: 'true' } })
   await db.setting.create({ data: { key: 'wc_sync_order_statuses', value: '["processing"]' } })
 
@@ -79,7 +81,7 @@ test('[db] a full-history first reconcile walk over pre-cut-off completed orders
     await purge(db, 'products', 'id', [product.id])
     await purge(db, 'warehouses', 'id', [warehouse.id])
     await db.firstLoadApplyRun.deleteMany({ where: { manifestDigest: { startsWith: 'h92-' } } })
-    await db.setting.deleteMany({ where: { key: { in: [...keys, 'wc_order_sync_reconcile_cursor'] } } })
+    await db.setting.deleteMany({ where: touched })
     for (const row of before) await db.setting.create({ data: { key: row.key, value: row.value } })
   })
 

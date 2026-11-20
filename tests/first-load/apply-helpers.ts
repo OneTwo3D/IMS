@@ -81,6 +81,9 @@ export function prepareSynthetic(datasets = syntheticDatasets()): PrepareResult 
   return result
 }
 
+/** One instant for the whole process (so two parses of the same manifest digest alike): an hour before the test run started. */
+export const STOCK_EXTRACTED_AT = new Date(Math.floor(Date.now() / 1000) * 1000 - 3_600_000).toISOString()
+
 export function manifestText(overrides: Record<string, unknown> = {}): string {
   const base: Record<string, unknown> = {
     formatVersion: 1,
@@ -92,7 +95,9 @@ export function manifestText(overrides: Record<string, unknown> = {}): string {
     acceptZeroCost: ['ZQSENT-TSHIRT-M@ZQSENT-MAIN'],
     restorePointDir: '/restore',
   }
-  const merged = { ...base, ...overrides }
+  const merged: Record<string, unknown> = { ...base, ...overrides }
+  // The stock extract instant is required exactly when opening-stock is a step; a test that wants it absent or different says so.
+  if (!('stockExtractedAt' in overrides) && Array.isArray(merged.steps) && merged.steps.includes('opening-stock')) merged.stockExtractedAt = STOCK_EXTRACTED_AT
   for (const key of Object.keys(merged)) if (merged[key] === undefined) delete merged[key]
   return JSON.stringify(merged)
 }
