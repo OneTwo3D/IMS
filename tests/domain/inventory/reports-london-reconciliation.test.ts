@@ -240,7 +240,7 @@ test('default report dates are the London day, not the UTC day (23:30Z in BST is
     COGS_ROWS = []
     const cogs = await getCogsReport({ product: 'Widget' }, { paginate: false })
     assert.equal(cogs.dateTo, '2026-07-02')
-    assert.equal(cogs.dateFrom, '2026-06-02')
+    assert.equal(cogs.dateFrom, '2026-06-03', 'the 30 London days ending 2 July, as Gross Margin (not 31)')
     const turnover = await getInventoryTurnoverReport({}, { paginate: false, client: { cogsEntry: { findMany: cogsFindMany }, inventorySnapshot: { findMany: async () => [] } } as never })
     assert.equal(turnover.dateTo, '2026-07-02')
     assert.equal(turnover.dateFrom, '2026-04-03')

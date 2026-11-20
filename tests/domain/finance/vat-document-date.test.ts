@@ -25,7 +25,7 @@ type RefundLine = { createdAt: Date; net: number; postedTaxRate: number | null; 
 type SupplierCredit = { postedAt: Date; amountBase: number; billTotal: number | null; lineNet: number; lineTax: number }
 type Bill = { invoiceDate: Date; net: number; tax: number }
 
-const rate = { name: 'VAT 20%', rate: D(20), accountingTaxType: 'OUTPUT2', countryCode: 'GB', reportingCategory: null }
+const rate = { name: 'VAT 20%', rate: D('0.2'), accountingTaxType: 'OUTPUT2', countryCode: 'GB', reportingCategory: null }
 function deps(data: { orders?: Order[]; refunds?: RefundLine[]; credits?: SupplierCredit[]; bills?: Bill[] }): FinanceAnalyticsDeps {
   return {
     now: () => NOW,

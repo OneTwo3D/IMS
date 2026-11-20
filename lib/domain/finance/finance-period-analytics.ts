@@ -609,6 +609,8 @@ export async function getVatReport(
         refund: {
           createdAt: { gte: window.dateFrom, lt: window.dateToExclusive },
           accountingCreditNoteId: { not: null },
+          // A deleted refund's credit note is voided in the ledger.
+          deletedAt: null,
           order: { status: { not: SalesOrderStatus.CANCELLED } },
         },
         ...(reportingCategoryFilter && {
@@ -748,7 +750,7 @@ export async function getVatReport(
   // CREDIT NOTES reduce the side they credit, exactly as Xero's return nets them by credit-note date.
   for (const line of refundLines) {
     const taxRate = line.salesOrderLine?.taxRate ?? null
-    const rate = line.postedTaxRate != null ? toDecimal(line.postedTaxRate) : toDecimal(taxRate?.rate ?? 0).div(100)
+    const rate = line.postedTaxRate != null ? toDecimal(line.postedTaxRate) : toDecimal(taxRate?.rate ?? 0)
     const net = toDecimal(line.totalBase)
     const row = getOrCreateRow({
       side: 'sales',
