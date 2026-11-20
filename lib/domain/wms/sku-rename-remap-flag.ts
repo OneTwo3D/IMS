@@ -5,10 +5,11 @@ import { getSettingValue } from '@/lib/settings-store'
  * sku-rename-hold.ts). OFF BY DEFAULT: only an explicit `true` turns it on. While it is off every line goes out with its own snapshot SKU, exactly as it
  * did before the remap existed (the open-rename-row order hold is independent of this switch and always applies). An unreadable setting is off.
  *
- * It applies to creates AND amendments alike, so an order is always amended with the SKU it was created with. Turn it on when no order created under an
- * older SKU is still open at the warehouse and awaiting an amendment: such an order holds the older SKU, and an amendment would then send the current
- * one. While it is on, the downstream SKU split in help-docs/warehouse.md applies (partial-shipment push forwards the warehouse SKU, the refund-remainder
- * task names the snapshot SKU).
+ * The SKU actually sent for each line is recorded on the push link at create (and refreshed by every applied line amendment); amendments and verifies
+ * are built from that record whatever this switch says, so it only decides lines that were never sent. An order created before the record existed has
+ * nothing recorded and follows the switch as it stands: turn it on only when no such order is still open at the warehouse and awaiting an amendment, and not
+ * off again while one created with it on is. While it is on, the downstream SKU split in help-docs/warehouse.md applies (partial-shipment push forwards the
+ * warehouse SKU, the refund-remainder task names the snapshot SKU).
  *
  * A system-managed key: not on the generic writers' allowlist; set with `npm run settings:set` (docs/installation.md).
  */

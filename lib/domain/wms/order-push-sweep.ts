@@ -28,7 +28,7 @@ import { withOrderPushSweepLockOrSkip } from './dispatch-sweep-lock'
 import { removalNoteKey, REMOVAL_NOTE_KEY_PREFIX, parseRemovalNote, serializeRemovalNote, type WmsRemovalNoteObligation, type RemovalNoteItem } from './removal-note-obligation'
 import { scrubWmsError } from './error-scrub'
 import { isSkuRenameRemapEnabled } from '@/lib/domain/wms/sku-rename-remap-flag'
-import { lineSkuMissingAtWarehouse, sentSkuForLine, SKU_RENAME_HOLD_REASON_PREFIX, skuRenameHoldReason, withSkuRenameHolds, type SkuRemap, type SkuRenameHold } from '@/lib/domain/wms/sku-rename-hold'
+import { lineSkuMissingAtWarehouse, sentSkuForLine, SKU_RENAME_HOLD_REASON_PREFIX, skuRenameHoldReason, withSkuRenameHolds, parseSentLineSkus, type SentLineSkus, type SkuRemap, type SkuRenameHold } from '@/lib/domain/wms/sku-rename-hold'
 import { amendmentSeverity, classifyAmendmentLineChange, recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER, type AmendmentLineChange, type RefusedActionInput } from '@/lib/domain/refused-actions'
 import { raiseRefundRemainderTasks } from './refund-remainder'
 import { amendmentNotAppliedQuery, courierFallbackQuery, describeTaskLines, identityCheckQuery, INVESTIGATE_NOTICE_PREFIX, mergedLinesRemovedQuery, noticeQuery, partialRemovalCheckQuery, raiseWmsOperatorTask, warehouseOrderRef, type WmsOperatorTaskInput } from './operator-tasks'
@@ -462,6 +462,8 @@ type OrderForPush = {
   skuRenameHolds?: ReadonlyArray<SkuRenameHold>
   /** Per product: the SKU the warehouse holds and the product's known earlier SKUs (see sentSkuForLine). Set only while `wms_sku_rename_remap_enabled` is on, on create AND amendment paths alike. */
   skuRemap?: SkuRemap
+  /** The SKU sent for each line when the warehouse order was created/last amended (the link's record). Set on AMENDMENT paths only; see sentSkuForLine. */
+  sentSkuByLine?: SentLineSkus
   refunds?: Array<{ lines: Array<{ salesOrderLineId: string | null; qty: unknown }> }>
   /** The business-event time of the order (paid, else created): the producer-side hold's obligation time. Read-only evidence; absent in a hand-built port. */
   paidAt?: Date | null
@@ -630,7 +632,7 @@ type CandidateLine = {
  */
 export const NO_GOODS_TO_PUSH_REASON = 'Sales order has only fee lines (no goods to fulfil); cannot push to WMS'
 
-export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, number>, skuRenameHolds?: ReadonlyArray<SkuRenameHold>, skuRemap?: SkuRemap): WmsOrderPushLine[] {
+export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, number>, skuRenameHolds?: ReadonlyArray<SkuRenameHold>, skuRemap?: SkuRemap, sentSkuByLine?: SentLineSkus): WmsOrderPushLine[] {
   const pushLines: WmsOrderPushLine[] = []
   const heldSkus: string[] = []
   for (const line of lines) {
@@ -652,7 +654,7 @@ export function buildLines(lines: CandidateLine[], refundedByLine?: Map<string, 
     if (quantity <= 0) continue
     // A line that WILL be sent with a SKU the warehouse does not hold for a product with an open rename row holds the whole order (see sku-rename-hold.ts). Fee lines and fully refunded lines are skipped above.
     // The SKU on the wire is sentSkuForLine's (the same for create and amendment; identity unless the remap setting is on).
-    const sku = sentSkuForLine(line, skuRemap)
+    const sku = sentSkuForLine(line, skuRemap, sentSkuByLine)
     if (skuRenameHolds?.some((hold) => hold.productId === line.productId && lineSkuMissingAtWarehouse(sku, hold))) heldSkus.push(sku)
     // IMS stores SalesOrderLine.totalForeign as NET (ex-VAT) in both tax-inclusive
     // and tax-exclusive cases; taxForeign is the line VAT. Unit prices are per the
@@ -808,7 +810,7 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string,
     ...(shippingVatDerived > 0 ? { shippingVatDerived } : {}),
     discountExVat: num(order.discountAmount),
     discountVat: 0,
-    lines: buildLines(order.lines, refundedQtyByLine(order), order.skuRenameHolds, order.skuRemap),
+    lines: buildLines(order.lines, refundedQtyByLine(order), order.skuRenameHolds, order.skuRemap, order.sentSkuByLine),
   }
   if (scope?.mode !== 'MIXED') return input
   const minorFactor = 10 ** currencyMinorUnits(order.currency)
@@ -819,13 +821,30 @@ export function buildPushInput(order: OrderForPush, externalWarehouseId: string,
     discountExVat: scope.discountMinor / minorFactor,
     lines: scope.lines.map((line) => ({
       // The same per-line SKU as the whole-order build (the scope line names its order line).
-      sku: sentSkuForLine({ sku: line.sku, productId: order.lines.find((l) => l.id === line.lineId)?.productId }, order.skuRemap),
+      sku: sentSkuForLine({ id: line.lineId, sku: line.sku, productId: order.lines.find((l) => l.id === line.lineId)?.productId }, order.skuRemap, order.sentSkuByLine),
       quantity: line.quantity,
       unitPriceExVat: line.unitPriceExVat,
       unitPriceVat: line.unitPriceVat,
       description: line.description,
     })),
   }
+}
+
+/**
+ * The SKU actually sent for each order line, for the link's record (WmsOrderPushLink.sentLineSkus): every goods line the payload carried (a MIXED scope: the
+ * lines of the scope), keyed by line id. Decided by sentSkuForLine, so it is exactly what buildPushInput put on the wire.
+ */
+export function sentLineSkusOf(order: OrderForPush, scope?: MixedScope): Record<string, { own: string; sent: string }> {
+  const refunded = refundedQtyByLine(order)
+  const inScope = scope?.mode === 'MIXED' ? new Set(scope.lines.map((line) => line.lineId)) : null
+  const out: Record<string, { own: string; sent: string }> = {}
+  for (const line of order.lines) {
+    if (!line.id || !line.sku || isMirroredFeeLine(line)) continue
+    if (inScope && !inScope.has(line.id)) continue
+    if (!inScope && Math.max(0, (num(line.qty) || 1) - (refunded.get(line.id) ?? 0)) <= 0) continue
+    out[line.id] = { own: line.sku, sent: sentSkuForLine(line, order.skuRemap, order.sentSkuByLine) }
+  }
+  return out
 }
 
 // Sum refunded quantity per sales-order line so the WMS payload can exclude it.
@@ -865,6 +884,8 @@ type LinkWrite = {
   courierTaskEpisode?: Date | null
   courierForm?: string | null
   courierFormName?: string | null
+  /** The SKU sent for each order line (see WmsOrderPushLink.sentLineSkus). Written with the create and with every applied line amendment. */
+  sentLineSkus?: Record<string, { own: string; sent: string }>
   totalMismatchPence?: number | null
   dispatchFailureCount?: number
   dispatchLastError?: string | null
@@ -1348,7 +1369,7 @@ export interface WmsOrderPushPort {
    * lock in a short transaction at the push boundary. The core builds the payload it sends from THIS, not from the earlier list
    * read, and refuses an erased order. Absent: the caller uses its snapshot (test doubles). A rejection fails closed.
    */
-  reloadOrderForPush?(orderId: string, sentToWarehouseId?: string | null, connectorId?: string): Promise<Partial<OrderForPush> | null>
+  reloadOrderForPush?(orderId: string, sentToWarehouseId?: string | null, connectorId?: string, forAmendment?: boolean): Promise<Partial<OrderForPush> | null>
   /**
    * The systemic-failure circuit breaker's state and incident (lib/domain/wms/systemic-failure.ts). Optional: a port without one
    * keeps the legacy behaviour (a record is parked the moment its retries run out), which is what test doubles get.
@@ -1559,8 +1580,8 @@ export async function runWmsOrderPushSweepCore(
           // The lines are compared as they would be SENT (the same per-line SKU as the build); for a rename hold a held line is compared under the SKU the
           // warehouse order carries (the open row's wmsValue): the rename itself is not a change of lines.
           const heldAs = new Map((renameHold ? (order.skuRenameHolds ?? []) : []).flatMap((hold) => (hold.wmsValue ? [[hold.productId, hold.wmsValue] as const] : [])))
-          const skuAsRecorded = new Map(order.lines.map((l) => [sentSkuForLine(l, order.skuRemap), heldAs.get(l.productId ?? '') ?? sentSkuForLine(l, order.skuRemap)] as const))
-          const wanted = buildLines(order.lines, refundedQtyByLine(order), undefined, order.skuRemap).map((line) => ({ sku: skuAsRecorded.get(line.sku) ?? line.sku, quantity: Number(line.quantity) }))
+          const skuAsRecorded = new Map(order.lines.map((l) => [sentSkuForLine(l, order.skuRemap, order.sentSkuByLine), heldAs.get(l.productId ?? '') ?? sentSkuForLine(l, order.skuRemap, order.sentSkuByLine)] as const))
+          const wanted = buildLines(order.lines, refundedQtyByLine(order), undefined, order.skuRemap, order.sentSkuByLine).map((line) => ({ sku: skuAsRecorded.get(line.sku) ?? line.sku, quantity: Number(line.quantity) }))
           const recorded = port.readOrderItems ? await port.readOrderItems(link.id).catch(() => null) : null
           lineChange = classifyAmendmentLineChange(wanted, recorded)
         } catch {
@@ -2930,6 +2951,8 @@ export async function runWmsOrderPushSweepCore(
       // that cannot be closed from inside IMS.
       // The shipping service the payload is built from: the RELOADED order's, not the candidate list's earlier read (the courier task names the service applied).
       let pushService: string | null = order.shippingService
+      // The order the payload is built from (the reload when there is one): its lines and remap decide the SKUs recorded on the link below.
+      let sentOrder: typeof order = order
       if (port.reloadOrderForPush) {
         let current: Partial<OrderForPush> | null = null
         let readFailed = false
@@ -2960,7 +2983,8 @@ export async function runWmsOrderPushSweepCore(
           }
         }
         try {
-          input = buildPushInput({ ...order, ...current } as typeof order, externalWarehouseId, scope)
+          sentOrder = { ...order, ...current } as typeof order
+          input = buildPushInput(sentOrder, externalWarehouseId, scope)
           if (current.shippingService !== undefined) pushService = current.shippingService
         } catch (buildError) {
           // This worker owns the claim and has NOT called the warehouse, so the refusal is a VALIDATION HOLD with the claim's own attempts (o3d-k6x6m),
@@ -2973,7 +2997,17 @@ export async function runWmsOrderPushSweepCore(
               lastError: message,
               lastAttemptAt: ts,
             })
-            if (parked) result.validationFailed += 1
+            if (parked) {
+              result.validationFailed += 1
+              // Recorded like the candidate-build park (the same one-time audit of the disposition).
+              await audit({
+                action: 'order_validate', outcome: 'FAILED', entityType: 'SALES_ORDER', entityId: order.id, externalId: null,
+                summary: `Order ${order.orderNumber ?? order.id} cannot be pushed to the WMS: ${message}`,
+                before: { state: 'PENDING_CREATE', attempts: order.pushAttempts },
+                after: { state: 'VALIDATION_FAILED', attempts: order.pushAttempts, remoteCallMade: false },
+                error: message,
+              })
+            }
           } catch (parkError) {
             // Reported, not swallowed: the claim stamp lapses and the order is re-selected, but this sweep answers failed.
             console.error('[wms-order-push] could not park a refused create after the post-claim reload', order.id, parkError)
@@ -3059,14 +3093,14 @@ export async function runWmsOrderPushSweepCore(
         if (totalMismatchPence !== null) {
           console.warn(`[wms-order-push] order ${order.orderNumber ?? order.id} total mismatch: components=${componentPence ?? 'ok'} payload=${payloadPence ?? 'ok'} (recording ${totalMismatchPence}; pushed, flagged for review)`)
         }
-        const createLinkData = { connector: connectorId, pushWarehouseId: order.shipFromWarehouseId ?? null, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, courierTaskService: courierPending ? (pushService ?? '—') : null, courierTaskEpisode: courierPending ? ts : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...(unverifiableError ? { lastError: unverifiableError } : {}) }
+        const createLinkData = { connector: connectorId, pushWarehouseId: order.shipFromWarehouseId ?? null, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, pushedAt: ts, lastAttemptAt: ts, courierPending, courierTaskService: courierPending ? (pushService ?? '—') : null, courierTaskEpisode: courierPending ? ts : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, sentLineSkus: sentLineSkusOf(sentOrder, scope), totalMismatchPence, ...(unverifiableError ? { lastError: unverifiableError } : {}) }
           // attempts: 0 on BOTH sides (o3d-bjc.8). claimForCreate has usually
           // created the link already, so the update side is what runs — and the
           // verification budget reads this counter. Left carrying four failed
           // create attempts, a create that finally succeeded would be
           // quarantined on its FIRST transient unknown, putting a live WMS order
           // outside the update, cancel and dispatch passes.
-        const updateLinkData = { connector: connectorId, pushWarehouseId: order.shipFromWarehouseId ?? null, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, courierTaskService: courierPending ? (pushService ?? '—') : null, courierTaskEpisode: courierPending ? ts : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, totalMismatchPence, ...RESET_DISPATCH_FAILURES,
+        const updateLinkData = { connector: connectorId, pushWarehouseId: order.shipFromWarehouseId ?? null, externalOrderId: push.externalOrderId, externalOrderNumber: push.externalOrderNumber, state: createdState, attempts: 0, lastError: unverifiableError, pushedAt: ts, lastAttemptAt: ts, cancelledAt: null, courierPending, courierTaskService: courierPending ? (pushService ?? '—') : null, courierTaskEpisode: courierPending ? ts : null, courierForm: push.courierForm ?? null, courierFormName: push.courierFormName ?? null, sentLineSkus: sentLineSkusOf(sentOrder, scope), totalMismatchPence, ...RESET_DISPATCH_FAILURES,
             // A (re-)created warehouse order starts with no amendment in flight and no stale mark, written atomically with the state it is
             // SYNCED under (and with its snapshot, see upsertCreatedLinkWithItems).
             lineSnapshotUnsafeAt: null, lineSnapshotToken: null, amendLeaseOwner: null, amendLeaseExpiresAt: null }
@@ -3756,7 +3790,7 @@ export async function runWmsOrderPushSweepCore(
         // that cannot be read left due (no pushedAt) so the next pass tries again.
         let amendOrder = link.order
         if (port.reloadOrderForPush) {
-          const current = await port.reloadOrderForPush(link.order.id, sentToWarehouseId ?? null, connectorId).catch(() => undefined)
+          const current = await port.reloadOrderForPush(link.order.id, sentToWarehouseId ?? null, connectorId, true).catch(() => undefined)
           if (current === undefined || current === null) {
             await port.updateLink(link.id, { lastAttemptAt: ts, lastError: 'Not sent by IMS: the order could not be re-read before the amendment.' })
             continue
@@ -3888,7 +3922,10 @@ export async function runWmsOrderPushSweepCore(
           ...(update.updated && link.amendNoticeAt ? { amendNoticeAt: null } : {}),
           // The accepted header POST carried WarehouseId, so the warehouse order now lives in the warehouse IMS built the amendment for:
           // stamped in the same write that records the outcome, or a despatch from it would read as foreign.
-          ...(update.updated ? { pushWarehouseId: linkIsMixed ? (link.pushWarehouseId ?? link.order.shipFromWarehouseId ?? null) : (link.order.shipFromWarehouseId ?? null) } : {}),
+          // sentToWarehouseId IS that warehouse (a MIXED link's push warehouse when it is mapped, else the ship-from the amendment was sent to).
+          ...(update.updated ? { pushWarehouseId: sentToWarehouseId ?? null } : {}),
+          // The lines the warehouse order now holds are what this amendment sent (a header-only amendment sent none, so the record stands).
+          ...(update.updated && !headerOnly ? { sentLineSkus: sentLineSkusOf(amendOrder, scope) } : {}),
           lastError: settled.retryable ? 'Courier-fallback operator task not recorded; will retry' : update.updated ? null : `Amendment not propagated (WMS status ${update.status})`,
           ...settled.linkFields,
         })
@@ -4775,12 +4812,13 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       if (!dueIds.length) return []
       const links = await db.wmsOrderPushLink.findMany({
         where: { id: { in: dueIds } },
-        select: { id: true, externalOrderId: true, courierTaskService: true, courierTaskEpisode: true, pushedAt: true, courierForm: true, courierFormName: true, amendNoticeAt: true, pushWarehouseId: true, scopeMode: true, scopeHash: true, scopeDirtyAt: true, scopeFrozenAt: true, scopeFrozenReason: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, updatedAt: true, status: true } } },
+        select: { id: true, externalOrderId: true, courierTaskService: true, courierTaskEpisode: true, pushedAt: true, courierForm: true, courierFormName: true, amendNoticeAt: true, pushWarehouseId: true, sentLineSkus: true, scopeMode: true, scopeHash: true, scopeDirtyAt: true, scopeFrozenAt: true, scopeFrozenReason: true, order: { select: { ...ORDER_PUSH_SELECT, shipFromWarehouseId: true, updatedAt: true, status: true } } },
       })
       // A mixed-warehouse amendment is sent to the link's push warehouse, which is the warehouse whose rename row holds it.
       const sentTo = new Map(links.map((link) => [link.order.id, link.scopeMode === 'MIXED' ? (link.pushWarehouseId ?? link.order.shipFromWarehouseId) : link.order.shipFromWarehouseId]))
       const heldOrders = await withSkuRenameHolds(db, links.map((link) => link.order), (order) => sentTo.get(order.id), await remapOptions(connector))
-      return links.map((link, index) => ({ ...link, order: heldOrders[index]! }))
+      // The SKUs sent are the link's record: the amendment is built from them whatever the remap setting is now.
+      return links.map(({ sentLineSkus, ...link }, index) => ({ ...link, order: { ...heldOrders[index]!, sentSkuByLine: parseSentLineSkus(sentLineSkus) } }))
     },
     async revalidatableLinks(connector, boundWarehouseIds, limit, paidNotBefore) {
       // o3d-92fu. The order predicate is deliberately IDENTICAL to createCandidates', because
@@ -5035,14 +5073,17 @@ export function createPrismaWmsOrderPushPort(): WmsOrderPushPort {
       const { recordMixedScopeOutcome } = await import('@/lib/domain/wms/mixed-scope-record')
       await recordMixedScopeOutcome(db, orderId, scope, readAt)
     },
-    async reloadOrderForPush(orderId, sentToWarehouseId, connectorId) {
+    async reloadOrderForPush(orderId, sentToWarehouseId, connectorId, forAmendment) {
       const remap = await remapOptions(connectorId)
       return db.$transaction(async (tx) => {
         await lockSalesOrder(tx, orderId)
         const fresh = await tx.salesOrder.findUnique({ where: { id: orderId }, select: ORDER_PUSH_SELECT })
         if (!fresh) return null
         const [held] = await withSkuRenameHolds(tx, [fresh], (order) => sentToWarehouseId ?? order.shipFromWarehouseId, remap)
-        return held as unknown as Partial<OrderForPush>
+        // An amendment is built from the SKUs recorded as sent; a create never is (a re-created warehouse order is a fresh send). Explicit key: this
+        // result is spread over the list read.
+        const record = forAmendment ? await tx.wmsOrderPushLink.findUnique({ where: { orderId }, select: { sentLineSkus: true } }) : null
+        return { ...held, sentSkuByLine: parseSentLineSkus(record?.sentLineSkus) } as unknown as Partial<OrderForPush>
       })
     },
     async updateLinkIfCreateClaimOwned(orderId, stamp, data) {

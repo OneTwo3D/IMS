@@ -434,3 +434,24 @@ test('o3d-k6x6m: a post-claim reload that no longer builds is a VALIDATION hold 
   assert.equal(writes[0]!.attempts, 0)
   assert.match(String(writes[0]!.lastError), /Order held: SKU NEW was renamed/)
 })
+
+test('o3d-gzszk: the post-claim VALIDATION_FAILED park writes an audit event (like the candidate-build park)', async () => {
+  const events: Array<Record<string, unknown>> = []
+  const { port } = makePort({ createCandidates: [candidate()] })
+  port.reloadOrderForPush = async () => ({ ...candidate(), lines: [{ id: 'l1', sku: 'NEW', productId: 'p1', qty: 1, taxForeign: 0, totalForeign: 10, description: 'W' }], skuRenameHolds: [{ productId: 'p1', wmsValue: 'OLD' }] }) as never
+  port.recordEvent = async (event) => { events.push(event as unknown as Record<string, unknown>) }
+  const r = await runWmsOrderPushSweepCore(connector(), 'mintsoft', port, { now: NOW })
+  assert.equal(r.validationFailed, 1)
+  const audited = events.filter((e) => e.action === 'order_validate')
+  assert.equal(audited.length, 1)
+  assert.equal(audited[0]!.outcome, 'FAILED')
+  assert.equal(audited[0]!.entityId, 'so-1')
+  assert.match(String(audited[0]!.error), /Order held: SKU NEW was renamed/)
+})
+
+test('o3d-gzszk: a MIXED amendment whose push warehouse is UNMAPPED stamps the warehouse it was actually sent to (the ship-from), not the stale push warehouse', async () => {
+  const { port, updates } = makePort({ updatable: [dirtyLink({ pushWarehouseId: 'wh-2' })], loadMixedScope: async () => MIXED })
+  const r = await runWmsOrderPushSweepCore(connector({ updateOrder: async () => ({ updated: true, status: 'NEW' }) }), 'mintsoft', port, { now: NOW })
+  assert.equal(r.updated, 1)
+  assert.equal(updates[0].data.pushWarehouseId, 'wh-1')
+})

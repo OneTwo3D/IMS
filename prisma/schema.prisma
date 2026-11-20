@@ -4597,6 +4597,10 @@ model WmsOrderPushLink {
   pushWarehouseId       String?   @map("push_warehouse_id")
   /// Set before IMS amends the warehouse order's lines and cleared only when a verified fresh snapshot of its line ids is stored (or the
   /// amendment provably changed nothing). While set, the recorded line ids cannot be trusted and a merged-order line removal refuses.
+  /// The SKU actually SENT for each order line, recorded when the warehouse order is created and refreshed by every applied line amendment:
+  /// `{ [salesOrderLineId]: { own: <the line's snapshot SKU>, sent: <the SKU on the wire> } }`. Amendments and the refused-amendment verify are
+  /// built from it whatever `wms_sku_rename_remap_enabled` is now. Null on links created before this column existed (those fall back to the flag).
+  sentLineSkus          Json?     @map("sent_line_skus")
   lineSnapshotUnsafeAt  DateTime? @map("line_snapshot_unsafe_at")
   /// The generation of the amendment that set the mark above. Only the amendment holding the CURRENT token may store a replacement snapshot
   /// or clear the mark (compare-and-set), so an older amendment finishing late cannot make a newer one's stale state look trustworthy.

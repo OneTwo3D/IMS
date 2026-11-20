@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs'
 import test, { mock } from 'node:test'
 
 import { buildLines, runWmsOrderPushSweepCore, type WmsOrderPushPort, type WmsPushCandidate, type WmsPushRevalidateLink, type WmsPushUpdateLink } from '@/lib/domain/wms/order-push-sweep'
-import { sentSkuForLine, withSkuRenameHolds } from '@/lib/domain/wms/sku-rename-hold'
+import { parseSentLineSkus, sentSkuForLine, withSkuRenameHolds } from '@/lib/domain/wms/sku-rename-hold'
 import { planMintsoftItemAmendments } from '@/lib/connectors/mintsoft/api/order-push'
 import type { WmsOrderPushInput, WmsOrderPushResult } from '@/lib/connectors/wms/types'
 
@@ -41,14 +41,17 @@ test('sentSkuForLine: only a KNOWN earlier SKU of the product is remapped; case 
   assert.equal(sentSkuForLine({ sku: 'A', productId: 'p1' }, undefined), 'A', 'setting off')
 })
 
-test('withSkuRenameHolds: the history of ANY status (resolved, ignored, open) names the earlier SKUs, per warehouse; setting off attaches nothing', async () => {
+test('withSkuRenameHolds: the history of ANY status (resolved, ignored, open) names the earlier SKUs, of EVERY warehouse of the connector; setting off attaches an explicit undefined remap', async () => {
   const rows = [history(), history({ status: 'IGNORED', imsValue: 'X', wmsValue: 'A' }), history({ warehouseId: 'wh-2', imsValue: 'OTHER-WH', wmsValue: 'OTHER-WH2' })]
   const order = { id: 'o1', shipFromWarehouseId: 'wh-1', lines: [line()] }
   const [on] = await withSkuRenameHolds(client(rows), [order], undefined, ON)
   assert.deepEqual(on!.skuRemap!.p1!.sku, 'B')
-  assert.deepEqual([...on!.skuRemap!.p1!.earlier].sort(), ['A', 'X'])
+  assert.deepEqual([...on!.skuRemap!.p1!.earlier].sort(), ['A', 'OTHER-WH', 'OTHER-WH2', 'X'], 'a binding added after the rename (wh-2 has no rows of its own) must not lose the product history')
   const [off] = await withSkuRenameHolds(client(rows), [order])
-  assert.equal('skuRemap' in off!, false)
+  assert.equal('skuRemap' in off!, true, 'the key is present...')
+  assert.equal(off!.skuRemap, undefined, '...and undefined, so a reload spread over an earlier list read cannot keep a stale remap')
+  const merged = { ...{ ...order, skuRemap: { p1: { sku: 'B', earlier: ['A'] } } }, ...off! }
+  assert.equal(merged.skuRemap, undefined)
   const [unconfirmed] = await withSkuRenameHolds(client(rows, { linkSku: 'A' }), [order], undefined, ON)
   assert.deepEqual(unconfirmed!.skuRemap, {}, 'the warehouse is not confirmed on the current SKU')
 })
@@ -156,12 +159,98 @@ test('FLAG ON: the revalidation path re-queues a parked order and the create pas
   assert.deepEqual(pushed, [['B']])
 })
 
+// ---- o3d-gzszk: amendments are built from the SKU RECORDED as sent at create, whatever the setting is now --------------------------------------------------
+/**
+ * A stateful stand-in for the link row: the create writes `sentLineSkus` (through the real sweep), the amend reads it back the way the Prisma port does
+ * (parseSentLineSkus -> order.sentSkuByLine on both the list read and the reload). `phase` carries what changes between the two sweeps.
+ */
+async function createThenAmendRecorded(opts: { createRows: Row[]; createOptions: { remapForConnector?: string }; amendRows: Row[]; amendOptions: { remapForConnector?: string }; snapshot?: string; linkSkuAtCreate?: string; linkSkuAtAmend?: string; productSku?: string; dropRecord?: boolean; amendShipFrom?: string }) {
+  const snapshot = opts.snapshot ?? 'A'
+  const order = () => candidate([line({ sku: snapshot })])
+  let stored: unknown
+  let created: WmsOrderPushInput | null = null
+  let amended: WmsOrderPushInput | null = null
+  const link = (data: Record<string, unknown>) => { if ('sentLineSkus' in data) stored = data.sentLineSkus }
+  const createDb = client(opts.createRows, { productSku: opts.productSku, linkSku: opts.linkSkuAtCreate })
+  const connectorFor = {
+    pushOrder: async (input: WmsOrderPushInput): Promise<WmsOrderPushResult> => { created = input; return { externalOrderId: 'wms-1', externalOrderNumber: 'WN-1', status: 'NEW' } },
+    updateOrder: async (_id: string, input: WmsOrderPushInput) => { amended = input; return { updated: true, status: 'NEW' } },
+    cancelOrder: async () => ({ cancelled: true, status: 'CANCELLED' }),
+  }
+  await runWmsOrderPushSweepCore(connectorFor as never, 'mintsoft', {
+    ...base(),
+    createCandidates: async () => withSkuRenameHolds(createDb, [order()], undefined, opts.createOptions),
+    reloadOrderForPush: async () => (await withSkuRenameHolds(createDb, [order()], undefined, opts.createOptions))[0] as never,
+    upsertByOrder: async (_id, create, update) => { link(create as Record<string, unknown>); link(update as Record<string, unknown>) },
+  } as WmsOrderPushPort, { now: NOW })
+  const afterDb = client(opts.amendRows, { productSku: opts.productSku, linkSku: opts.linkSkuAtAmend })
+  const recorded = opts.dropRecord ? undefined : parseSentLineSkus(stored)
+  const shipFrom = opts.amendShipFrom ?? 'wh-1'
+  const fresh = async () => ({ ...(await withSkuRenameHolds(afterDb, [{ ...order(), shipFromWarehouseId: shipFrom }], undefined, opts.amendOptions))[0]!, sentSkuByLine: recorded })
+  const updatedLink = { ...({ id: 'link-1', externalOrderId: 'wms-1', order: { ...(await fresh()), updatedAt: new Date('2026-11-19T00:00:00Z') } } as WmsPushUpdateLink) }
+  await runWmsOrderPushSweepCore(connectorFor as never, 'mintsoft', {
+    ...base(),
+    activeBindings: async () => [{ warehouseId: 'wh-1', externalWarehouseId: '301' }, { warehouseId: 'wh-2', externalWarehouseId: '302' }],
+    updatableLinks: async () => [updatedLink],
+    reloadOrderForPush: fresh as never,
+    updateLink: async (_id, data) => { link(data as Record<string, unknown>) },
+  } as WmsOrderPushPort, { now: NOW })
+  return { created: created as WmsOrderPushInput | null, amended: amended as WmsOrderPushInput | null, stored }
+}
+const OPEN_ROW: Row = { productId: 'p1', warehouseId: 'wh-1', status: 'OPEN', imsValue: 'B', wmsValue: 'A' }
+
+test('o3d-gzszk (MED 1): created as A while the rename row is OPEN, the row then RESOLVES, flag ON: the next amendment still sends A, so the real planner plans no delete or add', async () => {
+  const r = await createThenAmendRecorded({ createRows: [OPEN_ROW], createOptions: ON, linkSkuAtCreate: 'A', amendRows: [history()], amendOptions: ON, linkSkuAtAmend: 'B' })
+  assert.deepEqual(r.created!.lines.map((l) => l.sku), ['A'], 'precondition: the OPEN row let the old SKU through and the create sent A (no remap entry while the warehouse is not confirmed)')
+  assert.deepEqual(r.stored, { l1: { own: 'A', sent: 'A' } })
+  assert.deepEqual(r.amended!.lines.map((l) => l.sku), ['A'], 'the recorded sent SKU wins over the (now resolved) remap')
+  assert.deepEqual(planMintsoftItemAmendments(itemsOf(r.created!) as never, r.amended!.lines), [], 'no item DELETE and no item PUT on the live order')
+})
+
+test('o3d-gzszk (MED 1, control): the same order WITHOUT the record (created before it existed) falls back to the flag and remaps: the documented limit', async () => {
+  const r = await createThenAmendRecorded({ createRows: [OPEN_ROW], createOptions: ON, linkSkuAtCreate: 'A', amendRows: [history()], amendOptions: ON, linkSkuAtAmend: 'B', dropRecord: true })
+  assert.deepEqual(r.amended!.lines.map((l) => l.sku), ['B'])
+  assert.notDeepEqual(planMintsoftItemAmendments(itemsOf(r.created!) as never, r.amended!.lines), [])
+})
+
+test('o3d-gzszk (MED 2): flag ON, create as B, flag turned OFF, amend: the amendment still sends B, so the real planner plans no delete or add', async () => {
+  const r = await createThenAmendRecorded({ createRows: [history()], createOptions: ON, amendRows: [history()], amendOptions: {} })
+  assert.deepEqual(r.created!.lines.map((l) => l.sku), ['B'])
+  assert.deepEqual(r.stored, { l1: { own: 'A', sent: 'B' } })
+  assert.deepEqual(r.amended!.lines.map((l) => l.sku), ['B'])
+  assert.deepEqual(planMintsoftItemAmendments(itemsOf(r.created!) as never, r.amended!.lines), [])
+})
+
+test('o3d-gzszk (MED 2, control): a record-less order amended with the flag OFF sends the snapshot A: the documented limit for orders created before the record', async () => {
+  const r = await createThenAmendRecorded({ createRows: [history()], createOptions: ON, amendRows: [history()], amendOptions: {}, dropRecord: true })
+  assert.deepEqual(r.amended!.lines.map((l) => l.sku), ['A'])
+})
+
+test('o3d-gzszk (low): a ship-from change to a warehouse with NO rename history still amends as B (the recorded SKU), and a record-less order is remapped from the connector-wide history', async () => {
+  const withRecord = await createThenAmendRecorded({ createRows: [history()], createOptions: ON, amendRows: [history()], amendOptions: ON, amendShipFrom: 'wh-2' })
+  assert.deepEqual(withRecord.amended!.lines.map((l) => l.sku), ['B'])
+  assert.deepEqual(planMintsoftItemAmendments(itemsOf(withRecord.created!) as never, withRecord.amended!.lines), [])
+  const legacy = await createThenAmendRecorded({ createRows: [history()], createOptions: ON, amendRows: [history()], amendOptions: ON, amendShipFrom: 'wh-2', dropRecord: true })
+  assert.deepEqual(legacy.amended!.lines.map((l) => l.sku), ['B'], 'history rows are of wh-1 only; the connector-wide history still names A as an earlier SKU')
+})
+
+test('sentSkuForLine: a recorded line is sent as recorded (flag irrelevant) only while it still carries the snapshot it was recorded under; a line never sent follows the remap', () => {
+  const remap = { p1: { sku: 'B', earlier: ['A'] } }
+  const recorded = { l1: { own: 'A', sent: 'A' } }
+  assert.equal(sentSkuForLine({ id: 'l1', sku: 'A', productId: 'p1' }, remap, recorded), 'A', 'recorded beats the remap')
+  assert.equal(sentSkuForLine({ id: 'l1', sku: 'B', productId: 'p1' }, undefined, { l1: { own: 'A', sent: 'B' } }), 'B', 'recorded wins with the flag off')
+  assert.equal(sentSkuForLine({ id: 'l1', sku: 'X', productId: 'p1' }, undefined, { l1: { own: 'A', sent: 'B' } }), 'X', 'an edited line is not covered by the record')
+  assert.equal(sentSkuForLine({ id: 'l2', sku: 'A', productId: 'p1' }, remap, recorded), 'B', 'a line never sent before is remapped')
+  assert.equal(parseSentLineSkus({ l1: { own: 'A', sent: 'B' }, bad: 3, l2: { own: 1, sent: 'x' } })?.l1?.sent, 'B')
+  assert.equal(parseSentLineSkus(null), undefined)
+})
+
 test('wiring: every Prisma port load (create, amend, revalidate, ambiguous-create, reload) takes the remap option from the setting', () => {
   const source = readFileSync(new URL('../lib/domain/wms/order-push-sweep.ts', import.meta.url), 'utf8')
   const port = source.slice(source.indexOf('async createCandidates('))
   assert.equal((port.match(/await remapOptions\(/g) ?? []).length, 6, 'createCandidates x2, updatableLinks, revalidatableLinks, ambiguousCreateLinks, reloadOrderForPush')
   assert.match(source, /isSkuRenameRemapEnabled\(\)/)
-  assert.match(source, /port\.reloadOrderForPush\(link\.order\.id, sentToWarehouseId \?\? null, connectorId\)/)
+  assert.match(source, /port\.reloadOrderForPush\(link\.order\.id, sentToWarehouseId \?\? null, connectorId, true\)/)
   const flag = readFileSync(new URL('../lib/domain/wms/sku-rename-remap-flag.ts', import.meta.url), 'utf8')
   assert.match(flag, /=== 'true'/)
 })
