@@ -2323,6 +2323,18 @@ Loading the owner's exports into an empty, installed instance is a separate comm
 
 The target is named by an env file (mode 600), never by an argument, and is confirmed by database name and cluster system identifier. The load is for the P0 phase only: it never writes to WooCommerce, Mintsoft or Xero, and the verification proves no outbound queue grew. The readiness gate reads the published apply report: its `first-load-apply` check is **required at P0** (the database's run record must be `VERIFIED` and an intact report for that run, made on this cluster, must be in `--apply-report-dir`; see "The readiness gate" in [first-load-apply.md](first-load-apply.md)). Run `npm run readiness:gate -- --phase P0 --apply-report-dir <the --report-dir you gave the apply>` after the load.
 
+### Historical ECB rates before the first load (`npm run fx:backfill-ecb`)
+
+IMS's `fx_rates` only holds rates from the day it first fetched them, but the first load prices a foreign purchase order at the end of its created day and a foreign lot at the end of its received day. When an order or lot is older than the first row, backfill ECB history once, BEFORE `first-load:export-fx-rates`. The command never fetches: download <https://www.ecb.europa.eu/stats/eurofxref/eurofxref-hist.zip> by hand, unzip it and pass the CSV.
+
+```bash
+npm run fx:backfill-ecb -- --env-file /path/to/installation.env --expect-db <name> --expect-system-id <id> \
+  --ecb-csv /path/to/eurofxref-hist.csv --from 2025-11-01 --to 2026-11-19 --dry-run     # counts per currency, writes nothing
+npm run fx:backfill-ecb -- ... (same arguments without --dry-run)                           # one transaction, same double target confirmation as first-load:apply
+```
+
+Rows are written for the organisation's enabled foreign currencies (or `--currencies EUR,USD`, each of which must be enabled), one per ECB business day, `source = 'ecb-history'`, `fetchedAt` = 16:00 Europe/Berlin (the ECB publication time) in UTC, rate = `X_per_EUR / BASE_per_EUR` (EUR = `1 / BASE_per_EUR`), 8 decimal places. A currency/day that already has ANY row (live, manual or an earlier backfill) is skipped and counted, so a re-run is a no-op and the backfill never ties or overrides a live rate. It refuses, writing nothing, on a blank or N/A cell for a requested currency, a window outside the file, or a base currency missing from the file. Use `--to` no later than the day before the first live row; once the Aelia source switch is active, lookups dated inside an Aelia interval only accept `aelia` rows and manual overrides, so backfilled rows serve dates before the switch. Exit codes: 0 done, 2 usage, 3 target not confirmed, 4 refused, 6 internal error.
+
 ## WooCommerce initial-import rehearsal
 
 `npm run rehearse:woo-import` runs the **real WooCommerce initial order import** (the code behind **Import Active Orders**: `lib/connectors/woocommerce/sync/initial-import.ts`, `importWcOrder` and the allocation service) end to end against a **local fake WooCommerce REST server** serving synthetic orders, into a PostgreSQL cluster created for the occasion and thrown away afterwards, and writes a report. It is the rehearsal behind the first load's order import (o3d-zjsb5.16): it shows, before anything touches the live store, what the import does with open orders, which of them it cannot allocate, and whether the numbers agree.
