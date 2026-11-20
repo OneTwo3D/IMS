@@ -1,0 +1,4 @@
+### WooCommerce: orders first seen as completed, shipped, delivered or refunded
+- An order IMS first sees already completed (or mapped to Shipped / Delivered) is now created Processing and despatched through the existing external-fulfilment path: on-hand goes down, FIFO layers are consumed, the cost of sales is posted and the order becomes Shipped, with nothing sent to a warehouse. Before, it was created in a post-dispatch status with stock reserved and never consumed. If stock is short the import is reported failed and retried, never silently skipped.
+- An order first seen as refunded stays refundable (Processing, no allocation) so the refund sweep can record its refunds and credit notes; it is never pushed to a warehouse. A completed-then-refunded one is despatched first.
+- New `sales_orders.outside_ims_fulfilment_at` (additive migration) marks such orders; the warehouse create fences read it.

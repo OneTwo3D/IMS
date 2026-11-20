@@ -41,6 +41,7 @@ export const WMS_CREATE_READY_STATUSES = ['PROCESSING', 'ALLOCATED'] as const
  * - status/paidAt/refundStatus — a ready, paid, not-fully-refunded order is what fulfilment means.
  * - withdrawalHoldAt (o3d-e1yb) — the customer has asked to withdraw. Written BEFORE the ON_HOLD
  *   transition, so it also covers the window where the marker landed and the transition failed.
+ * - outsideImsFulfilmentAt — first seen already despatched or refunded outside IMS: nothing for a warehouse to pick.
  * - withdrawalApprovedAt — a DIRECT approval records only the approval fact until its cancellation
  *   finishes, so the hold alone would let the order be pushed in between.
  */
@@ -53,6 +54,9 @@ export const WMS_CREATE_ELIGIBLE_ORDER_FENCES = {
   refundStatus: { not: 'FULL' },
   withdrawalHoldAt: null,
   withdrawalApprovedAt: null,
+  // o3d-hqvrp.92: the order was first seen already completed / refunded, i.e. settled outside IMS. Never pushed to a warehouse, whatever
+  // status it is in at the moment a sweep looks (it is PROCESSING until the despatch it reports has been booked).
+  outsideImsFulfilmentAt: null,
 } satisfies Prisma.SalesOrderWhereInput
 
 /**
