@@ -13,13 +13,16 @@
  *                   account the original receipt's payment method maps to, carrying IMS's settlement rate as the payment's CurrencyRate so Xero books the
  *                   realised FX (exactly what a receipt does, lib/connectors/xero/sync-processor.ts xeroPaymentCurrencyRate).
  *
- * THE CASH EVIDENCE. IMS records a refund's cash-out in two ways: an operator-recorded `Payment` whose `refundId` names the refund (method, amount, date),
- * or a shop refund (WooCommerce: `externalRefundId`), which the shop's gateway paid back and which IMS never records as a Payment. A manual refund of a
- * paid invoice with neither is NOT posted: nothing says cash left the bank, so the row is retired (nothing sent) and the sweep raises it again once
- * the operator records the refund payment.
+ * THE CASH EVIDENCE. Cash is counted as having left the bank ONLY when IMS holds evidence of it: an operator-recorded `Payment` whose `refundId` names the refund,
+ * or a WooCommerce refund the store says went back THROUGH THE GATEWAY (`refunded_payment` true, stored on the refund as `refundedViaGateway`). A WooCommerce refund made
+ * "manually" (a store-credit coupon, a payment outside the gateway: `refundedViaGateway` false) moved no money out of the account, so NO bank refund is posted; and one
+ * written before that flag was kept (NULL) fails closed the same way. Neither is allocated to the paid invoice either (that would over-credit a paid invoice and leave the
+ * receipt unmatched): the credit note is left open in Xero as the customer's credit, and the operator is told (a WARNING, once per refund) to apply it or record the
+ * refund payment, after which the sweep raises the settlement.
  *
- * A PART-PAID INVOICE counts as paid: its credit note is refunded, never split. The unpaid remainder stays open in Xero for the operator (the decision is
- * logged with both figures); splitting one credit note across an allocation and a payment is the over-settlement shape #1039 R2 described.
+ * EVERY REFUND PAYMENT IS CAPPED at min(the credit left on the note in Xero, the receipts IMS has recorded for the order less the cash already paid out against its other
+ * refunds). A 10 receipt with a 50 refund pays out at most 10. A refund of a PART-PAID invoice that is capped leaves credit on the note and an amount due on the invoice;
+ * the row logs both figures in a WARNING and the operator applies the credit in Xero (IMS does not split one credit note across a payment and an allocation).
  *
  * Pure planning lives here (`planCreditNoteSettlement`) beside the one DB reader of its facts (`readCreditNoteSettlementFacts`), so the enqueue, the sweep and
  * the processor ask ONE function and cannot disagree about which settlement a refund owes.
@@ -74,13 +77,17 @@ export type CreditNoteSettlementFacts = {
   refundPaymentMethod: string | null
   refundPaymentPaidAt: Date | null
   originalReceiptMethod: string | null
+  /** WooCommerce `refunded_payment` as stored: true = through the gateway, false = refunded manually, null = unknown. */
+  refundedViaGateway: boolean | null
+  /** Cash already paid out against the order's OTHER refunds (recorded refund payments, or posted settlement rows, whichever is larger per refund). */
+  priorCashOut: Decimal
   /** ANOTHER CREDIT_NOTE_ALLOCATION row for this refund is SYNCED, or carries post evidence. */
   siblingSettled: boolean
 }
 
 export type CreditNoteSettlementPlan =
   | { kind: 'ALLOCATE' }
-  | { kind: 'REFUND_PAYMENT'; cashEvidence: 'RECORDED' | 'SHOP_REFUND'; recordedAmount: Decimal | null }
+  | { kind: 'REFUND_PAYMENT'; cashEvidence: 'RECORDED' | 'GATEWAY'; recordedAmount: Decimal | null; /** The most that may be paid out: receipts recorded less cash already out. */ cap: Decimal }
   | { kind: 'NOT_NOW'; reason: CreditNoteNotNowReason; message: string }
 
 export type CreditNoteNotNowReason =
@@ -90,6 +97,12 @@ export type CreditNoteNotNowReason =
   | 'DOCUMENT_NOT_XEROS'
   | 'ALREADY_SETTLED'
   | 'CASH_REFUND_NOT_RECORDED'
+  | 'REFUND_NOT_PAID_BY_GATEWAY'
+  | 'REFUND_CASH_UNKNOWN'
+  | 'NO_RECEIPT_CAPACITY'
+
+/** The reasons that need an OPERATOR (the sweep says so once); the others resolve themselves when IMS's reading changes. */
+export const OPERATOR_ATTENTION_REASONS: ReadonlySet<CreditNoteNotNowReason> = new Set(['REFUND_NOT_PAID_BY_GATEWAY', 'REFUND_CASH_UNKNOWN', 'NO_RECEIPT_CAPACITY'])
 
 /** Whether the order shows ANY receipt: a Payment, a registration of one, or the paid flag. One definition, used by the plan only. */
 export function invoiceHasReceiptEvidence(facts: Pick<CreditNoteSettlementFacts, 'receiptCount' | 'receiptTotal' | 'invoicePaymentRows'> & { order: Pick<CreditNoteSettlementFacts['order'], 'paidAt'> }): boolean {
@@ -110,8 +123,14 @@ export function planCreditNoteSettlement(facts: CreditNoteSettlementFacts): Cred
     return notNow('DOCUMENT_NOT_XEROS', 'the credit note and the invoice are not both recorded as Xero documents, so a Xero allocation or payment may not carry their ids')
   }
   if (!invoiceHasReceiptEvidence(facts)) return { kind: 'ALLOCATE' }
-  if (facts.recordedRefundCash.gt(0)) return { kind: 'REFUND_PAYMENT', cashEvidence: 'RECORDED', recordedAmount: facts.recordedRefundCash }
-  if (facts.refund.shopRefund) return { kind: 'REFUND_PAYMENT', cashEvidence: 'SHOP_REFUND', recordedAmount: null }
+  const cap = facts.receiptTotal.minus(facts.priorCashOut)
+  const needsCapacity = (): CreditNoteSettlementPlan | null => (cap.gt(0) ? null : notNow('NO_RECEIPT_CAPACITY', 'IMS has no receipt recorded for this order that is not already refunded, so there is nothing a refund payment could return'))
+  if (facts.recordedRefundCash.gt(0)) return needsCapacity() ?? { kind: 'REFUND_PAYMENT', cashEvidence: 'RECORDED', recordedAmount: facts.recordedRefundCash, cap }
+  if (facts.refund.shopRefund) {
+    if (facts.refundedViaGateway === true) return needsCapacity() ?? { kind: 'REFUND_PAYMENT', cashEvidence: 'GATEWAY', recordedAmount: null, cap }
+    if (facts.refundedViaGateway === false) return notNow('REFUND_NOT_PAID_BY_GATEWAY', 'WooCommerce records this refund as made manually (a store-credit coupon or a payment outside the gateway), so no money left the bank account and no bank refund is posted; the credit note stays open in Xero as the customer\'s credit')
+    return notNow('REFUND_CASH_UNKNOWN', 'this refund was recorded before IMS kept whether WooCommerce paid it back through the gateway, so IMS cannot tell whether cash left the bank and posts no bank refund')
+  }
   return notNow('CASH_REFUND_NOT_RECORDED', 'the invoice was paid and no refund payment is recorded for this refund, so nothing says cash left the bank')
 }
 
@@ -146,7 +165,7 @@ export async function readCreditNoteSettlementFacts(
     where: { id: refundId },
     select: {
       id: true, orderId: true, deletedAt: true, accountingCreditNoteId: true, accountingCreditNoteConnector: true,
-      externalRefundId: true, createdAt: true,
+      externalRefundId: true, refundedViaGateway: true, createdAt: true,
     },
   })
   if (!refund) return null
@@ -159,7 +178,7 @@ export async function readCreditNoteSettlementFacts(
   })
   if (!order) return null
 
-  const [payments, invoicePaymentRows, creditNoteRows, invoiceRows, siblings] = await Promise.all([
+  const [payments, invoicePaymentRows, creditNoteRows, invoiceRows, siblings, postedSettlements] = await Promise.all([
     client.payment.findMany({
       where: { orderId: order.id },
       select: { refundId: true, amount: true, currency: true, method: true, paidAt: true },
@@ -202,11 +221,34 @@ export async function readCreditNoteSettlementFacts(
       select: { id: true },
       take: 1,
     }),
+    // The refund payments this order's OTHER refunds already posted (their pinned amounts), for the cap.
+    client.accountingSyncLog.findMany({
+      where: {
+        connector: CREDIT_NOTE_ALLOCATION_CONNECTOR, type: 'CREDIT_NOTE_ALLOCATION', referenceType: 'SalesOrderRefund', referenceId: { not: refund.id },
+        payload: { path: ['orderId'], equals: order.id },
+        AND: [PROVEN_LEDGER_FACT_WHERE],
+      },
+      select: { referenceId: true, payload: true },
+    }),
   ])
 
   const receipts = payments.filter((p) => p.refundId === null && p.currency === order.currency)
   const refundPayments = payments.filter((p) => p.refundId === refund.id && p.currency === order.currency)
   const abs = (value: Decimal) => (value.lt(0) ? value.neg() : value)
+  // Per OTHER refund: the larger of what an operator recorded and what a settlement row posted, so one payment is never counted twice.
+  const outByRefund = new Map<string, Decimal>()
+  for (const p of payments) {
+    if (p.refundId === null || p.refundId === refund.id || p.currency !== order.currency) continue
+    outByRefund.set(p.refundId, addMoney(outByRefund.get(p.refundId) ?? toDecimal(0), abs(toDecimal(p.amount))))
+  }
+  for (const row of postedSettlements) {
+    const body = row.payload as { operation?: unknown; amount?: unknown } | null
+    if (!body || body.operation !== 'REFUND_PAYMENT' || (typeof body.amount !== 'number' && typeof body.amount !== 'string')) continue
+    const posted = toDecimal(body.amount)
+    const recorded = outByRefund.get(row.referenceId) ?? toDecimal(0)
+    outByRefund.set(row.referenceId, posted.gt(recorded) ? posted : recorded)
+  }
+  const priorCashOut = [...outByRefund.values()].reduce<Decimal>((sum, v) => addMoney(sum, v), toDecimal(0))
   return {
     refund: {
       id: refund.id,
@@ -236,6 +278,8 @@ export async function readCreditNoteSettlementFacts(
     refundPaymentMethod: refundPayments.find((p) => p.method)?.method ?? null,
     refundPaymentPaidAt: refundPayments.length > 0 ? refundPayments[refundPayments.length - 1]!.paidAt : null,
     originalReceiptMethod: payments.find((p) => p.refundId === null && p.method)?.method ?? null,
+    refundedViaGateway: refund.refundedViaGateway,
+    priorCashOut,
     siblingSettled: siblings.length > 0,
   }
 }

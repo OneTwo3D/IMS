@@ -590,6 +590,7 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the single-statement fallback write failed', verdict: 'DESCRIPTION', why: 'states where the only record is', count: 1 },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'created a DRAFT manual journal in Xero', verdict: 'DESCRIPTION', why: 'states what IMS did', count: 1 },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'ALLOCATED an existing supplier credit note', verdict: 'DESCRIPTION', why: 'states what IMS did', count: 1 },
+  { file: 'lib/domain/accounting/credit-note-allocation.ts', prefix: 'WooCommerce records this refund as made manually', verdict: 'DESCRIPTION', why: 'states why no bank refund is posted; the operator instruction is in the wrapped activity warning the sweep writes' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'SETTLED an existing sales credit note in Xero', verdict: 'DESCRIPTION', why: 'states what the settlement posting did (the effect label of the post-effect table)', count: 1 },
   { file: 'lib/domain/accounting/ledger-settlement-evidence.ts', prefix: 'this row does not record the amount and date', verdict: 'DESCRIPTION', why: 'states why evidence cannot be matched' },
   { file: 'lib/domain/accounting/posting-refusal-kinds.ts', prefix: 'The FX revaluation raises this journal only', verdict: 'DESCRIPTION', why: 'describes what the Retry button does for this kind' },

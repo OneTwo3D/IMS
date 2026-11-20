@@ -5,6 +5,7 @@ import { toDecimal } from '@/lib/domain/math/decimal'
 import {
   CREDIT_NOTE_ALLOCATION_SETTING_KEY,
   invoiceHasReceiptEvidence,
+  OPERATOR_ATTENTION_REASONS,
   isCreditNoteAllocationEnabled,
   planCreditNoteSettlement,
   refundPaymentMethodOf,
@@ -35,6 +36,8 @@ function facts(over: Omit<Partial<CreditNoteSettlementFacts>, 'order' | 'refund'
     refundPaymentMethod: null,
     refundPaymentPaidAt: null,
     originalReceiptMethod: null,
+    refundedViaGateway: null,
+    priorCashOut: toDecimal(0),
     siblingSettled: false,
     ...rest,
   }
@@ -51,13 +54,37 @@ test('every kind of receipt evidence makes the invoice PAID: a Payment, a regist
   assert.equal(invoiceHasReceiptEvidence(facts({ order: { paidAt: new Date() } })), true)
 })
 
-test('a PAID invoice is never allocated: a shop refund is refunded in cash', () => {
-  const plan = planCreditNoteSettlement(facts({ receiptCount: 1, receiptTotal: toDecimal(100), refund: { shopRefund: true } }))
-  assert.deepEqual(plan, { kind: 'REFUND_PAYMENT', cashEvidence: 'SHOP_REFUND', recordedAmount: null })
+test('a PAID invoice is never allocated: a refund the GATEWAY paid back is refunded in cash, capped at the receipts', () => {
+  const plan = planCreditNoteSettlement(facts({ receiptCount: 1, receiptTotal: toDecimal(100), refundedViaGateway: true, refund: { shopRefund: true } }))
+  assert.equal(plan.kind, 'REFUND_PAYMENT')
+  assert.equal(plan.kind === 'REFUND_PAYMENT' && plan.cashEvidence, 'GATEWAY')
+  assert.equal(plan.kind === 'REFUND_PAYMENT' && plan.cap.toFixed(), '100')
+})
+
+test('a WooCommerce refund made MANUALLY (refunded_payment false) posts no bank refund: no cash left the bank, and an operator is told', () => {
+  const plan = planCreditNoteSettlement(facts({ receiptCount: 1, receiptTotal: toDecimal(100), refundedViaGateway: false, refund: { shopRefund: true } }))
+  assert.equal(plan.kind, 'NOT_NOW')
+  assert.equal(plan.kind === 'NOT_NOW' && plan.reason, 'REFUND_NOT_PAID_BY_GATEWAY')
+  assert.ok(OPERATOR_ATTENTION_REASONS.has('REFUND_NOT_PAID_BY_GATEWAY'))
+})
+
+test('a WooCommerce refund recorded before the flag was kept (unknown) fails closed: no bank refund, an operator is told', () => {
+  const plan = planCreditNoteSettlement(facts({ receiptCount: 1, receiptTotal: toDecimal(100), refundedViaGateway: null, refund: { shopRefund: true } }))
+  assert.equal(plan.kind === 'NOT_NOW' && plan.reason, 'REFUND_CASH_UNKNOWN')
+  assert.ok(OPERATOR_ATTENTION_REASONS.has('REFUND_CASH_UNKNOWN'))
+})
+
+test('EVERY refund payment is capped by the receipts recorded less the cash already out: a 10 receipt pays out at most 10, nothing when nothing is left', () => {
+  const small = planCreditNoteSettlement(facts({ receiptCount: 1, receiptTotal: toDecimal(10), refundedViaGateway: true, refund: { shopRefund: true } }))
+  assert.equal(small.kind === 'REFUND_PAYMENT' && small.cap.toFixed(), '10')
+  const recorded = planCreditNoteSettlement(facts({ receiptCount: 1, receiptTotal: toDecimal(10), recordedRefundCash: toDecimal(50) }))
+  assert.equal(recorded.kind === 'REFUND_PAYMENT' && recorded.cap.toFixed(), '10', 'even a recorded refund payment is capped')
+  const spent = planCreditNoteSettlement(facts({ receiptCount: 1, receiptTotal: toDecimal(10), priorCashOut: toDecimal(10), refundedViaGateway: true, refund: { shopRefund: true } }))
+  assert.equal(spent.kind === 'NOT_NOW' && spent.reason, 'NO_RECEIPT_CAPACITY')
 })
 
 test('a PAID invoice with an operator-recorded refund payment is refunded for the recorded amount', () => {
-  const plan = planCreditNoteSettlement(facts({ invoicePaymentRows: 1, recordedRefundCash: toDecimal('42.5') }))
+  const plan = planCreditNoteSettlement(facts({ invoicePaymentRows: 1, receiptTotal: toDecimal(100), recordedRefundCash: toDecimal('42.5') }))
   assert.equal(plan.kind, 'REFUND_PAYMENT')
   assert.equal(plan.kind === 'REFUND_PAYMENT' && plan.cashEvidence, 'RECORDED')
   assert.equal(plan.kind === 'REFUND_PAYMENT' && plan.recordedAmount?.toFixed(), '42.5')
@@ -69,8 +96,8 @@ test('a PAID invoice, a manual refund, no refund payment recorded: nothing says 
   assert.equal(plan.kind === 'NOT_NOW' && plan.reason, 'CASH_REFUND_NOT_RECORDED')
 })
 
-test('a PART-PAID invoice counts as paid: refunded, never split', () => {
-  const plan = planCreditNoteSettlement(facts({ receiptCount: 1, receiptTotal: toDecimal(30), refund: { shopRefund: true } }))
+test('a PART-PAID invoice counts as paid: refunded up to the cap, never split', () => {
+  const plan = planCreditNoteSettlement(facts({ receiptCount: 1, receiptTotal: toDecimal(30), refundedViaGateway: true, refund: { shopRefund: true } }))
   assert.equal(plan.kind, 'REFUND_PAYMENT')
 })
 

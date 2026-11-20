@@ -3594,6 +3594,8 @@ export async function createRefund(
     expectedTaxIdentities?: RefundExpectedTaxIdentity[]
     /** IOSS credit notes: what the SOURCE of the refund (the WooCommerce refund `amount`) states was returned in all, tax included, in the order currency. Internal callers only; recorded only while the Sales Invoices switch is on and the order is on an EU scheme. */
     statedGrossForeign?: number
+    /** WooCommerce `refunded_payment` of a storefront refund (see SalesOrderRefund.refundedViaGateway). Internal callers only. */
+    refundedViaGateway?: boolean
     /** IOSS credit notes, rate 182: the tax the WooCommerce refund states across all its rate ids. Internal callers only; recorded only while the Sales Invoices switch is on and the order is on an EU scheme. */
     eas182StatedTaxForeign?: number
     /** The structured return reason (a configured ReturnReason id), one per refund. Optional. An unknown or inactive id is refused for an operator and ignored for an internal caller (which resolves it itself). */
@@ -3734,6 +3736,7 @@ export async function createRefund(
       deriveSaleLineNetsFromStoredBalance,
       maxRefundedQtyByLines: isInternal ? options?.maxRefundedQtyByLines : undefined,
       wcAmendment: isInternal ? options?.wcAmendment === true : undefined,
+      ...(isInternal && typeof options?.refundedViaGateway === 'boolean' ? { refundedViaGateway: options.refundedViaGateway } : {}),
       // o3d-w00 (Codex r4 #2): like enforcePerTargetBalances this is a tightening, but a forged EMPTY
       // list from a public caller would switch the fence off for the hand-recording path, so it is read
       // only from an internal caller.

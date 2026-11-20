@@ -601,18 +601,21 @@ export function decideCreditNoteAllocation(p: {
   remainingCredit: number
   amountDue: number
   allocatedCents: number
+  /** What the invoice-side document is called in the refusal text: 'bill' (supplier side, the default) or 'invoice' (sales side). */
+  noun?: string
 }): { action: 'put'; amount: number } | { action: 'already-allocated' } | { action: 'refuse'; reason: string } {
   const requestedCents = Math.round(p.requested * 100)
   if (p.allocatedCents >= requestedCents) return { action: 'already-allocated' }
   const need = (requestedCents - p.allocatedCents) / 100
   const amount = resolveCreditNoteAllocationAmount({ requested: need, remainingCredit: p.remainingCredit, amountDue: p.amountDue })
   if (amount > 0) return { action: 'put', amount }
-  const have = `${(p.allocatedCents / 100).toFixed(2)} of the ${p.requested.toFixed(2)} requested is allocated to this bill`
+  const noun = p.noun ?? 'bill'
+  const have = `${(p.allocatedCents / 100).toFixed(2)} of the ${p.requested.toFixed(2)} requested is allocated to this ${noun}`
   const cause = p.remainingCredit <= 0 && p.amountDue <= 0
-    ? 'the credit note has no credit remaining and the bill has nothing due (neither is explained by an allocation to this bill)'
+    ? `the credit note has no credit remaining and the ${noun} has nothing due (neither is explained by an allocation to this ${noun})`
     : p.remainingCredit <= 0
-      ? 'the credit note has no credit remaining (it was allocated to another document or refunded) while the bill still has an amount due'
-      : 'the bill has nothing due (it was settled by something other than this credit note) while the credit note still has credit'
+      ? `the credit note has no credit remaining (it was allocated to another document or refunded) while the ${noun} still has an amount due`
+      : `the ${noun} has nothing due (it was settled by something other than this credit note) while the credit note still has credit`
   return { action: 'refuse', reason: `Nothing was allocated: ${cause}; ${have}. Resolve in Xero, then retry.` }
 }
 
@@ -659,7 +662,7 @@ type XeroInvoiceDueResponse = {
  */
 export async function allocatePurchaseCreditNote(
   params: { creditNoteId: string; invoiceId: string; amount: number; date: string },
-  opts?: { idempotencyKey?: string },
+  opts?: { idempotencyKey?: string; /** 'invoice' on the sales side; the supplier side says 'bill'. */ documentNoun?: string },
 ): Promise<{
   success: boolean
   allocatedAmount?: number
@@ -667,6 +670,7 @@ export async function allocatePurchaseCreditNote(
   /** Present when a PUT WAS made but did not cover the whole request. */
   partial?: { allocatedNow: number; totalAllocatedToThisBill: number; requested: number; shortfall: number }
 }> {
+  const noun = opts?.documentNoun ?? 'bill'
   const cnRes = await xeroGet<XeroCreditNoteRemainingResponse>(`CreditNotes/${params.creditNoteId}`)
   if (!cnRes.ok) {
     return { success: false, error: cnRes.error ?? 'Credit note not found in Xero for allocation' }
@@ -685,16 +689,16 @@ export async function allocatePurchaseCreditNote(
 
   const billRes = await xeroGet<XeroInvoiceDueResponse>(`Invoices/${params.invoiceId}`)
   if (!billRes.ok) {
-    return { success: false, error: billRes.error ?? 'Bill not found in Xero for allocation' }
+    return { success: false, error: billRes.error ?? `${noun === 'bill' ? 'Bill' : 'Invoice'} not found in Xero for allocation` }
   }
   const billRead = readSingleXeroDocument<{ InvoiceID?: string; AmountDue?: unknown }>(
     billRes.data, 'Invoices', 'InvoiceID', params.invoiceId)
   if (billRead.status === 'unreadable') {
-    return { success: false, error: `Bill not read from Xero for allocation: ${billRead.reason}` }
+    return { success: false, error: `${noun === 'bill' ? 'Bill' : 'Invoice'} not read from Xero for allocation: ${billRead.reason}` }
   }
   const amountDue = readXeroBalance(billRead.document.AmountDue)
   if (amountDue === null) {
-    return { success: false, error: 'Bill read from Xero states no readable AmountDue, so IMS cannot tell how much can be allocated' }
+    return { success: false, error: `${noun === 'bill' ? 'Bill' : 'Invoice'} read from Xero states no readable AmountDue, so IMS cannot tell how much can be allocated` }
   }
 
   // o3d-h9pb (Codex round 2): a ZERO computed amount is not "already allocated". RemainingCredit 0 can mean
@@ -706,9 +710,9 @@ export async function allocatePurchaseCreditNote(
   }
   const allocatedCents = readAllocatedToInvoiceCents(cnRead.document.Allocations, params.invoiceId)
   if (allocatedCents === null) {
-    return { success: false, error: 'Credit note read from Xero states no readable Allocations, so IMS cannot tell whether it is already allocated to this bill' }
+    return { success: false, error: `Credit note read from Xero states no readable Allocations, so IMS cannot tell whether it is already allocated to this ${noun}` }
   }
-  const decision = decideCreditNoteAllocation({ requested, remainingCredit, amountDue, allocatedCents })
+  const decision = decideCreditNoteAllocation({ requested, remainingCredit, amountDue, allocatedCents, noun })
   if (decision.action === 'already-allocated') return { success: true, allocatedAmount: 0 }
   if (decision.action === 'refuse') return { success: false, error: decision.reason }
   const allocateAmount = decision.amount
@@ -737,7 +741,7 @@ export async function allocatePurchaseCreditNote(
   if (!allocationConfirmedByResponse(res.data?.Allocations, params.invoiceId, sentCents)) {
     return {
       success: false,
-      error: `Allocation not confirmed: Xero answered OK but its response does not show ${allocateAmount.toFixed(2)} allocated to this bill, `
+      error: `Allocation not confirmed: Xero answered OK but its response does not show ${allocateAmount.toFixed(2)} allocated to this ${noun}, `
         + 'so IMS cannot tell whether it was applied (a replayed or changed response looks like this). No completion is claimed; retry, which re-reads the credit note and sends only what is still missing.',
     }
   }
@@ -758,9 +762,9 @@ export async function allocatePurchaseCreditNote(
     success: false,
     allocatedAmount: allocateAmount,
     partial,
-    error: withLedgerCheck(`PARTIAL allocation: ${allocateAmount.toFixed(2)} was allocated to this bill just now (${partial.totalAllocatedToThisBill.toFixed(2)} of the `
+    error: withLedgerCheck(`PARTIAL allocation: ${allocateAmount.toFixed(2)} was allocated to this ${noun} just now (${partial.totalAllocatedToThisBill.toFixed(2)} of the `
       + `${requested.toFixed(2)} requested is now allocated; ${partial.shortfall.toFixed(2)} is still outstanding) because the credit note's remaining credit `
-      + `(${remainingCredit.toFixed(2)}) or the bill's amount due (${amountDue.toFixed(2)}) was smaller than the request. Allocate the rest in Xero or add credit, `
+      + `(${remainingCredit.toFixed(2)}) or the ${noun}'s amount due (${amountDue.toFixed(2)}) was smaller than the request. Allocate the rest in Xero or add credit, `
       + 'then retry: a retry sends only the remainder.'),
   }
 }

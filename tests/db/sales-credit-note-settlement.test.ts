@@ -107,7 +107,7 @@ async function setSetting(d: Deps, key: string, value: string | null) {
 }
 
 type Seed = { orderId: string; refundId: string; invoiceId: string; creditNoteId: string; tag: string }
-async function seed(d: Deps, opts: { paid: boolean; shopRefund: boolean; currency?: string; fxRateToBase?: number }): Promise<Seed> {
+async function seed(d: Deps, opts: { paid: boolean; shopRefund: boolean; gateway?: boolean | null; receipt?: number; currency?: string; fxRateToBase?: number }): Promise<Seed> {
   const tag = `cna${randomUUID().slice(0, 8)}`
   const currency = opts.currency ?? 'GBP'
   const invoiceId = `inv-${tag}`
@@ -125,6 +125,7 @@ async function seed(d: Deps, opts: { paid: boolean; shopRefund: boolean; currenc
     data: {
       orderId: order.id, totalForeign: 20, totalBase: 20, accountingCreditNoteId: creditNoteId, accountingCreditNoteConnector: 'xero',
       externalRefundId: opts.shopRefund ? Math.floor(Math.random() * 1_000_000_000) + 1 : null,
+      refundedViaGateway: opts.shopRefund ? (opts.gateway === undefined ? true : opts.gateway) : null,
     } as never,
     select: { id: true },
   })
@@ -136,7 +137,7 @@ async function seed(d: Deps, opts: { paid: boolean; shopRefund: boolean; currenc
   })
   if (opts.paid) {
     await d.db.payment.create({
-      data: { orderId: order.id, amount: 120, currency, method: 'stripe', settlementRateToBase: currency === 'GBP' ? null : opts.fxRateToBase ?? null },
+      data: { orderId: order.id, amount: opts.receipt ?? 120, currency, method: 'stripe', settlementRateToBase: currency === 'GBP' ? null : opts.fxRateToBase ?? null },
     })
   }
   return { orderId: order.id, refundId: refund.id, invoiceId, creditNoteId, tag }
@@ -397,3 +398,105 @@ for (const runner of ['outbox', 'direct'] as const) {
     })
   }
 }
+
+async function withGbpBank(d: Deps, t: { after: (fn: () => Promise<void>) => void }) {
+  const priorMap = (await d.db.setting.findUnique({ where: { key: PAYMENT_MAP } }))?.value ?? null
+  await setSetting(d, PAYMENT_MAP, JSON.stringify({ 'stripe:GBP': 'bank-gbp' }))
+  const account = await d.db.accountingAccount.create({ data: { connector: 'xero', externalAccountId: `ext-${randomUUID().slice(0, 8)}`, code: 'bank-gbp', name: 'Stripe GBP', type: 'BANK' } })
+  t.after(async () => { await setSetting(d, PAYMENT_MAP, priorMap); await d.db.accountingAccount.delete({ where: { id: account.id } }) })
+  return account
+}
+
+test('[db] a 10 receipt with a 50 gateway refund pays out at most 10 and logs both figures: the rest of the credit stays open', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  await setSetting(d, FLAG, 'true')
+  await withGbpBank(d, t)
+  const s = await seed(d, { paid: true, shopRefund: true, gateway: true, receipt: 10 })
+  t.after(async () => { await setSetting(d, FLAG, null); await cleanup(d, s) })
+  ledger = { ...freshLedger(), total: 50, remaining: 50, amountDue: 90 }
+  await d.processor.reenqueueMissingCreditNoteAllocations()
+  await d.processor.processPendingXeroSync()
+  assert.equal(refunds.length, 1)
+  assert.equal(refunds[0]!.amount, 10, 'capped at the receipts recorded')
+  assert.equal(allocations.length, 0)
+  const warning = await d.db.activityLog.findFirst({ where: { entityId: s.refundId, action: 'credit_note_refund_leaves_credit_open' }, select: { description: true } })
+  assert.ok(warning, 'both figures are logged')
+  assert.match(warning!.description ?? '', /40\.00 of credit stays/)
+  assert.match(warning!.description ?? '', /90\.00 due/)
+})
+
+for (const gateway of [false, null] as const) {
+  test(`[db] a WooCommerce refund with refunded_payment ${gateway === null ? 'UNKNOWN' : 'false (manual)'} posts NO bank refund and tells the operator once`, { skip }, async (t) => {
+    const d = await deps()
+    reset()
+    await setSetting(d, FLAG, 'true')
+    await withGbpBank(d, t)
+    const s = await seed(d, { paid: true, shopRefund: true, gateway })
+    t.after(async () => { await setSetting(d, FLAG, null); await cleanup(d, s) })
+    await d.processor.reenqueueMissingCreditNoteAllocations()
+    await d.processor.reenqueueMissingCreditNoteAllocations()
+    await d.processor.processPendingXeroSync()
+    assert.equal((await settlementRows(d, s)).length, 0, 'nothing queued')
+    assert.equal(refunds.length + allocations.length, 0, 'nothing sent: not a bank refund, and not allocated to a paid invoice')
+    assert.equal(await d.db.activityLog.count({ where: { entityId: s.refundId, action: 'credit_note_settlement_needs_operator' } }), 1, 'said once')
+  })
+}
+
+test('[db] an allocation with nothing to apply is RETIRED, not SYNCED, so it cannot block the refund the order later needs', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  await setSetting(d, FLAG, 'true')
+  const s = await seed(d, { paid: false, shopRefund: false })
+  t.after(async () => { await setSetting(d, FLAG, null); await cleanup(d, s) })
+  ledger = { ...freshLedger(), amountDue: 0 }
+  await d.processor.reenqueueMissingCreditNoteAllocations()
+  await d.processor.processPendingXeroSync()
+  const rows = await settlementRows(d, s)
+  assert.equal(rows[0]!.status, 'CANCELLED')
+  assert.equal(allocations.length, 0)
+})
+
+test('[db] an ATTEMPTED row is never retired as "not sent": the switch going off after a lost response holds it for the ledger check', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  await setSetting(d, FLAG, 'true')
+  const s = await seed(d, { paid: false, shopRefund: false })
+  t.after(async () => { await setSetting(d, FLAG, null); await cleanup(d, s) })
+  await d.processor.reenqueueMissingCreditNoteAllocations()
+  allocateOutcome = { success: false, error: 'socket hang up', landed: true }
+  await d.processor.processPendingXeroSync()
+  const first = (await settlementRows(d, s))[0]!
+  await setSetting(d, FLAG, null)
+  const longAgo = new Date(Date.now() - 24 * 3_600_000)
+  await d.db.accountingSyncLog.updateMany({ where: { id: first.id }, data: { status: 'PENDING', processingStartedAt: longAgo } })
+  await d.db.integrationOutbox.updateMany({ where: { idempotencyKey: { contains: first.id } }, data: { status: 'PENDING', nextAttemptAt: longAgo, lockedAt: null } }).catch(() => undefined)
+  await d.processor.processPendingXeroSync()
+  const after = (await settlementRows(d, s))[0]!
+  assert.notEqual(after.status, 'CANCELLED', 'not retired as unsent')
+})
+
+test('[db] a retry replays the pinned account and rate: a payment map changed after the attempt does not change the request', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  await setSetting(d, FLAG, 'true')
+  const account = await withGbpBank(d, t)
+  const s = await seed(d, { paid: true, shopRefund: true, gateway: true })
+  t.after(async () => { await setSetting(d, FLAG, null); await cleanup(d, s) })
+  ledger = { ...freshLedger(), amountDue: 0 }
+  await d.processor.reenqueueMissingCreditNoteAllocations()
+  refundOutcome = { success: false, error: 'socket hang up', landed: false }
+  await d.processor.processPendingXeroSync()
+  const first = (await settlementRows(d, s))[0]!
+  assert.equal((first.payload as { bankAccountId?: string }).bankAccountId, account.externalAccountId)
+  // The map now points somewhere else; the retry must still use the pinned account.
+  await setSetting(d, PAYMENT_MAP, JSON.stringify({ 'stripe:GBP': 'some-other-account' }))
+  const longAgo = new Date(Date.now() - 24 * 3_600_000)
+  await d.db.accountingSyncLog.updateMany({ where: { id: first.id }, data: { status: 'PENDING', processingStartedAt: longAgo } })
+  await d.db.integrationOutbox.updateMany({ where: { idempotencyKey: { contains: first.id } }, data: { status: 'PENDING', nextAttemptAt: longAgo, lockedAt: null } }).catch(() => undefined)
+  refundOutcome = { success: true, paymentId: 'pay-2', landed: true }
+  await d.processor.processPendingXeroSync()
+  const accounts = refunds.map((r) => r.accountId)
+  assert.ok(accounts.length >= 1)
+  assert.ok(accounts.every((a) => a === account.externalAccountId), 'every attempt used the pinned account')
+})
