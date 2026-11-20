@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 import { Prisma as PrismaRuntime } from '../../../app/generated/prisma/client.ts'
+import { businessDateYmd } from '../../../lib/business-date.ts'
 
 /**
  * The inventory reports window on LONDON business days, so they reconcile across a BST month-end:
@@ -26,15 +27,20 @@ const cogsFindMany = async (args?: { where?: { createdAt?: { gte?: Date; lt?: Da
   return COGS_ROWS.filter((r) => inWindow(r.createdAt, args?.where?.createdAt))
 }
 
+/** The as-of reader client of the fixture under test: getInventoryValuationReport reads through `db`, so the reader is served from the db mock below. */
+let READER: Record<string, unknown> = {}
+const STATIC_DB: Record<string, unknown> = {
+  cogsEntry: { findMany: cogsFindMany },
+  salesOrder: { findMany: async () => [] },
+  salesOrderRefundLine: { findMany: async () => [] },
+  shipmentLine: { findMany: async () => [] },
+  product: { findMany: async () => [PRODUCT] },
+  warehouse: { findMany: async () => [WAREHOUSE] },
+}
+
 mock.module('@/lib/db', {
   namedExports: {
-    db: {
-      cogsEntry: { findMany: cogsFindMany },
-      salesOrder: { findMany: async () => [] },
-      salesOrderRefundLine: { findMany: async () => [] },
-      shipmentLine: { findMany: async () => [] },
-      product: { findMany: async () => [{ id: 'p1' }] },
-    },
+    db: new Proxy({}, { get: (_t, prop: string) => STATIC_DB[prop] ?? READER[prop] }),
   },
 })
 
@@ -54,10 +60,9 @@ function cogsRowFor(cost: number, at: string) {
 async function load() {
   const fx = await import('./london-day-fixtures.ts')
   const { Prisma } = await import('../../../app/generated/prisma/client.ts')
-  const { getOnHandAsOf } = await import('../../../lib/domain/inventory/get-on-hand-as-of.ts')
   const { getStockMovementLedgerReport } = await import('../../../lib/domain/inventory/inventory-ledger-reports.ts')
-  const { getCogsReport, getInventoryTurnoverReport } = await import('../../../lib/domain/inventory/inventory-costing-reports.ts')
-  return { fx, Prisma, getOnHandAsOf, getStockMovementLedgerReport, getCogsReport, getInventoryTurnoverReport }
+  const { getCogsReport, getInventoryTurnoverReport, getInventoryValuationReport } = await import('../../../lib/domain/inventory/inventory-costing-reports.ts')
+  return { fx, Prisma, getInventoryValuationReport, getStockMovementLedgerReport, getCogsReport, getInventoryTurnoverReport }
 }
 
 type Fixture = { label: string; d0: string; d1: string; moves: Array<{ id: string; kind: 'in' | 'out' | 'open'; qty: number; at: string }>; current: number; backfillTo: string; expect: { val0: string; val1: string; received: string; cogs: string; ledgerMovement: string } }
@@ -102,7 +107,7 @@ const FIXTURES: Fixture[] = [
 
 for (const f of FIXTURES) {
   test(`reconciliation identity holds across ${f.label}`, async () => {
-    const { fx, Prisma, getOnHandAsOf, getStockMovementLedgerReport, getCogsReport, getInventoryTurnoverReport } = await load()
+    const { fx, Prisma, getInventoryValuationReport, getStockMovementLedgerReport, getCogsReport, getInventoryTurnoverReport } = await load()
     const D = (v: number) => new Prisma.Decimal(v)
     const moves = f.moves.map((m) => ({
       id: m.id,
@@ -117,9 +122,11 @@ for (const f of FIXTURES) {
     const store = await fx.backfill(moves, f.current, f.d0, f.backfillTo)
     const reader = fx.readerClient(store, moves, f.current)
 
-    const val = async (asOf: string) => (await getOnHandAsOf({ client: reader, asOf, now: fx.NOW })).rows.reduce((s, r) => s.add(r.valueBase), D(0))
-    const val0 = await val(f.d0)
-    const val1 = await val(f.d1)
+    // Valuation from the report operators read (getInventoryValuationReport), served by the real as-of reader over the fixture's backfilled store.
+    READER = reader as unknown as Record<string, unknown>
+    const val = async (asOf: string) => (await getInventoryValuationReport({ asOf, warehouseId: 'w1', includeZero: true }, { paginate: false })).totals.totalValueBase
+    const val0 = D(Number(await val(f.d0)))
+    const val1 = D(Number(await val(f.d1)))
     assert.equal(val0.toFixed(6), f.expect.val0)
     assert.equal(val1.toFixed(6), f.expect.val1)
 
@@ -142,10 +149,13 @@ for (const f of FIXTURES) {
     const turnover = await getInventoryTurnoverReport({ dateFrom: dayAfter, dateTo: f.d1, product: 'Widget' }, { paginate: false, client: { cogsEntry: { findMany: cogsFindMany }, inventorySnapshot: { findMany: async () => [] } } as never })
     assert.equal(Number(turnover.totals.cogsBase), Number(f.expect.cogs))
 
-    // received = ledger movement + COGS (the ledger nets the dispatches in); and opening + received - COGS = closing.
-    const cogsValue = D(Number(f.expect.cogs))
-    const received = new Prisma.Decimal(ledger.totals.movementValueBase).add(cogsValue)
+    // received is derived INDEPENDENTLY of every report: the sum of the inbound fixture moves whose London day is in (D0, D1].
+    // (The old definition, ledger movement + COGS, reduced the identity to the ledger-closing assertion above.)
+    const londonDay = (at: string) => businessDateYmd(new Date(at))
+    const received = f.moves.filter((m) => m.kind === 'in' && londonDay(m.at) > f.d0 && londonDay(m.at) <= f.d1).reduce((sum, m) => sum.add(D(m.qty)), D(0))
     assert.equal(received.toFixed(0), f.expect.received)
+    // COGS from the report's own total, never from a fixture constant.
+    const cogsValue = D(Number(cogs.totals.cogsBase.exactString()))
     assert.equal(val0.add(received).sub(cogsValue).toFixed(6), val1.toFixed(6))
   })
 }

@@ -264,3 +264,30 @@ test('lead-time report calculates supplier-SKU P50 and P95 from receipt lead tim
   assert.equal(report.rows[0]?.p95LeadTimeDays, '20')
   assert.equal(report.rows[0]?.configuredLeadTimeDays, '14')
 })
+
+test('open purchase order report windows poSentAt/createdAt on LONDON days (BST July) and displays the London sent date (o3d-bo89l)', async () => {
+  let seenWhere: { OR: Array<Record<string, { gte: Date; lt: Date } | null>> } | null = null
+  const client: PurchasingAnalyticsClient = {
+    ...unusedClient(),
+    purchaseOrder: {
+      findMany: async (args?: unknown) => {
+        seenWhere = (args as { where: typeof seenWhere }).where
+        return [{
+          id: 'po-1', reference: 'PO-1', status: PurchaseOrderStatus.PO_SENT,
+          // 2026-06-30T23:30Z is London 1 July: inside July.
+          poSentAt: new Date('2026-06-30T23:30:00.000Z'), expectedDelivery: null, createdAt: new Date('2026-06-30T23:30:00.000Z'),
+          supplierId: 'supplier-1', supplier,
+          lines: [{ qty: decimal('1'), qtyReceived: decimal('0'), qtyReturned: decimal('0'), unitCostBase: decimal('10'), landedUnitCostBase: decimal('10') }],
+        }]
+      },
+    },
+  }
+  const report = await getOpenPurchaseOrdersReport(
+    { dateFrom: '2026-07-01', dateTo: '2026-07-31' },
+    { deps: { client, now: () => new Date('2026-11-20T12:00:00.000Z') } },
+  )
+  const sentWindow = seenWhere!.OR[0]!.poSentAt!
+  assert.equal(sentWindow.gte.toISOString(), '2026-06-30T23:00:00.000Z')
+  assert.equal(sentWindow.lt.toISOString(), '2026-07-31T23:00:00.000Z')
+  assert.equal(report.rows[0]!.poSentAt, '2026-07-01', 'the sent date is the London day, not the UTC day')
+})

@@ -608,8 +608,9 @@ test('the credit window is the refund date, and nothing else narrows the query (
   assert.deepEqual(Object.keys(clauses[0]!.refund), ['refundedAt'])
   assert.deepEqual(Object.keys(clauses[1]!.refund), ['order'])
   const where = clauses[0] as unknown as { refund: { refundedAt: { gte: Date; lt: Date } } }
-  assert.equal(where.refund.refundedAt.gte.toISOString(), '2026-06-01T00:00:00.000Z')
-  assert.equal(where.refund.refundedAt.lt.toISOString(), '2026-07-01T00:00:00.000Z')
+  // June 2026 is BST: the London day starts at 23:00Z the evening before (o3d-bo89l, the same window the COGS entries use).
+  assert.equal(where.refund.refundedAt.gte.toISOString(), '2026-05-31T23:00:00.000Z')
+  assert.equal(where.refund.refundedAt.lt.toISOString(), '2026-06-30T23:00:00.000Z')
 })
 
 test('an in-period credit against an EARLIER period’s order is loaded, not dropped (Codex r2 HIGH 1)', async () => {

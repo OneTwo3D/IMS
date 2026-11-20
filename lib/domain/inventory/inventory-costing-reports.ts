@@ -16,7 +16,7 @@ import { businessDayWindow } from '@/lib/domain/inventory/inventory-snapshot'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { calculateInventoryTurnover, normalizeVelocityWindow } from '@/lib/domain/inventory/velocity'
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { dateOnly as utcDateOnly, exclusiveEndOfUtcDay, parseDateOnly as parseUtcDateOnly, subtractUtcDays } from '@/lib/domain/math/date-window'
+import { dateOnly as utcDateOnly, parseDateOnly as parseUtcDateOnly, subtractUtcDays } from '@/lib/domain/math/date-window'
 import { assertSourceLimit, SourceScanTooLargeError, sourceLimitNotice } from '@/lib/security/source-scan-error'
 import { getActiveAccountingConnectorInfo, syncAccountingAccountBalanceSnapshots, getAccountingSettingsFor } from '@/lib/accounting'
 import { cache } from 'react'
@@ -285,7 +285,10 @@ export type LandedCostReportRow = {
   poReference: string
   supplierName: string
   status: string
+  /** The UTC instant the PO was created. Operators read `createdDate`: a UTC instant near midnight reads as the wrong day in BST. */
   createdAt: string
+  /** The LONDON business day the PO was created (YYYY-MM-DD): the day the Landed Cost window filtered on. */
+  createdDate: string
   productId: string
   sku: string
   productName: string
@@ -2020,11 +2023,11 @@ export async function getCogsReport(filters: InventoryCostingFilters = {}, optio
   const dateFrom = filters.dateFrom ?? daysAgo(30)
   const dateTo = filters.dateTo ?? today()
   const { from, toExclusive } = businessWindow(dateFrom, dateTo, daysAgo(30), today())
-  // The CREDIT window stays the UTC day, on purpose: it is the same expression the Gross Margin report loads (refundLinesRaisedInPeriodWhere over the
-  // sales-analytics UTC period), and the two must agree on the credit they subtract (tests/analytics/cogs-report-refund-basis.test.ts). Credit is revenue-side and
-  // is not part of the stock reconciliation identity; the COGS entries above are, and are on London days. Moving the sales-analytics family is a separate change.
-  const creditFrom = parseUtcDateOnly(isValidDateOnly(dateFrom) ? dateFrom : daysAgo(30), new Date())
-  const creditToExclusive = exclusiveEndOfUtcDay(parseUtcDateOnly(isValidDateOnly(dateTo) ? dateTo : today(), new Date(), { endOfDay: true }))
+  // The CREDIT window is the SAME London-day window as the cost/revenue window above (o3d-bo89l): it is the expression the Gross Margin report loads
+  // (refundLinesRaisedInPeriodWhere over the sales-analytics London period), so the two agree on the credit they subtract
+  // (tests/analytics/cogs-report-refund-basis.test.ts) and a refund raised in the boundary hour is netted against the revenue booked in the same period.
+  const creditFrom = from
+  const creditToExclusive = toExclusive
   const groupBy = isCogsGroupBy(filters.groupBy) ? filters.groupBy : 'product'
   const cogsWhere: Prisma.CogsEntryWhereInput = {
     createdAt: { gte: from, lt: toExclusive },
@@ -2517,6 +2520,7 @@ export async function getLandedCostReport(filters: InventoryCostingFilters = {},
       supplierName: row.po.supplier.name,
       status: row.po.status,
       createdAt: formatDateTime(row.po.createdAt),
+      createdDate: businessDateYmd(row.po.createdAt),
       productId: row.product.id,
       sku: row.product.sku,
       productName: row.product.name,

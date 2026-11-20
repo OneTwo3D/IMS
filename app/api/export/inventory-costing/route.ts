@@ -181,6 +181,7 @@ export async function getInventoryCostingExportResponse(
         poReference: row.poReference,
         supplierName: row.supplierName,
         status: row.status,
+        createdDate: row.createdDate,
         sku: row.sku,
         mpn: mpnByProductId.get(row.productId) ?? '',
         productName: row.productName,
@@ -197,7 +198,7 @@ export async function getInventoryCostingExportResponse(
       }))
       return csvBufferedStreamResponseFor(req, 
         rows,
-        ['poReference', 'supplierName', 'status', 'sku', 'mpn', 'productName', 'categoryName', 'qty', 'goodsUnitCostBase', 'landedUnitCostBase', 'landedUpliftUnitBase', 'landedUpliftPct', 'goodsValueBase', 'landedValueBase', 'landedCostMethod', 'revaluationCount'],
+        ['poReference', 'supplierName', 'status', 'createdDate', 'sku', 'mpn', 'productName', 'categoryName', 'qty', 'goodsUnitCostBase', 'landedUnitCostBase', 'landedUpliftUnitBase', 'landedUpliftPct', 'goodsValueBase', 'landedValueBase', 'landedCostMethod', 'revaluationCount'],
         `landed-cost-${date}.csv`,
         { dateFrom: report.dateFrom, dateTo: report.dateTo, generatedAt: report.generatedAt },
       )

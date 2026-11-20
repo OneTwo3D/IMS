@@ -1,7 +1,8 @@
 import { Prisma, ProductionOrderStatus, ProductionOrderType, StockMovementType } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { dateOnly, elapsedDaysDecimal, exclusiveEndOfUtcDay, parseOptionalDateOnly } from '@/lib/domain/math/date-window'
+import { businessDayWindow } from '@/lib/domain/inventory/inventory-snapshot'
+import { dateOnly, elapsedDaysDecimal, parseOptionalDateOnly } from '@/lib/domain/math/date-window'
 import { parseProductionOrderComponentSnapshot } from '@/lib/domain/manufacturing/component-consumption'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { SourceScanTooLargeError } from '@/lib/security/source-scan-error'
@@ -277,15 +278,15 @@ function optionalDateOnly(date: Date | undefined): string | null {
   return date ? dateOnly(date) : null
 }
 
+/** The filter dates are inclusive LONDON business days (o3d-bo89l), the same days the stock ledger and COGS report window on. */
 function dateWhere(filters: ManufacturingAnalyticsFilters, field: 'createdAt' | 'completedAt'): Record<string, unknown> {
   const dateFrom = parseDateOnly(filters.dateFrom)
   const dateTo = parseDateOnly(filters.dateTo, true)
-  const dateToExclusive = dateTo ? exclusiveEndOfUtcDay(dateTo) : undefined
   if (!dateFrom && !dateTo) return {}
   return {
     [field]: {
-      ...(dateFrom ? { gte: dateFrom } : {}),
-      ...(dateToExclusive ? { lt: dateToExclusive } : {}),
+      ...(dateFrom ? { gte: businessDayWindow(dateFrom, dateFrom).gte } : {}),
+      ...(dateTo ? { lt: businessDayWindow(dateTo, dateTo).lt } : {}),
     },
   }
 }

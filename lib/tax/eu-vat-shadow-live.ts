@@ -8,6 +8,7 @@
  * Nothing here calls `pushSalesInvoice`, a queue function, `stampEuVatRegime`, `treatImportedSalesInvoice`, `logActivity`, `xeroPost`, `xeroPut`, `wcPost`, `wcPut`, `xeroGet`, `wcFetch` or `getAccessToken` (the clients that can refresh a token or re-encrypt a setting). What a vendor says is reduced to a closed code before
  * it leaves this file (an HTTP status or a fixed word): a response body, a header or an error text is never returned, so no credential or token that a vendor echoed can reach the output.
  */
+import { businessDayWindow } from '@/lib/domain/inventory/inventory-snapshot'
 import { db } from '@/lib/db'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { buildShadowWcSalesInvoice } from '@/lib/connectors/woocommerce/sync/order-import'
@@ -62,7 +63,7 @@ export async function createLiveShadowPorts(now: Date = new Date()): Promise<Sha
         return { refs, unresolved: selection.refs.filter((ref) => !found.has(ref)) }
       }
       const links = await db.shoppingOrderLink.findMany({
-        where: { connector: 'woocommerce', order: { createdAt: { gte: new Date(`${selection.from}T00:00:00Z`), lt: new Date(new Date(`${selection.to}T00:00:00Z`).getTime() + 24 * 3_600_000) } } },
+        where: { connector: 'woocommerce', order: { createdAt: londonDayRange(selection.from, selection.to) } },
         select: { orderId: true, externalOrderId: true, externalOrderNumber: true, order: { select: { externalOrderNumber: true } } },
         orderBy: { createdAt: 'asc' },
         take: limit,
@@ -132,4 +133,10 @@ export async function createLiveShadowPorts(now: Date = new Date()): Promise<Sha
       return invoice === undefined ? { kind: 'none' } : { kind: 'found', invoice }
     },
   }
+}
+
+/** The half-open instant range of the inclusive LONDON days from..to (YYYY-MM-DD): the days a VAT tax point and the Xero document use, not UTC days. */
+function londonDayRange(from: string, to: string): { gte: Date; lt: Date } {
+  const { gte, lt } = businessDayWindow(new Date(`${from}T00:00:00Z`), new Date(`${to}T00:00:00Z`))
+  return { gte, lt }
 }

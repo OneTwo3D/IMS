@@ -7,7 +7,8 @@ import { isMissingFxRateError, selectFxRateFromRows } from '@/lib/currencies/fx-
 import { getFxSourceRegime, type FxSourceRegime } from '@/lib/currencies/fx-source-regime'
 import { billNetPayableBase, billNetPayableForeign, type NetPayableLine } from '@/lib/domain/purchasing/bill-net-payable'
 import { multiplyMoney, roundMoney, roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
-import { dateOnly, defaultUtcDateWindow, exclusiveEndOfUtcDay, parseDateOnly, startOfUtcDay, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
+import { dateOnly, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
+import { londonPeriod, type LondonPeriod } from '@/lib/domain/math/london-period'
 import type { PageInfo } from '@/lib/domain/inventory/stock-position-reports'
 import { REFUND_TURNOVER_SELECT, type TurnoverRefund } from '@/lib/domain/sales/customer-turnover'
 import { receivableBalance } from '@/lib/domain/sales/receivable-balance'
@@ -370,13 +371,8 @@ async function baseCurrencyFromDeps(deps?: FinanceAnalyticsDeps): Promise<string
   return deps?.client ? DEFAULT_BASE_CURRENCY : getBaseCurrencyCode()
 }
 
-function period(filters: FinanceAnalyticsFilters, now: Date): { dateFrom: Date; dateTo: Date; dateToExclusive: Date } {
-  const { dateFrom: defaultFrom, dateTo: defaultTo } = defaultUtcDateWindow(now, DEFAULT_PERIOD_DAYS)
-  const dateTo = parseDateOnly(filters.dateTo, defaultTo, { endOfDay: true })
-  const dateFrom = parseDateOnly(filters.dateFrom, defaultFrom)
-  return dateFrom.getTime() <= dateTo.getTime()
-    ? { dateFrom, dateTo, dateToExclusive: exclusiveEndOfUtcDay(dateTo) }
-    : { dateFrom: startOfUtcDay(dateTo), dateTo, dateToExclusive: exclusiveEndOfUtcDay(dateTo) }
+function period(filters: FinanceAnalyticsFilters, now: Date): LondonPeriod {
+  return londonPeriod(filters, now, DEFAULT_PERIOD_DAYS)
 }
 
 function clampPageSize(value: number | undefined): number {
@@ -407,8 +403,8 @@ export function emptyFinanceAnalyticsReportForSourceLimit<Row, Totals extends Re
   const pageSize = clampPageSize(filters.pageSize)
   return {
     generatedAt: now.toISOString(),
-    dateFrom: dateOnly(window.dateFrom),
-    dateTo: dateOnly(window.dateTo),
+    dateFrom: dateOnly(window.fromLabel),
+    dateTo: dateOnly(window.toLabel),
     rows: [],
     pageInfo: pageInfo(0, filters.page, pageSize),
     totals,
@@ -427,7 +423,7 @@ function paginate<T>(rows: T[], filters: FinanceAnalyticsFilters, enabled: boole
 function report<Row, Totals extends Record<string, string>>(
   rows: Row[],
   filters: FinanceAnalyticsFilters,
-  window: { dateFrom: Date; dateTo: Date },
+  window: Pick<LondonPeriod, 'fromLabel' | 'toLabel'>,
   generatedAt: Date,
   totals: Totals,
   notices: string[],
@@ -436,8 +432,8 @@ function report<Row, Totals extends Record<string, string>>(
   const paged = paginate(rows, filters, paginateRows)
   return {
     generatedAt: generatedAt.toISOString(),
-    dateFrom: dateOnly(window.dateFrom),
-    dateTo: dateOnly(window.dateTo),
+    dateFrom: dateOnly(window.fromLabel),
+    dateTo: dateOnly(window.toLabel),
     rows: paged.rows,
     pageInfo: paged.pageInfo,
     totals,

@@ -1,5 +1,6 @@
 import type { Metadata } from 'next'
 import Link from 'next/link'
+import { businessDateOfIso } from '@/lib/business-date'
 import { ProductLink } from '@/components/inventory/product-link'
 import { getOrganisation } from '@/app/actions/company'
 import {
@@ -39,7 +40,7 @@ export default async function StockMovementsPage({ searchParams }: { searchParam
       render: (row) => <ProductLink productId={row.productId} sku={row.sku} name={row.productName} />,
       footer: 'Totals',
     },
-    { key: 'date', label: 'Date', render: (row) => row.createdAt.slice(0, 10) },
+    { key: 'date', label: 'Date', render: (row) => businessDateOfIso(row.createdAt) },
     { key: 'warehouse', label: 'Warehouse', render: (row) => <span className="font-medium">{row.warehouseCode}</span> },
     { key: 'type', label: 'Type', render: (row) => row.type },
     { key: 'qty', label: 'Signed qty', align: 'right', render: (row) => `${row.signedQty} ${row.stockUnit}`, footer: report.totals.movementQty },
