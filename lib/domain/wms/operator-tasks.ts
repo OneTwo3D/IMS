@@ -215,5 +215,5 @@ export function wcEditAfterPickingQuery(wmsOrder: string, imsOrder: string, chan
 export function refundRemainderQuery(wmsOrder: string, imsOrder: string, remainder: ReadonlyArray<{ sku: string; quantity: number }>): string {
   const list = remainder.map((line) => `${line.quantity} x ${line.sku}`).join(', ')
   return `IMS order ${imsOrder} had shipped units returned and refunded, so IMS still owes the customer units the warehouse order ${wmsOrder} no longer asks for. `
-    + `Please send the remaining units: ${list}. IMS has changed no quantity on the warehouse order.`
+    + `Please send the remaining units: ${list}. IMS has changed no quantity on the warehouse order. This replaces any earlier remainder request for this order.`
 }

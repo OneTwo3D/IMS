@@ -1079,6 +1079,8 @@ export async function syncOneMintsoftProduct(
   if (!isMintsoftProductEligible(context.product)) {
     // Nothing is synced (or cleared) for it any more: a manual-clear discrepancy left open would never resolve otherwise.
     await resolveProductDiscrepancy(context.scopes, context.product.id, 'CUSTOMS_CLEAR_MANUAL')
+    // No name is refused for a product nothing is sent for any more: the row would stay open for good.
+    await resolveProductDiscrepancy(context.scopes, context.product.id, 'PRODUCT_NAME_REFUSED')
     // The rename discrepancy is deliberately NOT closed here: archiving a product changes nothing at the warehouse, so the order-push hold it
     // causes still applies. The operator's exit is the Ignore action (o3d-zz37l).
     return {
@@ -1107,6 +1109,8 @@ export async function syncOneMintsoftProduct(
       wmsValue: renamed.sku,
       message: `IMS SKU is now "${context.product.sku}" but the linked Mintsoft product (id ${renamed.externalProductId}) still has SKU "${renamed.sku}" and Mintsoft has no product under the new SKU. Nothing was created or changed in Mintsoft, so its stock stays with the existing product. Rename the Mintsoft product to the new SKU (or rename the IMS SKU back), then the next sync re-links it.`,
     })
+    // Nothing is sent on this path, so a name refusal cannot be acted on; the SKU rename is the open item now.
+    await resolveProductDiscrepancy(context.scopes, context.product.id, 'PRODUCT_NAME_REFUSED')
     await recordMintsoftProductLinkError(context.product.id, `SKU renamed in IMS: Mintsoft product ${renamed.externalProductId} still has SKU ${renamed.sku}`)
     return {
       sku: context.product.sku,
@@ -1141,7 +1145,9 @@ export async function syncOneMintsoftProduct(
       //  - a NEW product (nothing in Mintsoft yet, so nothing to rename) is created under the plain fitted name, so order pushes for the SKU still find it;
       //  - an existing product whose current name cannot be read is not sent at all (nothing can be sent without risking a rename), and the refusal is reported.
       // Every case opens a visible discrepancy.
-      const remoteName = typeof authoritative?.raw?.Name === 'string' ? (authoritative.raw.Name as string).trim() : ''
+      // The name is sent back BYTE FOR BYTE: trim only decides whether there is a name at all (a whitespace-only Name reads as unreadable). A trimmed copy would be a whitespace-only rename of a live product.
+      const rawRemoteName = typeof authoritative?.raw?.Name === 'string' ? (authoritative.raw.Name as string) : ''
+      const remoteName = rawRemoteName.trim() === '' ? '' : rawRemoteName
       const isExisting = Boolean(authoritative) || Boolean(existingLink?.externalProductId)
       const heldName = remoteName || (isExisting ? null : fitMintsoftName(dto.name, '', context.product.sku))
       await upsertProductDiscrepancy({
@@ -1169,6 +1175,9 @@ export async function syncOneMintsoftProduct(
       await resolveProductDiscrepancy(context.scopes, context.product.id, 'PRODUCT_NAME_REFUSED')
       dto = withParity
     }
+  } else {
+    // Parity is off: no name is refused any more, so a row opened while it was on must not stay open ("the next sync renames it" would be false).
+    await resolveProductDiscrepancy(context.scopes, context.product.id, 'PRODUCT_NAME_REFUSED')
   }
   const logRaw = <T>(raw: T): T => (parityEnabled ? redactMintsoftCostPrice(raw) : raw)
 

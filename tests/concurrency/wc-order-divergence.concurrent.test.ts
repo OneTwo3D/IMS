@@ -418,3 +418,92 @@ test('[divergence] MED (r1): an unreadable warehouse gate queues a live re-read 
     else await f.db.setting.deleteMany({ where: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING } })
   }
 })
+
+test('[divergence] y1cqe 5: an unparseable stored or incoming `at` no longer freezes the seen state (no ::timestamp cast), and a failed write is logged', { skip }, async (t) => {
+  const f = await fixture(t)
+  const seenMod = await import('@/lib/connectors/woocommerce/sync/wc-seen-lines')
+  await f.setFlag(true)
+  await f.deliver({})
+  const read = async () => (await f.db.salesOrder.findUniqueOrThrow({ where: { id: f.orderId }, select: { wcSeenLines: true } })).wcSeenLines as { at: string | null; lines: Array<{ qty: number }> }
+  const wcAt = (qty: number, at: string) => seenMod.buildWcSeenLines({ date_modified_gmt: at, line_items: [{ id: 1, quantity: qty }] })
+  // The stored value cannot be cast (a pre-round-2 row, an odd date_modified fallback): a later, valid delivery is still recorded.
+  await f.db.$executeRaw`UPDATE sales_orders SET wc_seen_lines = '{"at":"not a date","digest":"d","lines":[{"externalLineItemId":1,"qty":1}]}'::jsonb WHERE id = ${f.orderId}`
+  await f.div.recordWcSeenLines(f.orderId, wcAt(3, '2026-11-02T10:00:00'))
+  assert.equal((await read()).lines[0]!.qty, 3, 'a stored value that cannot be ordered is overwritten, not a frozen state')
+  // The incoming value cannot be ordered: it does not throw and does not leave the state frozen either.
+  await f.div.recordWcSeenLines(f.orderId, wcAt(4, 'garbage'))
+  assert.equal((await read()).lines[0]!.qty, 4)
+  // Ordinary ordering still holds afterwards.
+  await f.div.recordWcSeenLines(f.orderId, wcAt(6, '2026-11-02T10:00:00'))
+  await f.div.recordWcSeenLines(f.orderId, wcAt(5, '2026-11-02T09:00:00'))
+  assert.equal((await read()).lines[0]!.qty, 6, 'an older delivery still never overwrites a newer one')
+
+  // A write that fails is LOGGED, not swallowed.
+  const logged: unknown[][] = []
+  const errorMock = mock.method(console, 'error', (...args: unknown[]) => { logged.push(args) })
+  await f.db.$executeRawUnsafe(`CREATE OR REPLACE FUNCTION y1cqe_seen_fail() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN IF NEW.id = '${f.orderId}' THEN RAISE EXCEPTION 'y1cqe forced failure'; END IF; RETURN NEW; END $$`)
+  await f.db.$executeRawUnsafe('CREATE TRIGGER y1cqe_seen_fail_trg BEFORE UPDATE ON sales_orders FOR EACH ROW EXECUTE FUNCTION y1cqe_seen_fail()')
+  try {
+    await f.div.recordWcSeenLines(f.orderId, wcAt(7, '2026-11-02T11:00:00'))
+  } finally {
+    await f.db.$executeRawUnsafe('DROP TRIGGER IF EXISTS y1cqe_seen_fail_trg ON sales_orders')
+    await f.db.$executeRawUnsafe('DROP FUNCTION IF EXISTS y1cqe_seen_fail()')
+    errorMock.mock.restore()
+  }
+  assert.ok(logged.some((args) => String(args[0]).includes('could not record the seen WooCommerce lines')), 'the failure is logged')
+})
+
+test('[divergence] y1cqe 3+4: a recheck queued by an unreadable gate that runs out of attempts raises a refused action (not dropped silently); a re-created row is not counted as resolved', { skip }, async (t) => {
+  const f = await fixture(t)
+  const amend = await import('@/lib/connectors/woocommerce/sync/order-amendment')
+  const gate = await import('@/lib/domain/sales/order-edit-wms-gate')
+  await f.setFlag(true)
+  const before = await f.db.setting.findUnique({ where: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING } })
+  await f.db.setting.upsert({ where: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING }, create: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING, value: 'true' }, update: { value: 'true' } })
+  const originalGate = gate.orderEditWmsGateDeps.current
+  const open = () => f.db.refusedAction.findMany({ where: { entityType: 'SALES_ORDER', entityId: f.orderId, action: 'WC_ORDER_AMENDMENT', resolvedAt: null } })
+  try {
+    await f.deliver({ qty: 3 })
+    await f.deliver({ qty: 3 })
+    await f.db.salesOrder.update({ where: { id: f.orderId }, data: { paidAt: new Date('2026-11-01T00:00:00Z') } })
+    await f.db.wmsOrderPushLink.create({ data: { orderId: f.orderId, connector: 'mintsoft', externalOrderId: 'MS-Y1CQE', externalOrderNumber: 'W-Y1CQE', state: 'SYNCED' } })
+    gate.orderEditWmsGateDeps.current = { ...originalGate, probe: async () => { throw new Error('warehouse down') } }
+    await f.deliver({ qty: 2 })
+    const queued = await f.db.wcOrderDivergenceRecheck.findFirstOrThrow({ where: { orderId: f.orderId } })
+    assert.equal(queued.fromRetry, true, 'queued by a retry outcome')
+
+    // y1cqe 4: the live re-read still cannot decide, so the row is re-created (new id). The order is still pending, not resolved.
+    f.div.divergenceSeams.readLiveOrder = async () => f.payload({ qty: 2 }) as never
+    t.after(() => { f.div.divergenceSeams.readLiveOrder = undefined })
+    const pending = await f.div.drainDeferredWcOrderDivergences()
+    assert.equal(pending.examined, 1)
+    assert.equal(pending.resolved, 0, 'a re-created recheck row is not "resolved"')
+    const again = await f.db.wcOrderDivergenceRecheck.findFirstOrThrow({ where: { orderId: f.orderId } })
+    assert.equal(again.attempts, 1)
+    assert.equal((await open()).length, 0, 'nothing is raised while attempts remain')
+
+    // y1cqe 3: the cap is reached: the row goes, and a visible refused action replaces it.
+    await f.db.wcOrderDivergenceRecheck.update({ where: { orderId: f.orderId }, data: { attempts: f.div.RECHECK_MAX_ATTEMPTS } })
+    const capped = await f.div.drainDeferredWcOrderDivergences()
+    assert.equal(capped.dropped, 1)
+    assert.equal(await f.db.wcOrderDivergenceRecheck.count({ where: { orderId: f.orderId } }), 0)
+    const raised = await open()
+    assert.equal(raised.length, 1, 'a refused action is raised for the order')
+    assert.equal(raised[0]!.gate, f.div.WC_AMENDMENT_RECHECK_GATE)
+    assert.equal(raised[0]!.severity, 'MEDIUM')
+
+    // A row deferred only for an unrecorded refund (not a retry outcome) is still dropped quietly at the cap.
+    await f.db.refusedAction.deleteMany({ where: { entityId: f.orderId } })
+    await f.db.wcOrderDivergenceRecheck.create({ data: { orderId: f.orderId, externalOrderId: String(f.externalId), attempts: f.div.RECHECK_MAX_ATTEMPTS } })
+    await f.div.drainDeferredWcOrderDivergences()
+    assert.equal((await open()).length, 0, 'a refund-deferral row that never resolved owes nothing')
+  } finally {
+    gate.orderEditWmsGateDeps.current = originalGate
+    await f.db.refusedAction.deleteMany({ where: { entityId: f.orderId } })
+    await f.db.wcOrderDivergenceRecheck.deleteMany({ where: { orderId: f.orderId } })
+    await f.db.wmsOperatorTask.deleteMany({ where: { orderId: f.orderId } })
+    await f.db.wmsOrderPushLink.deleteMany({ where: { orderId: f.orderId } })
+    if (before) await f.db.setting.update({ where: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING }, data: { value: before.value } })
+    else await f.db.setting.deleteMany({ where: { key: amend.WC_ORDER_AMENDMENT_WRITE_SETTING } })
+  }
+})

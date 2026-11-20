@@ -4972,6 +4972,8 @@ model WcOrderDivergenceRecheck {
   deferredAt      DateTime @default(now()) @map("deferred_at")
   attempts        Int      @default(0)
   lastAttemptAt   DateTime @default(now()) @map("last_attempt_at")
+  /// True when the write step queued this row because it could not decide (warehouse unreadable, same-second conflict). Such a row that runs out of attempts raises a refused action instead of being dropped silently.
+  fromRetry       Boolean  @default(false) @map("from_retry")
 
   @@index([lastAttemptAt], map: "wc_order_divergence_rechecks_attempt_idx")
   @@map("wc_order_divergence_rechecks")
