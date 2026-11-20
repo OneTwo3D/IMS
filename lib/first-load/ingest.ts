@@ -929,8 +929,12 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
   if (mapping?.ghostRows && skuAt !== undefined && ghostIndex >= 0) {
     const ghost = mapping.ghostRows.ghost
     const bySku = new Map<string, typeof records>()
+    // Only rows no selector deliberately skips take part: a skipped row is not a row of this dataset, so it can neither be "the typed row" that
+    // justifies dropping another row nor be dropped itself (otherwise a SKU whose typed row is Deleted would vanish behind a dropped Unknown one).
+    const skippedByMap = (record: (typeof records)[number]) => (mapping.rowSelect ?? []).some((selector, i) => selectIndexes[i]! >= 0 && selector.skip.includes(clean(record.cells[selectIndexes[i]!])))
     for (const record of records) {
       if (record.cells.length !== header.length) continue
+      if (skippedByMap(record)) continue
       const key = decisionSkuKey(record.cells[skuAt])
       if (key !== '') bySku.set(key, [...(bySku.get(key) ?? []), record])
     }

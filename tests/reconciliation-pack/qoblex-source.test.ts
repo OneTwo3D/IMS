@@ -278,7 +278,7 @@ test('THE NATIVE MAP COVERS THE TYPES AND STATES R14 NEEDS: kit, bom, non-invent
     // the state is a column of the products dataset only (stock lots do not read it); the type is read by both
     if (!/state/.test(label)) assert.notEqual(partReason(r, 'stock'), 'ok', `${label}: stock`)
   }
-  // a kit or non-inventory row whose state is unknown is still refused (the skip is for the listed type, not for a row that is otherwise unreadable)
+  // a kit row in a State the map does not list is still refused: skipping by Product Type does not excuse an unlisted State
   assert.notEqual(partReason(exportOf([row('COV-X8', 'kit', 'Suspended')]), 'products'), 'ok')
 })
 

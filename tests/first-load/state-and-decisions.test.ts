@@ -32,7 +32,7 @@ const small = (rowSelect: unknown, rows: string[]) => ingestDataset('products', 
 test('rowSelect list: a row must pass EVERY selector; a skip on any leaves it out; an unlisted value refuses it', (t) => {
   const sel = [{ column: 'T', keep: ['simple'], skip: ['kit'] }, { column: 'K', keep: ['Active'], skip: ['Deleted'] }]
   const r = small(sel, ['A,a,simple,Active,', 'B,b,kit,Active,', 'C,c,simple,Deleted,', 'D,d,simple,Weird,', 'E,e,odd,Deleted,', 'F,f,odd,Active,'])
-  precondition(t, 'rows', 6)
+  precondition(t, 'rows read or skipped', r.recordsRead + Object.values(r.rowsSkipped).reduce((n, c) => n + c, 0))
   assert.deepEqual(r.rows.map((x) => x.values.sku), ['A'], 'pass: only the row that passes both is read')
   assert.deepEqual(r.rowsSkipped, { kit: 1, Deleted: 2 }, 'a skip on either selector counts; Deleted of an unlisted type is skipped, not refused')
   assert.deepEqual(r.rejected.map((x) => [x.code, x.line]).sort(), [['UNLISTED_ROW_KIND', 5], ['UNLISTED_ROW_KIND', 7]], 'fail: the unlisted State and the unlisted type are refused')
@@ -42,7 +42,7 @@ test('rowSelect list: a row must pass EVERY selector; a skip on any leaves it ou
 test('rowSelect single object (the original form) still works and a bad list is refused', (t) => {
   const single = { column: 'T', keep: ['simple'], skip: ['kit'] }
   const r = small(single, ['A,a,simple,x,', 'B,b,kit,x,', 'C,c,odd,x,'])
-  precondition(t, 'rows', 3)
+  precondition(t, 'rows read or skipped', r.recordsRead + Object.values(r.rowsSkipped).reduce((n, c) => n + c, 0))
   assert.deepEqual(r.rows.map((x) => x.values.sku), ['A'])
   assert.deepEqual(r.rowsSkipped, { kit: 1 })
   assert.deepEqual(r.rejected.map((x) => x.code), ['UNLISTED_ROW_KIND'])
@@ -77,7 +77,7 @@ test('a purchase order line on a DRAFT product is accepted; on an EOL product it
     products: ds('products', [product('DR', 'SIMPLE', { lifecycleStatus: 'DRAFT' }), product('EO', 'SIMPLE', { lifecycleStatus: 'EOL' })]),
     'purchase-order-lines': ds('purchase-order-lines', [line('DR'), line('EO')]),
   })
-  precondition(t, 'lines', 2)
+  precondition(t, 'order lines', result.report.inputs.find((i) => i.dataset === 'purchase-order-lines')?.recordsRead ?? 0)
   assert.deepEqual(dispositionCodes(result, 'purchase-order-lines', 'REJECTED'), ['PRODUCT_NOT_PURCHASABLE'])
   const onlyDraft = run({ products: ds('products', [product('DR', 'SIMPLE', { lifecycleStatus: 'DRAFT' })]), 'purchase-order-lines': ds('purchase-order-lines', [line('DR')]) })
   assert.equal(onlyDraft.blocking, false)
@@ -89,7 +89,7 @@ test('a Qoblex lifecycle that disagrees with the WooCommerce status of a VARIABL
   const vp = (status: string) => ({ variantSku: 'M-01', wooVariationId: '11', parentSku: 'M', parentName: 'Parent M', parentStatus: status, wooParentId: '5001' })
   const disagree = run({ products: ds('products', [product('M', 'VARIABLE', { lifecycleStatus: 'DRAFT' }), product('M-01', 'VARIANT', { parentSku: 'M' })]), 'variant-parents': ds('variant-parents', [vp('publish')]) })
   const agree = run({ products: ds('products', [product('M', 'VARIABLE', { lifecycleStatus: 'DRAFT' }), product('M-01', 'VARIANT', { parentSku: 'M' })]), 'variant-parents': ds('variant-parents', [vp('draft')]) })
-  precondition(t, 'cases', 2)
+  precondition(t, 'runs examined', [disagree, agree].filter((x) => x.report.findings !== undefined).length)
   assert.ok(findingCodes(disagree, 'WARNING').includes('LIFECYCLE_DISAGREES_WITH_WOO'))
   assert.ok(!findingCodes(agree).includes('LIFECYCLE_DISAGREES_WITH_WOO'))
 })
@@ -101,7 +101,7 @@ test('non-stock SKUs: a source row of type Unknown loads as NON_INVENTORY and it
   const data = csv(row('99992345678', 'Active', 'Unknown', 'Synthetic fee'))
   const without = products(data)
   const withIt = products(data, decisions([' 99992345678 ']))
-  precondition(t, 'products', 2)
+  precondition(t, 'products records read', without.recordsRead + withIt.recordsRead)
   assert.equal(without.rows.length, 0)
   assert.equal(without.rejected[0]?.code, 'UNMAPPED_VALUE')
   assert.equal(withIt.rows[0].values.type, 'NON_INVENTORY')
@@ -116,7 +116,7 @@ test('non-stock SKUs: a source row of type Unknown loads as NON_INVENTORY and it
 test('a row with stock and a blank SKU is refused naming the product; a sku-name-overrides entry supplies the SKU', (t) => {
   const blank = csv(row('', 'Active', 'simple', 'Synthetic kit without printed parts'))
   const plain = stock(blank)
-  precondition(t, 'rows', 1)
+  precondition(t, 'stock records read', plain.recordsRead)
   assert.equal(plain.rows.length, 0)
   assert.equal(plain.rejected[0].code, 'BLANK_SKU')
   assert.match(plain.rejected[0].reason, /Synthetic kit without printed parts/)
@@ -132,7 +132,7 @@ test('supplier-overrides fill a blank currency and tax type; a different stated 
   const filled = run({ suppliers: ds('suppliers', [blank]), 'supplier-overrides': ds('supplier-overrides', [{ name: 'synthetic supplier', currency: 'USD', purchaseTaxType: 'NONE', reason: 'owner' }]) })
   const conflict = run({ suppliers: ds('suppliers', [{ ...blank, currency: 'EUR', purchaseTaxType: 'NONE' }]), 'supplier-overrides': ds('supplier-overrides', [{ name: 'Synthetic Supplier', currency: 'USD', purchaseTaxType: '', reason: 'owner' }]) })
   const none = run({ suppliers: ds('suppliers', [blank]) })
-  precondition(t, 'cases', 3)
+  precondition(t, 'supplier rows loaded or refused', [filled, conflict, none].reduce((n, x) => n + x.report.dispositions.filter((d) => d.dataset === 'suppliers').length, 0))
   assert.equal(filled.blocking, false)
   assert.deepEqual([rowsOf(filled, 'suppliers')[0].currency, rowsOf(filled, 'suppliers')[0].purchaseTaxType], ['USD', 'NONE'])
   assert.deepEqual(dispositionCodes(conflict, 'suppliers', 'REJECTED'), ['SUPPLIER_OVERRIDE_CONFLICT'])
@@ -152,7 +152,7 @@ test('recipe-overrides REPLACE a broken export recipe; an unknown component or a
   const overridden = run({ ...base, 'recipe-lines': broken, 'recipe-overrides': good })
   const onlyOverride = run({ ...base, 'recipe-overrides': good })
   const bad = run({ ...base, 'recipe-overrides': ds('recipe-overrides', [{ parentSku: 'KIT-1', componentSku: 'NOPE', qty: '1', reason: 'o' }, { parentSku: 'KIT-1', componentSku: 'C2', qty: '0', reason: 'o' }]) })
-  precondition(t, 'cases', 4)
+  precondition(t, 'recipe dispositions', [withExport, overridden, onlyOverride, bad].reduce((n, x) => n + x.report.dispositions.filter((d) => d.dataset.startsWith('recipe')).length, 0))
   assert.equal(withExport.blocking, true, 'the broken export alone blocks')
   assert.equal(overridden.blocking, false, 'the override wins')
   assert.deepEqual(dispositionCodes(overridden, 'recipe-lines', 'EXCLUDED'), ['REPLACED_BY_RECIPE_OVERRIDE', 'REPLACED_BY_RECIPE_OVERRIDE'])
@@ -171,7 +171,7 @@ test('ghost rows: a typed row and an Unknown row of one SKU keep the typed one a
   const data = csv(typed, withQty(ghost, '7.000000'))
   const lots = stock(data)
   const prods = products(data)
-  precondition(t, 'cases', 3)
+  precondition(t, 'stock records read or skipped', lots.recordsRead + Object.values(lots.rowsSkipped).reduce((n, c) => n + c, 0))
   assert.deepEqual(prods.rows.map((r) => r.values.sku), ['GH-1'])
   assert.equal(prods.rejected.length, 0, 'the ghost is not refused as an unmapped type')
   assert.equal(lots.rowsSkipped['ghost row dropped'], 1)
@@ -181,7 +181,8 @@ test('ghost rows: a typed row and an Unknown row of one SKU keep the typed one a
   const twoTyped = stock(csv(row('GH-2', 'Active', 'simple'), row('GH-2', 'Active', 'variable')))
   assert.deepEqual(twoTyped.rejected.map((r) => r.code), ['DUPLICATE_SOURCE_ROW', 'DUPLICATE_SOURCE_ROW'])
   const twoGhosts = stock(csv(row('GH-3', 'Active', 'Unknown'), row('GH-3', 'Active', 'Unknown')))
-  assert.ok(twoGhosts.rejected.length >= 2 && !twoGhosts.notes?.length)
+  assert.deepEqual(twoGhosts.rejected.map((r) => r.code), ['DUPLICATE_SOURCE_ROW', 'DUPLICATE_SOURCE_ROW'])
+  assert.equal(twoGhosts.notes?.length, 0)
 })
 
 // [mutation: the KIT decision does not suppress the stock, or the report line is missing]
@@ -190,7 +191,7 @@ test('a blank-SKU stock row mapped by override to a KIT: its on-hand is ignored 
   const d: IngestDecisions = { nonStockSkus: new Set(), skuByName: new Map([['Synthetic bundle', 'SYN-BUNDLE']]), typeByName: new Map([['Synthetic bundle', 'KIT']]) }
   const lots = stock(csv(kit), d)
   const prods = products(csv(kit), d)
-  precondition(t, 'rows', 1)
+  precondition(t, 'stock rows skipped', Object.values(lots.rowsSkipped).reduce((n, c) => n + c, 0))
   assert.equal(lots.rows.length, 0, 'no stock lot for a KIT')
   assert.equal(lots.rejected.length, 0)
   assert.equal(lots.notes?.[0].code, 'KIT_STOCK_IGNORED')
@@ -198,4 +199,23 @@ test('a blank-SKU stock row mapped by override to a KIT: its on-hand is ignored 
   assert.equal(prods.rows[0].values.type, 'KIT')
   const result = run({ products: ds('products', [product('SYN-BUNDLE', 'KIT')]), 'stock-lots': lots })
   assert.ok(result.report.findings.some((f) => f.code === 'KIT_STOCK_IGNORED' && f.severity === 'INFO'))
+})
+
+// [mutation: the ghost grouping counts a row the map skips as the typed row (or as a ghost)]
+test('ghost rows: a SKIPPED typed row (Deleted, or a skipped Product Type) never justifies dropping the Unknown row, which is refused as before', (t) => {
+  const cases: Array<[string, string, string]> = [['Deleted typed row', 'Deleted', 'simple'], ['skipped Product Type (kit)', 'Active', 'kit'], ['skipped Product Type (non-inventory)', 'Active', 'non-inventory']]
+  let examined = 0
+  for (const [label, state, type] of cases) {
+    const data = csv(row('GS-1', state, type, 'Synthetic typed'), row('GS-1', 'Active', 'Unknown', 'Synthetic unknown'))
+    const lots = stock(data)
+    examined += lots.recordsRead + Object.values(lots.rowsSkipped).reduce((n, c) => n + c, 0)
+    assert.equal(lots.rowsSkipped['ghost row dropped'], undefined, `${label}: nothing is dropped as a ghost`)
+    assert.equal(lots.notes?.length, 0, label)
+    assert.deepEqual(lots.rejected.map((r) => r.code), ['UNLISTED_ROW_KIND'], `${label}: the Unknown row is refused, never silently lost`)
+  }
+  const prods = products(csv(row('GS-2', 'Deleted', 'simple'), row('GS-2', 'Active', 'Unknown')))
+  examined += prods.recordsRead + Object.values(prods.rowsSkipped).reduce((n, c) => n + c, 0)
+  precondition(t, 'rows read or skipped', examined)
+  assert.equal(prods.rowsSkipped['ghost row dropped'], undefined)
+  assert.deepEqual(prods.rejected.map((r) => r.code), ['UNMAPPED_VALUE'])
 })
