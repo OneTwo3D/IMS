@@ -398,6 +398,10 @@ export async function drainDeferredWcOrderDivergences(
   try {
     // SINGLE FLIGHT: the cron sweep and a manual reconcile (or two overlapping sweeps) must not both read the same rows. A try-lock on one idle connection held across the drain (the amendment lock's accepted shape); a drain
     // that does not get it does nothing. The transaction's own timeout is the budget plus a long margin for the comparison and write steps of the last row.
+    // KNOWN LIMIT (o3d-0ged2 LOW 9, accepted and documented, not changed): the transaction holds one idle-in-transaction connection for the whole drain (about the budget, ~25 s, usually far less), and a drain that outlasts Prisma's
+    // interactive-transaction timeout (budget + 120 s) loses the lock while the work may still be running, so a second drain could overlap it. The overlap is harmless to the data (a row is re-read live and compared again; the comparison
+    // and the write step are idempotent, claim-guarded and bounded), it only repeats a few WooCommerce reads. A SESSION try-lock on the pinned lock pool (lib/db/pinned-advisory-lock.ts) would hold no transaction and could not lapse
+    // at the timeout; it was not done here because it changes the lock's class in the advisory-lock registry and tests, and the drain would then need the pool's lost-lock handling on every row, for a few repeated reads.
     await db.$transaction(async (tx) => {
       const [{ locked }] = await tx.$queryRaw<Array<{ locked: boolean }>>`SELECT pg_try_advisory_xact_lock(${WC_DIVERGENCE_DRAIN_LOCK_NAMESPACE}::int, 0) AS locked`
       if (!locked) {
