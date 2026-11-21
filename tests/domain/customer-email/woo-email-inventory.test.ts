@@ -19,7 +19,11 @@ import { WOO_NATIVE_CUSTOMER_EMAIL_IDS } from '@/lib/connectors/woocommerce/nati
 import { ownershipRowFor } from '@/lib/security/writer-ownership-map'
 
 // The kinds the e-mail builder really prepares, read from its source (buildEmail in lib/order-email.ts), so a new kind cannot be missed.
-const BUILDER_SOURCE = readFileSync(new URL('../../../lib/order-email.ts', import.meta.url), 'utf8')
+// Only the sales-order section (after the SalesOrder guard): the purchase-order e-mail above it goes to a supplier, not a customer.
+const FULL_SOURCE = readFileSync(new URL('../../../lib/order-email.ts', import.meta.url), 'utf8')
+const GUARD = "if (referenceType !== 'SalesOrder' || !referenceId) return null"
+assert.ok(FULL_SOURCE.includes(GUARD), 'the SalesOrder guard of the builder was found')
+const BUILDER_SOURCE = FULL_SOURCE.slice(FULL_SOURCE.indexOf(GUARD))
 const CONSTANT_KINDS: Record<string, string> = { STOREFRONT_CONFIRMATION_KIND, STOREFRONT_DELIVERED_KIND }
 const BUILDER_KINDS = [
   ...[...BUILDER_SOURCE.matchAll(/\bkind === '([A-Z_]+)'/g)].map((match) => match[1]!),
