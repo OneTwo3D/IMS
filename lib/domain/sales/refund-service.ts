@@ -95,6 +95,7 @@ import { activeRefundParkWhere } from '@/lib/domain/sales/refund-park-recovery'
 import { raiseWmsOperatorTask, refundNoteQuery, warehouseOrderRef } from '@/lib/domain/wms/operator-tasks'
 import { SHOP_REFUND_CONNECTOR, raiseShopRefundTask } from '@/lib/domain/sales/shop-refund-tasks'
 import { returnExchangeRefusals } from '@/lib/domain/sales/return-exchange'
+import { storeCreditCreditNoteNumber, type RefundParityFactsInput } from '@/lib/domain/sales/refund-cn-parity'
 import { findRestockedInboxesToAdopt, raiseAdoptionReclassTask, type InboxAdoption } from '@/lib/domain/sales/return-restock-cost'
 
 /**
@@ -4070,6 +4071,9 @@ export function refundLinesNotOnOrder<T extends { lineId?: string | null; descri
   return refundLines.find((l) => l.lineId != null && !ids.has(l.lineId)) ?? null
 }
 
+/** o3d-k26m.17: the storefront facts the refund sync hands the writer (see `createSalesOrderRefund`'s `refundParity`). */
+export type RefundParityFacts = RefundParityFactsInput
+
 export async function createSalesOrderRefund(
   client: RefundServiceClient,
   input: {
@@ -4082,6 +4086,12 @@ export async function createSalesOrderRefund(
     externalRefundId?: number
     /** WooCommerce `refunded_payment` of a storefront refund: stored on the refund (SalesOrderRefund.refundedViaGateway). */
     refundedViaGateway?: boolean
+    /**
+     * o3d-k26m.17 (switch `wc_refund_credit_note_parity_enabled`, read by the storefront refund sync): what the storefront plugins established about this refund.
+     * Honoured only for a storefront refund (an `externalRefundId`). `storeCreditRefund` numbers the credit note SC-<externalRefundId> instead of minting one and
+     * marks it never-allocated; `easFeeGapForeign` / `storefrontAmountForeign` record the EAS fee gap (see SalesOrderRefund).
+     */
+    refundParity?: RefundParityFacts
     creditNotePrefix: string
     accountingSettings?: AccountingSettings | null
     /**
@@ -5461,9 +5471,14 @@ export async function createSalesOrderRefund(
     ))
     const headerTotalBase = round4Sum(refundLines.reduce((sum, line) => sum + round4Sum(line.totalBase), 0))
     // The credit note pattern (Settings → Company → Numbering) decides the number; the prefix passed in is only what the default pattern starts with. The value minted here is stored on the refund and is the one the accounting payload carries.
-    const creditNoteNumber = await mintRequiredDocumentNumber(tx, 'credit_note', {
-      fallbackPrefix: input.creditNotePrefix,
-    })
+    // o3d-k26m.17: a store-credit refund's credit note is numbered in its own series, SC-<storefront refund id>, as the o3d-store-credit-refund plugin numbers
+    // Xeroom's, so it is never mistaken for a cash refund awaiting a bank payment. Nothing is minted for it, so the credit note sequence is not advanced.
+    const parity = input.externalRefundId != null ? input.refundParity : undefined
+    const creditNoteNumber = parity?.storeCreditRefund === true
+      ? storeCreditCreditNoteNumber(input.externalRefundId!)
+      : await mintRequiredDocumentNumber(tx, 'credit_note', {
+        fallbackPrefix: input.creditNotePrefix,
+      })
 
     // o3d-n8p: the WRITER stamps what the stored totals mean and where the refund came from — derived from
     // the call context here, not taken from a caller option. Every refund created on this path stores NET
@@ -5528,6 +5543,10 @@ export async function createSalesOrderRefund(
         creditNoteNumber,
         externalRefundId: input.externalRefundId ?? null,
         refundedViaGateway: input.externalRefundId != null && typeof input.refundedViaGateway === 'boolean' ? input.refundedViaGateway : null,
+        // o3d-k26m.17: written only from a storefront refund the parity switch examined; every other refund keeps the defaults.
+        ...(parity?.storeCreditRefund === true ? { storeCreditRefund: true } : {}),
+        ...(parity?.easFeeGapForeign != null && Number.isFinite(parity.easFeeGapForeign) && parity.easFeeGapForeign > 0 ? { easFeeGapForeign: parity.easFeeGapForeign } : {}),
+        ...(parity?.storefrontAmountForeign != null && Number.isFinite(parity.storefrontAmountForeign) && parity.easFeeGapForeign != null && parity.easFeeGapForeign > 0 ? { storefrontAmountForeign: parity.storefrontAmountForeign } : {}),
         // A storefront refund that returns quantity owes the storefront a stock correction (it raised its own stock first).
         // Written here, in the refund's own transaction: the obligation exists exactly when the refund does. Cleared (queued)
         // by lib/connectors/woocommerce/sync/refund-stock-correction.ts once the stock job is durably recorded.

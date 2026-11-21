@@ -287,3 +287,21 @@ test('a DELETED refund payment is not a record: the credit is back and the refun
   assert.equal(probe.ok, true)
   if (probe.ok) assert.equal(probe.records.length, 0)
 })
+
+test('o3d-k26m.17: a STORE-CREDIT refund is never settled, unpaid invoice or paid, gateway flag or not: NOT_NOW STORE_CREDIT_REFUND, and no operator is asked', () => {
+  for (const over of [{}, { receiptCount: 1, receiptTotal: toDecimal(100) }, { receiptCount: 1, receiptTotal: toDecimal(100), refundedViaGateway: false }]) {
+    const plan = planCreditNoteSettlement(facts({ ...over, refund: { shopRefund: true, storeCreditRefund: true } }))
+    assert.equal(plan.kind, 'NOT_NOW')
+    assert.equal(plan.kind === 'NOT_NOW' ? plan.reason : null, 'STORE_CREDIT_REFUND')
+    assert.equal(OPERATOR_ATTENTION_REASONS.has('STORE_CREDIT_REFUND'), false)
+  }
+  assert.deepEqual(planCreditNoteSettlement(facts({ refund: { shopRefund: true, storeCreditRefund: false } })), { kind: 'ALLOCATE' }, 'an ordinary refund on an unpaid invoice is still allocated')
+})
+
+test('o3d-k26m.17: an EAS fee-gap gateway refund pays out the STOREFRONT amount, not the credit; with no gap the whole credit as before', () => {
+  const gap = planCreditNoteSettlement(facts({ receiptCount: 1, receiptTotal: toDecimal(100), refundedViaGateway: true, refund: { shopRefund: true, storefrontAmountForeign: toDecimal('17.86') } }))
+  assert.equal(gap.kind, 'REFUND_PAYMENT')
+  assert.equal(gap.kind === 'REFUND_PAYMENT' ? gap.recordedAmount?.toString() : null, '17.86')
+  const plain = planCreditNoteSettlement(facts({ receiptCount: 1, receiptTotal: toDecimal(100), refundedViaGateway: true, refund: { shopRefund: true } }))
+  assert.equal(plain.kind === 'REFUND_PAYMENT' ? plain.recordedAmount : 'x', null)
+})

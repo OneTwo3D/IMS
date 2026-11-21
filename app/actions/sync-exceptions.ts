@@ -1,5 +1,6 @@
 'use server'
 
+import { isRefundParityHold } from '@/lib/domain/sales/refund-cn-parity'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { Prisma } from '@/app/generated/prisma/client'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
@@ -1884,7 +1885,8 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         // Only a QUARANTINED park is a deliberate, non-retryable refusal. PENDING/FAILED rows are
         // ordinary retryable failures whose remedy is Retry (usually after fixing the amount in the
         // storefront) — offering a manual credit note for those would invite a duplicate.
-        manuallyRecordable: log.status === 'QUARANTINED' && Boolean(log.entityId) && Boolean(log.externalId),
+        // o3d-k26m.17: never for a refund-parity hold, whose manual credit note would be wrong (see recordRefundParkManually).
+        manuallyRecordable: log.status === 'QUARANTINED' && Boolean(log.entityId) && Boolean(log.externalId) && !isRefundParityHold(log.errorMessage),
         currency: order?.currency ?? null,
         refundGrossForeign: payloadAmount,
         allocationTargets: buildAllocationTargets(order),
@@ -2998,10 +3000,15 @@ export async function recordRefundParkManually(
       where: { id: parkId, ...REFUND_PARK_WHERE, status: 'QUARANTINED' },
       // The parked WooCommerce refund itself (Codex r2 #2): its gross `amount` is the figure the credit
       // note has to come to. Without it there is nothing to reconcile against.
-      select: { id: true, entityId: true, externalId: true, payload: true },
+      select: { id: true, entityId: true, externalId: true, payload: true, errorMessage: true },
     })
     if (!park?.entityId || !park.externalId) {
       return { success: false, error: 'This refund is no longer quarantined (already resolved, retried, or removed).' }
+    }
+    // o3d-k26m.17: a refund-parity hold (the fee repayment, a fee-gap near miss, unconfirmed store credit) is never recorded by hand: the credit note this
+    // raises would credit the fee twice, credit an inflated total, or be an ordinary credit note for store credit. Refused here as well as hidden in the inbox.
+    if (isRefundParityHold(park.errorMessage)) {
+      return { success: false, error: withLedgerCheck('This refund was held by the storefront refund parity checks, and recording it manually would raise a wrong credit note, so nothing was recorded. Settle it in Xero, with the accountant, as the row says; the row stays here as the record of this refund.') }
     }
     const externalRefundId = Number(park.externalId)
     if (!Number.isSafeInteger(externalRefundId) || externalRefundId <= 0) {
