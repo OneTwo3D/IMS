@@ -43,6 +43,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { compareItem, decimalText, outcomeOfComparison, parseDecimalStrict, type CompareEntry, type CompareResult, type SideRow } from '@/lib/reconciliation-pack/compare'
 import { R5_PER_SKU_LIST_FRACTION, QOBLEX_BASE_CURRENCY, type PackReasonCode, type PackSourceCode } from '@/lib/reconciliation-pack/constants'
 import { keyToken, type KeyPart } from '@/lib/reconciliation-pack/identity'
+import { stockEvidenceEntries } from '@/lib/reconciliation-pack/qoblex-evidence'
 import type { ImsRead, ImsReadOptions, ImsSnapshots } from '@/lib/reconciliation-pack/ims-readers'
 import type { ItemInput } from '@/lib/reconciliation-pack/report'
 import type { QoblexExport, QoblexLocation, QoblexLot, QoblexSource } from '@/lib/reconciliation-pack/qoblex-source'
@@ -197,7 +198,12 @@ async function runR2(context: QoblexItemContext): Promise<ItemInput> {
   const ims: SideRow[] = view.positions.filter((p) => !p.qty.isZero()).map((p) => ({ key: stockKey(p.sku, p.code), value: decimalText(p.qty) }))
   const vendor: SideRow[] = theirs.positions.filter((p) => !p.qty.isZero()).map((p) => ({ key: stockKey(p.sku, p.code), value: decimalText(p.qty) }))
   const result = compareItem('R2', { ims, vendor, imsComplete: true, vendorComplete: true, emptyProof: 'snapshot-run-row-present' })
-  return fromComparison('R2', result)
+  if (result.status !== 'compared') return fromComparison('R2', result)
+  // REPORTED, NEVER JUDGED: what the read changed on the Qoblex side (a SKU read as 0 because its stock cells were blank or zero, a ghost row dropped).
+  const used = new Set<string>(comparisonTokens(result))
+  const reported = stockEvidenceEntries(loaded.value.qoblex.evidence)
+  if (reported.some((entry) => used.has(entry.key))) return inconclusive('R2', SOURCES, 'DUPLICATE_KEY')
+  return fromComparison('R2', { ...result, buckets: { ...result.buckets, outOfPopulation: [...result.buckets.outOfPopulation, ...reported] } })
 }
 
 // ---------------------------------------------------------------------------------------------

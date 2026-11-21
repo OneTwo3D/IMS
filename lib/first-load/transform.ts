@@ -39,6 +39,7 @@ import {
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { isPurchasableProductStatus } from '@/lib/products/lifecycle'
 import { joinVariantParents, type CatalogueView } from './variant-parents'
+import { planSkuRenames, type SkuRenameItem } from './sku-renames'
 import { boundProblems, type VariantParentsBinding } from './snapshot'
 import {
   accountRows,
@@ -473,36 +474,6 @@ const RENAMED_COLUMNS: ReadonlyArray<readonly [DatasetName, readonly string[]]> 
  */
 function loadSkuRenames(run: Run): void {
   if (!run.has('sku-renames')) return
-  type Item = { row: CanonRow; from: string; fromKey: string; to: string; toKey: string }
-  const items: Item[] = []
-  for (const row of run.rows('sku-renames')) {
-    const from = parseSku(row.values.fromSku, 'fromSku')
-    const to = parseSku(row.values.toSku, 'toSku')
-    const label = from.ok ? from.sku : row.values.fromSku
-    if (!from.ok) { run.add('sku-renames', row.line, label, 'REJECTED', 'BAD_SKU', from.reason); continue }
-    if (!to.ok) { run.add('sku-renames', row.line, label, 'REJECTED', 'BAD_SKU', to.reason); continue }
-    if (row.values.reason === '') { run.add('sku-renames', row.line, label, 'REJECTED', 'MISSING_REASON', 'a SKU rename needs a written reason'); continue }
-    if (from.key === to.key) { run.add('sku-renames', row.line, label, 'REJECTED', 'RENAME_TO_SELF', `${from.sku} is renamed to ${to.sku}, which is the same SKU`); continue }
-    items.push({ row, from: from.sku, fromKey: from.key, to: to.sku, toKey: to.key })
-  }
-  const refused = new Map<Item, { code: string; reason: string }>()
-  const refuse = (item: Item, code: string, reason: string): void => {
-    if (!refused.has(item)) refused.set(item, { code, reason })
-  }
-  const byFrom = new Map<string, Item[]>()
-  const byTo = new Map<string, Item[]>()
-  for (const item of items) {
-    byFrom.set(item.fromKey, [...(byFrom.get(item.fromKey) ?? []), item])
-    byTo.set(item.toKey, [...(byTo.get(item.toKey) ?? []), item])
-  }
-  for (const list of byFrom.values()) if (list.length > 1) for (const item of list) refuse(item, 'DUPLICATE_RENAME', `${item.from} is renamed ${list.length} times; which rename is meant cannot be decided`)
-  for (const list of byTo.values()) if (list.length > 1) for (const item of list) refuse(item, 'RENAME_TARGET_COLLISION', `${list.length} SKUs are renamed to ${item.to}; they would become one product`)
-  for (const item of items) {
-    const next = byFrom.get(item.toKey)
-    if (next) refuse(item, 'RENAME_CHAIN', `${item.to} is itself renamed (${next.map((n) => `${n.from} -> ${n.to}`).join(', ')}); a chain or a cycle of renames is never followed, state the final SKU directly`)
-    const previous = byTo.get(item.fromKey)
-    if (previous) refuse(item, 'RENAME_CHAIN', `${item.from} is the target of another rename (${previous.map((n) => `${n.from} -> ${n.to}`).join(', ')}); a chain or a cycle of renames is never followed`)
-  }
   // Where each SKU is read, by key: the existence checks.
   const present = new Map<string, Set<DatasetName>>()
   for (const [name, columns] of RENAMED_COLUMNS) {
@@ -513,19 +484,12 @@ function loadSkuRenames(run: Run): void {
       }
     }
   }
-  for (const item of items) {
-    if (refused.has(item)) continue
-    if (!present.has(item.fromKey)) refuse(item, 'RENAME_FROM_NOT_IN_SOURCE', `${item.from} is in no source dataset of this run (a typo, or the wrong file)`)
-    else if (present.has(item.toKey)) refuse(item, 'RENAME_TARGET_EXISTS', `${item.to} already exists in the source (${[...present.get(item.toKey)!].join(', ')}); renaming ${item.from} to it would merge two different products`)
-  }
-  const accepted = new Map<string, Item>()
-  for (const item of items) {
-    const why = refused.get(item)
-    if (why) run.add('sku-renames', item.row.line, item.from, 'REJECTED', why.code, why.reason)
-    else accepted.set(item.fromKey, item)
-  }
+  // The rules live in ONE pure helper, shared with the reconciliation pack (lib/first-load/sku-renames.ts).
+  const plan = planSkuRenames(run.rows('sku-renames'), present)
+  for (const refusal of plan.refusals) run.add('sku-renames', refusal.line, refusal.label, 'REJECTED', refusal.code, refusal.reason)
+  const accepted = plan.accepted
   if (accepted.size === 0) return
-  const counts = new Map<Item, Map<DatasetName, number>>()
+  const counts = new Map<SkuRenameItem, Map<DatasetName, number>>()
   const datasets = { ...run.input.datasets }
   for (const [name, columns] of RENAMED_COLUMNS) {
     const dataset = datasets[name]
