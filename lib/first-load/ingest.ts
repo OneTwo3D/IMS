@@ -914,6 +914,8 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
   const skuAt = mapping ? indexOf.get('sku') : undefined
   const notes: IngestNote[] = []
   const kindFromDecision = new Map<number, string>()
+  const nonStockConflicts = new Map<number, string>()
+  const nonStockQtyNotes = new Map<number, { line: number; code: string; reason: string }>()
   const ghostLines = new Set<number>()
   const quantityOf = (cells: string[]): string => {
     const at = totalIndex.get('qty') ?? ghostQtyIndex
@@ -939,7 +941,23 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
           }
         }
       }
-      if (nonStockIndex >= 0 && mapping.nonStock && decisions.nonStockSkus.has(decisionSkuKey(record.cells[skuAt]))) record.cells[nonStockIndex] = mapping.nonStock.value
+      if (nonStockIndex >= 0 && mapping.nonStock && decisions.nonStockSkus.has(decisionSkuKey(record.cells[skuAt]))) {
+        // The decision fills a kind the source does not state (blank or Unknown) or confirms a non-inventory one. A source that STATES a stock-bearing
+        // (or any other) kind contradicts the decision: the row is refused, never overwritten (a SKU wrongly listed would lose its stock silently).
+        const stated = clean(record.cells[nonStockIndex])
+        const statedType = Object.entries(mapping.valueMaps.type ?? {}).find(([k]) => k.toLowerCase() === stated.toLowerCase())?.[1]
+        if (stated === '' || stated.toLowerCase() === 'unknown' || statedType === 'NON_INVENTORY' || stated.toLowerCase() === mapping.nonStock.value.toLowerCase()) {
+          const qtyAt = totalIndex.get('qty') ?? indexOf.get('qty') ?? ghostQtyIndex
+          const raw = qtyAt !== undefined && qtyAt >= 0 ? clean(record.cells[qtyAt]) : ''
+          const parsedQty = raw === '' ? null : parseDecimal(raw, 'qty', { maxIntDigits: 12, maxDp: 6 }, { allowNegative: true })
+          if (parsedQty !== null && !(parsedQty.ok && parsedQty.value.isZero())) {
+            nonStockQtyNotes.set(record.line, { line: record.line, code: 'NON_STOCK_QTY_IGNORED', reason: `SKU ${clean(record.cells[skuAt])} line ${record.line} is non-stock by the owner's decision but states a quantity of ${raw}: it is ignored, not loaded` })
+          }
+          record.cells[nonStockIndex] = mapping.nonStock.value
+        } else {
+          nonStockConflicts.set(record.line, `SKU ${clean(record.cells[skuAt])} is on the non-stock-skus decisions list but the source states the type ${JSON.stringify(stated)}${statedType ? ` (${statedType})` : ''}; the decision only fills a blank or Unknown type, so the row is refused. Fix the source type or remove the SKU from the list`)
+        }
+      }
     }
   }
   // GHOST ROWS: of several rows for one SKU, exactly one typed (not `ghost`) keeps its place and the ghosts are dropped, each reported with its quantity.
@@ -1009,6 +1027,13 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
         reason: `the row has ${record.cells.length} cell(s) but the header has ${header.length}; a short or long row is never padded or truncated`,
       })
       if (mapping?.parentFrom) parent = null
+      continue
+    }
+    const conflict = nonStockConflicts.get(record.line)
+    // A row ANOTHER selector skips (for example State Deleted) is not a row of this dataset: it is not refused for the decision. The kind selector itself is not
+    // consulted (a stated kit would be skipped by it, which is the contradiction being refused).
+    if (conflict !== undefined && !(mapping?.rowSelect ?? []).some((selector, i) => selectIndexes[i]! >= 0 && selectIndexes[i] !== nonStockIndex && selector.skip.includes(clean(record.cells[selectIndexes[i]!])))) {
+      rejected.push({ line: record.line, code: 'NON_STOCK_DECISION_CONFLICT', reason: conflict })
       continue
     }
     if (mapping?.wide) {
@@ -1081,6 +1106,10 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
       if (skipped >= 0) {
         const kind = kinds[skipped]!
         rowsSkipped[kind] = (rowsSkipped[kind] ?? 0) + 1
+        const qtyNote = nonStockQtyNotes.get(record.line)
+        // Only when the non-stock kind is what skips the row: a row another selector also skips (for example State Deleted) is not a row of this dataset, so its quantity is not reported.
+        const alsoSkippedElsewhere = mapping.rowSelect.some((selector, i) => selectIndexes[i]! >= 0 && selectIndexes[i] !== nonStockIndex && selector.skip.includes(clean(record.cells[selectIndexes[i]!])))
+        if (qtyNote !== undefined && dataset === 'stock-lots' && selectIndexes[skipped] === nonStockIndex && !alsoSkippedElsewhere) notes.push(qtyNote)
         if (kindFromDecision.get(record.line) === 'KIT' && dataset === 'stock-lots' && skuAt !== undefined) {
           notes.push({ line: record.line, code: 'KIT_STOCK_IGNORED', reason: `SKU ${clean(record.cells[skuAt])} is a KIT by the owner's decision: the on-hand quantity ${quantityOf(record.cells)} on line ${record.line} is Qoblex's computed availability, not stock, and is not loaded` })
         }

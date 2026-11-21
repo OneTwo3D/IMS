@@ -30,6 +30,7 @@ import {
   RECIPE_TYPES,
   STOCK_BEARING_TYPES,
   STRANDED_TRANSFER_DAYS,
+  VARIANT_PARENT_STATUS_LIFECYCLE,
   SUPPLIER_PURCHASE_TAX_TYPES,
   type DatasetName,
   type ImporterTarget,
@@ -375,6 +376,8 @@ class Run {
   wmsQty = new Map<string, Dec>()
   wmsSkus = new Map<string, string>()
   wooSkus = new Map<string, string>()
+  /** Every product/variation whose lifecycle was taken from its WooCommerce status and differs from the Qoblex-derived one (owner ruling 2026-11-21: Woo's status is gospel). */
+  lifecycleFromWoo: Array<{ key: string; sku: string; kind: string; qoblex: string; wooStatus: string; result: string }> = []
   /** VARIABLE parents created from the variant-parents dataset (they are output rows without a products-dataset record). */
   syntheticParents = new Set<string>()
   variantConfirmed = new Set<string>()
@@ -484,8 +487,13 @@ function loadSkuRenames(run: Run): void {
       }
     }
   }
+  const excludedKeys = new Map<string, string>()
+  for (const row of run.rows('sku-exclusions')) {
+    const parsed = parseSku(row.values.sku)
+    if (parsed.ok) excludedKeys.set(parsed.key, parsed.sku)
+  }
   // The rules live in ONE pure helper, shared with the reconciliation pack (lib/first-load/sku-renames.ts).
-  const plan = planSkuRenames(run.rows('sku-renames'), present)
+  const plan = planSkuRenames(run.rows('sku-renames'), present, { excluded: excludedKeys })
   for (const refusal of plan.refusals) run.add('sku-renames', refusal.line, refusal.label, 'REJECTED', refusal.code, refusal.reason)
   const accepted = plan.accepted
   if (accepted.size === 0) return
@@ -552,6 +560,86 @@ function loadExclusions(run: Run): void {
 }
 
 /**
+ * lifecycle-confirmations is OBSOLETE (owner ruling 2026-11-21: "Use Woo's status as gospel"): the lifecycle of every product the first load can see a WooCommerce status for is taken from
+ * WooCommerce, so nothing is left to confirm. The dataset stays parseable so an existing manifest still loads; every row is an INFO no-op, never an error.
+ */
+function loadLifecycleConfirmations(run: Run): void {
+  if (!run.has('lifecycle-confirmations')) return
+  const rows = run.rows('lifecycle-confirmations')
+  for (const row of rows) {
+    run.add('lifecycle-confirmations', row.line, row.values.sku, 'EXCLUDED', 'LIFECYCLE_CONFIRMATION_NOT_NEEDED', 'no-op: the lifecycle is now taken from WooCommerce, so no confirmation is needed')
+  }
+  if (rows.length > 0) run.find('INFO', 'LIFECYCLE_CONFIRMATIONS_NOT_NEEDED', `${rows.length} row(s) on lifecycle-confirmations were ignored: the lifecycle is now taken from WooCommerce (owner ruling 2026-11-21), so a confirmation changes nothing`, 'lifecycle-confirmations')
+}
+
+/**
+ * OWNER RULING 2026-11-21, "Use Woo's status as gospel". The WooCommerce status decides the IMS lifecycle wherever the first load can see one: a Woo private, draft or pending status is DRAFT;
+ * publish is ACTIVE, except that a Qoblex EOL (Inactive) stays EOL, because EOL still pushes publish and so nothing would flip. This overrides the Qoblex State, including Archived.
+ * `qoblex` is the lifecycle derived from the Qoblex row; `woo` is the mapped Woo status (ACTIVE = publish, DRAFT = anything else that is mapped).
+ */
+function lifecycleFromWooStatus(qoblex: string, woo: 'ACTIVE' | 'DRAFT'): string {
+  if (woo === 'DRAFT') return 'DRAFT'
+  return qoblex === 'EOL' ? 'EOL' : 'ACTIVE'
+}
+
+/** Applies the Woo-derived lifecycle to one catalogue entry and records it when it differs from the Qoblex one. */
+function takeLifecycleFromWoo(run: Run, entry: CatEntry, kind: string, wooStatus: string, woo: 'ACTIVE' | 'DRAFT'): void {
+  const result = lifecycleFromWooStatus(entry.lifecycle, woo)
+  if (result === entry.lifecycle) return
+  run.lifecycleFromWoo.push({ key: entry.key, sku: entry.sku, kind, qoblex: entry.lifecycle, wooStatus, result })
+  entry.lifecycle = result
+  entry.cells.lifecycleStatus = result
+}
+
+const wooLifecycleOf = (status: string): 'ACTIVE' | 'DRAFT' | undefined => (Object.prototype.hasOwnProperty.call(VARIANT_PARENT_STATUS_LIFECYCLE, status) ? VARIANT_PARENT_STATUS_LIFECYCLE[status] : undefined)
+
+/**
+ * Right after the catalogue is read (so the transfer, stock and purchase-order checks all see the final lifecycle): a simple, KIT or BOM product (not a variation) takes its lifecycle from
+ * woo-products `status` when that column carries one. Variations and VARIABLE parents were handled by the variant-parents join. A product with no usable Woo status keeps the Qoblex lifecycle.
+ * Then every change is reported: one INFO per SKU (LIFECYCLE_TAKEN_FROM_WOO) and a count. A mismatch is never a blocker or a warning.
+ */
+function applyLifecycleFromWoo(run: Run): void {
+  if (run.has('woo-products') && run.has('products')) {
+    const wooStatus = new Map<string, string>()
+    for (const row of run.rows('woo-products')) {
+      const sku = parseSku(row.values.sku)
+      if (sku.ok) wooStatus.set(sku.key, (row.values.status ?? '').trim().toLowerCase())
+    }
+    const columnUsed = [...wooStatus.values()].some((status) => status !== '')
+    const unusable: string[] = []
+    for (const entry of run.cat.values()) {
+      if (entry.type === 'VARIABLE' || entry.type === 'VARIANT' || entry.parentSku !== '') continue
+      const status = wooStatus.get(entry.key)
+      if (status === undefined) continue
+      const mapped = wooLifecycleOf(status)
+      if (mapped === undefined) { unusable.push(`${entry.sku}: ${entry.lifecycle}${status === '' ? ', no WooCommerce status' : `, unmapped WooCommerce status ${JSON.stringify(status)}`}`); continue }
+      takeLifecycleFromWoo(run, entry, entry.type, status, mapped)
+    }
+    // No row states a status at all: the column is simply not in the file (woo-products need not carry it), so nothing is listed.
+    if (unusable.length > 0 && columnUsed) run.find('WARNING', 'LIFECYCLE_WOO_STATUS_UNUSABLE', `${unusable.length} product(s) are in woo-products but their row carries no usable status (blank or not publish/draft/pending/private), so their lifecycle stays the Qoblex one and cannot be checked against WooCommerce: add the status, or check each by hand`, 'woo-products', unusable)
+  }
+  // The real load has no woo-products file (the snapshot lists variable products only): a simple, KIT or BOM product then keeps its Qoblex lifecycle, which a later IMS to WooCommerce push
+  // may turn into a different WooCommerce status (DRAFT writes draft; ACTIVE and EOL write publish). Say so, with the count, rather than staying silent.
+  if (run.has('products')) {
+    const woo = run.has('woo-products') ? run.rows('woo-products') : []
+    const statusSupplied = woo.some((row) => (row.values.status ?? '').trim() !== '')
+    if (!statusSupplied) {
+      const fromQoblex = [...run.cat.values()].filter((entry) => (entry.type === 'SIMPLE' || entry.type === 'KIT' || entry.type === 'BOM') && entry.parentSku === '')
+      if (fromQoblex.length > 0) run.find('WARNING', 'LIFECYCLE_NOT_FROM_WOO', `${fromQoblex.length} simple, KIT or BOM product(s) keep the lifecycle derived from the Qoblex State, because no woo-products status was supplied (only variations and VARIABLE parents are read from the WooCommerce snapshot): a later IMS to WooCommerce push may change their WooCommerce status (DRAFT writes draft; ACTIVE and EOL write publish; private and pending are unpublished and are also written back as draft). Supply woo-products with a status column to take their lifecycle from WooCommerce`, 'products')
+    }
+  }
+  const changed = run.lifecycleFromWoo
+  for (const c of [...changed].sort((a, b) => cmp(a.key, b.key))) {
+    run.find('INFO', 'LIFECYCLE_TAKEN_FROM_WOO', `${c.sku} (${c.kind}): Qoblex state gives ${c.qoblex}, WooCommerce status is ${c.wooStatus}, lifecycle loaded is ${c.result}`, 'products', [c.sku])
+  }
+  if (changed.length > 0) {
+    const tally = new Map<string, number>()
+    for (const c of changed) tally.set(`${c.qoblex} -> ${c.result}`, (tally.get(`${c.qoblex} -> ${c.result}`) ?? 0) + 1)
+    run.find('INFO', 'LIFECYCLE_TAKEN_FROM_WOO_COUNT', `${changed.length} product(s) and variation(s) take their lifecycle from WooCommerce instead of the Qoblex state (${[...tally.entries()].sort((a, b) => cmp(a[0], b[0])).map(([k, n]) => `${k}: ${n}`).join(', ')}); each is listed as LIFECYCLE_TAKEN_FROM_WOO`, 'products')
+  }
+}
+
+/**
  * The owner decisions lists that act at read time (the ingest applied them to the cells): non-stock-skus and sku-name-overrides. Here every row gets its
  * disposition and the lists are checked: a bad or conflicting row is refused (it would otherwise have been applied by the ingest, which only reads the
  * trimmed values), and a decision that matched nothing is a warning.
@@ -565,7 +653,7 @@ function loadReadTimeDecisions(run: Run): void {
     if (seenSkus.has(sku.key)) { run.add('non-stock-skus', row.line, sku.sku, 'EXCLUDED', 'DUPLICATE_ROW', 'repeat of an earlier non-stock row'); continue }
     seenSkus.set(sku.key, sku.sku)
     run.nonStockDecisions.set(sku.key, sku.sku)
-    run.add('non-stock-skus', row.line, sku.sku, 'EMITTED', 'NON_STOCK_REGISTERED', 'loaded as NON_INVENTORY whatever the source type says; stock cells ignored')
+    run.add('non-stock-skus', row.line, sku.sku, 'EMITTED', 'NON_STOCK_REGISTERED', 'loaded as NON_INVENTORY when the source type is blank, Unknown or non-inventory (a stated stock-bearing type is refused NON_STOCK_DECISION_CONFLICT); stock cells ignored')
   }
   const byName = new Map<string, string>()
   for (const row of run.rows('sku-name-overrides')) {
@@ -867,20 +955,21 @@ function joinVariantParentsInto(run: Run, candidates: CatEntry[]): void {
     const joined = byKey.get(key)
     if (joined && (joined.type === 'KIT' || joined.type === 'BOM')) joined.variantRecipe = true
   }
-  // A VARIABLE parent the products file carries keeps its row, but WooCommerce decides its title and lifecycle (the parent title comes from WooCommerce).
+  // A VARIABLE parent the products file carries keeps its row, but WooCommerce decides its title (the parent title comes from WooCommerce); its lifecycle is taken from WooCommerce just below (takeLifecycleFromWoo), reported as LIFECYCLE_TAKEN_FROM_WOO.
   const differing: string[] = []
-  const lifecycleDisagrees: string[] = []
   for (const p of result.providedParents) {
     const entry = run.cat.get(p.key) ?? byKey.get(p.key)
     if (!entry) continue
-    if (entry.name !== p.name || entry.lifecycle !== p.lifecycle) differing.push(`${entry.sku}: ${JSON.stringify(entry.name)}/${entry.lifecycle} -> ${JSON.stringify(p.name)}/${p.lifecycle}`)
-    if (entry.lifecycle !== p.lifecycle) lifecycleDisagrees.push(`${entry.sku}: the products file says ${entry.lifecycle}, WooCommerce says ${p.lifecycle}`)
+    if (entry.name !== p.name) differing.push(`${entry.sku}: ${JSON.stringify(entry.name)} -> ${JSON.stringify(p.name)}`)
     entry.name = p.name
-    entry.cells.lifecycleStatus = p.lifecycle
-    entry.lifecycle = p.lifecycle
+    takeLifecycleFromWoo(run, entry, 'VARIABLE parent', p.status, p.lifecycle)
   }
-  if (differing.length > 0) run.find('INFO', 'PARENT_ATTRIBUTES_FROM_WOO', `${differing.length} VARIABLE product(s) in the products file carry a title or lifecycle that differs from WooCommerce: WooCommerce's title and mapped status are written`, 'variant-parents', differing)
-  if (lifecycleDisagrees.length > 0) run.find('WARNING', 'LIFECYCLE_DISAGREES_WITH_WOO', `${lifecycleDisagrees.length} VARIABLE product(s) have a lifecycle in the products file (for Qoblex: Archived is DRAFT, Active is ACTIVE) that disagrees with the WooCommerce status (publish is ACTIVE, draft/pending/private is DRAFT): WooCommerce's is written; check which side is right (the snapshot covers variable products only)`, 'variant-parents', lifecycleDisagrees)
+  if (differing.length > 0) run.find('INFO', 'PARENT_ATTRIBUTES_FROM_WOO', `${differing.length} VARIABLE product(s) in the products file carry a title that differs from WooCommerce: WooCommerce's title is written (a lifecycle that differs is reported as LIFECYCLE_TAKEN_FROM_WOO)`, 'variant-parents', differing)
+  // Each VARIANT, KIT or BOM variation takes its lifecycle from its OWN WooCommerce status (the parent's is context only): owner ruling 2026-11-21, "Use Woo's status as gospel".
+  for (const j of result.joined) {
+    const entry = byKey.get(j.key)
+    if (entry) takeLifecycleFromWoo(run, entry, entry.type, j.ownStatus, j.ownLifecycle)
+  }
   for (const key of result.namedKeys) run.variantParentKeys.add(key)
   run.variantParentSummary = { supplied: true, ...result.summary }
 }
@@ -2166,9 +2255,11 @@ export function prepare(input: PrepareInput): PrepareResult {
 
   loadSkuRenames(run)
   loadExclusions(run)
+  loadLifecycleConfirmations(run)
   loadReadTimeDecisions(run)
   loadImsSkus(run)
   loadCatalogue(run)
+  applyLifecycleFromWoo(run)
   loadRecipes(run)
   if (run.has('products')) checkRecipesPresent(run)
   loadImsSuppliers(run)

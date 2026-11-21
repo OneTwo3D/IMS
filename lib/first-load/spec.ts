@@ -229,6 +229,7 @@ export const DATASET_NAMES = [
   'supplier-overrides',
   'recipe-overrides',
   'sku-renames',
+  'lifecycle-confirmations',
   'ims-skus',
   'ims-suppliers',
   'ims-tax-rates',
@@ -309,13 +310,13 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     purpose: 'The 3PL (WMS) stock levels. Used for R14 coverage and to find a SKU that holds stock there but is missing from the Qoblex stock extract.',
   },
   'woo-products': {
-    columns: ['sku', 'wooProductId', 'type'],
+    columns: ['sku', 'wooProductId', 'type', 'status'],
     required: ['sku'],
     sources: ['woocommerce'],
-    purpose: 'WooCommerce product export. Used only for the four-way SKU coverage check (R14). Never a source for recipes.',
+    purpose: 'WooCommerce product export. Used for the four-way SKU coverage check (R14) and, when it carries `status`, to take the lifecycle of a Qoblex simple/KIT/BOM product from its own WooCommerce status. Never a source for recipes.',
   },
   'variant-parents': {
-    columns: ['variantSku', 'wooVariationId', 'parentSku', 'parentName', 'parentStatus', 'wooParentId'],
+    columns: ['variantSku', 'wooVariationId', 'parentSku', 'parentName', 'parentStatus', 'wooParentId', 'variationStatus'],
     required: ['variantSku', 'parentSku', 'parentName', 'parentStatus'],
     sources: ['woocommerce'],
     purpose:
@@ -356,7 +357,13 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     columns: ['fromSku', 'toSku', 'reason'],
     required: ['fromSku', 'toSku', 'reason'],
     sources: [],
-    purpose: 'Owner decision: a source SKU that is loaded under another SKU (the source spelling differs from the WooCommerce one). Renames the SKU in every source dataset of the run (products, recipe lines and overrides, stock lots, purchase order lines, transfers) before any join. A rename whose fromSku is in no input, whose toSku already exists, that chains into another rename, or that is listed twice is refused. Always canonical.',
+    purpose: 'Owner decision: a source SKU that is loaded under another SKU (the source spelling differs from the WooCommerce one). Renames the SKU in every source dataset of the run (products, recipe lines and overrides, stock lots, purchase order lines, transfers) before any join. A rename whose fromSku is in no input, whose toSku already exists, whose fromSku or toSku is on sku-exclusions, that chains into another rename, or that is listed twice is refused. Always canonical.',
+  },
+  'lifecycle-confirmations': {
+    columns: ['sku', 'reason'],
+    required: [],
+    sources: [],
+    purpose: 'OBSOLETE since the owner ruling of 2026-11-21 ("Use Woo\'s status as gospel"): the lifecycle of a product the first load can see a WooCommerce status for is taken from WooCommerce, so nothing needs confirming. Still parsed so an existing manifest loads; every row is reported as an INFO no-op. Always canonical.',
   },
   'ims-suppliers': {
     columns: ['name'],

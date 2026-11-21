@@ -7,7 +7,7 @@
  *
  * A rename is refused (never guessed) when: its SKU is bad, it has no reason, it renames a SKU to itself, its fromSku is listed twice, two renames share a
  * toSku, it chains into (or loops through) another rename, its toSku already exists in a source dataset, or (unless `fromMayBeAbsent`) its fromSku is in no
- * source dataset. `present` maps a SKU key to the datasets that hold it.
+ * source dataset, or (when `excluded` is given: SKU key -> SKU of the exclusion list) it touches an excluded SKU. `present` maps a SKU key to the datasets that hold it.
  */
 
 import type { CanonRow } from './ingest'
@@ -22,7 +22,7 @@ export type SkuRenamePlan = {
   refusals: SkuRenameRefusal[]
 }
 
-export function planSkuRenames(rows: readonly CanonRow[], present: ReadonlyMap<string, ReadonlySet<string>>, options: { fromMayBeAbsent?: boolean } = {}): SkuRenamePlan {
+export function planSkuRenames(rows: readonly CanonRow[], present: ReadonlyMap<string, ReadonlySet<string>>, options: { fromMayBeAbsent?: boolean; excluded?: ReadonlyMap<string, string> } = {}): SkuRenamePlan {
   const refusals: SkuRenameRefusal[] = []
   const items: SkuRenameItem[] = []
   for (const row of rows) {
@@ -38,6 +38,14 @@ export function planSkuRenames(rows: readonly CanonRow[], present: ReadonlyMap<s
   const refused = new Map<SkuRenameItem, { code: string; reason: string }>()
   const refuse = (item: SkuRenameItem, code: string, reason: string): void => {
     if (!refused.has(item)) refused.set(item, { code, reason })
+  }
+  // An exclusion is the owner's record that a SKU is NOT loaded. A rename that touches an excluded SKU would silently move the product out of (or into) that decision, so it is refused.
+  const excludedKeys = options.excluded
+  if (excludedKeys) {
+    for (const item of items) {
+      if (excludedKeys.has(item.fromKey)) refuse(item, 'RENAME_FROM_EXCLUDED', `${item.from} is on sku-exclusions, so it is deliberately not loaded; a rename would override that. To keep it out, drop the rename and exclude ${item.from}; to load it as ${item.to}, remove the exclusion`)
+      else if (excludedKeys.has(item.toKey)) refuse(item, 'RENAME_TO_EXCLUDED', `${item.to} is on sku-exclusions, so it is deliberately not loaded; the rename would silently exclude ${item.from} under that SKU. To exclude the renamed product, drop the rename and exclude ${item.from}; to load it, remove the exclusion`)
+    }
   }
   const byFrom = new Map<string, SkuRenameItem[]>()
   const byTo = new Map<string, SkuRenameItem[]>()

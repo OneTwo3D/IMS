@@ -274,7 +274,7 @@ test('arm (k): a manifest that lists variant-parents but names no wooSnapshot is
 })
 
 test('arm (l): prepare() called without a binding, or with a binding for other bytes, refuses the dataset', (t) => {
-  const datasets = { products: ds('products', [product('V-01', 'VARIANT')]), 'variant-parents': ds('variant-parents', [{ variantSku: 'V-01', wooVariationId: '1', parentSku: 'P', parentName: 'P', parentStatus: 'publish', wooParentId: '9' }]) }
+  const datasets = { products: ds('products', [product('V-01', 'VARIANT')]), 'variant-parents': ds('variant-parents', [{ variantSku: 'V-01', wooVariationId: '1', parentSku: 'P', parentName: 'P', parentStatus: 'publish', wooParentId: '9', variationStatus: 'publish' }]) }
   const config = { runId: 't', baseCurrency: 'GBP', asOf: null, inTransitConvention: null, purchaseOrderKeyPrefix: null, transferKeyPrefix: null, maxPurchaseTaxRate: null }
   const none = prepare({ config, datasets })
   const other = prepare({ config, datasets, variantParentsBinding: { verified: true, csvSha256: '1'.repeat(64), snapshotPayloadSha256: 'x' } })

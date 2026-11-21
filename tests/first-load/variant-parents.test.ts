@@ -18,7 +18,7 @@ import { dispositionCodes, ds, findingCodes, precondition, product, rowsOf, run,
 let nextId = 9000
 function vp(variantSku: string, parentSku: string, extra: Record<string, string> = {}): Record<string, string> {
   return {
-    variantSku, wooVariationId: String(nextId++), parentSku, parentName: `Parent ${parentSku}`, parentStatus: 'publish', wooParentId: String(100000 + parentSku.length * 1000 + [...parentSku].reduce((n, c) => n + c.charCodeAt(0), 0)), ...extra,
+    variantSku, wooVariationId: String(nextId++), parentSku, parentName: `Parent ${parentSku}`, parentStatus: 'publish', variationStatus: 'publish', wooParentId: String(100000 + parentSku.length * 1000 + [...parentSku].reduce((n, c) => n + c.charCodeAt(0), 0)), ...extra,
   }
 }
 
