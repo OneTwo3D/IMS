@@ -73,7 +73,8 @@ test('MED-1: loadFacts counts receipts only (a deposit counts; refund payment ro
   const paid = await order(w, 'm1p', { paidAt: new Date() })
   for (const id of [none, refundOnly, chargedBack, deposit, paid]) t.after(cleanup(w, id))
   const refund = await w.db.salesOrderRefund.create({ data: { orderId: refundOnly, totalForeign: 10, totalBase: 10 } })
-  await w.db.payment.create({ data: { orderId: refundOnly, refundId: refund.id, amount: -10, currency: 'GBP' } })
+  // Whatever its sign, a row that belongs to a credit note is not a receipt (positive here, so only the refund-id test can exclude it).
+  await w.db.payment.create({ data: { orderId: refundOnly, refundId: refund.id, amount: 10, currency: 'GBP' } })
   await w.db.payment.createMany({ data: [{ orderId: chargedBack, amount: 50, currency: 'GBP' }, { orderId: chargedBack, amount: -50, currency: 'GBP' }] })
   await w.db.payment.create({ data: { orderId: deposit, amount: 50, currency: 'GBP' } })
   await w.db.payment.create({ data: { orderId: paid, amount: 120, currency: 'GBP' } })
