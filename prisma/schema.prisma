@@ -4803,6 +4803,8 @@ enum WmsOperatorTaskReason {
   CANCELLED_POSTED_INVOICE
   /// WooCommerce changed an order's lines after the warehouse started picking it: IMS pushed nothing, a person applies the change in the warehouse by hand.
   WC_EDIT_AFTER_PICKING
+  /// A PAID order was increased in WooCommerce (more units, an added item, a higher price): IMS changed nothing, a person collects the difference or has the edit undone in WooCommerce. NOT a warehouse change.
+  WC_PAID_INCREASE
   /// A shipped unit was returned and refunded, so IMS still owes the customer those units but the warehouse push netted the gross refund: a person asks the warehouse to send the remainder. IMS changes no quantity at the warehouse.
   REFUND_REMAINDER_DUE
   /// An EU withdrawal request filed after despatch could not be rejected on the storefront (no request id known, withdrawal plugin missing, or the write failed): a person rejects it in WooCommerce.

@@ -18,9 +18,13 @@ const facts = (over: Partial<AmendmentFacts> = {}): AmendmentFacts => ({
 const diffs: DivergenceDifference[] = [{ field: 'LINE_QUANTITY', label: 'Quantity of RED changed in WooCommerce', woocommerce: '3', ims: '5' }]
 
 function deps(f: AmendmentFacts | null, over: Partial<AmendmentDeps> = {}) {
-  const calls = { refunds: [] as Array<{ lines: unknown[]; reason: string }>, tasks: [] as Array<Record<string, unknown>>, gate: 0, claims: 0, released: 0, logs: [] as string[] }
+  const calls = { refusals: [] as string[], refunds: [] as Array<{ lines: unknown[]; reason: string }>, tasks: [] as Array<Record<string, unknown>>, gate: 0, claims: 0, released: 0, logs: [] as string[] }
   const d: AmendmentDeps = {
     isEnabled: async () => true,
+    isUnpaidRewriteEnabled: async () => false,
+    rewriteUnpaid: async () => { throw new Error('the rewrite is not under test here') },
+    recordRefusal: async (r) => { calls.refusals.push(r.gate) },
+    resolveRefusals: async () => undefined,
     withOrderLock: async (_o, fn) => fn(),
     loadFacts: async () => f,
     claim: async () => { calls.claims += 1; return calls.claims === 1 },

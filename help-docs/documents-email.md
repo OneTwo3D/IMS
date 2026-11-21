@@ -236,6 +236,25 @@ Until the WooCommerce step of the switchover, WooCommerce (with its partial-ship
 - **Switch read twice** — when the e-mail is queued and again when it is sent, so switching it off also stops e-mails already waiting.
 - **The check** — `npm run writers:check` in phase P2-W reads WooCommerce's native "processing" and "completed" e-mail settings against this switch. It judges each e-mail on its own: each native e-mail must be off while the switch is on and on while it is off, so a mixed state fails too. A store that cannot be read fails the check, and so does the switch being on before step W. It cannot see the partial-shipment, AST and TrackShip plugins' own e-mails: switch those off by hand.
 
+#### Which customer e-mails IMS sends after step W, and which stay in WooCommerce
+
+One switch (`storefront_customer_email_enabled`) covers the four storefront order e-mails: confirmation, dispatched, partial shipment and delivered. There are no per-e-mail switches. It does not gate the invoice e-mails (sent by an operator, or automatically after Xero posting) or the sales quote.
+
+| E-mail | Sent by, before step W | Sent by, after step W |
+| --- | --- | --- |
+| Order confirmation (WooCommerce "processing order") | WooCommerce | IMS |
+| Dispatched (WooCommerce "completed order") | WooCommerce | IMS |
+| Partial shipment (partial-shipment plugin, AST) | WooCommerce and its plugins | IMS |
+| Delivered (AST, TrackShip) | WooCommerce and its plugins | IMS |
+| Customer invoice (WooCommerce "customer invoice") | IMS (operator, or after Xero posting) in every phase | IMS (operator, or after Xero posting) in every phase; WooCommerce's manual customer-invoice action stays available |
+| Refund / credit note (WooCommerce "refunded order") | WooCommerce | IMS, **planned** for a later release behind the same switch: until IMS sends it, WooCommerce keeps sending it |
+| Sales quote | IMS | IMS (no WooCommerce equivalent) |
+| New account, password reset | WooCommerce | WooCommerce, permanently |
+| Customer note | WooCommerce | WooCommerce, permanently |
+| Order on hold, order cancelled, order failed (customer e-mails) | WooCommerce | WooCommerce, permanently |
+
+Leave WooCommerce's account, customer-note and on-hold, cancelled and failed e-mails switched on. The refund e-mail is not switched over by this release: keep WooCommerce's refund e-mail on until IMS announces its own.
+
 ### Email Structure
 
 - **Header** — company logo (document logo or icon logo) with your brand accent colours

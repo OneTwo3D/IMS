@@ -51,6 +51,13 @@ export const EXCLUDED_OPERATIONS: Readonly<Record<string, string>> = {
  */
 export const NO_PRODUCER: Readonly<Record<string, string>> = {
   'woocommerce.order.trackship-reconcile': 'Owner answer 6: the endpoint stays in the TrackShip plugin; IMS only receives TrackShip events through an authenticated API, so IMS has no outbound producer for it.',
+  'customer-email.account-new': 'Owner ruling 2026-11-20 (c): stays in WooCommerce for good; IMS never sends it.',
+  'customer-email.account-password-reset': 'Owner ruling 2026-11-20 (c): stays in WooCommerce for good; IMS never sends it.',
+  'customer-email.customer-note': 'Owner ruling 2026-11-20 (c): stays in WooCommerce for good; IMS never sends it.',
+  'customer-email.status-on-hold': 'Owner ruling 2026-11-20 (c): stays in WooCommerce for good; IMS never sends it.',
+  'customer-email.status-cancelled': 'Owner ruling 2026-11-20 (c): stays in WooCommerce for good; IMS never sends it.',
+  'customer-email.status-failed': 'Owner ruling 2026-11-20 (c): stays in WooCommerce for good; IMS never sends it.',
+  'customer-email.refund': 'Owner ruling 2026-11-20 (d): IMS will send the refund / credit-note e-mail, but no producer exists yet; a later slice adds the kind and its producer.',
 }
 
 export const DECLARATIONS: readonly Declaration[] = [
@@ -88,9 +95,9 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Asks the shopping facade to push this product\'s stock to the storefront.'),
   d('app/actions/allocation.ts::updateShipmentStatus::queueDispatchEmailIfEligible#1', 'customer-email', 'despatch', 'queue-producer', 'not-applicable',
     'Queues the despatch e-mail when a shipment is dispatched (setting-gated).'),
-  d('app/actions/allocation.ts::updateShipmentStatus::queueStorefrontPartialShipmentEmailIfEligible#1', 'customer-email', 'despatch', 'queue-producer', 'not-applicable',
+  d('app/actions/allocation.ts::updateShipmentStatus::queueStorefrontPartialShipmentEmailIfEligible#1', 'customer-email', 'partial-shipment', 'queue-producer', 'not-applicable',
     'Queues the partial-shipment e-mail of a storefront order when one shipment leaves while the order still owes more (behind storefront_customer_email_enabled, default off; once per shipment).'),
-  d('lib/storefront-customer-email.ts::queueStorefrontPartialShipmentEmailsAfterBatch::queueStorefrontPartialShipmentEmailIfEligible#1', 'customer-email', 'despatch', 'queue-producer', 'not-applicable',
+  d('lib/storefront-customer-email.ts::queueStorefrontPartialShipmentEmailsAfterBatch::queueStorefrontPartialShipmentEmailIfEligible#1', 'customer-email', 'partial-shipment', 'queue-producer', 'not-applicable',
     'Queues the partial-shipment e-mails of one external (warehouse or storefront) dispatch batch, judged once after the whole batch is applied (behind storefront_customer_email_enabled, default off; once per shipment).'),
   d('app/actions/allocation.ts::updateShipmentStatus::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push this product\'s stock to the storefront.'),
@@ -190,6 +197,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Queues SALES_INVOICE_UPDATE of an already-posted invoice inside the transaction of an edit of a confirmed order (the update helper is handed the transactional enqueue as its queue, so the hold, the chart and document guards and the refusal inbox apply as on the facade path); xeroom owns this operation, so IMS shadows it in every phase.'),
   d('app/actions/sales.ts::updateSalesOrder::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push the stock of the products an edit of a confirmed order re-reserved (after the edit commits).'),
+  d('lib/connectors/woocommerce/sync/order-unpaid-rewrite.ts::rewriteUnpaidOrderFromWc::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
+    'Asks the shopping facade to push the stock of the products the rewrite of an unpaid order (to WooCommerce\'s own edit, behind wc_order_amendment_unpaid_rewrite_enabled) released and re-reserved (after the rewrite commits); the same stock push an IMS edit of a confirmed order asks for.'),
   d('app/actions/sales.ts::applySalesOrderStatusTransition::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push the stock of the products whose unshipped allocation was released when the order was closed as shipped, completed or delivered (after the closing commits).'),
   d('app/actions/sales.ts::applySalesOrderStatusTransition::enqueueStockSync#2', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
@@ -200,7 +209,7 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Queues the despatch e-mail on an order status transition (setting-gated).'),
   d('app/actions/sales.ts::applySalesOrderStatusTransition::claimAndQueueConfirmationOnReleaseInTx#1', 'customer-email', 'order-confirmation', 'queue-producer', 'not-applicable',
     'Claims the one-shot release marker and queues the order confirmation e-mail of a storefront order that was imported held (pending payment / on hold) when it moves to a despatch-pending status, inside the status-change transaction (behind storefront_customer_email_enabled, default off; same once-per-order dedupe as the import; judged on the release time).'),
-  d('app/actions/sales.ts::applySalesOrderStatusTransition::queueStorefrontDeliveredEmailIfEligible#1', 'customer-email', 'despatch', 'queue-producer', 'not-applicable',
+  d('app/actions/sales.ts::applySalesOrderStatusTransition::queueStorefrontDeliveredEmailIfEligible#1', 'customer-email', 'delivered', 'queue-producer', 'not-applicable',
     'Queues the delivered e-mail of a storefront order when it is marked DELIVERED (behind storefront_customer_email_enabled, default off; once per order).'),
   d('app/actions/sales.ts::queueRefundAccountingActions::queueAccountingSync#1', 'xero', 'sales.credit-note', 'queue-producer', 'required',
     'Queues CREDIT_NOTE for a refund (the treated, plain or refused payload; a rate-182 hold queues its refused row through the same call inside the hold\'s transaction).'),

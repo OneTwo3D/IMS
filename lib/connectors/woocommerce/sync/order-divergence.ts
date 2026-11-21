@@ -299,9 +299,7 @@ export function describeDivergence(differences: ReadonlyArray<DivergenceDifferen
  *   - the refund sweep of a webhook / reconcile run repeats the comparison straight away (`rerunDeferredWcOrderDivergence`, same payload);
  *   - the ordinary poll runs no refund sweep, so `drainDeferredWcOrderDivergences` (called by every order sweep, poll included) re-reads each deferred order live and compares again, a few per run;
  *   - a row that stays deferred (the refund never arrives) is dropped after `RECHECK_MAX_ATTEMPTS` attempts or `RECHECK_MAX_AGE_DAYS` days, so the table is bounded and nothing grows with the order history.
- *
- * NOTE (follow-up, deliberately not used here): PR #975 adds `sales_orders.edited_in_ims_at` and is not merged. Nothing in this module depends on that column. Once it has landed, the comparison could
- * use it to tell an IMS-side edit from a WooCommerce-side one; until then it must stay out of this file.
+ *     A row dropped with NO successful read behind it (its live reads kept failing: `failedReads > 0`) or queued by the write step because it could not decide (`fromRetry`) is surfaced as a refused action first.
  */
 export const RECHECK_MAX_ATTEMPTS = 20
 export const RECHECK_MAX_AGE_DAYS = 14
@@ -337,17 +335,13 @@ export async function rerunDeferredWcOrderDivergence(wcOrder: WcFullOrder): Prom
   }
 }
 
-/**
- * Resolve deferred comparisons by a live read, for the runs that do not sweep refunds (the ordinary poll). Bounded per run, oldest first; a row that is still deferred counts an attempt and is dropped at the
- * attempt or age cap. Never throws.
- */
 export const WC_AMENDMENT_RECHECK_GATE = 'WC_AMENDMENT_RECHECK_EXHAUSTED'
 
 async function raiseRecheckExhausted(row: { orderId: string; externalOrderId: string; attempts: number; failedReads: number }): Promise<void> {
-  const readsFailed = row.failedReads >= RECHECK_MAX_FAILED_READS
+  const readsFailed = row.failedReads > 0
   const detail = readsFailed
-    ? `WooCommerce changed this order but IMS could not read it back from WooCommerce to compare (${row.failedReads} live reads failed or timed out), and has stopped retrying. IMS refunded and sent nothing: check the order in WooCommerce and decide.`
-    : `WooCommerce changed this order but IMS could not decide what to do (the warehouse state could not be read) after ${row.attempts} live re-reads, and has stopped retrying. IMS refunded and sent nothing: check the order in WooCommerce and decide.`
+    ? `WooCommerce changed this order but IMS could not read it back from WooCommerce to compare (the last ${row.failedReads} live read(s) failed or timed out, with no successful read since), and has stopped retrying. IMS changed, refunded and sent nothing: check the order in WooCommerce and decide.`
+    : `WooCommerce changed this order but IMS could not decide what to do (the warehouse state could not be read) ${row.attempts > 0 ? `after ${row.attempts} live re-read(s)` : 'before any live re-read could be made'}, and has stopped retrying. IMS changed, refunded and sent nothing: check the order in WooCommerce and decide.`
   await recordRefusedAction(db, {
     entityType: REFUSED_ACTION_ENTITY_SALES_ORDER,
     entityId: row.orderId,
@@ -372,6 +366,12 @@ async function readLiveOrderWithin(externalOrderId: string, ms: number): Promise
   }
 }
 
+/**
+ * Resolve deferred comparisons by a live read, for the runs that do not sweep refunds (the ordinary poll). Called by the order sweeps once the poll position is saved (in webhook-primary mode the full
+ * reconciliation is daily, so that is how often it runs there). Bounded per run (`limit` rows, a wall-clock budget), oldest first; a row that is still deferred counts an attempt, a failed read counts
+ * against its own cap, and a row is dropped at the attempt cap, the failed-read cap or the age cap. A dropped row that IMS could not compare or decide (see `raiseRecheckExhausted`) raises a refused
+ * action first. Never throws.
+ */
 export async function drainDeferredWcOrderDivergences(
   limit: number = RECHECK_PER_RUN,
   opts: { budgetMs?: number; readTimeoutMs?: number } = {},
@@ -391,8 +391,9 @@ export async function drainDeferredWcOrderDivergences(
     for (const row of expired) {
       // A row the write step queued because it could NOT decide (warehouse unreadable, two deliveries in one second) is a paid order WooCommerce changed that IMS has neither refunded nor told anyone about: dropping it silently leaves
       // nothing that says so. It becomes a visible refused action (Sync > Exceptions) a person decides. A row deferred only for an unrecorded refund that never came owes nothing and is dropped as before.
-      // A row dropped because its live read kept failing is a comparison IMS lost: it is surfaced the same way, whatever queued it.
-      if (row.fromRetry || row.failedReads >= RECHECK_MAX_FAILED_READS) await raiseRecheckExhausted(row).catch((e) => console.error('wc_order_divergence: could not raise the exhausted recheck', e instanceof Error ? e.constructor.name : typeof e))
+      // A row dropped because its live read kept failing is a comparison IMS lost: it is surfaced the same way, whatever queued it, and whether it was dropped at the failed-read cap or aged out at the age cap with its
+      // latest reads still failing (`failedReads` is reset by any successful read, so above zero means no successful read since): the 14-day age cap is reached long before 48 failed reads when the poll drains rarely.
+      if (row.fromRetry || row.failedReads > 0) await raiseRecheckExhausted(row).catch((e) => console.error('wc_order_divergence: could not raise the exhausted recheck', e instanceof Error ? e.constructor.name : typeof e))
     }
     if (expired.length > 0) out.dropped += (await db.wcOrderDivergenceRecheck.deleteMany({ where: { id: { in: expired.map((row) => row.id) } } })).count
     const rows = await db.wcOrderDivergenceRecheck.findMany({ orderBy: { lastAttemptAt: 'asc' }, take: Math.max(1, limit) })
@@ -403,10 +404,12 @@ export async function drainDeferredWcOrderDivergences(
       const live = await readLiveOrderWithin(row.externalOrderId, readTimeoutMs)
       if (!live) {
         // A failed read is NOT an attempt (the comparison never happened). It has its own bounded counter, and the new lastAttemptAt sends the row to the back of the oldest-first queue (a backoff).
-        await db.wcOrderDivergenceRecheck.update({ where: { id: row.id }, data: { failedReads: { increment: 1 }, lastAttemptAt: new Date() } })
+        // updateMany, not update: a row deleted (or deleted and re-created by a comparison that could not decide) during the read is simply gone; a P2025 here would abort the rest of the drain.
+        await db.wcOrderDivergenceRecheck.updateMany({ where: { id: row.id }, data: { failedReads: { increment: 1 }, lastAttemptAt: new Date() } })
         continue
       }
-      await db.wcOrderDivergenceRecheck.update({ where: { id: row.id }, data: { attempts: { increment: 1 }, failedReads: 0, lastAttemptAt: new Date() } })
+      const counted = await db.wcOrderDivergenceRecheck.updateMany({ where: { id: row.id }, data: { attempts: { increment: 1 }, failedReads: 0, lastAttemptAt: new Date() } })
+      if (counted.count === 0) continue // the row went away during the read: a re-created row is drained next run
       await surfaceWcOrderDivergence(row.orderId, live)
       // By ORDER, not row id: a comparison that could not decide deletes the row and re-creates it (new id) for the next drain, and that order is still pending, not resolved.
       if ((await db.wcOrderDivergenceRecheck.count({ where: { orderId: row.orderId } })) === 0) out.resolved++
@@ -512,6 +515,9 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
         where: { orderId, resolvedAt: null },
         data: { resolvedAt: now, resolution: verdict.kind === 'not-comparable' ? `Not compared: ${verdict.reason}.` : 'A later WooCommerce delivery matched the IMS order again.' },
       })
+      // The order compares clean (or is not compared): the rewrite's and the paid-increase refusals no longer apply.
+      await resolveRefusedActions(db, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action: 'WC_ORDER_REWRITE' }, 'NO_LONGER_NEEDED').catch(() => undefined)
+      await resolveRefusedActions(db, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action: 'WC_ORDER_AMENDMENT', gate: 'WC_PAID_INCREASE' }, 'NO_LONGER_NEEDED').catch(() => undefined)
       // A REDUCTION WOOCOMMERCE UNDID leaves NO difference (the amendment refund changes neither the lines nor the stored total), so the write step would never run for it. Run it for an order that carries an amendment
       // refund, with no differences: it raises the "a person decides" task when WooCommerce shows more units than IMS holds after those refunds, and does nothing otherwise (off by default; never throws).
       if (verdict.kind === 'compared' && hasAmendmentRefund) await runStep([], 'restore')
