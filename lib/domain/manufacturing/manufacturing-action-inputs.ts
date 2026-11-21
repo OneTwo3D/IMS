@@ -40,9 +40,10 @@ export function manufacturingCostLayerReceivedAt(input: ManufacturingCostLayerRe
 
 export function parseManufacturingCostLines(
   lines: ManufacturingCostLineInputLike[],
-  fxRateToBase: number,
+  fxRateToBase: number | Prisma.Decimal,
 ): ParsedManufacturingCostLinesResult {
-  if (!Number.isFinite(fxRateToBase) || fxRateToBase <= 0) {
+  // A Decimal(18,8) stored rate is passed as the Decimal itself: no round trip through a float.
+  if (typeof fxRateToBase === 'number' ? !Number.isFinite(fxRateToBase) || fxRateToBase <= 0 : !fxRateToBase.isFinite() || fxRateToBase.lte(0)) {
     return {
       success: false,
       error: `Invalid FX rate ${fxRateToBase} on production order; set a positive rate before editing cost lines.`,

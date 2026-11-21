@@ -46,6 +46,7 @@ import {
   OPERATOR_ATTENTION_REASONS,
   planCreditNoteSettlement,
   readCreditNoteSettlementFacts,
+  refundPaymentCap,
   refundPaymentMethodOf,
   type CreditNoteSettlementOperation,
 } from '@/lib/domain/accounting/credit-note-allocation'
@@ -144,9 +145,10 @@ import {
 } from '@/lib/domain/accounting/sync-row-settlement'
 import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
-import { MONEY_POST_KEY_FIELD, countReversedEpisodes, moneyPostIdempotencySource, settlementDocumentAnchorFilters } from '@/lib/domain/accounting/money-post-document'
+import { MONEY_POST_KEY_FIELD, type MoneyPostDocument, countReversedEpisodes, moneyPostIdempotencySource, settlementDocumentAnchorFilters } from '@/lib/domain/accounting/money-post-document'
 import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
+import { withMoneyPostLock, type HeldMoneyPostLock, type MoneyPostLock, type MoneyPostLockOutcome } from '@/lib/domain/accounting/money-post-lock'
 import { marksOfOtherPayments } from '@/lib/domain/accounting/payment-identity-marks'
 import { loadOperatorLedgerChecks } from '@/lib/domain/accounting/operator-ledger-check-store'
 import { moneyPostDateToSend, settlementMarkerFor } from '@/lib/domain/accounting/ledger-settlement-evidence'
@@ -6320,6 +6322,20 @@ async function processCreditNoteAllocation(args: {
     payload = { ...payload, operation: undefined, amount: undefined } as SyncPayload
   }
   const operation: CreditNoteSettlementOperation = plan.kind
+  // o3d-jqmgb: A PINNED DECISION IS REPLAYED ONLY FOR A ROW THAT WAS ATTEMPTED (`remoteAttemptedAt` set). The pin is written BEFORE the fence, so a row can pin, fail
+  // before any call (rate, authorise, claim, connection) and come back later; replaying its stale amount would pay it past what other refunds have paid out since
+  // (receipts 50: A pins 40 and fails pre-call, B posts 40, A replays 40 = 80 out). A row that never attempted a call is decided afresh from the reading above and the
+  // balances below, so the cap applies to it again. An attempted row replays exactly: its call may have landed, so its Idempotency-Key and body must not change (and the
+  // order-locked check below still refuses it if replaying it would now pay out more than was received). `remoteAttemptedAt` null is trustworthy here: the repair that
+  // stamps every unstamped row outside stamping custody runs before any claim (processPendingXeroSync), so an unstamped row this worker holds never called.
+  const replay = pinnedOperation === operation && typeof payload.amount === 'number' && reading.attempted
+  if (!reading.attempted) {
+    // Everything a previous never-sent decision pinned is dropped with it, including the stored Idempotency-Key (it is derived from the amount).
+    payload = {
+      ...payload, amount: undefined, bankAccountId: undefined, paymentMethod: undefined, cashEvidence: undefined, rateDecided: undefined,
+      settlementRateToBase: undefined, [MONEY_POST_KEY_FIELD]: undefined,
+    } as SyncPayload
+  }
   const refundPlan = plan.kind === 'REFUND_PAYMENT' ? plan : null
   const scopeRequired = operation === 'REFUND_PAYMENT' ? blockingScopeFor('INVOICE_PAYMENT', await getGrantedScopes()) : null
   if (scopeRequired) return { success: false, error: scopeBlockedError('INVOICE_PAYMENT', scopeRequired) }
@@ -6335,9 +6351,8 @@ async function processCreditNoteAllocation(args: {
     return { success: false, error: withLedgerCheck(`Nothing was settled: the credit note is ${balances.creditNoteStatus ?? 'in an unreadable status'} in Xero (posting mode draft?), and only an authorised credit note can be allocated or refunded. Authorise it in Xero, then retry.`) }
   }
 
-  // A decision already pinned for THIS operation is replayed as it is: the same amount, account, method and rate, so a retry sends exactly the same payment under
-  // the same Idempotency-Key. Nothing below is recomputed for it.
-  const replay = pinnedOperation === operation && typeof payload.amount === 'number'
+  // A decision pinned for THIS operation on a row that may have left (`replay`, decided above) is replayed as it is: the same amount, account, method and rate, so a
+  // retry sends exactly the same payment under the same Idempotency-Key. Nothing below is recomputed for it.
   const pin: Record<string, unknown> = { operation, currency: facts.order.currency, orderId: facts.order.id }
   if (operation === 'ALLOCATE') {
     const pinnedAmount = typeof payload.amount === 'number' ? payload.amount : null
@@ -6373,7 +6388,19 @@ async function processCreditNoteAllocation(args: {
     const account = await db.accountingAccount.findFirst({ where: { connector: XERO_CONNECTOR, OR: [{ externalAccountId: mapped }, { code: mapped }] }, select: { externalAccountId: true } })
     if (!account) return { success: false, error: `Bank account ${mapped} not found in synced Xero chart of accounts` }
     const recorded = refundPlan?.recordedAmount != null ? Math.round(refundPlan.recordedAmount.toNumber() * 100) / 100 : null
-    const capNumber = refundPlan ? Math.floor(refundPlan.cap.toNumber() * 100) / 100 : 0
+    // o3d-0olzx: the cap is held to what XERO says the invoice has received, not only to IMS's receipts (a recorded receipt Xero never booked is not cash in
+    // the bank). An unreadable AmountPaid is a refusal, never the IMS-only figure.
+    if (balances.amountPaid === null) {
+      return { success: false, error: 'Nothing was paid: the invoice read from Xero states no readable AmountPaid, so IMS cannot tell how much cash the invoice has received and refuses to pay a refund out against it. Retry once Xero answers.' }
+    }
+    const capNumber = refundPlan ? Math.floor(refundPaymentCap(facts, balances.amountPaid).toNumber() * 100) / 100 : 0
+    if (refundPlan && !(capNumber > 0) && refundPlan.cap.gt(0)) {
+      return {
+        success: false,
+        error: withLedgerCheck(`Nothing was paid: IMS records ${facts.receiptTotal.toFixed(2)} received for the order, but Xero shows only ${balances.amountPaid.toFixed(2)} paid on the invoice and ${facts.priorCashOut.toFixed(2)} is already refunded or in flight against the order's other refunds, so there is no received cash left to return. `
+          + 'If the receipt is still queued for Xero, this retries once it posts; otherwise record it in Xero (or settle the credit note there by hand).'),
+      }
+    }
     // EVERY refund payment is capped at min(the credit left in Xero, receipts recorded less cash already out). A recorded refund payment is the requested figure;
     // a gateway refund asks for the whole credit left.
     const amount = Math.min(recorded ?? balances.remainingCredit, balances.remainingCredit, capNumber)
@@ -6423,10 +6450,45 @@ async function processCreditNoteAllocation(args: {
   const amount = pin.amount as number
   const rate = operation === 'REFUND_PAYMENT' ? await xeroPaymentCurrencyRate('CREDIT_NOTE_ALLOCATION', payload) : null
   if (rate && !rate.ok) return { success: false, error: rate.error }
+  // o3d-qrm47: A REFUND PAYMENT IS POSTED UNDER AN ORDER-SCOPED LOCK AS WELL AS ITS DOCUMENT'S. The document lock is per credit note, so two refunds of one order
+  // (two credit notes) took two different locks and could each pass the cap and each pay out. The order lock is taken first (try, never wait, like the document
+  // lock) and the cap is re-read under it, counting what the other refund pinned, has in flight or may have landed.
+  const orderId = facts.order.id
+  // The cap read AGAIN, under the order lock, BEFORE the document lock and the attempt stamp (a refusal here leaves the row unattempted, so a retry decides it afresh).
+  const capGuard = async (): Promise<{ ok: true } | { ok: false; error: string }> => {
+    const fresh = await readCreditNoteSettlementFacts(db, referenceId, entryId)
+    const stop = (message: string) => ({ ok: false as const, error: reading.attempted ? withLedgerCheck(message) : message })
+    if (!fresh) return stop('Not sent: the refund or its order could not be read under the order lock.')
+    const freshPlan = planCreditNoteSettlement(fresh)
+    if (freshPlan.kind !== 'REFUND_PAYMENT') return stop(`Not sent: under the order lock IMS no longer reads this as a refund payment (${freshPlan.kind === 'NOT_NOW' ? freshPlan.message : `it needs a ${freshPlan.kind}`}).`)
+    const cap = Math.floor(refundPaymentCap(fresh, balances.amountPaid).toNumber() * 100) / 100
+    if (amount > cap) {
+      return stop(`Not sent: a refund payment of ${amount.toFixed(2)} would pay out more than was received. Under the order lock the most that may go out is ${cap.toFixed(2)} (receipts ${fresh.receiptTotal.toFixed(2)}, Xero shows ${balances.amountPaid === null ? 'an unreadable amount' : balances.amountPaid.toFixed(2)} paid, ${fresh.priorCashOut.toFixed(2)} already refunded or in flight against the order's other refunds).`)
+    }
+    return { ok: true }
+  }
+  const orderScopedLock: MoneyPostLock = async <T>(document: MoneyPostDocument, run: (held: HeldMoneyPostLock) => Promise<T>) => {
+    const outer = await withMoneyPostLock(
+      { connector: XERO_CONNECTOR, type, referenceType: 'SalesOrder', referenceId: orderId, documentKey: JSON.stringify(['credit_note_refund_order', orderId]) },
+      async (): Promise<MoneyPostLockOutcome<T>> => {
+        const guard = await capGuard()
+        if (!guard.ok) return { locked: true, result: { success: false, error: guard.error } as unknown as T }
+        return withMoneyPostLock(document, run)
+      },
+    )
+    return outer.locked ? outer.result : { locked: false }
+  }
   const moneyPostKey = await resolveXeroMoneyPostIdempotencyKey(db, { entryId, type: 'CREDIT_NOTE_ALLOCATION', payload, operation: 'credit-note-allocation' })
   return postMoneyUnderLedgerFence({
     connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
     postingDate: settlementDate,
+    ...(operation === 'REFUND_PAYMENT'
+      ? {
+          lock: orderScopedLock,
+          // The same guard once more, under both locks and after the attempt stamp: nothing moved between the two reads can slip past.
+          recheckUnderLock: capGuard,
+        }
+      : {}),
   }, async ({ requireConnection }) => {
     try {
       // BOTH FENCES, CLAIM FENCE LAST: the ledger fence above answers "has this settlement reached the ledger?", the claim fence answers "do I still hold the

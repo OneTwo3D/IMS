@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { decodeCursor, encodeCursor, invoiceEventInstant, loadTimeline, pageEvents, type TimelineEvent } from '@/lib/domain/crm/timeline'
+import { decodeCursor, emailKindLabel, encodeCursor, invoiceEventInstant, loadTimeline, pageEvents, type TimelineEvent } from '@/lib/domain/crm/timeline'
 
 const ev = (key: string, at: string): TimelineEvent => ({ key, kind: 'PAYMENT', at, orderId: 'o', orderNumber: '1', customerId: 'c', reference: null, amount: '1', currency: 'GBP', status: null })
 
@@ -64,40 +64,85 @@ test('the same-instant rank keeps keyset pages stable: a cursor on the invoice r
   assert.deepEqual(second.events.map((e) => e.key), ['ORDER_PLACED:o1', 'PAYMENT:p1'])
 })
 
-// loadTimeline against a fake reader: only the e-mail path matters here, so every other source is empty.
-function fakeReader(emails: Array<Record<string, unknown>>, calls: { outbox: number } = { outbox: 0 }) {
+// loadTimeline against a fake reader: only the e-mail path matters here, so every other source is empty. The e-mail source is one raw query, so the fake
+// receives the tagged SQL (its text and bound values) and applies the same filters, order and limit to its rows. The SQL text is asserted separately (emailSql).
+type FakeMail = Record<string, unknown>
+function fakeReader(emails: FakeMail[], calls: { outbox: number; sql: Array<{ text: string; values: unknown[] }> } = { outbox: 0, sql: [] }) {
   const none = { findMany: async () => [] as unknown[] }
-  const orders = [{ id: 'o1', orderNumber: 'SO-1', externalOrderNumber: null, customerId: 'c1' }]
   const db = {
-    salesOrder: { findMany: async (a: { select: Record<string, boolean> }) => (a.select.createdAt || a.select.cancelledAt || a.select.invoicedAt ? [] : orders) },
-    payment: none, salesOrderRefund: none, returnExpectation: none, wmsReturnsInbox: none,
-    emailOutbox: {
-      findMany: async (a: { where: { sentAt: unknown } }) => {
-        calls.outbox += 1
-        const wantSent = a.where.sentAt !== null
-        return emails.filter((m) => (m.sentAt !== null) === wantSent)
-      },
+    salesOrder: none, payment: none, salesOrderRefund: none, returnExpectation: none, wmsReturnsInbox: none,
+    $queryRaw: async (q: { text: string; values: unknown[] }) => {
+      calls.outbox += 1
+      calls.sql.push({ text: q.text, values: q.values })
+      const [ids, placeholder, ...rest] = q.values as [string[], string, ...unknown[]]
+      const take = rest[rest.length - 1] as number
+      const upTo = rest.length > 1 ? (rest[0] as Date) : null
+      return emails
+        .filter((m) => m.referenceType === 'SalesOrder' && ids.includes(m.customerId as string) && m.orderErasedAt === null && m.toEmail !== placeholder && (!upTo || (m.createdAt as Date).getTime() <= upTo.getTime()))
+        .sort((x, y) => (y.createdAt as Date).getTime() - (x.createdAt as Date).getTime() || ((y.id as string) < (x.id as string) ? -1 : 1))
+        .slice(0, take)
     },
   }
   return db as unknown as Parameters<typeof loadTimeline>[0]
 }
-const mail = (id: string, sentAt: string | null, createdAt: string, status = 'SENT') => ({ id, kind: 'DISPATCH', status, sentAt: sentAt ? new Date(sentAt) : null, createdAt: new Date(createdAt), referenceId: 'o1', subject: 'S', html: 'H', toEmail: 'x@example.test' })
+const mail = (id: string, sentAt: string | null, createdAt: string, status = 'SENT', extra: FakeMail = {}) => ({ id, kind: 'DISPATCH', status, sentAt: sentAt ? new Date(sentAt) : null, createdAt: new Date(createdAt), orderId: 'o1', orderNumber: 'SO-1', externalOrderNumber: null, customerId: 'c1', referenceType: 'SalesOrder', orderErasedAt: null, toEmail: 'x@example.test', ...extra })
 
 test('e-mail events are absent while the switch is off, and the outbox is not even read', async () => {
-  const calls = { outbox: 0 }
+  const calls = { outbox: 0, sql: [] }
   const page = await loadTimeline(fakeReader([mail('m1', '2026-01-02T00:00:00.000Z', '2026-01-01T00:00:00.000Z')], calls), ['c1'])
   assert.equal(page.events.length, 0)
   assert.equal(calls.outbox, 0)
 })
 
-test('with the switch on an e-mail shows kind, status and time (sentAt, else createdAt), and no subject, body or address', async () => {
+test('with the switch on an e-mail shows a human kind label, status and its queued time (createdAt, never sentAt), and no subject, body or address', async () => {
   const page = await loadTimeline(fakeReader([mail('m1', '2026-01-05T00:00:00.000Z', '2026-01-01T00:00:00.000Z'), mail('m2', null, '2026-01-03T00:00:00.000Z', 'PENDING')]), ['c1'], { includeEmails: true })
   assert.deepEqual(page.events.map((e) => [e.key, e.kind, e.reference, e.status, e.at]), [
-    ['EMAIL:m1', 'EMAIL', 'DISPATCH', 'SENT', '2026-01-05T00:00:00.000Z'],
-    ['EMAIL:m2', 'EMAIL', 'DISPATCH', 'PENDING', '2026-01-03T00:00:00.000Z'],
+    ['EMAIL:m2', 'EMAIL', 'Dispatch', 'PENDING', '2026-01-03T00:00:00.000Z'],
+    ['EMAIL:m1', 'EMAIL', 'Dispatch', 'SENT', '2026-01-01T00:00:00.000Z'],
   ])
   const text = JSON.stringify(page.events)
   assert.ok(!text.includes('@') && !text.includes('"S"') && !text.includes('"H"'))
+})
+
+test('the e-mail query is one bounded, parameterised statement: ANY(ids), SalesOrder only, erased orders and the placeholder address excluded, newest first, limited', async () => {
+  const calls = { outbox: 0, sql: [] as Array<{ text: string; values: unknown[] }> }
+  const reader = fakeReader([], calls)
+  await loadTimeline(reader, ['c1', 'c2'], { includeEmails: true, limit: 7 })
+  await loadTimeline(reader, ['c1'], { includeEmails: true, limit: 7, cursor: encodeCursor({ at: '2026-02-01T00:00:00.000Z', key: 'EMAIL:z' }) })
+  assert.equal(calls.outbox, 2, 'one query per load, however many orders')
+  const [plain, bounded] = calls.sql
+  for (const q of [plain!, bounded!]) {
+    assert.match(q.text, /m\."referenceType" = 'SalesOrder'/)
+    assert.match(q.text, /o\."customerId" = ANY\(\$1::text\[\]\)/)
+    assert.match(q.text, /o\."erasedAt" IS NULL/)
+    assert.match(q.text, /m\."toEmail" <> \$2/)
+    assert.match(q.text, /ORDER BY m\."createdAt" DESC, m\."id" DESC\s+LIMIT/)
+    assert.deepEqual(q.values.slice(0, 2), [q === plain ? ['c1', 'c2'] : ['c1'], 'erased@erased.invalid'])
+    assert.equal(q.values[q.values.length - 1], 7 + 50 + 1)
+  }
+  assert.ok(!/m\."createdAt" <=/.test(plain!.text) && plain!.values.length === 3)
+  assert.match(bounded!.text, /m\."createdAt" <= \$3/)
+  assert.equal((bounded!.values[2] as Date).toISOString(), '2026-02-01T00:00:00.000Z')
+})
+
+test('another reference type, an erased order, the placeholder address and another customer are not listed', async () => {
+  const t = '2026-02-01T10:00:00.000Z'
+  const page = await loadTimeline(fakeReader([
+    mail('keep', t, t),
+    mail('po', t, t, 'SENT', { referenceType: 'PurchaseOrder' }),
+    mail('erased', t, t, 'SENT', { orderErasedAt: new Date() }),
+    mail('scrubbed', t, t, 'SENT', { toEmail: 'erased@erased.invalid' }),
+    mail('other', t, t, 'SENT', { customerId: 'c9' }),
+  ]), ['c1'], { includeEmails: true })
+  assert.deepEqual(page.events.map((e) => e.key), ['EMAIL:keep'])
+})
+
+test('e-mail kind codes map to labels; a partial-shipment code loses its shipment id; an unknown code reads as words', () => {
+  assert.equal(emailKindLabel('SHIPMENT_DISPATCHED'), 'Dispatch notice')
+  assert.equal(emailKindLabel('STOREFRONT_ORDER_CONFIRMATION'), 'Order confirmation')
+  assert.equal(emailKindLabel('STOREFRONT_PARTIAL_SHIPMENT:cm123abc'), 'Partial shipment notice')
+  assert.ok(!emailKindLabel('STOREFRONT_PARTIAL_SHIPMENT:cm123abc').includes('cm123abc'))
+  assert.equal(emailKindLabel('SOME_NEW_KIND'), 'Some new kind')
 })
 
 test('keyset pages stay stable with e-mail events sharing an instant with each other', async () => {

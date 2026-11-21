@@ -1,0 +1,5 @@
+### Manufacturing: production-order currency follow-ups
+- Re-order draft manufacturing orders now take the latest order's currency (with the `fx_rates` table rate read at that moment) instead of silently being base-currency; a foreign currency with no usable rate, or a switched-off one, skips that product with `fx rate unavailable` instead of using a rate of 1. The currency is fixed at create (cancel and re-raise to change it); documented in the Manufacturing help.
+- A new order raised without choosing a currency now records the organisation's base currency explicitly (the schema default is a literal GBP). The create action refuses non-text and inactive currencies, and reads the base currency once per create.
+- Cost-line edits pass the stored Decimal(18,8) rate to the parser as a Decimal (no float round trip). The cost-lines editor shows the real base currency instead of a hardcoded GBP.
+- The new-order dialog defaults the currency from the chosen manufacturer, has its own rate-changed message (it shows no amounts), and no longer empties the whole dialog when the currency list fails to load. Help text now names the ECB source.

@@ -20,8 +20,8 @@
  * receipt unmatched): the credit note is left open in Xero as the customer's credit, and the operator is told (a WARNING, once per refund) to apply it or record the
  * refund payment, after which the sweep raises the settlement.
  *
- * EVERY REFUND PAYMENT IS CAPPED at min(the credit left on the note in Xero, the receipts IMS has recorded for the order less the cash already paid out against its other
- * refunds). A 10 receipt with a 50 refund pays out at most 10. A refund of a PART-PAID invoice that is capped leaves credit on the note and an amount due on the invoice;
+ * EVERY REFUND PAYMENT IS CAPPED at min(the credit left on the note in Xero, the receipts IMS has recorded for the order held to the invoice's AmountPaid in Xero, less the
+ * cash paid out, in flight or possibly landed against its other refunds: `refundPaymentCap`, re-read under an order-scoped lock before the call). A 10 receipt with a 50 refund pays out at most 10. A refund of a PART-PAID invoice that is capped leaves credit on the note and an amount due on the invoice;
  * the row logs both figures in a WARNING and the operator applies the credit in Xero (IMS does not split one credit note across a payment and an allocation).
  *
  * Pure planning lives here (`planCreditNoteSettlement`) beside the one DB reader of its facts (`readCreditNoteSettlementFacts`), so the enqueue, the sweep and
@@ -79,7 +79,7 @@ export type CreditNoteSettlementFacts = {
   originalReceiptMethod: string | null
   /** WooCommerce `refunded_payment` as stored: true = through the gateway, false = refunded manually, null = unknown. */
   refundedViaGateway: boolean | null
-  /** Cash already paid out against the order's OTHER refunds (recorded refund payments, or posted settlement rows, whichever is larger per refund). */
+  /** Cash already paid out, in flight or possibly landed against the order's OTHER refunds (recorded refund payments, or settlement rows posted / PROCESSING / attempted, whichever is larger per refund). */
   priorCashOut: Decimal
   /** ANOTHER CREDIT_NOTE_ALLOCATION row for this refund is SYNCED, or carries post evidence. */
   siblingSettled: boolean
@@ -107,6 +107,22 @@ export const OPERATOR_ATTENTION_REASONS: ReadonlySet<CreditNoteNotNowReason> = n
 /** Whether the order shows ANY receipt: a Payment, a registration of one, or the paid flag. One definition, used by the plan only. */
 export function invoiceHasReceiptEvidence(facts: Pick<CreditNoteSettlementFacts, 'receiptCount' | 'receiptTotal' | 'invoicePaymentRows'> & { order: Pick<CreditNoteSettlementFacts['order'], 'paidAt'> }): boolean {
   return facts.order.paidAt !== null || facts.receiptCount > 0 || facts.receiptTotal.gt(0) || facts.invoicePaymentRows > 0
+}
+
+/**
+ * THE MOST A REFUND PAYMENT MAY PAY OUT (o3d-0olzx): the receipts IMS recorded, held to what XERO says the invoice has received (AmountPaid), less the cash the
+ * order's other refunds paid out or may have. Xero's figure is the cap's second witness: a receipt IMS recorded but Xero never booked (a PENDING, failed or
+ * shadowed INVOICE_PAYMENT) makes AmountPaid smaller, and the bank refund is held to what Xero actually holds. `xeroAmountPaid` null = unreadable: the cap
+ * is then ZERO (refuse), never the IMS-only figure.
+ *
+ * KNOWN LIMIT, stated rather than hidden: AmountPaid also counts credit applied to the invoice and does not fall when a credit note is paid out in Xero, so an
+ * operator's manual Xero refund of a credit note IMS does not know about stays invisible to this figure.
+ */
+export function refundPaymentCap(facts: Pick<CreditNoteSettlementFacts, 'receiptTotal' | 'priorCashOut'>, xeroAmountPaid: number | null): Decimal {
+  if (xeroAmountPaid === null || !Number.isFinite(xeroAmountPaid)) return toDecimal(0)
+  const paid = toDecimal(xeroAmountPaid)
+  const received = paid.lt(facts.receiptTotal) ? paid : facts.receiptTotal
+  return received.minus(facts.priorCashOut)
 }
 
 export function planCreditNoteSettlement(facts: CreditNoteSettlementFacts): CreditNoteSettlementPlan {
@@ -144,6 +160,17 @@ export function refundPaymentMethodOf(facts: Pick<CreditNoteSettlementFacts, 're
   return null
 }
 
+/**
+ * A PROCESSING settlement row of ANOTHER refund counts toward the order's cash-out when it is the OLDER of the two (createdAt, then id). Once a row's call has begun it
+ * carries `remoteAttemptedAt` and counts on that alone; this is the arm for a row that is claimed and pinned but not yet at its call. Counting every such row would let two
+ * refunds that are PROCESSING together each see the other's pinned amount and both refuse, over and over; ordering them makes exactly one (the older) proceed while the
+ * younger is held to what is left. With no row of its own (the sweep's plan) every PROCESSING row counts: the plan only ever gets more cautious.
+ */
+function inFlightBefore(self: { id: string; createdAt: Date } | null): Prisma.AccountingSyncLogWhereInput {
+  if (!self) return { status: 'PROCESSING' }
+  return { status: 'PROCESSING', OR: [{ createdAt: { lt: self.createdAt } }, { createdAt: self.createdAt, id: { lt: self.id } }] }
+}
+
 /** The reader client: a transaction (the processor, under the order lock) or the plain client (the sweep). */
 export type CreditNoteSettlementReader = Pick<
   Prisma.TransactionClient,
@@ -178,6 +205,7 @@ export async function readCreditNoteSettlementFacts(
   })
   if (!order) return null
 
+  const self = entryId ? await client.accountingSyncLog.findUnique({ where: { id: entryId }, select: { id: true, createdAt: true } }) : null
   const [payments, invoicePaymentRows, creditNoteRows, invoiceRows, siblings, postedSettlements] = await Promise.all([
     client.payment.findMany({
       where: { orderId: order.id },
@@ -221,12 +249,14 @@ export async function readCreditNoteSettlementFacts(
       select: { id: true },
       take: 1,
     }),
-    // The refund payments this order's OTHER refunds already posted (their pinned amounts), for the cap.
+    // The refund payments this order's OTHER refunds posted OR MAY HAVE POSTED (their pinned amounts), for the cap (o3d-qrm47). Cash that is out, cash that is
+    // in flight (PROCESSING: the call may be leaving right now) and cash that may have landed (an attempted row, whatever its status now: a lost response) all
+    // count. A row that never attempted a call and is merely queued or failed pre-call holds no cash and does not.
     client.accountingSyncLog.findMany({
       where: {
         connector: CREDIT_NOTE_ALLOCATION_CONNECTOR, type: 'CREDIT_NOTE_ALLOCATION', referenceType: 'SalesOrderRefund', referenceId: { not: refund.id },
         payload: { path: ['orderId'], equals: order.id },
-        AND: [PROVEN_LEDGER_FACT_WHERE],
+        AND: [MAY_HAVE_REACHED_LEDGER_WHERE, { OR: [PROVEN_LEDGER_FACT_WHERE, { remoteAttemptedAt: { not: null } }, inFlightBefore(self)] }],
       },
       select: { referenceId: true, payload: true },
     }),

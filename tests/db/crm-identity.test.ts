@@ -357,9 +357,9 @@ test('timeline e-mails: only with the switch, only the cluster\'s orders, no sub
   const on = await loadTimeline(db, ids, { includeEmails: true })
   const emails = on.events.filter((e) => e.kind === 'EMAIL')
   assert.deepEqual(emails.map((e) => [e.key, e.reference, e.status, e.orderId, e.at]), [
-    [`EMAIL:${queuedB.id}`, 'INVOICE', 'PENDING', ob, day(11).toISOString()],
-    [`EMAIL:${sentA.id}`, 'DISPATCH', 'SENT', oa, day(10).toISOString()],
-  ], 'cluster scope, sentAt ?? createdAt, no other order, no other reference type, no erased order')
+    [`EMAIL:${queuedB.id}`, 'Invoice', 'PENDING', ob, day(11).toISOString()],
+    [`EMAIL:${sentA.id}`, 'Dispatch', 'SENT', oa, day(9).toISOString()],
+  ], 'cluster scope, always createdAt (never sentAt), no other order, no other reference type, no erased order')
   const text = JSON.stringify(emails)
   assert.ok(!text.includes('@') && !text.includes(RUN.concat(' body')) && !text.includes(`Subject ${RUN}`), 'no address, subject or body')
   assert.ok(!on.events.some((e) => e.orderId === oOther), 'an order outside the cluster never appears')
@@ -374,6 +374,36 @@ test('timeline e-mails: only with the switch, only the cluster\'s orders, no sub
     cursor = p.nextCursor
   }
   assert.deepEqual(seen, on.events.map((e) => e.key), 'pagination across the new kind: no repeat, no gap')
+})
+
+test('timeline e-mails page through more than limit + tie room rows, newest first, without a repeat or a gap, skipping placeholder, other-type and erased rows', { skip }, async (t) => {
+  const { db, RUN, customer, order, cleanup } = await setup()
+  t.after(cleanup)
+  const { loadTimeline } = await import('@/lib/domain/crm/timeline')
+  const c = await customer('p', `${RUN}.page@example.test`)
+  const gone = await customer('pg', `${RUN}.pgone@example.test`)
+  const o = await order('p', c, { createdAt: new Date(Date.UTC(2026, 0, 1)) })
+  const oGone = await order('pg', gone, { createdAt: new Date(Date.UTC(2026, 0, 1)), erasedAt: new Date() })
+  const N = 130 // > limit (2) + TIE_ROOM (50) + 1, and above one page of the query
+  const at = (i: number) => new Date(Date.UTC(2026, 2, 1, 0, 0, i))
+  await db.emailOutbox.createMany({ data: Array.from({ length: N }, (_, i) => ({ kind: 'INVOICE', toEmail: `s${i}.${RUN}@example.test`, subject: 's', html: 'h', referenceType: 'SalesOrder', referenceId: o, status: 'SENT' as const, createdAt: at(i), sentAt: at(i + 1000) })) })
+  // rows that must never show, placed in the middle of the range
+  await db.emailOutbox.createMany({ data: [
+    { kind: 'INVOICE', toEmail: 'erased@erased.invalid', subject: 's', html: 'h', referenceType: 'SalesOrder', referenceId: o, status: 'SENT' as const, createdAt: at(60) },
+    { kind: 'INVOICE', toEmail: `po.${RUN}@example.test`, subject: 's', html: 'h', referenceType: 'PurchaseOrder', referenceId: o, status: 'SENT' as const, createdAt: at(61) },
+    { kind: 'INVOICE', toEmail: `gone.${RUN}@example.test`, subject: 's', html: 'h', referenceType: 'SalesOrder', referenceId: oGone, status: 'SENT' as const, createdAt: at(62) },
+  ] })
+  const expected = await db.emailOutbox.findMany({ where: { referenceType: 'SalesOrder', referenceId: o, NOT: { toEmail: 'erased@erased.invalid' } }, orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], select: { id: true } })
+  assert.equal(expected.length, N)
+  const seen: string[] = []
+  let cursor: string | null = null
+  for (let i = 0; i < N + 5; i++) {
+    const p = await loadTimeline(db, [c, gone], { limit: 2, cursor, includeEmails: true })
+    seen.push(...p.events.filter((e) => e.kind === 'EMAIL').map((e) => e.key))
+    if (!p.nextCursor) break
+    cursor = p.nextCursor
+  }
+  assert.deepEqual(seen, expected.map((e) => `EMAIL:${e.id}`), 'every e-mail once, newest queued first, in id order within one instant')
 })
 
 test('the timeline lists orders, invoices, payments, credit notes and returns of the whole cluster, newest first, and nothing of anyone else', { skip }, async (t) => {
