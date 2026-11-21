@@ -491,3 +491,33 @@ test('[credit note, o3d-k26m.17 rule 1/5] the EAS fee-gap credit (166128 shape):
   const atAmount = applyEuVatCreditNoteTreatment(fx, plan({ lineKinds: ['goods', 'marked-fee'], linePostingTypes: ['TAX131', 'TAX131'], vatAmount: '3.78', refundTotal: '17.86' }))
   assert.equal(atAmount.ok, false)
 })
+
+test('[credit note, o3d-k26m.17 LOW-10] DDP fee gap: the fee account IS the VAT account (232), so the fee line sits beside the ONE VAT line carrying goods and fee VAT', () => {
+  const fx = payload({ lines: [
+    { description: 'Widget', quantity: 1, unitAmount: 14.64, accountCode: '200', taxType: CHARGED, taxRateId: 'r1', taxRateBasis: 'sales_line' },
+    { description: 'EU Import Duty', quantity: 1, unitAmount: 2.44, accountCode: '200', taxType: CHARGED, taxRateId: 'r1', taxRateBasis: 'sales_line' },
+  ] })
+  const result = applyEuVatCreditNoteTreatment(fx, plan({ regime: 'DDP', vatAccount: '232', feeAccount: '232', vatDescription: 'DDP import VAT refunded', lineKinds: ['goods', 'marked-fee'], linePostingTypes: ['TAX131', 'TAX131'], vatAmount: '3.78', refundTotal: '20.86' }))
+  assert.equal(result.ok, true)
+  if (!result.ok) return
+  assert.deepEqual(result.payload.lines.map((l) => [l.accountCode, l.taxType, l.unitAmount, l.noTaxKind ?? null]), [
+    ['200', 'TAX131', 14.64, null],
+    ['232', 'NONE', 2.44, 'fee-no-tax'],
+    ['232', 'NONE', 3.78, 'eu-vat-recovery'],
+  ])
+})
+
+test('[credit note, o3d-k26m.17 rule 4] a refund with NO product line (shipping and a fee only, 166326 / 172767 shape) is treated like any other: shipping on the zero rate, fee on 232, VAT off 821', () => {
+  const fx = payload({ lines: [
+    { description: 'Shipping refund', quantity: 1, unitAmount: 14.06, accountCode: '260', taxType: CHARGED },
+    { description: 'EU Import Duty', quantity: 1, unitAmount: 3, accountCode: '200', taxType: CHARGED, taxRateId: 'r1', taxRateBasis: 'sales_line' },
+  ] })
+  const result = applyEuVatCreditNoteTreatment(fx, plan({ lineKinds: ['goods', 'marked-fee'], linePostingTypes: ['TAX131', 'TAX131'], vatAmount: '3.24', refundTotal: '20.30' }))
+  assert.equal(result.ok, true)
+  if (!result.ok) return
+  assert.deepEqual(result.payload.lines.map((l) => [l.description, l.accountCode, l.taxType]), [
+    ['Shipping refund', '260', 'TAX131'],
+    ['EU Import Duty', '232', 'NONE'],
+    ['IOSS VAT refunded', '821', 'NONE'],
+  ])
+})

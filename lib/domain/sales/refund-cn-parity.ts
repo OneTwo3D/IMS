@@ -16,9 +16,11 @@
  *      102.18 against 96.23 paid). Recognised exactly (the shipping excess equals the marked fees in net AND in VAT, and the lines less those fees equal the
  *      amount): shipping is restored to what was charged and the amount is expected. Anything close but not exact is held; the inflated total is never credited.
  *   6. STORE CREDIT. A refund issued as store credit (o3d-store-credit-refund: `_o3d_scr_attempt` on the refund, not paid through the gateway) gets a credit note
- *      numbered SC-<refund id> that is never allocated; and none at all until the store credit is live (the plugin's own hold, `_o3d_scr_xero_held`, or the
- *      order's unfinished-attempt record `_o3d_scr_incomplete` naming it).
+ *      numbered SC-<refund id> that is never allocated; and none at all until the store credit is POSITIVELY live: a PUBLISHED coupon carrying the same
+ *      `_o3d_scr_attempt`. The absence of the plugin's markers proves nothing (its discard and coupon-gone paths clear `_o3d_scr_incomplete` and leave the
+ *      refund; with Xeroom off it never writes `_o3d_scr_xero_held`), so a refund with no live coupon is QUARANTINED for a person.
  */
+import { Prisma } from '@/app/generated/prisma/client'
 import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 
@@ -52,13 +54,20 @@ function metaValue(meta: readonly Meta[] | null | undefined, key: string): unkno
   return (meta ?? []).find((entry) => entry?.key === key)?.value
 }
 
-/** Rounded to the cent, as WooCommerce and the plugins present each item. */
+/** Rounded to the cent half away from zero, as PHP's round() rounds each item for WooCommerce and the plugins. */
 function cents(value: DecimalInput | null | undefined): number {
-  const n = toDecimal(value ?? 0).toNumber()
-  return Number.isFinite(n) ? Math.round(n * 100) : NaN
+  let d
+  try { d = toDecimal(value ?? 0) } catch { return NaN }
+  if (!d.isFinite()) return NaN
+  return d.toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP).times(100).toNumber()
 }
 
 const money = (minor: number) => (minor / 100).toFixed(2)
+
+/** A payment-gateway fee line ("Stripe fee"): the storefront's Xero plugin never puts it on a credit note, so it is left out of the comparison (`is_gateway_fee`). */
+export function isGatewayFeeName(name: string | null | undefined): boolean {
+  return (name ?? '').trim().toLowerCase() === 'stripe fee'
+}
 
 /** One refund item as the breakdown reads it: its type, its total and tax as WooCommerce reports them (credits negative), and for a fee what it is. */
 export type ParityRefundItem = {
@@ -73,7 +82,7 @@ export type ParityRefundItem = {
 }
 
 export type ParityBreakdown = {
-  /** Everything the refund itemises, as a positive figure, in minor units. */
+  /** Everything the refund itemises (gateway fees excepted), as a positive figure, in minor units. */
   grossMinor: number
   /** Its marked fees, gross, net and VAT, positive, in minor units. */
   feeGrossMinor: number
@@ -85,6 +94,8 @@ export type ParityBreakdown = {
   otherFees: number
   /** Marked fee items. */
   markedFees: number
+  /** Gateway fee items, left out of every figure above. */
+  gatewayFees: number
   /** Some item is a charge rather than a credit. */
   positive: boolean
   /** A marked fee carries no total of its own. */
@@ -94,7 +105,7 @@ export type ParityBreakdown = {
   unreadable: boolean
 }
 
-/** `O3D_IOSS_Order_Facts::refund_breakdown`. Each item is rounded to the cent before it is added. */
+/** `O3D_IOSS_Order_Facts::refund_breakdown`. Each item is rounded to the cent before it is added; gateway fees are left out. */
 export function parityRefundBreakdown(items: readonly ParityRefundItem[]): ParityBreakdown {
   let signed = 0
   let fee = 0
@@ -103,11 +114,13 @@ export function parityRefundBreakdown(items: readonly ParityRefundItem[]): Parit
   let goods = 0
   let otherFees = 0
   let markedFees = 0
+  let gatewayFees = 0
   let positive = false
   let emptyFee = false
   let feesLinked = true
   let unreadable = false
   for (const item of items) {
+    if (item.type === 'fee' && isGatewayFeeName(item.name)) { gatewayFees += 1; continue }
     const total = cents(item.total)
     const tax = cents(item.tax)
     if (!Number.isFinite(total) || !Number.isFinite(tax)) { unreadable = true; continue }
@@ -125,82 +138,112 @@ export function parityRefundBreakdown(items: readonly ParityRefundItem[]): Parit
       else goods += 1
     }
   }
-  return { grossMinor: -signed, feeGrossMinor: -fee, feeNetMinor: -feeNet, feeTaxMinor: -feeTax, goods, otherFees, markedFees, positive, emptyFee, feesLinked, unreadable }
+  return { grossMinor: -signed, feeGrossMinor: -fee, feeNetMinor: -feeNet, feeTaxMinor: -feeTax, goods, otherFees, markedFees, gatewayFees, positive, emptyFee, feesLinked, unreadable }
 }
 
-/** What the order charged for shipping, net and VAT, in the order currency. Null when IMS cannot say (the figures are not stored). */
-export type ChargedShipping = { net: DecimalInput; tax: DecimalInput } | null
+/**
+ * One refunded shipping line with money on it (net or VAT: a tax-only line counts), and what its OWN original order shipping line charged, found through
+ * `_refunded_item_id`. `charged` null: the line names no original, or the original could not be read; such a refund is never folded and never credited on the
+ * fee-gap allowance.
+ */
+export type ParityShippingLine = { total: DecimalInput | null | undefined; tax: DecimalInput | null | undefined; name?: string; charged: { net: DecimalInput; tax: DecimalInput } | null }
 
 export type AmountGapVerdict =
-  /** Not one of the shapes this module recognises: the sync's ordinary amount-mismatch handling applies. */
+  /** No landed-cost fee on the refund: the sync's ordinary amount-mismatch handling applies. */
   | { kind: 'not-recognised' }
   /** The EAS fee gap, exactly: credit the item total; `feeGapMinor` is the fee left out of the amount. */
   | { kind: 'fee-gap'; creditedGrossMinor: number; feeGapMinor: number }
-  /** The EAS shipping fold, exactly: restore shipping to what was charged (`shippingNet` / `shippingTax`), and the lines then total the amount. */
-  | { kind: 'fold'; shippingNet: string; shippingTax: string; excessNet: string; excessTax: string }
-  /** Close to a fee gap or a fold but not exact: held for a person, never credited at the inflated total. */
+  /** The EAS shipping fold, exactly: each listed refund shipping line (by index) is restored to what its original charged, and the lines then total the amount. */
+  | { kind: 'fold'; restore: Array<{ index: number; net: string; tax: string }>; excessNet: string; excessTax: string }
+  /** A landed-cost fee is on the refund and its lines and amount disagree, but not in either exact shape: held for a person, never credited at the inflated total. */
   | { kind: 'hold'; message: string }
 
+const HOLD_TAIL = (refundId: number | string) => ` Nothing was recorded and nothing was sent to Xero. The money has ALREADY been returned in the storefront (refund ${refundId}) - do NOT issue another storefront refund.`
+
 /**
- * THE AMOUNT GAP between what a storefront refund itemises and what it paid (`O3D_IOSS_Hooks::decide`, the fee-gap and fold arms). Called only when the two
- * differ. `refundShipping` is the refund's shipping lines with a total (net and tax, credits negative); `charged` is what the order charged for shipping.
- * IMS stores the order's shipping as one figure, so a refund with more than one shipping line is compared against that one figure: it never folds, and
- * a fee-gap shape on it is held unless its shipping lines together equal the charge exactly.
+ * THE AMOUNT GAP between what a storefront refund itemises and what it paid (`O3D_IOSS_Hooks::decide`, the fee-gap and fold arms; `shipping_fold`,
+ * `shipping_as_charged`). Called only when the two differ.
  */
-export function decideAmountGap(input: {
-  refundId: number | string
-  amount: DecimalInput
-  breakdown: ParityBreakdown
-  refundShipping: ReadonlyArray<{ total: DecimalInput | null | undefined; tax: DecimalInput | null | undefined; name?: string }>
-  charged: ChargedShipping
-}): AmountGapVerdict {
+export function decideAmountGap(input: { refundId: number | string; amount: DecimalInput; breakdown: ParityBreakdown; refundShipping: readonly ParityShippingLine[] }): AmountGapVerdict {
   const b = input.breakdown
+  if (b.markedFees === 0) return { kind: 'not-recognised' }
   const amountMinor = cents(input.amount)
-  if (b.unreadable || !Number.isFinite(amountMinor)) return { kind: 'not-recognised' }
   const paid = Math.abs(amountMinor)
   const linesLessFees = b.grossMinor - b.feeGrossMinor
+  const hold = (why: string, extra = ''): AmountGapVerdict => ({
+    kind: 'hold',
+    message: withLedgerCheck(`WooCommerce refund ${input.refundId} cannot be credited automatically: its lines total ${money(b.grossMinor)}, of which ${money(b.feeGrossMinor)} is landed-cost fees, but ${Number.isFinite(paid) ? money(paid) : 'an unreadable amount'} was paid back, and ${why}. `
+      + `${extra}Record it from the Sync exceptions page once you have established from the storefront what was refunded: if EAS left the fees out of the amount, at ${money(b.grossMinor)} with the fees included; if EAS also put them on the shipping line, with shipping set back to what was charged, totalling ${Number.isFinite(paid) ? money(paid) : 'the amount'}.`
+      + HOLD_TAIL(input.refundId)),
+  })
+  if (b.unreadable || !Number.isFinite(amountMinor)) return hold('a figure on it cannot be read')
 
-  // THE FOLD, recognised first and exactly (`shipping_fold`): the shipping excess over what was charged equals the marked fees in net AND VAT, to the cent.
-  const chargedNet = input.charged === null ? NaN : Math.abs(cents(input.charged.net))
-  const chargedTax = input.charged === null ? NaN : Math.abs(cents(input.charged.tax))
-  const shipNet = input.refundShipping.reduce((sum, line) => sum + Math.abs(cents(line.total)), 0)
-  const shipTax = input.refundShipping.reduce((sum, line) => sum + Math.abs(cents(line.tax)), 0)
-  const chargeKnown = Number.isFinite(chargedNet) && Number.isFinite(chargedTax) && Number.isFinite(shipNet) && Number.isFinite(shipTax)
-  if (b.feeNetMinor > 0 && chargeKnown && input.refundShipping.length === 1 && !b.positive
-    && shipNet - chargedNet === b.feeNetMinor && shipTax - chargedTax === b.feeTaxMinor
-    && linesLessFees === paid) {
-    return { kind: 'fold', shippingNet: money(chargedNet), shippingTax: money(chargedTax), excessNet: money(b.feeNetMinor), excessTax: money(b.feeTaxMinor) }
-  }
+  const describe = () => input.refundShipping.map((line) => `"${line.name ?? 'Shipping'}" refunded ${money(Math.abs(cents(line.total)))} + ${money(Math.abs(cents(line.tax)))} VAT, charged ${line.charged ? `${money(Math.abs(cents(line.charged.net)))} + ${money(Math.abs(cents(line.charged.tax)))} VAT` : 'unknown (no link to its order line)'}`).join('; ')
+  const allMapped = input.refundShipping.every((line) => line.charged !== null)
 
-  // Lines less fees equal to the amount is ALSO what a folded refund looks like, so the fee-gap allowance is only safe when shipping is exactly what was charged.
-  const feeGapShape = b.feeGrossMinor > 0 && b.grossMinor > paid && linesLessFees === paid
-  if (!feeGapShape) return { kind: 'not-recognised' }
-  const shippingAsCharged = input.refundShipping.length === 0 || (chargeKnown && shipNet === chargedNet && shipTax === chargedTax)
-  if (!shippingAsCharged) {
-    const refunded = input.refundShipping.map((line) => `"${line.name ?? 'Shipping'}" refunded ${money(Math.abs(cents(line.total)))} + ${money(Math.abs(cents(line.tax)))} VAT`).join('; ')
-    const charged = chargeKnown ? `${money(chargedNet)} + ${money(chargedTax)} VAT` : 'unknown to IMS'
-    return {
-      kind: 'hold',
-      message: withLedgerCheck(`WooCommerce refund ${input.refundId} cannot be credited automatically: its lines total ${money(b.grossMinor)} but ${money(paid)} was paid back, and its shipping is not what was charged (${refunded}; the order charged ${charged}). `
-        + `If EAS put the fees on the shipping line as well as on the fee lines, record it with shipping set back to what was charged, totalling ${money(paid)}; if the fees were genuinely left out of the amount, record it at ${money(b.grossMinor)} with the fees included. `
-        + `Nothing was recorded and nothing was sent to Xero. The money has ALREADY been returned in the storefront (refund ${input.refundId}) - do NOT issue another storefront refund.`),
+  // THE FOLD, recognised first and exactly (`shipping_fold`): every refund shipping line names its original; the excess of those above what was charged equals
+  // the marked fees in net AND VAT, to the cent; and the lines less those fees equal what was paid.
+  if (allMapped && b.feeNetMinor > 0 && !b.positive) {
+    let excessNet = 0
+    let excessTax = 0
+    const restore: Array<{ index: number; net: string; tax: string }> = []
+    input.refundShipping.forEach((line, index) => {
+      const rNet = Math.abs(cents(line.total))
+      const rTax = Math.abs(cents(line.tax))
+      const oNet = Math.abs(cents(line.charged!.net))
+      const oTax = Math.abs(cents(line.charged!.tax))
+      if (rNet > oNet) {
+        excessNet += rNet - oNet
+        excessTax += rTax - oTax
+        restore.push({ index, net: money(oNet), tax: money(oTax) })
+      }
+    })
+    if (restore.length > 0 && excessNet === b.feeNetMinor && excessTax === b.feeTaxMinor && linesLessFees === paid) {
+      if (b.gatewayFees > 0) return hold('a payment-gateway fee is on it as well, which the storefront\'s credit note leaves out and IMS cannot reconcile automatically')
+      return { kind: 'fold', restore, excessNet: money(excessNet), excessTax: money(excessTax) }
     }
   }
-  // Only the exact signature: something paid out, goods refunded as well, every item a credit, every fee with a total and a link of its own.
-  if (paid > 0 && b.goods > 0 && !b.positive && !b.emptyFee && b.markedFees > 0 && b.feesLinked) {
-    return { kind: 'fee-gap', creditedGrossMinor: b.grossMinor, feeGapMinor: b.feeGrossMinor }
+
+  // Lines less fees equal to the amount is ALSO what a folded refund looks like, so the fee-gap allowance is only safe when every shipping line is exactly what its
+  // own original charged.
+  const asCharged = input.refundShipping.every((line) => line.charged !== null
+    && Math.abs(cents(line.total)) === Math.abs(cents(line.charged.net)) && Math.abs(cents(line.tax)) === Math.abs(cents(line.charged.tax)))
+  const feeGapShape = b.feeGrossMinor > 0 && b.grossMinor > paid && linesLessFees === paid
+  if (feeGapShape && !asCharged) return hold(`its shipping is not what was charged (${describe()})`)
+  if (!feeGapShape) {
+    return hold(linesLessFees > paid
+      ? `the lines less the fees (${money(linesLessFees)}) are more than was paid, so this is not EAS leaving the fees out of the amount`
+      : `the lines less the fees (${money(linesLessFees)}) are not what was paid${input.refundShipping.length > 0 ? ` (shipping: ${describe()})` : ''}`)
   }
-  return { kind: 'not-recognised' }
+  // Only the exact signature: something paid out, goods refunded as well, every item a credit, every fee with a total and a link of its own.
+  const failed: string[] = []
+  if (paid <= 0) failed.push('it paid nothing back')
+  if (b.goods === 0) failed.push('it refunds no goods')
+  if (b.positive) failed.push('an item on it is a charge, not a credit')
+  if (b.emptyFee) failed.push('a landed-cost fee on it has no amount of its own')
+  if (!b.feesLinked) failed.push('a landed-cost fee on it does not name the order fee it refunds')
+  if (b.gatewayFees > 0) failed.push('a payment-gateway fee is on it as well')
+  if (failed.length > 0) return hold(`it is not the exact EAS fee-gap shape: ${failed.join('; ')}`)
+  return { kind: 'fee-gap', creditedGrossMinor: b.grossMinor, feeGapMinor: b.feeGrossMinor }
 }
 
-/** An earlier refund on the same order, as the fee-repayment check reads it. */
+/**
+ * The landed-cost fee an EARLIER refund credited beyond what it paid (the gap still owed), from its own breakdown, as the plugin judges the order's other refunds:
+ * a refund whose fees were folded into shipping, or whose lines did not exceed what it paid, paid its fee back within its amount (owed 0).
+ */
+export function earlierFeeOwedMinor(input: { breakdown: ParityBreakdown; amount: DecimalInput; folded: boolean }): number {
+  if (input.breakdown.feeGrossMinor <= 0 || input.folded) return 0
+  return input.breakdown.grossMinor <= Math.abs(cents(input.amount)) ? 0 : input.breakdown.feeGrossMinor
+}
+
+/** An earlier refund on the same order (in WooCommerce, recorded in IMS, or parked), as the fee-repayment check reads it. */
 export type EarlierRefundFacts = {
-  creditNoteNumber: string | null
-  externalRefundId: number | null
-  /** A line of it refunds an order fee line carrying the wclc marker. */
+  /** How the operator finds it: "WooCommerce refund 166128 (credit note CN-00042)". */
+  label: string
+  /** It carries a landed-cost fee item. */
   carriedMarkedFee: boolean
-  /** The fee gap it recorded (fee credited beyond what it paid), when it did. */
-  easFeeGapForeign: DecimalInput | null
+  /** The fee it credited beyond what it paid, in minor units (0: none, or paid within its amount). */
+  owedMinor: number
 }
 
 /**
@@ -211,21 +254,20 @@ export function feeRepaymentHold(input: { refundId: number | string; amount: Dec
   const b = input.breakdown
   const paid = Math.abs(cents(input.amount))
   if (!Number.isFinite(paid) || paid <= 0 || b.goods !== 0 || b.otherFees !== 0 || b.markedFees !== 0 || b.feeGrossMinor > 0) return null
-  const feeCarriers = input.earlier.filter((refund) => refund.carriedMarkedFee || toDecimal(refund.easFeeGapForeign ?? 0).gt(0))
+  const feeCarriers = input.earlier.filter((refund) => refund.carriedMarkedFee || refund.owedMinor > 0)
   if (feeCarriers.length === 0) return null
-  const owedMinor = feeCarriers.reduce((sum, refund) => sum + Math.abs(cents(refund.easFeeGapForeign ?? 0)), 0)
-  const gapCarriers = feeCarriers.filter((refund) => toDecimal(refund.easFeeGapForeign ?? 0).gt(0))
-  const name = (refund: EarlierRefundFacts) => `credit note ${refund.creditNoteNumber ?? '(no number)'}${refund.externalRefundId != null ? ` (WooCommerce refund ${refund.externalRefundId})` : ''}`
-  const tail = ` Nothing was recorded and nothing was sent to Xero. The money has ALREADY been returned in the storefront (refund ${input.refundId}) - do NOT issue another storefront refund.`
+  const owed = feeCarriers.filter((refund) => refund.owedMinor > 0)
+  const owedMinor = owed.reduce((sum, refund) => sum + refund.owedMinor, 0)
+  const tail = HOLD_TAIL(input.refundId)
   if (owedMinor > 0 && owedMinor === paid) {
-    return withLedgerCheck(`WooCommerce refund ${input.refundId} refunds no goods and pays ${money(paid)} ${input.currency}, the landed-cost fee ${gapCarriers.map(name).join(' and ')} already credits beyond what it paid. `
-      + `It is the fee's repayment, not a new credit: apply this payment (${money(paid)} ${input.currency}) to that credit note in Xero, then dismiss this refund here.${tail}`)
+    return withLedgerCheck(`WooCommerce refund ${input.refundId} refunds no goods and pays ${money(paid)} ${input.currency}, the landed-cost fee that ${owed.map((refund) => refund.label).join(' and ')} credits beyond what it paid. `
+      + `It is the fee's repayment, not a new credit: apply this payment (${money(paid)} ${input.currency}) to that refund's credit note in Xero, then dismiss this refund here.${tail}`)
   }
   if (owedMinor > 0) {
-    return withLedgerCheck(`WooCommerce refund ${input.refundId} pays ${money(paid)} ${input.currency} but refunds no goods, on an order whose landed-cost fee ${gapCarriers.map(name).join(' and ')} credits (${money(owedMinor)} ${input.currency} of it not yet paid back); `
+    return withLedgerCheck(`WooCommerce refund ${input.refundId} pays ${money(paid)} ${input.currency} but refunds no goods, on an order where ${owed.map((refund) => refund.label).join(' and ')} credits ${money(owedMinor)} ${input.currency} of landed-cost fees beyond what it paid; `
       + `check by hand what it repays before crediting it.${tail}`)
   }
-  return withLedgerCheck(`WooCommerce refund ${input.refundId} pays ${money(paid)} ${input.currency} but refunds no goods, and the landed-cost fee on this order was already refunded within ${feeCarriers.map(name).join(' and ')}; `
+  return withLedgerCheck(`WooCommerce refund ${input.refundId} pays ${money(paid)} ${input.currency} but refunds no goods, and the landed-cost fee on this order was already refunded within ${feeCarriers.map((refund) => refund.label).join(' and ')}; `
     + `this looks like a second payment of the fee - check by hand before crediting it.${tail}`)
 }
 
@@ -239,20 +281,70 @@ export function storeCreditAttemptOf(refund: { meta_data?: readonly Meta[] | nul
   return text
 }
 
+/** The coupon meta the plugin writes naming the refund the credit was issued for (class-o3d-scr-credit.php ORIGIN_REFUND). */
+export const STORE_CREDIT_ORIGIN_REFUND_META = '_o3d_origin_refund_id'
+
+/** A WooCommerce coupon as the store-credit check reads it (REST v3 /coupons: `status` is the post status, `publish` when spendable). */
+export type StoreCreditCoupon = { id: number; code?: string; status?: string; meta_data?: readonly Meta[] | null }
+
+/** How long a store-credit refund may wait for its credit to go live before it is QUARANTINED for a person (from the refund's own creation time). */
+export const STORE_CREDIT_WAIT_LIMIT_MS = 24 * 60 * 60 * 1000
+
+export type StoreCreditVerdict =
+  | { kind: 'live'; couponId: number }
+  /** Not live yet but still in progress: parked PENDING and retried. */
+  | { kind: 'wait'; message: string }
+  /** No live credit can be shown: QUARANTINED for a person. */
+  | { kind: 'quarantine'; message: string }
+
 /**
- * Why a store-credit refund's credit note must wait, or null when the store credit is live. The plugin's Xero hold on the refund (`1` held, `sending` part-sent),
- * or the order's unfinished-attempt record naming this attempt or this refund. `orderMeta` null means the order could not be read: the caller retries.
+ * IS THE STORE CREDIT FOR THIS REFUND LIVE? Only a PUBLISHED coupon carrying this refund's attempt id (and, where it names one, this refund) says so. In progress
+ * (the plugin's Xero hold on the refund, the order's unfinished record naming the attempt, a draft coupon while that record stands, or the coupons could not be
+ * read) it waits, up to STORE_CREDIT_WAIT_LIMIT_MS from the refund's creation; anything else, and any wait past that limit, is QUARANTINED. `coupons` null: the
+ * coupon list could not be read. `orderMeta` null: the order could not be read.
  */
-export function storeCreditHoldReason(input: { refundId: number; attempt: string; refundMeta: readonly Meta[] | null | undefined; orderMeta: readonly Meta[] }): string | null {
+export function storeCreditVerdict(input: {
+  refundId: number
+  attempt: string
+  refundMeta: readonly Meta[] | null | undefined
+  orderMeta: readonly Meta[] | null
+  coupons: readonly StoreCreditCoupon[] | null
+  refundCreatedAt: Date | null
+  now: Date
+}): StoreCreditVerdict {
+  const mine = (input.coupons ?? []).filter((coupon) => {
+    if (String(metaValue(coupon.meta_data, STORE_CREDIT_ATTEMPT_META) ?? '').trim() !== input.attempt) return false
+    const origin = metaValue(coupon.meta_data, STORE_CREDIT_ORIGIN_REFUND_META)
+    return origin === undefined || origin === null || origin === '' || Number(origin) === input.refundId
+  })
+  const live = mine.find((coupon) => coupon.status === 'publish')
+  if (live) return { kind: 'live', couponId: live.id }
+
   const held = metaValue(input.refundMeta, STORE_CREDIT_XERO_HELD_META)
   const heldText = typeof held === 'string' || typeof held === 'number' ? String(held).trim() : ''
-  const incomplete = metaValue(input.orderMeta, STORE_CREDIT_INCOMPLETE_META)
+  const incomplete = input.orderMeta === null ? undefined : metaValue(input.orderMeta, STORE_CREDIT_INCOMPLETE_META)
   const record = incomplete !== null && typeof incomplete === 'object' ? incomplete as Record<string, unknown> : null
-  const names = record !== null && (String(record.attempt ?? '').trim() === input.attempt || Number(record.refund_id) === input.refundId)
-  if (heldText !== '' || names) {
-    const why = names ? `the order still records the store-credit attempt as unfinished (stage ${String(record?.stage ?? 'unknown')})` : `the refund is still held for Xero by the store-credit plugin (${heldText})`
-    return `WooCommerce refund ${input.refundId} was issued as store credit, and ${why}, so the store credit is not live yet. `
-      + 'No credit note is raised until it is: the refund is retried on the next sweep and recorded once the coupon is published. If the attempt failed, finish or cancel it from the order in WooCommerce.'
+  const named = record !== null && (String(record.attempt ?? '').trim() === input.attempt || Number(record.refund_id) === input.refundId)
+  const intro = `WooCommerce refund ${input.refundId} was issued as store credit (attempt ${input.attempt})`
+  const waiting = named
+    ? `the order still records the store-credit attempt as unfinished (stage ${String(record?.stage ?? 'unknown')})`
+    : heldText !== '' ? `the refund is still held for Xero by the store-credit plugin (${heldText})`
+      : input.coupons === null ? 'IMS could not read the store\'s coupons to confirm the credit is live'
+        : input.orderMeta === null ? 'IMS could not read the WooCommerce order to confirm the credit is live'
+          : null
+  const draft = mine.find((coupon) => coupon.status === 'draft' || coupon.status === 'pending')
+  const age = input.refundCreatedAt === null ? Infinity : input.now.getTime() - input.refundCreatedAt.getTime()
+  if (waiting !== null && age <= STORE_CREDIT_WAIT_LIMIT_MS) {
+    return { kind: 'wait', message: `${intro}, and ${waiting}, so the store credit is not confirmed live yet. No credit note is raised until a published coupon for this attempt exists: the refund is retried on every sweep, and held for a person if it is still not live ${STORE_CREDIT_WAIT_LIMIT_MS / 3_600_000} hours after the refund.` }
   }
-  return null
+  const found = mine.length === 0
+    ? 'no coupon for this attempt exists in the store (it was never issued, was discarded, or was deleted)'
+    : `its coupon${mine.length > 1 ? 's are' : ' is'} not published (${mine.map((coupon) => `coupon ${coupon.id}${coupon.code ? ` "${coupon.code}"` : ''}: ${coupon.status ?? 'unknown'}`).join('; ')})`
+  return {
+    kind: 'quarantine',
+    message: withLedgerCheck(`${intro}, but IMS cannot confirm the credit was ever issued: ${waiting !== null ? `${waiting}, for more than ${STORE_CREDIT_WAIT_LIMIT_MS / 3_600_000} hours, and ` : ''}${found}${draft && waiting === null ? ' while the order no longer records the attempt as unfinished' : ''}. `
+      + 'No credit note was raised: a store-credit refund gets one only when its credit is live. Check the order\'s notes and its coupons in WooCommerce. If the customer does hold the credit (a published coupon for this attempt), use Retry on this row in Sync exceptions and IMS records it. '
+      + 'If they do not, the customer was refunded nothing yet the refund stands: decide with the accountant how it is to be put right before doing anything in WooCommerce - do not discard, re-issue or cancel credit on the strength of this message.'
+      + HOLD_TAIL(input.refundId).replace(' The money has ALREADY been returned in the storefront', ' The refund already exists in the storefront').replace(' - do NOT issue another storefront refund.', '.')),
+  }
 }
