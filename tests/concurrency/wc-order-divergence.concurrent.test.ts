@@ -285,12 +285,14 @@ test('[divergence] o3d-7d84p: a FAILED live read is not an attempt; it counts ag
   await f.deliver({ qty: 3, refunds: [{ id: 888010, reason: '', total: '-5.00' }] })
   f.div.divergenceSeams.readLiveOrder = async () => null
   t.after(() => { f.div.divergenceSeams.readLiveOrder = undefined })
+  // The row's last try is set a minute back first, so "backed off" is a strict comparison (an unchanged value would pass a >=).
+  await f.db.wcOrderDivergenceRecheck.update({ where: { orderId: f.orderId }, data: { lastAttemptAt: new Date(Date.now() - 60_000) } })
   const before = await f.db.wcOrderDivergenceRecheck.findFirstOrThrow({ where: { orderId: f.orderId } })
   for (let i = 0; i < 3; i++) await f.div.drainDeferredWcOrderDivergences()
   const after = await f.db.wcOrderDivergenceRecheck.findFirstOrThrow({ where: { orderId: f.orderId } })
   assert.equal(after.attempts, before.attempts, 'failed reads never use up the attempt limit')
   assert.equal(after.failedReads, 3)
-  assert.ok(after.lastAttemptAt.getTime() >= before.lastAttemptAt.getTime(), 'backed off: sorted behind the rows not tried')
+  assert.ok(after.lastAttemptAt.getTime() > before.lastAttemptAt.getTime(), 'backed off: sorted behind the rows not tried')
   // A successful read counts an attempt and clears the failure streak.
   f.div.divergenceSeams.readLiveOrder = async () => f.payload({ qty: 3, refunds: [{ id: 888010, reason: '', total: '-5.00' }] }) as never
   await f.div.drainDeferredWcOrderDivergences()
@@ -307,7 +309,7 @@ test('[divergence] o3d-7d84p: a PERMANENTLY failing read still ends in a refused
   f.div.divergenceSeams.readLiveOrder = async () => { throw new Error('woocommerce down') }
   t.after(() => { f.div.divergenceSeams.readLiveOrder = undefined })
   try {
-    await f.db.wcOrderDivergenceRecheck.update({ where: { orderId: f.orderId }, data: { failedReads: f.div.RECHECK_MAX_FAILED_READS - 1 } })
+    await f.db.wcOrderDivergenceRecheck.update({ where: { orderId: f.orderId }, data: { failedReads: f.div.RECHECK_MAX_FAILED_READS - 1, deferredAt: new Date(Date.now() - 5 * 86_400_000) } })
     const last = await f.div.drainDeferredWcOrderDivergences()
     assert.equal(last.dropped, 0, 'one failure short of the cap: still retrying')
     assert.equal((await f.db.wcOrderDivergenceRecheck.findFirstOrThrow({ where: { orderId: f.orderId } })).failedReads, f.div.RECHECK_MAX_FAILED_READS)

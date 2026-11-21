@@ -32,7 +32,7 @@ export const WMS_OPERATOR_TASK_REASON_LABELS: Record<WmsOperatorTaskReasonValue,
   ORDER_NOT_FOUND: 'Warehouse order not found on repeated checks: IMS stopped checking its status',
   CANCELLED_POSTED_INVOICE: 'Cancelled order with a posted invoice: the invoice is still uncredited in the ledger',
   WC_EDIT_AFTER_PICKING: 'Order edited in WooCommerce after picking started: IMS sent nothing, apply the change in the warehouse by hand',
-  WC_PAID_INCREASE: 'Paid order increased in WooCommerce: IMS changed nothing, collect the difference or have the edit undone in WooCommerce (not a warehouse change)',
+  WC_PAID_INCREASE: 'Paid order changed in WooCommerce: IMS changed nothing. Paid in IMS: collect the difference or have the edit undone. Paid in WooCommerce only: check what the gateway charged, then edit the IMS order to match or settle the difference (not a warehouse change)',
   REFUND_REMAINDER_DUE: 'Returned units were refunded: ask the warehouse to send the remaining units',
   WITHDRAWAL_REJECT_NOT_WRITTEN: 'Withdrawal request filed after despatch: IMS could not reject it on the storefront, reject it in WooCommerce',
   MERGE_HOLD: 'Orders on merge hold in the warehouse: merge them there and confirm the merged order yourself',
@@ -217,6 +217,29 @@ export function wcPaidIncreaseQuery(wmsOrder: string | null, imsOrder: string, c
   const where = wmsOrder ? ` (warehouse order ${wmsOrder})` : ''
   return `IMS order ${imsOrder}${where} was PAID and has since been INCREASED in WooCommerce: ${changes.join('; ')}. IMS changed nothing and sent nothing to the warehouse. `
     + 'Please collect the difference from the customer, or undo the edit in WooCommerce; do not ship the extra goods until it is paid.'
+}
+
+/**
+ * The query for an order WooCommerce shows as PAID that IMS has NOT recorded as paid (a paid date on the payload, an open paid-block obligation, or a payment IMS holds that is not on the order yet), when WooCommerce then
+ * shows the order CHANGED (more or fewer units, an added item, a different unit price). The gateway may have charged the old total or the new one, and IMS cannot tell which, so the wording must not say "collect the
+ * difference" (the customer may already have paid it) and must not say "undo" first. `direction` words the old-total case: an increase is collected, a reduction is refunded. SKUs, quantities and amounts only.
+ */
+export function wcPaidInWooQuery(
+  wmsOrder: string | null,
+  imsOrder: string,
+  changes: ReadonlyArray<string>,
+  figures: { wcTotal: string | null; imsTotal: string | null; currency: string | null; direction: 'increase' | 'reduction' | 'both'; paidSource: 'woo' | 'ims' },
+): string {
+  const where = wmsOrder ? ` (warehouse order ${wmsOrder})` : ''
+  const ccy = figures.currency ? ` ${figures.currency}` : ''
+  const shows = figures.paidSource === 'woo' ? 'WooCommerce shows it paid' : 'A payment is recorded against it'
+  const amounts = figures.wcTotal !== null && figures.imsTotal !== null
+    ? ` at ${figures.wcTotal}${ccy}; IMS holds ${figures.imsTotal}${ccy} and has not recorded the payment`
+    : '; IMS has not recorded the payment'
+  const oldTotal = figures.direction === 'increase' ? 'collect the difference from the customer' : figures.direction === 'reduction' ? 'refund the difference to the customer' : 'settle the difference with the customer'
+  return `IMS order ${imsOrder}${where}: ${shows}${amounts}. The order was then changed in WooCommerce: ${changes.join('; ')}. IMS changed nothing and sent nothing to the warehouse. `
+    + `Check what the payment gateway charged. If it charged the new total, edit the IMS order to match WooCommerce (the payment is then recorded). If it charged the old total, ${oldTotal} or undo the edit in WooCommerce. `
+    + 'Do not ship goods that are not paid for.'
 }
 
 /**

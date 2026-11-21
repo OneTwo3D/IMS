@@ -220,7 +220,7 @@ export async function wcFetch(
   path: string,
   params: Record<string, string> = {},
   creds?: ConnectorCredentials | null,
-  readOptions: { refuseRedirects?: boolean } = {},
+  readOptions: { refuseRedirects?: boolean; /** Aborts the request (a caller's own deadline), in addition to the per-request timeout. */ signal?: AbortSignal } = {},
 ): Promise<{ data: unknown; totalPages: number; totalItems: number; /** True only when the store actually sent an X-WP-Total header (an absent one reads as 0 in `totalItems`). */ totalItemsPresent?: boolean; error?: string; /** The store's `Retry-After` on a failed response, in milliseconds (absent when it sent none or an unreadable one). */ retryAfterMs?: number }> {
   const credentials = creds === undefined ? await getWcCredentials() : creds
   if (!credentials) {
@@ -239,7 +239,7 @@ export async function wcFetch(
   const auth = Buffer.from(`${safeCredentials.key}:${safeCredentials.secret}`).toString('base64')
   const res = await connectorFetch(url, {
     headers: { Authorization: `Basic ${auth}` },
-    signal: wcRequestSignal(),
+    signal: readOptions.signal ? AbortSignal.any([wcRequestSignal(), readOptions.signal]) : wcRequestSignal(),
   }, {
     connectorName: 'WooCommerce',
     // READS ONLY. Lets the order-import rehearsal (scripts/rehearse-woo-import.ts) point this very code

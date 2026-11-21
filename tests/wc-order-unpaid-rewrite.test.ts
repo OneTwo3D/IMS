@@ -456,3 +456,134 @@ test('M3: a continued line whose product changed has its live pegs ended before 
   const update = src.indexOf('await tx.salesOrderLine.update({ where: { id: lineId }')
   assert.ok(pegs > 0 && update > pegs, 'pegs of product-changed lines are ended before the lines are updated')
 })
+
+// ---------------------------------------------------------------------------------------------------------------------------------------
+// o3d-ewe4y / o3d-9x6wk follow-ups: paid in WooCommerce only (wording, reductions), latest edit wins for paid additions, refusals after an IMS edit
+// ---------------------------------------------------------------------------------------------------------------------------------------
+
+const wcPaidTotal = (qty: number, total: string): WcFullOrder => ({ ...(wcPaidDate(qty) as object), total }) as unknown as WcFullOrder
+const wcFacts = (over: Partial<AmendmentFacts> = {}) => facts({ paidAt: null, totalForeign: '60.00', currency: 'GBP', ...over })
+
+test('MED-1: an order paid in WooCommerce only, increased: the task asks what the gateway charged (never just "collect the difference")', async () => {
+  const { d, calls } = deps(wcFacts(), { writeOn: true })
+  await applyWcOrderAmendment('o1', wcPaidTotal(7, '84.00'), up, 'fp', d)
+  assert.equal(calls.tasks.length, 1)
+  assert.equal(calls.tasks[0]!.reason, 'WC_PAID_INCREASE')
+  const text = String(calls.tasks[0]!.queryText)
+  assert.match(text, /WooCommerce shows it paid at 84\.00 GBP; IMS holds 60\.00 GBP and has not recorded the payment/)
+  assert.match(text, /Check what the payment gateway charged\. If it charged the new total, edit the IMS order to match WooCommerce/)
+  assert.match(text, /If it charged the old total, collect the difference from the customer or undo the edit/)
+  assert.match(text, /RED: quantity is 7 in WooCommerce against 5 in IMS \(2 more\)/)
+  assert.doesNotMatch(text, /Please collect the difference/)
+  assert.match(String(calls.tasks[0]!.dedupeBasis), /^wc-paid-in-woo:/, 'a different dedupe family from the paid-in-IMS task')
+  // An order paid in IMS keeps the original wording.
+  const imsPaid = deps(facts({ paidAt: paid }), { writeOn: true })
+  await applyWcOrderAmendment('o1', wcPaid(7), up, 'fp', imsPaid.d)
+  assert.match(String(imsPaid.calls.tasks[0]!.queryText), /Please collect the difference from the customer, or undo the edit/)
+  assert.match(String(imsPaid.calls.tasks[0]!.dedupeBasis), /^wc-paid-increase:/)
+})
+
+test('MED-1: a payment IMS holds that is not on the paid fields (no paid date on the update) is paid-in-WooCommerce handling too, worded for the payment', async () => {
+  const { d, calls } = deps(wcFacts({ imsPaymentUnrecorded: true }), { writeOn: true, rewriteOn: true })
+  await applyWcOrderAmendment('o1', wcPaid(7), up, 'fp', d)
+  assert.equal(calls.rewrites.length, 0, 'never rewritten')
+  assert.equal(calls.tasks.length, 1)
+  assert.match(String(calls.tasks[0]!.queryText), /A payment is recorded against it/)
+  const rewriteOnly = deps(wcFacts({ imsPaymentUnrecorded: true }), { writeOn: false, rewriteOn: true })
+  assert.deepEqual(await applyWcOrderAmendment('o1', wcPaid(7), up, 'fp', rewriteOnly.d), { kind: 'off' })
+})
+
+test('MED-2: a REDUCTION on an order paid in WooCommerce only is the same task (not "order not paid" left on the list), with the reduction wording and no refund', async () => {
+  const plan = planWcOrderAmendment(wcPaidDate(3), diffs, wcFacts({ paidInWoo: true }))
+  assert.deepEqual(plan.paidInWooReductions, ['RED: quantity is 3 in WooCommerce against 5 in IMS (2 fewer)'])
+  assert.equal(plan.leftForPerson.some((t) => /order not paid/.test(t)), false)
+  const { d, calls } = deps(wcFacts({ paidBlockOpen: true }), { writeOn: true })
+  const out = await applyWcOrderAmendment('o1', wcPaidTotal(3, '36.00'), [...diffs, { field: 'TOTAL', label: 'Order total (including tax) changed in WooCommerce', woocommerce: '36.00', ims: '60.00' }], 'fp', d)
+  assert.equal(out.kind, 'applied')
+  assert.equal(calls.refunds, 0, 'IMS holds no payment to refund against')
+  assert.equal(calls.rewrites.length, 0)
+  assert.equal(calls.tasks.length, 1)
+  assert.equal(calls.tasks[0]!.reason, 'WC_PAID_INCREASE')
+  const text = String(calls.tasks[0]!.queryText)
+  assert.match(text, /RED: quantity is 3 in WooCommerce against 5 in IMS \(2 fewer\)/)
+  assert.match(text, /Order total \(including tax\) is 36\.00 in WooCommerce against 60\.00 in IMS \(24\.00 less\)/)
+  assert.match(text, /If it charged the old total, refund the difference to the customer or undo the edit/)
+  // With no warehouse order the same text is a refused action.
+  const noLink = deps(wcFacts({ paidBlockOpen: true }), { writeOn: true, hasLink: false })
+  await applyWcOrderAmendment('o1', wcPaidTotal(3, '36.00'), diffs, 'fp', noLink.d)
+  assert.equal(noLink.calls.refusals[0]!.gate, WC_PAID_INCREASE_GATE)
+  assert.match(String(noLink.calls.refusals[0]!.detail), /Check what the payment gateway charged/)
+  // The refusal is not resolved while the reduction stands.
+  assert.equal(noLink.calls.resolved.includes(WC_PAID_INCREASE_GATE), false)
+})
+
+test('MED-2: a LOWER unit price on an order paid in WooCommerce only is the task; on an order paid in IMS it stays on the list', () => {
+  const lower: DivergenceDifference[] = [{ field: 'LINE_PRICE', label: 'Unit price (excluding tax) of RED changed in WooCommerce', woocommerce: '8.00', ims: '10.00' }]
+  assert.equal(planWcOrderAmendment(wcPaidDate(5), lower, wcFacts({ paidInWoo: true })).paidInWooReductions.length, 1)
+  const imsPaid = planWcOrderAmendment(wcPaid(5), lower, facts({ paidAt: paid }))
+  assert.equal(imsPaid.paidInWooReductions.length + imsPaid.increases.length, 0)
+})
+
+test('9x6wk L1: latest edit wins for a paid ADDED item and a higher price: after an IMS edit only an item the baseline did not show counts, and a price never does', () => {
+  const edited = new Date('2026-11-19T09:00:00Z')
+  const added = (id: number): DivergenceDifference[] => [{ field: 'LINE_ADDED', label: 'Item GRN was added in WooCommerce', woocommerce: '1 x GRN at 8.00 each', ims: 'not on the order', externalLineItemId: id }]
+  // WooCommerce showed item 88 at the IMS edit (IMS removed it since): not a WooCommerce increase.
+  assert.equal(planWcOrderAmendment(wcPaid(5), added(88), facts({ paidAt: paid, editedInImsAt: edited, baselineQtyByExternalLineId: new Map([[77, 5], [88, 1]]) })).increases.length, 0)
+  // An item the baseline did not hold: WooCommerce added it after the IMS edit.
+  assert.equal(planWcOrderAmendment(wcPaid(5), added(99), facts({ paidAt: paid, editedInImsAt: edited, baselineQtyByExternalLineId: new Map([[77, 5], [88, 1]]) })).increases.length, 1)
+  // No baseline, or no item id on the difference: IMS wins.
+  assert.equal(planWcOrderAmendment(wcPaid(5), added(99), facts({ paidAt: paid, editedInImsAt: edited, baselineQtyByExternalLineId: null })).increases.length, 0)
+  assert.equal(planWcOrderAmendment(wcPaid(5), [{ ...added(99)[0]!, externalLineItemId: undefined }], facts({ paidAt: paid, editedInImsAt: edited, baselineQtyByExternalLineId: new Map([[77, 5]]) })).increases.length, 0)
+  // An order nobody edited in IMS: unchanged behaviour.
+  assert.equal(planWcOrderAmendment(wcPaid(5), added(99), facts({ paidAt: paid })).increases.length, 1)
+  const higher: DivergenceDifference[] = [{ field: 'LINE_PRICE', label: 'Unit price (excluding tax) of RED changed in WooCommerce', woocommerce: '12.00', ims: '10.00' }]
+  assert.equal(planWcOrderAmendment(wcPaid(5), higher, facts({ paidAt: paid, editedInImsAt: edited, baselineQtyByExternalLineId: new Map([[77, 5]]) })).increases.length, 0, 'a price has no baseline: after an IMS edit it cannot be attributed to WooCommerce')
+  assert.equal(planWcOrderAmendment(wcPaid(5), higher, facts({ paidAt: paid })).increases.length, 1)
+})
+
+test('MED-3: an unpaid order edited in IMS that now differs in price, shipping or discount is REFUSED visibly (a tax or total difference alone, or quantities WooCommerce did not change, stay quiet)', async () => {
+  const baseline = new Map([[77, 3]])
+  const imsEdited = () => facts({ editedInImsAt: new Date(), baselineQtyByExternalLineId: baseline })
+  for (const field of ['LINE_PRICE', 'SHIPPING', 'DISCOUNT', 'LINE_PRODUCT'] as const) {
+    const { d, calls } = deps(imsEdited())
+    const out = await applyWcOrderAmendment('o1', wcOrder(), [{ field, label: `The ${field} changed in WooCommerce`, woocommerce: '9.00', ims: '7.00' }], 'fp', d)
+    assert.equal(out.kind, 'skipped', field)
+    assert.equal(calls.refusals.length, 1, `${field} is refused`)
+    assert.equal(calls.refusals[0]!.gate, WC_REWRITE_REFUSED_GATE)
+    assert.equal(calls.refusals[0]!.action, 'WC_ORDER_REWRITE')
+    assert.match(String(calls.refusals[0]!.detail), /cannot tell whether WooCommerce changed them afterwards/)
+    assert.equal(calls.rewrites.length + calls.claims, 0, 'nothing written, no claim')
+  }
+  for (const field of ['TAX', 'TOTAL', 'LINE_QUANTITY'] as const) {
+    const { d, calls } = deps(imsEdited())
+    await applyWcOrderAmendment('o1', wcOrder(), [{ field, label: 'x', woocommerce: '9.00', ims: '7.00' }], 'fp', d)
+    assert.equal(calls.refusals.length + calls.claims + calls.rewrites.length, 0, `${field} alone is quiet`)
+  }
+})
+
+test('M2 (killing): an item WooCommerce added since the baseline counts as a change even at quantity 0 (the added-item line is not redundant with the quantity comparison)', () => {
+  const withZero = { line_items: [{ id: 77, quantity: 3 }, { id: 99, quantity: 0 }] } as unknown as WcFullOrder
+  assert.equal(wcChangedSinceBaseline(withZero, { baselineQtyByExternalLineId: new Map([[77, 3]]) }), true)
+  assert.equal(wcChangedSinceBaseline({ line_items: [{ id: 77, quantity: 3 }] } as unknown as WcFullOrder, { baselineQtyByExternalLineId: new Map([[77, 3]]) }), false)
+  // An item removed since: a baseline id WooCommerce no longer shows, with the rest unchanged.
+  assert.equal(wcChangedSinceBaseline({ line_items: [{ id: 77, quantity: 3 }] } as unknown as WcFullOrder, { baselineQtyByExternalLineId: new Map([[77, 3], [88, 0]]) }), true)
+})
+
+test('9x6wk L3: a line total ABOVE its subtotal (the importer would clamp the discount to 0 and the figures would disagree) is refused beyond half a minor unit', () => {
+  const over: Item = { ...A, subtotal: '20.00', total: '21.00', tax: '4.20' }
+  const r = refused(planUnpaidRewrite(input({ items: [over, B] })))
+  assert.equal(r.code, 'BAD_LINE')
+  assert.match(r.detail, /above its subtotal/)
+  const rounding: Item = { ...A, subtotal: '20.00', total: '20.004', tax: '4.00' }
+  assert.notEqual((planUnpaidRewrite(input({ items: [rounding, B] })) as { code?: string }).code, 'BAD_LINE', 'under half a penny is rounding')
+})
+
+test('9x6wk L4: with no shipping line on the payload the shipping method fields are cleared, not left stale', () => {
+  const noShipping = { ...input({ shipping: '0.00', shippingTax: '0.00' }), shipping: null }
+  const plan = ok(planUnpaidRewrite(noShipping))
+  assert.equal(plan.order.shippingService, null)
+  assert.equal(plan.order.courierKey, null)
+  assert.equal(plan.order.shippingMethodId, null)
+  const withShipping = ok(planUnpaidRewrite(input()))
+  assert.equal(withShipping.order.shippingService, 'Flat')
+})

@@ -5538,7 +5538,9 @@ export async function syncNewWcOrders(
   // Comparisons deferred for an unrecorded refund are resolved here in EVERY mode, the ordinary poll included (it sweeps no refunds): the deferral is a durable row, so this is a retry that survives a restart.
   // It runs AFTER the cursor commit, never before: each live read is a WooCommerce request, and a slow or hung one must not stand between a finished walk and its cursor. It has its own wall-clock budget
   // (under the proxy's 60 s read timeout), never throws and never holds the cursor.
-  await drainDeferredWcOrderDivergences()
+  const drained = await drainDeferredWcOrderDivergences()
+  // The drain never throws and never holds the cursor, but a failure of its own is reported here instead of only in the server log (o3d-hu8g9 LOW 5): a warning, not an error (the run's work committed).
+  if (drained.failed) (result.warnings ??= []).push('The drain of deferred WooCommerce order comparisons failed (see the server log); the rows stay for the next run.')
 
   if (result.synced > 0) {
     await logActivity({
