@@ -77,6 +77,10 @@ export const SALES_DISCOUNT_APPORTION_KEY = 'sales_order_discount_tax_apportion_
 export const STOREFRONT_EMAIL_SWITCH_KEY = 'storefront_customer_email_enabled'
 export const STOREFRONT_EMAIL_ENABLED_AT_KEY = 'storefront_customer_email_enabled_at'
 
+// The first-load archive command's write switch (scripts/first-load-<wms>-archive.ts reads it from the target with the import proof, `=== 'true'`).
+// Off by default; turned on only at the owner's go for the one run at the cut-over, and back off afterwards. ADMIN: it lets a command write to the LIVE warehouse.
+export const FIRST_LOAD_WMS_ARCHIVE_SWITCH_KEY = 'first_load_mintsoft_archive_enabled' // wms-connector-boundary-ok: 2026-11-21: operator switch registry names the setting key
+
 export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   booleanSwitch('trackship_refire_enabled'),
   booleanSwitch('wc_withdrawal_outcome_enabled'),
@@ -106,6 +110,7 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   booleanSwitch(ASN_SEND_SUPPLIER_KEY, undefined, true),
   booleanSwitch(ASN_SUPPLIER_REQUIRED_KEY, [ASN_REQUIRED_NEEDS_SEND], true),
   { ...booleanSwitch(STOREFRONT_EMAIL_SWITCH_KEY), stampOnKey: STOREFRONT_EMAIL_ENABLED_AT_KEY, turnOnInterlock: 'storefront-customer-email' },
+  booleanSwitch(FIRST_LOAD_WMS_ARCHIVE_SWITCH_KEY, undefined, true),
 ]
 
 export const SYSTEM_SWITCH_KEYS: readonly string[] = SYSTEM_SWITCHES.map((s) => s.key)

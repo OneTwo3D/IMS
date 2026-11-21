@@ -145,6 +145,7 @@ export const PRIMITIVES: Readonly<Record<string, Primitive>> = {
   createMintsoftAsn: { family: 'mintsoft-write' },
   createMintsoftSupplier: { family: 'mintsoft-write' },
   createMintsoftBundle: { family: 'mintsoft-write' },
+  discontinueMintsoftProduct: { family: 'mintsoft-write' },
   requestMintsoftAuthSession: { family: 'mintsoft-write' },
   runWmsOrderPushSweep: { family: 'mintsoft-write' },
   scheduleWmsProductSync: { family: 'mintsoft-write' },

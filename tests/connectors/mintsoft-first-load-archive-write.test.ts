@@ -1,0 +1,154 @@
+/**
+ * The first-load Mintsoft archive WRITER (lib/connectors/mintsoft/first-load-archive-write.ts) over a LOOPBACK HTTP double: no real network
+ * (tests/no-outbound-network.cjs refuses anything but loopback). The double is a fake Mintsoft tenant holding synthetic products and stock; it records every
+ * request, implements the verified answers (a partial {ID, SKU, DisCont} body is accepted with Success:true; a full product body is refused with HTTP 200
+ * and Success:false, 'One or more pallet sizes are not valid!') and can be told to misbehave. Synthetic data only.
+ */
+import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import path from 'node:path'
+import test, { after, afterEach, before } from 'node:test'
+import { archiveHopRefusal, changedMintsoftProductFields, createMintsoftArchiveWriter, discontinueMintsoftProduct, mintsoftMessage, ARCHIVE_USER_AGENT } from '../../lib/connectors/mintsoft/first-load-archive-write.ts'
+import { KEY, configOf, fakeMintsoft as fakeTenant, grantedEnv, stockRow, syntheticProduct, type FakeTenant, type Rig } from './mintsoft-archive-fake.ts'
+import { setOutboundRefusalSink } from '../../lib/security/outbound-write-refusal-log.ts'
+
+// A held write is recorded through the refusal sink; here it is counted, never written to a database.
+const heldRecorded: string[] = []
+before(() => setOutboundRefusalSink(async (error) => { heldRecorded.push(error.code) }))
+after(() => setOutboundRefusalSink(null))
+
+const noSleep = async () => {}
+const rigs: Rig[] = []
+afterEach(async () => { for (const rig of rigs.splice(0)) await rig.close() })
+const fakeMintsoft = (tenant: FakeTenant) => fakeTenant(tenant, rigs)
+
+function tenantOf(): FakeTenant {
+  return { products: new Map([['501', syntheticProduct(501, 'SYN-A')]]), stock: { '5': [stockRow(501, 'SYN-A', 0)] } }
+}
+
+// [mutation: the body carries the full product, another field, or no User-Agent] (the verified write shape, 2026-11-21)
+test('the discontinue request is POST /api/Product with exactly {ID, SKU, DisCont: true}, the key only in ms-apikey, a User-Agent, and Success:true is accepted', async () => {
+  const rig = await fakeMintsoft(tenantOf())
+  const writer = createMintsoftArchiveWriter(configOf(rig), { env: grantedEnv(rig), sleep: noSleep })
+  const answer = await writer.setDiscontinued('501', 'SYN-A')
+  assert.deepEqual(answer, { ok: true, value: { accepted: true, message: 'Product Successfully Updated!' } })
+  assert.equal(rig.seen.length, 1)
+  assert.equal(rig.seen[0]!.method, 'POST')
+  assert.equal(rig.seen[0]!.url, '/api/Product')
+  assert.deepEqual(JSON.parse(rig.seen[0]!.body), { ID: 501, SKU: 'SYN-A', DisCont: true })
+  assert.deepEqual(Object.keys(JSON.parse(rig.seen[0]!.body)), ['ID', 'SKU', 'DisCont'])
+  assert.equal(rig.seen[0]!.apikey, KEY)
+  assert.equal(rig.seen[0]!.ua, ARCHIVE_USER_AGENT)
+  assert.ok(!rig.seen[0]!.url.includes(KEY))
+  assert.equal(rig.tenant.products.get('501')!.DisCont, true)
+})
+
+// [mutation: HTTP 200 is read as success] (the pallet-size refusal of a full body, and any Success:false, come back as 200)
+test('HTTP 200 with Success:false is NOT accepted: the pallet-size refusal shape and any other Success:false; a 200 without the body is a failure', async () => {
+  const pallet = await fakeMintsoft({ ...tenantOf(), onPost: () => ({ body: { Success: false, Message: 'One or more pallet sizes are not valid!', ID: 501 } }) })
+  const refused = await discontinueMintsoftProduct(configOf(pallet), '501', 'SYN-A', { env: grantedEnv(pallet) })
+  assert.deepEqual(refused, { ok: true, value: { accepted: false, message: 'One or more pallet sizes are not valid!' } })
+  const noBody = await fakeMintsoft({ ...tenantOf(), onPost: () => ({ body: [] }) })
+  const r = await discontinueMintsoftProduct(configOf(noBody), '501', 'SYN-A', { env: grantedEnv(noBody) })
+  assert.equal(r.ok, false)
+  const server = await fakeMintsoft({ ...tenantOf(), onPost: () => ({ status: 500, body: { Success: true } }) })
+  const s = await discontinueMintsoftProduct(configOf(server), '501', 'SYN-A', { env: grantedEnv(server) })
+  assert.deepEqual(s, { ok: false, problem: 'Mintsoft answered HTTP 500' })
+})
+
+// [mutation: the writer bypasses the outbound-write grant or the producer hold]
+test('without the outbound-write grant, or while the producer hold is enforced and Mintsoft is not live, the POST never leaves (the double sees nothing)', async () => {
+  const rig = await fakeMintsoft(tenantOf())
+  const noGrant = await discontinueMintsoftProduct(configOf(rig), '501', 'SYN-A', { env: { E2E_TEST_MODE: '1', NODE_ENV: 'test' } })
+  assert.equal(noGrant.ok, false)
+  assert.match((noGrant as { problem: string }).problem, /held before it left IMS: the outbound-write grant/)
+  const otherTenant = await discontinueMintsoftProduct(configOf(rig), '501', 'SYN-A', { env: { E2E_TEST_MODE: '1', NODE_ENV: 'test', MINTSOFT_WRITE_ALLOWED: `${rig.base}|90` } })
+  assert.equal(otherTenant.ok, false)
+  const held = await discontinueMintsoftProduct(configOf(rig), '501', 'SYN-A', { env: { ...grantedEnv(rig), PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'all' } })
+  assert.equal(held.ok, false)
+  assert.match((held as { problem: string }).problem, /producer hold is enforced/)
+  // The per-hop gate composes the producer hold too: with the precheck's environment clear but the process holding, the hop is refused.
+  const before = process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+  process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = 'all'
+  try {
+    const hop = await discontinueMintsoftProduct(configOf(rig), '501', 'SYN-A', { env: grantedEnv(rig) })
+    assert.equal(hop.ok, false)
+  } finally {
+    if (before === undefined) delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+    else process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = before
+  }
+  assert.deepEqual(rig.seen, [], 'nothing reached the tenant')
+  assert.ok(heldRecorded.length >= 1, 'the transport recorded the held write')
+  assert.equal(rig.tenant.products.get('501')!.DisCont, false)
+})
+
+// [mutation: the hop gate admits another path, method, parameter, origin or a redirect]
+test('the hop gate admits exactly GET /api/Product/{id}, GET /api/Product/StockLevels?WarehouseId and POST /api/Product, on the connection origin, no redirect', () => {
+  const base = new URL('https://ms.example.test/base')
+  const hop = (method: string, url: string, redirectCount = 0) => archiveHopRefusal(base, { method, url: new URL(url), redirectCount })
+  assert.equal(hop('GET', 'https://ms.example.test/base/api/Product/501'), null)
+  assert.equal(hop('GET', 'https://ms.example.test/base/api/Product/StockLevels?WarehouseId=5'), null)
+  assert.equal(hop('POST', 'https://ms.example.test/base/api/Product'), null)
+  assert.equal(hop('PUT', 'https://ms.example.test/base/api/Product'), 'method')
+  assert.equal(hop('DELETE', 'https://ms.example.test/base/api/Product/501'), 'method')
+  assert.equal(hop('POST', 'https://ms.example.test/base/api/Auth'), 'path')
+  assert.equal(hop('POST', 'https://ms.example.test/base/api/Product/501'), 'path')
+  assert.equal(hop('GET', 'https://ms.example.test/base/api/Order/5/Cancel'), 'path')
+  assert.equal(hop('GET', 'https://ms.example.test/base/api/Product/List?PageNo=1&Limit=100'), 'path')
+  assert.equal(hop('POST', 'https://ms.example.test/base/api/Product?x=1'), 'parameter')
+  assert.equal(hop('GET', 'https://ms.example.test/base/api/Product/501?x=1'), 'parameter')
+  assert.equal(hop('GET', 'https://ms.example.test/base/api/Product/StockLevels?WarehouseId=a'), 'parameter')
+  assert.equal(hop('GET', 'https://ms.example.test/base/api/Product/StockLevels?WarehouseId=5&x=1'), 'parameter')
+  assert.equal(hop('GET', 'https://other.example.test/base/api/Product/501'), 'origin')
+  assert.equal(hop('GET', 'https://ms.example.test/api/Product/501'), 'path')
+  assert.equal(hop('GET', 'https://ms.example.test/base/api/Product/501', 1), 'redirect')
+  // The producer hold's per-hop gate is composed in the transport call (the census entry MINT_OPERATOR_TRANSPORT relies on it).
+  const source = readFileSync(path.join(process.cwd(), 'lib/connectors/mintsoft/first-load-archive-write.ts'), 'utf8')
+  assert.match(source, /hopGate: \(hop\) => archiveHopRefusal\(new URL\(config\.baseUrl\), hop\) \?\? mintsoftHopGate\(hop\)/)
+})
+
+test('the product read gives id, SKU exactly, bundle, flag and client; the stock read sums the configured warehouses and says whether a row exists', async () => {
+  const tenant = tenantOf()
+  tenant.products.set('502', syntheticProduct(502, 'SYN-B ', { Bundle: true, DisCont: undefined, ClientId: 90 }))
+  tenant.stock['6'] = [stockRow(501, 'SYN-A', 2, 6)]
+  const rig = await fakeMintsoft(tenant)
+  const writer = createMintsoftArchiveWriter(configOf(rig, ['5', '6']), { env: grantedEnv(rig), sleep: noSleep })
+  const a = await writer.readProduct('501')
+  assert.ok(a.ok)
+  assert.deepEqual({ ...a.value, snapshot: undefined }, { productId: '501', sku: 'SYN-A', bundle: false, discontinued: false, ownClient: true, snapshot: undefined })
+  const b = await writer.readProduct('502')
+  assert.ok(b.ok)
+  assert.deepEqual([b.value.sku, b.value.bundle, b.value.discontinued, b.value.ownClient], ['SYN-B ', true, null, false])
+  assert.deepEqual(await writer.readProduct('503'), { ok: false, problem: 'Mintsoft answered HTTP 404' })
+  assert.deepEqual(await writer.readStock('501', 'SYN-A'), { ok: true, value: { stockRow: true, onHand: 2 } })
+  assert.deepEqual(await writer.readStock('502', 'SYN-B '), { ok: true, value: { stockRow: false, onHand: 0 } })
+  assert.ok(rig.seen.every((s) => s.method === 'GET' && s.ua === ARCHIVE_USER_AGENT && s.apikey === KEY))
+})
+
+test('the writer paces every request (the interval between any two), never before the first', async () => {
+  const rig = await fakeMintsoft(tenantOf())
+  const waits: number[] = []
+  const writer = createMintsoftArchiveWriter(configOf(rig), { env: grantedEnv(rig), sleep: async (ms) => { waits.push(ms) }, minIntervalMs: 1234 })
+  await writer.readProduct('501')
+  await writer.readStock('501', 'SYN-A')
+  await writer.setDiscontinued('501', 'SYN-A')
+  assert.deepEqual(waits, [1234, 1234])
+})
+
+// [mutation: a changed field is not reported, or LastUpdated / DisCont are reported]
+test('changedFields names every other field that differs or appears on one side only; DisCont, LastUpdated and LastUpdatedByUser are ignored', () => {
+  const before = syntheticProduct(501, 'SYN-A')
+  assert.deepEqual(changedMintsoftProductFields(before, { ...before, DisCont: true, LastUpdated: 'x', LastUpdatedByUser: 'y' }), [])
+  assert.deepEqual(changedMintsoftProductFields(before, { ...before, CommodityCode: { Code: '0000000000' } }), [], 'equal nested values')
+  assert.deepEqual(changedMintsoftProductFields(before, { ...before, PalletSizes: '', Weight: 0.3, ProductCustomFields: [] }), ['PalletSizes', 'ProductCustomFields', 'Weight'])
+  const withoutDescription = Object.fromEntries(Object.entries(before).filter(([k]) => k !== 'Description'))
+  assert.deepEqual(changedMintsoftProductFields(before, withoutDescription), ['Description'])
+  assert.deepEqual(changedMintsoftProductFields(before, { ...before, Extra: 1 }), ['Extra'])
+  assert.deepEqual(changedMintsoftProductFields(before, null), ['(the product answer is not an object)'])
+})
+
+test('Mintsoft\'s message is shown printable and short', () => {
+  assert.equal(mintsoftMessage('ok\u0000\u001b[2Jdone'), 'ok  [2Jdone')
+  assert.equal(mintsoftMessage(undefined), '(no message)')
+  assert.equal(mintsoftMessage('x'.repeat(300)).length, 203)
+})

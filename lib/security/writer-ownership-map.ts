@@ -226,6 +226,13 @@ export const WRITER_OWNERSHIP_MAP = [
     obligationTime: 'not-applicable',
     note: 'Owner answer 3: product content is authored in WooCommerce and flows Woo -> IMS -> Mintsoft; the plugin\'s Python product sync is retired at P2.',
   }),
+  // A ONE-OFF OPERATOR-RUN WRITE AT THE CUT-OVER, not an application writer: the first-load archive command (scripts/first-load-mintsoft-archive.ts
+  // --execute) sets DisCont on the products the owner set to Archived. It runs at step M, by an operator, behind its own switch.
+  row('mintsoft', 'product.discontinue', { P1: 'operator-manual', P2: 'IMS' }, {
+    step: 'mintsoft',
+    obligationTime: 'not-applicable',
+    note: 'Owner addition 2026-11-21 (lifecycle review): every product the owner sets to Archived is also discontinued (DisCont) in Mintsoft. P1: the owner sets DisCont by hand in Mintsoft. P2 (step M, cut-over): the IMS operator command first-load:mintsoft-archive --execute, run ONCE by an operator after the woo-mintsoft plugin product sync is retired (it may reset DisCont), behind the switch first_load_mintsoft_archive_enabled (default off) and the outbound-write grant. No application path writes it.',
+  }),
   row('mintsoft', 'product.content', { P1: 'woo-mintsoft-plugin', P2: 'IMS' }, {
     step: 'mintsoft',
     obligationTime: 'not-applicable',

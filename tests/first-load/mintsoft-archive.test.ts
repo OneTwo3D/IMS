@@ -1,7 +1,8 @@
 /**
  * `first-load:mintsoft-archive`: the dry-run planner for archiving, in the WMS, every product the owner set to Archived on the lifecycle review sheet.
- * Synthetic data only: the WooCommerce store is the review fixture's local fake and the WMS census is a FAKE reader (no request of any kind); the
- * connector's own census reader is tested over a loopback double in tests/connectors/mintsoft-lifecycle-review-read.test.ts.
+ * Synthetic data only: the review fixture's inputs are local files and the WMS census is a FAKE reader (no request of any kind). The connector's own
+ * census reader (readMintsoftProductCensus, with the bundle flag the planner refuses on) is tested over a loopback double in
+ * tests/connectors/mintsoft-lifecycle-review-read.test.ts; the write half (--execute) in tests/first-load/mintsoft-archive-write.test.ts.
  */
 import assert from 'node:assert/strict'
 import { readFileSync, writeFileSync } from 'node:fs'
@@ -52,9 +53,9 @@ function census(change?: (c: { products: Array<WmsCensus['products'][number]>; p
     { sku: 'OLD-1', productId: '15', bundle: false, status: 'active' },
     { sku: 'VAR-02', productId: '17', bundle: true, status: 'active' },
   ]
-  const physical = new Map([['NEW-ARCH', 3], ['SIM-DRAFT', 2]])
+  const physical = new Map([['NEW-ARCH', 3], ['SIM-DRAFT', 2], ['SIM-PRIV', 0], ['VAR-02', 0]])
   change?.({ products, physical })
-  return { products, physical, warehouses: ['5'] }
+  return { products, physical, warehouses: ['5'], clientId: '89', origin: 'https://ms.example.test' }
 }
 function reader(c: WmsCensus | (() => never) = census(), calls: string[] = []): WmsCensusReader {
   return { flag: '--mintsoft-env-file', label: 'Mintsoft', read: async (file) => { calls.push(file); return typeof c === 'function' ? c() : c } }
@@ -80,7 +81,7 @@ test('the dry run lists every Archived SKU with the Mintsoft product id, the cur
   assert.deepEqual(rowOf(r.stdout, 'VAR-02')!.slice(0, 5), ['VAR-02', 'REFUSED_BUNDLE', '17', 'false', '0'])
   assert.deepEqual(rowOf(r.stdout, 'NEW-1')!.slice(0, 5), ['NEW-1', 'REFUSED_NOT_FOUND', '-', '-', '-'])
   assert.match(r.stdout, /NEW-1 .*Mintsoft still holds the pre-rename SKU "OLD-1": fix the SKU there first/)
-  assert.match(r.stdout, /would archive 1; already discontinued 1; not a Mintsoft product 0; refused 3 \(not found 1, bundle 1, no flag 0, stock 1\)/)
+  assert.match(r.stdout, /would archive 1; already discontinued 1; not a Mintsoft product 0; refused 3 \(not found 1, bundle 1, no flag 0, no stock row 0, stock 1\)/)
   assert.match(r.stdout, /plan token: MSA-[0-9a-f]{16} /)
 })
 
@@ -101,11 +102,18 @@ test('only Archived decisions are planned; a plan with nothing refused exits 0; 
   assert.deepEqual(rowOf(unflagged.stdout, 'SIM-PRIV')!.slice(0, 5), ['SIM-PRIV', 'REFUSED_FLAG_NOT_STATED', '13', '-', '0'])
 })
 
-test('--execute is refused before anything is read: the write is not built', async () => {
+// [mutation: a missing stock row reads as 0] (#1126 R1 LOW)
+test('a Mintsoft product with no stock row in any configured warehouse is refused (no stock row), never read as stock 0', async () => {
+  const r = await run(['--manifest', manifestWith({ 'SIM-PRIV': ['Archived'] }), ...ENV], reader(census((c) => c.physical.delete('SIM-PRIV'))))
+  assert.equal(r.code, EXIT_CODES.BLOCKING_FINDINGS)
+  assert.deepEqual(rowOf(r.stdout, 'SIM-PRIV')!.slice(0, 5), ['SIM-PRIV', 'REFUSED_NO_STOCK_ROW', '13', 'false', 'none'])
+})
+
+test('--execute without a wired writer and target is refused before anything is read', async () => {
   const calls: string[] = []
-  const r = await run(['--manifest', manifestWith(ALL_ARCHIVED), ...ENV, '--execute'], reader(census(), calls))
+  const r = await run(['--manifest', manifestWith(ALL_ARCHIVED), ...ENV, '--execute', '--plan-token', 'MSA-0123456789abcdef', '--env-file', 'x', '--expect-db', 'd', '--expect-system-id', '1', '--operator', 'Synthetic'], reader(census(), calls))
   assert.equal(r.code, EXIT_CODES.USAGE)
-  assert.match(r.stderr, /--execute is refused: the Mintsoft write is NOT BUILT/)
+  assert.match(r.stderr, /--execute is not wired/)
   assert.deepEqual(calls, [])
   assert.equal(r.stdout, '')
 })
@@ -145,19 +153,58 @@ test('usage: --manifest and the credentials file are required, an unknown option
   for (const row of WMS_ARCHIVE_EXIT_CODE_TABLE) assert.ok(help.stdout.includes(`  ${row.code}  ${row.name}: `), row.name)
 })
 
-test('the plan: a VARIABLE parent and a NON_INVENTORY product the WMS does not hold are skipped; a case-only near match is named, never matched; non-decision ARCHIVED is not planned', () => {
-  const entry = (sku: string, type: CatalogueEntry['type'], lifecycleSource: CatalogueEntry['lifecycleSource'] = 'decision'): CatalogueEntry => ({ sku, name: sku, type, parentSku: '', lifecycle: 'ARCHIVED', lifecycleSource })
+const entry = (sku: string, type: CatalogueEntry['type'], lifecycleSource: CatalogueEntry['lifecycleSource'] = 'decision'): CatalogueEntry => ({ sku, name: sku, type, parentSku: '', lifecycle: 'ARCHIVED', lifecycleSource })
+const baseCensus = (over: Partial<WmsCensus> = {}): WmsCensus => ({ products: [{ sku: 'A-1', productId: '9', bundle: false, status: 'active' }], physical: new Map([['A-1', 0]]), warehouses: ['5'], clientId: '89', origin: 'https://ms.example.test', ...over })
+const planOf = (over: Partial<Parameters<typeof buildArchivePlan>[0]> = {}) => buildArchivePlan({ sheetId: 'LR-0123456789abcdef', catalogue: [entry('A-1', 'SIMPLE')], skuRenames: [], census: baseCensus(), wmsLabel: 'WMS', prepareBlocked: false, ...over })
+
+test('the plan: a VARIABLE parent is looked up (planned when the WMS holds it, skipped when not); a NON_INVENTORY product it does not hold is skipped; case-only near matches are named, never matched; non-decision ARCHIVED is not planned', () => {
   const plan = buildArchivePlan({
     sheetId: 'LR-0123456789abcdef',
-    catalogue: [entry('PARENT', 'VARIABLE'), entry('SERVICE', 'NON_INVENTORY'), entry('mug-1', 'SIMPLE'), entry('FROM-QOBLEX', 'SIMPLE', 'qoblex'), entry('FROM-WOO', 'SIMPLE', 'woo')],
+    catalogue: [entry('PARENT', 'VARIABLE'), entry('HELD-PARENT', 'VARIABLE'), entry('SERVICE', 'NON_INVENTORY'), entry('mug-1', 'SIMPLE'), entry('FROM-QOBLEX', 'SIMPLE', 'qoblex'), entry('FROM-WOO', 'SIMPLE', 'woo')],
     skuRenames: [],
-    census: { products: [{ sku: 'MUG-1 ', productId: '9', bundle: false, status: 'active' }, { sku: 'FROM-QOBLEX', productId: '10', bundle: false, status: 'active' }], physical: new Map(), warehouses: ['5'] },
+    census: baseCensus({ products: [{ sku: 'MUG-1 ', productId: '9', bundle: false, status: 'active' }, { sku: 'FROM-QOBLEX', productId: '10', bundle: false, status: 'active' }, { sku: 'HELD-PARENT', productId: '11', bundle: false, status: 'active' }], physical: new Map([['HELD-PARENT', 0]]) }),
     wmsLabel: 'WMS',
+    prepareBlocked: false,
   })
-  assert.deepEqual(plan.rows.map((r) => [r.sku, r.outcome]), [['PARENT', 'SKIP_NOT_A_WMS_PRODUCT'], ['SERVICE', 'SKIP_NOT_A_WMS_PRODUCT'], ['mug-1', 'REFUSED_NOT_FOUND']])
-  assert.match(plan.rows[2].reason, /WMS holds "MUG-1 ", which differs only in letter case or whitespace \(never matched\)/)
+  assert.deepEqual(plan.rows.map((r) => [r.sku, r.outcome]), [['HELD-PARENT', 'WOULD_ARCHIVE'], ['PARENT', 'SKIP_NOT_A_WMS_PRODUCT'], ['SERVICE', 'SKIP_NOT_A_WMS_PRODUCT'], ['mug-1', 'REFUSED_NOT_FOUND']])
+  assert.match(plan.rows[1].reason, /a VARIABLE parent WMS does not hold under exactly this SKU/)
+  assert.match(plan.rows[3].reason, /WMS holds "MUG-1 ", which differs only in letter case or whitespace \(never matched\)/)
   assert.match(plan.token, /^MSA-[0-9a-f]{16}$/)
   assert.equal(plan.token, `MSA-${plan.digest.slice(0, 16)}`)
+})
+
+test('the pre-rename hint also names a case or whitespace variant of the pre-rename SKU', () => {
+  const plan = planOf({ catalogue: [entry('NEW-SKU', 'SIMPLE')], skuRenames: [{ from: 'OLD-SKU', to: 'NEW-SKU' }], census: baseCensus({ products: [{ sku: 'old-sku', productId: '9', bundle: false, status: 'active' }] }) })
+  assert.equal(plan.rows[0].outcome, 'REFUSED_NOT_FOUND')
+  assert.match(plan.rows[0].reason, /WMS holds "old-sku", which differs from the pre-rename SKU "OLD-SKU" only in letter case or whitespace: fix the SKU there first/)
+})
+
+// [mutation: any one field left out of the digest] (#1126 R1 MED: one test per digest field)
+test('the plan token changes with every field it is derived from: stock, product id, sheet id, warehouses, client id, origin, the stock row and a blocked prepare', () => {
+  const base = planOf().token
+  const variants: Array<[string, string]> = [
+    ['stock', planOf({ census: baseCensus({ physical: new Map([['A-1', -1]]) }) }).token],
+    ['productId', planOf({ census: baseCensus({ products: [{ sku: 'A-1', productId: '19', bundle: false, status: 'active' }] }) }).token],
+    ['sheetId', planOf({ sheetId: 'LR-fedcba9876543210' }).token],
+    ['warehouses', planOf({ census: baseCensus({ warehouses: ['5', '6'] }) }).token],
+    ['clientId', planOf({ census: baseCensus({ clientId: '90' }) }).token],
+    ['origin', planOf({ census: baseCensus({ origin: 'https://other.example.test' }) }).token],
+    ['stockRow', planOf({ census: baseCensus({ physical: new Map() }) }).token],
+    ['prepareBlocked', planOf({ prepareBlocked: true }).token],
+  ]
+  for (const [field, token] of variants) assert.notEqual(token, base, `${field} is part of the token`)
+  assert.equal(new Set(variants.map(([, t]) => t)).size, variants.length, 'each change gives its own token')
+  assert.equal(planOf().token, base, 'the same plan gives the same token')
+  // The stock figure itself, not only the outcome: two refused plans differing only in the stock.
+  const stocked = (n: number) => planOf({ census: baseCensus({ physical: new Map([['A-1', n]]) }) })
+  assert.equal(stocked(1).rows[0].outcome, stocked(2).rows[0].outcome)
+  assert.notEqual(stocked(1).token, stocked(2).token)
+})
+
+test('the plan records a blocked prepare (the dry run cannot be confirmed for a write)', () => {
+  const plan = planOf({ prepareBlocked: true })
+  assert.equal(plan.prepareBlocked, true)
+  assert.equal(plan.rows[0].outcome, 'WOULD_ARCHIVE')
 })
 
 test('the document states exactly the planner\'s exit codes', () => {

@@ -129,6 +129,8 @@ export const IMS_WRITER_SWITCHES: readonly Switch[] = [
   { key: 'mintsoft.order.comment', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
   { key: 'mintsoft.product.upsert', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
   { key: 'mintsoft.product.content', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
+  // The first-load archive command (an operator runs it once at the cut-over); it reads the switch from the target itself and needs no IMS connector setting.
+  { key: 'mintsoft.product.discontinue', trigger: 'operator', requires: [{ settingTrue: 'first_load_mintsoft_archive_enabled', defaultValue: 'false' }] },
   { key: 'mintsoft.product.delete', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }, { settingTrue: 'mintsoft_parent_sku_delete_enabled', defaultValue: 'false' }] },
   { key: 'mintsoft.product.bundle', trigger: 'automatic', requires: [{ plugin: 'mintsoft' }] },
   { key: 'mintsoft.asn.create', trigger: 'operator', requires: [{ plugin: 'mintsoft' }] },
