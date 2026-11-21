@@ -90,7 +90,6 @@ Database migrations:
 ## Git workflow
 - IMS PRs target `development` (`gh pr create --base development`); branch details in `docs/agent-workflow.md` and `docs/development.md`.
 - Commit messages clear and descriptive (e.g. "Add COGS recalculation on landed cost edit"). Commit and push after completing features.
-- Legacy rules still in this file, which conflict with the `development` rule above (owner to resolve): main is always production-ready and reflects the live environment; feature branches `feature/description` and bug fixes `fix/description` from main; direct commits to main after local testing (no PR process).
 
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
