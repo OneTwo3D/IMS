@@ -10,7 +10,7 @@ import type { AddressInfo } from 'node:net'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test, { after, afterEach } from 'node:test'
-import { MAX_REQUESTS, MintsoftReviewFailed, MintsoftReviewRefused, readMintsoftReviewConfig, readMintsoftReviewListing, type MintsoftReviewConfig, type MintsoftReviewDeps } from '../../lib/connectors/mintsoft/lifecycle-review-read.ts'
+import { MAX_REQUESTS, MintsoftReviewFailed, MintsoftReviewRefused, readMintsoftProductCensus, readMintsoftReviewConfig, readMintsoftReviewListing, type MintsoftReviewConfig, type MintsoftReviewDeps } from '../../lib/connectors/mintsoft/lifecycle-review-read.ts'
 
 const E2E = { E2E_TEST_MODE: '1', NODE_ENV: 'test' }
 const KEY = 'ms_fixed_key_review_0123456789_test_only'
@@ -83,6 +83,17 @@ test('the listing is read GET-only from the two allow-listed paths, the key only
   assert.equal(listing.products[7].sku, 'SYN-0007 ', 'the SKU exactly as Mintsoft holds it (the sheet flags the whitespace)')
   assert.deepEqual([...listing.physical.entries()], [['SYN-0001', 10], ['SYN-0007 ', 2]], 'joined to the product by id, summed over the warehouses')
   assert.deepEqual(listing.warehouses, ['5', '6'])
+})
+
+// [mutation: the census drops the bundle flag, or the review listing starts carrying it (its digest would change)] (first-load Mintsoft archive planner)
+test('the product census carries each product\'s bundle flag for the archive planner; the review listing stays without it', async () => {
+  const products = [...PRODUCTS.slice(0, 4), { ...PRODUCTS[4], Bundle: true }]
+  const rig = await double(tenant(products, {}))
+  const census = await readMintsoftProductCensus(config(rig), { env: E2E, sleep: noSleep })
+  assert.deepEqual(census.products.map((p) => [p.sku, p.bundle]), [['SYN-0000', false], ['SYN-0001', false], ['SYN-0002', false], ['SYN-0003', false], ['SYN-0004', true]])
+  assert.deepEqual([...new Set(rig.seen.map((s) => s.method))], ['GET'])
+  const listing = await read(await double(tenant(products, {})))
+  assert.deepEqual(Object.keys(listing.products[0]).sort(), ['productId', 'sku', 'status'])
 })
 
 test('an unreadable listing fails closed with a message that carries no key, URL or body: a page after a short page, a repeated SKU, another client, a bad flag, a stock row for an unlisted product, an error status', async () => {

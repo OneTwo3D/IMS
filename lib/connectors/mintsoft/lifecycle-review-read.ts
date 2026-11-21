@@ -121,10 +121,28 @@ export interface MintsoftReviewDeps extends Pick<MintsoftReadPortDeps, 'env' | '
   maxPages?: number
 }
 
-interface ListedProduct { sku: string; productId: string; bundle: boolean; status: 'active' | 'discontinued' | 'not stated' }
+/** One product of the proven product list, with its bundle flag (the first-load Mintsoft archive planner refuses a bundle). */
+export interface MintsoftCensusProduct { sku: string; productId: string; bundle: boolean; status: 'active' | 'discontinued' | 'not stated' }
+type ListedProduct = MintsoftCensusProduct
 
-/** Reads the listing. Any failure is a MintsoftReviewFailed with a short reason (never the key, a URL or a body). */
+export interface MintsoftProductCensus {
+  products: MintsoftCensusProduct[]
+  physical: Map<string, number>
+  warehouses: string[]
+}
+
+/** Reads the listing for the review sheet (the census without the bundle flag, so the sheet's listing digest is unchanged). */
 export async function readMintsoftReviewListing(config: MintsoftReviewConfig, deps: MintsoftReviewDeps = {}): Promise<MintsoftReviewListing> {
+  const census = await readMintsoftProductCensus(config, deps)
+  return { products: census.products.map(({ sku, productId, status }) => ({ sku, productId, status })), physical: census.physical, warehouses: census.warehouses }
+}
+
+/**
+ * Reads the proven product list (with each product's bundle flag) and the physical stock of the configured warehouses, with every completeness check above.
+ * Shared by the lifecycle review sheet and the first-load Mintsoft archive planner (scripts/first-load-mintsoft-archive.ts). Any failure is a
+ * MintsoftReviewFailed with a short reason (never the key, a URL or a body).
+ */
+export async function readMintsoftProductCensus(config: MintsoftReviewConfig, deps: MintsoftReviewDeps = {}): Promise<MintsoftProductCensus> {
   const sleep = deps.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)))
   const maxRequests = Math.min(MAX_REQUESTS, deps.maxRequests ?? MAX_REQUESTS)
   const maxPages = Math.min(MAX_PAGES, deps.maxPages ?? MAX_PAGES)
@@ -247,5 +265,5 @@ export async function readMintsoftReviewListing(config: MintsoftReviewConfig, de
     const stocked = (await stockOf(warehouse)).filter((row) => row.onHand > 0).length
     if (stocked > 0) throw new MintsoftReviewFailed(`warehouse ${warehouse} holds stock of ${stocked} product(s) but is not in ${LIFECYCLE_REVIEW_MINTSOFT_KEYS.warehouseIds}: name it there, or the sheet would show that stock as absent`)
   }
-  return { products: first.map(({ sku, productId, status }) => ({ sku, productId, status })), physical, warehouses: [...config.warehouseIds] }
+  return { products: first.map(({ sku, productId, bundle, status }) => ({ sku, productId, bundle, status })), physical, warehouses: [...config.warehouseIds] }
 }
