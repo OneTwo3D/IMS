@@ -40,7 +40,7 @@ export type WalkStatus = (typeof WALK_STATUSES)[number]
 export type StatusTotals = Record<WalkStatus, number>
 /** Only the fields the payload uses are asked for, to keep the load on a live store small (the count probes ask for `id` alone: only their X-WP-Total matters). */
 const PRODUCT_FIELDS = 'id,sku,name,type,status,manage_stock,stock_quantity,variations'
-const VARIATION_FIELDS = 'id,parent_id,sku,status,attributes'
+const VARIATION_FIELDS = 'id,parent_id,sku,status,attributes,manage_stock,stock_quantity'
 const VARIATION_ORDER = { orderby: 'id', order: 'asc' }
 const emptyStatusTotals = (): StatusTotals => ({ publish: 0, draft: 0, private: 0, pending: 0 })
 

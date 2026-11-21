@@ -7,15 +7,19 @@
  * a frozen header, an auto-filter and a hidden sheet. Writing that subset, and reading back exactly the cells the read-back needs, is small
  * enough to own and test byte for byte.
  *
- * WRITER. Every text cell is an INLINE STRING and no cell ever carries a formula element, so nothing the sheet holds is evaluated when it is
+ * WRITER. A sheet may be PROTECTED (`protect`): every cell is locked except the ones marked `unlocked`, with no password (a guard against accidents, not
+ * a security boundary: anyone can lift it in the spreadsheet's own menu). Excel then refuses a sort, an insert or a paste into a locked cell; filtering and
+ * resizing columns stay allowed. Every text cell is an INLINE STRING and no cell ever carries a formula element, so nothing the sheet holds is evaluated when it is
  * opened. A text that a spreadsheet would read as a formula when it is typed or re-imported (leading `=`, `+`, `-`, `@`, tab or carriage
  * return) is also given the `quotePrefix` style, which keeps it text if the owner edits that cell. The value itself is never altered, so a
  * SKU reads back exactly as written. Output is deterministic (fixed ZIP timestamps, fixed part order): the same sheet is the same bytes.
  *
  * READER. Reads what Excel, LibreOffice, Numbers or Google Sheets write when the owner saves the filled sheet: shared strings (rich-text runs
  * concatenated, phonetic runs ignored), inline strings, plain values, the `_xHHHH_` escapes, cell references or their absence. It reports a
- * cell that carries a formula, so the read-back can refuse a computed decision. It refuses, never guesses: an encrypted or ZIP64 archive, a
- * compression method other than stored or deflate, a part above the size cap, malformed XML.
+ * cell that carries a formula, so the read-back can refuse a computed decision. A protected sheet (its <sheetProtection>, in any program's form, with or
+ * without a password hash) reads like any other. It refuses, never guesses: an encrypted or ZIP64 archive, a compression method other than stored or
+ * deflate, a part above the size cap or inflating beyond its declared size, a local header that disagrees with the directory, malformed XML, an unknown
+ * entity, a character XML cannot carry (a lone surrogate, U+FFFD), a row or cell given twice or out of order, a row or column beyond the sheet limits.
  */
 import { crc32, deflateRawSync, inflateRawSync } from 'node:zlib'
 
@@ -37,6 +41,8 @@ export interface XCell {
   v: string | number | null
   fill?: XFill
   bold?: boolean
+  /** On a protected sheet: the cell stays editable (it is the only kind that does). An empty unlocked cell is still written, so its lock state is set. */
+  unlocked?: boolean
 }
 
 export interface XValidation {
@@ -58,7 +64,13 @@ export interface XSheet {
   freeze?: { columns: number }
   autoFilter?: boolean
   validations?: readonly XValidation[]
+  /** Protect the sheet without a password: every cell is locked except the `unlocked` ones; sorting and inserting are refused, filtering is allowed. */
+  protect?: boolean
 }
+
+/** The sheet limits of the .xlsx format (Excel's): rows 1..1048576, columns A..XFD. */
+export const XLSX_MAX_ROWS = 1_048_576
+export const XLSX_MAX_COLUMNS = 16_384
 
 /** A text a spreadsheet would evaluate if typed or re-imported (the same set lib/first-load/validate.ts FORMULA_LEADING names). */
 export const FORMULA_LEADING_TEXT = /^[=@+\-\t\r]/
@@ -110,20 +122,26 @@ export function columnIndex(letters: string): number {
 const FILL_RGB: Record<XFill, string> = { header: 'FFD9D9D9', stock: 'FFFFF2CC', mismatch: 'FFF8CBAD', input: 'FFE2EFDA', muted: 'FFF2F2F2' }
 const FILL_ORDER: readonly XFill[] = ['header', 'stock', 'mismatch', 'input', 'muted']
 
-function styleIndex(fill: XFill | undefined, bold: boolean, quote: boolean): number {
-  // xf 0 is the default. Then every combination in a fixed order: (fill none + 5 fills) x bold x quote.
+/** The number of (fill, bold, quote) combinations: (fill none + 5 fills) x bold x quote. */
+const LOCKED_STYLES = (FILL_ORDER.length + 1) * 4
+
+function styleIndex(fill: XFill | undefined, bold: boolean, quote: boolean, unlocked = false): number {
+  // xf 0 is the default. Then every combination in a fixed order: (fill none + 5 fills) x bold x quote, locked (the default); then the same again unlocked.
   const f = fill === undefined ? 0 : FILL_ORDER.indexOf(fill) + 1
-  return 1 + f * 4 + (bold ? 2 : 0) + (quote ? 1 : 0)
+  return 1 + (unlocked ? LOCKED_STYLES : 0) + f * 4 + (bold ? 2 : 0) + (quote ? 1 : 0)
 }
 
 function stylesXml(): string {
   const fills = ['<fill><patternFill patternType="none"/></fill>', '<fill><patternFill patternType="gray125"/></fill>', ...FILL_ORDER.map((f) => `<fill><patternFill patternType="solid"><fgColor rgb="${FILL_RGB[f]}"/><bgColor indexed="64"/></patternFill></fill>`)]
   const xfs = ['<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>']
-  for (let f = 0; f <= FILL_ORDER.length; f++) {
-    for (const bold of [false, true]) {
-      for (const quote of [false, true]) {
-        const fillId = f === 0 ? 0 : f + 1
-        xfs.push(`<xf numFmtId="0" fontId="${bold ? 1 : 0}" fillId="${fillId}" borderId="0" xfId="0"${fillId ? ' applyFill="1"' : ''}${bold ? ' applyFont="1"' : ''}${quote ? ' quotePrefix="1"' : ''}/>`)
+  for (const unlocked of [false, true]) {
+    for (let f = 0; f <= FILL_ORDER.length; f++) {
+      for (const bold of [false, true]) {
+        for (const quote of [false, true]) {
+          const fillId = f === 0 ? 0 : f + 1
+          const attrs = `numFmtId="0" fontId="${bold ? 1 : 0}" fillId="${fillId}" borderId="0" xfId="0"${fillId ? ' applyFill="1"' : ''}${bold ? ' applyFont="1"' : ''}${quote ? ' quotePrefix="1"' : ''}`
+          xfs.push(unlocked ? `<xf ${attrs} applyProtection="1"><protection locked="0"/></xf>` : `<xf ${attrs}/>`)
+        }
       }
     }
   }
@@ -145,7 +163,8 @@ function stylesXml(): string {
 const SHEET_NAME_FORBIDDEN = /[\\/?*[\]:]/
 
 function sheetXml(sheet: XSheet): string {
-  const width = Math.max(1, ...sheet.rows.map((row) => row.length))
+  // A loop, not Math.max(...rows): a spread of every row overflows the call stack past about 125,000 rows.
+  const width = sheet.rows.reduce((w, row) => (row.length > w ? row.length : w), 1)
   const height = Math.max(1, sheet.rows.length)
   const parts: string[] = []
   parts.push('<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n')
@@ -163,23 +182,26 @@ function sheetXml(sheet: XSheet): string {
     const cells: string[] = []
     row.forEach((cell, c) => {
       const ref = `${columnLetter(c)}${r + 1}`
+      const unlocked = cell.unlocked === true
       if (cell.v === null || cell.v === '') {
-        if (cell.fill !== undefined || cell.bold) cells.push(`<c r="${ref}" s="${styleIndex(cell.fill, cell.bold === true, false)}"/>`)
+        if (cell.fill !== undefined || cell.bold || unlocked) cells.push(`<c r="${ref}" s="${styleIndex(cell.fill, cell.bold === true, false, unlocked)}"/>`)
         return
       }
       if (typeof cell.v === 'number') {
         if (!Number.isFinite(cell.v)) throw new XlsxError(`cell ${sheet.name}!${ref} holds a number that is not finite`)
-        cells.push(`<c r="${ref}" s="${styleIndex(cell.fill, cell.bold === true, false)}"><v>${String(cell.v)}</v></c>`)
+        cells.push(`<c r="${ref}" s="${styleIndex(cell.fill, cell.bold === true, false, unlocked)}"><v>${String(cell.v)}</v></c>`)
         return
       }
       assertWellFormed(cell.v, `cell ${sheet.name}!${ref}`)
       if (cell.v.length > 32767) throw new XlsxError(`cell ${sheet.name}!${ref} holds more than 32767 characters`)
       const quote = FORMULA_LEADING_TEXT.test(cell.v)
-      cells.push(`<c r="${ref}" s="${styleIndex(cell.fill, cell.bold === true, quote)}" t="inlineStr"><is><t xml:space="preserve">${escapeXml(xstring(cell.v))}</t></is></c>`)
+      cells.push(`<c r="${ref}" s="${styleIndex(cell.fill, cell.bold === true, quote, unlocked)}" t="inlineStr"><is><t xml:space="preserve">${escapeXml(xstring(cell.v))}</t></is></c>`)
     })
     parts.push(`<row r="${r + 1}">${cells.reduce(glue, '')}</row>`)
   })
   parts.push('</sheetData>')
+  // No password: a guard against an accidental sort or paste. sort, insertRows, deleteRows, formatCells stay locked (their default); filtering and column widths are allowed.
+  if (sheet.protect) parts.push('<sheetProtection sheet="1" objects="1" scenarios="1" formatColumns="0" autoFilter="0"/>')
   if (sheet.autoFilter && sheet.rows.length > 0) parts.push(`<autoFilter ref="A1:${columnLetter(width - 1)}${height}"/>`)
   const validations = sheet.validations ?? []
   if (validations.length > 0) {
@@ -309,7 +331,8 @@ export function unzip(bytes: Uint8Array): Map<string, Buffer> {
   let p = buf.readUInt32LE(eocd + 16)
   if (count === 0xffff || centralSize === 0xffffffff || p === 0xffffffff) throw new XlsxError('ZIP64 archives are not supported')
   if (p + centralSize > eocd) throw new XlsxError('the .xlsx archive directory is damaged')
-  const out = new Map<string, Buffer>()
+  // Pass 1: the whole directory, checked and summed BEFORE anything is inflated (a bomb spread over many parts is refused without expanding any of them).
+  const entries: Array<{ name: string; method: number; expectedCrc: number; compSize: number; size: number; localOffset: number }> = []
   let total = 0
   for (let n = 0; n < count; n++) {
     if (p + 46 > buf.length || buf.readUInt32LE(p) !== 0x02014b50) throw new XlsxError('the .xlsx archive directory is damaged')
@@ -325,25 +348,41 @@ export function unzip(bytes: Uint8Array): Map<string, Buffer> {
     const name = buf.subarray(p + 46, p + 46 + nameLen).toString('utf8')
     p += 46 + nameLen + extraLen + commentLen
     if ((flags & 0x1) !== 0) throw new XlsxError('the .xlsx archive is encrypted')
+    if (compSize === 0xffffffff || size === 0xffffffff || localOffset === 0xffffffff) throw new XlsxError('ZIP64 archives are not supported')
     if (name.endsWith('/')) continue
-    if (size > XLSX_MAX_PART_BYTES || compSize === 0xffffffff || size === 0xffffffff) throw new XlsxError(`the part ${name} is too large`)
+    if (size > XLSX_MAX_PART_BYTES) throw new XlsxError(`the part ${name} is too large`)
     total += size
     if (total > XLSX_MAX_TOTAL_BYTES) throw new XlsxError('the .xlsx archive is too large')
+    if (entries.some((e) => e.name === name)) throw new XlsxError(`the part ${name} appears twice`)
+    entries.push({ name, method, expectedCrc, compSize, size, localOffset })
+  }
+  // Pass 2: each part, its local header compared with the directory, inflated to at most its declared size and checksummed.
+  const out = new Map<string, Buffer>()
+  for (const { name, method, expectedCrc, compSize, size, localOffset } of entries) {
     if (localOffset + 30 > buf.length || buf.readUInt32LE(localOffset) !== 0x04034b50) throw new XlsxError(`the part ${name} is damaged`)
-    const start = localOffset + 30 + buf.readUInt16LE(localOffset + 26) + buf.readUInt16LE(localOffset + 28)
+    // L4: the local header must agree with the directory (its name, method and encryption flag; and its CRC and sizes unless it defers them to a data descriptor).
+    const localFlags = buf.readUInt16LE(localOffset + 6)
+    const localNameLen = buf.readUInt16LE(localOffset + 26)
+    const localName = buf.subarray(localOffset + 30, localOffset + 30 + localNameLen).toString('utf8')
+    if ((localFlags & 0x1) !== 0) throw new XlsxError('the .xlsx archive is encrypted')
+    if (localName !== name || buf.readUInt16LE(localOffset + 8) !== method) throw new XlsxError(`the part ${name} has a local header that disagrees with the archive directory`)
+    if ((localFlags & 0x8) === 0 && (buf.readUInt32LE(localOffset + 14) !== expectedCrc || buf.readUInt32LE(localOffset + 18) !== compSize || buf.readUInt32LE(localOffset + 22) !== size)) {
+      throw new XlsxError(`the part ${name} has a local header that disagrees with the archive directory`)
+    }
+    const start = localOffset + 30 + localNameLen + buf.readUInt16LE(localOffset + 28)
     if (start + compSize > buf.length) throw new XlsxError(`the part ${name} is truncated`)
     const raw = buf.subarray(start, start + compSize)
     let data: Buffer
     if (method === 0) data = Buffer.from(raw)
     else if (method === 8) {
       try {
-        data = inflateRawSync(raw, { maxOutputLength: XLSX_MAX_PART_BYTES })
+        // L3: never more than the size the directory declares (a part that inflates further is refused, not expanded to the cap).
+        data = inflateRawSync(raw, { maxOutputLength: Math.max(1, size) })
       } catch {
         throw new XlsxError(`the part ${name} cannot be decompressed`)
       }
     } else throw new XlsxError(`the part ${name} uses an unsupported compression method (${method})`)
     if (data.length !== size || crc32(data) !== expectedCrc) throw new XlsxError(`the part ${name} fails its checksum`)
-    if (out.has(name)) throw new XlsxError(`the part ${name} appears twice`)
     out.set(name, data)
   }
   return out
@@ -360,7 +399,14 @@ export interface XmlNode {
   text: string
 }
 
+/** A character XML 1.0 cannot carry (a C0 control other than tab, newline, carriage return; U+FFFE, U+FFFF). */
+const XML_FORBIDDEN_CHAR = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\ufffe\uffff]/
+const KNOWN_REFERENCE = /&(#x[0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);/g
+
 function decodeEntities(text: string): string {
+  // L5: an `&` that does not start one of the five predefined entities or a character reference is an unknown entity: refused, never kept as text.
+  if (text.replace(KNOWN_REFERENCE, '').includes('&')) throw new XlsxError('malformed XML (an unknown entity or a bare &)')
+  if (XML_FORBIDDEN_CHAR.test(text)) throw new XlsxError('malformed XML (a character XML cannot carry)')
   return text.replace(/&(#x[0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);/g, (whole, body: string) => {
     if (body === 'amp') return '&'
     if (body === 'lt') return '<'
@@ -368,7 +414,9 @@ function decodeEntities(text: string): string {
     if (body === 'quot') return '"'
     if (body === 'apos') return "'"
     const code = body.startsWith('#x') ? Number.parseInt(body.slice(2), 16) : Number.parseInt(body.slice(1), 10)
-    if (!Number.isFinite(code) || code > 0x10ffff) throw new XlsxError(`malformed character reference ${whole}`)
+    // XML 1.0 Char only: no NUL or other C0 control but tab, newline and carriage return, no surrogate, not U+FFFE or U+FFFF.
+    const allowed = code === 0x9 || code === 0xa || code === 0xd || (code >= 0x20 && code <= 0xd7ff) || (code >= 0xe000 && code <= 0xfffd) || (code >= 0x10000 && code <= 0x10ffff)
+    if (!Number.isFinite(code) || !allowed) throw new XlsxError(`malformed character reference ${whole.slice(0, 20)}`)
     return String.fromCodePoint(code)
   })
 }
@@ -534,6 +582,10 @@ export function readXlsx(bytes: Uint8Array): ReadSheet[] {
     for (const row of data ? childrenNamed(data, 'row') : []) {
       const r = row.attrs.r !== undefined ? Number(row.attrs.r) : nextRow
       if (!Number.isSafeInteger(r) || r < 1) throw new XlsxError('a row has an unusable number')
+      // L2: within the sheet limits (a row number of a billion would otherwise be read back as that many blank rows).
+      if (r > XLSX_MAX_ROWS) throw new XlsxError(`a row number ${r} is beyond the sheet limit of ${XLSX_MAX_ROWS} rows`)
+      // L1: rows come once each, in ascending order; a row given twice (whose cells the last copy would silently replace) is refused.
+      if (r < nextRow) throw new XlsxError(`row ${r} is given twice or out of order`)
       nextRow = r + 1
       const cells = new Map<number, ReadCell>()
       let nextCol = 0
@@ -544,6 +596,8 @@ export function readXlsx(bytes: Uint8Array): ReadSheet[] {
           if (!m || Number(m[2]) !== r) throw new XlsxError(`a cell reference ${JSON.stringify(c.attrs.r)} is not in row ${r}`)
           col = columnIndex(m[1])
         }
+        if (col >= XLSX_MAX_COLUMNS) throw new XlsxError(`a cell in row ${r} is beyond the sheet limit of ${XLSX_MAX_COLUMNS} columns (XFD)`)
+        if (col < nextCol) throw new XlsxError(`a cell in row ${r} is given twice or out of order`)
         nextCol = col + 1
         const t = c.attrs.t ?? 'n'
         const v = firstChild(c, 'v')?.text
@@ -559,6 +613,9 @@ export function readXlsx(bytes: Uint8Array): ReadSheet[] {
           text = t === 'str' ? unescapeXstring(v ?? '') : (v ?? '')
         } else throw new XlsxError(`cell ${c.attrs.r ?? ''} has an unknown type ${JSON.stringify(t)}`)
         const formula = firstChild(c, 'f') !== undefined
+        // L5: a lone surrogate (from an `_xD800_` escape) or U+FFFD (a character already lost in a conversion) is refused, never read as a decision or a SKU.
+        if (!text.isWellFormed()) throw new XlsxError(`cell ${columnLetter(col)}${r} holds an unpaired surrogate character`)
+        if (text.includes('\ufffd')) throw new XlsxError(`cell ${columnLetter(col)}${r} holds U+FFFD, a character lost in a conversion: save the sheet again from the original`)
         if (text !== '' || formula) cells.set(col, { text, formula })
       }
       if (cells.size > 0) rows.set(r, cells)

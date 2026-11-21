@@ -9,8 +9,8 @@
  *   NEW-ARCH    Archived, MIL1 3          publish, stock 2                NEW-ARCH active, 3       reviewed (Qoblex Archived); stock
  *   NEW-1       OLD-1 (renamed), Active   publish, stock 0                OLD-1 discontinued, 0    reviewed (WMS); pre-rename SKU in WMS
  *   VAR-PARENT  -                         variable, publish               -                        VARIABLE parent (Woo + IMS only)
- *   VAR-01      variant, Active           variation, publish              VAR-01 active, 0
- *   VAR-02      variant, Archived         variation, private              VAR-02 active, 0         reviewed; Woo stock not read
+ *   VAR-01      variant, Active           variation, publish, stock parent 0 VAR-01 active, 0
+ *   VAR-02      variant, Archived         variation, private, stock 3     VAR-02 active, 0         reviewed; Woo stock (variation walk)
  *   case-1      Active                    CASE-1 publish                  case-1 active            case-only mismatch
  *   Q-ONLY      Inactive                  -                               -                        Qoblex name fallback
  *   -           -                         EXT-1 external draft            -                        Woo-only, reviewed, not decidable
@@ -103,7 +103,7 @@ export async function buildFixture(): Promise<Fixture> {
   process.env.E2E_TEST_MODE = '1'
   const server = await startFakeCatalogue({
     key: KEY, secret: SECRET,
-    parents: [{ id: 100, sku: 'VAR-PARENT', name: 'Mug', status: 'publish', variations: [{ id: 1001, sku: 'VAR-01', attributes: [{ name: 'Colour', option: 'Red' }] }, { id: 1002, sku: 'VAR-02', status: 'private', attributes: [{ name: 'Colour', option: 'Blue' }] }] }],
+    parents: [{ id: 100, sku: 'VAR-PARENT', name: 'Mug', status: 'publish', variations: [{ id: 1001, sku: 'VAR-01', attributes: [{ name: 'Colour', option: 'Red' }], manage_stock: 'parent', stock_quantity: 0 }, { id: 1002, sku: 'VAR-02', status: 'private', attributes: [{ name: 'Colour', option: 'Blue' }], manage_stock: true, stock_quantity: 3 }] }],
     products: [
       { id: 201, sku: 'SIM-PUB', name: 'Simple published (Woo)', status: 'publish', manage_stock: true, stock_quantity: 7 },
       { id: 202, sku: 'SIM-DRAFT', name: FORMULA_NAME, status: 'draft', manage_stock: true, stock_quantity: 0 },

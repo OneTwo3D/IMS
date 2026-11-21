@@ -1,13 +1,13 @@
 {
-  "formatVersion": 2,
+  "formatVersion": 3,
   "source": "woocommerce",
   "origin": "https://synthetic.invalid",
   "note": "SYNTHETIC fixture: no store was contacted",
   "snapshotFile": {
     "name": "woo-snapshot.json",
-    "sha256": "421c5caa2f58c887b3d2a9dff5b56b724ca7f1df75702461abcb6d83cce7f00e",
-    "bytes": 3688,
-    "payloadSha256": "c476c33b320e1475ca830edf527dc86f1a831476ea7be48de3693e9943a368db"
+    "sha256": "a50d1e7e19d60e96bb4e9cfb15b41442718637a1524396c5ac56469fce069ce7",
+    "bytes": 4176,
+    "payloadSha256": "c37c66c486c4679989bd115e1e473dbe639810482c2948b4f19d589f7cf49e69"
   },
   "formulaLeadingCells": 0,
   "variantParentsFile": {

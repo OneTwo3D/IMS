@@ -25,6 +25,8 @@ export type DecisionFileRead =
       sheetIds: string[]
       /** The hidden binding tab of an .xlsx (null for a CSV, or when the tab is missing or unreadable: the binding then refuses). */
       bindingTab: { sheetId: string; digest: string } | null
+      /** The line (sheet row) of every row that carries a status but no sheet id: the binding refuses the file when there is any (L6). */
+      decidedWithoutSheetId: number[]
     }
   | { ok: false; problems: string[] }
 
@@ -38,9 +40,11 @@ function isZip(bytes: Uint8Array): boolean {
   return bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04
 }
 
-function finish(kind: 'xlsx' | 'review-csv' | 'canonical-csv', rows: string[][], bindingTab: { sheetId: string; digest: string } | null): DecisionFileRead {
+/** `lines[i]` is the line (sheet row) of `rows[i]`, for the messages. */
+function finish(kind: 'xlsx' | 'review-csv' | 'canonical-csv', rows: string[][], lines: readonly number[], bindingTab: { sheetId: string; digest: string } | null): DecisionFileRead {
   const sheetIds = [...new Set(rows.filter((r) => r.some((c) => c.trim() !== '')).map((r) => r[3].trim()).filter((id) => id !== ''))].sort()
-  return { ok: true, kind, canonicalCsv: serializeCsv(CANONICAL, rows), sheetIds, bindingTab }
+  const decidedWithoutSheetId = rows.flatMap((r, i) => (r[1].trim() !== '' && r[3].trim() === '' ? [lines[i]] : []))
+  return { ok: true, kind, canonicalCsv: serializeCsv(CANONICAL, rows), sheetIds, bindingTab, decidedWithoutSheetId }
 }
 
 function readBindingTab(sheet: ReadSheet | undefined): { sheetId: string; digest: string } | null {
@@ -78,9 +82,13 @@ function fromXlsx(bytes: Uint8Array): DecisionFileRead {
   for (const label of Object.values(DECISION_HEADERS)) if (!columns.has(label)) problems.push(`the "${REVIEW_TAB}" tab has no "${label}" column`)
   if (problems.length > 0) return bad(...problems)
   const order = [DECISION_HEADERS.sku, DECISION_HEADERS.status, DECISION_HEADERS.reason, DECISION_HEADERS.sheetId].map((label) => columns.get(label)!)
-  const last = Math.max(1, ...review.rows.keys())
+  // L2: a loop, never Math.max(...keys) (a spread of a million row numbers overflows the call stack). The reader caps row numbers at the sheet limit.
+  let last = 1
+  for (const r of review.rows.keys()) if (r > last) last = r
   const rows: string[][] = []
+  const lines: number[] = []
   for (let r = 2; r <= last; r++) {
+    lines.push(r)
     const cells = review.rows.get(r)
     const out = order.map((col) => {
       const cell = cells?.get(col)
@@ -90,7 +98,7 @@ function fromXlsx(bytes: Uint8Array): DecisionFileRead {
     rows.push(out)
   }
   if (problems.length > 0) return bad(...problems.slice(0, 8), ...(problems.length > 8 ? [`... and ${problems.length - 8} more`] : []))
-  return finish('xlsx', rows, readBindingTab(sheets.find((s) => s.name === BINDING_TAB)))
+  return finish('xlsx', rows, lines, readBindingTab(sheets.find((s) => s.name === BINDING_TAB)))
 }
 
 function fromCsv(bytes: Uint8Array): DecisionFileRead {
@@ -126,11 +134,13 @@ function fromCsv(bytes: Uint8Array): DecisionFileRead {
   if (problems.length > 0) return bad(...problems)
   const width = parsed.header.length
   const rows: string[][] = []
+  const lines: number[] = []
   for (const record of parsed.rows) {
     if (record.cells.length !== width) return bad(`line ${record.line} of the decisions CSV has ${record.cells.length} cell(s) but the header has ${width}`)
     rows.push(index.map((i) => (i < 0 ? '' : record.cells[i])))
+    lines.push(record.line)
   }
-  return finish(isReview ? 'review-csv' : 'canonical-csv', rows, null)
+  return finish(isReview ? 'review-csv' : 'canonical-csv', rows, lines, null)
 }
 
 export function readDecisionFile(bytes: Uint8Array): DecisionFileRead {
