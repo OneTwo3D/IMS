@@ -202,6 +202,19 @@ test('every row names its switchover step; the step table is the owner-approved 
   for (const key of ['woocommerce.tax-rate', 'xero.tax-rate', 'xero.sales.invoice', 'xero.sales.credit-note', 'woocommerce.fx-rates']) assert.equal(step(key), 'never', key)
 })
 
+test('customer e-mail rows of the 2026-11-20 owner rulings: partial, delivered and refund move to IMS at step W; the account, note and status e-mails stay with WooCommerce for ever', () => {
+  for (const op of ['partial-shipment', 'delivered', 'refund']) {
+    const row = rows.find((candidate) => candidate.destination === 'customer-email' && candidate.operation === op)!
+    assert.deepEqual([row.owners.P1, row.owners.P2, row.step], ['woocommerce-native', 'IMS', 'woocommerce'], op)
+    assert.ok(row.note.includes('2026-11-20'), op)
+  }
+  for (const op of ['account-new', 'account-password-reset', 'customer-note', 'status-on-hold', 'status-cancelled', 'status-failed']) {
+    const row = rows.find((candidate) => candidate.destination === 'customer-email' && candidate.operation === op)!
+    assert.deepEqual([row.owners.P1, row.owners.P2, row.step], ['woocommerce-native', 'woocommerce-native', 'never'], op)
+    assert.ok(row.note.includes('2026-11-20'), op)
+  }
+})
+
 test('a row is IMS-owned in P2 exactly when it has a step: `never` rows are never IMS-owned in P2, and a stepped row is not left to another writer', () => {
   for (const row of rows) {
     // The one exception: a sales quotation exists only in IMS, so IMS sends it in every phase (enforced by its own setting).
