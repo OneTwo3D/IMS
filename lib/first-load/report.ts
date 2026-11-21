@@ -132,6 +132,11 @@ export function renderMarkdown(report: PrepareReport, mode: { dryRun: boolean })
   out.push(vp.supplied
     ? `- Variation rows read: ${vp.rowsRead}; Qoblex variants joined by exact SKU: ${vp.variantsJoined}; VARIABLE parents emitted (once each): ${vp.parentsEmitted}; WooCommerce parents with no Qoblex variant (not loaded): ${vp.parentsWithoutQoblexVariant}`
     : 'Not supplied: no Qoblex variant can be given a parent.', '')
+  const ps = report.wooProductStatus
+  out.push('## WooCommerce product status (lifecycle of simple, KIT and BOM products)', '')
+  out.push(ps.supplied
+    ? `- woo-product-status rows read: ${ps.rowsRead}; bound to a verified snapshot: ${ps.bound ? 'yes' : 'NO (refused)'}; Qoblex products matched to a WooCommerce status: ${ps.productsMatched}`
+    : 'Not supplied: a simple, KIT or BOM product keeps the lifecycle derived from the Qoblex State (LIFECYCLE_NOT_FROM_WOO lists them).', '')
   out.push('## Purchase orders and transfers', '')
   out.push(`- Purchase orders emitted: ${report.purchaseOrders.orders} (${report.purchaseOrders.linesEmitted} line(s)); orders with nothing outstanding: ${report.purchaseOrders.ordersNothingOutstanding}`)
   out.push(`- Transfers emitted: ${report.transfers.transfers} (${report.transfers.linesEmitted} line(s))`, '')

@@ -38,6 +38,7 @@ export interface ApplyReport {
     outputs: Array<{ name: string; sha256: string }>
     notSelected: string[]
     variantParents: { csvSha256: string; snapshotPayloadSha256: string } | null
+    productStatus: { csvSha256: string; snapshotPayloadSha256: string } | null
     zeroCostAccepted: string[]
     warehouses: string[]
   }
@@ -100,6 +101,7 @@ export function buildApplyReport(args: { prepared: PreparedRun; result: ApplyRes
       outputs: prepared.outputs,
       notSelected: prepared.notSelected,
       variantParents: prepared.variantParents,
+      productStatus: prepared.productStatus,
       zeroCostAccepted: prepared.manifest.acceptZeroCost,
       warehouses: prepared.warehouseCodes,
     },
@@ -140,7 +142,7 @@ export function renderApplyMarkdown(report: ApplyReport): string {
   if (report.restorePoint) out.push('## Restore point', '', `- File: ${report.restorePoint.path}`, `- SHA-256: ${report.restorePoint.sha256} (${report.restorePoint.bytes} bytes)`, `- pg_restore --list read it: ${report.restorePoint.listed ? 'yes' : 'NO'}`, '')
   if (report.targetUnchanged !== null) out.push(`- The target database was only read; its table row counts were ${report.targetUnchanged ? 'identical before and after' : '**DIFFERENT after (the rehearsal is not valid)**'}.`, '')
   out.push('## Prepared run', '', `- Prepared report SHA-256: ${report.prepared.reportSha256}`, `- Steps not selected: ${report.prepared.notSelected.join(', ') || 'none'}`)
-  out.push(`- Variant parents bound to a verified WooCommerce snapshot: ${report.prepared.variantParents ? 'yes' : 'not used'}`, `- Zero-cost pairs accepted by the operator: ${report.prepared.zeroCostAccepted.length}`, '')
+  out.push(`- Variant parents bound to a verified WooCommerce snapshot: ${report.prepared.variantParents ? 'yes' : 'not used'}`, `- WooCommerce product statuses (lifecycle) bound to a verified snapshot: ${report.prepared.productStatus ? 'yes' : 'not used'}`, `- Zero-cost pairs accepted by the operator: ${report.prepared.zeroCostAccepted.length}`, '')
   out.push(...table(['File', 'SHA-256'], report.prepared.outputs.map((o) => [o.name, o.sha256])), '')
   out.push('## Steps', '')
   out.push(...table(['Step', 'Status', 'Emitted', 'Created', 'Updated', 'Skipped (existing)', 'Failed', 'To load'], report.steps.map((s) => [s.step, s.status, s.emitted, s.created, s.updated, s.skippedExisting, s.failed, s.toLoad])), '')

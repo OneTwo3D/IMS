@@ -53,7 +53,7 @@ async function rewrite(order: WcFullOrder) {
   return mod.rewriteUnpaidOrderFromWc('o1', order, null)
 }
 
-test('under the lock: a paid date on the payload stops the rewrite before anything else is read', async () => {
+test('under the lock: a paid date on the payload stops the rewrite (checked after IMS\'s own payment evidence, before the invoice and edit rules)', async () => {
   state.paidBlockRows = []
   const out = await rewrite(wc({ date_paid_gmt: '2026-11-20T09:00:00' }))
   assert.equal(out.kind, 'skipped')

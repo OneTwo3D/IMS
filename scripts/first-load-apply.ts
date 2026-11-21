@@ -161,7 +161,7 @@ export async function runCli(argv: readonly string[], io: CliIo, parentEnv: Read
     const read = readRegularFile(path.resolve(base, p), 64 * 1024 * 1024)
     return read.ok ? read.bytes : null
   }
-  const woo = manifest.wooSnapshot ? { snapshot: readBytes(manifest.wooSnapshot.snapshot), provenance: readBytes(manifest.wooSnapshot.provenance), variantParents: readBytes(manifest.wooSnapshot.variantParents) } : null
+  const woo = manifest.wooSnapshot ? { snapshot: readBytes(manifest.wooSnapshot.snapshot), provenance: readBytes(manifest.wooSnapshot.provenance), variantParents: readBytes(manifest.wooSnapshot.variantParents), productStatus: manifest.wooSnapshot.productStatus === null ? undefined : readBytes(manifest.wooSnapshot.productStatus) } : null
   const loaded = loadPreparedRun({ manifest, files, woo })
   if (!loaded.ok) return stopWith('USAGE', loaded.problems)
   const prepared: PreparedRun = loaded.run

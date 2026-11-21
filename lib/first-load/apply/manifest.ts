@@ -23,6 +23,8 @@ export interface ApplyWooSnapshot {
   snapshot: string
   provenance: string
   variantParents: string
+  /** woo-product-status.csv of the same snapshot bundle; required when the prepared run took lifecycles from it, otherwise it must be absent. */
+  productStatus: string | null
   origin: string
   visibilityChecked: VisibilityAttestation
 }
@@ -197,7 +199,7 @@ export function parseApplyManifest(text: string): ApplyManifest {
   let wooSnapshot: ApplyWooSnapshot | null = null
   if (raw.wooSnapshot !== undefined) {
     const w = raw.wooSnapshot
-    if (!isObject(w)) fail('apply manifest wooSnapshot must be an object {snapshot, provenance, variantParents, origin, visibilityChecked}')
+    if (!isObject(w)) fail('apply manifest wooSnapshot must be an object {snapshot, provenance, variantParents, productStatus (optional), origin, visibilityChecked}')
     else {
       Object.keys(w).forEach((key, k) => { if (!(APPLY_WOO_SNAPSHOT_KEYS as readonly string[]).includes(key)) fail(`apply manifest wooSnapshot: unknown key (position ${k + 1})`) })
       const paths = (['snapshot', 'provenance', 'variantParents'] as const).map((key) => {
@@ -205,12 +207,17 @@ export function parseApplyManifest(text: string): ApplyManifest {
         if (typeof value !== 'string' || value.trim() === '') fail(`apply manifest wooSnapshot.${key} must be a path`)
         return typeof value === 'string' ? value : ''
       })
+      let productStatus: string | null = null
+      if (w.productStatus !== undefined) {
+        if (typeof w.productStatus !== 'string' || w.productStatus.trim() === '') fail('apply manifest wooSnapshot.productStatus must be a path')
+        else productStatus = w.productStatus
+      }
       const origin = typeof w.origin === 'string' ? normaliseStoreOrigin(w.origin) : null
       if (origin === null) fail('apply manifest wooSnapshot.origin must be the http(s) origin of the WooCommerce store the snapshot must come from')
       const attestation = parseVisibilityAttestation(w.visibilityChecked)
       if (!attestation.ok) fail('apply manifest wooSnapshot.visibilityChecked is not a valid attestation (the detail would quote the file; see first-load-input-spec.md for the shape)')
       if (origin !== null && attestation.ok && paths.every((p) => p !== '')) {
-        wooSnapshot = { snapshot: paths[0], provenance: paths[1], variantParents: paths[2], origin, visibilityChecked: attestation.value }
+        wooSnapshot = { snapshot: paths[0], provenance: paths[1], variantParents: paths[2], productStatus, origin, visibilityChecked: attestation.value }
       }
     }
   }

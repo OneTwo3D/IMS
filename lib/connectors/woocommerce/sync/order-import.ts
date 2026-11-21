@@ -37,7 +37,7 @@ import { accountingPostingKey } from '@/lib/accounting/posting-key'
 import { wcFetch, MAX_WC_PAGE_WALK_PAGES, describeWcPageWalkCeilingStall } from '../api'
 import type { WcFullOrder, SyncResult } from './types'
 import { surfaceWcOrderEditDrift } from './order-edit-drift'
-import { drainDeferredWcOrderDivergences, rerunDeferredWcOrderDivergence, surfaceWcOrderDivergence } from './order-divergence'
+import { drainDeferredWcOrderDivergences, noteDrainOutcome, rerunDeferredWcOrderDivergence, surfaceWcOrderDivergence } from './order-divergence'
 import {
   mapWcAddress, upsertCustomer, mapWcLineItems, logWcUnmatchedLines,
   mapWcFeeLines, readWclcOrderComponents, mapWcShipping, resolveWcTaxRateById, collectingUnmappedWcRates, getFxRateToBase, isMissingFxRateError,
@@ -5539,8 +5539,8 @@ export async function syncNewWcOrders(
   // It runs AFTER the cursor commit, never before: each live read is a WooCommerce request, and a slow or hung one must not stand between a finished walk and its cursor. It has its own wall-clock budget
   // (under the proxy's 60 s read timeout), never throws and never holds the cursor.
   const drained = await drainDeferredWcOrderDivergences()
-  // The drain never throws and never holds the cursor, but a failure of its own is reported here instead of only in the server log (o3d-hu8g9 LOW 5): a warning, not an error (the run's work committed).
-  if (drained.failed) (result.warnings ??= []).push('The drain of deferred WooCommerce order comparisons failed (see the server log); the rows stay for the next run.')
+  // The drain never throws and never holds the cursor, but a failure of its own is reported here instead of only in the server log (o3d-hu8g9 LOW 5): a warning, not an error (the run's work committed). The wc-reconcile cron outcome reads it.
+  noteDrainOutcome(result, drained)
 
   if (result.synced > 0) {
     await logActivity({

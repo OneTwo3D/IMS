@@ -45,6 +45,8 @@ export interface PreparedRun {
   warehouseCodes: string[]
   /** The bound variant-parents file hash (and snapshot payload hash), or null when the run uses no variant parents. */
   variantParents: { csvSha256: string; snapshotPayloadSha256: string } | null
+  /** The bound woo-product-status file hash, or null when the run took no lifecycle from it. */
+  productStatus: { csvSha256: string; snapshotPayloadSha256: string } | null
   /** SHA-256 over the canonical apply manifest and the prepared files: the identity of THIS load. */
   manifestDigest: string
 }
@@ -54,7 +56,7 @@ export interface PreparedInput {
   /** Every regular file of the prepared directory, by name. */
   files: ReadonlyMap<string, Uint8Array>
   /** The bytes of the three snapshot files the manifest names; null where unreadable. */
-  woo: { snapshot: Uint8Array | null; provenance: Uint8Array | null; variantParents: Uint8Array | null } | null
+  woo: { snapshot: Uint8Array | null; provenance: Uint8Array | null; variantParents: Uint8Array | null; productStatus?: Uint8Array | null } | null
 }
 
 export type PreparedLoad = { ok: true; run: PreparedRun } | { ok: false; problems: string[] }
@@ -443,6 +445,26 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
   } else if (manifest.wooSnapshot !== null) {
     problems.push('the apply manifest names a wooSnapshot but the prepared run used no variant parents: an input nothing uses is refused')
   }
+  // ---- 5b. The woo-product-status binding: the Woo-gospel lifecycle of simple, KIT and BOM products ---------------------------------
+  let productStatus: PreparedRun['productStatus'] = null
+  const statusDataset = (report.inputs ?? []).find((i) => i.dataset === 'woo-product-status')
+  if (statusDataset) {
+    if (manifest.wooSnapshot === null || manifest.wooSnapshot.productStatus === null || input.woo === null) problems.push('the prepared run took lifecycles from WooCommerce product statuses (woo-product-status), so the apply manifest must name the verified snapshot bundle and its productStatus file: an unbound lifecycle is never loaded')
+    else {
+      const verdict = verifyWooSnapshotBundle({
+        snapshotBytes: input.woo.snapshot,
+        provenanceBytes: input.woo.provenance,
+        productStatusBytes: input.woo.productStatus ?? null,
+        expectedOrigin: manifest.wooSnapshot.origin,
+        visibilityChecked: manifest.wooSnapshot.visibilityChecked,
+      })
+      if (!verdict.ok) problems.push(`the WooCommerce snapshot is not verified for woo-product-status (${verdict.problems.length} problem(s); the detail names values from the snapshot, so it is not printed here: run first-load:woo-snapshot --verify)`)
+      else if (verdict.productStatusSha256 === null || statusDataset.sha256 !== verdict.productStatusSha256 || statusDataset.parts.length !== 1 || statusDataset.parts[0].sha256 !== verdict.productStatusSha256) problems.push('the woo-product-status file the prepared run read is not the file of the verified snapshot bundle (its SHA-256 differs)')
+      else productStatus = { csvSha256: verdict.productStatusSha256, snapshotPayloadSha256: verdict.payloadSha256 }
+    }
+  } else if (manifest.wooSnapshot !== null && manifest.wooSnapshot.productStatus !== null) {
+    problems.push('the apply manifest names a wooSnapshot productStatus but the prepared run took no lifecycle from woo-product-status: an input nothing uses is refused')
+  }
 
   if (problems.length > 0) return { ok: false, problems }
 
@@ -452,6 +474,7 @@ export function loadPreparedRun(input: PreparedInput): PreparedLoad {
     preparedReportSha256: reportSha256,
     outputs,
     variantParents,
+    ...(productStatus === null ? {} : { productStatus }),
   }))
-  return { ok: true, run: { manifest, report, reportSha256, steps, outputs, notSelected, zeroCostPairs, warehouseCodes: used, variantParents, manifestDigest } }
+  return { ok: true, run: { manifest, report, reportSha256, steps, outputs, notSelected, zeroCostPairs, warehouseCodes: used, variantParents, productStatus, manifestDigest } }
 }

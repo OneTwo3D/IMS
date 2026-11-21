@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test, { after, before } from 'node:test'
 import { ingestDataset } from '../../lib/first-load/ingest.ts'
-import { bindingFromVerification, verifyWooSnapshotBundle } from '../../lib/first-load/snapshot.ts'
+import { bindingFromVerification, productStatusBindingFromVerification, verifyWooSnapshotBundle } from '../../lib/first-load/snapshot.ts'
 import { SNAPSHOT_EXIT_CODES, SNAPSHOT_FILE_NAMES } from '../../lib/first-load/spec.ts'
 import { prepare } from '../../lib/first-load/transform.ts'
 import { runSnapshotCli } from '../../lib/first-load/woo-snapshot/cli.ts'
@@ -29,9 +29,9 @@ after(() => {
   else process.env.E2E_TEST_MODE = savedEnv
   rmSync(scratch, { recursive: true, force: true })
 })
-const ATTESTED = { products: { publish: 1, draft: 0, private: 0, pending: 0 }, variations: { publish: 2, draft: 0, private: 0, pending: 0 } }
+const ATTESTED = { allProducts: { publish: 1, draft: 0, private: 1, pending: 0 }, products: { publish: 1, draft: 0, private: 0, pending: 0 }, variations: { publish: 2, draft: 0, private: 0, pending: 0 } }
 
-type Bundle = { snapshot: Uint8Array; provenance: Uint8Array; csv: Uint8Array; origin: string }
+type Bundle = { snapshot: Uint8Array; provenance: Uint8Array; csv: Uint8Array; status: Uint8Array; origin: string }
 const cache = new Map<string, Promise<Bundle>>()
 function snapshotBundle(sku2 = 'V-02'): Promise<Bundle> {
   if (!cache.has(sku2)) cache.set(sku2, writeBundle(sku2))
@@ -43,6 +43,7 @@ async function writeBundle(sku2: string): Promise<Bundle> {
     key: KEY,
     secret: SECRET,
     parents: [{ id: 100, sku: 'REAL-PARENT', name: 'Real parent', status: 'publish', variations: [{ id: 1001, sku: 'V-01' }, { id: 1002, sku: sku2 }] }],
+    products: [{ id: 201, sku: 'S-1', name: `A simple product ${sku2}`, status: 'private' }],
   })
   try {
     const envFile = path.join(scratch, `creds-${sku2}`)
@@ -53,22 +54,26 @@ async function writeBundle(sku2: string): Promise<Bundle> {
     const code = await runSnapshotCli(['--env-file', envFile, '--out', out, '--allow-origin', server.origin, '--min-interval-ms', '0'], { stdout: () => {}, stderr: (s) => (stderr += s) })
     assert.equal(code, SNAPSHOT_EXIT_CODES.OK, stderr)
     const read = (name: string) => new Uint8Array(readFileSync(path.join(out, name)))
-    return { snapshot: read(SNAPSHOT_FILE_NAMES.snapshot), provenance: read(SNAPSHOT_FILE_NAMES.provenance), csv: read(SNAPSHOT_FILE_NAMES.variantParents), origin: server.origin }
+    return { snapshot: read(SNAPSHOT_FILE_NAMES.snapshot), provenance: read(SNAPSHOT_FILE_NAMES.provenance), csv: read(SNAPSHOT_FILE_NAMES.variantParents), status: read(SNAPSHOT_FILE_NAMES.productStatus), origin: server.origin }
   } finally { await server.close() }
 }
 
-function preparedWithParents(bundle: { snapshot: Uint8Array; provenance: Uint8Array; csv: Uint8Array; origin: string }): FileMap {
+function preparedWithParents(bundle: Bundle, withStatus = false): FileMap {
   const vp = ingestDataset('variant-parents', bundle.csv, 'variant-parents.csv', null)
   const binding = bindingFromVerification(verifyWooSnapshotBundle({ snapshotBytes: bundle.snapshot, provenanceBytes: bundle.provenance, csvBytes: bundle.csv, expectedOrigin: bundle.origin, visibilityChecked: ATTESTED }))
   assert.equal(binding.verified, true, 'the honest bundle verifies (control)')
+  const statusBinding = productStatusBindingFromVerification(verifyWooSnapshotBundle({ snapshotBytes: bundle.snapshot, provenanceBytes: bundle.provenance, productStatusBytes: bundle.status, expectedOrigin: bundle.origin, visibilityChecked: ATTESTED }))
+  assert.equal(statusBinding.verified, true, 'the honest product status file verifies (control)')
   const result = prepare({
     config: config(),
     datasets: {
       products: ds('products', [product('V-01', 'VARIANT'), product('V-02', 'VARIANT')]),
       'stock-lots': ds('stock-lots', [lot('V-01', '4', '2'), lot('V-02', '5', '3')]),
       'variant-parents': vp,
+      ...(withStatus ? { 'woo-product-status': ingestDataset('woo-product-status', bundle.status, 'woo-product-status.csv', null), products: ds('products', [product('V-01', 'VARIANT'), product('V-02', 'VARIANT'), product('S-1', 'SIMPLE', { lifecycleStatus: 'ACTIVE' })]) } : {}),
     },
     variantParentsBinding: binding,
+    ...(withStatus ? { productStatusBinding: statusBinding } : {}),
   })
   assert.equal(result.blocking, false, JSON.stringify(result.report.findings.filter((f) => f.severity === 'ERROR')))
   return preparedFiles(result)
@@ -111,7 +116,7 @@ test('unbound or unverified variant parents are refused: no bundle named, the fi
     ['snapshot and provenance of another snapshot', manifestFor(bundle), { snapshot: other.snapshot, provenance: other.provenance, variantParents: bundle.csv }, /snapshot is not verified/],
     ['CSV of another snapshot, bundle of this one', manifestFor(bundle), { ...woo, variantParents: other.csv }, /snapshot is not verified/],
     ['declared origin differs', manifestFor({ origin: 'https://other-shop.example' }), woo, /snapshot is not verified \(\d+ problem/],
-    ['attestation differs', manifestFor(bundle, {}, { visibilityChecked: { products: { publish: 9, draft: 0, private: 0, pending: 0 }, variations: ATTESTED.variations } }), woo, /snapshot is not verified \(\d+ problem/],
+    ['attestation differs', manifestFor(bundle, {}, { visibilityChecked: { ...ATTESTED, products: { publish: 9, draft: 0, private: 0, pending: 0 } } }), woo, /snapshot is not verified \(\d+ problem/],
   ]
   precondition(t, 'refusal arms', arms.length)
   for (const [label, manifest, bytes, pattern] of arms) {
@@ -140,4 +145,46 @@ test('an apply manifest with a wooSnapshot but no variant parents in the run is 
   const plain = preparedFiles(prepare({ config: config(), datasets: { products: ds('products', [product('A')]) } }))
   const loaded = loadPreparedRun({ manifest: manifestFor(bundle, { steps: ['products'], expectWarehouses: undefined }), files: plain, woo: { snapshot: bundle.snapshot, provenance: bundle.provenance, variantParents: bundle.csv } })
   assert.ok(!loaded.ok && loaded.problems.some((p) => /used no variant parents/.test(p)))
+})
+
+test('woo-product-status is bound at apply time too: loaded when the manifest names the verified bundle and productStatus; refused when unnamed, edited, of another snapshot, or named but unused', async (t) => {
+  const bundle = await snapshotBundle()
+  const other = await snapshotBundle('V-33')
+  const files = preparedWithParents(bundle, true)
+  const woo: { snapshot: Uint8Array; provenance: Uint8Array; variantParents: Uint8Array; productStatus: Uint8Array | null } = { snapshot: bundle.snapshot, provenance: bundle.provenance, variantParents: bundle.csv, productStatus: bundle.status }
+  const named = (over: Record<string, unknown> = {}) => manifestFor(bundle, {}, { productStatus: '/ps', ...over })
+  const ok = loadPreparedRun({ manifest: named(), files, woo })
+  assert.ok(ok.ok, ok.ok ? '' : ok.problems.join('; '))
+  if (ok.ok) {
+    precondition(t, 'bound product status', ok.run.productStatus ? 1 : 0)
+    // the digest covers it: the same run with the status file named differently bound is not the plain run
+    const plain = loadPreparedRun({ manifest: manifestFor(bundle), files: preparedWithParents(bundle), woo: { snapshot: bundle.snapshot, provenance: bundle.provenance, variantParents: bundle.csv } })
+    assert.ok(plain.ok && plain.run.productStatus === null && plain.run.manifestDigest !== ok.run.manifestDigest)
+  }
+  const edited = new TextEncoder().encode(new TextDecoder().decode(bundle.status).replace('S-1,201,simple,private', 'S-1,201,simple,publish'))
+  const arms: Array<[string, ReturnType<typeof manifestFor>, typeof woo | null, RegExp]> = [
+    ['productStatus not named in the manifest', manifestFor(bundle), woo, /must name the verified snapshot bundle and its productStatus file/],
+    ['product status file edited', named(), { ...woo, productStatus: edited }, /not verified for woo-product-status \(\d+ problem/],
+    ['product status of another snapshot', named(), { ...woo, productStatus: other.status }, /not verified for woo-product-status/],
+    ['product status file unreadable', named(), { ...woo, productStatus: null }, /not verified for woo-product-status/],
+  ]
+  for (const [label, manifest, bytes, pattern] of arms) {
+    const loaded = loadPreparedRun({ manifest, files, woo: bytes })
+    assert.ok(!loaded.ok && loaded.problems.some((p) => pattern.test(p)), `${label}: ${loaded.ok ? 'was accepted' : JSON.stringify(loaded.problems)}`)
+  }
+  const unused = loadPreparedRun({ manifest: named(), files: preparedWithParents(bundle), woo })
+  assert.ok(!unused.ok && unused.problems.some((p) => /names a wooSnapshot productStatus but the prepared run took no lifecycle/.test(p)))
+})
+
+// [mutation: the prepared run's woo-product-status sha is not compared with the verified bundle's (prepared.ts block 5b)]
+test('apply: the woo-product-status file the prepared run recorded reading must be the verified bundle\'s file', async () => {
+  const bundle = await snapshotBundle()
+  const files = withReport(preparedWithParents(bundle, true), (r) => {
+    const input = r.inputs.find((i) => i.dataset === 'woo-product-status')!
+    input.sha256 = 'b'.repeat(64)
+    input.parts[0].sha256 = 'b'.repeat(64)
+  })
+  const woo = { snapshot: bundle.snapshot, provenance: bundle.provenance, variantParents: bundle.csv, productStatus: bundle.status }
+  const loaded = loadPreparedRun({ manifest: manifestFor(bundle, {}, { productStatus: '/ps' }), files, woo })
+  assert.ok(!loaded.ok && loaded.problems.some((p) => /woo-product-status file the prepared run read is not the file of the verified snapshot bundle/.test(p)), loaded.ok ? 'accepted' : JSON.stringify(loaded.problems))
 })

@@ -94,7 +94,7 @@ test('arm (a): a complete walk over several pages writes the snapshot, its prove
     precondition(t, 'requests served', r.server.requests.length)
     precondition(t, 'product pages walked', r.server.requests.filter((q) => q.path.endsWith('/products')).length)
     assert.ok(r.server.requests.filter((q) => q.path.endsWith('/products')).length >= 2, 'the store granted 2 rows a page, so the walk must page')
-    assert.deepEqual(listFiles(r.out), [SNAPSHOT_FILE_NAMES.provenance, SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.variantParents, SNAPSHOT_FILE_NAMES.variantParentsInspection].sort())
+    assert.deepEqual(listFiles(r.out), [SNAPSHOT_FILE_NAMES.provenance, SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.variantParents, SNAPSHOT_FILE_NAMES.variantParentsInspection, SNAPSHOT_FILE_NAMES.productStatus].sort())
     const parsed = parseSnapshotFile(readFileSync(path.join(r.out, SNAPSHOT_FILE_NAMES.snapshot), 'utf8'))
     assert.ok(parsed.ok)
     if (!parsed.ok) return
@@ -206,7 +206,7 @@ test('arm (d): a page the store did not serve is an error: nothing is written (p
     const ran = await snapshot(r)
     precondition(t, 'pages the fake emptied', dropped)
     assert.equal(ran.code, SNAPSHOT_EXIT_CODES.INCONSISTENT, ran.stderr)
-    assert.match(ran.stderr, /variable product\(s\) were read but the store's X-WP-Total says 4/)
+    assert.match(ran.stderr, /product\(s\) were read but the store's X-WP-Total says 4/)
     assert.deepEqual(listFiles(r.out), [], 'no snapshot, no partial walk')
   } finally { await r.server.close() }
 })
@@ -285,10 +285,9 @@ test('arm (g): a repeated variation SKU (letter case ignored) is an error and no
   } finally { await r.server.close() }
 })
 
-test('arm (g2): a parent without a SKU, a parent that is not variable, and a mismatching parent_id are each an error', async (t) => {
+test('arm (g2): a parent without a SKU and a mismatching parent_id are each an error', async (t) => {
   const cases: Array<{ name: string; edit: (p: FakeParent[]) => void; match: RegExp }> = [
     { name: 'blank parent SKU', edit: (p) => { p[2].sku = '' }, match: /parent 300 has a blank SKU/ },
-    { name: 'not variable', edit: (p) => { p[2].type = 'simple' }, match: /has type "simple", not "variable"/ },
     { name: 'parent_id mismatch', edit: (p) => { p[0].variations[0].parent_id = 999 }, match: /says its parent is 999/ },
   ]
   precondition(t, 'cases', cases.length)
@@ -402,7 +401,7 @@ test('arm (j): a walk that failed part-way resumes without asking for a finished
     const resumed = await snapshot(r, ['--resume'])
     assert.equal(resumed.code, SNAPSHOT_EXIT_CODES.OK, resumed.stderr)
     assert.equal(requestsTo(r.server, '/products', 1), page1Before + 1, 'page 1 was not requested again by the resumed walk; the one extra request is the verifying second walk')
-    assert.deepEqual(listFiles(r.out), [SNAPSHOT_FILE_NAMES.provenance, SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.variantParents, SNAPSHOT_FILE_NAMES.variantParentsInspection].sort(), 'the partial walk is removed once the snapshot is complete')
+    assert.deepEqual(listFiles(r.out), [SNAPSHOT_FILE_NAMES.provenance, SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.variantParents, SNAPSHOT_FILE_NAMES.variantParentsInspection, SNAPSHOT_FILE_NAMES.productStatus].sort(), 'the partial walk is removed once the snapshot is complete')
     for (const name of [SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.variantParents]) {
       assert.equal(readFileSync(path.join(r.out, name), 'utf8'), readFileSync(path.join(clean.out, name), 'utf8'), name)
     }
@@ -480,7 +479,11 @@ test('arm (m): the same store gives the same bytes whatever page size it grants 
 })
 
 test('arm (m2): the canonical form sorts by id whatever order it is given (the sort in the snapshot module itself, isolated from the walk)', (t) => {
-  const sorted = { source: 'woocommerce' as const, parents: [
+  const sorted = { source: 'woocommerce' as const, products: [
+    { id: 2, sku: 'B', name: 'B', type: 'variable', status: 'publish', manageStock: false, stockQuantity: null },
+    { id: 1, sku: 'A', name: 'A', type: 'variable', status: 'publish', manageStock: false, stockQuantity: null },
+    { id: 5, sku: 'S', name: 'S', type: 'simple', status: 'draft', manageStock: true, stockQuantity: 4 },
+  ], parents: [
     { id: 1, sku: 'A', name: 'A', status: 'publish', variationIds: [11, 12] },
     { id: 2, sku: 'B', name: 'B', status: 'publish', variationIds: [21] },
   ], variations: [
@@ -490,6 +493,7 @@ test('arm (m2): the canonical form sorts by id whatever order it is given (the s
   ] }
   const shuffled = {
     source: 'woocommerce' as const,
+    products: [sorted.products[2], sorted.products[1], sorted.products[0]],
     parents: [sorted.parents[1], { ...sorted.parents[0], variationIds: [12, 11] }],
     variations: [sorted.variations[2], { ...sorted.variations[0], attributes: [{ name: 'b', option: '2' }, { name: 'a', option: '1' }] }, sorted.variations[1]],
   }
@@ -504,11 +508,11 @@ test('arm (n): --verify recomputes the checksum: an edited snapshot is refused, 
     assert.equal((await snapshot(r)).code, SNAPSHOT_EXIT_CODES.OK)
     const file = path.join(r.out, SNAPSHOT_FILE_NAMES.snapshot)
     const attest = fresh('attest.json')
-    writeFileSync(attest, JSON.stringify({ products: { publish: 2, draft: 1, private: 1, pending: 0 }, variations: { publish: 9, draft: 0, private: 1, pending: 0 } }))
+    writeFileSync(attest, JSON.stringify({ allProducts: { publish: 2, draft: 1, private: 1, pending: 0 }, products: { publish: 2, draft: 1, private: 1, pending: 0 }, variations: { publish: 9, draft: 0, private: 1, pending: 0 } }))
     const good = await snapshot(r, [], {}, ['--verify', file, '--expect-origin', r.server.origin, '--expect-visibility', attest])
     precondition(t, 'verifications', 1)
     assert.equal(good.code, SNAPSHOT_EXIT_CODES.OK, good.stderr)
-    assert.match(good.stdout, /4 variable product\(s\), 10 variation\(s\)/)
+    assert.match(good.stdout, /4 product\(s\) of any type \(4 variable\), 10 variation\(s\)/)
     const edited = fresh('edited.json')
     writeFileSync(edited, readFileSync(file, 'utf8').replace('"sku": "W-01"', '"sku": "W-99"'))
     const bad = await snapshot(r, [], {}, ['--verify', edited, '--expect-origin', r.server.origin, '--expect-visibility', attest])
@@ -531,7 +535,7 @@ test('arm (o): end to end: the snapshot\'s variant-parents.csv, fed to first-loa
     writeFileSync(path.join(dir, 'exclusions.csv'), 'sku,reason\nW-03,not loaded at first\nB-02,not loaded at first\nB-03,not loaded at first\nB-04,not loaded at first\nB-05,not loaded at first\n')
     writeFileSync(path.join(dir, 'manifest.json'), JSON.stringify({
       formatVersion: 1, baseCurrency: 'GBP',
-      wooSnapshot: { snapshot: SNAPSHOT_FILE_NAMES.snapshot, provenance: SNAPSHOT_FILE_NAMES.provenance, origin: r.server.origin, visibilityChecked: { products: { publish: 2, draft: 1, private: 1, pending: 0 }, variations: { publish: 9, draft: 0, private: 1, pending: 0 } } },
+      wooSnapshot: { snapshot: SNAPSHOT_FILE_NAMES.snapshot, provenance: SNAPSHOT_FILE_NAMES.provenance, origin: r.server.origin, visibilityChecked: { allProducts: { publish: 2, draft: 1, private: 1, pending: 0 }, products: { publish: 2, draft: 1, private: 1, pending: 0 }, variations: { publish: 9, draft: 0, private: 1, pending: 0 } } },
       inputs: [
         { dataset: 'products', file: 'products.csv' },
         { dataset: 'variant-parents', file: 'variant-parents.csv' },
@@ -659,7 +663,7 @@ test('arm (s): an upstream error body that echoes the credentials never reaches 
 
 test('arm (s2): the redaction backstop alone: a credential that arrives as store data (a product type) is removed from the message', async (t) => {
   const parents = catalogue()
-  parents[2].type = SECRET
+  parents[2].status = SECRET
   const r = await rig({}, parents)
   try {
     const ran = await snapshot(r)
@@ -739,7 +743,7 @@ test('arm (w): the walk asks for each status BY NAME for the products and for th
     const proof = JSON.parse(readFileSync(path.join(r.out, SNAPSHOT_FILE_NAMES.provenance), 'utf8')).proof
     assert.deepEqual(proof.parents.statusTotals, { publish: 2, draft: 1, private: 1, pending: 0 })
     assert.deepEqual(proof.variations.statusTotals, { publish: 9, draft: 0, private: 1, pending: 0 })
-    assert.match(ran.stdout, /by status \(compare with the shop's own admin counts\): products publish 2, draft 1, private 1, pending 0; variations publish 9, draft 0, private 1, pending 0/)
+    assert.match(ran.stdout, /by status \(compare with the shop's own admin counts\): all products publish 2, draft 1, private 1, pending 0; variable products publish 2, draft 1, private 1, pending 0; variations publish 9, draft 0, private 1, pending 0/)
   } finally { await r.server.close() }
 })
 
@@ -813,9 +817,9 @@ test('o3d-7lxrt L2: --verify of a variant-parents.csv written before variationSt
     precondition(t, 'current csv has the column', current.split('\r\n')[0].includes('variationStatus') ? 1 : 0)
     writeFileSync(csvFile, current.split('\r\n').map((line) => line.replace(/,[^,]*$/, '')).join('\r\n'))
     const attest = fresh('attest-old.json')
-    writeFileSync(attest, JSON.stringify({ products: { publish: 2, draft: 1, private: 1, pending: 0 }, variations: { publish: 9, draft: 0, private: 1, pending: 0 } }))
+    writeFileSync(attest, JSON.stringify({ allProducts: { publish: 2, draft: 1, private: 1, pending: 0 }, products: { publish: 2, draft: 1, private: 1, pending: 0 }, variations: { publish: 9, draft: 0, private: 1, pending: 0 } }))
     const old = await snapshot(r, [], {}, ['--verify', path.join(r.out, SNAPSHOT_FILE_NAMES.snapshot), '--expect-origin', r.server.origin, '--expect-visibility', attest])
     assert.equal(old.code, SNAPSHOT_EXIT_CODES.INCONSISTENT)
-    assert.match(old.stderr, /no variationStatus column: it was written from a snapshot taken before variationStatus was added/)
+    assert.match(old.stderr, /variant-parents\.csv predates the variationStatus column/)
   } finally { await r.server.close() }
 })

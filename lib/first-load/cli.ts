@@ -10,7 +10,7 @@ import path from 'node:path'
 import { InputError, decisionSkuKey, ingestDataset, type IngestDecisions, mergeIngested, parseColumnMap, type ColumnMap, type DatasetMapping, type IngestedDataset } from './ingest'
 import { renderAccountingTable, renderJson, renderMarkdown } from './report'
 import { DATASET_NAMES, EXIT_CODES, EXIT_CODE_TABLE, IN_TRANSIT_CONVENTIONS, type DatasetName, type InTransitConvention } from './spec'
-import { bindingFromVerification, normaliseStoreOrigin, parseVisibilityAttestation, verifyWooSnapshotBundle, type VisibilityAttestation, type VariantParentsBinding } from './snapshot'
+import { bindingFromVerification, productStatusBindingFromVerification, normaliseStoreOrigin, parseVisibilityAttestation, verifyWooSnapshotBundle, type VisibilityAttestation, type ProductStatusBinding, type VariantParentsBinding } from './snapshot'
 import { ConfigError, prepare, type PrepareConfig } from './transform'
 
 export interface CliIo {
@@ -298,34 +298,33 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
     maxPurchaseTaxRate: manifest.maxPurchaseTaxRate,
     requireVariantParents: manifest.requireVariantParents,
   }
-  // The variant-parents dataset assigns parents, so it is only accepted when it equals the rows regenerated from the verified snapshot named by the manifest.
-  let variantParentsBinding: VariantParentsBinding | undefined
-  if (datasets['variant-parents'] !== undefined) {
-    const listed = manifest.inputs.filter((i) => i.dataset === 'variant-parents')
-    const readOrNull = (file: string): Buffer | null => {
-      try {
-        return readFileSync(resolve(file))
-      } catch {
-        return null
-      }
-    }
-    if (listed.length !== 1 || listed[0].columnMap !== null) {
-      variantParentsBinding = { verified: false, problems: ['the variant-parents dataset must be exactly one canonical file written by first-load:woo-snapshot (no column map, listed once)'] }
-    } else if (manifest.wooSnapshot === null) {
-      variantParentsBinding = { verified: false, problems: ['the manifest does not name wooSnapshot (the snapshot and provenance variant-parents.csv was written with)'] }
-    } else {
-      variantParentsBinding = bindingFromVerification(verifyWooSnapshotBundle({
-        snapshotBytes: readOrNull(manifest.wooSnapshot.snapshot),
-        provenanceBytes: readOrNull(manifest.wooSnapshot.provenance),
-        csvBytes: readOrNull(listed[0].file),
-        expectedOrigin: manifest.wooSnapshot.origin,
-        visibilityChecked: manifest.wooSnapshot.visibilityChecked,
-      }))
+  // The variant-parents dataset assigns parents and woo-product-status gives lifecycles, so each is only accepted when it equals the rows regenerated from the verified snapshot named by the manifest.
+  const readOrNull = (file: string): Buffer | null => {
+    try {
+      return readFileSync(resolve(file))
+    } catch {
+      return null
     }
   }
+  const bindingFor = (dataset: 'variant-parents' | 'woo-product-status'): VariantParentsBinding | undefined => {
+    if (datasets[dataset] === undefined) return undefined
+    const listed = manifest.inputs.filter((i) => i.dataset === dataset)
+    if (listed.length !== 1 || listed[0].columnMap !== null) return { verified: false, problems: [`the ${dataset} dataset must be exactly one canonical file written by first-load:woo-snapshot (no column map, listed once)`] }
+    if (manifest.wooSnapshot === null) return { verified: false, problems: [`the manifest does not name wooSnapshot (the snapshot and provenance that ${dataset}.csv was written with), so ${dataset}.csv cannot be verified`] }
+    const verdict = verifyWooSnapshotBundle({
+      snapshotBytes: readOrNull(manifest.wooSnapshot.snapshot),
+      provenanceBytes: readOrNull(manifest.wooSnapshot.provenance),
+      ...(dataset === 'variant-parents' ? { csvBytes: readOrNull(listed[0].file) } : { productStatusBytes: readOrNull(listed[0].file) }),
+      expectedOrigin: manifest.wooSnapshot.origin,
+      visibilityChecked: manifest.wooSnapshot.visibilityChecked,
+    })
+    return dataset === 'variant-parents' ? bindingFromVerification(verdict) : productStatusBindingFromVerification(verdict)
+  }
+  const variantParentsBinding: VariantParentsBinding | undefined = bindingFor('variant-parents')
+  const productStatusBinding: ProductStatusBinding | undefined = bindingFor('woo-product-status')
   let result
   try {
-    result = (deps.prepare ?? prepare)({ config, datasets, variantParentsBinding })
+    result = (deps.prepare ?? prepare)({ config, datasets, variantParentsBinding, productStatusBinding })
   } catch (error) {
     if (error instanceof ConfigError) {
       io.stderr(`first-load-prepare: invalid run configuration: ${error.message}\n`)

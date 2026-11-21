@@ -104,7 +104,7 @@ test('the snapshot command section documents exactly the environment variables t
   assert.deepEqual([...documented].sort(), Object.values(ENV_KEYS).sort(), 'every variable the command reads is documented, and none that it does not')
   const files = tableRows(body.slice(body.indexOf('| File |'), body.indexOf('**Completeness is proved')))
   precondition(t, 'documented output files', files.length)
-  assert.deepEqual(files.map((row) => row[0].replace(/`/g, '')).sort(), [SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.provenance, SNAPSHOT_FILE_NAMES.variantParents, SNAPSHOT_FILE_NAMES.variantParentsInspection].sort())
+  assert.deepEqual(files.map((row) => row[0].replace(/`/g, '')).sort(), [SNAPSHOT_FILE_NAMES.snapshot, SNAPSHOT_FILE_NAMES.provenance, SNAPSHOT_FILE_NAMES.variantParents, SNAPSHOT_FILE_NAMES.variantParentsInspection, SNAPSHOT_FILE_NAMES.productStatus].sort())
   assert.ok(body.includes(`(default ${DEFAULT_MIN_INTERVAL_MS})`), 'the documented default interval is the real one')
   assert.ok(body.includes(`(default ${DEFAULT_MAX_RESUME_AGE_MINUTES})`), 'the documented resume age is the real one')
   assert.equal(WALK_MAX_ATTEMPTS, 3)
