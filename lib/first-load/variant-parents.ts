@@ -66,6 +66,8 @@ export interface VariantJoinResult {
   confirmed: Set<string>
   /** Parents the products file itself carries as VARIABLE, with what WooCommerce says about them (WooCommerce wins for title and lifecycle). */
   providedParents: Array<{ key: string; sku: string; name: string; lifecycle: 'ACTIVE' | 'DRAFT' }>
+  /** Every variation (VARIANT, KIT or BOM) that joined its parent, with the lifecycle WooCommerce gives the parent. */
+  joined: Array<{ key: string; sku: string; parentSku: string; parentLifecycle: 'ACTIVE' | 'DRAFT' }>
   /** Every SKU key the dataset names (variations and parents), so an exclusion on one of them is not reported as stale. */
   namedKeys: Set<string>
   summary: { rowsRead: number; variantsJoined: number; parentsEmitted: number; parentsWithoutQoblexVariant: number }
@@ -172,6 +174,7 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
   const parents = new Map<string, SyntheticParent>()
   const confirmed = new Set<string>()
   const provided = new Map<string, { key: string; sku: string; name: string; lifecycle: 'ACTIVE' | 'DRAFT' }>()
+  const joined: VariantJoinResult['joined'] = []
   const typeNotVariant: string[] = []
   const stemMismatch: string[] = []
   const joinedParentKeys = new Set<string>()
@@ -217,6 +220,7 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
       confirmed.add(i.variantKey)
       add(i.row, i.variantSku, 'EMITTED', 'VARIATION_JOINED', `joined by exact SKU to WooCommerce parent ${i.parentSku}`)
       joinedParentKeys.add(parentKey)
+      joined.push({ key: i.variantKey, sku: i.variantSku, parentSku: i.parentSku, parentLifecycle: i.lifecycle })
       if (skuStem(i.variantSku) !== parentKey) stemMismatch.push(`${i.variantSku} -> ${i.parentSku}`)
       if (providedByProducts(parentKey)) {
         provided.set(parentKey, { key: parentKey, sku: head.parentSku, name: head.parentName, lifecycle: head.lifecycle })
@@ -265,6 +269,7 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
     findings,
     assignments,
     confirmed,
+    joined,
     providedParents: [...provided.values()].sort((a, b) => cmp(a.key, b.key)),
     parents: emitted,
     namedKeys,

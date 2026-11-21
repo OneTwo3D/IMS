@@ -229,6 +229,7 @@ export const DATASET_NAMES = [
   'supplier-overrides',
   'recipe-overrides',
   'sku-renames',
+  'lifecycle-confirmations',
   'ims-skus',
   'ims-suppliers',
   'ims-tax-rates',
@@ -309,10 +310,10 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     purpose: 'The 3PL (WMS) stock levels. Used for R14 coverage and to find a SKU that holds stock there but is missing from the Qoblex stock extract.',
   },
   'woo-products': {
-    columns: ['sku', 'wooProductId', 'type'],
+    columns: ['sku', 'wooProductId', 'type', 'status'],
     required: ['sku'],
     sources: ['woocommerce'],
-    purpose: 'WooCommerce product export. Used only for the four-way SKU coverage check (R14). Never a source for recipes.',
+    purpose: 'WooCommerce product export. Used for the four-way SKU coverage check (R14) and, when it carries `status`, to check a DRAFT Qoblex product against a published WooCommerce one. Never a source for recipes.',
   },
   'variant-parents': {
     columns: ['variantSku', 'wooVariationId', 'parentSku', 'parentName', 'parentStatus', 'wooParentId'],
@@ -356,7 +357,13 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     columns: ['fromSku', 'toSku', 'reason'],
     required: ['fromSku', 'toSku', 'reason'],
     sources: [],
-    purpose: 'Owner decision: a source SKU that is loaded under another SKU (the source spelling differs from the WooCommerce one). Renames the SKU in every source dataset of the run (products, recipe lines and overrides, stock lots, purchase order lines, transfers) before any join. A rename whose fromSku is in no input, whose toSku already exists, that chains into another rename, or that is listed twice is refused. Always canonical.',
+    purpose: 'Owner decision: a source SKU that is loaded under another SKU (the source spelling differs from the WooCommerce one). Renames the SKU in every source dataset of the run (products, recipe lines and overrides, stock lots, purchase order lines, transfers) before any join. A rename whose fromSku is in no input, whose toSku already exists, whose fromSku or toSku is on sku-exclusions, that chains into another rename, or that is listed twice is refused. Always canonical.',
+  },
+  'lifecycle-confirmations': {
+    columns: ['sku', 'reason'],
+    required: ['sku', 'reason'],
+    sources: [],
+    purpose: 'Owner decision: a SKU whose products-file lifecycle is DRAFT while WooCommerce publishes it (a variation under a published parent, or a published simple product) is confirmed, per SKU, to be loaded as DRAFT even though DRAFT forces a WooCommerce draft. Without a row the run is blocked (LIFECYCLE_DISAGREES_WITH_WOO). Always canonical.',
   },
   'ims-suppliers': {
     columns: ['name'],

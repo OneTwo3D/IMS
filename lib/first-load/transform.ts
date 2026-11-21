@@ -30,6 +30,7 @@ import {
   RECIPE_TYPES,
   STOCK_BEARING_TYPES,
   STRANDED_TRANSFER_DAYS,
+  VARIANT_PARENT_STATUS_LIFECYCLE,
   SUPPLIER_PURCHASE_TAX_TYPES,
   type DatasetName,
   type ImporterTarget,
@@ -374,6 +375,9 @@ class Run {
   wmsQty = new Map<string, Dec>()
   wmsSkus = new Map<string, string>()
   wooSkus = new Map<string, string>()
+  /** lifecycle-confirmations: SKU key -> SKU, and the keys a check actually needed. */
+  lifecycleConfirmations = new Map<string, string>()
+  lifecycleConfirmationsUsed = new Set<string>()
   /** VARIABLE parents created from the variant-parents dataset (they are output rows without a products-dataset record). */
   syntheticParents = new Set<string>()
   variantConfirmed = new Set<string>()
@@ -489,6 +493,16 @@ function loadSkuRenames(run: Run): void {
   const refuse = (item: Item, code: string, reason: string): void => {
     if (!refused.has(item)) refused.set(item, { code, reason })
   }
+  // An exclusion is the owner's record that a SKU is NOT loaded. A rename that touches an excluded SKU would silently move the product out of (or into) that decision, so it is refused.
+  const excludedKeys = new Map<string, string>()
+  for (const row of run.rows('sku-exclusions')) {
+    const parsed = parseSku(row.values.sku)
+    if (parsed.ok) excludedKeys.set(parsed.key, parsed.sku)
+  }
+  for (const item of items) {
+    if (excludedKeys.has(item.fromKey)) refuse(item, 'RENAME_FROM_EXCLUDED', `${item.from} is on sku-exclusions (it is deliberately not loaded); renaming it to ${item.to} would load it anyway. Remove the exclusion or the rename`)
+    else if (excludedKeys.has(item.toKey)) refuse(item, 'RENAME_TO_EXCLUDED', `${item.to} is on sku-exclusions (it is deliberately not loaded); renaming ${item.from} to it would exclude that product silently. Remove the exclusion or the rename`)
+  }
   const byFrom = new Map<string, Item[]>()
   const byTo = new Map<string, Item[]>()
   for (const item of items) {
@@ -588,6 +602,61 @@ function loadExclusions(run: Run): void {
 }
 
 /**
+ * OWNER DECISIONS (lifecycle-confirmations): a SKU the owner confirms may load as DRAFT although WooCommerce publishes it. Each row is validated here; the checks that need it
+ * (a variation under a published parent, a published simple product) consult run.lifecycleConfirmations and record which rows they used.
+ */
+function loadLifecycleConfirmations(run: Run): void {
+  const seen = new Set<string>()
+  for (const row of run.rows('lifecycle-confirmations')) {
+    const sku = parseSku(row.values.sku)
+    if (!sku.ok) { run.add('lifecycle-confirmations', row.line, row.values.sku, 'REJECTED', 'BAD_SKU', sku.reason); continue }
+    if (row.values.reason === '') { run.add('lifecycle-confirmations', row.line, sku.sku, 'REJECTED', 'MISSING_REASON', 'a lifecycle confirmation needs a written reason: it is the owner-accepted record that this DRAFT product may force its published WooCommerce listing to draft'); continue }
+    if (seen.has(sku.key)) { run.add('lifecycle-confirmations', row.line, sku.sku, 'EXCLUDED', 'DUPLICATE_ROW', 'repeat of an earlier lifecycle confirmation'); continue }
+    seen.add(sku.key)
+    run.lifecycleConfirmations.set(sku.key, sku.sku)
+    run.add('lifecycle-confirmations', row.line, sku.sku, 'EMITTED', 'LIFECYCLE_CONFIRMATION_REGISTERED', 'registered: this SKU may load as DRAFT under a published WooCommerce listing')
+  }
+}
+
+/**
+ * A DRAFT product whose WooCommerce listing is published: the importers force a WooCommerce draft for a DRAFT product (shouldForceWooDraft), so loading it would unpublish a live
+ * listing. Refuse rather than guess: each such SKU is a blocking ERROR unless it is on lifecycle-confirmations (then INFO). Any other disagreement stays a WARNING.
+ */
+function reportDraftAgainstPublished(run: Run, what: string, risky: Array<{ key: string; label: string }>): void {
+  if (risky.length === 0) return
+  const unconfirmed = risky.filter((r) => !run.lifecycleConfirmations.has(r.key))
+  const confirmed = risky.filter((r) => run.lifecycleConfirmations.has(r.key))
+  for (const r of confirmed) run.lifecycleConfirmationsUsed.add(r.key)
+  if (confirmed.length > 0) run.find('INFO', 'LIFECYCLE_CONFIRMED', `${confirmed.length} ${what} are DRAFT in the products file while WooCommerce publishes them; the owner confirmed each on lifecycle-confirmations (the importer will force the WooCommerce listing to draft)`, 'lifecycle-confirmations', confirmed.map((r) => r.label))
+  if (unconfirmed.length > 0) run.find('ERROR', 'LIFECYCLE_DISAGREES_WITH_WOO', `${unconfirmed.length} ${what} are DRAFT in the products file (Qoblex Archived) while WooCommerce publishes them. A DRAFT product forces its WooCommerce listing to draft, so loading it could unpublish a live listing. Fix the state in Qoblex, or confirm each SKU with a reason on the lifecycle-confirmations list`, 'products', unconfirmed.map((r) => r.label))
+}
+
+/** After the coverage datasets are read: a DRAFT simple product against its published WooCommerce listing, and the stale confirmations. */
+function checkLifecycleAgainstWoo(run: Run): void {
+  if (run.has('woo-products') && run.has('products')) {
+    const wooStatus = new Map<string, string>()
+    for (const row of run.rows('woo-products')) {
+      const sku = parseSku(row.values.sku)
+      if (sku.ok) wooStatus.set(sku.key, (row.values.status ?? '').trim().toLowerCase())
+    }
+    const risky: Array<{ key: string; label: string }> = []
+    const unverified: string[] = []
+    for (const entry of run.cat.values()) {
+      if (entry.type === 'VARIABLE' || entry.type === 'VARIANT' || entry.parentSku !== '' || entry.lifecycle !== 'DRAFT') continue
+      const status = wooStatus.get(entry.key)
+      if (status === undefined) continue
+      const mapped = Object.prototype.hasOwnProperty.call(VARIANT_PARENT_STATUS_LIFECYCLE, status) ? VARIANT_PARENT_STATUS_LIFECYCLE[status] : undefined
+      if (mapped === 'ACTIVE') risky.push({ key: entry.key, label: `${entry.sku}: DRAFT in the products file, WooCommerce status ${status}` })
+      else if (mapped === undefined) unverified.push(entry.sku)
+    }
+    reportDraftAgainstPublished(run, 'simple/KIT/BOM product(s)', risky)
+    if (unverified.length > 0) run.find('WARNING', 'DRAFT_PRODUCT_WOO_STATUS_UNKNOWN', `${unverified.length} DRAFT product(s) are in woo-products but its rows carry no usable status, so a published WooCommerce listing cannot be ruled out (a DRAFT product forces its WooCommerce listing to draft): add the status column, or check each by hand`, 'woo-products', unverified)
+  }
+  const stale = [...run.lifecycleConfirmations.entries()].filter(([key]) => !run.lifecycleConfirmationsUsed.has(key)).map(([, sku]) => sku)
+  if (stale.length > 0) run.find('WARNING', 'STALE_LIFECYCLE_CONFIRMATION', 'SKU(s) on the lifecycle-confirmations list were not a DRAFT product against a published WooCommerce listing in this run: the confirmation does nothing', 'lifecycle-confirmations', stale)
+}
+
+/**
  * The owner decisions lists that act at read time (the ingest applied them to the cells): non-stock-skus and sku-name-overrides. Here every row gets its
  * disposition and the lists are checked: a bad or conflicting row is refused (it would otherwise have been applied by the ingest, which only reads the
  * trimmed values), and a decision that matched nothing is a warning.
@@ -601,7 +670,7 @@ function loadReadTimeDecisions(run: Run): void {
     if (seenSkus.has(sku.key)) { run.add('non-stock-skus', row.line, sku.sku, 'EXCLUDED', 'DUPLICATE_ROW', 'repeat of an earlier non-stock row'); continue }
     seenSkus.set(sku.key, sku.sku)
     run.nonStockDecisions.set(sku.key, sku.sku)
-    run.add('non-stock-skus', row.line, sku.sku, 'EMITTED', 'NON_STOCK_REGISTERED', 'loaded as NON_INVENTORY whatever the source type says; stock cells ignored')
+    run.add('non-stock-skus', row.line, sku.sku, 'EMITTED', 'NON_STOCK_REGISTERED', 'loaded as NON_INVENTORY when the source type is blank, Unknown or non-inventory (a stated stock-bearing type is refused NON_STOCK_DECISION_CONFLICT); stock cells ignored')
   }
   const byName = new Map<string, string>()
   for (const row of run.rows('sku-name-overrides')) {
@@ -916,7 +985,19 @@ function joinVariantParentsInto(run: Run, candidates: CatEntry[]): void {
     entry.lifecycle = p.lifecycle
   }
   if (differing.length > 0) run.find('INFO', 'PARENT_ATTRIBUTES_FROM_WOO', `${differing.length} VARIABLE product(s) in the products file carry a title or lifecycle that differs from WooCommerce: WooCommerce's title and mapped status are written`, 'variant-parents', differing)
-  if (lifecycleDisagrees.length > 0) run.find('WARNING', 'LIFECYCLE_DISAGREES_WITH_WOO', `${lifecycleDisagrees.length} VARIABLE product(s) have a lifecycle in the products file (for Qoblex: Archived is DRAFT, Active is ACTIVE) that disagrees with the WooCommerce status (publish is ACTIVE, draft/pending/private is DRAFT): WooCommerce's is written; check which side is right (the snapshot covers variable products only)`, 'variant-parents', lifecycleDisagrees)
+  if (lifecycleDisagrees.length > 0) run.find('WARNING', 'LIFECYCLE_DISAGREES_WITH_WOO', `${lifecycleDisagrees.length} VARIABLE product(s) have a lifecycle in the products file (for Qoblex: Archived is DRAFT, Active is ACTIVE) that disagrees with the WooCommerce status (publish is ACTIVE, draft/pending/private is DRAFT): WooCommerce's is written; check which side is right (variations are checked separately, against their parent)`, 'variant-parents', lifecycleDisagrees)
+  // Each VARIANT, KIT or BOM variation against its WooCommerce parent: Qoblex does not send parent rows, so this is the check that fires on real data.
+  // A DRAFT variation under a published parent forces a WooCommerce draft (blocks unless confirmed); any other difference is a warning.
+  const draftUnderPublished: Array<{ key: string; label: string }> = []
+  const otherVariantDisagreements: string[] = []
+  for (const j of result.joined) {
+    const entry = byKey.get(j.key)
+    if (!entry || entry.lifecycle === j.parentLifecycle) continue
+    if (entry.lifecycle === 'DRAFT' && j.parentLifecycle === 'ACTIVE') draftUnderPublished.push({ key: j.key, label: `${j.sku} (under ${j.parentSku})` })
+    else otherVariantDisagreements.push(`${j.sku} (under ${j.parentSku}): the products file says ${entry.lifecycle}, the WooCommerce parent says ${j.parentLifecycle}`)
+  }
+  reportDraftAgainstPublished(run, 'variation(s) (VARIANT, KIT or BOM)', draftUnderPublished)
+  if (otherVariantDisagreements.length > 0) run.find('WARNING', 'LIFECYCLE_DISAGREES_WITH_WOO', `${otherVariantDisagreements.length} variation(s) have a lifecycle in the products file that differs from their WooCommerce parent's status (not a DRAFT variation under a published parent): check which side is right`, 'variant-parents', otherVariantDisagreements)
   for (const key of result.namedKeys) run.variantParentKeys.add(key)
   run.variantParentSummary = { supplied: true, ...result.summary }
 }
@@ -2202,6 +2283,7 @@ export function prepare(input: PrepareInput): PrepareResult {
 
   loadSkuRenames(run)
   loadExclusions(run)
+  loadLifecycleConfirmations(run)
   loadReadTimeDecisions(run)
   loadImsSkus(run)
   loadCatalogue(run)
@@ -2216,6 +2298,7 @@ export function prepare(input: PrepareInput): PrepareResult {
   loadPurchaseOrders(run)
   reportNormalisation(run)
   loadCoverageDatasets(run)
+  checkLifecycleAgainstWoo(run)
   const coverage = checkCoverage(run)
   const split = splitZeroAndMissing(run)
 
