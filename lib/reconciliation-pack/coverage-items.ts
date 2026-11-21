@@ -16,7 +16,7 @@
  * (sku-exclusions.ts), moves exactly that pair to the `excluded` bucket, listed and not judged. An exclusion for one system never covers
  * another system or another SKU; an untrusted, absent or expired exclusion covers nothing.
  *
- * SET ASIDE, LISTED, NEVER A FINDING (outOfPopulation): a SKU that is a product VARIATION (VARIANT in IMS or in the export) is not looked
+ * SET ASIDE, LISTED, NEVER A FINDING (outOfPopulation): a SKU that is a product VARIATION (VARIANT in IMS or in the export, or ANY IMS product that has a parent: the first load also gives a KIT or BOM a parent when it is a variation of a variable product) is not looked
  * for in the storefront walk, which lists top-level products only (STATED LIMIT: variations are separate collections that the transport
  * does not walk, so a variation missing from the storefront is not detected here); a storefront product with an empty SKU has no SKU
  * identity and is listed under its storefront id.
@@ -28,6 +28,7 @@
 import { compareItem, outcomeOfComparison, type CompareEntry, type CompareResult, type SideRow } from '@/lib/reconciliation-pack/compare'
 import { R14_SYSTEMS, R14_SYSTEM_SOURCES, R14_WMS_SYSTEM, type PackReasonCode, type PackSourceCode, type R14System } from '@/lib/reconciliation-pack/constants'
 import { canonicalKey, keyToken, type KeyPart } from '@/lib/reconciliation-pack/identity'
+import { coverageEvidenceEntries } from '@/lib/reconciliation-pack/qoblex-evidence'
 import type { ImsRead, ImsReadOptions, ProductRow } from '@/lib/reconciliation-pack/ims-readers'
 import type { QoblexSource } from '@/lib/reconciliation-pack/qoblex-source'
 import type { ItemInput } from '@/lib/reconciliation-pack/report'
@@ -124,7 +125,7 @@ async function runR14(context: CoverageContext): Promise<ItemInput> {
   }
 
   // Set aside: a variation is not looked for in the storefront walk (top-level products only).
-  const variations = new Set<string>([...imsProducts.filter((p) => p.type === 'VARIANT').map((p) => p.sku), ...qoblexProducts.filter((p) => p.type === 'VARIANT').map((p) => p.sku)])
+  const variations = new Set<string>([...imsProducts.filter((p) => p.type === 'VARIANT' || p.parentId !== null).map((p) => p.sku), ...qoblexProducts.filter((p) => p.type === 'VARIANT').map((p) => p.sku)])
   const population = new Set<string>()
   for (const row of expected) {
     const [skuPart, systemPart] = row.key as [KeyPart, KeyPart]
@@ -150,7 +151,13 @@ async function runR14(context: CoverageContext): Promise<ItemInput> {
     used.add(token)
     unkeyed.push({ key: token, ims: null, vendor: null, delta: null, imsCurrency: null, vendorCurrency: null, imsPresent: false, vendorPresent: true })
   }
-  const withUnkeyed: CompareResult = { ...result, buckets: { ...result.buckets, outOfPopulation: [...result.buckets.outOfPopulation, ...unkeyed] } }
+  // What the Qoblex read skipped, dropped or renamed (reported, never judged).
+  const reported = coverageEvidenceEntries(qoblex.value.evidence)
+  for (const entry of reported) {
+    if (used.has(entry.key)) return inconclusive(sources, 'DUPLICATE_KEY')
+    used.add(entry.key)
+  }
+  const withUnkeyed: CompareResult = { ...result, buckets: { ...result.buckets, outOfPopulation: [...result.buckets.outOfPopulation, ...unkeyed, ...reported] } }
 
   const verdict = outcomeOfComparison(withUnkeyed)
   const entries = withUnkeyed.buckets

@@ -7,7 +7,10 @@
  * COLUMN_MAP_NOT_NATIVE. A test pins this text byte for byte to tests/first-load/fixtures/qoblex-native/maps/qoblex-stock-on-hand.map.json, the
  * map the first-load tool is tested with, so the two cannot drift.
  *
- * EVERY TRANSFORM IN IT, and why none can change a compared value:
+ * EVERY TRANSFORM IN IT, and what each does to a compared value. THREE of them DO change what is compared, and each is REPORTED in the pack's evidence
+ * (qoblex-evidence.ts), never silent: ghostRows (a dropped row; a ghost with a NON-ZERO quantity makes its part inconclusive, QOBLEX_GHOST_STOCK, and a
+ * zero one is listed), blankStockIsZero (a SKU read as 0 on hand; listed per run with its SKU) and the rowSelect skips (counted per part and per kind).
+ * The rest are renames, constants and fixed lists that cannot alter a quantity, SKU or location:
  *   products  rowsAboveHeader 1                 the report's label row above the header: structure, no data.
  *             columns sku/name/type/barcode/lifecycleStatus  header renames only.
  *             valueMaps.type simple->SIMPLE, variable->VARIANT, kit->KIT, bom->BOM, non-inventory->NON_INVENTORY
@@ -21,17 +24,22 @@
  *             rowSelect State keep Active/Inactive/Archived, skip Deleted  a Deleted product is not part of the load (owner ruling): counted by the
  *                                               ingest (rowsSkipped), never read as a product.
  *             nameColumn Product, nonStock Product Type=non-inventory  decisions hooks: the pack is never given a decisions list, so they do nothing here.
- *             ghostRows Product Type=Unknown  of several rows of one SKU exactly one of which is typed, the Unknown ones are dropped and reported (a ghost left behind in Qoblex); any other duplicate is still refused.
+ *             ghostRows Product Type=Unknown  of several rows of one SKU exactly one of which is typed, the Unknown ones are dropped (a ghost left behind in Qoblex); any other duplicate is still refused.
+ *                                               CHANGES WHAT IS COMPARED: the dropped row's quantity vanishes from the pack's stock. Reported (R2 qoblex-ghost-row, R14 qoblex-ghost-row and
+ *                                               qoblex-rows-skipped, from the ingest's notes and rowsSkipped); a ghost with a non-zero quantity makes the part inconclusive.
  *   stock-lots rowsAboveHeader 1                the same label row.
  *             blankStockIsZero true             a row whose all-warehouses total is blank and every warehouse cell is blank or exactly zero is read as 0 on hand (owner ruling), reported per row
- *                                               (BLANK_STOCK_AS_ZERO). A blank total next to any non-zero warehouse cell is still refused (WIDE_TOTAL_MISMATCH).
+ *                                               by the ingest (BLANK_STOCK_AS_ZERO). A blank total next to any non-zero warehouse cell is still refused (WIDE_TOTAL_MISMATCH).
+ *                                               CHANGES A COMPARED VALUE (blank -> 0): first load and pack now share this reading (one ingest), so an export fault that
+ *                                               leaves real stock blank reads 0 on BOTH legs and only the warehouse-system leg can catch it. The pack therefore lists, per
+ *                                               run, every SKU so read (R2 qoblex-blank-as-zero, value 0), from the ingest's notes.
  *             columns sku, unitCost             header renames only (unit cost is the report's Moving Average Cost).
  *             constants.currency GBP            the report has no currency column; the manifest declares GBP and R5 refuses anything else. It cannot
  *                                               change a quantity, SKU or location. LIMIT: the currency is a declaration, not read from the file.
  *             rowSelect (a list, every selector must pass): Product Type keep simple/variable/bom  the kinds that hold stock of their own (IMS stock-bearing types: SIMPLE, VARIANT, BOM).
  *                                               skip kit/non-inventory  the two kinds that never hold stock in IMS (a kit's stock is its components', a
  *                                               non-inventory item has none; the first-load tool refuses opening stock for both). Those rows are counted
- *                                               by the ingest (rowsSkipped), not read as lots. A row of ANY other kind is refused by the ingest
+ *                                               by the ingest (rowsSkipped), not read as lots, and the counts are listed (R14 qoblex-rows-skipped). A row of ANY other kind is refused by the ingest
  *                                               (UNLISTED_ROW_KIND), never dropped. State: the same keep/skip lists as the products (Deleted skipped).
  *             wide (blocks, label -> warehouse code, totals, uniqueBy sku)  the warehouse labels map to the fixed codes MIL1, CAMBRIDGE, RESTOCK,
  *                                               QUARANTINE-CAMBRIDGE, RXT2; the quantity of each block must add up to the report's all-warehouses

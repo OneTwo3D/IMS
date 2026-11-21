@@ -58,7 +58,7 @@ function rig(base: string, config: { mode?: string; wooSkus?: string[] } = {}): 
     { connector: 'mintsoft', warehouse_id: cuid(5), warehouse_code: 'EAR2', external_id: '5', active: true, mode: 'NOTIFICATION_ONLY', confirmed: false },
     { connector: 'mintsoft', warehouse_id: cuid(6), warehouse_code: 'MIL1', external_id: '6', active: true, mode: 'NOTIFICATION_ONLY', confirmed: false },
   ]
-  const products = PROBE_WH6.map((row, index) => ({ id: cuid(1000 + index), sku: row.SKU, type: row.Bundle ? 'KIT' : 'SIMPLE', active: true, lifecycle: 'ACTIVE' }))
+  const products = PROBE_WH6.map((row, index) => ({ id: cuid(1000 + index), sku: row.SKU, type: row.Bundle ? 'KIT' : 'SIMPLE', active: true, lifecycle: 'ACTIVE', parentId: null }))
   const plain = products.filter((_, index) => !PROBE_WH6[index]!.Bundle)
   const links = plain.map((p) => ({ connector: 'mintsoft', product_id: p.id, external_id: String(PROBE_WH6.find((row) => row.SKU === p.sku)!.ProductId) }))
   const levels = bindings.flatMap((b, bi) => plain.map((p, index) => {

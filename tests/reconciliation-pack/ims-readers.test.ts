@@ -86,7 +86,7 @@ test('a timeout (57014) is READ_INCOMPLETE, another database error is SOURCE_UNR
 })
 
 test('more rows than the cap is CAP_EXCEEDED for that section, never a shorter list; exactly the cap is read in full', async () => {
-  const rows = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `p${i}`, sku: `S${i}`, type: 'SIMPLE', active: true, lifecycle: 'ACTIVE' }))
+  const rows = (n: number) => Array.from({ length: n }, (_, i) => ({ id: `p${i}`, sku: `S${i}`, type: 'SIMPLE', active: true, lifecycle: 'ACTIVE', parentId: null }))
   const over = await readImsSnapshot(fake(() => rows(4)), { sections: ['products'], rowCap: 3 })
   assert.ok(over.ok && over.sections.products!.ok === false && over.sections.products!.reason === 'CAP_EXCEEDED')
   const client = fake((sql) => { assert.match(sql, /LIMIT 4$/); return rows(3) })
@@ -131,7 +131,7 @@ test('duplicate identities are DUPLICATE_KEY: the same stock level id, the same 
   const dup = async (sections: Parameters<typeof readImsSnapshot>[1]['sections'], rows: Array<Record<string, unknown>>) => (await readImsSnapshot(fake(() => rows), { sections }) as Extract<Awaited<ReturnType<typeof readImsSnapshot>>, { ok: true }>).sections
   assert.deepEqual((await dup(['stock'], [stockRow(), stockRow()])).stock, { ok: false, reason: 'DUPLICATE_KEY' })
   assert.deepEqual((await dup(['stock'], [stockRow(), stockRow({ id: 'sl2' })])).stock, { ok: false, reason: 'DUPLICATE_KEY' })
-  const product = (id: string, sku: string) => ({ id, sku, type: 'SIMPLE', active: true, lifecycle: 'ACTIVE' })
+  const product = (id: string, sku: string) => ({ id, sku, type: 'SIMPLE', active: true, lifecycle: 'ACTIVE', parentId: null })
   assert.deepEqual((await dup(['products'], [product('a', 'S'), product('b', 'S')])).products, { ok: false, reason: 'DUPLICATE_KEY' })
 })
 

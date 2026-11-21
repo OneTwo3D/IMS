@@ -512,6 +512,12 @@ export interface IngestRejection {
   reason: string
 }
 
+/**
+ * One explanatory line of a read. `sku` and `quantity` are the structured form of the two notes a consumer must be able to act on without parsing the
+ * text: GHOST_ROW_DROPPED (the ghost row's SKU and its quantity cell as written) and BLANK_STOCK_AS_ZERO (the SKU read as 0 on hand).
+ */
+export type IngestNote = { line: number; code: string; reason: string; sku?: string; quantity?: string }
+
 export interface IngestedDataset {
   dataset: DatasetName
   file: string
@@ -531,7 +537,7 @@ export interface IngestedDataset {
   /** Rows the map's closed `rowSelect.skip` list deliberately left out, by the value that skipped them. Not records. */
   rowsSkipped: Record<string, number>
   /** Explanatory lines the read adds to the report (INFO): ghost rows dropped, stock ignored on a KIT decided by the owner. */
-  notes?: Array<{ line: number; code: string; reason: string }>
+  notes?: IngestNote[]
   /**
    * Rows a LATER file of the same dataset deliberately replaced (manifest `supersedesEarlier`), with the line they were on.
    * They are records read, and the transform books each as EXCLUDED, so the accounting still reconciles.
@@ -906,7 +912,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
   // OWNER DECISIONS, applied to the cells as they are read (before the wide keys, the row selection and the value maps see them):
   // a blank SKU is filled from sku-name-overrides by the exact product name, and a SKU on non-stock-skus has its kind cell overwritten.
   const skuAt = mapping ? indexOf.get('sku') : undefined
-  const notes: Array<{ line: number; code: string; reason: string }> = []
+  const notes: IngestNote[] = []
   const kindFromDecision = new Map<number, string>()
   const nonStockConflicts = new Map<number, string>()
   const nonStockQtyNotes = new Map<number, { line: number; code: string; reason: string }>()
@@ -976,7 +982,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
         if (r === typed[0]) continue
         ghostLines.add(r.line)
         rowsSkipped['ghost row dropped'] = (rowsSkipped['ghost row dropped'] ?? 0) + 1
-        notes.push({ line: r.line, code: 'GHOST_ROW_DROPPED', reason: `ghost row dropped: SKU ${clean(r.cells[skuAt])} line ${r.line} is typed ${JSON.stringify(ghost)} and quantity ${quantityOf(r.cells)}; the typed row on line ${typed[0].line} (quantity ${quantityOf(typed[0].cells)}) is kept` })
+        notes.push({ line: r.line, code: 'GHOST_ROW_DROPPED', sku: clean(r.cells[skuAt]), quantity: quantityOf(r.cells), reason: `ghost row dropped: SKU ${clean(r.cells[skuAt])} line ${r.line} is typed ${JSON.stringify(ghost)} and quantity ${quantityOf(r.cells)}; the typed row on line ${typed[0].line} (quantity ${quantityOf(typed[0].cells)}) is kept` })
       }
     }
   }
@@ -1011,7 +1017,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
   const derived = mapping?.derived ?? {}
 
   // set by the wide-total check for a row that is blank everywhere; reported only if the row is then actually emitted (not a ghost, not refused)
-  let blankZeroNote: { line: number; code: string; reason: string } | null = null
+  let blankZeroNote: IngestNote | null = null
   for (const record of records) {
     blankZeroNote = null
     if (record.cells.length !== header.length) {
@@ -1065,7 +1071,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
             record.cells[totalAt] = '0'
             for (const block of blocks) record.cells[block.index.get(column)!] = '0'
             const stated = zeroCells === 0 ? 'blank' : zeroCells === blocks.length ? 'zero' : 'blank or zero'
-            blankZeroNote = { line: record.line, code: 'BLANK_STOCK_AS_ZERO', reason: `SKU ${skuAt !== undefined ? clean(record.cells[skuAt]) : '(no SKU)'} line ${record.line}: the all-warehouses ${column} is blank and every warehouse ${column} cell is ${stated}; loaded as 0 on hand by the map's blankStockIsZero (owner ruling)` }
+            blankZeroNote = { line: record.line, code: 'BLANK_STOCK_AS_ZERO', sku: skuAt !== undefined ? clean(record.cells[skuAt]) : '', reason: `SKU ${skuAt !== undefined ? clean(record.cells[skuAt]) : '(no SKU)'} line ${record.line}: the all-warehouses ${column} is blank and every warehouse ${column} cell is ${stated}; loaded as 0 on hand by the map's blankStockIsZero (owner ruling)` }
             continue
           }
         }

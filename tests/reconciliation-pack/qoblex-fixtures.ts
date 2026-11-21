@@ -3,7 +3,7 @@ import { mkdirSync, symlinkSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 
 import { DATASETS } from '../../lib/first-load/spec.ts'
-import type { QoblexExport, QoblexLocation, QoblexLot, QoblexPoLine, QoblexProduct, QoblexPurchaseOrders, QoblexRead, QoblexSource } from '../../lib/reconciliation-pack/qoblex-source.ts'
+import { emptyQoblexEvidence, type QoblexExport, type QoblexLocation, type QoblexLot, type QoblexPoLine, type QoblexProduct, type QoblexPurchaseOrders, type QoblexRead, type QoblexReadEvidence, type QoblexSource } from '../../lib/reconciliation-pack/qoblex-source.ts'
 import { QOBLEX_NATIVE_PO_COLUMN_MAP } from '../../lib/reconciliation-pack/qoblex-native-map.ts'
 import { scratchDir } from './helpers.ts'
 
@@ -88,14 +88,14 @@ export function writeSubdir(dir: string, name: string): string {
 export { symlinkSync }
 
 /** A source that hands out a prepared export (no file): for the item tests. */
-export function sourceOf(parts: { locations?: readonly QoblexLocation[]; stock?: QoblexLot[] | 'fail'; products?: QoblexProduct[] | 'fail'; purchaseOrders?: QoblexPurchaseOrders | 'fail' } | QoblexRead, counter?: { reads: number }): QoblexSource {
+export function sourceOf(parts: { locations?: readonly QoblexLocation[]; stock?: QoblexLot[] | 'fail'; products?: QoblexProduct[] | 'fail'; purchaseOrders?: QoblexPurchaseOrders | 'fail'; evidence?: QoblexReadEvidence } | QoblexRead, counter?: { reads: number }): QoblexSource {
   return {
     async read() {
       if (counter) counter.reads += 1
       if ('ok' in parts) return parts
       const p = parts
       const value: QoblexExport = {
-        exportedAt: EXPORTED_AT, asOf: ASOF, locations: [...(p.locations ?? LOCATIONS)], files: [],
+        exportedAt: EXPORTED_AT, asOf: ASOF, locations: [...(p.locations ?? LOCATIONS)], files: [], evidence: p.evidence ?? emptyQoblexEvidence(),
         stock: p.stock === 'fail' ? { ok: false, reason: 'SOURCE_UNREADABLE' } : { ok: true, value: p.stock ?? [] },
         products: p.products === 'fail' ? { ok: false, reason: 'SOURCE_UNREADABLE' } : { ok: true, value: p.products ?? [] },
         purchaseOrders: p.purchaseOrders === 'fail' ? { ok: false, reason: 'SOURCE_UNREADABLE' } : { ok: true, value: p.purchaseOrders ?? { keyPrefix: PO_PREFIX, lines: [] } },
