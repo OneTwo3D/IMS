@@ -1,0 +1,7 @@
+### WooCommerce order edits: deposit orders, stale paid-increase tasks, follow-ups (behind the amendment switches, default off)
+- A deposit or part payment IMS holds is no longer treated as "paid in WooCommerce": only payments received count (credit-note payment rows and a payment a chargeback took back do not). Such an order gets its own task wording: IMS holds payments of P against a total of Y; WooCommerce now shows X; decide whether to collect, refund or edit. The impossible "unregisteredPaidAt set while paidAt is empty" test is gone.
+- Raising a *Paid order changed in WooCommerce* task closes the order's earlier open ones (done by the system), so two contradicting tasks are never open together; a state WooCommerce returns to after a Done task raises a fresh task.
+- Paid-in-WooCommerce orders: a shipping, discount or tax change alone now raises the money task, and a reduction in units tells the warehouse once picking has started. An unreadable warehouse no longer delays the money task.
+- A failed drain of deferred order comparisons now makes the wc-reconcile cron run read as failed, so it reaches the cron monitor and alerting.
+- The "edited in IMS, differs in more than quantities" refusal and its warning are recorded once per difference, not on every delivery. An empty payload currency is refused with its own wording.
+- Tests: more mutants killed (request abort signal, drain warning, tax-rate lock option, drain failure flag).

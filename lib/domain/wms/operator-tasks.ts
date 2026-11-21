@@ -220,7 +220,7 @@ export function wcPaidIncreaseQuery(wmsOrder: string | null, imsOrder: string, c
 }
 
 /**
- * The query for an order WooCommerce shows as PAID that IMS has NOT recorded as paid (a paid date on the payload, an open paid-block obligation, or a payment IMS holds that is not on the order yet), when WooCommerce then
+ * The query for an order WooCommerce shows as PAID that IMS has NOT recorded as paid (a paid date on the payload, or an open paid-block obligation), when WooCommerce then
  * shows the order CHANGED (more or fewer units, an added item, a different unit price). The gateway may have charged the old total or the new one, and IMS cannot tell which, so the wording must not say "collect the
  * difference" (the customer may already have paid it) and must not say "undo" first. `direction` words the old-total case: an increase is collected, a reduction is refunded. SKUs, quantities and amounts only.
  */
@@ -228,11 +228,11 @@ export function wcPaidInWooQuery(
   wmsOrder: string | null,
   imsOrder: string,
   changes: ReadonlyArray<string>,
-  figures: { wcTotal: string | null; imsTotal: string | null; currency: string | null; direction: 'increase' | 'reduction' | 'both'; paidSource: 'woo' | 'ims' },
+  figures: { wcTotal: string | null; imsTotal: string | null; currency: string | null; direction: 'increase' | 'reduction' | 'both' },
 ): string {
   const where = wmsOrder ? ` (warehouse order ${wmsOrder})` : ''
   const ccy = figures.currency ? ` ${figures.currency}` : ''
-  const shows = figures.paidSource === 'woo' ? 'WooCommerce shows it paid' : 'A payment is recorded against it'
+  const shows = 'WooCommerce shows it paid'
   const amounts = figures.wcTotal !== null && figures.imsTotal !== null
     ? ` at ${figures.wcTotal}${ccy}; IMS holds ${figures.imsTotal}${ccy} and has not recorded the payment`
     : '; IMS has not recorded the payment'
@@ -240,6 +240,67 @@ export function wcPaidInWooQuery(
   return `IMS order ${imsOrder}${where}: ${shows}${amounts}. The order was then changed in WooCommerce: ${changes.join('; ')}. IMS changed nothing and sent nothing to the warehouse. `
     + `Check what the payment gateway charged. If it charged the new total, edit the IMS order to match WooCommerce (the payment is then recorded). If it charged the old total, ${oldTotal} or undo the edit in WooCommerce. `
     + 'Do not ship goods that are not paid for.'
+}
+
+/**
+ * The query for an order on which IMS holds a PART PAYMENT (a deposit: receipts recorded, the order not yet marked paid) when WooCommerce then shows the order CHANGED. WooCommerce has not said the order is paid, so there
+ * is no gateway charge to check: the wording states what IMS holds against what it expects and what WooCommerce now shows, and a person decides. Amounts and SKUs only.
+ */
+export function wcPartPaymentChangedQuery(
+  wmsOrder: string | null,
+  imsOrder: string,
+  changes: ReadonlyArray<string>,
+  figures: { paid: string | null; wcTotal: string | null; imsTotal: string | null; currency: string | null },
+): string {
+  const where = wmsOrder ? ` (warehouse order ${wmsOrder})` : ''
+  const ccy = figures.currency ? ` ${figures.currency}` : ''
+  const held = figures.paid !== null && figures.imsTotal !== null
+    ? `IMS holds payments of ${figures.paid}${ccy} against a total of ${figures.imsTotal}${ccy}`
+    : 'IMS holds payments against this order that do not cover its total'
+  const shows = figures.wcTotal !== null ? `WooCommerce now shows ${figures.wcTotal}${ccy}` : 'WooCommerce now shows a changed order'
+  return `IMS order ${imsOrder}${where}: ${held}; ${shows}. The order was changed in WooCommerce: ${changes.join('; ')}. IMS changed nothing and sent nothing to the warehouse. `
+    + 'Decide whether to collect the difference from the customer, refund what is over, or edit the IMS order to match WooCommerce. Do not ship goods that are not paid for.'
+}
+
+/** Who closes an earlier open WC_PAID_INCREASE task when a newer one for the same order is raised. */
+export const WC_PAID_INCREASE_SUPERSEDED_ACTOR = 'system:wc-paid-increase-superseded'
+
+/**
+ * Raise a WC_PAID_INCREASE task, ONE LIVE TASK PER ORDER. Each task states the whole difference WooCommerce shows at that moment, so an earlier open one ("2 more: collect") would contradict a later one ("2 fewer: refund"):
+ * raising a new task closes the order's earlier open ones as done by the system (`WC_PAID_INCREASE_SUPERSEDED_ACTOR`), the way REFUND_REMAINDER_DUE does. Tasks are deduplicated on their content, including finished ones,
+ * so a state the order returns to after moving away would otherwise find its old Done task and raise nothing: the dedupe basis therefore carries an EPISODE number, one higher each time the order comes back to a state
+ * that already has a task while a later task exists. The SAME state seen again (no later task) is still one task, open or done. Call under the per-order lock. Returns true when a new row was written.
+ */
+export async function raiseWcPaidIncreaseTask(
+  client: Pick<Prisma.TransactionClient, 'wmsOperatorTask'>,
+  input: Omit<WmsOperatorTaskInput, 'reason'> & { dedupeBasis: string },
+): Promise<boolean> {
+  const task: WmsOperatorTaskInput = { ...input, reason: 'WC_PAID_INCREASE' }
+  const existing = await client.wmsOperatorTask.findMany({
+    where: { connector: input.connector, orderId: input.orderId, reason: 'WC_PAID_INCREASE' },
+    select: { contentHash: true },
+    orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+  })
+  const basisFor = (episode: number) => (episode === 0 ? input.dedupeBasis : `${input.dedupeBasis}|episode:${episode}`)
+  const hashes = existing.map((row) => row.contentHash)
+  let episode = 0
+  let newest = -1 // position (0 = newest task) of the latest episode of this state
+  for (let k = 0; k <= existing.length; k++) {
+    const at = hashes.indexOf(wmsOperatorTaskHash({ ...task, dedupeBasis: basisFor(k) }))
+    if (at >= 0) { episode = k; newest = at }
+  }
+  // This state's latest task is also the order's newest task: the same fact again, nothing to raise.
+  if (newest === 0) return false
+  if (newest > 0) episode += 1
+  task.dedupeBasis = basisFor(episode)
+  const created = await raiseWmsOperatorTask(client, task)
+  if (created) {
+    await client.wmsOperatorTask.updateMany({
+      where: { connector: input.connector, orderId: input.orderId, reason: 'WC_PAID_INCREASE', status: 'OPEN', contentHash: { not: wmsOperatorTaskHash(task) } },
+      data: { status: 'DONE', doneAt: new Date(), doneBy: WC_PAID_INCREASE_SUPERSEDED_ACTOR },
+    })
+  }
+  return created
 }
 
 /**

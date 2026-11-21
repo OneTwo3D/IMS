@@ -16,6 +16,16 @@ const fakeDb = {
   },
 }
 mock.module('@/lib/db', { namedExports: { db: fakeDb } })
+// The transport the live read goes through (the seam is left unset in the tests that use it): records what it was called with.
+const wcFetchCalls: Array<{ path: string; signal: AbortSignal | undefined }> = []
+mock.module('@/lib/connectors/woocommerce/api', {
+  namedExports: {
+    wcFetch: async (path: string, _params: unknown, _creds: unknown, options?: { signal?: AbortSignal }) => {
+      wcFetchCalls.push({ path, signal: options?.signal })
+      return new Promise<never>(() => undefined) // never answers: only the deadline ends the read
+    },
+  },
+})
 
 async function load() {
   return import('@/lib/connectors/woocommerce/sync/order-divergence')
@@ -88,4 +98,32 @@ test('the budget is checked before every new read, so rows that no longer fit ar
     assert.deepEqual(reads, ['0', '1'])
     assert.equal(out.examined, 2)
   } finally { div.divergenceSeams.readLiveOrder = undefined; state.rows = [] }
+})
+
+test('o3d-0ged2 LOW 12: the live read hands its abort signal to the WooCommerce transport (the deadline aborts the real request, not only the wait)', async () => {
+  const div = await load()
+  state.locked = true
+  state.rows = [{ id: 'r1', orderId: 'o1', externalOrderId: '9', attempts: 0, failedReads: 0, fromRetry: false }]
+  wcFetchCalls.length = 0
+  div.divergenceSeams.readLiveOrder = undefined
+  try {
+    const out = await div.drainDeferredWcOrderDivergences(25, { budgetMs: 2_000, readTimeoutMs: 50 })
+    assert.equal(out.examined, 1)
+    assert.equal(wcFetchCalls.length, 1)
+    assert.equal(wcFetchCalls[0]!.path, '/orders/9')
+    assert.ok(wcFetchCalls[0]!.signal instanceof AbortSignal, 'a signal reached the transport')
+    assert.equal(wcFetchCalls[0]!.signal!.aborted, true, 'and it was aborted at the deadline')
+  } finally { state.rows = [] }
+})
+
+test('o3d-0ged2 LOW 12: a failure of the drain\'s own lock transaction (not only of the work inside it) is reported as failed, and never throws', async () => {
+  const div = await load()
+  const failing = { ...tx, $queryRaw: async () => { throw new Error('connection lost') } }
+  const original = fakeDb.$transaction
+  fakeDb.$transaction = async (fn: (t: typeof tx) => Promise<unknown>) => fn(failing as unknown as typeof tx)
+  const errors = mock.method(console, 'error', () => undefined)
+  try {
+    const out = await div.drainDeferredWcOrderDivergences()
+    assert.deepEqual(out, { examined: 0, resolved: 0, dropped: 0, failed: true })
+  } finally { errors.mock.restore(); fakeDb.$transaction = original }
 })
