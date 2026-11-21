@@ -483,12 +483,13 @@ test('MED-1: an order paid in WooCommerce only, increased: the task asks what th
   assert.match(String(imsPaid.calls.tasks[0]!.dedupeBasis), /^wc-paid-increase:/)
 })
 
-test('MED-1: a payment IMS holds that is not on the paid fields (no paid date on the update) is paid-in-WooCommerce handling too, worded for the payment', async () => {
-  const { d, calls } = deps(wcFacts({ imsPaymentUnrecorded: true }), { writeOn: true, rewriteOn: true })
+test('MED-1: a payment IMS holds that is not on the paid fields (no paid date on the update) is never rewritten, and its task is worded for the part payment (no gateway text)', async () => {
+  const { d, calls } = deps(wcFacts({ imsPaymentUnrecorded: true, imsReceiptTotal: '30.00' }), { writeOn: true, rewriteOn: true })
   await applyWcOrderAmendment('o1', wcPaid(7), up, 'fp', d)
   assert.equal(calls.rewrites.length, 0, 'never rewritten')
   assert.equal(calls.tasks.length, 1)
-  assert.match(String(calls.tasks[0]!.queryText), /A payment is recorded against it/)
+  assert.match(String(calls.tasks[0]!.queryText), /IMS holds payments of 30\.00 GBP against a total of 60\.00 GBP/)
+  assert.doesNotMatch(String(calls.tasks[0]!.queryText), /gateway/i)
   const rewriteOnly = deps(wcFacts({ imsPaymentUnrecorded: true }), { writeOn: false, rewriteOn: true })
   assert.deepEqual(await applyWcOrderAmendment('o1', wcPaid(7), up, 'fp', rewriteOnly.d), { kind: 'off' })
 })
@@ -552,7 +553,8 @@ test('MED-3: an unpaid order edited in IMS that now differs in price, shipping o
     assert.equal(calls.refusals[0]!.gate, WC_REWRITE_REFUSED_GATE)
     assert.equal(calls.refusals[0]!.action, 'WC_ORDER_REWRITE')
     assert.match(String(calls.refusals[0]!.detail), /cannot tell whether WooCommerce changed them afterwards/)
-    assert.equal(calls.rewrites.length + calls.claims, 0, 'nothing written, no claim')
+    assert.equal(calls.rewrites.length, 0, 'nothing written')
+    assert.equal(calls.claims, 1, 'only the once-per-difference marker is taken (o3d-0ged2 LOW 4), not a rewrite claim')
   }
   for (const field of ['TAX', 'TOTAL', 'LINE_QUANTITY'] as const) {
     const { d, calls } = deps(imsEdited())

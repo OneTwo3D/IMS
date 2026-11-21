@@ -129,7 +129,8 @@ export function planUnpaidRewrite(input: RewriteInput): RewritePlan | RewriteRef
   const { wc, stored } = input
   if (stored.editedInImsAt !== null) return refuse('EDITED_IN_IMS', 'the order was edited in IMS, so latest-edit-wins applies and a person decides (IMS does not overwrite an IMS edit from WooCommerce)')
   const wcCurrency = typeof wc.currency === 'string' ? wc.currency.trim().toUpperCase() : ''
-  if (wcCurrency === '' || wcCurrency !== stored.currency.trim().toUpperCase()) return refuse('CURRENCY', `the currency differs (WooCommerce ${wcCurrency || 'none'}, IMS ${stored.currency}); IMS does not convert a booked order`)
+  if (wcCurrency === '') return refuse('CURRENCY', 'the WooCommerce payload states no currency, so IMS cannot tell that its amounts are in the order\'s currency')
+  if (wcCurrency !== stored.currency.trim().toUpperCase()) return refuse('CURRENCY', `the currency differs (WooCommerce ${wcCurrency}, IMS ${stored.currency}); IMS does not convert a booked order`)
   const fx = money(stored.fxRateToBase)
   if (fx === null || fx.lte(0)) return refuse('FX_RATE', 'the order has no usable booked FX rate')
   const currency = stored.currency
@@ -302,6 +303,11 @@ export function invoiceEvidence(o: { accountingInvoiceId: string | null; invoice
   return null
 }
 
+/** The importer's own rule for the header tax rate lock: a header name that matched an ACTIVE rate when the payload was mapped must still be there under the lock; one that matched none may stay missing. Pure. */
+export function headerRateLockOptions(lineRateIds: ReadonlyArray<string | null | undefined>, headerRateWasActive: boolean): { lineRateIds: ReadonlyArray<string | null | undefined>; allowMissing: boolean } {
+  return { lineRateIds, allowMissing: !headerRateWasActive }
+}
+
 const NO_PICKING_YET = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED'])
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -396,7 +402,7 @@ export async function rewriteUnpaidOrderFromWc(orderId: string, wcOrder: WcFullO
       if (plan.unchanged) return { kind: 'unchanged' }
 
       // THE WRITE: the same release, in-place line edit and re-reserve as an IMS edit of a confirmed order, with WooCommerce's figures.
-      await lockOrderNamedTaxRate(tx, plan.order.taxRateName, { lineRateIds: [...plan.lines.update.map((l) => l.data.taxRateId), ...plan.lines.create.map((l) => l.taxRateId)], allowMissing: !headerRateWasActive })
+      await lockOrderNamedTaxRate(tx, plan.order.taxRateName, headerRateLockOptions([...plan.lines.update.map((l) => l.data.taxRateId), ...plan.lines.create.map((l) => l.taxRateId)], headerRateWasActive))
       const allLines = [...plan.lines.update.map((l) => l.data), ...plan.lines.create]
       await resolveLinesTaxRates(tx, allLines, { lenient: true })
       const allocationsBefore = current._count.allocations
