@@ -276,7 +276,7 @@ test('an input nothing uses is refused: a wooSnapshot for a run without variant 
   const m = manifest()
   const text = (a: unknown) => JSON.stringify(a)
   void text
-  const loaded = loadPreparedRun({ manifest: { ...m, wooSnapshot: { snapshot: 's', provenance: 'p', variantParents: 'v', origin: 'https://shop.example', visibilityChecked: { products: { publish: 1, draft: 0, private: 0, pending: 0 }, variations: { publish: 1, draft: 0, private: 0, pending: 0 } } } }, files: honest, woo: null })
+  const loaded = loadPreparedRun({ manifest: { ...m, wooSnapshot: { snapshot: 's', provenance: 'p', variantParents: 'v', productStatus: null, origin: 'https://shop.example', visibilityChecked: { allProducts: { publish: 1, draft: 0, private: 0, pending: 0 }, products: { publish: 1, draft: 0, private: 0, pending: 0 }, variations: { publish: 1, draft: 0, private: 0, pending: 0 } } } }, files: honest, woo: null })
   assert.ok(!loaded.ok && loaded.problems.some((p) => /names a wooSnapshot but the prepared run used no variant parents/.test(p)))
 })
 

@@ -3,7 +3,7 @@
  *
  * Binds 127.0.0.1 on an EPHEMERAL port, serves a fixed catalogue from memory and talks to nobody:
  *
- *   GET /wp-json/wc/v3/products?type=variable&status=any|publish|draft|private|pending&per_page&page&orderby=id&order=asc
+ *   GET /wp-json/wc/v3/products?[type=<t>&]status=any|publish|draft|private|pending&per_page&page&orderby=id&order=asc
  *   GET /wp-json/wc/v3/products/{id}/variations?status&per_page&page
  *
  * with HTTP Basic auth against the key and secret it was started with, `X-WP-Total` / `X-WP-TotalPages` headers, and an empty list for a page past
@@ -33,6 +33,17 @@ export interface FakeParent {
   variations: FakeVariation[]
   /** Override the variation id list the parent advertises (to model a store whose list and endpoint disagree). */
   advertisedVariationIds?: number[]
+}
+
+/** A top-level product that is not a variable parent (simple, grouped, external, ...). Variations never appear in /products, as on a real store. */
+export interface FakeProduct {
+  id: number
+  sku: string
+  name: string
+  type?: string
+  status?: string
+  manage_stock?: boolean
+  stock_quantity?: number | null
 }
 
 export interface RecordedRequest {
@@ -65,6 +76,8 @@ export interface FakeCatalogueOptions {
   key: string
   secret: string
   parents: readonly FakeParent[]
+  /** Other products of any type and status, listed in /products beside the variable parents. */
+  products?: readonly FakeProduct[]
   /** The most rows the store grants per page whatever `per_page` asks for. */
   pageSizeCap?: number
   omitPaginationHeaders?: boolean
@@ -143,12 +156,18 @@ export async function startFakeCatalogue(options: FakeCatalogueOptions): Promise
     const override = wanted !== 'any' ? options.statusTotalOverride?.[wanted] : undefined
 
     if (route === '/products') {
-      if (query.type !== 'variable') return error(400, 'unexpected_type_filter')
-      const sorted = [...options.parents].filter((p) => keep(p.status ?? 'publish')).sort((a, b) => a.id - b.id)
-      return paged(sorted.map((p) => ({
+      const variable = options.parents.map((p) => ({
         id: p.id, sku: p.sku, name: p.name, status: p.status ?? 'publish', type: p.type ?? 'variable',
+        manage_stock: false, stock_quantity: null as number | null,
         variations: p.advertisedVariationIds ?? p.variations.filter((v) => !invisible.includes(v.status ?? 'publish')).map((v) => v.id),
-      })), { route: 'products', parentId: null })
+      }))
+      const others = (options.products ?? []).map((p) => ({
+        id: p.id, sku: p.sku, name: p.name, status: p.status ?? 'publish', type: p.type ?? 'simple',
+        manage_stock: p.manage_stock ?? false, stock_quantity: p.stock_quantity ?? null, variations: [] as number[],
+      }))
+      const wantedType = query.type
+      const sorted = [...variable, ...others].filter((p) => keep(p.status) && (wantedType === undefined || p.type === wantedType)).sort((a, b) => a.id - b.id)
+      return paged(sorted, { route: 'products', parentId: null })
     }
     const match = /^\/products\/(\d+)\/variations$/.exec(route)
     if (match) {

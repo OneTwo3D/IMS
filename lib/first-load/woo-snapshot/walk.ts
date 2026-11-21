@@ -1,5 +1,5 @@
 /**
- * THE READ-ONLY WALK of a WooCommerce store's variable products and their variations.
+ * THE READ-ONLY WALK of a WooCommerce store's products (every type and status) and the variations of its variable products.
  *
  * THIS IS THE ONLY PLACE IN lib/first-load THAT TALKS TO A STORE, and it does so in exactly one way: `fetchPage` below, which the command wires to the
  * connector's own read function (`wcFetch`, lib/connectors/woocommerce/api.ts) with credentials given explicitly. `wcFetch` can only issue GET, goes
@@ -8,13 +8,14 @@
  *
  * What the walk guarantees, each one a test:
  *   - every request waits for the minimum interval since the previous one (rate limiting), and a failed request is retried a bounded number of times;
- *   - COMPLETENESS IS PROVED, not assumed: the rows read for the parents must equal the store's own X-WP-Total, and for every parent the variations
+ *   - COMPLETENESS IS PROVED, not assumed: the rows read for the products (any type, 100 a page) must equal the store's own X-WP-Total, the variable ones
+ *     are counted again by their own type filter, and for every variable parent the variations
  *     read must equal that call's X-WP-Total AND the list of variation ids the parent itself carries. A page the store did not serve, or a store that
  *     sends no usable total, is an error, never a smaller snapshot;
  *   - a store that changes while it is being walked (its total moves between pages) is an error;
  *   - the walk is RESUMABLE: after every page the state is handed to `onProgress`, and a later run given that state continues after the last whole page.
  */
-import { SNAPSHOT_STATUSES, SNAPSHOT_FORMAT_VERSION, payloadSha256, reduceParent, reduceVariation, snapshotProblems, normalizePayload, type SnapshotParent, type SnapshotPayload, type SnapshotVariation } from '../snapshot'
+import { SNAPSHOT_STATUSES, SNAPSHOT_FORMAT_VERSION, comparisonSha256, reduceParent, reduceProduct, reduceVariation, snapshotProblems, normalizePayload, type SnapshotParent, type SnapshotPayload, type SnapshotProduct, type SnapshotVariation } from '../snapshot'
 
 export const WALK_PAGE_SIZE = 100
 /** Attempts per request, including the first. */
@@ -37,6 +38,9 @@ export const WALK_MAX_ROUNDS = 3
 export const WALK_STATUSES = SNAPSHOT_STATUSES
 export type WalkStatus = (typeof WALK_STATUSES)[number]
 export type StatusTotals = Record<WalkStatus, number>
+/** Only the fields the payload uses are asked for, to keep the load on a live store small (the count probes ask for `id` alone: only their X-WP-Total matters). */
+const PRODUCT_FIELDS = 'id,sku,name,type,status,manage_stock,stock_quantity,variations'
+const VARIATION_FIELDS = 'id,parent_id,sku,status,attributes'
 const VARIATION_ORDER = { orderby: 'id', order: 'asc' }
 const emptyStatusTotals = (): StatusTotals => ({ publish: 0, draft: 0, private: 0, pending: 0 })
 
@@ -87,7 +91,8 @@ export interface WalkState {
   formatVersion: typeof SNAPSHOT_FORMAT_VERSION
   /** Identifies the store the state belongs to; a state for another store is refused. */
   origin: string
-  parents: { total: number; totalPages: number; pagesDone: number; rows: SnapshotParent[] } | null
+  /** Every product, any type; `variable` holds the variable ones again as parents (with their variation ids). */
+  products: { total: number; totalPages: number; pagesDone: number; rows: SnapshotProduct[]; variable: SnapshotParent[] } | null
   /** Per parent id: the variations read for it, complete. */
   variations: Record<string, { total: number; pages: number; rows: SnapshotVariation[]; statusTotals?: StatusTotals }>
   requests: number
@@ -96,13 +101,16 @@ export interface WalkState {
 }
 
 export function freshState(origin: string): WalkState {
-  return { formatVersion: SNAPSHOT_FORMAT_VERSION, origin, parents: null, variations: {}, requests: 0 }
+  return { formatVersion: SNAPSHOT_FORMAT_VERSION, origin, products: null, variations: {}, requests: 0 }
 }
 
 export interface WalkResult {
   payload: SnapshotPayload
   proof: {
-    parents: { totalHeader: number; rowsRead: number; pages: number; statusTotals: StatusTotals }
+    /** Every product of every type: the counts the operator compares with the shop's own admin counts for all products. */
+    allProducts: { totalHeader: number; rowsRead: number; pages: number; statusTotals: StatusTotals; withoutSku: number; byType: Record<string, number> }
+    /** The variable products alone (`type=variable`). */
+    parents: { totalHeader: number; rowsRead: number; statusTotals: StatusTotals }
     variations: {
       /** Summed over every product: the per-status counts the operator compares with the shop's own admin counts. */
       statusTotals: StatusTotals
@@ -175,7 +183,7 @@ async function walkOnce(state: WalkState, deps: WalkDeps, clock: Clock): Promise
     for (const status of WALK_STATUSES) {
       let res: PageResult
       try {
-        res = await get(path, { ...base, status, per_page: '1', page: '1' })
+        res = await get(path, { ...base, status, per_page: '1', page: '1', _fields: 'id' })
       } catch (error) {
         // A product listed a moment ago that no longer exists: the store changed under the walk.
         if (error instanceof SnapshotFetchError && /HTTP 404/.test(error.message)) throw new SnapshotChangedError(`${what}: the product was listed but no longer exists: the store changed during the walk`)
@@ -196,41 +204,50 @@ async function walkOnce(state: WalkState, deps: WalkDeps, clock: Clock): Promise
     return totals
   }
   const assertKnownStatus = (what: string, status: string) => {
-    if (!(WALK_STATUSES as readonly string[]).includes(status)) throw new SnapshotInconsistentError(`${what} has the status "${status}", which the snapshot cannot enumerate (it covers ${WALK_STATUSES.join(', ')}): refusing`)
+    if (!(WALK_STATUSES as readonly string[]).includes(status)) throw new SnapshotInconsistentError(`${what} has the status "${status}", which the snapshot cannot enumerate (it covers ${WALK_STATUSES.join(', ')}): refusing. A scheduled (future) product must be unscheduled, or the run repeated once it has published`)
   }
 
-  // ----- parents -----
-  const parentParams = (page: number): Record<string, string> => ({ type: 'variable', status: 'any', per_page: String(WALK_PAGE_SIZE), page: String(page), orderby: 'id', order: 'asc' })
-  state.parents ??= { total: -1, totalPages: -1, pagesDone: 0, rows: [] }
-  const parents = state.parents
-  while (parents.totalPages < 0 || parents.pagesDone < parents.totalPages) {
-    if (parents.pagesDone >= WALK_MAX_PAGES) throw new SnapshotInconsistentError(`the product walk passed ${WALK_MAX_PAGES} pages without ending: refusing to continue`)
-    const page = parents.pagesDone + 1
-    const res = await get('/products', parentParams(page))
+  // ----- every product (any type) -----
+  const productParams = (page: number): Record<string, string> => ({ status: 'any', per_page: String(WALK_PAGE_SIZE), page: String(page), orderby: 'id', order: 'asc', _fields: PRODUCT_FIELDS })
+  state.products ??= { total: -1, totalPages: -1, pagesDone: 0, rows: [], variable: [] }
+  const products = state.products
+  while (products.totalPages < 0 || products.pagesDone < products.totalPages) {
+    if (products.pagesDone >= WALK_MAX_PAGES) throw new SnapshotInconsistentError(`the product walk passed ${WALK_MAX_PAGES} pages without ending: refusing to continue`)
+    const page = products.pagesDone + 1
+    const res = await get('/products', productParams(page))
     if (!Array.isArray(res.data)) throw new SnapshotInconsistentError(`GET /products page ${page} did not return a list`)
     // The connector reports an ABSENT total as 0 items / 1 page, so rows with a total of 0 mean the store sent none.
     if (!Number.isSafeInteger(res.totalItems) || res.totalItems < 0 || (res.totalItems === 0 && res.data.length > 0) || !Number.isSafeInteger(res.totalPages) || res.totalPages < 1) {
       throw new SnapshotInconsistentError(`GET /products page ${page} came without a readable X-WP-Total / X-WP-TotalPages (${res.totalItems} / ${res.totalPages}): completeness cannot be proved`)
     }
-    if (parents.totalPages >= 0 && (res.totalItems !== parents.total || res.totalPages !== parents.totalPages)) {
-      throw new SnapshotChangedError(`the store's product total moved during the walk (was ${parents.total} in ${parents.totalPages} page(s), now ${res.totalItems} in ${res.totalPages}): run again without --resume`)
+    if (products.totalPages >= 0 && (res.totalItems !== products.total || res.totalPages !== products.totalPages)) {
+      throw new SnapshotChangedError(`the store's product total moved during the walk (was ${products.total} in ${products.totalPages} page(s), now ${res.totalItems} in ${res.totalPages}): run again without --resume`)
     }
-    parents.total = res.totalItems
-    parents.totalPages = res.totalPages
+    products.total = res.totalItems
+    products.totalPages = res.totalPages
     for (const raw of res.data) {
-      const reduced = reduceParent(raw)
+      const reduced = reduceProduct(raw)
       if (!reduced.ok) throw new SnapshotInconsistentError(reduced.problem)
-      assertKnownStatus(`product ${reduced.parent.id}`, reduced.parent.status)
-      parents.rows.push(reduced.parent)
+      assertKnownStatus(`product ${reduced.product.id}`, reduced.product.status)
+      products.rows.push(reduced.product)
+      if (reduced.product.type === 'variable') {
+        const parent = reduceParent(raw)
+        if (!parent.ok) throw new SnapshotInconsistentError(parent.problem)
+        products.variable.push(parent.parent)
+      }
     }
-    parents.pagesDone = page
+    products.pagesDone = page
     deps.onProgress?.(state)
   }
-  if (parents.rows.length !== parents.total) {
-    throw new SnapshotInconsistentError(`${parents.rows.length} variable product(s) were read but the store's X-WP-Total says ${parents.total}: the snapshot would be incomplete`)
+  if (products.rows.length !== products.total) {
+    throw new SnapshotInconsistentError(`${products.rows.length} product(s) were read but the store's X-WP-Total says ${products.total}: the snapshot would be incomplete`)
   }
-  if (parents.total === 0) throw new SnapshotInconsistentError('the store returned no variable products: refusing to write an empty snapshot')
-  const parentStatusTotals = await countByStatus('variable products', '/products', { type: 'variable', orderby: 'id', order: 'asc' }, parents.total)
+  if (products.total === 0) throw new SnapshotInconsistentError('the store returned no products: refusing to write an empty snapshot')
+  const allStatusTotals = await countByStatus('products', '/products', { orderby: 'id', order: 'asc' }, products.total)
+  // The variable products are counted again by the store's own type filter, one request per status; those counts must add up to the variable rows read from the product list.
+  const parentStatusTotals = await countByStatus('variable products', '/products', { type: 'variable', orderby: 'id', order: 'asc' }, products.variable.length)
+  const parentRows = products.variable
+  const parents = { rows: parentRows }
 
   // ----- variations of each parent -----
   const ordered = [...parents.rows].sort((a, b) => a.id - b.id)
@@ -253,7 +270,7 @@ async function walkOnce(state: WalkState, deps: WalkDeps, clock: Clock): Promise
       variationRequests++
       let res: PageResult
       try {
-        res = await get(`/products/${parent.id}/variations`, { status: 'any', per_page: String(WALK_PAGE_SIZE), page: String(page), orderby: 'id', order: 'asc' })
+        res = await get(`/products/${parent.id}/variations`, { status: 'any', per_page: String(WALK_PAGE_SIZE), page: String(page), orderby: 'id', order: 'asc', _fields: VARIATION_FIELDS })
       } catch (error) {
         // A product listed a moment ago that no longer exists: the store changed under the walk.
         if (error instanceof SnapshotFetchError && /HTTP 404/.test(error.message)) throw new SnapshotChangedError(`product ${parent.id} was listed but no longer exists: the store changed during the walk`)
@@ -283,14 +300,19 @@ async function walkOnce(state: WalkState, deps: WalkDeps, clock: Clock): Promise
   }
 
   const variations = ordered.flatMap((p) => state.variations[String(p.id)].rows)
-  const payload = normalizePayload({ source: 'woocommerce', parents: ordered, variations })
+  const payload = normalizePayload({ source: 'woocommerce', products: products.rows, parents: ordered, variations })
   const problems = snapshotProblems(payload)
   if (problems.length > 0) throw new SnapshotInconsistentError(`the snapshot is not consistent:\n  - ${problems.join('\n  - ')}`)
   const perParent = ordered.map((p) => state.variations[String(p.id)])
   return {
     payload,
     proof: {
-      parents: { totalHeader: parents.total, rowsRead: parents.rows.length, pages: parents.pagesDone, statusTotals: parentStatusTotals },
+      allProducts: {
+        totalHeader: products.total, rowsRead: products.rows.length, pages: products.pagesDone, statusTotals: allStatusTotals,
+        withoutSku: products.rows.filter((p) => p.sku === '').length,
+        byType: Object.fromEntries([...products.rows.reduce((m, p) => m.set(p.type, (m.get(p.type) ?? 0) + 1), new Map<string, number>())].sort((a, b) => (a[0] < b[0] ? -1 : 1))),
+      },
+      parents: { totalHeader: WALK_STATUSES.reduce((n, status) => n + parentStatusTotals[status], 0), rowsRead: parents.rows.length, statusTotals: parentStatusTotals },
       variations: {
         statusTotals: perParent.reduce((acc, v) => {
           for (const status of WALK_STATUSES) acc[status] += v.statusTotals?.[status] ?? 0
@@ -319,8 +341,8 @@ export async function walkStore(state: WalkState, deps: WalkDeps): Promise<WalkR
       const second = freshState(state.origin)
       const b = await walkOnce(second, { ...deps, onProgress: undefined }, clock)
       requests += a.requests + b.requests
-      if (payloadSha256(a.payload) === payloadSha256(b.payload)) return { ...a, requests, verificationRounds: round }
-      last = 'two complete walks read different catalogues'
+      if (comparisonSha256(a.payload) === comparisonSha256(b.payload)) return { ...a, requests, verificationRounds: round }
+      last = 'two complete walks read different catalogues (stock figures are not compared: they move while the store trades)'
     } catch (error) {
       if (!(error instanceof SnapshotChangedError)) throw error
       last = error.message

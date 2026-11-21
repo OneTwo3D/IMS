@@ -55,11 +55,13 @@ export function run(datasets: Partial<Record<DatasetName, IngestedDataset>>, ove
     withDefaults = { ...withDefaults, suppliers: ds('suppliers', names.map((name) => ({ name }))) }
   }
   if (po && !datasets['ims-fx-rates']) withDefaults = { ...withDefaults, 'ims-fx-rates': ds('ims-fx-rates', FX_RATES_ROWS) }
-  return runBare(withDefaults, overrides, variantParentsBinding)
+  const ps = datasets['woo-product-status']
+  const productStatusBinding: VariantParentsBinding | undefined = ps ? { verified: true, csvSha256: ps.parts[0].sha256, snapshotPayloadSha256: 'test-stub' } : undefined
+  return runBare(withDefaults, overrides, variantParentsBinding, productStatusBinding)
 }
 
-export function runBare(datasets: Partial<Record<DatasetName, IngestedDataset>>, overrides: Partial<PrepareConfig> = {}, variantParentsBinding?: VariantParentsBinding): PrepareResult {
-  return prepare({ config: config(overrides), datasets, variantParentsBinding })
+export function runBare(datasets: Partial<Record<DatasetName, IngestedDataset>>, overrides: Partial<PrepareConfig> = {}, variantParentsBinding?: VariantParentsBinding, productStatusBinding?: VariantParentsBinding): PrepareResult {
+  return prepare({ config: config(overrides), datasets, variantParentsBinding, productStatusBinding })
 }
 
 export function product(sku: string, type = 'SIMPLE', extra: Record<string, string> = {}): Record<string, string> {

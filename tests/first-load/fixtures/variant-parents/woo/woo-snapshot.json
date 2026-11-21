@@ -1,5 +1,5 @@
 {
-  "formatVersion": 1,
+  "formatVersion": 2,
   "kind": "woocommerce-catalogue-snapshot",
   "payload": {
     "parents": [
@@ -58,6 +58,62 @@
         "variationIds": [
           9501
         ]
+      }
+    ],
+    "products": [
+      {
+        "id": 9000,
+        "manageStock": false,
+        "name": "Widget",
+        "sku": "WIDGET",
+        "status": "publish",
+        "stockQuantity": null,
+        "type": "variable"
+      },
+      {
+        "id": 9100,
+        "manageStock": false,
+        "name": "Gadget",
+        "sku": "2002",
+        "status": "draft",
+        "stockQuantity": null,
+        "type": "variable"
+      },
+      {
+        "id": 9200,
+        "manageStock": false,
+        "name": "Gizmo",
+        "sku": "GIZ-PARENT",
+        "status": "private",
+        "stockQuantity": null,
+        "type": "variable"
+      },
+      {
+        "id": 9300,
+        "manageStock": false,
+        "name": "Other",
+        "sku": "OTHER-PARENT",
+        "status": "publish",
+        "stockQuantity": null,
+        "type": "variable"
+      },
+      {
+        "id": 9400,
+        "manageStock": false,
+        "name": "Seven",
+        "sku": "SEVEN",
+        "status": "publish",
+        "stockQuantity": null,
+        "type": "variable"
+      },
+      {
+        "id": 9500,
+        "manageStock": false,
+        "name": "Eight",
+        "sku": "EIGHT",
+        "status": "publish",
+        "stockQuantity": null,
+        "type": "variable"
       }
     ],
     "source": "woocommerce",
@@ -120,5 +176,5 @@
       }
     ]
   },
-  "payloadSha256": "527094e6a44983841eae2609221277227078440a8a2a91375757d53ddc3a0841"
+  "payloadSha256": "c476c33b320e1475ca830edf527dc86f1a831476ea7be48de3693e9943a368db"
 }

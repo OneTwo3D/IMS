@@ -337,7 +337,7 @@ test('o3d-7lxrt L4/L5: a stated kit/bom/variable type on a non-stock SKU is refu
 })
 
 // [mutation: the real-load gap is silent again, or the warning counts variations / fires when a status was supplied]
-test('o3d-7lxrt H2: without a woo-products status, simple/KIT/BOM products keep the Qoblex lifecycle and the run warns LIFECYCLE_NOT_FROM_WOO with the count', (t) => {
+test('o3d-7lxrt H2: with no WooCommerce status for a simple/KIT/BOM product it keeps the Qoblex lifecycle and the run warns LIFECYCLE_NOT_FROM_WOO with the count and the SKUs', (t) => {
   const mixed = {
     products: ds('products', [product('S-1', 'SIMPLE', { lifecycleStatus: 'ARCHIVED' }), product('S-2', 'SIMPLE'), product('C1', 'SIMPLE'), product('K-1', 'KIT'), product('P-01', 'VARIANT')]),
     'recipe-lines': ds('recipe-lines', [{ parentSku: 'K-1', componentSku: 'C1', qty: '1' }]),
@@ -348,14 +348,18 @@ test('o3d-7lxrt H2: without a woo-products status, simple/KIT/BOM products keep 
   const warning = r.report.findings.find((f) => f.code === 'LIFECYCLE_NOT_FROM_WOO')
   assert.equal(warning?.severity, 'WARNING')
   assert.ok(warning?.message.startsWith('4 simple, KIT or BOM product(s)'), warning?.message)
-  assert.ok(warning?.message.includes('Qoblex') && warning.message.includes('push may change their WooCommerce status'))
+  assert.ok(warning?.message.includes('Qoblex') && warning.message.includes('push may create or change their WooCommerce status') && warning.message.includes('no WooCommerce status was supplied'))
+  assert.deepEqual(warning?.keys, ['C1', 'K-1', 'S-1', 'S-2'], 'the SKUs are listed')
   assert.equal(lifecycleOf(r, 'S-1'), 'ARCHIVED')
   assert.equal(r.blocking, false)
   // a woo-products file WITHOUT a status column is the same situation; one that states a status is not
   const noStatus = run({ ...mixed, 'woo-products': ds('woo-products', [{ sku: 'S-1' }]) })
   assert.ok(findingCodes(noStatus, 'WARNING').includes('LIFECYCLE_NOT_FROM_WOO'))
+  // one that states a status warns only about the products it does not hold (a product WooCommerce does not hold keeps its Qoblex lifecycle)
   const withStatus = run({ ...mixed, 'woo-products': ds('woo-products', [{ sku: 'S-1', status: 'publish' }]) })
-  assert.equal(findingCodes(withStatus).includes('LIFECYCLE_NOT_FROM_WOO'), false)
+  assert.deepEqual(withStatus.report.findings.find((f) => f.code === 'LIFECYCLE_NOT_FROM_WOO')?.keys, ['C1', 'K-1', 'S-2'])
+  const allHeld = run({ ...mixed, 'woo-products': ds('woo-products', ['S-1', 'S-2', 'C1', 'K-1'].map((sku) => ({ sku, status: 'publish' }))) })
+  assert.equal(findingCodes(allHeld).includes('LIFECYCLE_NOT_FROM_WOO'), false)
   // no simple/KIT/BOM products at all (variations only): nothing to say
   const variationsOnly = run({ products: ds('products', [product('P-01', 'VARIANT')]), 'variant-parents': ds('variant-parents', [vp('P-01', 'P', 'publish', 'publish')]) })
   assert.equal(findingCodes(variationsOnly).includes('LIFECYCLE_NOT_FROM_WOO'), false)
