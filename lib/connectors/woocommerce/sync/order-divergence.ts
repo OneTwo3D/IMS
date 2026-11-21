@@ -45,6 +45,7 @@ import { db } from '@/lib/db'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
 import { currencyMinorUnits, ledgerMatchEpsilon, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import { WC_DIVERGENCE_DRAIN_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import type { WcFullOrder } from './types'
 import { applyWcOrderAmendment } from './order-amendment'
 import { recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER } from '@/lib/domain/refused-actions'
@@ -67,6 +68,8 @@ export type DivergenceDifference = {
   label: string
   woocommerce: string
   ims: string
+  /** The WooCommerce item id, on a line-level difference that is about one item (LINE_ADDED). NOT part of the fingerprint (an open row recorded before this field existed keeps its fingerprint). */
+  externalLineItemId?: number
 }
 
 export type StoredOrderForDivergence = {
@@ -202,6 +205,7 @@ export function compareWcOrderWithIms(
           label: `Item ${sku(w.sku)} was added in WooCommerce`,
           woocommerce: `${fmtQty(w.qty)} x ${sku(w.sku)}${unit ? ` at ${fmtUnit(unit, dp)} each` : ''}`,
           ims: 'not on the order',
+          externalLineItemId: id,
         })
         continue
       }
@@ -282,7 +286,8 @@ export function compareWcOrderWithIms(
 
 /** The order of the differences is stable, so the same difference seen again hashes the same. */
 export function divergenceFingerprint(differences: ReadonlyArray<DivergenceDifference>): string {
-  return createHash('sha256').update(JSON.stringify(differences)).digest('hex').slice(0, 40)
+  // The item id is left out: it is a later addition and must not change the fingerprint of a difference an open row already holds.
+  return createHash('sha256').update(JSON.stringify(differences.map(({ field, label, woocommerce, ims }) => ({ field, label, woocommerce, ims })))).digest('hex').slice(0, 40)
 }
 
 /** One readable sentence per difference, e.g. "Quantity of RED-M changed in WooCommerce: WooCommerce 3, IMS 2". */
@@ -306,17 +311,19 @@ export const RECHECK_MAX_AGE_DAYS = 14
 export const RECHECK_PER_RUN = 25
 /** Failed live reads (error, timeout, hang) a row survives. They do NOT count as attempts (an attempt is a read that returned an order); at this many the row is dropped and a refused action says the comparison was lost. */
 export const RECHECK_MAX_FAILED_READS = 48
+/** A row is dropped at the failed-read cap only once it has also been deferred this long: reads that fail FAST (a 401, a refused connection) reach 48 within about two days of a 15-minute poll, which is not a lost comparison yet. The age cap still applies. */
+export const RECHECK_MIN_AGE_AT_FAILED_CAP_HOURS = 72
 /** One drain's wall-clock budget, kept well under the deployed proxy's 60 s read timeout, and the longest one live read may take. The drain stops starting reads once a whole read no longer fits. */
 export const RECHECK_BUDGET_MS = 25_000
 export const RECHECK_READ_TIMEOUT_MS = 8_000
 
-export const divergenceSeams: { readLiveOrder?: (externalOrderId: string) => Promise<WcFullOrder | null> } = {}
+export const divergenceSeams: { readLiveOrder?: (externalOrderId: string, signal?: AbortSignal) => Promise<WcFullOrder | null> } = {}
 
-async function readLiveOrder(externalOrderId: string): Promise<WcFullOrder | null> {
-  if (divergenceSeams.readLiveOrder) return divergenceSeams.readLiveOrder(externalOrderId)
+async function readLiveOrder(externalOrderId: string, signal?: AbortSignal): Promise<WcFullOrder | null> {
+  if (divergenceSeams.readLiveOrder) return divergenceSeams.readLiveOrder(externalOrderId, signal)
   try {
     const { wcFetch } = await import('../api')
-    const { data, error } = await wcFetch(`/orders/${externalOrderId}`)
+    const { data, error } = await wcFetch(`/orders/${externalOrderId}`, {}, undefined, { signal })
     if (error || !data || typeof data !== 'object' || !('status' in data)) return null
     return data as WcFullOrder
   } catch {
@@ -358,9 +365,11 @@ async function raiseRecheckExhausted(row: { orderId: string; externalOrderId: st
 /** A live read that never takes longer than `ms` and never throws: a hang, a timeout or an error is a failed read (null). */
 async function readLiveOrderWithin(externalOrderId: string, ms: number): Promise<WcFullOrder | null> {
   let timer: ReturnType<typeof setTimeout> | undefined
-  const timeout = new Promise<null>((resolve) => { timer = setTimeout(() => resolve(null), ms) })
+  // The request itself is aborted at the deadline (not only abandoned), so a hung read no longer runs on in the background for up to the transport's own 120 s.
+  const controller = new AbortController()
+  const timeout = new Promise<null>((resolve) => { timer = setTimeout(() => { controller.abort(); resolve(null) }, ms) })
   try {
-    return await Promise.race([readLiveOrder(externalOrderId).catch(() => null), timeout])
+    return await Promise.race([readLiveOrder(externalOrderId, controller.signal).catch(() => null), timeout])
   } finally {
     if (timer) clearTimeout(timer)
   }
@@ -375,11 +384,32 @@ async function readLiveOrderWithin(externalOrderId: string, ms: number): Promise
 export async function drainDeferredWcOrderDivergences(
   limit: number = RECHECK_PER_RUN,
   opts: { budgetMs?: number; readTimeoutMs?: number } = {},
-): Promise<{ examined: number; resolved: number; dropped: number }> {
+): Promise<{ examined: number; resolved: number; dropped: number; /** True when the drain failed with an error (logged): the caller reports it as a warning. */ failed?: boolean; /** True when another drain held the single-flight lock, so this one did nothing. */ busy?: boolean }> {
+  const out: { examined: number; resolved: number; dropped: number; failed?: boolean; busy?: boolean } = { examined: 0, resolved: 0, dropped: 0 }
+  const budgetMs = opts.budgetMs ?? RECHECK_BUDGET_MS
+  try {
+    // SINGLE FLIGHT: the cron sweep and a manual reconcile (or two overlapping sweeps) must not both read the same rows. A try-lock on one idle connection held across the drain (the amendment lock's accepted shape); a drain
+    // that does not get it does nothing. The transaction's own timeout is the budget plus a long margin for the comparison and write steps of the last row.
+    await db.$transaction(async (tx) => {
+      const [{ locked }] = await tx.$queryRaw<Array<{ locked: boolean }>>`SELECT pg_try_advisory_xact_lock(${WC_DIVERGENCE_DRAIN_LOCK_NAMESPACE}::int, 0) AS locked`
+      if (!locked) {
+        out.busy = true
+        return
+      }
+      Object.assign(out, await drainLocked(limit, opts))
+    }, { timeout: budgetMs + 120_000, maxWait: 5_000 })
+  } catch (e) {
+    console.error('wc_order_divergence: could not drain deferred comparisons', e instanceof Error ? e.constructor.name : typeof e)
+    out.failed = true
+  }
+  return out
+}
+
+async function drainLocked(limit: number, opts: { budgetMs?: number; readTimeoutMs?: number }): Promise<{ examined: number; resolved: number; dropped: number; failed?: boolean }> {
   const budgetMs = opts.budgetMs ?? RECHECK_BUDGET_MS
   const readTimeoutMs = opts.readTimeoutMs ?? RECHECK_READ_TIMEOUT_MS
   const startedAt = Date.now()
-  const out = { examined: 0, resolved: 0, dropped: 0 }
+  const out: { examined: number; resolved: number; dropped: number; failed?: boolean } = { examined: 0, resolved: 0, dropped: 0 }
   try {
     if (!(await isWcOrderDivergenceDetectionEnabled())) {
       // Detection is off: nothing is owed, so nothing is kept.
@@ -387,7 +417,8 @@ export async function drainDeferredWcOrderDivergences(
       return out
     }
     const cutoff = new Date(Date.now() - RECHECK_MAX_AGE_DAYS * 86_400_000)
-    const expired = await db.wcOrderDivergenceRecheck.findMany({ where: { OR: [{ deferredAt: { lt: cutoff } }, { attempts: { gte: RECHECK_MAX_ATTEMPTS } }, { failedReads: { gte: RECHECK_MAX_FAILED_READS } }] }, select: { id: true, orderId: true, externalOrderId: true, attempts: true, failedReads: true, fromRetry: true } })
+    const failedCapCutoff = new Date(Date.now() - RECHECK_MIN_AGE_AT_FAILED_CAP_HOURS * 3_600_000)
+    const expired = await db.wcOrderDivergenceRecheck.findMany({ where: { OR: [{ deferredAt: { lt: cutoff } }, { attempts: { gte: RECHECK_MAX_ATTEMPTS } }, { failedReads: { gte: RECHECK_MAX_FAILED_READS }, deferredAt: { lt: failedCapCutoff } }] }, select: { id: true, orderId: true, externalOrderId: true, attempts: true, failedReads: true, fromRetry: true } })
     for (const row of expired) {
       // A row the write step queued because it could NOT decide (warehouse unreadable, two deliveries in one second) is a paid order WooCommerce changed that IMS has neither refunded nor told anyone about: dropping it silently leaves
       // nothing that says so. It becomes a visible refused action (Sync > Exceptions) a person decides. A row deferred only for an unrecorded refund that never came owes nothing and is dropped as before.
@@ -398,7 +429,8 @@ export async function drainDeferredWcOrderDivergences(
     if (expired.length > 0) out.dropped += (await db.wcOrderDivergenceRecheck.deleteMany({ where: { id: { in: expired.map((row) => row.id) } } })).count
     const rows = await db.wcOrderDivergenceRecheck.findMany({ orderBy: { lastAttemptAt: 'asc' }, take: Math.max(1, limit) })
     for (const row of rows) {
-      // Stop before a read that could overrun the budget (a hung WooCommerce must not hold the caller); the remaining rows wait for the next run.
+      // Stop before a read that could overrun the budget (a hung WooCommerce must not hold the caller); the remaining rows wait for the next run. The elapsed time counts everything since the drain began, the comparison and
+      // write step of the rows already handled included, so a slow row shortens what follows. A single comparison and write step is not itself interrupted: the budget bounds when a NEW read starts.
       if (Date.now() - startedAt + readTimeoutMs > budgetMs) break
       out.examined++
       const live = await readLiveOrderWithin(row.externalOrderId, readTimeoutMs)
@@ -416,6 +448,7 @@ export async function drainDeferredWcOrderDivergences(
     }
   } catch (e) {
     console.error('wc_order_divergence: could not drain deferred comparisons', e instanceof Error ? e.constructor.name : typeof e)
+    out.failed = true
   }
   return out
 }

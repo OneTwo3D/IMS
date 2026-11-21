@@ -430,6 +430,12 @@ export const CRM_IDENTITY_LOCK_NAMESPACE = 411_220_891
 export const WC_AMENDMENT_LOCK_NAMESPACE = 411_220_883
 
 /**
+ * THE WC ORDER DIVERGENCE RECHECK DRAIN (two-int, key 0). Try-acquired (transaction scope, pg_try_advisory_xact_lock) around one drain of the deferred comparisons, so the cron sweep and a manual reconcile do not both
+ * read the same rows from WooCommerce. A drain that does not get it does nothing (the other one is working the queue); it is never queued behind it.
+ */
+export const WC_DIVERGENCE_DRAIN_LOCK_NAMESPACE = 411_220_892
+
+/**
  * The warehouse supplier-list read sync's single-flight lease (pg_try_advisory_lock(namespace, 0)): two operators clicking Refresh must not double the
  * request rate on the shared live warehouse tenant. Taken on a SESSION-lock connection, never the Prisma pool; a second caller is refused, not queued.
  */
@@ -493,5 +499,6 @@ export const TWO_INT_ADVISORY_LOCK_NAMESPACES = {
   WMS_SUPPLIER_LIST_SYNC_LOCK_NAMESPACE,
   CRM_AUTO_MERGE_AUDIT_LOCK_NAMESPACE,
   CRM_IDENTITY_LOCK_NAMESPACE,
+  WC_DIVERGENCE_DRAIN_LOCK_NAMESPACE,
   SESSION_LOCK_SPACE_PROBE_NAMESPACE,
 } as const

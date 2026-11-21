@@ -251,6 +251,8 @@ export type SyncResult = {
   synced: number
   skipped: number
   errors: string[]
+  /** Things that went wrong AFTER the run's real work committed (they never hold a cursor and never fail the run): for example the drain of deferred order comparisons. */
+  warnings?: string[]
 }
 
 export type StockSyncResult = SyncResult & {

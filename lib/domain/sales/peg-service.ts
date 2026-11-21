@@ -469,22 +469,23 @@ export function applyPegCapsToStockMap(
 
 export type EndedPeg = { pegId: string; orderId: string; productId: string; reason: SalesOrderLinePegEndReason }
 
-async function endPeg(tx: Tx, peg: LoadedPeg, reason: SalesOrderLinePegEndReason, userId: string | null): Promise<EndedPeg> {
+async function endPeg(tx: Tx, peg: LoadedPeg, reason: SalesOrderLinePegEndReason, userId: string | null, labelOverride?: string): Promise<EndedPeg> {
+  const label = labelOverride ?? PEG_END_LABEL[reason]
   await tx.salesOrderLinePeg.update({ where: { id: peg.id }, data: { endedAt: new Date(), endReason: reason, endedById: userId, allocatedQty: peg.allocatedQty } })
   const orderRef = peg.salesOrderLine.order.orderNumber ?? peg.salesOrderLine.order.externalOrderNumber ?? peg.salesOrderLine.orderId.slice(0, 8)
   const poRef = peg.purchaseOrderLine.po.reference
   const metadata = {
-    pegId: peg.id, reason, qty: peg.qty.toString(), receivedQty: peg.receivedQty.toString(), allocatedQty: peg.allocatedQty.toString(),
+    pegId: peg.id, reason, ...(labelOverride ? { detail: labelOverride } : {}), qty: peg.qty.toString(), receivedQty: peg.receivedQty.toString(), allocatedQty: peg.allocatedQty.toString(),
     salesOrderLineId: peg.salesOrderLineId, purchaseOrderLineId: peg.purchaseOrderLineId,
   }
   await logActivityInTransaction(tx, {
     entityType: 'SALES_ORDER', entityId: peg.salesOrderLine.orderId, action: 'peg_ended', tag: 'sales', userId,
-    description: `Peg of ${orderRef} to purchase order ${poRef} ended: ${PEG_END_LABEL[reason]}`,
+    description: `Peg of ${orderRef} to purchase order ${poRef} ended: ${label}`,
     metadata,
   })
   await logActivityInTransaction(tx, {
     entityType: 'PURCHASE_ORDER', entityId: peg.purchaseOrderLine.poId, action: 'peg_ended', tag: 'purchase', userId,
-    description: `Peg of sales order ${orderRef} to ${poRef} ended: ${PEG_END_LABEL[reason]}`,
+    description: `Peg of sales order ${orderRef} to ${poRef} ended: ${label}`,
     metadata,
   })
   return { pegId: peg.id, orderId: peg.salesOrderLine.orderId, productId: peg.salesOrderLine.productId!, reason }
@@ -556,6 +557,8 @@ export async function recordPegsRemovedWithLines(
   tx: Tx,
   where: { salesOrderLineIds?: string[]; purchaseOrderLineIds?: string[] },
   userId: string | null,
+  /** Wording for the activity entries when the line is KEPT and only its pegs end (a product change): the stored reason stays `SALES_LINE_REMOVED` (no enum change), but the log must not say the line was removed. */
+  opts: { labelOverride?: string } = {},
 ): Promise<number> {
   const or: Prisma.SalesOrderLinePegWhereInput[] = []
   if (where.salesOrderLineIds?.length) or.push({ salesOrderLineId: { in: where.salesOrderLineIds } })
@@ -563,7 +566,7 @@ export async function recordPegsRemovedWithLines(
   if (or.length === 0) return 0
   const pegs = await loadLivePegs(tx, { OR: or })
   for (const peg of pegs) {
-    await endPeg(tx, peg, where.salesOrderLineIds?.includes(peg.salesOrderLineId) ? 'SALES_LINE_REMOVED' : 'PURCHASE_LINE_REMOVED', userId)
+    await endPeg(tx, peg, where.salesOrderLineIds?.includes(peg.salesOrderLineId) ? 'SALES_LINE_REMOVED' : 'PURCHASE_LINE_REMOVED', userId, opts.labelOverride)
   }
   return pegs.length
 }

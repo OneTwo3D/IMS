@@ -161,6 +161,25 @@ test('every order sweep, the ordinary poll included, drains deferred comparisons
   const committedDone = src.indexOf('if (!committed) {')
   assert.ok(commit > 0 && committedDone > commit, 'the commit block is where expected')
   assert.ok(drain > committedDone, 'the live reads of the drain run after the cursor transaction has committed, so a slow WooCommerce cannot block the cursor')
+  // TOP LEVEL of the sweep function, not inside the clean-run block or any other block (o3d-hu8g9 LOW 7): the drain's line sits at the function body's own indentation, and the braces that open between the function's start and the
+  // drain all closed again before it.
+  const lineStart = src.lastIndexOf('\n', drain) + 1
+  assert.equal(src.slice(lineStart, drain), '  const drained = ', 'indented exactly as a statement of the function body')
+  const fnStart = src.indexOf('export async function syncNewWcOrders(')
+  const body = src.slice(src.indexOf('{', src.indexOf('): Promise<SyncResult> {', fnStart)), drain)
+  let depth = 0
+  for (const ch of body) { if (ch === '{') depth++; else if (ch === '}') depth-- }
+  assert.equal(depth, 1, 'every block opened since the function began has closed before the drain')
   const refundBlock = src.indexOf("if (mode !== 'poll' && !importResult.skipped)")
   assert.ok(drain > refundBlock + 600 || drain < refundBlock, 'not inside the refund-sweep block')
 })
+
+test('the fingerprint does not include the WooCommerce item id added to an added-item difference (an open row keeps its fingerprint)', () => {
+  const base = { field: 'LINE_ADDED' as const, label: 'Item GRN was added in WooCommerce', woocommerce: '1 x GRN', ims: 'not on the order' }
+  assert.equal(divergenceFingerprint([base]), divergenceFingerprint([{ ...base, externalLineItemId: 99 }]))
+  assert.notEqual(divergenceFingerprint([base]), divergenceFingerprint([{ ...base, woocommerce: '2 x GRN' }]))
+  const v = compareWcOrderWithIms(payload({ line_items: [{ id: 11, quantity: 2, sku: 'RED-M', subtotal: '20.00', total: '20.00' }, { id: 12, quantity: 1, sku: 'BLU-L', subtotal: '10.00', total: '10.00' }, { id: 13, quantity: 1, sku: 'GRN', subtotal: '8.00', total: '8.00' }] }), stored(), NO_REFUNDS)
+  assert.equal(v.kind, 'compared')
+  if (v.kind === 'compared') assert.equal(v.differences.find((d) => d.field === 'LINE_ADDED')?.externalLineItemId, 13, 'the added item carries its WooCommerce id')
+}
+)
