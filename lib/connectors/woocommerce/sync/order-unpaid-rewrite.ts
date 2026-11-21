@@ -162,6 +162,9 @@ export function planUnpaidRewrite(input: RewriteInput): RewritePlan | RewriteRef
     const lineTotal = money(item.total)
     const lineTax = money(item.total_tax) ?? toDecimal(0)
     if (lineTotal === null) return refuse('BAD_LINE', `the item ${m.sku} states no total`)
+    // The importer clamps a line's discount (subtotal - total) at zero, so a line whose total is ABOVE its subtotal would be stored with figures that disagree (total != subtotal - discount): refused, beyond half a minor unit.
+    const lineSubtotal = money(item.subtotal)
+    if (lineSubtotal !== null && lineTotal.minus(lineSubtotal).gt(half)) return refuse('BAD_LINE', `the item ${m.sku} shows a total (${fmt(lineTotal, currency)}) above its subtotal (${fmt(lineSubtotal, currency)}), which IMS cannot store as a discount`)
     sumLines = sumLines.plus(roundQuantity(lineTotal, 4))
     sumLineTax = sumLineTax.plus(lineTax)
     lineDataList.push({
@@ -221,7 +224,8 @@ export function planUnpaidRewrite(input: RewriteInput): RewritePlan | RewriteRef
     discountStr: input.coupon.discountStr,
     taxRateName: input.header.taxRateName,
     taxRatePercent: input.header.taxRatePercent,
-    ...(input.shipping ? input.shipping : {}),
+    // No shipping line on the payload: the shipping method fields are cleared too (they must not keep the old service while the shipping total is zero).
+    ...(input.shipping ?? { shippingService: null, courierKey: null, shippingMethodId: null }),
   }
 
   const update: RewritePlan['lines']['update'] = []
@@ -315,6 +319,25 @@ export async function rewriteUnpaidOrderFromWc(orderId: string, wcOrder: WcFullO
   let syncProductIds: string[] = []
   let releasedProductIds: string[] = []
   try {
+    // THE IMPORTER'S OWN MAPPING of the payload (reads only: the same product match, the same per-line tax resolution, the same coupon classification as the creating import), done BEFORE the transaction. These
+    // helpers read through the shared pool, so run inside the row-lock transaction they held a third connection and lengthened the lock for nothing (o3d-9x6wk L6). What they depend on (the booked rate and
+    // currency) is read here and checked again under the lock: a change in between is a retry, never a write from a stale mapping.
+    const pre = await db.salesOrder.findUnique({ where: { id: orderId }, select: { fxRateToBase: true, currency: true } })
+    if (!pre) return { kind: 'skipped', reason: 'the order is erased, a quote or gone' }
+    const importer = await import('./order-import')
+    const fieldMapping = await import('./field-mapping')
+    const coupons = await import('./coupon-classification')
+    const items = Array.isArray(wcOrder.line_items) ? wcOrder.line_items : []
+    const mapped = await fieldMapping.mapWcLineItems(items, Number(pre.fxRateToBase))
+    const resolution = await importer.resolveWcOrderTaxResolution(wcOrder, mapped)
+    const lineDiscountTotal = mapped.reduce((sum, l) => sum.plus(toDecimal(l.discountAmount)), toDecimal(0))
+    const couponPlan = coupons.planWcOrderCoupons({
+      couponLines: wcOrder.coupon_lines ?? [], orderMeta: wcOrder.meta_data, feeLines: wcOrder.fee_lines, lineDiscountTotalForeign: lineDiscountTotal, currency: pre.currency,
+      resolveResidual: ({ couponTotalForeign, lineDiscountTotalForeign, currency }) => fieldMapping.resolveWcOrderLevelDiscount({ couponTotalForeign, lineDiscountTotalForeign, currency }),
+    })
+    // The importer's own rule for the header rate (order-import.ts): a header name that matches no ACTIVE rate (free text, a deactivated legacy name) is allowed to be missing; one that does is locked and must still be there.
+    const headerRateName = resolution.taxRateName ?? null
+    const headerRateWasActive = headerRateName ? (await db.taxRate.findFirst({ where: { name: headerRateName, active: true }, select: { id: true } })) !== null : false
     const outcome = await db.$transaction(async (tx): Promise<RewriteOutcome> => {
       await lockSalesOrder(tx, orderId)
       const current = await tx.salesOrder.findUnique({
@@ -328,6 +351,7 @@ export async function rewriteUnpaidOrderFromWc(orderId: string, wcOrder: WcFullO
         },
       })
       if (!current || current.erasedAt || current.isQuote) return { kind: 'skipped', reason: 'the order is erased, a quote or gone' }
+      if (Number(current.fxRateToBase) !== Number(pre.fxRateToBase) || current.currency !== pre.currency) return { kind: 'skipped', retry: true, reason: 'the order\'s booked rate or currency changed while the payload was being mapped' }
       if (current.paidAt !== null || current.unregisteredPaidAt !== null || current._count.payments > 0) return { kind: 'skipped', reason: 'the order is paid: a paid order is never rewritten' }
       // PAID IN WOOCOMMERCE counts as paid even when IMS has not recorded it yet (a post-payment edit seen after a missed webhook; a receipt that could not be recorded and waits in a paid-block obligation): the
       // receipt is registered at the TOTAL THE GATEWAY CHARGED, so the order must not be rewritten under it.
@@ -358,18 +382,6 @@ export async function rewriteUnpaidOrderFromWc(orderId: string, wcOrder: WcFullO
       })
       if (block) return { kind: 'refused', code: 'BLOCKED', detail: block.reason }
 
-      // THE IMPORTER'S OWN MAPPING of the payload (reads only): the same product match, the same per-line tax resolution, the same coupon classification as the creating import.
-      const importer = await import('./order-import')
-      const fieldMapping = await import('./field-mapping')
-      const coupons = await import('./coupon-classification')
-      const items = Array.isArray(wcOrder.line_items) ? wcOrder.line_items : []
-      const mapped = await fieldMapping.mapWcLineItems(items, Number(current.fxRateToBase))
-      const resolution = await importer.resolveWcOrderTaxResolution(wcOrder, mapped)
-      const lineDiscountTotal = mapped.reduce((sum, l) => sum.plus(toDecimal(l.discountAmount)), toDecimal(0))
-      const couponPlan = coupons.planWcOrderCoupons({
-        couponLines: wcOrder.coupon_lines ?? [], orderMeta: wcOrder.meta_data, feeLines: wcOrder.fee_lines, lineDiscountTotalForeign: lineDiscountTotal, currency: current.currency,
-        resolveResidual: ({ couponTotalForeign, lineDiscountTotalForeign, currency }) => fieldMapping.resolveWcOrderLevelDiscount({ couponTotalForeign, lineDiscountTotalForeign, currency }),
-      })
       const plan = planUnpaidRewrite({
         wc: wcOrder,
         stored: { ...current, currency: current.currency, lines: current.lines },
@@ -384,7 +396,7 @@ export async function rewriteUnpaidOrderFromWc(orderId: string, wcOrder: WcFullO
       if (plan.unchanged) return { kind: 'unchanged' }
 
       // THE WRITE: the same release, in-place line edit and re-reserve as an IMS edit of a confirmed order, with WooCommerce's figures.
-      await lockOrderNamedTaxRate(tx, plan.order.taxRateName, { lineRateIds: [...plan.lines.update.map((l) => l.data.taxRateId), ...plan.lines.create.map((l) => l.taxRateId)], allowMissing: true })
+      await lockOrderNamedTaxRate(tx, plan.order.taxRateName, { lineRateIds: [...plan.lines.update.map((l) => l.data.taxRateId), ...plan.lines.create.map((l) => l.taxRateId)], allowMissing: !headerRateWasActive })
       const allLines = [...plan.lines.update.map((l) => l.data), ...plan.lines.create]
       await resolveLinesTaxRates(tx, allLines, { lenient: true })
       const allocationsBefore = current._count.allocations
@@ -396,7 +408,7 @@ export async function rewriteUnpaidOrderFromWc(orderId: string, wcOrder: WcFullO
       }
       // A continued line whose PRODUCT changed keeps its row but not the pegs (a peg ties a sales line to a purchase line for the old product): they are ended, as for a removed line.
       const productChangedIds = plan.lines.update.filter((l) => l.productChanged).map((l) => l.lineId)
-      if (productChangedIds.length > 0) await recordPegsRemovedWithLines(tx, { salesOrderLineIds: productChangedIds }, null)
+      if (productChangedIds.length > 0) await recordPegsRemovedWithLines(tx, { salesOrderLineIds: productChangedIds }, null, { labelOverride: 'the product on the sales order line was changed in WooCommerce (the line stays, its pegs were for the old product)' })
       for (const { lineId, productChanged, data } of plan.lines.update) {
         await tx.salesOrderLine.update({ where: { id: lineId }, data: { ...data, ...(productChanged ? { fulfillmentRequirements: Prisma.DbNull } : {}) } })
       }

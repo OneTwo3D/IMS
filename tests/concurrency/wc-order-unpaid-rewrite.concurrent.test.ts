@@ -141,7 +141,7 @@ async function fixture(t: { after: (fn: () => Promise<void>) => void }) {
   const order = () => db.salesOrder.findUniqueOrThrow({ where: { id: orderId! } })
   const refusals = () => db.refusedAction.findMany({ where: { entityId: orderId!, resolvedAt: null } })
   const rewrittenCount = () => db.activityLog.count({ where: { entityId: orderId!, action: 'wc_order_unpaid_rewritten' } })
-  return { db, mod, div, rewriteMod, tag, state, clearInvoiceTraces, setSwitch, deliver, lines, order, refusals, rewrittenCount, makeProduct, payload: (o: Over) => payload(externalId, wcRateId, o), get orderId() { return orderId! }, externalId }
+  return { db, mod, div, rewriteMod, tag, warehouseId: warehouse.id, state, clearInvoiceTraces, setSwitch, deliver, lines, order, refusals, rewrittenCount, makeProduct, payload: (o: Over) => payload(externalId, wcRateId, o), get orderId() { return orderId! }, externalId }
 }
 
 const T1 = '2026-11-20T10:00:01'
@@ -481,4 +481,198 @@ test('[hu8g9 LOW 3] a row deleted during its live read does not abort the rest o
     assert.equal(out.examined, 2)
     assert.equal(logged.some((args) => String(args[0]).includes('could not drain deferred comparisons')), false, 'no P2025 aborted the drain')
   } finally { errorMock.mock.restore() }
+})
+
+// ---- o3d-ewe4y / o3d-9x6wk follow-ups (DB) ----
+
+test('[ewe4y MED-1/2] paid in WooCommerce only: an increase and a REDUCTION are the same task (what the gateway charged), nothing is rewritten or refunded; the refund of an order paid in IMS is untouched', { skip }, async (t) => {
+  const f = await fixture(t)
+  const a = await f.makeProduct('A')
+  await f.setSwitch(SW.divergence, true)
+  await f.setSwitch(SW.rewrite, true)
+  await f.setSwitch(SW.write, true)
+  await f.deliver({ specs: [{ id: 1, sku: a, qty: 4, unit: 10 }], at: T1 })
+  await f.db.wmsOrderPushLink.create({ data: { orderId: f.orderId, connector: 'mintsoft', externalOrderId: 'MS-RW5', externalOrderNumber: 'W-RW5', state: 'SYNCED' } })
+  const imsTotal = Number((await f.order()).totalForeign)
+  // INCREASE: WooCommerce shows the order paid at a higher total.
+  await f.deliver({ specs: [{ id: 1, sku: a, qty: 6, unit: 10 }], at: T2, paidAt: '2026-11-20T09:30:00' })
+  const increase = await f.db.wmsOperatorTask.findMany({ where: { orderId: f.orderId }, orderBy: { createdAt: 'asc' } })
+  assert.equal(increase.length, 1)
+  assert.equal(increase[0]!.reason, 'WC_PAID_INCREASE')
+  const wcTotal = Number(f.payload({ specs: [{ id: 1, sku: a, qty: 6, unit: 10 }], at: T2 }).total)
+  assert.match(increase[0]!.queryText, new RegExp(`WooCommerce shows it paid at ${wcTotal.toFixed(2)} GBP; IMS holds ${imsTotal.toFixed(2)} GBP and has not recorded the payment`))
+  assert.match(increase[0]!.queryText, /Check what the payment gateway charged/)
+  assert.match(increase[0]!.queryText, /If it charged the new total, edit the IMS order to match WooCommerce/)
+  assert.match(increase[0]!.queryText, /quantity is 6 in WooCommerce against 4 in IMS \(2 more\)/)
+  // REDUCTION: WooCommerce now shows it paid at a LOWER total (qty 2).
+  await f.deliver({ specs: [{ id: 1, sku: a, qty: 2, unit: 10 }], at: T3, paidAt: '2026-11-20T09:30:00' })
+  const all = await f.db.wmsOperatorTask.findMany({ where: { orderId: f.orderId }, orderBy: { createdAt: 'asc' } })
+  assert.equal(all.length, 2, 'the reduction is its own task (not silently left on the list)')
+  assert.equal(all[1]!.reason, 'WC_PAID_INCREASE')
+  assert.match(all[1]!.queryText, /quantity is 2 in WooCommerce against 4 in IMS \(2 fewer\)/)
+  assert.match(all[1]!.queryText, /If it charged the old total, refund the difference to the customer or undo the edit/)
+  assert.equal(Number((await f.lines())[0]!.qty), 4, 'IMS changed nothing')
+  assert.equal(await f.db.salesOrderRefund.count({ where: { orderId: f.orderId } }), 0, 'no refund: IMS holds no payment')
+  assert.equal(await f.rewrittenCount(), 0)
+  assert.equal((await f.order()).paidAt, null)
+  await f.deliver({ specs: [{ id: 1, sku: a, qty: 2, unit: 10 }], at: '2026-11-20T10:00:05', paidAt: '2026-11-20T09:30:00' })
+  assert.equal(await f.db.wmsOperatorTask.count({ where: { orderId: f.orderId } }), 2, 'raised once per set of lines')
+  await f.db.shoppingSyncLog.deleteMany({ where: { connector: 'woocommerce', entityType: 'SalesOrder', externalId: String(f.externalId) } })
+})
+
+test('[ewe4y 8 / 9x6wk M3] a continued line whose PRODUCT changed keeps its row and its live pegs are ended, with wording that does not say the line was removed', { skip }, async (t) => {
+  const f = await fixture(t)
+  const a = await f.makeProduct('A')
+  const b = await f.makeProduct('B')
+  await f.setSwitch(SW.divergence, true)
+  await f.setSwitch(SW.rewrite, true)
+  await f.deliver({ specs: [{ id: 1, sku: a, qty: 2, unit: 10 }], at: T1 })
+  const [line] = await f.lines()
+  const supplier = await f.db.supplier.create({ data: { name: `peg supplier ${f.tag}` }, select: { id: true } })
+  const po = await f.db.purchaseOrder.create({
+    data: {
+      reference: `RW-PO-${f.tag}`, supplierId: supplier.id, status: 'PO_SENT', currency: 'GBP', fxRateToBase: 1, subtotalForeign: 100, subtotalBase: 100, totalForeign: 100, totalBase: 100, destinationWarehouseId: f.warehouseId,
+      lines: { create: [{ productId: line!.productId!, qty: 10, unitCostForeign: 10, unitCostBase: 10, totalForeign: 100, totalBase: 100 }] },
+    },
+    select: { id: true, lines: { select: { id: true } } },
+  })
+  t.after(async () => {
+    await f.db.salesOrderLinePeg.deleteMany({ where: { purchaseOrderLineId: po.lines[0]!.id } })
+    await f.db.activityLog.deleteMany({ where: { entityType: 'PURCHASE_ORDER', entityId: po.id } })
+    await f.db.purchaseOrderLine.deleteMany({ where: { poId: po.id } })
+    await f.db.purchaseOrder.deleteMany({ where: { id: po.id } })
+    await f.db.supplier.deleteMany({ where: { id: supplier.id } })
+  })
+  const peg = await f.db.salesOrderLinePeg.create({ data: { salesOrderLineId: line!.id, purchaseOrderLineId: po.lines[0]!.id, qty: 2 }, select: { id: true } })
+  // WooCommerce swaps the product on the same item (same id, same figures).
+  await f.deliver({ specs: [{ id: 1, sku: b, qty: 2, unit: 10 }], at: T2 })
+  const [after] = await f.lines()
+  assert.equal(after!.id, line!.id, 'the line keeps its row')
+  assert.equal(after!.productId, (await f.db.product.findFirstOrThrow({ where: { sku: b } })).id)
+  const ended = await f.db.salesOrderLinePeg.findUniqueOrThrow({ where: { id: peg.id } })
+  assert.notEqual(ended.endedAt, null, 'the live peg of the OLD product is ended')
+  assert.equal(ended.endReason, 'SALES_LINE_REMOVED', 'the stored reason is unchanged (no enum change)')
+  const entries = await f.db.activityLog.findMany({ where: { entityId: f.orderId, action: 'peg_ended' } })
+  assert.equal(entries.length, 1)
+  assert.match(entries[0]!.description, /the product on the sales order line was changed in WooCommerce/)
+  assert.doesNotMatch(entries[0]!.description, /line was removed/)
+})
+
+test('[ewe4y 9] a held sales invoice ALONE (no owed mark, no accounting entry, no number) refuses the rewrite as INVOICED, and no evidence lets it through', { skip }, async (t) => {
+  const f = await fixture(t)
+  const a = await f.makeProduct('A')
+  f.state.keepInvoice = true
+  await f.setSwitch(SW.divergence, true)
+  await f.deliver({ specs: [{ id: 1, sku: a, qty: 2, unit: 10 }], at: T1 })
+  await f.db.salesOrder.update({ where: { id: f.orderId }, data: { salesInvoiceOwedAt: null, invoicedAt: null, invoiceNumber: null, accountingInvoiceId: null } })
+  await f.db.accountingSyncLog.deleteMany({ where: { referenceId: f.orderId } })
+  await f.db.salesOrderInvoiceDocument.deleteMany({ where: { orderId: f.orderId } })
+  const held = await f.db.shoppingSyncLog.count({ where: { entityType: 'SalesOrder', entityId: f.orderId, recordKind: { not: null } } })
+  assert.ok(held > 0, 'the import left a held invoice row')
+  const edit = f.payload({ specs: [{ id: 1, sku: a, qty: 3, unit: 10 }], at: T2 })
+  const out = await f.rewriteMod.rewriteUnpaidOrderFromWc(f.orderId, edit as never, null)
+  assert.equal(out.kind === 'refused' && out.code, 'INVOICED')
+  assert.match(out.kind === 'refused' ? out.detail : '', /sales invoice is held/)
+  assert.equal(Number((await f.lines())[0]!.qty), 2)
+  await f.clearInvoiceTraces()
+  assert.equal((await f.rewriteMod.rewriteUnpaidOrderFromWc(f.orderId, edit as never, null)).kind, 'rewritten', 'with the held row gone the same edit rewrites')
+})
+
+test('[ewe4y 9] a clean comparison resolves BOTH the rewrite refusal and the paid-increase refusal, and only those', { skip }, async (t) => {
+  const f = await fixture(t)
+  const a = await f.makeProduct('A')
+  await f.setSwitch(SW.divergence, true)
+  await f.deliver({ specs: [{ id: 1, sku: a, qty: 2, unit: 10 }], at: T1 })
+  const { recordRefusedAction } = await import('@/lib/domain/refused-actions')
+  const base = { entityType: 'SALES_ORDER', entityId: f.orderId, permanence: 'RETRYABLE', severity: 'MEDIUM', detail: 'x' } as const
+  await recordRefusedAction(f.db, { ...base, action: 'WC_ORDER_REWRITE', gate: 'WC_REWRITE_REFUSED' })
+  await recordRefusedAction(f.db, { ...base, action: 'WC_ORDER_AMENDMENT', gate: 'WC_PAID_INCREASE' })
+  await recordRefusedAction(f.db, { ...base, action: 'WC_ORDER_AMENDMENT', gate: f.div.WC_AMENDMENT_RECHECK_GATE })
+  assert.equal((await f.refusals()).length, 3)
+  await f.deliver({ specs: [{ id: 1, sku: a, qty: 2, unit: 10 }], at: T2 }) // matches the IMS order: nothing differs
+  const open = await f.refusals()
+  assert.deepEqual(open.map((r) => r.gate), [f.div.WC_AMENDMENT_RECHECK_GATE], 'the rewrite refusal and the paid-increase refusal are closed; the unrelated recheck refusal is not')
+})
+
+test('[9x6wk L11 / MED-3] races under the order row lock: a despatch that commits first, and an IMS edit that commits first, both beat a waiting rewrite (it re-reads under the lock and writes nothing)', { skip }, async (t) => {
+  const f = await fixture(t)
+  const a = await f.makeProduct('A')
+  await f.setSwitch(SW.divergence, true)
+  await f.setSwitch(SW.rewrite, true)
+  await f.deliver({ specs: [{ id: 1, sku: a, qty: 2, unit: 10 }], at: T1 })
+  const { lockSalesOrder } = await import('@/lib/domain/sales/allocation-service')
+  const sleep = (ms: number) => new Promise<'waiting'>((resolve) => setTimeout(() => resolve('waiting'), ms))
+  const race = async (holderWrites: (tx: Parameters<Parameters<typeof f.db.$transaction>[0]>[0]) => Promise<void>) => {
+    let release!: () => void
+    const held = new Promise<void>((resolve) => { release = resolve })
+    let locked!: () => void
+    const lockedP = new Promise<void>((resolve) => { locked = resolve })
+    const holder = f.db.$transaction(async (tx) => {
+      await lockSalesOrder(tx, f.orderId)
+      await holderWrites(tx)
+      locked()
+      await held
+    }, { timeout: 30_000 })
+    await lockedP
+    const rewrite = f.rewriteMod.rewriteUnpaidOrderFromWc(f.orderId, f.payload({ specs: [{ id: 1, sku: a, qty: 3, unit: 10 }], at: T2 }) as never, null)
+    assert.equal(await Promise.race([rewrite.then(() => 'done' as const), sleep(400)]), 'waiting', 'the rewrite waits for the order row lock')
+    release()
+    await holder
+    return rewrite
+  }
+  // 1. A despatch commits while the rewrite waits.
+  const afterDespatch = await race(async (tx) => { await tx.shipment.create({ data: { orderId: f.orderId, warehouseId: f.warehouseId, status: 'SHIPPED', shippedAt: new Date() } }) })
+  assert.equal(afterDespatch.kind === 'refused' && afterDespatch.code, 'BLOCKED', JSON.stringify(afterDespatch))
+  assert.equal(Number((await f.lines())[0]!.qty), 2, 'nothing was written over a despatched order')
+  await f.db.shipment.deleteMany({ where: { orderId: f.orderId } })
+  // 2. An IMS edit commits while the rewrite waits.
+  const afterEdit = await race(async (tx) => { await tx.salesOrder.update({ where: { id: f.orderId }, data: { editedInImsAt: new Date() } }) })
+  assert.equal(afterEdit.kind === 'refused' && afterEdit.code, 'EDITED_IN_IMS', JSON.stringify(afterEdit))
+  assert.equal(Number((await f.lines())[0]!.qty), 2)
+})
+
+test('[hu8g9 LOW 2/6] the failed-read cap waits for the row\'s age, and a second drain started while one is running does nothing', { skip }, async (t) => {
+  const f = await fixture(t)
+  await f.setSwitch(SW.divergence, true)
+  const a = await f.makeProduct('A')
+  await f.deliver({ specs: [{ id: 1, sku: a, qty: 2, unit: 10 }], at: T1 })
+  f.div.divergenceSeams.readLiveOrder = async () => null
+  t.after(() => { f.div.divergenceSeams.readLiveOrder = undefined })
+  const gate = f.div.WC_AMENDMENT_RECHECK_GATE
+  // 48 failed reads in a day (fast-failing reads, such as a rejected key): not a lost comparison yet.
+  await f.db.wcOrderDivergenceRecheck.create({ data: { orderId: f.orderId, externalOrderId: String(f.externalId), failedReads: f.div.RECHECK_MAX_FAILED_READS, deferredAt: new Date(Date.now() - 86_400_000) } })
+  const young = await f.div.drainDeferredWcOrderDivergences()
+  assert.equal(young.dropped, 0, 'kept: it has not waited the minimum age')
+  assert.equal(await f.db.refusedAction.count({ where: { entityId: f.orderId, gate } }), 0)
+  // The same row, older than the minimum age: dropped and surfaced.
+  await f.db.wcOrderDivergenceRecheck.updateMany({ where: { orderId: f.orderId }, data: { deferredAt: new Date(Date.now() - (f.div.RECHECK_MIN_AGE_AT_FAILED_CAP_HOURS + 2) * 3_600_000) } })
+  const old = await f.div.drainDeferredWcOrderDivergences()
+  assert.equal(old.dropped, 1)
+  assert.equal(await f.db.refusedAction.count({ where: { entityId: f.orderId, gate } }), 1)
+
+  // Single flight: another session holds the drain lock; this drain reports busy and reads nothing.
+  const { WC_DIVERGENCE_DRAIN_LOCK_NAMESPACE } = await import('@/lib/db/advisory-locks')
+  await f.db.wcOrderDivergenceRecheck.create({ data: { orderId: f.orderId, externalOrderId: String(f.externalId) } })
+  let release!: () => void
+  const held = new Promise<void>((resolve) => { release = resolve })
+  let locked!: () => void
+  const lockedP = new Promise<void>((resolve) => { locked = resolve })
+  const holder = f.db.$transaction(async (tx) => {
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(${WC_DIVERGENCE_DRAIN_LOCK_NAMESPACE}::int, 0)`
+    locked()
+    await held
+  }, { timeout: 30_000 })
+  await lockedP
+  let reads = 0
+  f.div.divergenceSeams.readLiveOrder = async () => { reads++; return null }
+  const busy = await f.div.drainDeferredWcOrderDivergences()
+  release()
+  await holder
+  assert.equal(busy.busy, true)
+  assert.equal(busy.examined, 0)
+  assert.equal(reads, 0)
+  assert.equal((await f.db.wcOrderDivergenceRecheck.findFirstOrThrow({ where: { orderId: f.orderId } })).failedReads, 0, 'the row was left alone')
+  const free = await f.div.drainDeferredWcOrderDivergences()
+  assert.equal(free.busy, undefined)
+  assert.equal(reads, 1, 'with the lock free the same drain reads the row')
 })

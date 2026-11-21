@@ -43,8 +43,8 @@ import { db } from '@/lib/db'
 import { WC_AMENDMENT_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { logActivity } from '@/lib/activity-log'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
-import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
-import { raiseWmsOperatorTask, warehouseOrderRef, wcEditAfterPickingQuery, wcPaidIncreaseQuery } from '@/lib/domain/wms/operator-tasks'
+import { currencyMinorUnits, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import { raiseWmsOperatorTask, warehouseOrderRef, wcEditAfterPickingQuery, wcPaidIncreaseQuery, wcPaidInWooQuery } from '@/lib/domain/wms/operator-tasks'
 import { recordRefusedAction, resolveRefusedActions, REFUSED_ACTION_ENTITY_SALES_ORDER, type RefusedActionInput } from '@/lib/domain/refused-actions'
 import { resolveOrderEditWmsGate } from '@/lib/domain/sales/order-edit-wms-gate'
 import type { RefundRequestLine } from '@/lib/domain/sales/refund-service'
@@ -62,6 +62,8 @@ export const WC_PAID_INCREASE_GATE = 'WC_PAID_INCREASE'
 /** The reason text recorded on a refund this step creates (display only: a later run recognises its own refunds by `SalesOrderRefund.wcAmendment`, never by this text). */
 export const WC_AMENDMENT_REFUND_REASON = 'Order reduced in WooCommerce after payment (IMS amendment, latest edit wins)'
 const QTY_EPS = toDecimal('0.0001')
+/** Differences the quantity baseline cannot attribute once an order has been edited in IMS. */
+const UNATTRIBUTABLE_AFTER_IMS_EDIT = new Set(['LINE_PRICE', 'LINE_PRODUCT', 'SHIPPING', 'DISCOUNT'])
 const NO_PICKING_YET = new Set(['PENDING_PAYMENT', 'ON_HOLD', 'PROCESSING', 'ALLOCATED'])
 const PICKING_STARTED = new Set(['PICKING', 'PACKING'])
 
@@ -94,6 +96,11 @@ export type AmendmentFacts = {
   paidBlockOpen?: boolean
   /** Set by the step: WooCommerce shows the order as paid (a paid date, or an open paid-block obligation) although IMS has not recorded the payment. Such an order is never rewritten, and its increases are raised as for a paid one. */
   paidInWoo?: boolean
+  /** IMS holds a payment that is not on the order's paid fields (`unregisteredPaidAt` set, or a payment row) while `paidAt` is empty. Counts as paid for this step even when the payload carries no paid date. Read under the lock. */
+  imsPaymentUnrecorded?: boolean
+  /** The stored order total and currency (the paid-in-WooCommerce task names it next to WooCommerce's). */
+  totalForeign?: unknown
+  currency?: string
   /** The order-level discount (what the refund path reverses server-side for a public refund). Above zero, this step does not refund. */
   orderDiscount?: unknown
 }
@@ -130,6 +137,8 @@ export type AmendmentPlan = {
   restores: string[]
   /** PAID order only: what WooCommerce now shows ABOVE what IMS holds (a quantity up, an added item, a higher unit price, and the order-total difference). IMS changes nothing; an operator task names these. */
   increases: string[]
+  /** An order PAID IN WOOCOMMERCE ONLY (IMS has not recorded the payment): the reductions WooCommerce shows (fewer units, a lower unit price). IMS changes nothing; the same task as an increase names them (the gateway may have charged either total). */
+  paidInWooReductions: string[]
 }
 
 function round4(value: Decimal): number {
@@ -145,9 +154,16 @@ function wcWinsLine(facts: AmendmentFacts, externalLineItemId: number, wcQty: nu
   return Math.abs(baseline - wcQty) >= 0.0001 // WooCommerce never changed this line since IMS's edit: the IMS value stands
 }
 
+/** Latest edit wins for an ADDED item: with no IMS edit WooCommerce is the only editor; after one, the item counts only when the baseline (what WooCommerce showed at the first IMS edit) did not hold it. No baseline, or no id on the difference: IMS wins. */
+function wcAddedAfterImsEdit(facts: AmendmentFacts, diff: DivergenceDifference): boolean {
+  if (facts.editedInImsAt === null) return true
+  if (!facts.baselineQtyByExternalLineId || typeof diff.externalLineItemId !== 'number') return false
+  return !facts.baselineQtyByExternalLineId.has(diff.externalLineItemId)
+}
+
 /** Pure: what the write step would do. */
 export function planWcOrderAmendment(wcOrder: Pick<WcFullOrder, 'line_items'>, differences: ReadonlyArray<DivergenceDifference>, facts: AmendmentFacts): AmendmentPlan {
-  const plan: AmendmentPlan = { reductions: [], leftForPerson: [], imsWins: [], wcChanges: [], reductionChanges: [], caps: [], restores: [], increases: [] }
+  const plan: AmendmentPlan = { reductions: [], leftForPerson: [], imsWins: [], wcChanges: [], reductionChanges: [], caps: [], restores: [], increases: [], paidInWooReductions: [] }
   const wcQtyByLineId = new Map<number, number>()
   for (const item of (Array.isArray(wcOrder.line_items) ? wcOrder.line_items : []) as Array<{ id?: unknown; quantity?: unknown }>) {
     if (typeof item?.id === 'number' && typeof item.quantity === 'number') wcQtyByLineId.set(item.id, (wcQtyByLineId.get(item.id) ?? 0) + item.quantity)
@@ -187,8 +203,14 @@ export function planWcOrderAmendment(wcOrder: Pick<WcFullOrder, 'line_items'>, d
       continue
     }
     if (!paid) {
-      plan.leftForPerson.push(`${label} (order not paid: IMS does not rewrite the lines of an unpaid order from WooCommerce)`)
-      plan.wcChanges.push(`${sku} quantity is now ${wcQty}`)
+      if (facts.paidInWoo === true) {
+        // PAID IN WOOCOMMERCE ONLY: not "unpaid" (the receipt is registered at what the gateway charged) and not refundable here (IMS holds no payment to refund against). The same task as an increase, worded for either total.
+        plan.paidInWooReductions.push(`${sku}: quantity is ${wcQty} in WooCommerce against ${imsQty.toString()} in IMS (${imsQty.minus(wcQty).toString()} fewer)`)
+      } else {
+        plan.leftForPerson.push(`${label} (order not paid: IMS does not rewrite the lines of an unpaid order from WooCommerce)`)
+        plan.wcChanges.push(`${sku} quantity is now ${wcQty}`)
+      }
+      // (No warehouse change for an order paid in WooCommerce only: the task is about the money, and it must not wait on the warehouse gate.)
       continue
     }
     const wanted = imsQty.minus(wcQty).minus(refundedTotal) // units still to take off, over all the IMS lines of this item
@@ -225,22 +247,34 @@ export function planWcOrderAmendment(wcOrder: Pick<WcFullOrder, 'line_items'>, d
     if (diff.field === 'LINE_QUANTITY' || diff.field === 'LINE_REMOVED') continue
     plan.leftForPerson.push(`${diff.label}: WooCommerce ${diff.woocommerce}, IMS ${diff.ims}`)
     // PAID ORDER INCREASES (owner ruling 2026-11-20): an added item or a higher unit price changes nothing in IMS; the operator task names it. (An unpaid order is the rewrite's, or stays on the list.)
-    if (increaseScope && diff.field === 'LINE_ADDED') {
+    // LATEST EDIT WINS applies here too (o3d-9x6wk L1): on an order edited in IMS an added item counts only when it is NOT on the baseline (WooCommerce did not show it at the IMS edit), and a price carries no
+    // baseline at all, so after an IMS edit a price difference cannot be attributed to WooCommerce and raises nothing (it stays on the divergence list).
+    if (increaseScope && diff.field === 'LINE_ADDED' && wcAddedAfterImsEdit(facts, diff)) {
       plan.increases.push(`${diff.label}: WooCommerce ${diff.woocommerce}`)
       continue
     }
-    if (increaseScope && diff.field === 'LINE_PRICE' && Number.parseFloat(diff.woocommerce) > Number.parseFloat(diff.ims)) {
-      plan.increases.push(`${diff.label}: WooCommerce ${diff.woocommerce}, IMS ${diff.ims}`)
-      continue
+    if (increaseScope && diff.field === 'LINE_PRICE' && facts.editedInImsAt === null) {
+      const wcPrice = Number.parseFloat(diff.woocommerce)
+      const imsPrice = Number.parseFloat(diff.ims)
+      if (wcPrice > imsPrice) {
+        plan.increases.push(`${diff.label}: WooCommerce ${diff.woocommerce}, IMS ${diff.ims}`)
+        continue
+      }
+      // A LOWER unit price on an order paid in WooCommerce only: the gateway may have charged either total, so it is the same task (a lower price on an order paid in IMS stays on the list: the paid amount is never edited).
+      if (!paid && facts.paidInWoo === true && wcPrice < imsPrice) {
+        plan.paidInWooReductions.push(`${diff.label}: WooCommerce ${diff.woocommerce}, IMS ${diff.ims}`)
+        continue
+      }
     }
     if (diff.field === 'LINE_ADDED' || diff.field === 'LINE_PRODUCT') plan.wcChanges.push(`${diff.label}: WooCommerce ${diff.woocommerce}`)
   }
   // THE DIFFERENCE IN MONEY, named with the lines: the order total WooCommerce now shows above the IMS one.
-  if (plan.increases.length > 0) {
+  if (plan.increases.length > 0 || plan.paidInWooReductions.length > 0) {
     const total = differences.find((d) => d.field === 'TOTAL')
     const wcTotal = total ? Number.parseFloat(total.woocommerce) : Number.NaN
     const imsTotal = total ? Number.parseFloat(total.ims) : Number.NaN
-    if (total && wcTotal > imsTotal) plan.increases.push(`Order total (including tax) is ${total.woocommerce} in WooCommerce against ${total.ims} in IMS (${(wcTotal - imsTotal).toFixed(2)} more)`)
+    if (total && wcTotal > imsTotal && plan.increases.length > 0) plan.increases.push(`Order total (including tax) is ${total.woocommerce} in WooCommerce against ${total.ims} in IMS (${(wcTotal - imsTotal).toFixed(2)} more)`)
+    if (total && wcTotal < imsTotal && plan.paidInWooReductions.length > 0) plan.paidInWooReductions.push(`Order total (including tax) is ${total.woocommerce} in WooCommerce against ${total.ims} in IMS (${(imsTotal - wcTotal).toFixed(2)} less)`)
   }
   return plan
 }
@@ -296,7 +330,8 @@ export const defaultAmendmentDeps: AmendmentDeps = {
     const order = await db.salesOrder.findUnique({
       where: { id: orderId },
       select: {
-        orderNumber: true, status: true, paidAt: true, editedInImsAt: true, wcLineBaseline: true, erasedAt: true, isQuote: true, externalUpdatedAt: true, discountAmount: true,
+        orderNumber: true, status: true, paidAt: true, unregisteredPaidAt: true, editedInImsAt: true, wcLineBaseline: true, erasedAt: true, isQuote: true, externalUpdatedAt: true, discountAmount: true, totalForeign: true, currency: true,
+        _count: { select: { payments: true } },
         lines: { select: { id: true, externalLineItemId: true, productId: true, sku: true, description: true, qty: true, totalForeign: true, totalBase: true } },
       },
     })
@@ -320,6 +355,7 @@ export const defaultAmendmentDeps: AmendmentDeps = {
       orderNumber: order.orderNumber, status: order.status, paidAt: order.paidAt, editedInImsAt: order.editedInImsAt,
       baselineQtyByExternalLineId: baseline, lines: order.lines, refundedQtyByLineId: refunded, amendmentRefundedQtyByLineId: amendmentRefunded, shippedQtyByLineId: shipped,
       externalUpdatedAt: order.externalUpdatedAt, orderDiscount: order.discountAmount, paidBlockOpen,
+      imsPaymentUnrecorded: order.paidAt === null && (order.unregisteredPaidAt !== null || order._count.payments > 0), totalForeign: order.totalForeign, currency: order.currency,
     }
   },
   async claim(orderId, fingerprint, claimKey) {
@@ -357,6 +393,16 @@ export type AmendmentOutcome =
   | { kind: 'skipped'; reason: string; /** The caller should queue a live re-read so the step runs again without waiting for another WooCommerce delivery. */ retry?: true }
   | { kind: 'applied'; refundedLines: number; taskRaised: boolean }
   | { kind: 'refund-failed'; error: string }
+
+/** A money string in the order's currency decimals, or null when it cannot be read. */
+function formatMoney(value: unknown, currency: string | undefined): string | null {
+  if (value === undefined || value === null || String(value).trim() === '') return null
+  try {
+    return toDecimal(value as never).toDecimalPlaces(currencyMinorUnits(currency ?? 'GBP')).toFixed(currencyMinorUnits(currency ?? 'GBP'))
+  } catch {
+    return null
+  }
+}
 
 function claimKeyOf(fingerprint: string, plan: { reductions: PlannedReduction[] }, items: string[]): string {
   const units = plan.reductions.map((r) => `${r.lineId}=${r.qty}`).sort().join(',')
@@ -397,7 +443,21 @@ async function askPickingGate(deps: AmendmentDeps, orderId: string): Promise<{ p
 async function runUnpaidRewrite(deps: AmendmentDeps, orderId: string, wcOrder: WcFullOrder, differences: ReadonlyArray<DivergenceDifference>, fingerprint: string, facts: AmendmentFacts): Promise<AmendmentOutcome> {
   if (differences.length === 0) return { kind: 'skipped', reason: 'nothing differs' }
   // LATEST EDIT WINS: an order edited in IMS keeps its IMS lines unless WooCommerce changed something since the baseline (what it showed at the first IMS edit). Quiet otherwise: no refused action every delivery.
-  if (facts.editedInImsAt !== null && !wcChangedSinceBaseline(wcOrder, facts)) return { kind: 'skipped', reason: 'the order was edited in IMS and WooCommerce has not changed since (the IMS edit stands)' }
+  if (facts.editedInImsAt !== null && !wcChangedSinceBaseline(wcOrder, facts)) {
+    // The baseline holds QUANTITIES only. A price, shipping, discount or product difference on an order IMS edited cannot be told apart from the IMS edit itself (or from a WooCommerce change after it), so IMS does not guess
+    // and does not stay quiet: it refuses visibly and a person decides (o3d-ewe4y MED-3). A tax or total difference alone follows from the lines and is not reported on its own.
+    const unattributable = differences.filter((d) => UNATTRIBUTABLE_AFTER_IMS_EDIT.has(d.field))
+    if (unattributable.length > 0) {
+      await deps.recordRefusal({
+        entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action: 'WC_ORDER_REWRITE', gate: WC_REWRITE_REFUSED_GATE, permanence: 'RETRYABLE', severity: 'MEDIUM',
+        intent: { externalOrderId: String(wcOrder.id), code: 'EDITED_IN_IMS_NOT_QUANTITY' },
+        detail: `The unpaid order was edited in IMS and now differs from WooCommerce in more than quantities (${unattributable.map((d) => `${d.label}: WooCommerce ${d.woocommerce}, IMS ${d.ims}`).join('; ')}). IMS keeps no record of the prices, shipping or discount WooCommerce showed at the IMS edit, so it cannot tell whether WooCommerce changed them afterwards. IMS rewrote nothing: check the order in WooCommerce and in IMS and decide.`,
+      })
+      await deps.log({ orderId, level: 'WARNING', action: 'wc_order_unpaid_rewrite_refused', description: 'The unpaid order was edited in IMS and differs from WooCommerce in price, shipping or discount, which IMS cannot attribute. IMS rewrote nothing; a refused action was recorded.', metadata: { code: 'EDITED_IN_IMS_NOT_QUANTITY', fields: unattributable.map((d) => d.field) } })
+      return { kind: 'skipped', reason: 'the order was edited in IMS and differs from WooCommerce in more than quantities (refused: IMS cannot attribute the difference)' }
+    }
+    return { kind: 'skipped', reason: 'the order was edited in IMS and WooCommerce has not changed since (the IMS edit stands)' }
+  }
   const link = await deps.warehouseLink(orderId)
   let pickingStarted = PICKING_STARTED.has(facts.status)
   let gateExternalOrderId: string | null = null
@@ -474,7 +534,7 @@ export async function applyWcOrderAmendment(orderId: string, wcOrder: WcFullOrde
       // WHICH STEP ASKS: an UNPAID order is the rewrite's (its own switch); everything else is the paid-order step (`wc_order_amendment_write_enabled`). With the matching switch off nothing at all happens.
       // PAID IN WOOCOMMERCE counts as paid: a paid date on the payload, or an open paid-block obligation (the receipt could not be recorded yet), even while IMS's own paid fields are still empty. Such an order is never rewritten:
       // the receipt is registered at the total the gateway charged.
-      const paidInWoo = facts.paidAt === null && (wcSaysPaid(wcOrder) || facts.paidBlockOpen === true)
+      const paidInWoo = facts.paidAt === null && (wcSaysPaid(wcOrder) || facts.paidBlockOpen === true || facts.imsPaymentUnrecorded === true)
       if (paidInWoo) facts.paidInWoo = true
       const rewriteMode = facts.paidAt === null && !paidInWoo && rewriteOn
       if (!rewriteMode && !writeOn) return { kind: 'off' }
@@ -491,10 +551,10 @@ export async function applyWcOrderAmendment(orderId: string, wcOrder: WcFullOrde
       if (rewriteMode) return await runUnpaidRewrite(deps, orderId, wcOrder, differences, fingerprint, facts)
 
       const plan = planWcOrderAmendment(wcOrder, differences, facts)
-      if (plan.increases.length === 0 && (facts.paidAt !== null || paidInWoo)) await deps.resolveRefusals(orderId, 'WC_ORDER_AMENDMENT', WC_PAID_INCREASE_GATE).catch(() => undefined)
+      if (plan.increases.length === 0 && plan.paidInWooReductions.length === 0 && (facts.paidAt !== null || paidInWoo)) await deps.resolveRefusals(orderId, 'WC_ORDER_AMENDMENT', WC_PAID_INCREASE_GATE).catch(() => undefined)
       // The order has left the rewrite's scope (paid): an earlier rewrite refusal no longer applies.
       if (facts.paidAt !== null || paidInWoo) await deps.resolveRefusals(orderId, 'WC_ORDER_REWRITE', WC_REWRITE_REFUSED_GATE).catch(() => undefined)
-      if (plan.reductions.length === 0 && plan.wcChanges.length === 0 && plan.restores.length === 0 && plan.increases.length === 0) {
+      if (plan.reductions.length === 0 && plan.wcChanges.length === 0 && plan.restores.length === 0 && plan.increases.length === 0 && plan.paidInWooReductions.length === 0) {
         return { kind: 'skipped', reason: plan.imsWins.length > 0 ? 'the IMS edit is the latest on every changed line' : 'nothing the write step acts on' }
       }
 
@@ -533,7 +593,9 @@ export async function applyWcOrderAmendment(orderId: string, wcOrder: WcFullOrde
       }
       const operatorItems = manual
       // A PAID ORDER INCREASE is its own task (WC_PAID_INCREASE): IMS changes nothing, and it is NOT a warehouse change (the extra must not ship until the difference is collected).
-      const increases = plan.increases
+      // PAID IN WOOCOMMERCE ONLY (IMS has not recorded the payment): an increase AND a reduction are the same task, worded for either total (the gateway may have charged the old or the new one).
+      const paidInWooOnly = facts.paidInWoo === true && facts.paidAt === null
+      const increases = paidInWooOnly ? [...plan.increases, ...plan.paidInWooReductions] : plan.increases
       if (toRefund.length === 0 && afterPicking.length === 0 && operatorItems.length === 0 && increases.length === 0) return { kind: 'skipped', reason: 'the changes are left for a person and the warehouse has not started on the order' }
 
       const claimKey = claimKeyOf(fingerprint, { reductions: toRefund }, [...afterPicking, ...operatorItems, ...increases])
@@ -586,22 +648,29 @@ export async function applyWcOrderAmendment(orderId: string, wcOrder: WcFullOrde
         })
       }
       if (increases.length > 0) {
+        const imsRef = facts.orderNumber ?? orderId
+        const direction = plan.increases.length > 0 && plan.paidInWooReductions.length > 0 ? 'both' : plan.paidInWooReductions.length > 0 ? 'reduction' : 'increase'
+        const queryFor = (wmsRef: string | null) => paidInWooOnly
+          ? wcPaidInWooQuery(wmsRef, imsRef, increases, { wcTotal: formatMoney(wcOrder.total, facts.currency), imsTotal: formatMoney(facts.totalForeign, facts.currency), currency: facts.currency ?? null, direction, paidSource: wcSaysPaid(wcOrder) || facts.paidBlockOpen === true ? 'woo' : 'ims' })
+          : wcPaidIncreaseQuery(wmsRef, imsRef, increases)
         if (link) {
           const raised = await deps.raiseTask({
             connector: link.connector, orderId, externalOrderId: link.externalOrderId, reason: 'WC_PAID_INCREASE',
-            queryText: wcPaidIncreaseQuery(warehouseOrderRef(link.externalOrderNumber, link.externalOrderId), facts.orderNumber ?? orderId, increases),
-            payload: { orderNumber: facts.orderNumber, externalOrderNumber: link.externalOrderNumber }, dedupeBasis: `wc-paid-increase:${createHash('sha256').update(increases.join('\n')).digest('hex').slice(0, 16)}`,
+            queryText: queryFor(warehouseOrderRef(link.externalOrderNumber, link.externalOrderId)),
+            payload: { orderNumber: facts.orderNumber, externalOrderNumber: link.externalOrderNumber }, dedupeBasis: `${paidInWooOnly ? 'wc-paid-in-woo' : 'wc-paid-increase'}:${createHash('sha256').update(increases.join('\n')).digest('hex').slice(0, 16)}`,
           })
           taskRaised = raised || taskRaised
         } else {
-          // No warehouse order to carry the task: the increase must still be visible, so it is a refused action (Sync > Exceptions).
+          // No warehouse order to carry the task: the change must still be visible, so it is a refused action (Sync > Exceptions).
           await deps.recordRefusal({
             entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action: 'WC_ORDER_AMENDMENT', gate: WC_PAID_INCREASE_GATE, permanence: 'RETRYABLE', severity: 'MEDIUM',
             intent: { externalOrderId: String(wcOrder.id), increases },
-            detail: `A paid order was increased in WooCommerce (${increases.join('; ')}). IMS changed nothing and there is no warehouse order to raise a task on: collect the difference from the customer or undo the edit in WooCommerce.`,
+            detail: paidInWooOnly
+              ? `${queryFor(null)} There is no warehouse order to raise a task on.`
+              : `A paid order was increased in WooCommerce (${increases.join('; ')}). IMS changed nothing and there is no warehouse order to raise a task on: collect the difference from the customer or undo the edit in WooCommerce.`,
           })
         }
-        await deps.log({ orderId, level: 'WARNING', action: 'wc_order_paid_increase', description: `A paid order was increased in WooCommerce (${increases.join('; ')}). IMS changed nothing. ${link ? 'An operator task was raised.' : 'A refused action was recorded (no warehouse order to carry a task).'}`, metadata: { increases } })
+        await deps.log({ orderId, level: 'WARNING', action: 'wc_order_paid_increase', description: `${paidInWooOnly ? 'An order paid in WooCommerce (not yet in IMS) was changed in WooCommerce' : 'A paid order was increased in WooCommerce'} (${increases.join('; ')}). IMS changed nothing. ${link ? 'An operator task was raised.' : 'A refused action was recorded (no warehouse order to carry a task).'}`, metadata: { increases, paidInWooOnly } })
       }
       return { kind: 'applied', refundedLines, taskRaised }
     })
