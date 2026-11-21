@@ -313,7 +313,7 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     columns: ['sku', 'wooProductId', 'type', 'status'],
     required: ['sku'],
     sources: ['woocommerce'],
-    purpose: 'WooCommerce product export. Used for the four-way SKU coverage check (R14) and, when it carries `status`, to check the lifecycle of a Qoblex simple product against its own WooCommerce status. Never a source for recipes.',
+    purpose: 'WooCommerce product export. Used for the four-way SKU coverage check (R14) and, when it carries `status`, to take the lifecycle of a Qoblex simple/KIT/BOM product from its own WooCommerce status. Never a source for recipes.',
   },
   'variant-parents': {
     columns: ['variantSku', 'wooVariationId', 'parentSku', 'parentName', 'parentStatus', 'wooParentId', 'variationStatus'],
@@ -361,9 +361,9 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
   },
   'lifecycle-confirmations': {
     columns: ['sku', 'reason'],
-    required: ['sku', 'reason'],
+    required: ['sku'],
     sources: [],
-    purpose: 'Owner decision: a SKU whose products-file lifecycle would make a later IMS to WooCommerce product push change its own WooCommerce status (DRAFT against a published listing, or ACTIVE/EOL against a draft, pending or private one) is confirmed, per SKU. Nothing is pushed at load time. Without a row the run is blocked (LIFECYCLE_PUSH_WOULD_CHANGE_WOO_STATUS). Always canonical.',
+    purpose: 'OBSOLETE since the owner ruling of 2026-11-21 ("Use Woo\'s status as gospel"): the lifecycle of a product the first load can see a WooCommerce status for is taken from WooCommerce, so nothing needs confirming. Still parsed so an existing manifest loads; every row is reported as an INFO no-op. Always canonical.',
   },
   'ims-suppliers': {
     columns: ['name'],

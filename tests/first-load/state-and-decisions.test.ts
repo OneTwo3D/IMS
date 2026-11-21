@@ -84,14 +84,15 @@ test('a purchase order line on a DRAFT product is accepted; on an EOL product it
   assert.deepEqual(rowsOf(onlyDraft, 'purchase-orders').map((r) => r.orderKey), ['T-O-DR'])
 })
 
-// [mutation: the disagreement is silently resolved, or reported as INFO]
-test('a Qoblex lifecycle that disagrees with the WooCommerce status of a VARIABLE product is a WARNING; agreement is silent', (t) => {
-  const vp = (status: string) => ({ variantSku: 'M-01', wooVariationId: '11', parentSku: 'M', parentName: 'Parent M', parentStatus: status, wooParentId: '5001' })
+// [mutation: the Woo status is not applied to a provided VARIABLE parent, or its change is not reported as INFO]
+test('a Qoblex lifecycle that differs from the WooCommerce status of a VARIABLE product is overridden by Woo and reported as INFO (never a warning); agreement is silent', (t) => {
+  const vp = (status: string) => ({ variantSku: 'M-01', wooVariationId: '11', parentSku: 'M', parentName: 'Parent M', parentStatus: status, wooParentId: '5001', variationStatus: status })
   const disagree = run({ products: ds('products', [product('M', 'VARIABLE', { lifecycleStatus: 'DRAFT' }), product('M-01', 'VARIANT', { parentSku: 'M' })]), 'variant-parents': ds('variant-parents', [vp('publish')]) })
   const agree = run({ products: ds('products', [product('M', 'VARIABLE', { lifecycleStatus: 'DRAFT' }), product('M-01', 'VARIANT', { parentSku: 'M', lifecycleStatus: 'DRAFT' })]), 'variant-parents': ds('variant-parents', [vp('draft')]) })
   precondition(t, 'runs examined', [disagree, agree].filter((x) => x.report.findings !== undefined).length)
-  assert.ok(findingCodes(disagree, 'WARNING').includes('LIFECYCLE_DISAGREES_WITH_WOO'))
-  assert.ok(!findingCodes(agree).includes('LIFECYCLE_DISAGREES_WITH_WOO'))
+  assert.ok(findingCodes(disagree, 'INFO').includes('LIFECYCLE_TAKEN_FROM_WOO'))
+  assert.ok(!findingCodes(disagree, 'WARNING').includes('LIFECYCLE_DISAGREES_WITH_WOO'))
+  assert.ok(!findingCodes(agree).includes('LIFECYCLE_TAKEN_FROM_WOO'))
 })
 
 const decisions = (nonStock: string[], byName: Array<[string, string]> = []): IngestDecisions => ({ nonStockSkus: new Set(nonStock.map(decisionSkuKey)), skuByName: new Map(byName) })

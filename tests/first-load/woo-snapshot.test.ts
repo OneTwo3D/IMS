@@ -802,3 +802,20 @@ test('arm (z): a key that gets 200 and an EMPTY list for rows it may not read, w
     assert.deepEqual(listFiles(blind.out), [])
   } finally { await control.server.close(); await blind.server.close() }
 })
+
+// [mutation: the old-snapshot refusal is the generic "stale" message again (o3d-7lxrt L2)]
+test('o3d-7lxrt L2: --verify of a variant-parents.csv written before variationStatus existed says so, and the file is refused', async (t) => {
+  const r = await rig()
+  try {
+    assert.equal((await snapshot(r)).code, SNAPSHOT_EXIT_CODES.OK)
+    const csvFile = path.join(r.out, SNAPSHOT_FILE_NAMES.variantParents)
+    const current = readFileSync(csvFile, 'utf8')
+    precondition(t, 'current csv has the column', current.split('\r\n')[0].includes('variationStatus') ? 1 : 0)
+    writeFileSync(csvFile, current.split('\r\n').map((line) => line.replace(/,[^,]*$/, '')).join('\r\n'))
+    const attest = fresh('attest-old.json')
+    writeFileSync(attest, JSON.stringify({ products: { publish: 2, draft: 1, private: 1, pending: 0 }, variations: { publish: 9, draft: 0, private: 1, pending: 0 } }))
+    const old = await snapshot(r, [], {}, ['--verify', path.join(r.out, SNAPSHOT_FILE_NAMES.snapshot), '--expect-origin', r.server.origin, '--expect-visibility', attest])
+    assert.equal(old.code, SNAPSHOT_EXIT_CODES.INCONSISTENT)
+    assert.match(old.stderr, /no variationStatus column: it was written from a snapshot taken before variationStatus was added/)
+  } finally { await r.server.close() }
+})

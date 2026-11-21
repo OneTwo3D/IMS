@@ -65,9 +65,9 @@ export interface VariantJoinResult {
   /** Qoblex variant keys with an accepted exact-SKU WooCommerce match (their parent is confirmed). */
   confirmed: Set<string>
   /** Parents the products file itself carries as VARIABLE, with what WooCommerce says about them (WooCommerce wins for title and lifecycle). */
-  providedParents: Array<{ key: string; sku: string; name: string; lifecycle: 'ACTIVE' | 'DRAFT' }>
+  providedParents: Array<{ key: string; sku: string; name: string; status: string; lifecycle: 'ACTIVE' | 'DRAFT' }>
   /** Every variation (VARIANT, KIT or BOM) that joined its parent, with the lifecycle WooCommerce gives the parent. */
-  joined: Array<{ key: string; sku: string; parentSku: string; parentLifecycle: 'ACTIVE' | 'DRAFT'; ownStatus: string; ownLifecycle: 'ACTIVE' | 'DRAFT' | null }>
+  joined: Array<{ key: string; sku: string; parentSku: string; parentLifecycle: 'ACTIVE' | 'DRAFT'; ownStatus: string; ownLifecycle: 'ACTIVE' | 'DRAFT' }>
   /** Every SKU key the dataset names (variations and parents), so an exclusion on one of them is not reported as stale. */
   namedKeys: Set<string>
   summary: { rowsRead: number; variantsJoined: number; parentsEmitted: number; parentsWithoutQoblexVariant: number }
@@ -86,7 +86,7 @@ interface Item {
   wooParentId: string
   /** The variation's OWN WooCommerce status (lower case, '' when the file does not say) and its mapped lifecycle. */
   ownStatus: string
-  ownLifecycle: 'ACTIVE' | 'DRAFT' | null
+  ownLifecycle: 'ACTIVE' | 'DRAFT'
 }
 
 function cmp(a: string, b: string): number {
@@ -122,7 +122,9 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
       continue
     }
     const ownStatus = (v.variationStatus ?? '').trim().toLowerCase()
-    const ownLifecycle = ownStatus === '' ? null : Object.prototype.hasOwnProperty.call(VARIANT_PARENT_STATUS_LIFECYCLE, ownStatus) ? VARIANT_PARENT_STATUS_LIFECYCLE[ownStatus] : undefined
+    // WooCommerce's status is gospel for the lifecycle of a joined variation, so a row without it cannot be used: refused, never guessed from the parent or from Qoblex.
+    if (ownStatus === '') { add(row, variant.sku, 'REJECTED', 'MISSING_VARIATION_STATUS', 'the variation has no own WooCommerce status (variationStatus is blank): its IMS lifecycle is taken from that status, so the row is refused. A snapshot taken before variationStatus was added has no such column: re-run first-load:woo-snapshot'); continue }
+    const ownLifecycle = Object.prototype.hasOwnProperty.call(VARIANT_PARENT_STATUS_LIFECYCLE, ownStatus) ? VARIANT_PARENT_STATUS_LIFECYCLE[ownStatus] : undefined
     if (ownLifecycle === undefined) {
       add(row, variant.sku, 'REJECTED', 'UNMAPPED_VARIATION_STATUS', `variation status ${JSON.stringify(v.variationStatus)} is not one of ${Object.keys(VARIANT_PARENT_STATUS_LIFECYCLE).join(', ')} (a closed list: add a mapping deliberately)`)
       continue
@@ -182,7 +184,7 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
   const assignments = new Map<string, string>()
   const parents = new Map<string, SyntheticParent>()
   const confirmed = new Set<string>()
-  const provided = new Map<string, { key: string; sku: string; name: string; lifecycle: 'ACTIVE' | 'DRAFT' }>()
+  const provided = new Map<string, { key: string; sku: string; name: string; status: string; lifecycle: 'ACTIVE' | 'DRAFT' }>()
   const joined: VariantJoinResult['joined'] = []
   const typeNotVariant: string[] = []
   const stemMismatch: string[] = []
@@ -232,7 +234,7 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
       joined.push({ key: i.variantKey, sku: i.variantSku, parentSku: i.parentSku, parentLifecycle: i.lifecycle, ownStatus: i.ownStatus, ownLifecycle: i.ownLifecycle })
       if (skuStem(i.variantSku) !== parentKey) stemMismatch.push(`${i.variantSku} -> ${i.parentSku}`)
       if (providedByProducts(parentKey)) {
-        provided.set(parentKey, { key: parentKey, sku: head.parentSku, name: head.parentName, lifecycle: head.lifecycle })
+        provided.set(parentKey, { key: parentKey, sku: head.parentSku, name: head.parentName, status: head.status, lifecycle: head.lifecycle })
         continue
       }
       const parent = parents.get(parentKey) ?? { sku: head.parentSku, key: parentKey, name: head.parentName, lifecycle: head.lifecycle, wooParentId: head.wooParentId, variants: [] }

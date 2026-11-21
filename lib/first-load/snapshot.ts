@@ -448,7 +448,9 @@ export function verifyWooSnapshotBundle(input: {
   if (parsed?.ok) {
     if (input.csvBytes !== null) {
       const expected = Buffer.from(renderVariantParentsCsv(parsed.payload), 'utf8')
-      if (!expected.equals(Buffer.from(input.csvBytes))) problems.push(`variant-parents.csv is not the rows regenerated from the verified snapshot (${expected.length} byte(s) expected, ${input.csvBytes.length} found): it is stale, edited or from another snapshot`)
+      const headerLine = Buffer.from(input.csvBytes).toString('utf8').replace(/^\uFEFF/, '').split(/\r?\n/, 1)[0] ?? ''
+      if (!headerLine.split(',').map((cell) => cell.replace(/^"|"$/g, '').trim()).includes('variationStatus')) problems.push('variant-parents.csv has no variationStatus column: it was written from a snapshot taken before variationStatus was added (the old 6-column layout). The lifecycle of a variation is taken from its own WooCommerce status, so re-run first-load:woo-snapshot to take a new snapshot and regenerate the CSV')
+      else if (!expected.equals(Buffer.from(input.csvBytes))) problems.push(`variant-parents.csv is not the rows regenerated from the verified snapshot (${expected.length} byte(s) expected, ${input.csvBytes.length} found): it is stale, edited or from another snapshot`)
     }
     if (input.requireInspection) {
       if (input.inspectionBytes == null) problems.push('the inspection copy could not be read')

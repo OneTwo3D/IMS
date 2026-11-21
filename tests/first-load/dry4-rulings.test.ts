@@ -158,7 +158,7 @@ test('blankStockIsZero: a blank total over blank-or-zero warehouse cells is 0 on
 // ---------------------------------------------------------------------------
 // A variation that carries a BOM recipe
 // ---------------------------------------------------------------------------
-const wooRow = (variantSku: string, parentSku: string) => ({ variantSku, wooVariationId: '501', parentSku, parentName: `Parent ${parentSku}`, parentStatus: 'publish', wooParentId: '900' })
+const wooRow = (variantSku: string, parentSku: string) => ({ variantSku, wooVariationId: '501', parentSku, parentName: `Parent ${parentSku}`, parentStatus: 'publish', variationStatus: 'publish', wooParentId: '900' })
 const merged = (second: string) => mergeIngested([ds('products', [product('V-01', 'VARIANT')], 'stock.csv'), ds('products', [product('V-01', second)], 'bundles.csv')], [false, true])
 const bomRecipe = ds('recipe-lines', [{ parentSku: 'V-01', componentSku: 'C1', qty: '10' }])
 
