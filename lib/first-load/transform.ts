@@ -618,6 +618,16 @@ function applyLifecycleFromWoo(run: Run): void {
     // No row states a status at all: the column is simply not in the file (woo-products need not carry it), so nothing is listed.
     if (unusable.length > 0 && columnUsed) run.find('WARNING', 'LIFECYCLE_WOO_STATUS_UNUSABLE', `${unusable.length} product(s) are in woo-products but their row carries no usable status (blank or not publish/draft/pending/private), so their lifecycle stays the Qoblex one and cannot be checked against WooCommerce: add the status, or check each by hand`, 'woo-products', unusable)
   }
+  // The real load has no woo-products file (the snapshot lists variable products only): a simple, KIT or BOM product then keeps its Qoblex lifecycle, which a later IMS to WooCommerce push
+  // may turn into a different WooCommerce status (DRAFT writes draft; ACTIVE and EOL write publish). Say so, with the count, rather than staying silent.
+  if (run.has('products')) {
+    const woo = run.has('woo-products') ? run.rows('woo-products') : []
+    const statusSupplied = woo.some((row) => (row.values.status ?? '').trim() !== '')
+    if (!statusSupplied) {
+      const fromQoblex = [...run.cat.values()].filter((entry) => (entry.type === 'SIMPLE' || entry.type === 'KIT' || entry.type === 'BOM') && entry.parentSku === '')
+      if (fromQoblex.length > 0) run.find('WARNING', 'LIFECYCLE_NOT_FROM_WOO', `${fromQoblex.length} simple, KIT or BOM product(s) keep the lifecycle derived from the Qoblex State, because no woo-products status was supplied (only variations and VARIABLE parents are read from the WooCommerce snapshot): a later IMS to WooCommerce push may change their WooCommerce status (DRAFT writes draft; ACTIVE and EOL write publish; private and pending are unpublished and are also written back as draft). Supply woo-products with a status column to take their lifecycle from WooCommerce`, 'products')
+    }
+  }
   const changed = run.lifecycleFromWoo
   for (const c of [...changed].sort((a, b) => cmp(a.key, b.key))) {
     run.find('INFO', 'LIFECYCLE_TAKEN_FROM_WOO', `${c.sku} (${c.kind}): Qoblex state gives ${c.qoblex}, WooCommerce status is ${c.wooStatus}, lifecycle loaded is ${c.result}`, 'products', [c.sku])
@@ -945,7 +955,7 @@ function joinVariantParentsInto(run: Run, candidates: CatEntry[]): void {
     const joined = byKey.get(key)
     if (joined && (joined.type === 'KIT' || joined.type === 'BOM')) joined.variantRecipe = true
   }
-  // A VARIABLE parent the products file carries keeps its row, but WooCommerce decides its title and lifecycle (the parent title comes from WooCommerce).
+  // A VARIABLE parent the products file carries keeps its row, but WooCommerce decides its title (the parent title comes from WooCommerce); its lifecycle is taken from WooCommerce just below (takeLifecycleFromWoo), reported as LIFECYCLE_TAKEN_FROM_WOO.
   const differing: string[] = []
   for (const p of result.providedParents) {
     const entry = run.cat.get(p.key) ?? byKey.get(p.key)

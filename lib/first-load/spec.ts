@@ -361,7 +361,7 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
   },
   'lifecycle-confirmations': {
     columns: ['sku', 'reason'],
-    required: ['sku'],
+    required: [],
     sources: [],
     purpose: 'OBSOLETE since the owner ruling of 2026-11-21 ("Use Woo\'s status as gospel"): the lifecycle of a product the first load can see a WooCommerce status for is taken from WooCommerce, so nothing needs confirming. Still parsed so an existing manifest loads; every row is reported as an INFO no-op. Always canonical.',
   },

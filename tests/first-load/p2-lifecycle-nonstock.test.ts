@@ -335,3 +335,28 @@ test('o3d-7lxrt L4/L5: a stated kit/bom/variable type on a non-stock SKU is refu
   // L9: the decision accepts a stated non-inventory type in any letter case, through the map's own value only
   for (const type of ['non-inventory', 'Non-Inventory']) assert.equal(prods(csv(stockRow('SYN-NS', type, NONE))).rejected.length, 0, type)
 })
+
+// [mutation: the real-load gap is silent again, or the warning counts variations / fires when a status was supplied]
+test('o3d-7lxrt H2: without a woo-products status, simple/KIT/BOM products keep the Qoblex lifecycle and the run warns LIFECYCLE_NOT_FROM_WOO with the count', (t) => {
+  const mixed = {
+    products: ds('products', [product('S-1', 'SIMPLE', { lifecycleStatus: 'ARCHIVED' }), product('S-2', 'SIMPLE'), product('C1', 'SIMPLE'), product('K-1', 'KIT'), product('P-01', 'VARIANT')]),
+    'recipe-lines': ds('recipe-lines', [{ parentSku: 'K-1', componentSku: 'C1', qty: '1' }]),
+    'variant-parents': ds('variant-parents', [vp('P-01', 'P', 'publish', 'publish')]),
+  }
+  const r = run(mixed)
+  precondition(t, 'products loaded', rowsOf(r, 'products').length)
+  const warning = r.report.findings.find((f) => f.code === 'LIFECYCLE_NOT_FROM_WOO')
+  assert.equal(warning?.severity, 'WARNING')
+  assert.ok(warning?.message.startsWith('4 simple, KIT or BOM product(s)'), warning?.message)
+  assert.ok(warning?.message.includes('Qoblex') && warning.message.includes('push may change their WooCommerce status'))
+  assert.equal(lifecycleOf(r, 'S-1'), 'ARCHIVED')
+  assert.equal(r.blocking, false)
+  // a woo-products file WITHOUT a status column is the same situation; one that states a status is not
+  const noStatus = run({ ...mixed, 'woo-products': ds('woo-products', [{ sku: 'S-1' }]) })
+  assert.ok(findingCodes(noStatus, 'WARNING').includes('LIFECYCLE_NOT_FROM_WOO'))
+  const withStatus = run({ ...mixed, 'woo-products': ds('woo-products', [{ sku: 'S-1', status: 'publish' }]) })
+  assert.equal(findingCodes(withStatus).includes('LIFECYCLE_NOT_FROM_WOO'), false)
+  // no simple/KIT/BOM products at all (variations only): nothing to say
+  const variationsOnly = run({ products: ds('products', [product('P-01', 'VARIANT')]), 'variant-parents': ds('variant-parents', [vp('P-01', 'P', 'publish', 'publish')]) })
+  assert.equal(findingCodes(variationsOnly).includes('LIFECYCLE_NOT_FROM_WOO'), false)
+})
