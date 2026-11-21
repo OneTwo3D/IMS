@@ -1998,7 +1998,7 @@ test('[k26m.17 rule 1] a near miss of the signature (a cent off, an unlinked fee
     const result = await syncWcRefund(166122, refund, { ...state.dependencies, ...PARITY_ON })
     assert.equal(result.outcome, 'quarantined-refusal', why)
     assert.match(result.error ?? '', pattern, why)
-    assert.match(result.error ?? '', /Record it from the Sync exceptions page/, why)
+    assert.match(result.error ?? '', /settle its credit note in Xero by hand, with the accountant/, why)
     assert.equal(state.createRefundCalls, 0, why)
     assert.ok(actions(state).includes('refund_sync_eas_amount_gap_held'), why)
   }
@@ -2246,4 +2246,24 @@ test('[k26m.17 rule 6] a gateway refund is never store credit (nothing is read);
   const off = makeDependencies({ alwaysMissExistingRefund: true })
   assert.equal((await syncWcRefund(1001, storeCreditRefund(), off.dependencies)).outcome, 'applied', 'switch off: as before')
   assert.equal(off.createRefundOptionsSeen[0]!.refundParity, undefined)
+})
+
+test('[k26m.17 MED-2/4] every parity hold and quarantine is recognisable as one, so the inbox never offers "Record manually" for it; an ordinary quarantine is not', async () => {
+  const { isRefundParityHold } = await import('@/lib/domain/sales/refund-cn-parity')
+  const nearMiss = makeDependencies({ alwaysMissExistingRefund: true, order: FEE_GAP_ORDER })
+  const r1 = await syncWcRefund(166122, feeGapRefund({ amount: '17.85' }), { ...nearMiss.dependencies, ...PARITY_ON })
+  const repay = makeDependencies({ alwaysMissExistingRefund: true, order: FEE_GAP_ORDER })
+  const r2 = await syncWcRefund(166122, repaymentRefund(), { ...repay.dependencies, ...PARITY_ON, orderRefunds: [feeGapRefund()] })
+  const sc = makeDependencies({ alwaysMissExistingRefund: true })
+  const r3 = await syncWcRefund(1001, storeCreditRefund(), { ...sc.dependencies, ...scDeps([], []) })
+  for (const result of [r1, r2, r3]) {
+    assert.equal(result.outcome, 'quarantined-refusal')
+    assert.equal(isRefundParityHold(result.error), true, result.error)
+    assert.match(result.error ?? '', /Do not use "Record manually" on this row/)
+    assert.doesNotMatch(result.error ?? '', /dismiss this refund here/)
+  }
+  const plain = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: FEE_ORDER_LINES } })
+  const r4 = await syncWcRefund(1001, makeRefund({ amount: '19.80', line_items: [goodsRefundLine], fee_lines: [{ name: 'Some Other Fee', total: '-4.00', total_tax: '-0.80' }] }), plain.dependencies)
+  assert.equal(r4.outcome, 'quarantined-refusal')
+  assert.equal(isRefundParityHold(r4.error), false, 'an ordinary quarantine keeps "Record manually"')
 })

@@ -158,7 +158,18 @@ export type AmountGapVerdict =
   /** A landed-cost fee is on the refund and its lines and amount disagree, but not in either exact shape: held for a person, never credited at the inflated total. */
   | { kind: 'hold'; message: string }
 
-const HOLD_TAIL = (refundId: number | string) => ` Nothing was recorded and nothing was sent to Xero. The money has ALREADY been returned in the storefront (refund ${refundId}) - do NOT issue another storefront refund.`
+/**
+ * Said on every parity hold and quarantine, and how the Sync exceptions page recognises one (`isRefundParityHold`): "Record manually" raises a credit note,
+ * which here would credit the fee a second time, credit an inflated total, or raise a non-SC credit note for store credit that was never issued.
+ */
+export const PARITY_NO_MANUAL_RECORD = ' Do not use "Record manually" on this row: the credit note it raises is wrong here (it would credit the landed-cost fee a second time, credit an inflated total, or raise an ordinary credit note for store credit). This refund is settled in Xero, with the accountant, and the row stays on Sync exceptions as the record of it.'
+
+/** Whether a refund park was written by one of the parity holds (its message carries PARITY_NO_MANUAL_RECORD). */
+export function isRefundParityHold(errorMessage: string | null | undefined): boolean {
+  return typeof errorMessage === 'string' && errorMessage.includes(PARITY_NO_MANUAL_RECORD.trim())
+}
+
+const HOLD_TAIL = (refundId: number | string) => ` Nothing was recorded and nothing was sent to Xero. The money has ALREADY been returned in the storefront (refund ${refundId}) - do NOT issue another storefront refund.${PARITY_NO_MANUAL_RECORD}`
 
 /**
  * THE AMOUNT GAP between what a storefront refund itemises and what it paid (`O3D_IOSS_Hooks::decide`, the fee-gap and fold arms; `shipping_fold`,
@@ -173,7 +184,7 @@ export function decideAmountGap(input: { refundId: number | string; amount: Deci
   const hold = (why: string, extra = ''): AmountGapVerdict => ({
     kind: 'hold',
     message: withLedgerCheck(`WooCommerce refund ${input.refundId} cannot be credited automatically: its lines total ${money(b.grossMinor)}, of which ${money(b.feeGrossMinor)} is landed-cost fees, but ${Number.isFinite(paid) ? money(paid) : 'an unreadable amount'} was paid back, and ${why}. `
-      + `${extra}Record it from the Sync exceptions page once you have established from the storefront what was refunded: if EAS left the fees out of the amount, at ${money(b.grossMinor)} with the fees included; if EAS also put them on the shipping line, with shipping set back to what was charged, totalling ${Number.isFinite(paid) ? money(paid) : 'the amount'}.`
+      + `${extra}Establish from the storefront what was refunded and settle its credit note in Xero by hand, with the accountant: if EAS left the fees out of the amount, at ${money(b.grossMinor)} with the fees included; if EAS also put them on the shipping line, with shipping set back to what was charged, totalling ${Number.isFinite(paid) ? money(paid) : 'the amount'}.`
       + HOLD_TAIL(input.refundId)),
   })
   if (b.unreadable || !Number.isFinite(amountMinor)) return hold('a figure on it cannot be read')
@@ -261,7 +272,7 @@ export function feeRepaymentHold(input: { refundId: number | string; amount: Dec
   const tail = HOLD_TAIL(input.refundId)
   if (owedMinor > 0 && owedMinor === paid) {
     return withLedgerCheck(`WooCommerce refund ${input.refundId} refunds no goods and pays ${money(paid)} ${input.currency}, the landed-cost fee that ${owed.map((refund) => refund.label).join(' and ')} credits beyond what it paid. `
-      + `It is the fee's repayment, not a new credit: apply this payment (${money(paid)} ${input.currency}) to that refund's credit note in Xero, then dismiss this refund here.${tail}`)
+      + `It is the fee's repayment, not a new credit: apply this payment (${money(paid)} ${input.currency}) to that refund's credit note in Xero.${tail}`)
   }
   if (owedMinor > 0) {
     return withLedgerCheck(`WooCommerce refund ${input.refundId} pays ${money(paid)} ${input.currency} but refunds no goods, on an order where ${owed.map((refund) => refund.label).join(' and ')} credits ${money(owedMinor)} ${input.currency} of landed-cost fees beyond what it paid; `

@@ -33,6 +33,7 @@ let alreadySyncedHere = new Set<number>()
 /** Whether the IMS order behind this WC order can be resolved at all. */
 let orderResolves = true
 let lookedUp: number[] = []
+let parity = false
 
 const WC_ORDER_ID = 7301
 const IMS_ORDER_ID = 'so-1'
@@ -103,6 +104,8 @@ mock.module('@/lib/db', {
           return null
         },
       },
+      // o3d-k26m.17: the parity switch the sweep reads (OFF unless a test turns it on).
+      setting: { findUnique: async () => (parity ? { value: 'true' } : null) },
       shoppingSyncLog: {
         updateMany: async () => ({ count: 0 }),
         findFirst: async () => null,
@@ -124,6 +127,7 @@ function reset() {
   alreadySyncedHere = new Set()
   orderResolves = true
   lookedUp = []
+  parity = false
 }
 
 test('o3d-xnwu r3: a sweep that reads every page and applies NOTHING is not an empty store', async () => {
@@ -186,12 +190,23 @@ test('o3d-xnwu r3: a fully-applied sweep reports no failures, and an empty store
   )
 })
 
-test('o3d-k26m.17: the sweep applies an order\'s refunds OLDEST FIRST, whatever order the store pages them in (a fee repayment never goes before the fee refund)', async () => {
+test('o3d-k26m.17: under the parity switch the sweep applies an order\'s refunds OLDEST FIRST, whatever order the store pages them in (a fee repayment never goes before the fee refund)', async () => {
+  reset()
+  collection = [13, 12, 11]
+  alreadySyncedHere = new Set([11, 12, 13])
+  parity = true
+  const sweep = await loadSweep()
+  const result = await sweep(WC_ORDER_ID)
+  assert.equal(result.synced, 3)
+  assert.deepEqual(lookedUp, [11, 12, 13])
+})
+
+test('o3d-k26m.17: with the parity switch OFF the sweep walks the refunds in the store\'s own order, exactly as before', async () => {
   reset()
   collection = [13, 12, 11]
   alreadySyncedHere = new Set([11, 12, 13])
   const sweep = await loadSweep()
   const result = await sweep(WC_ORDER_ID)
   assert.equal(result.synced, 3)
-  assert.deepEqual(lookedUp, [11, 12, 13])
+  assert.deepEqual(lookedUp, [13, 12, 11])
 })

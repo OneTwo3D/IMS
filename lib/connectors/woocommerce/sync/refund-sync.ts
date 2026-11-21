@@ -22,7 +22,7 @@ import { easRefundRefusal, refundStatedTax, refundTaxOnEasRate } from '@/lib/dom
 import { matchRefundedFeeLines, refundedOrderLineId } from './refund-line-link'
 export { refundedOrderLineId }
 import type { WcMeta, WcRefund } from './types'
-import { decideAmountGap, earlierFeeOwedMinor, feeRepaymentHold, isRefundCnParityEnabled, parityRefundBreakdown, storeCreditAttemptOf, storeCreditVerdict, WCLC_FEE_MARKER_META, type EarlierRefundFacts, type ParityRefundItem, type ParityShippingLine, type RefundParityFactsInput, type StoreCreditCoupon } from '@/lib/domain/sales/refund-cn-parity'
+import { decideAmountGap, earlierFeeOwedMinor, PARITY_NO_MANUAL_RECORD, feeRepaymentHold, isRefundCnParityEnabled, parityRefundBreakdown, storeCreditAttemptOf, storeCreditVerdict, WCLC_FEE_MARKER_META, type EarlierRefundFacts, type ParityRefundItem, type ParityShippingLine, type RefundParityFactsInput, type StoreCreditCoupon } from '@/lib/domain/sales/refund-cn-parity'
 import type { createRefund as createRefundAction } from '@/app/actions/sales'
 
 type CreateRefundAction = typeof createRefundAction
@@ -1415,7 +1415,7 @@ export async function syncWcRefund(
       // A tax-only shipping line is not one IMS records as a line, so the lines it writes could not total what the verdict expects: held, never guessed.
       const taxOnlyShipping = wcShipping.filter((line) => !parseDecimalAbs(line.total).gt(0.000001))
       if ((verdict.kind === 'fee-gap' || verdict.kind === 'fold') && taxOnlyShipping.length > 0) {
-        verdict = { kind: 'hold', message: withLedgerCheck(`WooCommerce refund ${wcRefund.id} cannot be credited automatically: it refunds landed-cost fees EAS left out of (or folded into) the amount, and also a shipping line that carries VAT but no net (${taxOnlyShipping.map((line) => `"${line.method_title || 'Shipping'}" ${parseDecimalAbs(line.total_tax).toFixed(2)} VAT`).join('; ')}), which IMS does not record as a line. Record it from the Sync exceptions page. Nothing was recorded and nothing was sent to Xero. The money has ALREADY been returned in the storefront (refund ${wcRefund.id}) - do NOT issue another storefront refund.`) }
+        verdict = { kind: 'hold', message: withLedgerCheck(`WooCommerce refund ${wcRefund.id} cannot be credited automatically: it refunds landed-cost fees EAS left out of (or folded into) the amount, and also a shipping line that carries VAT but no net (${taxOnlyShipping.map((line) => `"${line.method_title || 'Shipping'}" ${parseDecimalAbs(line.total_tax).toFixed(2)} VAT`).join('; ')}), which IMS does not record as a line. Settle its credit note in Xero by hand, with the accountant. Nothing was recorded and nothing was sent to Xero. The money has ALREADY been returned in the storefront (refund ${wcRefund.id}) - do NOT issue another storefront refund.${PARITY_NO_MANUAL_RECORD}`) }
       }
       if (verdict.kind === 'hold') {
         await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: verdict.message, payload: wcRefund })
@@ -1997,13 +1997,17 @@ export async function syncRefundsForOrder(externalOrderId: number): Promise<Refu
 
   // o3d-k26m.17: OLDEST FIRST. The store pages refunds newest first, so a catch-up or a backfill met the fee's repayment (a later refund) before the refund that
   // carried the fee. Each refund is also handed the whole list when it was read completely, so the fee-repayment check judges from the store's own refunds.
-  const ordered = [...refunds].sort((a, b) => (Date.parse(a.date_created_gmt || '') || 0) - (Date.parse(b.date_created_gmt || '') || 0) || a.id - b.id)
+  // Only under the parity switch: off, the walk is the store's own order, exactly as before (it decides credit-note numbering, posting order and which refund
+  // meets a cumulative ceiling first).
+  const parityOn = await readParitySwitch({})
+  const gmt = (value: string | undefined) => Date.parse(value ? `${value.replace(/Z$/, '')}Z` : '') || 0
+  const ordered = parityOn ? [...refunds].sort((a, b) => gmt(a.date_created_gmt) - gmt(b.date_created_gmt) || a.id - b.id) : refunds
   for (const refund of ordered) {
     // o3d-7yf: BOTH the already-synced check and the parked-refund skip live in syncWcRefund now, scoped to
     // the resolved IMS order id. An externalId-only pre-skip HERE (the sweep has only the WC order id) would
     // repeat the cross-order leak — a refund/park owned by another order would wrongly skip this one.
     // syncWcRefund is idempotent for an already-synced or parked refund, so it is the single scoped authority.
-    const result = await syncWcRefund(externalOrderId, refund, error === undefined ? { orderRefunds: refunds } : {})
+    const result = parityOn ? await syncWcRefund(externalOrderId, refund, error === undefined ? { orderRefunds: refunds } : {}) : await syncWcRefund(externalOrderId, refund)
     // COUNTED ON APPLICATION, NOT INFERRED FROM SUCCESS (o3d-xnwu r4). `syncWcRefund` never throws —
     // its body ends in a catch that returns a retryable failure — so every refund read lands in
     // exactly one of these two and `synced + unapplied === fetched` holds for every walk. What
