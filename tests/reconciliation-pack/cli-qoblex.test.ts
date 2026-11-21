@@ -38,7 +38,7 @@ function rig(over: { qty?: string; value?: string; wooSkus?: string[]; imsSkus?:
         { product_id: cuid(2), warehouse_id: cuid(102), qty: '4', value: '40', reliable: true },
       ] }
       if (/FROM accounting_account_balance_snapshots/.test(sql)) return { rows: [] }
-      if (/FROM products/.test(sql)) return { rows: imsSkus.map((sku, i) => ({ id: cuid(i + 1), sku, type: 'SIMPLE', active: true, lifecycle: 'ACTIVE' })) }
+      if (/FROM products/.test(sql)) return { rows: imsSkus.map((sku, i) => ({ id: cuid(i + 1), sku, type: 'SIMPLE', active: true, lifecycle: 'ACTIVE', parentId: null })) }
       if (/FROM warehouses/.test(sql)) return { rows: [{ id: cuid(101), code: 'MIL1', active: true }, { id: cuid(102), code: 'CAMBRIDGE', active: true }, { id: cuid(103), code: 'RXT2', active: true }] }
       if (/FROM external_wms_bindings/.test(sql)) return { rows: [{ connector: 'x', warehouse_id: cuid(103), warehouse_code: 'RXT2', external_id: '9', active: true, mode: 'NOTIFICATION_ONLY', confirmed: false }] }
       return { rows: [] }

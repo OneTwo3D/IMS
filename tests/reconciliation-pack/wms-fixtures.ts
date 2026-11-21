@@ -82,7 +82,7 @@ export type Estate = {
   fail?: 'throws' | 'read' | Partial<Record<'wmsBindings' | 'wmsProductLinks' | 'products' | 'stock', 'READ_INCOMPLETE' | 'CAP_EXCEEDED' | 'SOURCE_UNREADABLE'>>
 }
 
-export const product = (n: number, sku: string, type = 'SIMPLE'): ProductRow => ({ id: cuid(1000 + n), sku, type, active: true, lifecycleStatus: 'ACTIVE' })
+export const product = (n: number, sku: string, type = 'SIMPLE'): ProductRow => ({ id: cuid(1000 + n), sku, type, active: true, lifecycleStatus: 'ACTIVE', parentId: null })
 export const link = (p: ProductRow, externalProductId: string, connector = 'mintsoft'): WmsProductLinkRow => ({ connector, productId: p.id, externalProductId })
 export const pair = (p: ProductRow, b: WmsBindingRow, quantity: string): StockPair => ({ stockLevelId: cuid(5000 + Number(p.id.slice(-4)) + Number(b.externalWarehouseId)), productId: p.id, sku: p.sku, productType: p.type, warehouseId: b.warehouseId, warehouseCode: b.warehouseCode, quantity, reservedQty: '0' })
 

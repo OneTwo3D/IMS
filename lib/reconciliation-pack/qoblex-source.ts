@@ -22,7 +22,15 @@
  *     (the foreign exchange source of the export side is written into it), and it declares the prefix the first load gave the IMS purchase-order
  *     references. Its lines must be open, internally consistent and unique per (order, SKU) (purchaseOrdersOf); an empty report is legal and is
  *     the only part that may be empty.
- *   - EVERY DATA ROW IS ACCOUNTED FOR: a rejected row makes the part unreadable. The native map skips nothing. Only blank lines (no cell) are uncounted; zero-quantity rows are kept here and dropped by R2/R5 on both sides.
+ *   - EVERY DATA ROW IS ACCOUNTED FOR: a rejected row makes the part unreadable. The native map does skip and drop rows (a Deleted product, a kit or
+ *     non-inventory item that holds no stock, a ghost row of a SKU that also has a typed row), and none of it is silent: the ingest counts every
+ *     skipped row (rowsSkipped) and notes every ghost row and every blank-read-as-zero row (`evidence`, below), and the items list them. A ghost row
+ *     that carries a NON-ZERO quantity makes its part unreadable (QOBLEX_GHOST_STOCK): the pack never discards stock it was shown. Only blank lines
+ *     (no cell) are uncounted; zero-quantity rows are kept here and dropped by R2/R5 on both sides.
+ *   - THE FIRST LOAD'S SKU RENAMES are an optional fourth input (`skuRenames`, a canonical fromSku,toSku,reason file with a declared digest, the same
+ *     list the first load was run with). IMS holds the renamed SKU and the export the source one, so without the list every rename would be a standing
+ *     R14 and stock discrepancy. The list is judged by the first load's own rules (lib/first-load/sku-renames.ts) and applied to the stock, products
+ *     and incoming parts; a list the rules refuse makes all three unreadable (SKU_RENAMES_REFUSED), and every rename applied is listed in the evidence.
  *   - THE EXPORT IS PARSED BY THE FIRST-LOAD INGEST (lib/first-load/ingest.ts), not by a parser of its own: a malformed header, a rejected
  *     row, an unknown or repeated location, a SKU that is not a valid SKU, a non-decimal quantity (a negative one is data: an oversold position is compared as it is), a repeated (SKU, location)
  *     that is not told apart by distinct lot references, an empty file: each makes that part unreadable.
@@ -37,6 +45,7 @@ import { createHash } from 'node:crypto'
 import path from 'node:path'
 
 import { ingestDataset, parseColumnMap, type DatasetMapping, type IngestedDataset } from '@/lib/first-load/ingest'
+import { planSkuRenames, type SkuRenamePlan } from '@/lib/first-load/sku-renames'
 import { parseCsvStrict } from '@/lib/first-load/csv'
 import { PRODUCT_TYPES } from '@/lib/first-load/spec'
 import { idToken, parseSku } from '@/lib/first-load/validate'
@@ -70,6 +79,22 @@ export type QoblexProduct = { sku: string; type: string }
 export type QoblexPoLine = { orderKey: string; sku: string; supplier: string; qtyOrdered: string; qtyReceived: string; unitCostForeign: string; /** The per-line Discount (%) as a plain decimal in 0-100; blank is '0'. Judged only on a line with a quantity outstanding. */ lineDiscountPercent: string }
 /** `keyPrefix` is what the first load put in front of a Qoblex order number to make the IMS purchase-order reference (the manifest's declaration; it only maps identities and never narrows a population). */
 export type QoblexPurchaseOrders = { keyPrefix: string; lines: QoblexPoLine[] }
+/** What one read of a native report did that changes or hides a row: the counts and the SKUs, never silently. */
+export type QoblexDatasetEvidence = {
+  /** Rows the native map's closed skip lists left out, by the value that skipped them (`ghost row dropped` included). */
+  rowsSkipped: Record<string, number>
+  /** Ghost rows dropped, with their quantity cell as written (a non-zero one makes the part unreadable, so a listed one is zero or blank). */
+  ghostRows: Array<{ sku: string; quantity: string }>
+  /** SKUs read as 0 on hand because the total was blank and every warehouse cell was blank or zero (BLANK_STOCK_AS_ZERO). */
+  blankAsZero: string[]
+}
+export type QoblexReadEvidence = {
+  stock: QoblexDatasetEvidence
+  products: QoblexDatasetEvidence
+  /** The first load's SKU renames applied to this read: `cells` is how many SKU cells they changed across the three parts; a rename that changed none is `unused`. */
+  skuRenames: Array<{ from: string; to: string; cells: number }>
+}
+export const emptyQoblexEvidence = (): QoblexReadEvidence => ({ stock: { rowsSkipped: {}, ghostRows: [], blankAsZero: [] }, products: { rowsSkipped: {}, ghostRows: [], blankAsZero: [] }, skuRenames: [] })
 export type QoblexPart<T> = { ok: true; value: T } | { ok: false; reason: PackReasonCode }
 export type QoblexExport = {
   exportedAt: string
@@ -80,6 +105,8 @@ export type QoblexExport = {
   purchaseOrders: QoblexPart<QoblexPurchaseOrders>
   /** Every file read, once, with the sha256 of the bytes that were parsed. */
   files: Array<{ name: string; sha256: string }>
+  /** What the read skipped, dropped, read as zero or renamed: listed by the items, never silent. */
+  evidence: QoblexReadEvidence
 }
 export type QoblexRead = { ok: true; value: QoblexExport } | { ok: false; reason: PackReasonCode }
 
@@ -102,7 +129,7 @@ const NATIVE_PO_MAP_SHA256 = createHash('sha256').update(QOBLEX_NATIVE_PO_COLUMN
 type Reference = { file: string; sha256: string }
 type PartSpec = { file: string; sha256: string; columnMap: Reference | null }
 type PoSpec = PartSpec & { keyPrefix: string }
-type Manifest = { exportedAt: string; asOf: string; locations: QoblexLocation[]; stock: PartSpec | null; products: PartSpec | null; purchaseOrders: PoSpec | null }
+type Manifest = { exportedAt: string; asOf: string; locations: QoblexLocation[]; stock: PartSpec | null; products: PartSpec | null; purchaseOrders: PoSpec | null; skuRenames: Reference | null }
 
 function record(value: unknown, keys: readonly string[], required: readonly string[]): Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value) || Object.getPrototypeOf(value) !== Object.prototype) return bad()
@@ -144,7 +171,7 @@ export function parseQoblexManifest(text: string): Manifest {
   let raw: unknown
   // A member named twice (two threePl on a location, say) is a manifest that says two things: refused whole (lib/ops/strict-json.ts).
   try { raw = parseJsonNoDuplicates(text) } catch (error) { return bad(error instanceof DuplicateMemberError ? 'MANIFEST_INCONSISTENT' : 'SOURCE_UNREADABLE') }
-  const r = record(raw, ['formatVersion', 'exportedAt', 'asOf', 'baseCurrency', 'locations', 'stock', 'products', 'purchaseOrders'], ['formatVersion', 'exportedAt', 'asOf', 'baseCurrency', 'locations'])
+  const r = record(raw, ['formatVersion', 'exportedAt', 'asOf', 'baseCurrency', 'locations', 'stock', 'products', 'purchaseOrders', 'skuRenames'], ['formatVersion', 'exportedAt', 'asOf', 'baseCurrency', 'locations'])
   if (r.formatVersion !== QOBLEX_MANIFEST_VERSION) return bad()
   if (r.baseCurrency !== QOBLEX_BASE_CURRENCY) return bad('CURRENCY_UNKNOWN')
   if (typeof r.exportedAt !== 'string' || !ISO_UTC_RE.test(r.exportedAt) || Number.isNaN(Date.parse(r.exportedAt))) return bad()
@@ -161,6 +188,7 @@ export function parseQoblexManifest(text: string): Manifest {
   const stock = r.stock === undefined ? null : partSpec(r.stock)
   const products = r.products === undefined ? null : partSpec(r.products)
   const purchaseOrders = r.purchaseOrders === undefined ? null : poSpec(r.purchaseOrders)
+  const skuRenames = r.skuRenames === undefined ? null : reference(r.skuRenames)
   // ONE FILE, ONE CLAIM. Every reference to a file, a data file or a column map, in any part, is gathered. A file name is judged
   // CASE-INSENSITIVELY (two names that differ only in case could be one file on a case-folding file system, so they are refused, not
   // guessed apart); every reference to it must spell it identically and declare the same sha256. A file is never both a data file and a
@@ -171,6 +199,11 @@ export function parseQoblexManifest(text: string): Manifest {
     if (part === null) continue
     refs.push({ file: part.file, sha256: part.sha256, role: 'data' })
     if (part.columnMap) refs.push({ file: part.columnMap.file, sha256: part.columnMap.sha256, role: 'map' })
+  }
+  // The rename list is its own file: a file that is also a part or a column map would be read as two different things.
+  if (skuRenames !== null) {
+    if (refs.some((ref) => ref.file.toLowerCase() === skuRenames.file.toLowerCase())) return bad('MANIFEST_INCONSISTENT')
+    refs.push({ file: skuRenames.file, sha256: skuRenames.sha256, role: 'data' })
   }
   const byName = new Map<string, (typeof refs)[number]>()
   for (const ref of refs) {
@@ -185,7 +218,7 @@ export function parseQoblexManifest(text: string): Manifest {
   }
   // The incoming report is its own file: sharing the stock report's file would read one set of bytes as two different reports.
   if (purchaseOrders !== null && [stock, products].some((other) => other !== null && other.file.toLowerCase() === purchaseOrders.file.toLowerCase())) return bad('MANIFEST_INCONSISTENT')
-  return { exportedAt: r.exportedAt, asOf, locations, stock, products, purchaseOrders }
+  return { exportedAt: r.exportedAt, asOf, locations, stock, products, purchaseOrders, skuRenames }
 }
 
 /**
@@ -274,7 +307,19 @@ function assertRawIdentities(bytes: Uint8Array, dataset: 'stock-lots' | 'product
   }
 }
 
-function ingest(dataset: 'stock-lots' | 'products' | 'purchase-order-lines', spec: PartSpec, files: Files): IngestedDataset {
+const isZeroQuantity = (quantity: string): boolean => quantity.trim() === '' || (parseDecimalStrict(quantity.trim())?.isZero() ?? false)
+
+/** Reads what a native ingest skipped, dropped or read as zero into the run's evidence (before any later check can refuse the part, so a refused part is still explained). */
+function collectEvidence(dataset: 'stock-lots' | 'products', out: IngestedDataset, evidence: QoblexReadEvidence): void {
+  const into = dataset === 'stock-lots' ? evidence.stock : evidence.products
+  for (const [kind, count] of Object.entries(out.rowsSkipped)) into.rowsSkipped[kind] = (into.rowsSkipped[kind] ?? 0) + count
+  for (const note of out.notes ?? []) {
+    if (note.code === 'GHOST_ROW_DROPPED' && note.sku !== undefined) into.ghostRows.push({ sku: note.sku, quantity: note.quantity ?? '' })
+    if (note.code === 'BLANK_STOCK_AS_ZERO' && note.sku !== undefined) into.blankAsZero.push(note.sku)
+  }
+}
+
+function ingest(dataset: 'stock-lots' | 'products' | 'purchase-order-lines', spec: PartSpec, files: Files, evidence: QoblexReadEvidence): IngestedDataset {
   const bytes = files.read({ file: spec.file, sha256: spec.sha256 })
   let mapping = null
   if (dataset === 'purchase-order-lines' && spec.columnMap === null) return bad('COLUMN_MAP_NOT_NATIVE')
@@ -288,18 +333,74 @@ function ingest(dataset: 'stock-lots' | 'products' | 'purchase-order-lines', spe
     if (mapping === null) return bad()
   }
   const out = ingestDataset(dataset, bytes, spec.file, mapping)
+  if (dataset !== 'purchase-order-lines') collectEvidence(dataset, out, evidence)
   assertRawIdentities(bytes, dataset, mapping)
   // Nothing rejected, nothing set aside unaccounted, and not empty: a file that yields no rows says nothing about the stock.
-  // EVERY data row is accounted for: none rejected, and the records read are exactly the rows kept. The only map is the native one, which skips
-  // nothing and merges nothing. Blank lines are the one thing not counted: a blank line carries no cell, so no stock or product is hidden by it.
+  // EVERY data row is accounted for: none rejected, and the records read are exactly the rows kept. Every row the native map skips or drops is COUNTED by
+  // the ingest (rowsSkipped, notes) and listed in the evidence, never silent. Blank lines are the one thing not counted: a blank line carries no cell, so
+  // no stock or product is hidden by it.
   // The incoming report alone may be empty (no order is incoming): the header check of the ingest still proved it is that report, and R7 and R8
   // pass on it only on a named proof that also needs IMS to hold no open order.
   if (out.rejected.length > 0 || out.recordsRead !== out.rows.length || (out.rows.length === 0 && dataset !== 'purchase-order-lines')) return bad()
+  // A ghost row is dropped, and the ingest reports its quantity. A ghost holding stock is stock the pack was shown and would discard: the part is
+  // inconclusive, never read without it (and first load and pack would otherwise agree on the loss by construction).
+  if (dataset !== 'purchase-order-lines' && (dataset === 'stock-lots' ? evidence.stock : evidence.products).ghostRows.some((ghost) => !isZeroQuantity(ghost.quantity))) return bad('QOBLEX_GHOST_STOCK')
   return out
 }
 
-function stockOf(spec: PartSpec, locations: readonly QoblexLocation[], files: Files): QoblexLot[] {
-  const ingested = ingest('stock-lots', spec, files)
+type Settled<T> = { ok: true; value: T } | { ok: false; error: unknown }
+const settle = <T>(run: () => T): Settled<T> => { try { return { ok: true, value: run() } } catch (error) { return { ok: false, error } } }
+const unsettle = <T>(result: Settled<T>): T => { if (!result.ok) throw result.error; return result.value }
+
+type RawSets = Partial<Record<'stock-lots' | 'products' | 'purchase-order-lines', Settled<IngestedDataset>>>
+type Renames = { plan: SkuRenamePlan } | null
+
+/**
+ * The first load's SKU renames, judged by the first load's own rules (lib/first-load/sku-renames.ts) against the SKUs the three parts hold. A rename whose
+ * fromSku is in none of them is allowed (it may name a SKU only a dataset the pack does not read holds) and is reported as unused; every other refusal
+ * (a bad SKU, no reason, a chain, a duplicate, a target that already exists) makes the list unusable. What each rename changed is counted into the evidence.
+ */
+function renamesOf(reference: Reference, files: Files, raw: RawSets, evidence: QoblexReadEvidence): { plan: SkuRenamePlan } {
+  const bytes = files.read(reference)
+  const list = ingestDataset('sku-renames', bytes, reference.file, null)
+  if (list.rejected.length > 0 || list.recordsRead !== list.rows.length) return bad('SKU_RENAMES_REFUSED')
+  const present = new Map<string, Set<string>>()
+  const readSets = (Object.entries(raw) as Array<['stock-lots' | 'products' | 'purchase-order-lines', Settled<IngestedDataset>]>).flatMap(([name, result]) => (result.ok ? [[name, result.value] as const] : []))
+  for (const [name, data] of readSets) {
+    for (const row of data.rows) {
+      const parsed = parseSku(row.values.sku ?? '')
+      if (parsed.ok) present.set(parsed.key, (present.get(parsed.key) ?? new Set<string>()).add(name))
+    }
+  }
+  const plan = planSkuRenames(list.rows, present, { fromMayBeAbsent: true })
+  if (plan.refusals.length > 0) return bad('SKU_RENAMES_REFUSED')
+  const cells = new Map<string, number>()
+  for (const [, data] of readSets) {
+    for (const row of data.rows) {
+      const parsed = parseSku(row.values.sku ?? '')
+      if (parsed.ok && plan.accepted.has(parsed.key)) cells.set(parsed.key, (cells.get(parsed.key) ?? 0) + 1)
+    }
+  }
+  for (const item of plan.accepted.values()) evidence.skuRenames.push({ from: item.from, to: item.to, cells: cells.get(item.fromKey) ?? 0 })
+  return { plan }
+}
+
+/** One dataset as the pack compares it: ingested, with the first load's renames applied to its SKU cells. */
+function datasetOf(name: 'stock-lots' | 'products' | 'purchase-order-lines', raw: RawSets, renames: Settled<Renames>): IngestedDataset {
+  const out = unsettle(raw[name] ?? { ok: false, error: new Unreadable('SOURCE_UNREADABLE') })
+  const applied = unsettle(renames)
+  if (applied === null || applied.plan.accepted.size === 0) return out
+  return {
+    ...out,
+    rows: out.rows.map((row) => {
+      const parsed = parseSku(row.values.sku ?? '')
+      const item = parsed.ok ? applied.plan.accepted.get(parsed.key) : undefined
+      return item === undefined ? row : { ...row, values: { ...row.values, sku: item.to } }
+    }),
+  }
+}
+
+function stockOf(ingested: IngestedDataset, locations: readonly QoblexLocation[]): QoblexLot[] {
   const known = new Set(locations.map((l) => l.code))
   const lots = ingested.rows.map((row): QoblexLot => {
     const v = row.values
@@ -331,8 +432,7 @@ function stockOf(spec: PartSpec, locations: readonly QoblexLocation[], files: Fi
   return lots
 }
 
-function productsOf(spec: PartSpec, files: Files): QoblexProduct[] {
-  const ingested = ingest('products', spec, files)
+function productsOf(ingested: IngestedDataset): QoblexProduct[] {
   const products = ingested.rows.map((row): QoblexProduct => {
     const sku = parseSku(row.values.sku ?? '')
     if (!sku.ok) return bad('BAD_KEY')
@@ -358,8 +458,7 @@ const isNonNegativeDecimal = (value: string): boolean => { const d = parseDecima
  * is a plain token (QOBLEX_PO_NUMBER_RE); the same (order, SKU) twice, or two order numbers that differ only in case, is DUPLICATE_KEY (never
  * summed, never picked between). Anything else is a closed reason and no line is returned.
  */
-function purchaseOrdersOf(spec: PoSpec, files: Files): QoblexPurchaseOrders {
-  const ingested = ingest('purchase-order-lines', spec, files)
+function purchaseOrdersOf(spec: PoSpec, ingested: IngestedDataset): QoblexPurchaseOrders {
   // A CLOSED line (the native map's "Closed" status) is a finished one: R7 and R8 compare only open orders, so it is dropped here, BEFORE the
   // duplicate check below (a closed line repeated in the export must not refuse the whole run). Only the exact mapped value CLOSED is dropped; any
   // other status that is not OPEN is still BAD_VALUE, and a duplicate among OPEN lines is still DUPLICATE_KEY.
@@ -424,10 +523,17 @@ export function readQoblexExport(dir: string, asOf: string, now: Date): QoblexRe
     const manifest = parseQoblexManifest(text)
     const stale = qoblexStaleness(manifest, asOf, now)
     if (stale !== null) return { ok: false, reason: stale }
-    const stock = manifest.stock === null ? ({ ok: false, reason: 'SOURCE_UNREADABLE' } as const) : part(() => stockOf(manifest.stock!, manifest.locations, files))
-    const products = manifest.products === null ? ({ ok: false, reason: 'SOURCE_UNREADABLE' } as const) : part(() => productsOf(manifest.products!, files))
-    const purchaseOrders = manifest.purchaseOrders === null ? ({ ok: false, reason: 'SOURCE_UNREADABLE' } as const) : part(() => purchaseOrdersOf(manifest.purchaseOrders!, files))
-    return { ok: true, value: { exportedAt: manifest.exportedAt, asOf: manifest.asOf, locations: manifest.locations, stock, products, purchaseOrders, files: files.list } }
+    // Every part is ingested once, raw; the first load's renames (when the manifest names them) are then judged against what the parts hold and applied.
+    const evidence = emptyQoblexEvidence()
+    const raw: RawSets = {}
+    if (manifest.stock !== null) raw['stock-lots'] = settle(() => ingest('stock-lots', manifest.stock!, files, evidence))
+    if (manifest.products !== null) raw.products = settle(() => ingest('products', manifest.products!, files, evidence))
+    if (manifest.purchaseOrders !== null) raw['purchase-order-lines'] = settle(() => ingest('purchase-order-lines', manifest.purchaseOrders!, files, evidence))
+    const renames: Settled<Renames> = manifest.skuRenames === null ? { ok: true, value: null } : settle(() => renamesOf(manifest.skuRenames!, files, raw, evidence))
+    const stock = manifest.stock === null ? ({ ok: false, reason: 'SOURCE_UNREADABLE' } as const) : part(() => stockOf(datasetOf('stock-lots', raw, renames), manifest.locations))
+    const products = manifest.products === null ? ({ ok: false, reason: 'SOURCE_UNREADABLE' } as const) : part(() => productsOf(datasetOf('products', raw, renames)))
+    const purchaseOrders = manifest.purchaseOrders === null ? ({ ok: false, reason: 'SOURCE_UNREADABLE' } as const) : part(() => purchaseOrdersOf(manifest.purchaseOrders!, datasetOf('purchase-order-lines', raw, renames)))
+    return { ok: true, value: { exportedAt: manifest.exportedAt, asOf: manifest.asOf, locations: manifest.locations, stock, products, purchaseOrders, files: files.list, evidence } }
   } catch (error) {
     return { ok: false, reason: error instanceof Unreadable ? error.reason : 'SOURCE_UNREADABLE' }
   }

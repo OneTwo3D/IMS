@@ -71,7 +71,8 @@ export type PopulationBoundaries = { firstLoad: FirstLoadRecord; storefrontImpor
 
 export type StockPair = { stockLevelId: string; productId: string; sku: string; productType: string; warehouseId: string; warehouseCode: string; quantity: string; reservedQty: string }
 export type ImsStock = { tracked: StockPair[]; untracked: StockPair[] }
-export type ProductRow = { id: string; sku: string; type: string; active: boolean; lifecycleStatus: string }
+/** `parentId` is the parent product of a variation (set for VARIANT products, and also for the KIT/BOM variations the first load creates); null for a top-level product. */
+export type ProductRow = { id: string; sku: string; type: string; active: boolean; lifecycleStatus: string; parentId: string | null }
 export type OrderLink = { connector: string; externalOrderId: string }
 export type OrderRow = { id: string; status: string; currency: string; totalForeign: string; externalCreatedAt: string | null; externalUpdatedAt: string | null; links: OrderLink[] }
 /** The importer's admitted WooCommerce order statuses (normalised, unique) and every mapping row of the storefront connector. */
@@ -404,8 +405,8 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
   },
 
   async products(tx) {
-    const rows = await readCapped(tx, 'SELECT id, sku, type::text AS type, active, "lifecycleStatus"::text AS lifecycle FROM products ORDER BY id')
-    const products = rows.map((row): ProductRow => ({ id: text(row.id), sku: text(row.sku), type: text(row.type, 'SOURCE_UNREADABLE'), active: bool(row.active), lifecycleStatus: text(row.lifecycle, 'SOURCE_UNREADABLE') }))
+    const rows = await readCapped(tx, 'SELECT id, sku, type::text AS type, active, "lifecycleStatus"::text AS lifecycle, "parentId" FROM products ORDER BY id')
+    const products = rows.map((row): ProductRow => ({ id: text(row.id), sku: text(row.sku), type: text(row.type, 'SOURCE_UNREADABLE'), active: bool(row.active), lifecycleStatus: text(row.lifecycle, 'SOURCE_UNREADABLE'), parentId: textOrNull(row.parentId) }))
     unique(products, (product) => product.id)
     unique(products, (product) => product.sku)
     return products

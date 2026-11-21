@@ -58,7 +58,7 @@ function rig(base: string, config: Config = {}): Rig {
     { connector: 'mintsoft', warehouse_id: cuid(5), warehouse_code: 'EAR2', external_id: '5', active: true, mode: 'NOTIFICATION_ONLY', confirmed: false },
     { connector: 'mintsoft', warehouse_id: cuid(6), warehouse_code: 'MIL1', external_id: '6', active: true, mode: config.alignmentConfirmed ? 'ALIGN_TO_WMS' : 'NOTIFICATION_ONLY', confirmed: config.alignmentConfirmed === true },
   ]
-  const products = plain.map((row, index) => ({ id: cuid(1000 + index), sku: row.SKU, type: 'SIMPLE', active: true, lifecycle: 'ACTIVE' }))
+  const products = plain.map((row, index) => ({ id: cuid(1000 + index), sku: row.SKU, type: 'SIMPLE', active: true, lifecycle: 'ACTIVE', parentId: null }))
   const links = products.map((p, index) => ({ connector: 'mintsoft', product_id: p.id, external_id: String(plain[index]!.ProductId) }))
   const levels = bindings.flatMap((b, bi) => products.map((p, index) => {
     const wh = (b.external_id === '5' ? PROBE_WH5 : PROBE_WH6).find((row) => row.SKU === plain[index]!.SKU)!
