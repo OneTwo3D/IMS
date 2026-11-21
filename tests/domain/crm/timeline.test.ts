@@ -71,9 +71,9 @@ function fakeReader(emails: FakeMail[], calls: { outbox: number; sql: Array<{ te
   const none = { findMany: async () => [] as unknown[] }
   const db = {
     salesOrder: none, payment: none, salesOrderRefund: none, returnExpectation: none, wmsReturnsInbox: none,
-    $queryRaw: async (q: { sql: string; values: unknown[] }) => {
+    $queryRaw: async (q: { text: string; values: unknown[] }) => {
       calls.outbox += 1
-      calls.sql.push({ text: q.sql, values: q.values })
+      calls.sql.push({ text: q.text, values: q.values })
       const [ids, placeholder, ...rest] = q.values as [string[], string, ...unknown[]]
       const take = rest[rest.length - 1] as number
       const upTo = rest.length > 1 ? (rest[0] as Date) : null
