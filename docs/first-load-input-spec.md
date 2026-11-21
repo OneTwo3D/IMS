@@ -773,7 +773,7 @@ These are keys of the credentials file, not environment variables of the applica
 3. Send `lifecycle-review.xlsx` to the owner. The owner picks a New IMS status for every decidable Review row, writes an override reason for any Archived product that holds stock, does not edit the SKU or Sheet id columns or delete the hidden tab, and saves it as `.xlsx` (or exports the Review tab as CSV UTF-8). The SKU mismatches tab lists what to fix in Qoblex or Mintsoft.
 4. Add to the run manifest `"lifecycleReview": {"generation": "<folder>/lifecycle-review.generation.json"}` and the input `{"dataset": "lifecycle-decisions", "file": "<the filled file>"}`.
 5. Run `first-load:prepare --dry-run` and read every `LIFECYCLE_FROM_DECISION`, `ARCHIVED_WITH_STOCK_OVERRIDE`, refusal, `LIFECYCLE_DECISION_MISSING` and `LIFECYCLE_REVIEW_SET_CHANGED`; send any refusal or undecided row back to the owner. If the real run's exports are fresher than the sheet's, `LIFECYCLE_REVIEW_SET_CHANGED` lists the products that joined the review set since: generate the sheet again, or get the owner's decision for each and add it as a row. A real prepare is blocked until every review-set product is decided.
-6. Archiving the owner's Archived products in Mintsoft is a separate, live step (not part of this command).
+6. Archiving the owner's Archived products in Mintsoft is a separate step (not part of this command): plan it with `first-load:mintsoft-archive` (below). The write itself is not built yet.
 
 ### Lifecycle review exit codes
 
@@ -784,6 +784,50 @@ These are keys of the credentials file, not environment variables of the applica
 | 3 | INPUT_UNUSABLE | An input cannot be used: a manifest file or column map, the products or stock-lots dataset missing, the WooCommerce snapshot bundle not verified, or the Mintsoft credentials file refused or its listing unreadable. Nothing was written. |
 | 4 | OUTPUT_FAILED | The output directory is unusable (it exists and is not empty, or a write failed). Files this run had created were removed again. |
 | 5 | INTERNAL | A self-check of this command failed (the sheet just written does not read back). A defect in the tool. |
+
+## Mintsoft archive for Archived decisions
+
+Owner requirement (2026-11-21): after the sheet is imported, every product the owner set to **Archived** must also be archived (discontinued) in Mintsoft. Mintsoft is LIVE and shared, so this is a separate operator command, and today it is a **dry-run planner only**.
+
+```bash
+npm run first-load:mintsoft-archive -- --manifest path/to/run.json --mintsoft-env-file path/to/mintsoft-readonly.env
+npm run first-load:mintsoft-archive -- --help
+```
+
+**What it reads.** The same run manifest as `first-load:prepare`, with `lifecycleReview.generation` and the `lifecycle-decisions` input (the owner's filled sheet). It runs the transform exactly as a real prepare does (pure: nothing is written) and plans every product whose lifecycle comes from an owner decision and is ARCHIVED. It **refuses to plan** (exit 3, Mintsoft not read) when the decisions would not import: not bound to a verified sheet (`LIFECYCLE_DECISIONS_NOT_BOUND`), a refused decision row (for example Archived with stock and no override reason), an undecided review row (`LIFECYCLE_DECISION_MISSING`), or a review set that changed or cannot be checked. Other blocking findings of the prepare are only noted. Then it reads Mintsoft with GET only through the lifecycle review's guarded reader (the same credentials file and the same completeness checks: two equal scans of `Product/List`, the warehouse list, the physical stock of every configured warehouse; see "Owner lifecycle review sheet"), now with each product's bundle flag.
+
+**The plan.** One line per Archived SKU, matched to Mintsoft by EXACT SKU only: the Mintsoft product id, its current `DisCont`, its physical stock (summed over the configured warehouses), and the outcome:
+
+| Outcome | Meaning |
+| --- | --- |
+| `WOULD_ARCHIVE` | Not discontinued, physical stock 0, not a bundle: the product a write would change. |
+| `SKIP_ALREADY_DISCONTINUED` | Already discontinued in Mintsoft: nothing to change (reported with its stock). |
+| `SKIP_NOT_A_WMS_PRODUCT` | A VARIABLE parent (a WooCommerce construct; each variation is a line of its own), or a NON_INVENTORY product Mintsoft does not hold. |
+| `REFUSED_NOT_FOUND` | Mintsoft holds no product under exactly this SKU (the line names a pre-rename spelling or a letter-case/whitespace near match Mintsoft holds instead; fix the SKU there). |
+| `REFUSED_BUNDLE` | The Mintsoft product is a bundle. |
+| `REFUSED_FLAG_NOT_STATED` | The Mintsoft row carries no `DisCont` flag, so its state cannot be shown or verified. |
+| `REFUSED_STOCK` | Mintsoft physical stock above zero: never archived while it holds stock. |
+
+It ends with a **plan token** (`MSA-` and 16 hex digits) and the plan digest, derived from every line (SKU, outcome, product id, flag, stock), the sheet id and the warehouses read: any change between two runs gives another token, so a write (when it exists) can require the token of the plan the operator reviewed and refuse a stale one. Nothing is signalled through Mintsoft notes (the warehouse does not read them). No credential, URL or response body is printed.
+
+**The write is NOT BUILT; `--execute` is refused** (exit 2, nothing read). The repository has no vetted Mintsoft request that sets a product's discontinued flag: the connector's product update is `POST /api/Product` with the product `ID` and the full product META payload (name, barcode, weight, dimensions, customs data), which the writer-ownership map gives to the woo-mintsoft plugin until P2, and it never sends `DisCont`; `DisCont` is known only from the `GET /api/Product/List` row shape read on 2026-10-23. Unknown, to be verified read-only (and then with one controlled, owner-approved write on a zero-stock product) before the write is built:
+
+1. which route and field set the discontinued flag (`POST /api/Product` with `DisCont: true`, or another route or field name);
+2. whether a body of `ID` (+ `SKU`) + the flag leaves every other field untouched, or replaces the product and blanks the fields it does not carry (the same open question as the product-content `Description` / `ShortDescription` fields, docs/mintsoft.md "Field names not yet verified");
+3. what Mintsoft answers to it (a `ToolkitResult` with `Success` and `Message`? "nothing to update" when already set?);
+4. whether `GET /api/Product/{id}` (allow-listed) carries `DisCont`, so each write can be GET-verified on the one product rather than by re-reading the whole list;
+5. whether a discontinued product stays visible to `Product/List` and `StockLevels` (the planner and the reconciliation pack read it there).
+
+Once those are known, the write is to be built behind a switch that is OFF by default, `--execute` requiring the switch and the plan token, one write per `WOULD_ARCHIVE` SKU with its physical stock re-read right before it, rate-limited, GET-verified after, each recorded, stopping at the first unexpected answer, and registered in the egress allow-list, the writer-ownership map and writers-check, and the producer census.
+
+### Mintsoft archive exit codes
+
+| Code | Name | Meaning |
+| --- | --- | --- |
+| 0 | OK | The plan was printed and no SKU is refused (it may be empty). |
+| 1 | BLOCKING_FINDINGS | The plan was printed and at least one Archived SKU is refused (not found, a bundle, no discontinued flag, or physical stock above zero): resolve each before any write. |
+| 2 | USAGE | Bad command line, an invalid run manifest, or `--execute` (the write is not built). Nothing was read or requested. |
+| 3 | INPUT_UNUSABLE | An input cannot be used: a manifest file, the decisions not bound to a verified review sheet, a refused or missing decision, a review set that changed or cannot be checked, or the Mintsoft credentials file refused or its census unreadable. Nothing was planned. |
 
 ## Output files and load order
 
