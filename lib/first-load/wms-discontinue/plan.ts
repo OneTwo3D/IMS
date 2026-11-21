@@ -1,7 +1,7 @@
 /**
- * THE FIRST-LOAD MINTSOFT ARCHIVE PLAN (owner addition 2026-11-21 (b) to the lifecycle review): after the owner's filled review sheet is imported, every
+ * THE FIRST-LOAD WMS ARCHIVE PLAN (owner addition 2026-11-21 (b) to the lifecycle review): after the owner's filled review sheet is imported, every
  * product the owner set to Archived must also be archived (discontinued) in the WMS. This module only PLANS it: which SKUs would change, and why every
- * other one would not. PURE: no file, no clock, no request. lib/first-load/mintsoft-archive/cli.ts gathers the inputs.
+ * other one would not. PURE: no file, no clock, no request. lib/first-load/wms-discontinue/cli.ts gathers the inputs.
  *
  * WHO IS IN THE PLAN. Every catalogue entry whose lifecycle came from an owner decision (`lifecycleSource: 'decision'`) and is ARCHIVED: a decision the
  * transform refused (unknown SKU, Archived with stock and no reason, ...) never reaches the catalogue as ARCHIVED, so it is never planned.
@@ -61,7 +61,7 @@ export interface ArchivePlan {
   counts: Record<ArchiveOutcome, number>
 }
 
-export const ARCHIVE_PLAN_KIND = 'first-load-mintsoft-archive-plan'
+export const ARCHIVE_PLAN_KIND = 'first-load-wms-archive-plan'
 export const ARCHIVE_PLAN_FORMAT_VERSION = 1
 
 const cmp = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0)

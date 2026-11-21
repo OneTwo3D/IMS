@@ -9,10 +9,10 @@
  * This wrapper is the only place that names the WMS connector (lib/first-load is connector-agnostic). Exit codes: run with --help.
  */
 import process from 'node:process'
-import { runMintsoftArchiveCli, WmsCensusFailed, WmsCensusRefused } from '../lib/first-load/mintsoft-archive/cli'
+import { runWmsArchiveCli, WmsCensusFailed, WmsCensusRefused } from '../lib/first-load/wms-discontinue/cli'
 import { MintsoftReviewFailed, MintsoftReviewRefused, readMintsoftProductCensus, readMintsoftReviewConfig } from '../lib/connectors/mintsoft/lifecycle-review-read'
 
-runMintsoftArchiveCli(process.argv.slice(2), {
+runWmsArchiveCli(process.argv.slice(2), {
   stdout: (text) => process.stdout.write(text),
   stderr: (text) => process.stderr.write(text),
 }, {
@@ -28,7 +28,7 @@ runMintsoftArchiveCli(process.argv.slice(2), {
       throw new WmsCensusFailed('the product census could not be read')
     }
   },
-}).then(
+}, 'first-load-mintsoft-archive').then(
   (code) => {
     process.exitCode = code
   },

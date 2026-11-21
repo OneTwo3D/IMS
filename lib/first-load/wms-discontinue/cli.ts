@@ -1,6 +1,7 @@
 /**
- * `npm run first-load:mintsoft-archive`: the DRY-RUN PLANNER for archiving, in the WMS, every product the owner set to Archived on the lifecycle review
- * sheet. A function so tests drive it without a subprocess; scripts/first-load-mintsoft-archive.ts is a thin wrapper that supplies the WMS reader.
+ * The first-load WMS ARCHIVE command: the DRY-RUN PLANNER for archiving, in the WMS, every product the owner set to Archived on the lifecycle review
+ * sheet. A function so tests drive it without a subprocess; the script that names the connector is a thin wrapper that supplies the WMS reader and
+ * the command's name (lib/first-load never names a connector).
  *
  * READ-ONLY. It reads the SAME run manifest as first-load:prepare, with the owner's filled sheet bound to its generation record (`lifecycleReview` and the
  * `lifecycle-decisions` input), runs the transform exactly as a real prepare does (pure: nothing is written) and takes the products whose lifecycle comes
@@ -10,14 +11,14 @@
  * derived from the plan.
  *
  * THE WRITE IS NOT BUILT. `--execute` is refused before anything is read: the WMS product-update request that sets the discontinued flag has not been
- * verified (docs/first-load-input-spec.md "Mintsoft archive for Archived decisions" lists what is unknown). Nothing here can write; no credential is printed.
+ * verified (docs/first-load-input-spec.md, the archive section for Archived decisions, lists what is unknown). Nothing here can write; no credential is printed.
  */
 import { loadPrepareRun, type CliIo } from '../cli'
 import { EXIT_CODES } from '../spec'
 import { ConfigError, prepare } from '../transform'
 import { buildArchivePlan, isRefused, type ArchivePlan, type WmsCensus } from './plan'
 
-export const MINTSOFT_ARCHIVE_EXIT_CODE_TABLE: ReadonlyArray<{ code: number; name: string; meaning: string }> = [
+export const WMS_ARCHIVE_EXIT_CODE_TABLE: ReadonlyArray<{ code: number; name: string; meaning: string }> = [
   { code: EXIT_CODES.OK, name: 'OK', meaning: 'The plan was printed and no SKU is refused (it may be empty).' },
   { code: EXIT_CODES.BLOCKING_FINDINGS, name: 'BLOCKING_FINDINGS', meaning: 'The plan was printed and at least one Archived SKU is refused (not found, a bundle, no discontinued flag, or physical stock above zero): resolve each before any write.' },
   { code: EXIT_CODES.USAGE, name: 'USAGE', meaning: 'Bad command line, an invalid run manifest, or --execute (the write is not built). Nothing was read or requested.' },
@@ -37,11 +38,11 @@ export interface WmsCensusReader {
 export class WmsCensusRefused extends Error {}
 export class WmsCensusFailed extends Error {}
 
-export function usageText(reader?: Pick<WmsCensusReader, 'flag' | 'label'>): string {
+export function usageText(reader?: Pick<WmsCensusReader, 'flag' | 'label'>, tool = DEFAULT_TOOL): string {
   const flag = reader?.flag ?? '--wms-env-file'
   const label = reader?.label ?? 'WMS'
   return [
-    `Usage: first-load-mintsoft-archive --manifest <run.json> ${flag} <file>`,
+    `Usage: ${tool} --manifest <run.json> ${flag} <file>`,
     '',
     `Plans archiving (discontinuing) in ${label} every product the owner set to Archived on the lifecycle review sheet. A DRY RUN: it reads, prints the plan and writes nothing.`,
     '',
@@ -51,12 +52,14 @@ export function usageText(reader?: Pick<WmsCensusReader, 'flag' | 'label'>): str
     '  --help             this text',
     '',
     'Exit codes:',
-    ...MINTSOFT_ARCHIVE_EXIT_CODE_TABLE.map((row) => `  ${row.code}  ${row.name}: ${row.meaning}`),
+    ...WMS_ARCHIVE_EXIT_CODE_TABLE.map((row) => `  ${row.code}  ${row.name}: ${row.meaning}`),
     '',
   ].join('\n')
 }
 
 class UsageError extends Error {}
+
+const DEFAULT_TOOL = 'first-load-wms-archive'
 
 function parseArgs(argv: string[], reader: WmsCensusReader): { manifest: string; envFile: string } | 'help' | 'execute' {
   let manifest: string | null = null
@@ -83,33 +86,34 @@ function parseArgs(argv: string[], reader: WmsCensusReader): { manifest: string;
 
 const DECISION_CODES = new Set(['LIFECYCLE_DECISIONS_NOT_BOUND', 'LIFECYCLE_DECISION_MISSING', 'LIFECYCLE_REVIEW_SET_CHANGED', 'LIFECYCLE_REVIEW_SET_UNCHECKED'])
 
-export async function runMintsoftArchiveCli(argv: string[], io: CliIo, reader: WmsCensusReader): Promise<number> {
-  const tool = 'first-load-mintsoft-archive'
+export async function runWmsArchiveCli(argv: string[], io: CliIo, reader: WmsCensusReader, tool = DEFAULT_TOOL): Promise<number> {
   let args: ReturnType<typeof parseArgs>
   try {
     args = parseArgs(argv, reader)
   } catch (error) {
     if (error instanceof UsageError) {
-      io.stderr(`${tool}: ${error.message}\n\n${usageText(reader)}`)
+      io.stderr(`${tool}: ${error.message}\n\n${usageText(reader, tool)}`)
       return EXIT_CODES.USAGE
     }
     throw error
   }
   if (args === 'help') {
-    io.stdout(usageText(reader))
+    io.stdout(usageText(reader, tool))
     return EXIT_CODES.OK
   }
   if (args === 'execute') {
-    io.stderr(`${tool}: --execute is refused: the ${reader.label} write is NOT BUILT. The request that sets a product's discontinued flag has not been verified (which route and field, whether a partial body leaves every other field untouched, what the answer looks like, and how a read-back shows it). Nothing was read, requested or written. Run without --execute for the dry-run plan; see docs/first-load-input-spec.md "Mintsoft archive for Archived decisions".\n`)
+    io.stderr(`${tool}: --execute is refused: the ${reader.label} write is NOT BUILT. The request that sets a product's discontinued flag has not been verified (which route and field, whether a partial body leaves every other field untouched, what the answer looks like, and how a read-back shows it). Nothing was read, requested or written. Run without --execute for the dry-run plan; docs/first-load-input-spec.md lists what is unknown.\n`)
     return EXIT_CODES.USAGE
   }
 
   // ---- the decisions, bound and applied exactly as a real first-load:prepare does ----
-  const loaded = loadPrepareRun(args.manifest, io, { runId: null }, tool, () => usageText(reader))
+  const loaded = loadPrepareRun(args.manifest, io, { runId: null }, tool, () => usageText(reader, tool))
   if (!loaded.ok) return loaded.exit
   const run = loaded.run
   const refuse = (problems: string[]): number => {
-    io.stderr(`${tool}: the plan cannot be made, nothing was requested:\n${problems.slice(0, 20).map((p) => `  - ${p}\n`).join('')}${problems.length > 20 ? `  ... and ${problems.length - 20} more\n` : ''}`)
+    const listed = problems.slice(0, 20).map((p) => `  - ${p}`)
+    if (problems.length > 20) listed.push(`  ... and ${problems.length - 20} more`)
+    io.stderr(`${tool}: the plan cannot be made, nothing was requested:\n${listed.join('\n')}\n`)
     return EXIT_CODES.INPUT_UNUSABLE
   }
   if (!run.datasets['lifecycle-decisions'] || run.manifest.lifecycleReview === null) return refuse(['the manifest names no lifecycle-decisions input and lifecycleReview.generation: the plan is made from the owner\'s filled review sheet, bound to its generation record'])

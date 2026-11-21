@@ -11,8 +11,8 @@ import { serializeCsv } from '../../lib/first-load/csv.ts'
 import { EXIT_CODES } from '../../lib/first-load/spec.ts'
 import { runLifecycleReviewCli, type WmsReader } from '../../lib/first-load/lifecycle-review/cli.ts'
 import { LIFECYCLE_REVIEW_FILE_NAMES } from '../../lib/first-load/lifecycle-review/generation.ts'
-import { MINTSOFT_ARCHIVE_EXIT_CODE_TABLE, runMintsoftArchiveCli, WmsCensusFailed, type WmsCensusReader } from '../../lib/first-load/mintsoft-archive/cli.ts'
-import { buildArchivePlan, type WmsCensus } from '../../lib/first-load/mintsoft-archive/plan.ts'
+import { WMS_ARCHIVE_EXIT_CODE_TABLE, runWmsArchiveCli, WmsCensusFailed, type WmsCensusReader } from '../../lib/first-load/wms-discontinue/cli.ts'
+import { buildArchivePlan, type WmsCensus } from '../../lib/first-load/wms-discontinue/plan.ts'
 import type { CatalogueEntry } from '../../lib/first-load/transform.ts'
 import { buildFixture, fakeWms, type Fixture } from './lifecycle-review-fixture.ts'
 
@@ -62,7 +62,7 @@ function reader(c: WmsCensus | (() => never) = census(), calls: string[] = []): 
 async function run(args: string[], r = reader()): Promise<{ code: number; stdout: string; stderr: string }> {
   let stdout = ''
   let stderr = ''
-  const code = await runMintsoftArchiveCli(args, { stdout: (s) => (stdout += s), stderr: (s) => (stderr += s) }, r)
+  const code = await runWmsArchiveCli(args, { stdout: (s) => (stdout += s), stderr: (s) => (stderr += s) }, r, 'first-load-mintsoft-archive')
   return { code, stdout, stderr }
 }
 const ENV = ['--mintsoft-env-file', '/only/for/the/fake']
@@ -142,7 +142,7 @@ test('usage: --manifest and the credentials file are required, an unknown option
   assert.ok(!unknown.stderr.includes('ms_secret_value'))
   const help = await run(['--help'])
   assert.equal(help.code, EXIT_CODES.OK)
-  for (const row of MINTSOFT_ARCHIVE_EXIT_CODE_TABLE) assert.ok(help.stdout.includes(`  ${row.code}  ${row.name}: `), row.name)
+  for (const row of WMS_ARCHIVE_EXIT_CODE_TABLE) assert.ok(help.stdout.includes(`  ${row.code}  ${row.name}: `), row.name)
 })
 
 test('the plan: a VARIABLE parent and a NON_INVENTORY product the WMS does not hold are skipped; a case-only near match is named, never matched; non-decision ARCHIVED is not planned', () => {
@@ -166,5 +166,5 @@ test('the document states exactly the planner\'s exit codes', () => {
   assert.ok(start >= 0, 'the section exists')
   const section = doc.slice(start, doc.indexOf('\n## ', start) < 0 ? undefined : doc.indexOf('\n## ', start))
   const rows = section.split('\n').filter((l) => /^\| \d/.test(l)).map((l) => l.split('|').slice(1, 3).map((c) => c.trim()))
-  assert.deepEqual(rows, MINTSOFT_ARCHIVE_EXIT_CODE_TABLE.map((r) => [String(r.code), r.name]))
+  assert.deepEqual(rows, WMS_ARCHIVE_EXIT_CODE_TABLE.map((r) => [String(r.code), r.name]))
 })
