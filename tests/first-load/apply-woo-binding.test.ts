@@ -175,3 +175,16 @@ test('woo-product-status is bound at apply time too: loaded when the manifest na
   const unused = loadPreparedRun({ manifest: named(), files: preparedWithParents(bundle), woo })
   assert.ok(!unused.ok && unused.problems.some((p) => /names a wooSnapshot productStatus but the prepared run took no lifecycle/.test(p)))
 })
+
+// [mutation: the prepared run's woo-product-status sha is not compared with the verified bundle's (prepared.ts block 5b)]
+test('apply: the woo-product-status file the prepared run recorded reading must be the verified bundle\'s file', async () => {
+  const bundle = await snapshotBundle()
+  const files = withReport(preparedWithParents(bundle, true), (r) => {
+    const input = r.inputs.find((i) => i.dataset === 'woo-product-status')!
+    input.sha256 = 'b'.repeat(64)
+    input.parts[0].sha256 = 'b'.repeat(64)
+  })
+  const woo = { snapshot: bundle.snapshot, provenance: bundle.provenance, variantParents: bundle.csv, productStatus: bundle.status }
+  const loaded = loadPreparedRun({ manifest: manifestFor(bundle, {}, { productStatus: '/ps' }), files, woo })
+  assert.ok(!loaded.ok && loaded.problems.some((p) => /woo-product-status file the prepared run read is not the file of the verified snapshot bundle/.test(p)), loaded.ok ? 'accepted' : JSON.stringify(loaded.problems))
+})

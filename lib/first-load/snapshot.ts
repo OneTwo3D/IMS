@@ -104,6 +104,16 @@ export function payloadSha256(payload: SnapshotPayload): string {
   return sha256Hex(canonicalJson(normalizePayload(payload)))
 }
 
+/**
+ * The checksum the TWO WALKS are compared by: the payload WITHOUT the stock figures (manageStock, stockQuantity). Stock moves with every order and every stock push, and the
+ * verifying walk runs minutes after the first, so comparing it would refuse a live store that is merely trading. Status, SKU, type, title, ids and variations still must agree.
+ * The stock figures kept in the file are walk A's: a point-in-time read, for information only (the file's own checksum still covers them).
+ */
+export function comparisonSha256(payload: SnapshotPayload): string {
+  const n = normalizePayload(payload)
+  return sha256Hex(canonicalJson({ ...n, products: n.products.map(({ manageStock: _m, stockQuantity: _q, ...rest }) => rest) }))
+}
+
 /** The snapshot file: pretty, key-sorted JSON carrying the payload and the checksum of its canonical form. */
 export function renderSnapshotFile(payload: SnapshotPayload): string {
   const normalised = normalizePayload(payload)

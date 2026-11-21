@@ -665,8 +665,18 @@ function loadProductStatus(run: Run): ReturnType<typeof statusBySku> {
 function applyLifecycleFromWoo(run: Run): void {
   const fromSnapshot = loadProductStatus(run)
   const fromExport = run.has('woo-products') ? statusBySku(run, 'woo-products') : { status: new Map<string, string>(), conflicts: [] }
-  const conflicts = [...fromSnapshot.conflicts.map((c) => ({ key: c.key, text: `${c.text} (woo-product-status)` })), ...fromExport.conflicts.map((c) => ({ key: c.key, text: `${c.text} (woo-products)` }))]
-  if (conflicts.length > 0) run.find('ERROR', 'LIFECYCLE_WOO_STATUS_CONFLICT', `${conflicts.length} SKU(s) appear more than once with different WooCommerce statuses, so their lifecycle cannot be decided and none is taken from WooCommerce for them (fix the source rows): ${conflicts.slice(0, 20).map((c) => c.text).join('; ')}${conflicts.length > 20 ? `; ... and ${conflicts.length - 20} more` : ''}`, undefined, conflicts.map((c) => c.text.split(':')[0]))
+  // Decide the conflicts AFTER the sources are merged: a woo-products conflict does not matter for a SKU the bound snapshot states (the snapshot's status stands). What is left is
+  // an ERROR for a catalogue simple/KIT/BOM product that therefore gets no status, and only a WARNING for a SKU that is no such product (nothing would have used it).
+  const conflicts = [...fromSnapshot.conflicts.map((c) => ({ key: c.key, text: `${c.text} (woo-product-status)` })), ...fromExport.conflicts.filter((c) => !fromSnapshot.status.has(c.key)).map((c) => ({ key: c.key, text: `${c.text} (woo-products)` }))]
+  const usesStatus = (key: string): boolean => {
+    const e = run.cat.get(key)
+    return e !== undefined && (e.type === 'SIMPLE' || e.type === 'KIT' || e.type === 'BOM') && e.parentSku === ''
+  }
+  const blocking = conflicts.filter((c) => usesStatus(c.key))
+  const harmless = conflicts.filter((c) => !usesStatus(c.key))
+  const list = (rows: typeof conflicts) => `${rows.slice(0, 20).map((c) => c.text).join('; ')}${rows.length > 20 ? `; ... and ${rows.length - 20} more` : ''}`
+  if (blocking.length > 0) run.find('ERROR', 'LIFECYCLE_WOO_STATUS_CONFLICT', `${blocking.length} product(s) appear more than once with different WooCommerce statuses and the bound snapshot does not state one, so their lifecycle cannot be decided and none is taken from WooCommerce for them (fix the source rows): ${list(blocking)}`, undefined, blocking.map((c) => c.text.split(':')[0]))
+  if (harmless.length > 0) run.find('WARNING', 'LIFECYCLE_WOO_STATUS_CONFLICT_UNUSED', `${harmless.length} SKU(s) appear more than once with different WooCommerce statuses, but none is a simple, KIT or BOM product of the catalogue, so no lifecycle depends on them: ${list(harmless)}`, undefined, harmless.map((c) => c.text.split(':')[0]))
   const conflicted = new Set<string>(conflicts.map((c) => c.key))
   const wooStatus = new Map<string, string>()
   const stated = (map: Map<string, string>) => [...map.values()].some((status) => status !== '')

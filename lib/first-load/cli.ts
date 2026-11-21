@@ -310,7 +310,7 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
     if (datasets[dataset] === undefined) return undefined
     const listed = manifest.inputs.filter((i) => i.dataset === dataset)
     if (listed.length !== 1 || listed[0].columnMap !== null) return { verified: false, problems: [`the ${dataset} dataset must be exactly one canonical file written by first-load:woo-snapshot (no column map, listed once)`] }
-    if (manifest.wooSnapshot === null) return { verified: false, problems: [`the manifest does not name wooSnapshot (the snapshot and provenance ${dataset}.csv was written with)`] }
+    if (manifest.wooSnapshot === null) return { verified: false, problems: [`the manifest does not name wooSnapshot (the snapshot and provenance that ${dataset}.csv was written with), so ${dataset}.csv cannot be verified`] }
     const verdict = verifyWooSnapshotBundle({
       snapshotBytes: readOrNull(manifest.wooSnapshot.snapshot),
       provenanceBytes: readOrNull(manifest.wooSnapshot.provenance),

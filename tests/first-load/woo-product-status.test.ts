@@ -10,7 +10,7 @@
  * The store is a local fake on 127.0.0.1 (nothing leaves loopback); every datum is synthetic. Mutations are listed in the PR.
  */
 import assert from 'node:assert/strict'
-import { chmodSync, cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, cpSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import path from 'node:path'
 import test, { after, before } from 'node:test'
@@ -19,7 +19,7 @@ import { EXIT_CODES, SNAPSHOT_EXIT_CODES, SNAPSHOT_FILE_NAMES } from '../../lib/
 import { parseSnapshotFile, renderProductStatusCsv, sha256Hex } from '../../lib/first-load/snapshot.ts'
 import { runSnapshotCli } from '../../lib/first-load/woo-snapshot/cli.ts'
 import { startFakeCatalogue, type FakeCatalogue, type FakeParent, type FakeProduct } from '../helpers/fake-woocommerce-catalogue.ts'
-import { ds, findingCodes, precondition, product, rowsOf, run } from './helpers.ts'
+import { ds, findingCodes, precondition, product, rowsOf, run, runBare } from './helpers.ts'
 
 const KEY = 'ck_test_readonly_key_0000'
 const SECRET = 'cs_test_readonly_secret_1111'
@@ -324,6 +324,8 @@ test('L2: a SKU repeated with conflicting statuses is refused (blocking, none ta
     // the lifecycle the refused SKU would have had is not taken: it is in no LIFECYCLE_TAKEN_FROM_WOO
     assert.ok(!r.report.findings.some((f) => f.code === 'LIFECYCLE_TAKEN_FROM_WOO' && f.keys?.includes('S-1')), dataset)
     assert.ok(r.report.findings.some((f) => f.code === 'LIFECYCLE_TAKEN_FROM_WOO' && f.keys?.includes('S-2')), `${dataset}: the non-conflicting SKU is still taken`)
+    // L4: a conflicted SKU is refused, not reported as absent from WooCommerce
+    assert.ok(!r.report.findings.find((f) => f.code === 'LIFECYCLE_NOT_FROM_WOO')?.keys?.includes('S-1'), `${dataset}: the conflicted SKU is not listed as absent`)
   }
 })
 
@@ -339,4 +341,118 @@ test('the bound woo-product-status wins over a woo-products row; LIFECYCLE_NOT_F
   const warning = r.report.findings.find((f) => f.code === 'LIFECYCLE_NOT_FROM_WOO')
   assert.deepEqual(warning?.keys, ['S-3'])
   assert.deepEqual(findingCodes(r, 'ERROR'), [])
+})
+
+// [mutation: conflicts are decided per dataset before the merge, so a woo-products conflict beats the snapshot's status or blocks for a non-catalogue SKU]
+test('M2: the conflict is decided after merging: ignored when the bound snapshot has the SKU, a WARNING for a SKU that is no catalogue simple/KIT/BOM, an ERROR only for a product left without a status', () => {
+  const dup = (sku: string) => [{ sku, status: 'publish' }, { sku, status: 'private' }]
+  const covered = run({
+    products: ds('products', [product('S-1', 'SIMPLE', { lifecycleStatus: 'ACTIVE' })]),
+    'woo-products': ds('woo-products', dup('S-1')),
+    'woo-product-status': ds('woo-product-status', [{ sku: 'S-1', status: 'draft' }]),
+  })
+  assert.deepEqual(findingCodes(covered).filter((c) => c.startsWith('LIFECYCLE_WOO_STATUS_CONFLICT')), [], 'the snapshot states the SKU: no conflict')
+  assert.equal(lifecycleOf(covered, 'S-1'), 'DRAFT', "the snapshot's status is not discarded")
+  assert.equal(covered.blocking, false)
+  const unused = run({
+    products: ds('products', [product('S-1', 'SIMPLE', { lifecycleStatus: 'ACTIVE' }), product('P-01', 'VARIANT'), product('X-1', 'SIMPLE')]),
+    'variant-parents': ds('variant-parents', [vp('P-01', 'P', 'publish', 'publish')]),
+    'woo-products': ds('woo-products', [...dup('P-01'), { sku: 'S-1', status: 'publish' }, { sku: 'X-1', status: 'publish' }]),
+  })
+  const warn = unused.report.findings.find((f) => f.code === 'LIFECYCLE_WOO_STATUS_CONFLICT_UNUSED')
+  assert.equal(warn?.severity, 'WARNING')
+  assert.deepEqual(warn?.keys, ['P-01'])
+  assert.ok(!findingCodes(unused, 'ERROR').includes('LIFECYCLE_WOO_STATUS_CONFLICT'))
+  assert.equal(unused.blocking, false)
+  const blocked = run({ products: ds('products', [product('S-1', 'SIMPLE')]), 'woo-products': ds('woo-products', dup('S-1')) })
+  assert.equal(blocked.report.findings.find((f) => f.code === 'LIFECYCLE_WOO_STATUS_CONFLICT')?.severity, 'ERROR')
+  assert.equal(blocked.blocking, true)
+})
+
+// [mutation: the sha comparison of the bytes read against the bytes verified is dropped in loadProductStatus]
+test('M3: prepare refuses woo-product-status whose bytes are not the ones the binding verified, and one with no or an unverified binding', () => {
+  const datasets = { products: ds('products', [product('S-1', 'SIMPLE', { lifecycleStatus: 'ACTIVE' })]), 'woo-product-status': ds('woo-product-status', [{ sku: 'S-1', status: 'private' }]) }
+  const sha = datasets['woo-product-status'].parts[0].sha256
+  const good = runBare(datasets, {}, undefined, { verified: true, csvSha256: sha, snapshotPayloadSha256: 'x' })
+  assert.equal(lifecycleOf(good, 'S-1'), 'DRAFT', 'control: the matching binding is accepted')
+  const cases: Array<[string, Parameters<typeof runBare>[3], RegExp]> = [
+    ['bytes differ from the verified ones', { verified: true, csvSha256: 'b'.repeat(64), snapshotPayloadSha256: 'x' }, /bytes read are not the bytes that were verified/],
+    ['binding unverified', { verified: false, problems: ['a problem named by the verifier'] }, /a problem named by the verifier/],
+    ['no binding at all', undefined, /no proof was given/],
+  ]
+  for (const [label, binding, pattern] of cases) {
+    const r = runBare(datasets, {}, undefined, binding)
+    const finding = r.report.findings.find((f) => f.code === 'PRODUCT_STATUS_NOT_BOUND')
+    assert.equal(finding?.severity, 'ERROR', label)
+    assert.match(finding?.message ?? '', pattern, label)
+    assert.equal(r.blocking, true, label)
+    assert.equal(r.report.wooProductStatus.bound, false, label)
+  }
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------
+// H1: stock moves between the walks
+// ---------------------------------------------------------------------------------------------------------------------------------------------------
+
+async function walkWith(intercept: NonNullable<Parameters<typeof startFakeCatalogue>[0]['intercept']>): Promise<{ code: number; stderr: string; out: string; rounds: number | null; stock: number | null | undefined }> {
+  const server = await startFakeCatalogue({ key: KEY, secret: SECRET, parents: PARENTS, products: OTHERS, intercept })
+  try {
+    const envFile = fresh('creds')
+    writeFileSync(envFile, `FIRST_LOAD_WOO_URL=${server.url}\nFIRST_LOAD_WOO_KEY=${KEY}\nFIRST_LOAD_WOO_SECRET=${SECRET}\n`, { mode: 0o600 })
+    chmodSync(envFile, 0o600)
+    const out = fresh('bundle')
+    let stderr = ''
+    const code = await runSnapshotCli(['--env-file', envFile, '--out', out, '--allow-origin', server.origin, '--min-interval-ms', '0'], { stdout: () => {}, stderr: (x) => (stderr += x) })
+    let rounds: number | null = null
+    let stock: number | null | undefined
+    if (code === 0) {
+      rounds = JSON.parse(readFileSync(file(out, SNAPSHOT_FILE_NAMES.provenance), 'utf8')).verificationRounds
+      const parsed = parseSnapshotFile(readFileSync(file(out, SNAPSHOT_FILE_NAMES.snapshot), 'utf8'))
+      if (parsed.ok) stock = parsed.payload.products.find((p) => p.id === 201)?.stockQuantity
+    }
+    return { code, stderr, out, rounds, stock }
+  } finally { await server.close() }
+}
+const mutateRows = (change: (row: Record<string, unknown>) => void) => (c: { probe: boolean; route: string; attempt: number }, res: { status: number; headers: Record<string, string>; body: unknown }) => {
+  if (c.probe || c.route !== 'products' || c.attempt % 2 !== 0) return res
+  return { ...res, body: (res.body as Array<Record<string, unknown>>).map((row) => { const copy = { ...row }; change(copy); return copy }) }
+}
+
+// [mutation: the walks are compared by the full payload hash, stock included]
+test('H1: stock that changes between the two walks does not fail the walk; the file keeps the FIRST walk\'s figures', async (t) => {
+  const r = await walkWith(mutateRows((row) => { if (row.id === 201) row.stock_quantity = 99; if (row.id === 203) row.manage_stock = false }))
+  precondition(t, 'walk exit', r.code === 0 ? 1 : 0)
+  assert.equal(r.code, SNAPSHOT_EXIT_CODES.OK, r.stderr)
+  assert.equal(r.rounds, 1, 'verified in the first round')
+  assert.equal(r.stock, 7, "walk A's stock (7), not walk B's (99)")
+})
+
+// [mutation: the stock-free comparison also ignores status]
+test('H1: a status change between the two walks still fails the walk (every round differs: nothing is written)', async (t) => {
+  const r = await walkWith(mutateRows((row) => { if (row.id === 202) row.status = 'publish' }))
+  precondition(t, 'walk exit', r.code)
+  assert.equal(r.code, SNAPSHOT_EXIT_CODES.INCONSISTENT, r.stderr)
+  assert.match(r.stderr, /two complete walks read different catalogues/)
+  assert.equal(existsSync(r.out), false)
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------
+// L3 / L8: the probes and the requested fields
+// ---------------------------------------------------------------------------------------------------------------------------------------------------
+
+// [mutation: the all-products probe is dropped, or _fields removes a field the payload uses]
+test('L3/L8: every status is asked for by name for ALL products (no type filter) and for the variable ones, with _fields=id; the list asks only for the fields the payload uses', async (t) => {
+  const b = await bundle()
+  const probes = b.requests.filter((q) => q.path.endsWith('/products') && q.query.status !== 'any' && q.query.status !== undefined)
+  precondition(t, 'status probes on /products', probes.length)
+  for (const status of ['publish', 'draft', 'private', 'pending']) {
+    assert.ok(probes.some((q) => q.query.status === status && q.query.type === undefined && q.query.per_page === '1'), `all-products probe for ${status}`)
+    assert.ok(probes.some((q) => q.query.status === status && q.query.type === 'variable' && q.query.per_page === '1'), `variable probe for ${status}`)
+  }
+  assert.ok(probes.every((q) => q.query._fields === 'id'))
+  const lists = b.requests.filter((q) => q.path.endsWith('/products') && q.query.status === 'any')
+  precondition(t, 'list pages', lists.length)
+  for (const field of ['id', 'sku', 'name', 'type', 'status', 'manage_stock', 'stock_quantity', 'variations']) assert.ok(lists.every((q) => (q.query._fields ?? '').split(',').includes(field)), field)
+  const varPages = b.requests.filter((q) => /\/variations$/.test(q.path) && q.query.status === 'any')
+  for (const field of ['id', 'sku', 'status', 'attributes']) assert.ok(varPages.every((q) => (q.query._fields ?? '').split(',').includes(field)), `variation ${field}`)
 })

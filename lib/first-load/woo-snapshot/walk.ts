@@ -15,7 +15,7 @@
  *   - a store that changes while it is being walked (its total moves between pages) is an error;
  *   - the walk is RESUMABLE: after every page the state is handed to `onProgress`, and a later run given that state continues after the last whole page.
  */
-import { SNAPSHOT_STATUSES, SNAPSHOT_FORMAT_VERSION, payloadSha256, reduceParent, reduceProduct, reduceVariation, snapshotProblems, normalizePayload, type SnapshotParent, type SnapshotPayload, type SnapshotProduct, type SnapshotVariation } from '../snapshot'
+import { SNAPSHOT_STATUSES, SNAPSHOT_FORMAT_VERSION, comparisonSha256, reduceParent, reduceProduct, reduceVariation, snapshotProblems, normalizePayload, type SnapshotParent, type SnapshotPayload, type SnapshotProduct, type SnapshotVariation } from '../snapshot'
 
 export const WALK_PAGE_SIZE = 100
 /** Attempts per request, including the first. */
@@ -38,6 +38,9 @@ export const WALK_MAX_ROUNDS = 3
 export const WALK_STATUSES = SNAPSHOT_STATUSES
 export type WalkStatus = (typeof WALK_STATUSES)[number]
 export type StatusTotals = Record<WalkStatus, number>
+/** Only the fields the payload uses are asked for, to keep the load on a live store small (the count probes ask for `id` alone: only their X-WP-Total matters). */
+const PRODUCT_FIELDS = 'id,sku,name,type,status,manage_stock,stock_quantity,variations'
+const VARIATION_FIELDS = 'id,parent_id,sku,status,attributes'
 const VARIATION_ORDER = { orderby: 'id', order: 'asc' }
 const emptyStatusTotals = (): StatusTotals => ({ publish: 0, draft: 0, private: 0, pending: 0 })
 
@@ -180,7 +183,7 @@ async function walkOnce(state: WalkState, deps: WalkDeps, clock: Clock): Promise
     for (const status of WALK_STATUSES) {
       let res: PageResult
       try {
-        res = await get(path, { ...base, status, per_page: '1', page: '1' })
+        res = await get(path, { ...base, status, per_page: '1', page: '1', _fields: 'id' })
       } catch (error) {
         // A product listed a moment ago that no longer exists: the store changed under the walk.
         if (error instanceof SnapshotFetchError && /HTTP 404/.test(error.message)) throw new SnapshotChangedError(`${what}: the product was listed but no longer exists: the store changed during the walk`)
@@ -201,11 +204,11 @@ async function walkOnce(state: WalkState, deps: WalkDeps, clock: Clock): Promise
     return totals
   }
   const assertKnownStatus = (what: string, status: string) => {
-    if (!(WALK_STATUSES as readonly string[]).includes(status)) throw new SnapshotInconsistentError(`${what} has the status "${status}", which the snapshot cannot enumerate (it covers ${WALK_STATUSES.join(', ')}): refusing`)
+    if (!(WALK_STATUSES as readonly string[]).includes(status)) throw new SnapshotInconsistentError(`${what} has the status "${status}", which the snapshot cannot enumerate (it covers ${WALK_STATUSES.join(', ')}): refusing. A scheduled (future) product must be unscheduled, or the run repeated once it has published`)
   }
 
   // ----- every product (any type) -----
-  const productParams = (page: number): Record<string, string> => ({ status: 'any', per_page: String(WALK_PAGE_SIZE), page: String(page), orderby: 'id', order: 'asc' })
+  const productParams = (page: number): Record<string, string> => ({ status: 'any', per_page: String(WALK_PAGE_SIZE), page: String(page), orderby: 'id', order: 'asc', _fields: PRODUCT_FIELDS })
   state.products ??= { total: -1, totalPages: -1, pagesDone: 0, rows: [], variable: [] }
   const products = state.products
   while (products.totalPages < 0 || products.pagesDone < products.totalPages) {
@@ -267,7 +270,7 @@ async function walkOnce(state: WalkState, deps: WalkDeps, clock: Clock): Promise
       variationRequests++
       let res: PageResult
       try {
-        res = await get(`/products/${parent.id}/variations`, { status: 'any', per_page: String(WALK_PAGE_SIZE), page: String(page), orderby: 'id', order: 'asc' })
+        res = await get(`/products/${parent.id}/variations`, { status: 'any', per_page: String(WALK_PAGE_SIZE), page: String(page), orderby: 'id', order: 'asc', _fields: VARIATION_FIELDS })
       } catch (error) {
         // A product listed a moment ago that no longer exists: the store changed under the walk.
         if (error instanceof SnapshotFetchError && /HTTP 404/.test(error.message)) throw new SnapshotChangedError(`product ${parent.id} was listed but no longer exists: the store changed during the walk`)
@@ -338,8 +341,8 @@ export async function walkStore(state: WalkState, deps: WalkDeps): Promise<WalkR
       const second = freshState(state.origin)
       const b = await walkOnce(second, { ...deps, onProgress: undefined }, clock)
       requests += a.requests + b.requests
-      if (payloadSha256(a.payload) === payloadSha256(b.payload)) return { ...a, requests, verificationRounds: round }
-      last = 'two complete walks read different catalogues'
+      if (comparisonSha256(a.payload) === comparisonSha256(b.payload)) return { ...a, requests, verificationRounds: round }
+      last = 'two complete walks read different catalogues (stock figures are not compared: they move while the store trades)'
     } catch (error) {
       if (!(error instanceof SnapshotChangedError)) throw error
       last = error.message
