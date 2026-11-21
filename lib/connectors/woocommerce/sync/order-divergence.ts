@@ -311,11 +311,19 @@ export const RECHECK_MAX_AGE_DAYS = 14
 export const RECHECK_PER_RUN = 25
 /** Failed live reads (error, timeout, hang) a row survives. They do NOT count as attempts (an attempt is a read that returned an order); at this many the row is dropped and a refused action says the comparison was lost. */
 export const RECHECK_MAX_FAILED_READS = 48
-/** A row is dropped at the failed-read cap only once it has also been deferred this long: reads that fail FAST (a 401, a refused connection) reach 48 within about two days of a 15-minute poll, which is not a lost comparison yet. The age cap still applies. */
+/** A row is dropped at the failed-read cap only once it has also been waiting this long, MEASURED FROM WHEN THE COMPARISON WAS FIRST DEFERRED (`deferredAt`), not from the first failed read: reads that fail FAST (a 401, a refused connection) reach 48 within about two days of a 15-minute poll, which is not a lost comparison yet. The age cap still applies. */
 export const RECHECK_MIN_AGE_AT_FAILED_CAP_HOURS = 72
 /** One drain's wall-clock budget, kept well under the deployed proxy's 60 s read timeout, and the longest one live read may take. The drain stops starting reads once a whole read no longer fits. */
 export const RECHECK_BUDGET_MS = 25_000
 export const RECHECK_READ_TIMEOUT_MS = 8_000
+
+/** The warning a failed drain puts on the sweep's result (and so on the cron outcome). */
+export const DRAIN_FAILED_WARNING = 'The drain of deferred WooCommerce order comparisons failed (see the server log); the rows stay for the next run.'
+
+/** Report a drain's own failure on the sweep result: a warning (the run's work committed), which the wc-reconcile cron outcome reads as a failed run so it reaches alerting (o3d-0ged2 LOW 3). */
+export function noteDrainOutcome(result: { warnings?: string[] }, drained: { failed?: boolean }): void {
+  if (drained.failed) (result.warnings ??= []).push(DRAIN_FAILED_WARNING)
+}
 
 export const divergenceSeams: { readLiveOrder?: (externalOrderId: string, signal?: AbortSignal) => Promise<WcFullOrder | null> } = {}
 
@@ -390,6 +398,10 @@ export async function drainDeferredWcOrderDivergences(
   try {
     // SINGLE FLIGHT: the cron sweep and a manual reconcile (or two overlapping sweeps) must not both read the same rows. A try-lock on one idle connection held across the drain (the amendment lock's accepted shape); a drain
     // that does not get it does nothing. The transaction's own timeout is the budget plus a long margin for the comparison and write steps of the last row.
+    // KNOWN LIMIT (o3d-0ged2 LOW 9, accepted and documented, not changed): the transaction holds one idle-in-transaction connection for the whole drain (about the budget, ~25 s, usually far less), and a drain that outlasts Prisma's
+    // interactive-transaction timeout (budget + 120 s) loses the lock while the work may still be running, so a second drain could overlap it. The overlap is harmless to the data (a row is re-read live and compared again; the comparison
+    // and the write step are idempotent, claim-guarded and bounded), it only repeats a few WooCommerce reads. A SESSION try-lock on the pinned lock pool (lib/db/pinned-advisory-lock.ts) would hold no transaction and could not lapse
+    // at the timeout; it was not done here because it changes the lock's class in the advisory-lock registry and tests, and the drain would then need the pool's lost-lock handling on every row, for a few repeated reads.
     await db.$transaction(async (tx) => {
       const [{ locked }] = await tx.$queryRaw<Array<{ locked: boolean }>>`SELECT pg_try_advisory_xact_lock(${WC_DIVERGENCE_DRAIN_LOCK_NAMESPACE}::int, 0) AS locked`
       if (!locked) {
@@ -534,11 +546,11 @@ export async function surfaceWcOrderDivergence(orderId: string, wcOrder: WcFullO
     // The write step asks for a live re-read when it could not decide (warehouse unreadable, two deliveries in one second): the same bounded recheck row the deferred comparisons use, keeping the attempts and age already spent.
     const runStep = async (differences: ReadonlyArray<DivergenceDifference>, fingerprint: string) => {
       const outcome = await applyWcOrderAmendment(orderId, wcOrder, differences, fingerprint, undefined, { sameSecondConflict })
-      if (!(outcome.kind === 'skipped' && outcome.retry)) {
+      if (!((outcome.kind === 'skipped' || outcome.kind === 'applied') && outcome.retry)) {
         // The step decided (or is off): an "ran out of rechecks" refusal raised earlier for this order has been overtaken.
         await resolveRefusedActions(db, { entityType: REFUSED_ACTION_ENTITY_SALES_ORDER, entityId: orderId, action: 'WC_ORDER_AMENDMENT', gate: WC_AMENDMENT_RECHECK_GATE }, 'NO_LONGER_NEEDED').catch(() => undefined)
       }
-      if (outcome.kind === 'skipped' && outcome.retry) {
+      if ((outcome.kind === 'skipped' || outcome.kind === 'applied') && outcome.retry) {
         await db.wcOrderDivergenceRecheck.upsert({ where: { orderId }, create: { orderId, externalOrderId: String(wcOrder.id), fromRetry: true, attempts: priorRecheck?.attempts ?? 0, ...(priorRecheck ? { deferredAt: priorRecheck.deferredAt } : {}) }, update: { fromRetry: true } }).catch(() => undefined)
       }
     }

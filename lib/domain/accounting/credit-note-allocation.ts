@@ -54,6 +54,10 @@ export type CreditNoteSettlementFacts = {
     /** A refund the shop raised (and its gateway paid back): there is no Payment row to find. */
     shopRefund: boolean
     createdAt: Date
+    /** o3d-k26m.17: issued as store credit (SalesOrderRefund.storeCreditRefund). Its credit note is never settled: the liability true-up nets it off 813. Absent = false. */
+    storeCreditRefund?: boolean
+    /** o3d-k26m.17: what the storefront refund paid out when its credit note credits more (the EAS fee gap); a gateway refund payment is held to it. Absent / null = no gap. */
+    storefrontAmountForeign?: Decimal | null
   }
   order: {
     id: string
@@ -100,6 +104,7 @@ export type CreditNoteNotNowReason =
   | 'REFUND_NOT_PAID_BY_GATEWAY'
   | 'REFUND_CASH_UNKNOWN'
   | 'NO_RECEIPT_CAPACITY'
+  | 'STORE_CREDIT_REFUND'
 
 /** The reasons that need an OPERATOR (the sweep says so once); the others resolve themselves when IMS's reading changes. */
 export const OPERATOR_ATTENTION_REASONS: ReadonlySet<CreditNoteNotNowReason> = new Set(['REFUND_NOT_PAID_BY_GATEWAY', 'REFUND_CASH_UNKNOWN', 'NO_RECEIPT_CAPACITY'])
@@ -129,6 +134,10 @@ export function planCreditNoteSettlement(facts: CreditNoteSettlementFacts): Cred
   const notNow = (reason: CreditNoteNotNowReason, message: string): CreditNoteSettlementPlan => ({ kind: 'NOT_NOW', reason, message })
   if (facts.refund.deleted) return notNow('REFUND_DELETED', 'the refund was deleted in IMS, so its credit note is being voided, not settled')
   if (facts.siblingSettled) return notNow('ALREADY_SETTLED', 'another settlement row for this refund has already posted')
+  // o3d-k26m.17 (rule 6): a store-credit refund's credit note stays UNALLOCATED and is never paid out. The credit is owed to the customer, and the liability
+  // true-up nets exactly those open credit notes off 813 by order. Allocating it to an invoice that merely LOOKS unpaid (a card receipt reconciled from the
+  // bank feed later) closed the invoice against the credit and counted it twice (172934, 173814). Nothing for an operator to do, so not an attention reason.
+  if (facts.refund.storeCreditRefund === true) return notNow('STORE_CREDIT_REFUND', 'the refund was issued as store credit, so its credit note stays open in Xero (the liability true-up nets it off 813); it is neither allocated nor paid out')
   if (!facts.refund.creditNoteId || !facts.creditNotePosted) {
     return notNow('CREDIT_NOTE_NOT_POSTED', 'the credit note is not posted to Xero yet')
   }
@@ -143,7 +152,9 @@ export function planCreditNoteSettlement(facts: CreditNoteSettlementFacts): Cred
   const needsCapacity = (): CreditNoteSettlementPlan | null => (cap.gt(0) ? null : notNow('NO_RECEIPT_CAPACITY', 'IMS has no receipt recorded for this order that is not already refunded, so there is nothing a refund payment could return'))
   if (facts.recordedRefundCash.gt(0)) return needsCapacity() ?? { kind: 'REFUND_PAYMENT', cashEvidence: 'RECORDED', recordedAmount: facts.recordedRefundCash, cap }
   if (facts.refund.shopRefund) {
-    if (facts.refundedViaGateway === true) return needsCapacity() ?? { kind: 'REFUND_PAYMENT', cashEvidence: 'GATEWAY', recordedAmount: null, cap }
+    // o3d-k26m.17 (rule 1): the EAS fee gap. The credit note credits the fee as well, but the gateway paid back only the storefront amount, so the payment
+    // is held to it; the fee's own repayment is applied to the credit note by hand.
+    if (facts.refundedViaGateway === true) return needsCapacity() ?? { kind: 'REFUND_PAYMENT', cashEvidence: 'GATEWAY', recordedAmount: facts.refund.storefrontAmountForeign ?? null, cap }
     if (facts.refundedViaGateway === false) return notNow('REFUND_NOT_PAID_BY_GATEWAY', 'WooCommerce records this refund as made manually (a store-credit coupon or a payment outside the gateway), so no money left the bank account and no bank refund is posted; the credit note stays open in Xero as the customer\'s credit')
     return notNow('REFUND_CASH_UNKNOWN', 'this refund was recorded before IMS kept whether WooCommerce paid it back through the gateway, so IMS cannot tell whether cash left the bank and posts no bank refund')
   }
@@ -192,7 +203,7 @@ export async function readCreditNoteSettlementFacts(
     where: { id: refundId },
     select: {
       id: true, orderId: true, deletedAt: true, accountingCreditNoteId: true, accountingCreditNoteConnector: true,
-      externalRefundId: true, refundedViaGateway: true, createdAt: true,
+      externalRefundId: true, refundedViaGateway: true, createdAt: true, storeCreditRefund: true, storefrontAmountForeign: true,
     },
   })
   if (!refund) return null
@@ -288,6 +299,8 @@ export async function readCreditNoteSettlementFacts(
       creditNoteConnector: refund.accountingCreditNoteConnector,
       shopRefund: refund.externalRefundId !== null,
       createdAt: refund.createdAt,
+      storeCreditRefund: refund.storeCreditRefund === true,
+      storefrontAmountForeign: refund.storefrontAmountForeign == null ? null : toDecimal(refund.storefrontAmountForeign),
     },
     order: {
       id: order.id,

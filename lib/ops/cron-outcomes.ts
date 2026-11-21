@@ -39,6 +39,12 @@ import { counts, from, enumResult, noFailureSignal, num, permanentLists, structu
 import { mintsoftCronOutcomes as warehouseConnectorCronOutcomes } from '@/lib/connectors/mintsoft/cron-outcomes' // wms-connector-boundary-ok: 2026-11-13: the registry spreads the connector's own entries
 import type { CronOutcomeClass } from './cron-run'
 
+/** The order sweep's post-commit warnings (a failed drain of deferred comparisons): any is a failed run, so the failure reaches the cron outcome and alerting rather than only the server log. */
+function wcReconcileOrderWarnings(r: WcReconcileResult | Skip): CronOutcomeClass | null {
+  if (!('orders' in r) || !r.orders || !('warnings' in r.orders)) return null
+  return Array.isArray(r.orders.warnings) && r.orders.warnings.length > 0 ? 'failed' : null
+}
+
 /** A merge-hold failure carried on a WMS sweep result: the maintenance threw, or a hold could not be placed. */
 function mergeHoldFailure(r: { mergeHoldMaintenance?: unknown; mergeCandidateDetection?: { detection: string } }): CronOutcomeClass | null {
   return r.mergeHoldMaintenance || r.mergeCandidateDetection?.detection === 'holds-failed' ? 'failed' : null
@@ -210,8 +216,9 @@ export const cronOutcomes = {
   // error texts and lists in each section (orders, products, stock, queued pushes); held pushes are recognised by their text;
   // productPushRetrySweep.error (the product-push retry sweep threw); refundStockCorrections.error (the queueing of open refund stock corrections threw); products.permanentErrors: permanent import conflicts, reported apart from errors and never cleared without an operator
   // heldSalesInvoices.readError: the held-invoice release sweep could not read its queue or the orders behind it (a database read: never held)
+  // orders.warnings: things that went wrong AFTER the order sweep's work committed (the drain of deferred order comparisons failed): the cursor is safe, but the failure is real and must reach alerting, so a non-empty list is a failed run (o3d-0ged2 LOW 3)
   'wc-reconcile': (r: WcReconcileResult | Skip) =>
-    from(r, structural(r), permanentLists(r, ['permanentErrors']), 'heldSalesInvoices' in r && r.heldSalesInvoices?.readError ? 'failed' : null),
+    from(r, structural(r), permanentLists(r, ['permanentErrors']), 'heldSalesInvoices' in r && r.heldSalesInvoices?.readError ? 'failed' : null, wcReconcileOrderWarnings(r)),
   // the withdrawal and screening failures throw; errors: string[] from the erasure sweep; admissionRefusals.failed: number (the by-id read or the import failed)
   'wc-withdrawal-sweep': (r: WcWithdrawalSweepCronResult | Skip) => from(r, structural(r), counts(r, ['failed'])),
   // failed, deadLettered and shadowUnrecorded (a held create whose only record could not be written): numbers, with outboundHeld (held pushes, also in failed) subtracted;

@@ -131,6 +131,7 @@ import {
   type RefundAccountingSyncRequest,
   type RefundCreationConflict,
   type RefundExpectedTaxIdentity,
+  type RefundParityFacts,
   type RefundRequestLine,
 } from '@/lib/domain/sales/refund-service'
 import {
@@ -3596,6 +3597,8 @@ export async function createRefund(
     statedGrossForeign?: number
     /** WooCommerce `refunded_payment` of a storefront refund (see SalesOrderRefund.refundedViaGateway). Internal callers only. */
     refundedViaGateway?: boolean
+    /** o3d-k26m.17: what the storefront refund sync established under `wc_refund_credit_note_parity_enabled` (store credit, the EAS fee gap). Internal callers only. */
+    refundParity?: RefundParityFacts
     /** IOSS credit notes, rate 182: the tax the WooCommerce refund states across all its rate ids. Internal callers only; recorded only while the Sales Invoices switch is on and the order is on an EU scheme. */
     eas182StatedTaxForeign?: number
     /** The structured return reason (a configured ReturnReason id), one per refund. Optional. An unknown or inactive id is refused for an operator and ignored for an internal caller (which resolves it itself). */
@@ -3737,6 +3740,7 @@ export async function createRefund(
       maxRefundedQtyByLines: isInternal ? options?.maxRefundedQtyByLines : undefined,
       wcAmendment: isInternal ? options?.wcAmendment === true : undefined,
       ...(isInternal && typeof options?.refundedViaGateway === 'boolean' ? { refundedViaGateway: options.refundedViaGateway } : {}),
+      ...(isInternal && options?.refundParity ? { refundParity: options.refundParity } : {}),
       // o3d-w00 (Codex r4 #2): like enforcePerTargetBalances this is a tightening, but a forged EMPTY
       // list from a public caller would switch the fence off for the hand-recording path, so it is read
       // only from an internal caller.

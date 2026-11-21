@@ -109,7 +109,7 @@ async function setSetting(d: Deps, key: string, value: string | null) {
 }
 
 type Seed = { orderId: string; refundId: string; invoiceId: string; creditNoteId: string; tag: string }
-async function seed(d: Deps, opts: { paid: boolean; shopRefund: boolean; gateway?: boolean | null; receipt?: number; currency?: string; fxRateToBase?: number }): Promise<Seed> {
+async function seed(d: Deps, opts: { paid: boolean; shopRefund: boolean; gateway?: boolean | null; receipt?: number; currency?: string; fxRateToBase?: number; refund?: Record<string, unknown> }): Promise<Seed> {
   const tag = `cna${randomUUID().slice(0, 8)}`
   const currency = opts.currency ?? 'GBP'
   const invoiceId = `inv-${tag}`
@@ -128,6 +128,7 @@ async function seed(d: Deps, opts: { paid: boolean; shopRefund: boolean; gateway
       orderId: order.id, totalForeign: 20, totalBase: 20, accountingCreditNoteId: creditNoteId, accountingCreditNoteConnector: 'xero',
       externalRefundId: opts.shopRefund ? Math.floor(Math.random() * 1_000_000_000) + 1 : null,
       refundedViaGateway: opts.shopRefund ? (opts.gateway === undefined ? true : opts.gateway) : null,
+      ...(opts.refund ?? {}),
     } as never,
     select: { id: true },
   })
@@ -501,4 +502,34 @@ test('[db] a retry replays the pinned account and rate: a payment map changed af
   const accounts = refunds.map((r) => r.accountId)
   assert.ok(accounts.length >= 1)
   assert.ok(accounts.every((a) => a === account.externalAccountId), 'every attempt used the pinned account')
+})
+
+// o3d-k26m.17 (rule 6): a store-credit refund's credit note stays UNALLOCATED, even on an invoice that looks unpaid (172934, 173814: Xeroom allocated those).
+test('[db] a STORE-CREDIT refund on an UNPAID invoice is neither allocated nor paid out, and no operator is asked to act: the true-up nets it off 813', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  await setSetting(d, FLAG, 'true')
+  const s = await seed(d, { paid: false, shopRefund: true, gateway: false, refund: { storeCreditRefund: true, creditNoteNumber: 'SC-172934' } })
+  t.after(async () => { await setSetting(d, FLAG, null); await cleanup(d, s) })
+  await d.processor.reenqueueMissingCreditNoteAllocations()
+  await d.processor.processPendingXeroSync()
+  assert.equal((await settlementRows(d, s)).length, 0, 'nothing queued')
+  assert.equal(allocations.length + refunds.length, 0, 'not allocated to the invoice, not paid out')
+  assert.equal(await d.db.activityLog.count({ where: { entityId: s.refundId, action: 'credit_note_settlement_needs_operator' } }), 0, 'nothing for an operator to do')
+})
+
+// o3d-k26m.17 (rule 1): the EAS fee gap. The credit note credits 20.86 (the fee included) but the gateway paid back 17.86: the bank refund is held to 17.86.
+test('[db] an EAS fee-gap refund pays out only what the storefront refund paid back; the fee stays as credit on the note for its repayment', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  await setSetting(d, FLAG, 'true')
+  await withGbpBank(d, t)
+  const s = await seed(d, { paid: true, shopRefund: true, gateway: true, refund: { easFeeGapForeign: 3, storefrontAmountForeign: 17.86 } })
+  t.after(async () => { await setSetting(d, FLAG, null); await cleanup(d, s) })
+  ledger = { ...freshLedger(), total: 20.86, remaining: 20.86, amountDue: 0 }
+  await d.processor.reenqueueMissingCreditNoteAllocations()
+  await d.processor.processPendingXeroSync()
+  assert.equal(refunds.length, 1)
+  assert.equal(refunds[0]!.amount, 17.86, 'held to the storefront amount, not the 20.86 credit')
+  assert.equal(allocations.length, 0)
 })

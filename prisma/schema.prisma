@@ -2585,6 +2585,17 @@ model SalesOrderRefund {
   /// FALSE for "refund manually" (a store-credit coupon, a payment made outside the gateway). NULL: unknown (every refund written before this column, and every
   /// non-storefront refund). Only TRUE counts as cash for the Xero credit-note settlement; NULL and FALSE never post a bank refund payment.
   refundedViaGateway Boolean? @map("refunded_via_gateway")
+  /// o3d-k26m.17 (switch `wc_refund_credit_note_parity_enabled`): the storefront refund was issued as STORE CREDIT by the o3d-store-credit-refund plugin (its refund carries
+  /// `_o3d_scr_attempt` and was not paid back through the gateway). Its credit note is numbered SC-<WooCommerce refund id> and is never allocated to the invoice:
+  /// the liability true-up nets it off 813 by order. FALSE for every other refund and every row written before the column.
+  storeCreditRefund Boolean @default(false) @map("store_credit_refund")
+  /// o3d-k26m.17: the landed-cost fee (gross) this refund's credit note credits BEYOND what the storefront refund paid out, because EAS re-priced the refund
+  /// and left the fee out of its amount while the fee items stayed on it. The fee's repayment arrives separately and is applied to this credit note by hand.
+  /// NULL: no such gap (every other refund, and every row written before the column).
+  easFeeGapForeign Decimal? @db.Decimal(18, 4) @map("eas_fee_gap_foreign")
+  /// o3d-k26m.17: what the storefront refund actually paid out (the WooCommerce `amount`), recorded only when the credit note credits more (the fee gap above).
+  /// A gateway refund payment against the credit note is held to this. NULL otherwise.
+  storefrontAmountForeign Decimal? @db.Decimal(18, 4) @map("storefront_amount_foreign")
   /// A storefront refund that returns quantity owes the storefront a stock correction (the store raised its own
   /// stock for it before IMS heard). Written TRUE in the refund's own transaction, so a refund can never commit
   /// without the obligation; FALSE for every other refund (manual, money-only, chargeback) and every row that
