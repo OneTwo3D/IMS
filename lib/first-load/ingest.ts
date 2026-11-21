@@ -909,6 +909,7 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
   const notes: Array<{ line: number; code: string; reason: string }> = []
   const kindFromDecision = new Map<number, string>()
   const nonStockConflicts = new Map<number, string>()
+  const nonStockQtyNotes = new Map<number, { line: number; code: string; reason: string }>()
   const ghostLines = new Set<number>()
   const quantityOf = (cells: string[]): string => {
     const at = totalIndex.get('qty') ?? ghostQtyIndex
@@ -938,13 +939,13 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
         // The decision fills a kind the source does not state (blank or Unknown) or confirms a non-inventory one. A source that STATES a stock-bearing
         // (or any other) kind contradicts the decision: the row is refused, never overwritten (a SKU wrongly listed would lose its stock silently).
         const stated = clean(record.cells[nonStockIndex])
-        const statedType = (mapping.valueMaps.type ?? {})[stated]
-        if (stated === '' || stated.toLowerCase() === 'unknown' || statedType === 'NON_INVENTORY' || stated === mapping.nonStock.value) {
+        const statedType = Object.entries(mapping.valueMaps.type ?? {}).find(([k]) => k.toLowerCase() === stated.toLowerCase())?.[1]
+        if (stated === '' || stated.toLowerCase() === 'unknown' || statedType === 'NON_INVENTORY' || stated.toLowerCase() === mapping.nonStock.value.toLowerCase() || stated.toLowerCase() === 'non-inventory') {
           const qtyAt = totalIndex.get('qty') ?? indexOf.get('qty') ?? ghostQtyIndex
           const raw = qtyAt !== undefined && qtyAt >= 0 ? clean(record.cells[qtyAt]) : ''
           const parsedQty = raw === '' ? null : parseDecimal(raw, 'qty', { maxIntDigits: 12, maxDp: 6 }, { allowNegative: true })
           if (parsedQty !== null && !(parsedQty.ok && parsedQty.value.isZero())) {
-            notes.push({ line: record.line, code: 'NON_STOCK_QTY_IGNORED', reason: `SKU ${clean(record.cells[skuAt])} line ${record.line} is non-stock by the owner's decision but states a quantity of ${raw}: it is ignored, not loaded` })
+            nonStockQtyNotes.set(record.line, { line: record.line, code: 'NON_STOCK_QTY_IGNORED', reason: `SKU ${clean(record.cells[skuAt])} line ${record.line} is non-stock by the owner's decision but states a quantity of ${raw}: it is ignored, not loaded` })
           }
           record.cells[nonStockIndex] = mapping.nonStock.value
         } else {
@@ -1023,7 +1024,9 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
       continue
     }
     const conflict = nonStockConflicts.get(record.line)
-    if (conflict !== undefined) {
+    // A row a ghost drop or ANOTHER selector skips (for example State Deleted) is not a row of this dataset: it is not refused for the decision. The kind selector itself is not
+    // consulted (a stated kit would be skipped by it, which is the contradiction being refused).
+    if (conflict !== undefined && !ghostLines.has(record.line) && !(mapping?.rowSelect ?? []).some((selector, i) => selectIndexes[i]! >= 0 && selectIndexes[i] !== nonStockIndex && selector.skip.includes(clean(record.cells[selectIndexes[i]!])))) {
       rejected.push({ line: record.line, code: 'NON_STOCK_DECISION_CONFLICT', reason: conflict })
       continue
     }
@@ -1097,6 +1100,8 @@ export function ingestDataset(dataset: DatasetName, bytes: Uint8Array, file: str
       if (skipped >= 0) {
         const kind = kinds[skipped]!
         rowsSkipped[kind] = (rowsSkipped[kind] ?? 0) + 1
+        const qtyNote = nonStockQtyNotes.get(record.line)
+        if (qtyNote !== undefined && dataset === 'stock-lots' && selectIndexes[skipped] === nonStockIndex) notes.push(qtyNote)
         if (kindFromDecision.get(record.line) === 'KIT' && dataset === 'stock-lots' && skuAt !== undefined) {
           notes.push({ line: record.line, code: 'KIT_STOCK_IGNORED', reason: `SKU ${clean(record.cells[skuAt])} is a KIT by the owner's decision: the on-hand quantity ${quantityOf(record.cells)} on line ${record.line} is Qoblex's computed availability, not stock, and is not loaded` })
         }

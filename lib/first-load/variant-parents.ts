@@ -67,7 +67,7 @@ export interface VariantJoinResult {
   /** Parents the products file itself carries as VARIABLE, with what WooCommerce says about them (WooCommerce wins for title and lifecycle). */
   providedParents: Array<{ key: string; sku: string; name: string; lifecycle: 'ACTIVE' | 'DRAFT' }>
   /** Every variation (VARIANT, KIT or BOM) that joined its parent, with the lifecycle WooCommerce gives the parent. */
-  joined: Array<{ key: string; sku: string; parentSku: string; parentLifecycle: 'ACTIVE' | 'DRAFT' }>
+  joined: Array<{ key: string; sku: string; parentSku: string; parentLifecycle: 'ACTIVE' | 'DRAFT'; ownStatus: string; ownLifecycle: 'ACTIVE' | 'DRAFT' | null }>
   /** Every SKU key the dataset names (variations and parents), so an exclusion on one of them is not reported as stale. */
   namedKeys: Set<string>
   summary: { rowsRead: number; variantsJoined: number; parentsEmitted: number; parentsWithoutQoblexVariant: number }
@@ -84,6 +84,9 @@ interface Item {
   lifecycle: 'ACTIVE' | 'DRAFT'
   wooVariationId: string
   wooParentId: string
+  /** The variation's OWN WooCommerce status (lower case, '' when the file does not say) and its mapped lifecycle. */
+  ownStatus: string
+  ownLifecycle: 'ACTIVE' | 'DRAFT' | null
 }
 
 function cmp(a: string, b: string): number {
@@ -118,11 +121,17 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
       add(row, variant.sku, 'REJECTED', 'UNMAPPED_PARENT_STATUS', `parent status ${JSON.stringify(v.parentStatus)} is not one of ${Object.keys(VARIANT_PARENT_STATUS_LIFECYCLE).join(', ')} (a closed list: add a mapping deliberately)`)
       continue
     }
+    const ownStatus = (v.variationStatus ?? '').trim().toLowerCase()
+    const ownLifecycle = ownStatus === '' ? null : Object.prototype.hasOwnProperty.call(VARIANT_PARENT_STATUS_LIFECYCLE, ownStatus) ? VARIANT_PARENT_STATUS_LIFECYCLE[ownStatus] : undefined
+    if (ownLifecycle === undefined) {
+      add(row, variant.sku, 'REJECTED', 'UNMAPPED_VARIATION_STATUS', `variation status ${JSON.stringify(v.variationStatus)} is not one of ${Object.keys(VARIANT_PARENT_STATUS_LIFECYCLE).join(', ')} (a closed list: add a mapping deliberately)`)
+      continue
+    }
     const badId = (['wooVariationId', 'wooParentId'] as const).find((column) => v[column] !== '' && !/^[0-9]{1,18}$/.test(v[column]))
     if (badId) { add(row, variant.sku, 'REJECTED', 'BAD_ID', `${badId} ${JSON.stringify(v[badId])} is not a whole number`); continue }
     valid.push({
       row, variantSku: variant.sku, variantKey: variant.key, parentSku: parent.sku, parentKey: parent.key, parentName: v.parentName,
-      status, lifecycle, wooVariationId: v.wooVariationId, wooParentId: v.wooParentId,
+      status, lifecycle, wooVariationId: v.wooVariationId, wooParentId: v.wooParentId, ownStatus, ownLifecycle,
     })
   }
 
@@ -131,7 +140,7 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
   for (const item of valid) byVariant.set(item.variantKey, [...(byVariant.get(item.variantKey) ?? []), item])
   const unique: Item[] = []
   for (const [, list] of [...byVariant.entries()].sort((a, b) => cmp(a[0], b[0]))) {
-    const signatures = new Set(list.map((i) => JSON.stringify([i.variantSku, i.parentSku, i.parentName, i.status, i.wooVariationId, i.wooParentId])))
+    const signatures = new Set(list.map((i) => JSON.stringify([i.variantSku, i.parentSku, i.parentName, i.status, i.wooVariationId, i.wooParentId, i.ownStatus])))
     if (list.length > 1 && signatures.size > 1) {
       for (const i of list) { add(i.row, i.variantSku, 'REJECTED', 'DUPLICATE_VARIATION_SKU', `the variation SKU appears ${list.length} times with different data (${[...new Set(list.map((x) => x.parentSku))].sort(cmp).join(', ')}): which is right cannot be decided`) }
       continue
@@ -220,7 +229,7 @@ export function joinVariantParents(input: VariantJoinInput): VariantJoinResult {
       confirmed.add(i.variantKey)
       add(i.row, i.variantSku, 'EMITTED', 'VARIATION_JOINED', `joined by exact SKU to WooCommerce parent ${i.parentSku}`)
       joinedParentKeys.add(parentKey)
-      joined.push({ key: i.variantKey, sku: i.variantSku, parentSku: i.parentSku, parentLifecycle: i.lifecycle })
+      joined.push({ key: i.variantKey, sku: i.variantSku, parentSku: i.parentSku, parentLifecycle: i.lifecycle, ownStatus: i.ownStatus, ownLifecycle: i.ownLifecycle })
       if (skuStem(i.variantSku) !== parentKey) stemMismatch.push(`${i.variantSku} -> ${i.parentSku}`)
       if (providedByProducts(parentKey)) {
         provided.set(parentKey, { key: parentKey, sku: head.parentSku, name: head.parentName, lifecycle: head.lifecycle })

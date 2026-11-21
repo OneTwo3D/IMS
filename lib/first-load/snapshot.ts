@@ -245,7 +245,7 @@ export function variantParentRows(payload: SnapshotPayload): string[][] {
     if (v.sku === '') continue
     const p = parents.get(v.parentId)
     if (!p) continue
-    rows.push([v.sku, String(v.id), p.sku, p.name, p.status, String(p.id)])
+    rows.push([v.sku, String(v.id), p.sku, p.name, p.status, String(p.id), v.status])
   }
   return rows.sort((a, b) => cmp(skuKey(a[0]), skuKey(b[0])) || cmp(a[0], b[0]))
 }

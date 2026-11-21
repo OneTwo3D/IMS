@@ -12,12 +12,12 @@
   "formulaLeadingCells": 0,
   "variantParentsFile": {
     "name": "variant-parents.csv",
-    "sha256": "58aefad447fdcf3d24912f60654c58d805069aa111c8dbf02aef0ee7e7d6dde8",
+    "sha256": "550cd9c3e1dcd7fc1943179ed1e0d624b688f8136dd281875e234dc8514dc436",
     "rows": 8
   },
   "variantParentsInspectionFile": {
     "name": "variant-parents.inspect.csv",
-    "sha256": "58aefad447fdcf3d24912f60654c58d805069aa111c8dbf02aef0ee7e7d6dde8"
+    "sha256": "550cd9c3e1dcd7fc1943179ed1e0d624b688f8136dd281875e234dc8514dc436"
   },
   "proof": {
     "parents": {

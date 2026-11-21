@@ -313,10 +313,10 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     columns: ['sku', 'wooProductId', 'type', 'status'],
     required: ['sku'],
     sources: ['woocommerce'],
-    purpose: 'WooCommerce product export. Used for the four-way SKU coverage check (R14) and, when it carries `status`, to check a DRAFT Qoblex product against a published WooCommerce one. Never a source for recipes.',
+    purpose: 'WooCommerce product export. Used for the four-way SKU coverage check (R14) and, when it carries `status`, to check the lifecycle of a Qoblex simple product against its own WooCommerce status. Never a source for recipes.',
   },
   'variant-parents': {
-    columns: ['variantSku', 'wooVariationId', 'parentSku', 'parentName', 'parentStatus', 'wooParentId'],
+    columns: ['variantSku', 'wooVariationId', 'parentSku', 'parentName', 'parentStatus', 'wooParentId', 'variationStatus'],
     required: ['variantSku', 'parentSku', 'parentName', 'parentStatus'],
     sources: ['woocommerce'],
     purpose:
@@ -363,7 +363,7 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     columns: ['sku', 'reason'],
     required: ['sku', 'reason'],
     sources: [],
-    purpose: 'Owner decision: a SKU whose products-file lifecycle is DRAFT while WooCommerce publishes it (a variation under a published parent, or a published simple product) is confirmed, per SKU, to be loaded as DRAFT even though DRAFT forces a WooCommerce draft. Without a row the run is blocked (LIFECYCLE_DISAGREES_WITH_WOO). Always canonical.',
+    purpose: 'Owner decision: a SKU whose products-file lifecycle would make a later IMS to WooCommerce product push change its own WooCommerce status (DRAFT against a published listing, or ACTIVE/EOL against a draft, pending or private one) is confirmed, per SKU. Nothing is pushed at load time. Without a row the run is blocked (LIFECYCLE_PUSH_WOULD_CHANGE_WOO_STATUS). Always canonical.',
   },
   'ims-suppliers': {
     columns: ['name'],
