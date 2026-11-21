@@ -7,7 +7,8 @@
  *     "Sheet id"), so the owner may sort, filter or widen columns; the hidden binding tab gives the sheet id and the generation digest;
  *   - a CSV export of the Review tab (the same headers; every other column is ignored);
  *   - a canonical lifecycle-decisions CSV (header: sku, status, reason, sheetId; sku required).
- * A formula in a cell that is read is refused (a decision is typed or picked, never computed). Every other check (unknown SKU, bad status,
+ * A formula in a cell that is read is refused (a decision is typed or picked, never computed), and so is U+FFFD in one (a character lost in a conversion;
+ * #1123 R1 MED-2: only in the cells that are read, never in a product name). Every other check (unknown SKU, bad status,
  * duplicates, archived with stock, the sheet id against the generation record) belongs to the binding and the transform.
  */
 import { CsvFormatError, parseCsvStrict, serializeCsv } from '../csv'
@@ -40,8 +41,24 @@ function isZip(bytes: Uint8Array): boolean {
   return bytes.length >= 4 && bytes[0] === 0x50 && bytes[1] === 0x4b && bytes[2] === 0x03 && bytes[3] === 0x04
 }
 
+/**
+ * U+FFFD in a decision cell (#1123 R1 MED-2): a character already lost in a conversion (a CSV saved in another encoding, a program that could not read it).
+ * A SKU or a reason that lost a character is never trusted. Only the four decision columns are checked: a product name (from WooCommerce or Qoblex) may
+ * carry U+FFFD, and it is never read back.
+ */
+function lostCharacters(rows: readonly string[][], lines: readonly number[], labels: readonly string[], where: string): string[] {
+  const out: string[] = []
+  rows.forEach((row, i) => row.forEach((cell, c) => {
+    if (cell.includes('\ufffd')) out.push(`${where} ${lines[i]}: the ${labels[c]} cell holds U+FFFD, a character lost in a conversion: save the sheet again from the original`)
+  }))
+  return out
+}
+
 /** `lines[i]` is the line (sheet row) of `rows[i]`, for the messages. */
 function finish(kind: 'xlsx' | 'review-csv' | 'canonical-csv', rows: string[][], lines: readonly number[], bindingTab: { sheetId: string; digest: string } | null): DecisionFileRead {
+  const labels = kind === 'canonical-csv' ? CANONICAL : [DECISION_HEADERS.sku, DECISION_HEADERS.status, DECISION_HEADERS.reason, DECISION_HEADERS.sheetId]
+  const lost = lostCharacters(rows, lines, labels, kind === 'xlsx' ? 'row' : 'line')
+  if (lost.length > 0) return bad(...lost.slice(0, 8), ...(lost.length > 8 ? [`... and ${lost.length - 8} more`] : []))
   const sheetIds = [...new Set(rows.filter((r) => r.some((c) => c.trim() !== '')).map((r) => r[3].trim()).filter((id) => id !== ''))].sort()
   const decidedWithoutSheetId = rows.flatMap((r, i) => (r[1].trim() !== '' && r[3].trim() === '' ? [lines[i]] : []))
   return { ok: true, kind, canonicalCsv: serializeCsv(CANONICAL, rows), sheetIds, bindingTab, decidedWithoutSheetId }

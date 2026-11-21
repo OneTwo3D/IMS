@@ -174,3 +174,49 @@ test('L9: the hop gate admits GET /api/Warehouse (no parameter) only for the rev
   assert.equal(mintsoftReadHopRefusal(base, hop('/api/Warehouse', 'POST'), undefined, { warehouseList: true }), 'method')
   assert.equal(mintsoftReadHopRefusal(base, hop('/api/Warehouse/5'), undefined, { warehouseList: true }), 'path')
 })
+
+// [mutation: the two scans are compared one way only, or by length only] (#1123 R1 L5)
+test('#1123 L5: a product only in the second scan (one more, or one swapped for another of the same count) refuses the listing', async () => {
+  const extra = { ...PRODUCTS[9], ID: 4242, SKU: 'SYN-LATE' }
+  for (const [label, second] of [
+    ['one more product', [...PRODUCTS.slice(0, 5), extra]],
+    ['the same count, one product swapped', [...PRODUCTS.slice(0, 4), extra]],
+  ] as const) {
+    const rig = await double(tenant(PRODUCTS.slice(0, 5), {}, WAREHOUSES, [...second]))
+    await assert.rejects(read(rig), (e: unknown) => e instanceof MintsoftReviewFailed && /changed between two complete reads/.test(e.message), label)
+  }
+})
+
+// [mutation: a warehouse listed twice is read twice; a row whose ids disagree takes one of them] (#1123 R1 L5)
+test('#1123 L5: a warehouse listed twice, or a warehouse row whose ids disagree, refuses the listing', async () => {
+  const twice = await double(tenant(PRODUCTS.slice(0, 5), STOCK, [{ ID: 5 }, { ID: 6 }, { ID: 5, Name: 'again' }]))
+  await assert.rejects(read(twice), (e: unknown) => e instanceof MintsoftReviewFailed && /warehouse 5 appears twice in the warehouse list/.test(e.message))
+  for (const row of [{ ID: 6, WarehouseId: 7 }, { Id: 6, id: '7' }, { ID: 6, WarehouseId: 'x' }]) {
+    const rig = await double(tenant(PRODUCTS.slice(0, 5), STOCK, [{ ID: 5 }, row]))
+    await assert.rejects(read(rig), (e: unknown) => e instanceof MintsoftReviewFailed && /a warehouse in the warehouse list has no usable id/.test(e.message), JSON.stringify(row))
+  }
+  const agreeing = await double(tenant(PRODUCTS, STOCK, [{ ID: 5, WarehouseId: 5 }, { Id: 6, warehouseId: '6' }]))
+  assert.deepEqual((await read(agreeing)).warehouses, ['5', '6'], 'several id names that agree are one id')
+})
+
+// [mutation: the unconfigured-warehouse check is onHand > 1, or >= 0] (#1123 R1 L5)
+test('#1123 L5: an unconfigured warehouse holding exactly 1 of a product refuses the listing; 0 does not', async () => {
+  const one = await double(tenant(PRODUCTS.slice(0, 5), { '9': [{ ...STOCK['5'][0], WarehouseId: 9, TotalStockLevel: 1, Level: 1 }] }, [...WAREHOUSES, { ID: 9 }]))
+  await assert.rejects(read(one), (e: unknown) => e instanceof MintsoftReviewFailed && /warehouse 9 holds stock of 1 product\(s\)/.test(e.message))
+  const zero = await double(tenant(PRODUCTS.slice(0, 5), { '9': [{ ...STOCK['5'][0], WarehouseId: 9, TotalStockLevel: 0, Level: 0 }] }, [...WAREHOUSES, { ID: 9 }]))
+  await read(zero)
+})
+
+// [mutation: the credentials file is opened without O_NONBLOCK (a FIFO hangs the open)] (#1123 R1 L3)
+test('#1123 L3: a FIFO named as the credentials file is refused at once, never waited on', async () => {
+  const { execFileSync, spawnSync } = await import('node:child_process')
+  const fifo = path.join(scratch, 'creds.fifo')
+  execFileSync('mkfifo', ['-m', '600', fifo])
+  // In a child process with a deadline: a blocking open would hang this test process itself.
+  const probe = path.join(scratch, 'fifo-probe.ts')
+  const moduleUrl = new URL('../../lib/connectors/mintsoft/lifecycle-review-read.ts', import.meta.url).href
+  writeFileSync(probe, `import { readMintsoftReviewConfig, MintsoftReviewRefused } from ${JSON.stringify(moduleUrl)}\ntry { readMintsoftReviewConfig(${JSON.stringify(fifo)}); console.log('READ') } catch (e) { console.log(e instanceof MintsoftReviewRefused ? 'REFUSED ' + e.message : 'OTHER') }\n`)
+  const child = spawnSync(process.execPath, [...process.execArgv.filter((a) => !a.startsWith('--test')), probe], { encoding: 'utf8', timeout: 20_000 })
+  assert.equal(child.error, undefined, 'the open returned (no hang until the deadline)')
+  assert.match(child.stdout, /^REFUSED the credentials file .* must be a regular file/m, child.stderr)
+})

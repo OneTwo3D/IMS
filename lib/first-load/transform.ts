@@ -797,7 +797,8 @@ const DECISION_LABELS = Object.keys(LIFECYCLE_DECISION_STATUSES) as LifecycleDec
  * decisions are keyed by the IMS SKU exactly as the sheet shows it), a SKU listed twice (every row of it), a status that is not one of the four labels, a SKU
  * this run does not load, and Archived for a SKU holding stock unless the override reason is filled (then applied and reported, WARNING
  * ARCHIVED_WITH_STOCK_OVERRIDE). Stock is held when ANY single figure is above zero or was not read: one Qoblex warehouse at generation or in this run's
- * stock-lots (never the sum, MED-2), the WooCommerce figure at generation and in this run's snapshot, the WMS figure at generation (the WMS is not read again;
+ * stock-lots (never the sum, MED-2), the WooCommerce figure at generation and in this run's snapshot (taken for EVERY product IMS loads, by IMS SKU, also one that
+ * has left the review set since: #1123 R1 MED-1), the WMS figure at generation (the WMS is not read again;
  * the report names the figures that are older than this run). A VARIABLE parent (MED-3) is refused Archived while any of its variations loads with another
  * lifecycle (VARIATION_NOT_ARCHIVED, no override), and its variations' stock counts as its own. A review-set SKU with no decision (no row, or a blank status)
  * blocks the run (ERROR LIFECYCLE_DECISION_MISSING); a dry run reports it as a WARNING.
@@ -836,7 +837,10 @@ function applyLifecycleDecisions(run: Run): void {
   if (changed.length > 0) run.find('WARNING', 'LIFECYCLE_REVIEW_INPUTS_CHANGED', `the review sheet ${binding.sheetId} was generated from other inputs than this run reads (${changed.join(', ')}). Stale figures an Archived decision is checked against: ${stale.join('; ')}. This run's review set is recomputed from its own inputs (LIFECYCLE_REVIEW_SET_CHANGED lists any product the sheet lacks)`, 'lifecycle-decisions')
 
   // ---- the review set of THIS run (MED-1) ----
-  const current = currentReviewSet(run, generation)
+  const recomputed = currentReviewSet(run, generation)
+  const current = recomputed?.set ?? null
+  /** This run's WooCommerce stock figure for a SKU IMS loads, from EVERY model row (#1123 R1 MED-1), not only the review set's: a product that left the review set (published since) still has its stock checked. Undefined: no verified snapshot, or IMS does not load the SKU. */
+  const wooNowOf = (sku: string): StockFigure | undefined => recomputed?.wooNow.get(sku)
   if (current === null) {
     run.find(dry ? 'WARNING' : 'ERROR', 'LIFECYCLE_REVIEW_SET_UNCHECKED', `the review set of this run cannot be recomputed (it needs the verified WooCommerce snapshot and the products dataset), so products that became draft or Archived after the review sheet ${binding.sheetId} was generated cannot be found${dry ? ': a real prepare is BLOCKED by this' : ', so the real prepare is blocked'}`, 'lifecycle-decisions')
   }
@@ -932,7 +936,7 @@ function applyLifecycleDecisions(run: Run): void {
   const parentArchives = valid.filter((d) => d.lifecycle === 'ARCHIVED' && d.entry.type === 'VARIABLE')
   for (const d of valid) {
     if (parentArchives.includes(d)) continue
-    if (d.lifecycle === 'ARCHIVED') archive(d, holdings(d.sku, '', review.get(d.sku), current?.get(d.sku)?.wooStock))
+    if (d.lifecycle === 'ARCHIVED') archive(d, holdings(d.sku, '', review.get(d.sku), wooNowOf(d.sku)))
     else apply(d)
   }
   for (const d of parentArchives) {
@@ -943,11 +947,10 @@ function applyLifecycleDecisions(run: Run): void {
       continue
     }
     const at = review.get(d.sku)
-    const now = current?.get(d.sku)
-    const holds = holdings(d.sku, '', at, now?.wooStock)
+    const holds = holdings(d.sku, '', at, wooNowOf(d.sku))
     for (const child of children) {
       const childAt = at?.variations?.find((v) => v.sku === child.sku) ?? review.get(child.sku)
-      holds.push(...holdings(child.sku, `variation ${child.sku}: `, childAt, now?.variations?.find((v) => v.sku === child.sku)?.wooStock ?? current?.get(child.sku)?.wooStock))
+      holds.push(...holdings(child.sku, `variation ${child.sku}: `, childAt, wooNowOf(child.sku)))
     }
     archive(d, holds)
   }
@@ -967,8 +970,12 @@ function applyLifecycleDecisions(run: Run): void {
  * The review set of THIS run's inputs (MED-1), by the same model the sheet is built with (lib/first-load/lifecycle-review/model.ts): every product IMS loads
  * that is Archived in Qoblex (the State as the export states it, before the column map) or not publish in WooCommerce (its own status or its parent's), plus the
  * sheet's WMS-discontinued rows (the WMS is not read again). Null when it cannot be computed: no verified snapshot was handed over.
+ *
+ * `wooNow` is this run's WooCommerce stock figure of EVERY model row IMS loads, by IMS SKU (#1123 R1 MED-1): an Archived decision is checked against it
+ * whether or not the product is still in the review set (a product draft with stock 0 at generation and published with stock 10 since has left the set, and
+ * its stale 0 must not clear it). A carried WMS-discontinued row takes its figure from there too (L4), never "not read".
  */
-function currentReviewSet(run: Run, generation: GenerationBody): Map<string, ReviewEntry> | null {
+function currentReviewSet(run: Run, generation: GenerationBody): { set: Map<string, ReviewEntry>; wooNow: Map<string, StockFigure> } | null {
   const inputs = run.input.lifecycleReviewInputs
   if (inputs === undefined || run.input.productStatusBinding?.verified !== true || !run.has('products')) return null
   // The products and stock-lots cells already carry the renamed SKUs; the model joins WooCommerce on the pre-rename spelling too, so it is given back.
@@ -988,14 +995,16 @@ function currentReviewSet(run: Run, generation: GenerationBody): Map<string, Rev
     if (error instanceof ReviewModelError) return null
     throw error
   }
+  const wooNow = new Map<string, StockFigure>()
+  for (const row of model.rows) if (row.imsSku !== null) wooNow.set(row.imsSku, row.wooStock)
   const out = new Map(model.entries.map((e) => [e.sku, e]))
   for (const entry of generation.review) {
     if (!entry.reasons.includes('WMS discontinued')) continue
     if (!run.cat.has(skuKey(entry.sku))) continue
     const mine = out.get(entry.sku)
-    out.set(entry.sku, mine === undefined ? { ...entry, wooStock: { kind: 'unknown' } } : { ...mine, reasons: [...mine.reasons, 'WMS discontinued'] })
+    out.set(entry.sku, mine === undefined ? { ...entry, wooStock: wooNow.get(entry.sku) ?? { kind: 'unknown' } } : { ...mine, reasons: [...mine.reasons, 'WMS discontinued'] })
   }
-  return out
+  return { set: out, wooNow }
 }
 
 /**

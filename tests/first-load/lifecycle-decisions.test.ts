@@ -295,6 +295,29 @@ test('a decision cell that holds a formula makes the file unusable (exit 3): a d
   assert.match(stderr, /holds a formula/)
 })
 
+// [mutation: U+FFFD is not refused in a decision cell, or is refused in a column that is not read (a name)] (#1123 R1 MED-2)
+test('#1123 MED-2: U+FFFD in a decision cell (.xlsx, Review CSV or canonical CSV) makes the file unusable (exit 3); in a product name it is ignored', async () => {
+  const { readDecisionFile } = await import('../../lib/first-load/lifecycle-review/read-back.ts')
+  const named = readXlsx(fill(withWms, ALL_DECIDED))
+  const review = grid(named.find((s) => s.name === REVIEW_TAB)!)
+  const nameCol = review[0].indexOf('Name')
+  assert.ok(nameCol >= 0, 'precondition: the Name column')
+  review[1][nameCol] = 'Mug \ufffd lost'
+  const withLostName = writeXlsx([{ name: REVIEW_TAB, rows: review.map((r) => r.map((v): XCell => ({ v }))) }, { name: BINDING_TAB, state: 'hidden', rows: grid(named.find((s) => s.name === BINDING_TAB)!).map((r) => r.map((v): XCell => ({ v }))) }])
+  assert.equal(readDecisionFile(withLostName).ok, true, 'a lost character in a product name is not a decision')
+  const lostReason = fill(withWms, { ...ALL_DECIDED, 'NEW-ARCH': { status: 'Archived', reason: 'write\ufffdoff' } })
+  const xlsx = readDecisionFile(lostReason)
+  assert.equal(xlsx.ok, false)
+  assert.match(!xlsx.ok ? xlsx.problems.join('; ') : '', /^row \d+: the Override reason cell holds U\+FFFD, a character lost in a conversion/)
+  const csv = readDecisionFile(csvExport(withWms, { ...ALL_DECIDED, 'SIM-DRAFT': { status: 'Act\ufffdve' } }))
+  assert.match(!csv.ok ? csv.problems.join('; ') : '', /^line \d+: the New IMS status cell holds U\+FFFD/)
+  const canon = readDecisionFile(canonical(withWms, [['SIM\ufffdDRAFT', 'Active']]))
+  assert.match(!canon.ok ? canon.problems.join('; ') : '', /^line 2: the sku cell holds U\+FFFD/)
+  let stderr = ''
+  assert.equal(await runPrepare(['--manifest', manifestWith(generationOf(withWms), writeDecisions(lostReason, 'xlsx')), '--dry-run'], { stdout: () => {}, stderr: (s) => (stderr += s) }), EXIT_CODES.INPUT_UNUSABLE)
+  assert.match(stderr, /Override reason cell holds U\+FFFD/)
+})
+
 test('the manifest refuses a column map or a second file for lifecycle-decisions, and a malformed lifecycleReview (usage, exit 2)', async () => {
   const decisions = writeDecisions(fill(withWms, ALL_DECIDED), 'xlsx')
   for (const [label, manifest, why] of [
@@ -350,6 +373,42 @@ test('MED-1: a product that became draft in a fresher WooCommerce snapshot, and 
   const changed = findings(r, 'LIFECYCLE_REVIEW_SET_CHANGED')
   assert.deepEqual(changed.map((f) => f.keys), [['SIM-PUB', 'VAR-01', 'VAR-PARENT']])
   assert.match(changed[0].message, /SIM-PUB \(WooCommerce draft\), VAR-01 \(WooCommerce parent draft\), VAR-PARENT \(WooCommerce draft\)/)
+})
+
+/** A fresher WooCommerce snapshot (a test seam: this run's snapshot changed, and the generation names another one, as a real re-snapshot would). */
+const fresherSnapshot = (change: (products: Array<{ sku: string; status: string; manageStock: boolean | 'parent'; stockQuantity: number | null }>) => void) => (input: Input) => {
+  const snapshot = structuredClone(input.lifecycleReviewInputs!.snapshot)
+  change(snapshot.products as Array<{ sku: string; status: string; manageStock: boolean | 'parent'; stockQuantity: number | null }>)
+  input.lifecycleReviewInputs = { ...input.lifecycleReviewInputs!, snapshot }
+  generationIn(input).generation.inputs.snapshotPayloadSha256 = 'f'.repeat(64)
+}
+
+// [mutation: this run's WooCommerce stock is only taken for products still in the review set] (#1123 R1 MED-1)
+test('#1123 MED-1: a product draft with stock 0 at generation and published with stock since has LEFT the review set; Archived is still checked against this run\'s WooCommerce stock', () => {
+  const manifest = manifestWith(generationOf(withWms), writeDecisions(fill(withWms, { ...ALL_DECIDED, 'SIM-DRAFT': { status: 'Archived' } }), 'xlsx'))
+  const unchanged = prepareWith(manifest, false, fresherSnapshot(() => {}))
+  assert.equal(lifecycleOf(unchanged, 'SIM-DRAFT')?.lifecycle, 'ARCHIVED', 'precondition: with no stock anywhere, Archived is applied on another snapshot')
+  const published = prepareWith(manifest, false, fresherSnapshot((products) => {
+    const p = products.find((x) => x.sku === 'SIM-DRAFT')!
+    p.status = 'publish'
+    p.manageStock = true
+    p.stockQuantity = 10
+  }))
+  assert.deepEqual(findings(published, 'LIFECYCLE_REVIEW_SET_CHANGED'), [], 'precondition: SIM-DRAFT is no longer in this run\'s review set')
+  assert.deepEqual(disp(published, 'ARCHIVED_WITH_STOCK'), ['REJECTED SIM-DRAFT'])
+  assert.match(published.report.dispositions.find((d) => d.dataset === 'lifecycle-decisions' && d.key === 'SIM-DRAFT')!.reason, /^Archived is refused: WooCommerce stock in this run 10 \(/)
+  assert.notEqual(lifecycleOf(published, 'SIM-DRAFT')?.lifecycle, 'ARCHIVED')
+})
+
+// [mutation: a carried WMS-discontinued row reads its WooCommerce stock as "not read"] (#1123 R1 L4)
+test('#1123 L4: a WMS-discontinued row carried into this run\'s review set takes this run\'s WooCommerce figure: 0 clears Archived, stock refuses it', () => {
+  const manifest = manifestWith(generationOf(withWms), writeDecisions(fill(withWms, { ...ALL_DECIDED, 'NEW-1': { status: 'Archived' } }), 'xlsx'))
+  const zero = prepareWith(manifest, false, fresherSnapshot(() => {}))
+  assert.deepEqual(disp(zero, 'ARCHIVED_WITH_STOCK'), [])
+  assert.equal(lifecycleOf(zero, 'NEW-1')?.lifecycle, 'ARCHIVED', 'WooCommerce 0 in this run, WMS 0 and no Qoblex stock: nothing holds stock')
+  const stocked = prepareWith(manifest, false, fresherSnapshot((products) => { products.find((x) => x.sku === 'NEW-1')!.stockQuantity = 4 }))
+  assert.deepEqual(disp(stocked, 'ARCHIVED_WITH_STOCK'), ['REJECTED NEW-1'])
+  assert.match(stocked.report.dispositions.find((d) => d.dataset === 'lifecycle-decisions' && d.key === 'NEW-1')!.reason, /^Archived is refused: WooCommerce stock in this run 4 \(/)
 })
 
 // [mutation: a run without the recompute inputs is silently accepted] (MED-1)
