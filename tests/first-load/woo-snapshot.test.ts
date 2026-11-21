@@ -823,3 +823,27 @@ test('o3d-7lxrt L2: --verify of a variant-parents.csv written before variationSt
     assert.match(old.stderr, /variant-parents\.csv predates the variationStatus column/)
   } finally { await r.server.close() }
 })
+
+// [mutation: a field the walk reads (for example attributes or stock_quantity) is dropped from its _fields list]
+test('#1119 R2 (f): the fake store honours _fields as WordPress does, so the walk is proved to ask for every field it reads; a store that ignores _fields gives the same snapshot', async (t) => {
+  const products = [{ id: 900, sku: 'S-STOCK', name: 'Managed', status: 'publish', manage_stock: true, stock_quantity: 4 }]
+  const honoured = await rig({ products })
+  const ignoring = await rig({ products, ignoreFields: true })
+  try {
+    const a = await snapshot(honoured)
+    const b = await snapshot(ignoring)
+    assert.equal(a.code, SNAPSHOT_EXIT_CODES.OK, a.stderr)
+    assert.equal(b.code, SNAPSHOT_EXIT_CODES.OK, b.stderr)
+    const walkPages = honoured.server.requests.filter((q) => !isProbe(q))
+    precondition(t, 'walk pages served with _fields honoured', walkPages.length)
+    assert.ok(walkPages.every((q) => (q.query._fields ?? '') !== ''), 'every walk page names its fields')
+    const text = readFileSync(path.join(honoured.out, SNAPSHOT_FILE_NAMES.snapshot), 'utf8')
+    assert.equal(text, readFileSync(path.join(ignoring.out, SNAPSHOT_FILE_NAMES.snapshot), 'utf8'), 'the same catalogue whether or not the store trims the rows')
+    const parsed = parseSnapshotFile(text)
+    assert.ok(parsed.ok && parsed.payload.products.find((p) => p.sku === 'S-STOCK')?.stockQuantity === 4, 'a stock figure survives _fields')
+    assert.ok(parsed.ok && parsed.payload.variations.find((v) => v.sku === 'W-01')?.attributes.length === 1, 'the attributes survive _fields')
+  } finally {
+    await honoured.server.close()
+    await ignoring.server.close()
+  }
+})

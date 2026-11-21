@@ -27,6 +27,7 @@
     "check:bom-recipes": "tsx scripts/check-bom-recipe-consistency.ts",
     "first-load:prepare": "tsx scripts/first-load-prepare.ts",
     "first-load:woo-snapshot": "tsx scripts/first-load-woo-snapshot.ts",
+    "first-load:lifecycle-review": "tsx scripts/first-load-lifecycle-review.ts",
     "first-load:apply": "tsx scripts/first-load-apply.ts",
     "first-load:export-fx-rates": "tsx scripts/first-load-export-fx-rates.ts",
     "fx:backfill-ecb": "tsx scripts/fx-backfill-ecb.ts",

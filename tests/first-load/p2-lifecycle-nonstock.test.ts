@@ -347,7 +347,7 @@ test('o3d-7lxrt H2: with no WooCommerce status for a simple/KIT/BOM product it k
   precondition(t, 'products loaded', rowsOf(r, 'products').length)
   const warning = r.report.findings.find((f) => f.code === 'LIFECYCLE_NOT_FROM_WOO')
   assert.equal(warning?.severity, 'WARNING')
-  assert.ok(warning?.message.startsWith('4 simple, KIT or BOM product(s)'), warning?.message)
+  assert.ok(warning?.message.startsWith('4 simple, KIT, BOM or NON_INVENTORY product(s)'), warning?.message)
   assert.ok(warning?.message.includes('Qoblex') && warning.message.includes('push may create or change their WooCommerce status') && warning.message.includes('no WooCommerce status was supplied'))
   assert.deepEqual(warning?.keys, ['C1', 'K-1', 'S-1', 'S-2'], 'the SKUs are listed')
   assert.equal(lifecycleOf(r, 'S-1'), 'ARCHIVED')

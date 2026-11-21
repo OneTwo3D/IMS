@@ -125,31 +125,37 @@ function wholeNumber(value: unknown): number | null {
   return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 ? value : null
 }
 
-export function createMintsoftReadPort(deps: MintsoftReadPortDeps): WmsReadPort {
+/**
+ * ONE GET to an allow-listed Mintsoft read path, through the connector fetch seam with the hop gate (GET only, the two exact paths and their digit
+ * parameters, the connection's own origin, no redirect), the fixed key in `ms-apikey`. Exactly 200 with JSON, else it throws (a short code, never a body,
+ * a URL or the key). Shared by the reconciliation pack's port and the first-load lifecycle review reader (lifecycle-review-read.ts).
+ */
+export async function mintsoftGuardedGet(creds: MintsoftPackCredentials, relativePath: string, params: Record<string, string>, deps: Pick<MintsoftReadPortDeps, 'env' | 'fetchImpl' | 'timeoutMs'> = {}): Promise<unknown> {
   const send = deps.fetchImpl ?? connectorFetch
-  let credentials: Promise<MintsoftPackCredentialRead> | null = null
+  const base = new URL(creds.baseUrl.endsWith('/') ? creds.baseUrl : `${creds.baseUrl}/`)
+  const url = new URL(relativePath.replace(/^\/+/, ''), base)
+  for (const [name, value] of Object.entries(params)) url.searchParams.set(name, value)
+  const response = await send(url, {
+    method: 'GET',
+    headers: { 'ms-apikey': creds.apiKey, Accept: 'application/json' },
+    cache: 'no-store',
+    signal: AbortSignal.timeout(deps.timeoutMs ?? REQUEST_TIMEOUT_MS),
+  }, {
+    connectorName: 'Mintsoft',
+    allowE2eLocalHttp: true,
+    env: deps.env,
+    refuseRedirects: true,
+    hopGate: (hop) => mintsoftReadHopRefusal(new URL(creds.baseUrl), hop),
+  })
+  // Exactly 200 with JSON: a 204, a 3xx that was not followed, a 401 (never refreshed) and every error are unreadable.
+  if (response.status !== 200) throw new Error('status')
+  if (!(response.headers.get('content-type') ?? '').includes('application/json')) throw new Error('type')
+  return await response.json()
+}
 
-  async function get(creds: MintsoftPackCredentials, relativePath: string, params: Record<string, string>): Promise<unknown> {
-    const base = new URL(creds.baseUrl.endsWith('/') ? creds.baseUrl : `${creds.baseUrl}/`)
-    const url = new URL(relativePath.replace(/^\/+/, ''), base)
-    for (const [name, value] of Object.entries(params)) url.searchParams.set(name, value)
-    const response = await send(url, {
-      method: 'GET',
-      headers: { 'ms-apikey': creds.apiKey, Accept: 'application/json' },
-      cache: 'no-store',
-      signal: AbortSignal.timeout(deps.timeoutMs ?? REQUEST_TIMEOUT_MS),
-    }, {
-      connectorName: 'Mintsoft',
-      allowE2eLocalHttp: true,
-      env: deps.env,
-      refuseRedirects: true,
-      hopGate: (hop) => mintsoftReadHopRefusal(new URL(creds.baseUrl), hop),
-    })
-    // Exactly 200 with JSON: a 204, a 3xx that was not followed, a 401 (never refreshed) and every error are unreadable.
-    if (response.status !== 200) throw new Error('status')
-    if (!(response.headers.get('content-type') ?? '').includes('application/json')) throw new Error('type')
-    return await response.json()
-  }
+export function createMintsoftReadPort(deps: MintsoftReadPortDeps): WmsReadPort {
+  let credentials: Promise<MintsoftPackCredentialRead> | null = null
+  const get = (creds: MintsoftPackCredentials, relativePath: string, params: Record<string, string>): Promise<unknown> => mintsoftGuardedGet(creds, relativePath, params, deps)
 
   async function credentialsOnce(): Promise<MintsoftPackCredentialRead> {
     credentials ??= deps.readCredentials().catch((): MintsoftPackCredentialRead => refused('SOURCE_UNREADABLE'))
