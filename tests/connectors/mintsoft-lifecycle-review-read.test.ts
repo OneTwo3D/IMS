@@ -83,7 +83,7 @@ test('an unreadable listing fails closed with a message that carries no key, URL
   const cases: Array<[string, Parameters<typeof tenant>, RegExp]> = [
     ['a repeated SKU', [[...PRODUCTS.slice(0, 10), { ...PRODUCTS[11], SKU: 'SYN-0001' }], STOCK], /SKU appears twice/],
     ['another client', [[{ ...PRODUCTS[0], ClientId: 7 }], {}], /another client/],
-    ['a flag that is not true or false', [[{ ...PRODUCTS[0], DisCont: 'yes' }], {}], /not true or false/],
+    ['a flag that is not true or false', [[{ ...PRODUCTS[0], DisCont: 'yes' as unknown as boolean }], {}], /not true or false/],
     ['a stock row for a product the list does not hold', [PRODUCTS.slice(0, 5), { '5': [{ ...STOCK['5'][0], ProductId: 9999 }] }], /does not hold/],
   ]
   // The first case needs a store that answers a page AFTER the end: built by hand.
