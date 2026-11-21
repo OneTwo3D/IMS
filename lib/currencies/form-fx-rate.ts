@@ -86,6 +86,9 @@ export function isFxRateChangedError(error: string | undefined): boolean {
 
 export const FX_RATE_CHANGED_FORM_MESSAGE = 'The exchange rate changed while you were working. The rate and the amounts shown have been updated: check them, then submit again.'
 
+/** The manufacturing-order dialog shows a rate but no amounts, so its message does not mention amounts. */
+export const FX_RATE_CHANGED_MO_FORM_MESSAGE = 'The exchange rate changed while you were working. The rate shown has been updated: check it, then submit again.'
+
 export function fxRateChangedMessage(currency: string, expected: number, actual: number): string {
   return `FX_RATE_CHANGED: the ${currency} table rate moved from ${expected} to ${actual} since it was checked; nothing was written`
 }

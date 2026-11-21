@@ -36,7 +36,7 @@ import { getCurrencies, type CurrencyRow } from '@/app/actions/currencies'
 import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormFxRate } from '@/components/currencies/use-form-fx-rate'
 import { FxRateInput, FxRateNotice } from '@/components/currencies/fx-rate-field'
-import { FX_RATE_CHANGED_FORM_MESSAGE, fxBlocksSubmit, isFxRateChangedError, usableRate } from '@/lib/currencies/form-fx-rate'
+import { FX_RATE_CHANGED_MO_FORM_MESSAGE, fxBlocksSubmit, isFxRateChangedError, usableRate } from '@/lib/currencies/form-fx-rate'
 
 const STATUS_BADGE: Record<string, string> = {
   DRAFT: 'bg-slate-100 text-slate-700 dark:bg-slate-800 dark:text-slate-300',
@@ -279,6 +279,7 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
   // the rate is display only, the server stores the fx_rates rate (never an invented 1).
   const baseCurrency = useBaseCurrency()
   const [currencies, setCurrencies] = useState<CurrencyRow[]>([])
+  const [currenciesFailed, setCurrenciesFailed] = useState(false)
   const [currency, setCurrency] = useState(baseCurrency.code)
   const { fx, load: loadFxRate } = useFormFxRate({ state: 'base' })
   const fxRate = fx ? usableRate(fx) : null
@@ -290,11 +291,12 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
 
   // Load reference data
   useEffect(() => {
-    Promise.all([getBomProducts(), getWarehouses(), getSuppliers(), getCurrencies(true)]).then(([p, w, s, c]) => {
+    // Currencies load on their own: a failure there leaves the order in the base currency instead of emptying the whole dialog.
+    getCurrencies(true).then(setCurrencies).catch(() => { setCurrenciesFailed(true) })
+    Promise.all([getBomProducts(), getWarehouses(), getSuppliers()]).then(([p, w, s]) => {
       setBomProducts(p)
       setWarehouses(w)
       setSuppliers(s)
-      setCurrencies(c)
       setLoading(false)
     }).catch(() => { setLoading(false) })
   }, [])
@@ -359,6 +361,15 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
     loadFxRate(code, code === baseCurrency.code)
   }
 
+  // The manufacturer's currency is the natural order currency: default to it when it is an active currency we can read a rate for.
+  function handleManufacturerChange(id: string) {
+    setManufacturerId(id)
+    const supplierCurrency = suppliers.find((s) => s.id === id)?.currency
+    if (supplierCurrency && supplierCurrency !== currency && (supplierCurrency === baseCurrency.code || currencies.some((c) => c.code === supplierCurrency))) {
+      handleCurrencyChange(supplierCurrency)
+    }
+  }
+
   function handleCreate() {
     if (!selectedProduct || !warehouseId || qtyNum <= 0 || fxBlocksSubmit(fx)) return
     setError(null)
@@ -378,7 +389,7 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
         onCreated()
       } else if (isFxRateChangedError(result.error)) {
         handleCurrencyChange(currency)
-        setError(FX_RATE_CHANGED_FORM_MESSAGE)
+        setError(FX_RATE_CHANGED_MO_FORM_MESSAGE)
       } else {
         setError(result.error ?? 'Failed to create order.')
       }
@@ -491,7 +502,7 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
                 <Label className="text-xs">Manufacturer (optional)</Label>
                 <select
                   value={manufacturerId}
-                  onChange={(e) => setManufacturerId(e.target.value)}
+                  onChange={(e) => handleManufacturerChange(e.target.value)}
                   className="flex h-9 w-full rounded-md border border-input bg-background px-3 py-1 text-sm"
                 >
                   <option value="">None / In-house</option>
@@ -617,6 +628,7 @@ function CreateOrderDialog({ onClose, onCreated }: { onClose: () => void; onCrea
                 </div>
               </div>
               <FxRateNotice fx={fx} />
+              {currenciesFailed && <p className="text-xs text-muted-foreground">Other currencies could not be loaded, so this order can only be raised in {baseCurrency.code}. Reopen the dialog to try again.</p>}
             </div>
 
             {/* Notes */}

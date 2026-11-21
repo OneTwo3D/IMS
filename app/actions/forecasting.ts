@@ -9,6 +9,7 @@ import { logActivity } from '@/lib/activity-log'
 import { REORDER_ELIGIBLE_PRODUCT_STATUSES } from '@/lib/products/lifecycle'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
+import { productionOrderFxCreateData, resolveProductionOrderFx } from '@/lib/domain/manufacturing/production-order-fx'
 import { claimedActiveBomIdsByProduct, partitionReorderMoCandidates, type ReorderMoSkip } from '@/lib/domain/manufacturing/reorder-mo-planning'
 import {
   earliestLineDelivery,
@@ -626,15 +627,16 @@ export async function createReorderMOs(
     // to copy. orderBy then keep-first wins so a single query covers it.
     const latestMoRows = await db.productionOrder.findMany({
       where: { outputProductId: { in: eligible } },
-      select: { outputProductId: true, warehouseId: true, manufacturerId: true },
+      select: { outputProductId: true, warehouseId: true, manufacturerId: true, currency: true },
       orderBy: { createdAt: 'desc' },
     })
-    const latestByProduct = new Map<string, { warehouseId: string; manufacturerId: string | null }>()
+    const latestByProduct = new Map<string, { warehouseId: string; manufacturerId: string | null; currency: string }>()
     for (const row of latestMoRows) {
       if (!latestByProduct.has(row.outputProductId)) {
         latestByProduct.set(row.outputProductId, {
           warehouseId: row.warehouseId,
           manufacturerId: row.manufacturerId,
+          currency: row.currency,
         })
       }
     }
@@ -668,9 +670,18 @@ export async function createReorderMOs(
       recentDraftProductIds,
     })
 
+    // The order currency is fixed at create, so a re-order inherits the latest order's currency like its manufacturer (o3d-ags9b). A foreign
+    // currency is resolved through the one production-order lookup: the fx_rates table rate, or a refusal that skips the product; never 1.
+    const baseCurrency = await getBaseCurrencyCode()
     let moCount = 0
+    const fxSkipped: ReorderMoSkip[] = []
     for (const candidate of toCreate) {
       const latest = latestByProduct.get(candidate.productId)
+      const fx = await resolveProductionOrderFx(db, { currency: latest?.currency, baseCurrency, asOf: new Date() })
+      if (!fx.ok) {
+        fxSkipped.push({ productId: candidate.productId, sku: candidate.sku, reason: 'fx_rate_unavailable' })
+        continue
+      }
       const reference = `MO-${new Date().toISOString().slice(0, 10).replace(/-/g, '')}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`
       await db.productionOrder.create({
         data: {
@@ -682,6 +693,7 @@ export async function createReorderMOs(
           manufacturerId: latest?.manufacturerId ?? null,
           qtyPlanned: candidate.qtyPlanned,
           status: 'DRAFT',
+          ...productionOrderFxCreateData(fx, baseCurrency),
         },
       })
       await logActivity({
@@ -697,6 +709,7 @@ export async function createReorderMOs(
 
     // audit-M-mfg #3: surface skipped products (no active BOM / no warehouse /
     // recent duplicate) so the operator knows why fewer MOs were created.
+    skipped.push(...fxSkipped)
     if (skipped.length > 0) {
       await logActivity({
         entityType: 'SYSTEM',

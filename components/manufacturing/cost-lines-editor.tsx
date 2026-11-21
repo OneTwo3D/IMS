@@ -30,6 +30,7 @@ export function ManufacturingCostLinesEditor({
   productionOrderId,
   reference,
   currency,
+  baseCurrency,
   fxRateToBase,
   initialLines,
   isCompleted,
@@ -38,6 +39,8 @@ export function ManufacturingCostLinesEditor({
   productionOrderId: string
   reference: string
   currency: string
+  /** The organisation's base currency, shown beside the converted total. */
+  baseCurrency: string
   fxRateToBase: number
   initialLines: ManufacturingCostLineRow[]
   isCompleted: boolean
@@ -209,8 +212,8 @@ export function ManufacturingCostLinesEditor({
               <TableCell colSpan={2} className="text-right">Total</TableCell>
               <TableCell className="text-right font-mono">
                 {totalForeign.toFixed(2)} {currency}
-                {currency !== 'GBP' && (
-                  <span className="text-muted-foreground text-xs ml-2">≈ {totalBase.toFixed(2)} GBP</span>
+                {currency !== baseCurrency && (
+                  <span className="text-muted-foreground text-xs ml-2">≈ {totalBase.toFixed(2)} {baseCurrency}</span>
                 )}
               </TableCell>
               <TableCell colSpan={canEdit ? 2 : 1}></TableCell>
