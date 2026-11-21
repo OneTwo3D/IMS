@@ -231,6 +231,7 @@ export const DATASET_NAMES = [
   'recipe-overrides',
   'sku-renames',
   'lifecycle-confirmations',
+  'lifecycle-decisions',
   'ims-skus',
   'ims-suppliers',
   'ims-tax-rates',
@@ -374,6 +375,12 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     required: [],
     sources: [],
     purpose: 'OBSOLETE since the owner ruling of 2026-11-21 ("Use Woo\'s status as gospel"): the lifecycle of a product the first load can see a WooCommerce status for is taken from WooCommerce, so nothing needs confirming. Still parsed so an existing manifest loads; every row is reported as an INFO no-op. Always canonical.',
+  },
+  'lifecycle-decisions': {
+    columns: ['sku', 'status', 'reason', 'sheetId'],
+    required: ['sku'],
+    sources: [],
+    purpose: 'Owner decision: the IMS lifecycle of each product on the owner lifecycle review sheet (npm run first-load:lifecycle-review), read back from the filled sheet (.xlsx) or its CSV export of the Review tab, or a canonical file with these columns. `status` is one of Discontinued (EOL), Archived (ARCHIVED), Do not sell yet (DRAFT) or Active (ACTIVE); it has the HIGHEST precedence, over the WooCommerce-derived and the Qoblex lifecycle. Bound to the sheet generation the manifest names (lifecycleReview.generation) by `sheetId`. Archived for a SKU holding stock (or whose stock was not read) is refused unless `reason` is filled. A review-set SKU left blank blocks a real prepare. Never column-mapped.',
   },
   'ims-suppliers': {
     columns: ['name'],

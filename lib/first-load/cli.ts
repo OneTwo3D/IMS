@@ -5,13 +5,16 @@
  * File in, file out: it reads the files named in a run manifest and writes into --out. It opens no network socket and
  * no database connection (the module graph imports neither).
  */
+import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { InputError, decisionSkuKey, ingestDataset, type IngestDecisions, mergeIngested, parseColumnMap, type ColumnMap, type DatasetMapping, type IngestedDataset } from './ingest'
 import { renderAccountingTable, renderJson, renderMarkdown } from './report'
 import { DATASET_NAMES, EXIT_CODES, EXIT_CODE_TABLE, IN_TRANSIT_CONVENTIONS, type DatasetName, type InTransitConvention } from './spec'
-import { bindingFromVerification, productStatusBindingFromVerification, normaliseStoreOrigin, parseVisibilityAttestation, verifyWooSnapshotBundle, type VisibilityAttestation, type ProductStatusBinding, type VariantParentsBinding } from './snapshot'
+import { bindingFromVerification, productStatusBindingFromVerification, normaliseStoreOrigin, parseVisibilityAttestation, verifyWooSnapshotBundle, type SnapshotPayload, type VisibilityAttestation, type ProductStatusBinding, type VariantParentsBinding } from './snapshot'
 import { ConfigError, prepare, type PrepareConfig } from './transform'
+import { parseGeneration, type LifecycleDecisionsBinding } from './lifecycle-review/generation'
+import { readDecisionFile } from './lifecycle-review/read-back'
 
 export interface CliIo {
   stdout: (text: string) => void
@@ -39,7 +42,7 @@ export function usageText(): string {
 
 class UsageError extends Error {}
 
-interface Manifest {
+export interface Manifest {
   baseCurrency: string
   asOf: string | null
   inTransitConvention: InTransitConvention | null
@@ -49,10 +52,12 @@ interface Manifest {
   requireVariantParents: boolean
   /** Where the snapshot and its provenance are, for the variant-parents binding. Relative to the manifest. */
   wooSnapshot: { snapshot: string; provenance: string; origin: string | null; visibilityChecked: VisibilityAttestation | null } | null
+  /** The owner lifecycle review the lifecycle-decisions were made on: the generation record first-load:lifecycle-review wrote beside the sheet. Relative to the manifest. */
+  lifecycleReview: { generation: string } | null
   inputs: Array<{ dataset: DatasetName; file: string; columnMap: string | null; supersedesEarlier: boolean }>
 }
 
-const MANIFEST_KEYS = new Set(['formatVersion', 'baseCurrency', 'asOf', 'inTransitConvention', 'purchaseOrderKeyPrefix', 'transferKeyPrefix', 'maxPurchaseTaxRate', 'requireVariantParents', 'wooSnapshot', 'inputs'])
+const MANIFEST_KEYS = new Set(['formatVersion', 'baseCurrency', 'asOf', 'inTransitConvention', 'purchaseOrderKeyPrefix', 'transferKeyPrefix', 'maxPurchaseTaxRate', 'requireVariantParents', 'wooSnapshot', 'lifecycleReview', 'inputs'])
 const INPUT_KEYS = new Set(['dataset', 'file', 'columnMap', 'supersedesEarlier'])
 
 function parseManifest(text: string): Manifest {
@@ -101,6 +106,14 @@ function parseManifest(text: string): Manifest {
     }
     wooSnapshot = { snapshot: wo.snapshot, provenance: wo.provenance, origin, visibilityChecked }
   }
+  let lifecycleReview: Manifest['lifecycleReview'] = null
+  if (m.lifecycleReview !== undefined) {
+    const l = m.lifecycleReview
+    if (typeof l !== 'object' || l === null || Array.isArray(l) || Object.keys(l).some((key) => key !== 'generation') || typeof (l as Record<string, unknown>).generation !== 'string' || (l as Record<string, unknown>).generation === '') {
+      throw new UsageError('manifest lifecycleReview must be an object {"generation": <lifecycle-review.generation.json>} (the record first-load:lifecycle-review wrote beside the sheet)')
+    }
+    lifecycleReview = { generation: (l as Record<string, string>).generation }
+  }
   if (!Array.isArray(m.inputs) || m.inputs.length === 0) throw new UsageError('manifest inputs must be a non-empty array')
   const seen = new Set<string>()
   const inputs: Manifest['inputs'] = []
@@ -113,6 +126,8 @@ function parseManifest(text: string): Manifest {
     if (e.columnMap !== undefined && (typeof e.columnMap !== 'string' || e.columnMap === '')) throw new UsageError(`manifest input ${e.dataset}: columnMap must be a path`)
     if (e.supersedesEarlier !== undefined && typeof e.supersedesEarlier !== 'boolean') throw new UsageError(`manifest input ${e.dataset}: supersedesEarlier must be true or false`)
     if (e.supersedesEarlier === true && e.dataset !== 'products') throw new UsageError(`manifest input ${e.dataset}: supersedesEarlier is only supported for the products dataset`)
+    if (e.dataset === 'lifecycle-decisions' && e.columnMap !== undefined) throw new UsageError('manifest input lifecycle-decisions takes no columnMap: it is the filled review sheet (.xlsx), a CSV export of its Review tab, or a canonical file')
+    if (e.dataset === 'lifecycle-decisions' && inputs.some((earlier) => earlier.dataset === e.dataset)) throw new UsageError('manifest input lifecycle-decisions may be listed once: the decisions of one review sheet')
     if (e.supersedesEarlier === true && !inputs.some((earlier) => earlier.dataset === e.dataset)) throw new UsageError(`manifest input ${e.dataset}: supersedesEarlier needs an earlier file for the same dataset (list the file to be replaced first)`)
     const key = `${e.dataset}\u0000${path.normalize(e.file)}`
     if (seen.has(key)) throw new UsageError(`dataset ${e.dataset} lists the file ${e.file} twice`)
@@ -128,6 +143,7 @@ function parseManifest(text: string): Manifest {
     maxPurchaseTaxRate: optionalString('maxPurchaseTaxRate'),
     requireVariantParents: requireFlag,
     wooSnapshot,
+    lifecycleReview,
     inputs,
   }
 }
@@ -169,31 +185,56 @@ export interface CliDeps {
   prepare?: typeof prepare
 }
 
-export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Promise<number> {
-  let args: Args
+/** Everything a manifest names, read, ingested and bound: what `prepare()` takes. Shared by first-load:prepare and first-load:lifecycle-review. */
+export interface LoadedRun {
+  manifest: Manifest
+  manifestDir: string
+  config: PrepareConfig
+  datasets: Partial<Record<DatasetName, IngestedDataset>>
+  variantParentsBinding: VariantParentsBinding | undefined
+  productStatusBinding: ProductStatusBinding | undefined
+  lifecycleDecisionsBinding: LifecycleDecisionsBinding | undefined
+  /**
+   * With `rawProductStates`: the products dataset's lifecycle cell per SKU (as read, before renames) BEFORE the column map's value map turned it into a
+   * lifecycle (Qoblex "State": Active, Inactive, Archived), for the review sheet. Later files win where they state one.
+   */
+  rawProductStates: Map<string, string>
+  /** The verified snapshot payload, when woo-product-status was verified against it (the review sheet reads names, statuses and stock from it). */
+  wooSnapshot: SnapshotPayload | null
+}
+
+export interface LoadOptions {
+  runId: string | null
+  /** Leave the lifecycle-decisions input and the lifecycleReview binding out of the run (the review sheet shows the lifecycle BEFORE any decision). */
+  withoutDecisions?: boolean
+  rawProductStates?: boolean
+}
+
+export type LoadResult = { ok: true; run: LoadedRun } | { ok: false; exit: number }
+
+const sha256 = (bytes: Uint8Array): string => createHash('sha256').update(bytes).digest('hex')
+
+/** Reads the manifest and every file it names. On a usage or input problem it prints the message (as first-load-prepare does) and returns the exit code. */
+export function loadPrepareRun(manifestPath: string, io: CliIo, options: LoadOptions, tool = 'first-load-prepare', usage: () => string = usageText): LoadResult {
   let manifest: Manifest
   let manifestDir = ''
   try {
-    args = parseArgs(argv)
-    if (args.help) {
-      io.stdout(usageText())
-      return EXIT_CODES.OK
-    }
-    manifestDir = path.dirname(path.resolve(args.manifest))
+    manifestDir = path.dirname(path.resolve(manifestPath))
     let text: string
     try {
-      text = readFileSync(args.manifest, 'utf8')
+      text = readFileSync(manifestPath, 'utf8')
     } catch (error) {
-      throw new UsageError(`cannot read the manifest ${args.manifest}: ${error instanceof Error ? error.message : String(error)}`)
+      throw new UsageError(`cannot read the manifest ${manifestPath}: ${error instanceof Error ? error.message : String(error)}`)
     }
     manifest = parseManifest(text)
   } catch (error) {
     if (error instanceof UsageError) {
-      io.stderr(`first-load-prepare: ${error.message}\n\n${usageText()}`)
-      return EXIT_CODES.USAGE
+      io.stderr(`${tool}: ${error.message}\n\n${usage()}`)
+      return { ok: false, exit: EXIT_CODES.USAGE }
     }
     throw error
   }
+  if (options.withoutDecisions) manifest = { ...manifest, lifecycleReview: null, inputs: manifest.inputs.filter((input) => input.dataset !== 'lifecycle-decisions') }
 
   const resolve = (file: string) => path.resolve(manifestDir, file)
   const parts: Partial<Record<DatasetName, Array<{ ingested: IngestedDataset; supersedes: boolean }>>> = {}
@@ -201,6 +242,8 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
   const maps = new Map<string, ColumnMap>()
   const datasets: Partial<Record<DatasetName, IngestedDataset>> = {}
   const problems: string[] = []
+  const rawProductStates = new Map<string, string>()
+  let decisionsFile: { sheetIds: string[]; bindingTab: { sheetId: string; digest: string } | null; kind: string; sha256: string } | null = null
   try {
     // Pass 1: resolve every column map and check the manifest as a whole BEFORE any dataset file is read, so a missing or malformed data
     // file cannot turn a manifest error (exit 2) into an input error (exit 3).
@@ -240,8 +283,8 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
     }
     for (const [name, kinds] of layouts) {
       if (kinds.size > 1) {
-        io.stderr(`first-load-prepare: dataset ${name} is listed with a mix of wide-warehouse-block files and other files; one run reads a dataset either entirely wide or entirely not wide, because rows of the same SKU and warehouse in two layouts could not be told apart and would be added together. Nothing was read.\n\n${usageText()}`)
-        return EXIT_CODES.USAGE
+        io.stderr(`${tool}: dataset ${name} is listed with a mix of wide-warehouse-block files and other files; one run reads a dataset either entirely wide or entirely not wide, because rows of the same SKU and warehouse in two layouts could not be told apart and would be added together. Nothing was read.\n\n${usage()}`)
+        return { ok: false, exit: EXIT_CODES.USAGE }
       }
     }
     // Pass 2: read the files. The decisions lists that act while a source file is read (non-stock SKUs, SKU by product name) are read FIRST.
@@ -272,7 +315,27 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
         continue
       }
       try {
+        if (input.dataset === 'lifecycle-decisions') {
+          // The filled review sheet (.xlsx), a CSV export of its Review tab, or a canonical file: read into the canonical dataset, keeping the hash of the bytes READ.
+          const read = readDecisionFile(bytes)
+          if (!read.ok) { problems.push(...read.problems.map((p) => `${input.file}: ${p}`)); continue }
+          const fileSha = sha256(bytes)
+          const ingested = ingestDataset('lifecycle-decisions', Buffer.from(read.canonicalCsv, 'utf8'), input.file, null, decisions)
+          ;(parts[input.dataset] ??= []).push({ ingested: { ...ingested, sha256: fileSha, bytes: bytes.length, parts: [{ file: input.file, sha256: fileSha, bytes: bytes.length }] }, supersedes: false })
+          decisionsFile = { sheetIds: read.sheetIds, bindingTab: read.bindingTab, kind: read.kind, sha256: fileSha }
+          continue
+        }
         ;(parts[input.dataset] ??= []).push({ ingested: ingestDataset(input.dataset, bytes, input.file, mapping, decisions), supersedes: input.supersedesEarlier })
+        if (options.rawProductStates && input.dataset === 'products') {
+          // The same file again with the lifecycle cell left as the source states it (the value map removed): the Qoblex State the review sheet shows.
+          const raw = mapping === null ? null : { ...mapping, valueMaps: Object.fromEntries(Object.entries(mapping.valueMaps).filter(([column]) => column !== 'lifecycleStatus')) }
+          const again = raw === null ? parts[input.dataset]!.at(-1)!.ingested : ingestDataset(input.dataset, bytes, input.file, raw, decisions)
+          for (const row of again.rows) {
+            const sku = (row.values.sku ?? '').trim()
+            const state = (row.values.lifecycleStatus ?? '').trim() || ((row.values.active ?? '').trim() === '' ? '' : `active=${(row.values.active ?? '').trim()}`)
+            if (sku !== '' && state !== '') rawProductStates.set(sku, state)
+          }
+        }
       } catch (error) {
         if (error instanceof InputError) problems.push(...error.problems)
         else throw error
@@ -282,14 +345,14 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
     for (const name of Object.keys(parts) as DatasetName[]) datasets[name] = mergeIngested(parts[name]!.map((part) => part.ingested), parts[name]!.map((part) => part.supersedes))
   } catch (error) {
     if (error instanceof InputError) {
-      io.stderr(`first-load-prepare: an input cannot be used, nothing was written:\n${error.problems.map((p) => `  - ${p}`).join('\n')}\n`)
-      return EXIT_CODES.INPUT_UNUSABLE
+      io.stderr(`${tool}: an input cannot be used, nothing was written:\n${error.problems.map((p) => `  - ${p}`).join('\n')}\n`)
+      return { ok: false, exit: EXIT_CODES.INPUT_UNUSABLE }
     }
     throw error
   }
 
   const config: PrepareConfig = {
-    runId: args.runId,
+    runId: options.runId,
     baseCurrency: manifest.baseCurrency,
     asOf: manifest.asOf,
     inTransitConvention: manifest.inTransitConvention,
@@ -318,13 +381,64 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
       expectedOrigin: manifest.wooSnapshot.origin,
       visibilityChecked: manifest.wooSnapshot.visibilityChecked,
     })
+    if (dataset === 'woo-product-status' && verdict.ok && verdict.productStatusSha256 !== null) wooSnapshot = verdict.payload
     return dataset === 'variant-parents' ? bindingFromVerification(verdict) : productStatusBindingFromVerification(verdict)
   }
-  const variantParentsBinding: VariantParentsBinding | undefined = bindingFor('variant-parents')
-  const productStatusBinding: ProductStatusBinding | undefined = bindingFor('woo-product-status')
+  let wooSnapshot: SnapshotPayload | null = null
+  // The owner's decisions are only taken from the review sheet the manifest names (lifecycleReview.generation): the decisions file must carry that sheet's id,
+  // and an .xlsx also its hidden binding tab with the generation digest. Absent the record, a supplied decisions dataset is refused by the transform.
+  const decisionsBinding = (): LifecycleDecisionsBinding | undefined => {
+    if (manifest.lifecycleReview === null) return undefined
+    const bytes = readOrNull(manifest.lifecycleReview.generation)
+    if (bytes === null) return { verified: false, problems: [`the lifecycle review generation record ${manifest.lifecycleReview.generation} could not be read`] }
+    const parsed = parseGeneration(bytes.toString('utf8'))
+    if (!parsed.ok) return { verified: false, problems: [parsed.problem] }
+    const generation = parsed.value
+    if (decisionsFile === null) return { verified: true, sheetId: generation.sheetId, generation: generation.body, fileSha256: null }
+    const found: { sheetIds: string[]; bindingTab: { sheetId: string; digest: string } | null; kind: string } = decisionsFile
+    const why: string[] = []
+    if (found.sheetIds.length === 0) why.push(`no decision row carries a Sheet id (the review sheet ${generation.sheetId} writes it on every row)`)
+    else if (found.sheetIds.length > 1 || found.sheetIds[0] !== generation.sheetId) why.push(`the decisions carry the sheet id(s) ${found.sheetIds.slice(0, 3).join(', ')}, not ${generation.sheetId} (the sheet the generation record describes): the decisions were made on another sheet`)
+    if (found.kind === 'xlsx') {
+      if (found.bindingTab === null) why.push('the workbook\'s hidden binding tab is missing or unreadable')
+      else if (found.bindingTab.sheetId !== generation.sheetId || found.bindingTab.digest !== generation.digest) why.push('the workbook\'s hidden binding tab names another generation (sheet id or digest differ): the workbook is not the sheet this record describes')
+    }
+    return why.length > 0 ? { verified: false, problems: why } : { verified: true, sheetId: generation.sheetId, generation: generation.body, fileSha256: (decisionsFile as { sha256: string }).sha256 }
+  }
+  return {
+    ok: true,
+    run: {
+      manifest, manifestDir, config, datasets,
+      variantParentsBinding: bindingFor('variant-parents'),
+      productStatusBinding: bindingFor('woo-product-status'),
+      lifecycleDecisionsBinding: decisionsBinding(),
+      rawProductStates,
+      wooSnapshot,
+    },
+  }
+}
+
+export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Promise<number> {
+  let args: Args
+  try {
+    args = parseArgs(argv)
+    if (args.help) {
+      io.stdout(usageText())
+      return EXIT_CODES.OK
+    }
+  } catch (error) {
+    if (error instanceof UsageError) {
+      io.stderr(`first-load-prepare: ${error.message}\n\n${usageText()}`)
+      return EXIT_CODES.USAGE
+    }
+    throw error
+  }
+  const loaded = loadPrepareRun(args.manifest, io, { runId: args.runId })
+  if (!loaded.ok) return loaded.exit
+  const { config, datasets, variantParentsBinding, productStatusBinding, lifecycleDecisionsBinding } = loaded.run
   let result
   try {
-    result = (deps.prepare ?? prepare)({ config, datasets, variantParentsBinding, productStatusBinding })
+    result = (deps.prepare ?? prepare)({ config, datasets, variantParentsBinding, productStatusBinding, lifecycleDecisionsBinding, dryRun: args.dryRun })
   } catch (error) {
     if (error instanceof ConfigError) {
       io.stderr(`first-load-prepare: invalid run configuration: ${error.message}\n`)

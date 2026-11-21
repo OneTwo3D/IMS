@@ -42,6 +42,7 @@ import { isPurchasableProductStatus } from '@/lib/products/lifecycle'
 import { joinVariantParents, type CatalogueView } from './variant-parents'
 import { planSkuRenames, type SkuRenameItem } from './sku-renames'
 import { boundProblems, type ProductStatusBinding, type VariantParentsBinding } from './snapshot'
+import { LIFECYCLE_DECISION_STATUSES, describeFigure, figureBlocksArchive, type LifecycleDecisionLabel, type LifecycleDecisionsBinding, type StockFigure } from './lifecycle-review/generation'
 import {
   accountRows,
   assertWithinImporterLimits,
@@ -107,6 +108,14 @@ export interface PrepareInput {
    * refused (ERROR PRODUCT_STATUS_NOT_BOUND): a lifecycle is never taken from a file that was not verified against the snapshot.
    */
   productStatusBinding?: ProductStatusBinding
+  /**
+   * Proof that the lifecycle-decisions dataset is the owner's filled review sheet of ONE generation (see lib/first-load/lifecycle-review/generation.ts). Supplied
+   * and not proved, the dataset is refused (ERROR LIFECYCLE_DECISIONS_NOT_BOUND). Proved, it also names the review set: every review-set SKU left without a
+   * decision blocks the run (ERROR LIFECYCLE_DECISION_MISSING), or is only reported in a dry run (`dryRun`).
+   */
+  lifecycleDecisionsBinding?: LifecycleDecisionsBinding
+  /** True for `first-load:prepare --dry-run` (and the review sheet's own preview run): an undecided review-set SKU is a WARNING there, an ERROR otherwise. */
+  dryRun?: boolean
 }
 
 export type Severity = 'ERROR' | 'WARNING' | 'INFO'
@@ -233,6 +242,22 @@ export interface PrepareResult {
   report: PrepareReport
   /** True when any record was rejected or any ERROR finding exists. Then `outputs` is empty. */
   blocking: boolean
+  /**
+   * NOT PART OF THE REPORT: the catalogue as it would load (every accepted product and VARIABLE parent, with its final lifecycle and where that came from),
+   * and the accepted SKU renames. The owner lifecycle review sheet (lib/first-load/lifecycle-review) reads them; nothing is written from them.
+   */
+  catalogue: CatalogueEntry[]
+  skuRenames: Array<{ from: string; to: string }>
+}
+
+export interface CatalogueEntry {
+  sku: string
+  name: string
+  type: ProductType
+  parentSku: string
+  lifecycle: string
+  /** `qoblex`: derived from the Qoblex row (a WooCommerce status that agrees with it leaves it `qoblex`); `woo`: the WooCommerce status changed it; `decision`: the owner's lifecycle-decisions row. */
+  lifecycleSource: 'qoblex' | 'woo' | 'decision'
 }
 
 // ---------------------------------------------------------------------------
@@ -393,6 +418,10 @@ class Run {
   variantParentsRefused = false
   variantParentSummary = { supplied: false, rowsRead: 0, variantsJoined: 0, parentsEmitted: 0, parentsWithoutQoblexVariant: 0 }
   productStatusSummary = { supplied: false, bound: false, rowsRead: 0, productsMatched: 0 }
+  /** The accepted sku-renames (from -> to), for the review sheet. */
+  acceptedRenames: Array<{ from: string; to: string }> = []
+  /** Catalogue keys whose lifecycle the owner decided (lifecycle-decisions). */
+  decidedKeys = new Set<string>()
 
   constructor(public input: PrepareInput) {}
 
@@ -529,6 +558,7 @@ function loadSkuRenames(run: Run): void {
     }
   }
   run.input = { ...run.input, datasets }
+  run.acceptedRenames = [...accepted.values()].map((item) => ({ from: item.from, to: item.to }))
   for (const item of accepted.values()) {
     const perDataset = counts.get(item) ?? new Map<DatasetName, number>()
     const where = [...perDataset.entries()].map(([name, n]) => `${n} cell(s) in ${name}`).join(', ')
@@ -668,15 +698,18 @@ function applyLifecycleFromWoo(run: Run): void {
   // Decide the conflicts AFTER the sources are merged: a woo-products conflict does not matter for a SKU the bound snapshot states (the snapshot's status stands). What is left is
   // an ERROR for a catalogue simple/KIT/BOM product that therefore gets no status, and only a WARNING for a SKU that is no such product (nothing would have used it).
   const conflicts = [...fromSnapshot.conflicts.map((c) => ({ key: c.key, text: `${c.text} (woo-product-status)` })), ...fromExport.conflicts.filter((c) => !fromSnapshot.status.has(c.key)).map((c) => ({ key: c.key, text: `${c.text} (woo-products)` }))]
+  // ONE predicate (#1119 R2 MED-1): the products the loop below gives their own WooCommerce status, NON_INVENTORY included, are exactly the ones a conflict blocks.
   const usesStatus = (key: string): boolean => {
     const e = run.cat.get(key)
-    return e !== undefined && (e.type === 'SIMPLE' || e.type === 'KIT' || e.type === 'BOM') && e.parentSku === ''
+    return e !== undefined && takesOwnWooStatus(e)
   }
   const blocking = conflicts.filter((c) => usesStatus(c.key))
   const harmless = conflicts.filter((c) => !usesStatus(c.key))
   const list = (rows: typeof conflicts) => `${rows.slice(0, 20).map((c) => c.text).join('; ')}${rows.length > 20 ? `; ... and ${rows.length - 20} more` : ''}`
-  if (blocking.length > 0) run.find('ERROR', 'LIFECYCLE_WOO_STATUS_CONFLICT', `${blocking.length} product(s) appear more than once with different WooCommerce statuses and the bound snapshot does not state one, so their lifecycle cannot be decided and none is taken from WooCommerce for them (fix the source rows): ${list(blocking)}`, undefined, blocking.map((c) => c.text.split(':')[0]))
-  if (harmless.length > 0) run.find('WARNING', 'LIFECYCLE_WOO_STATUS_CONFLICT_UNUSED', `${harmless.length} SKU(s) appear more than once with different WooCommerce statuses, but none is a simple, KIT or BOM product of the catalogue, so no lifecycle depends on them: ${list(harmless)}`, undefined, harmless.map((c) => c.text.split(':')[0]))
+  // The wording says which source left the SKU undecided (#1119 R2 (e)): with no bound snapshot there is no snapshot status to fall back on.
+  const snapshotNote = run.productStatusSummary.bound ? 'and the bound snapshot does not state one' : run.productStatusSummary.supplied ? 'and the woo-product-status dataset was refused (not bound), so no snapshot status can decide it' : 'and no woo-product-status snapshot was supplied to decide it'
+  if (blocking.length > 0) run.find('ERROR', 'LIFECYCLE_WOO_STATUS_CONFLICT', `${blocking.length} product(s) appear more than once with different WooCommerce statuses ${snapshotNote}, so their lifecycle cannot be decided and none is taken from WooCommerce for them (fix the source rows): ${list(blocking)}`, undefined, blocking.map((c) => c.text.split(':')[0]))
+  if (harmless.length > 0) run.find('WARNING', 'LIFECYCLE_WOO_STATUS_CONFLICT_UNUSED', `${harmless.length} SKU(s) appear more than once with different WooCommerce statuses, but none is a simple, KIT, BOM or NON_INVENTORY product of the catalogue (the products that take their own WooCommerce status), so no lifecycle depends on them: ${list(harmless)}`, undefined, harmless.map((c) => c.text.split(':')[0]))
   const conflicted = new Set<string>(conflicts.map((c) => c.key))
   const wooStatus = new Map<string, string>()
   const stated = (map: Map<string, string>) => [...map.values()].some((status) => status !== '')
@@ -685,32 +718,41 @@ function applyLifecycleFromWoo(run: Run): void {
   // The bound snapshot is authoritative over a hand-made export.
   for (const [key, status] of fromSnapshot.status) wooStatus.set(key, status)
   if (run.has('products')) {
-    const unusable: string[] = []
+    const unusable: Record<'woo-product-status' | 'woo-products', string[]> = { 'woo-product-status': [], 'woo-products': [] }
     const absent: string[] = []
     let matched = 0
     for (const entry of run.cat.values()) {
-      if (entry.type === 'VARIABLE' || entry.type === 'VARIANT' || entry.parentSku !== '') continue
+      if (!takesOwnWooStatus(entry)) continue
       if (conflicted.has(entry.key)) continue
       const status = wooStatus.get(entry.key)
       if (status === undefined) {
-        if (entry.type === 'SIMPLE' || entry.type === 'KIT' || entry.type === 'BOM') absent.push(entry.sku)
+        absent.push(entry.sku)
         continue
       }
       if (fromSnapshot.status.has(entry.key)) matched++
       const mapped = wooLifecycleOf(status)
-      if (mapped === undefined) { unusable.push(`${entry.sku}: ${entry.lifecycle}${status === '' ? ', no WooCommerce status' : `, unmapped WooCommerce status ${JSON.stringify(status)}`}`); continue }
+      // Attributed to the dataset the status was taken from (#1119 R2 (b)): the bound snapshot wins where both name the SKU.
+      if (mapped === undefined) { unusable[fromSnapshot.status.has(entry.key) ? 'woo-product-status' : 'woo-products'].push(`${entry.sku}: ${entry.lifecycle}${status === '' ? ', no WooCommerce status' : `, unmapped WooCommerce status ${JSON.stringify(status)}`}`); continue }
       takeLifecycleFromWoo(run, entry, entry.type, status, mapped)
     }
     run.productStatusSummary.productsMatched = matched
     // No row states a status at all: the column is simply not in the file (woo-products need not carry it), so nothing is listed.
-    if (unusable.length > 0 && (stated(fromExport.status) || stated(fromSnapshot.status))) run.find('WARNING', 'LIFECYCLE_WOO_STATUS_UNUSABLE', `${unusable.length} product(s) are in woo-products or woo-product-status but their row carries no usable status (blank or not publish/draft/pending/private), so their lifecycle stays the Qoblex one and cannot be checked against WooCommerce: add the status, or check each by hand`, 'woo-products', unusable)
-    // A simple, KIT or BOM product that WooCommerce does not hold keeps its Qoblex lifecycle, which a later IMS to WooCommerce push may turn into a WooCommerce status (DRAFT writes draft; ACTIVE and EOL write publish).
+    if (stated(fromExport.status) || stated(fromSnapshot.status)) {
+      for (const dataset of ['woo-product-status', 'woo-products'] as const) {
+        const list = unusable[dataset]
+        if (list.length > 0) run.find('WARNING', 'LIFECYCLE_WOO_STATUS_UNUSABLE', `${list.length} product(s) are in ${dataset} but their row carries no usable status (blank or not publish/draft/pending/private), so their lifecycle stays the Qoblex one and cannot be checked against WooCommerce: add the status, or check each by hand`, dataset, list)
+      }
+    }
+    // A simple, KIT, BOM or NON_INVENTORY product that WooCommerce does not hold keeps its Qoblex lifecycle, which a later IMS to WooCommerce push may turn into a WooCommerce status (DRAFT writes draft; ACTIVE and EOL write publish).
     // With the snapshot's woo-product-status that is only a product genuinely absent from WooCommerce; without any status source it is every one of them.
     if (absent.length > 0) {
+      // #1119 R2 (a): a woo-product-status dataset that was supplied but refused is not "not supplied".
       const sourceNote = run.productStatusSummary.bound || stated(fromExport.status)
         ? 'WooCommerce has no product with that SKU (it is absent from the woo-product-status snapshot and from woo-products)'
-        : 'no WooCommerce status was supplied (supply woo-product-status from the WooCommerce snapshot: first-load:woo-snapshot writes it)'
-      run.find('WARNING', 'LIFECYCLE_NOT_FROM_WOO', `${absent.length} simple, KIT or BOM product(s) keep the lifecycle derived from the Qoblex State: ${sourceNote}. A later IMS to WooCommerce push may create or change their WooCommerce status (DRAFT writes draft; ACTIVE and EOL write publish; private and pending are unpublished and are also written back as draft)`, 'products', absent)
+        : run.productStatusSummary.supplied
+          ? 'the woo-product-status dataset was supplied but REFUSED (PRODUCT_STATUS_NOT_BOUND: not bound to a verified WooCommerce snapshot), so no WooCommerce status was taken from it'
+          : 'no WooCommerce status was supplied (supply woo-product-status from the WooCommerce snapshot: first-load:woo-snapshot writes it)'
+      run.find('WARNING', 'LIFECYCLE_NOT_FROM_WOO', `${absent.length} simple, KIT, BOM or NON_INVENTORY product(s) keep the lifecycle derived from the Qoblex State: ${sourceNote}. A later IMS to WooCommerce push may create or change their WooCommerce status (DRAFT writes draft; ACTIVE and EOL write publish; private and pending are unpublished and are also written back as draft)`, 'products', absent)
     }
   }
   const changed = run.lifecycleFromWoo
@@ -721,6 +763,129 @@ function applyLifecycleFromWoo(run: Run): void {
     const tally = new Map<string, number>()
     for (const c of changed) tally.set(`${c.qoblex} -> ${c.result}`, (tally.get(`${c.qoblex} -> ${c.result}`) ?? 0) + 1)
     run.find('INFO', 'LIFECYCLE_TAKEN_FROM_WOO_COUNT', `${changed.length} product(s) and variation(s) take their lifecycle from WooCommerce instead of the Qoblex state (${[...tally.entries()].sort((a, b) => cmp(a[0], b[0])).map(([k, n]) => `${k}: ${n}`).join(', ')}); each is listed as LIFECYCLE_TAKEN_FROM_WOO`, 'products')
+  }
+}
+
+/** A catalogue product that takes its lifecycle from its OWN WooCommerce product status: every product that is not a VARIABLE parent and not a variation (SIMPLE, KIT, BOM and NON_INVENTORY). */
+function takesOwnWooStatus(entry: CatEntry): boolean {
+  return entry.type !== 'VARIABLE' && entry.type !== 'VARIANT' && entry.parentSku === ''
+}
+
+const DECISION_LABELS = Object.keys(LIFECYCLE_DECISION_STATUSES) as LifecycleDecisionLabel[]
+
+/**
+ * OWNER DECISIONS (lifecycle-decisions): the owner's filled lifecycle review sheet. HIGHEST precedence: it runs after the Qoblex lifecycle and after every
+ * WooCommerce-derived one (variant-parents and woo-product-status), so a decided SKU loads with the decided lifecycle whatever those said, and every later check
+ * (transfers, purchase orders) sees it. Bound to ONE sheet generation (LifecycleDecisionsBinding): an unbound dataset is refused whole.
+ *
+ * Every row is reported. Refused (REJECTED, blocking): a bad SKU, a SKU that is not a row of the review sheet (UNKNOWN_SKU: decisions are keyed by the IMS SKU
+ * exactly as the sheet shows it), a SKU listed twice (every row of it), a status that is not one of the four labels, a SKU this run does not load, and Archived
+ * for a SKU holding stock in Qoblex (at generation or in this run's stock-lots), WooCommerce or the WMS, or whose WooCommerce or WMS figure was not read, unless
+ * the override reason is filled (then applied and reported, WARNING ARCHIVED_WITH_STOCK_OVERRIDE). A review-set SKU with no decision (no row, or a blank
+ * status) blocks the run (ERROR LIFECYCLE_DECISION_MISSING); a dry run reports it as a WARNING.
+ */
+function applyLifecycleDecisions(run: Run): void {
+  const binding = run.input.lifecycleDecisionsBinding
+  const supplied = run.has('lifecycle-decisions')
+  if (!supplied && binding === undefined) return
+  const rows = run.rows('lifecycle-decisions')
+  const problems: string[] = []
+  if (binding === undefined) problems.push('the manifest does not name lifecycleReview.generation (the record of the review sheet the decisions were made on)')
+  else if (!binding.verified) problems.push(...binding.problems)
+  else if (supplied) {
+    const dataset = run.input.datasets['lifecycle-decisions']!
+    if (dataset.parts.length !== 1 || binding.fileSha256 === null || dataset.parts[0].sha256 !== binding.fileSha256) problems.push('the lifecycle-decisions bytes read are not the bytes that were bound to the review sheet')
+  }
+  if (binding === undefined || !binding.verified || problems.length > 0) {
+    for (const row of rows) run.add('lifecycle-decisions', row.line, row.values.sku, 'EXCLUDED', 'NOT_BOUND_TO_REVIEW', 'the decisions are not bound to a verified lifecycle review sheet, so no lifecycle is taken from them')
+    run.find('ERROR', 'LIFECYCLE_DECISIONS_NOT_BOUND', `the owner lifecycle decisions were REFUSED: ${boundProblems(problems).join('; ')}. Generate the sheet with first-load:lifecycle-review, have it filled, and name its generation record in the manifest as lifecycleReview.generation.`, 'lifecycle-decisions')
+    return
+  }
+  const generation = binding.generation
+  const review = new Map(generation.review.map((entry) => [entry.sku, entry]))
+  // The sheet was generated from these inputs: a run on different ones is not refused (a fresher export is normal), but it is never silent.
+  const partsOf = (name: DatasetName) => (run.input.datasets[name]?.parts ?? []).map((part) => part.sha256)
+  const same = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i])
+  const changed: string[] = []
+  if (!same(partsOf('products'), generation.inputs.products)) changed.push('the products file(s)')
+  if (!same(partsOf('stock-lots'), generation.inputs.stockLots)) changed.push('the stock-lots file(s)')
+  const statusBinding = run.input.productStatusBinding
+  if (statusBinding?.verified !== true || statusBinding.snapshotPayloadSha256 !== generation.inputs.snapshotPayloadSha256) changed.push('the WooCommerce snapshot')
+  if (changed.length > 0) run.find('WARNING', 'LIFECYCLE_REVIEW_INPUTS_CHANGED', `the review sheet ${binding.sheetId} was generated from other inputs than this run reads (${changed.join(', ')}): its review set and stock figures are those of the sheet's own inputs; this run's Qoblex stock is still checked for an Archived decision. Generate a new sheet if products were added or changed since`, 'lifecycle-decisions')
+  // The Qoblex stock THIS run reads (stock-lots, after renames): a fresher export than the sheet's can only add a reason to refuse an Archived decision.
+  const stockNow = new Map<string, Dec>()
+  for (const row of run.rows('stock-lots')) {
+    const sku = parseSku(row.values.sku ?? '')
+    const qty = parseDecimal(row.values.qty ?? '', 'qty', NUMERIC_LIMITS.stockQty, { allowNegative: true })
+    if (sku.ok && qty.ok) stockNow.set(sku.key, (stockNow.get(sku.key) ?? new D(0)).add(qty.value))
+  }
+  const bySku = new Map<string, CanonRow[]>()
+  for (const row of rows) {
+    const sku = parseSku(row.values.sku)
+    if (!sku.ok) { run.add('lifecycle-decisions', row.line, row.values.sku, 'REJECTED', 'BAD_SKU', sku.reason); continue }
+    if (!review.has(sku.sku)) {
+      run.add('lifecycle-decisions', row.line, sku.sku, 'REJECTED', 'UNKNOWN_SKU', `${sku.sku} is not a row of the review sheet ${binding.sheetId} (a decision is keyed by the IMS SKU exactly as the sheet shows it; a row added to the sheet is never applied)`)
+      continue
+    }
+    bySku.set(sku.sku, [...(bySku.get(sku.sku) ?? []), row])
+  }
+  const settled = new Set<string>()
+  let applied = 0
+  for (const [sku, list] of [...bySku.entries()].sort((a, b) => cmp(a[0], b[0]))) {
+    settled.add(sku)
+    if (list.length > 1) {
+      for (const row of list) run.add('lifecycle-decisions', row.line, sku, 'REJECTED', 'DUPLICATE_DECISION', `${sku} has ${list.length} decision rows; which one is meant cannot be decided`)
+      continue
+    }
+    const row = list[0]
+    const label = (row.values.status ?? '').trim()
+    const reason = (row.values.reason ?? '').trim()
+    if (label === '') {
+      settled.delete(sku)
+      run.add('lifecycle-decisions', row.line, sku, 'EXCLUDED', 'UNDECIDED', 'the New IMS status is blank: no decision yet')
+      continue
+    }
+    const decided = DECISION_LABELS.find((l) => l.toLowerCase() === label.toLowerCase())
+    if (decided === undefined) {
+      run.add('lifecycle-decisions', row.line, sku, 'REJECTED', 'BAD_STATUS', `status ${JSON.stringify(label.slice(0, 60))} is not one of ${DECISION_LABELS.join(', ')}`)
+      continue
+    }
+    const lifecycle = LIFECYCLE_DECISION_STATUSES[decided]
+    const key = skuKey(sku)
+    if (run.exclusions.has(key)) { run.add('lifecycle-decisions', row.line, sku, 'EXCLUDED', 'SKU_EXCLUDED', `${sku} is on sku-exclusions, so it is not loaded and the decision changes nothing`); continue }
+    const entry = run.cat.get(key)
+    if (entry === undefined || entry.sku !== sku) {
+      run.add('lifecycle-decisions', row.line, sku, 'REJECTED', 'PRODUCT_NOT_LOADED', `${sku} is not in this run's catalogue (its product row was refused, or it is not in the products dataset), so the decision cannot be applied`)
+      continue
+    }
+    if (lifecycle === 'ARCHIVED') {
+      const at = review.get(sku)!
+      const now = stockNow.get(key)
+      const figures: Array<[string, StockFigure]> = [
+        ['Qoblex stock at generation', { kind: 'qty', qty: at.qoblexStock }],
+        ['Qoblex stock in this run', now === undefined ? { kind: 'absent' } : { kind: 'qty', qty: fmt(now) }],
+        ['WooCommerce stock', at.wooStock],
+        ['WMS physical stock', at.wmsStock],
+      ]
+      const holds = figures.filter(([, f]) => figureBlocksArchive(f)).map(([name, f]) => `${name} ${describeFigure(f)}`)
+      if (holds.length > 0 && reason === '') {
+        run.add('lifecycle-decisions', row.line, sku, 'REJECTED', 'ARCHIVED_WITH_STOCK', `Archived is refused: ${holds.join(', ')} (a figure that was not read cannot prove there is no stock). Fill the Override reason to archive it anyway`)
+        continue
+      }
+      if (holds.length > 0) run.find('WARNING', 'ARCHIVED_WITH_STOCK_OVERRIDE', `${sku} is archived although ${holds.join(', ')}; override reason: ${reason}`, 'lifecycle-decisions', [sku])
+    }
+    const before = entry.lifecycle
+    entry.lifecycle = lifecycle
+    entry.cells.lifecycleStatus = lifecycle
+    run.decidedKeys.add(key)
+    applied++
+    run.add('lifecycle-decisions', row.line, sku, 'EMITTED', 'LIFECYCLE_DECIDED', `${decided}: loaded as ${lifecycle}`)
+    run.find('INFO', 'LIFECYCLE_FROM_DECISION', `${sku}: owner decision ${decided}, loaded as ${lifecycle} (the first load would otherwise set ${before})${reason === '' ? '' : `; reason: ${reason}`}`, 'lifecycle-decisions', [sku])
+  }
+  if (applied > 0) run.find('INFO', 'LIFECYCLE_FROM_DECISION_COUNT', `${applied} product(s) take their lifecycle from the owner's review sheet ${binding.sheetId}; each is listed as LIFECYCLE_FROM_DECISION`, 'lifecycle-decisions')
+  const missing = generation.review.filter((entry) => !settled.has(entry.sku) && !run.exclusions.has(skuKey(entry.sku))).map((entry) => entry.sku)
+  if (missing.length > 0) {
+    run.find(run.input.dryRun === true ? 'WARNING' : 'ERROR', 'LIFECYCLE_DECISION_MISSING', `${missing.length} product(s) of the review sheet ${binding.sheetId} have no decision (the New IMS status is blank or the row is missing)${run.input.dryRun === true ? ': a real prepare is BLOCKED until each is decided' : ', so the real prepare is blocked until each is decided'}`, 'lifecycle-decisions', missing)
   }
 }
 
@@ -2345,6 +2510,7 @@ export function prepare(input: PrepareInput): PrepareResult {
   loadImsSkus(run)
   loadCatalogue(run)
   applyLifecycleFromWoo(run)
+  applyLifecycleDecisions(run)
   loadRecipes(run)
   if (run.has('products')) checkRecipesPresent(run)
   loadImsSuppliers(run)
@@ -2499,5 +2665,9 @@ export function prepare(input: PrepareInput): PrepareResult {
     applyTimeChecks: APPLY_TIME_CHECKS.map((c) => ({ ...c })),
     selfCheckFailures: run.selfCheck,
   }
-  return { outputs: finalOutputs, report, blocking: blocking || run.selfCheck.length > 0 }
+  const fromWoo = new Set(run.lifecycleFromWoo.map((c) => c.key))
+  const catalogue: CatalogueEntry[] = [...run.cat.values()]
+    .map((e) => ({ sku: e.sku, name: e.name, type: e.type, parentSku: e.parentSku, lifecycle: e.lifecycle, lifecycleSource: run.decidedKeys.has(e.key) ? 'decision' as const : fromWoo.has(e.key) ? 'woo' as const : 'qoblex' as const }))
+    .sort((a, b) => cmp(a.sku, b.sku))
+  return { outputs: finalOutputs, report, blocking: blocking || run.selfCheck.length > 0, catalogue, skuRenames: run.acceptedRenames }
 }

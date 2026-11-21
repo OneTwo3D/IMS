@@ -7,7 +7,7 @@
  *   GET /wp-json/wc/v3/products/{id}/variations?status&per_page&page
  *
  * with HTTP Basic auth against the key and secret it was started with, `X-WP-Total` / `X-WP-TotalPages` headers, and an empty list for a page past
- * the end. EVERY request is recorded; a request whose method is not GET or HEAD is a VIOLATION (recorded, answered 405), so a test can prove the
+ * the end, honouring a top-level `_fields` list as WordPress does (unless `ignoreFields`). EVERY request is recorded; a request whose method is not GET or HEAD is a VIOLATION (recorded, answered 405), so a test can prove the
  * command never wrote to the store. `intercept` lets a test change one response (drop rows, lie about a total, fail a page) after the fake built it.
  * Nothing the fake does depends on the code under test.
  */
@@ -92,6 +92,11 @@ export interface FakeCatalogueOptions {
   statusTotalOverride?: Readonly<Record<string, number>>
   /** Products no longer listed whose variations endpoint still answers (a store that deletes lazily). */
   ghosts?: readonly FakeParent[]
+  /**
+   * WordPress honours a top-level `_fields` list: only the named top-level fields of each row are sent. This fake does the same (so a field the walk reads
+   * but forgets to ask for is missing, as on a real store); `ignoreFields` models a store that does not (a plugin, a cache, an older version) and sends whole rows.
+   */
+  ignoreFields?: boolean
   intercept?: (context: InterceptContext, response: FakeResponse) => FakeResponse
 }
 
@@ -139,10 +144,12 @@ export async function startFakeCatalogue(options: FakeCatalogueOptions): Promise
       const key = `${context.route}:${context.parentId ?? ''}:${page}:${query.status ?? 'any'}`
       const attempt = (attempts.get(key) ?? 0) + 1
       attempts.set(key, attempt)
+      const wantedFields = (query._fields ?? '').split(',').map((f) => f.trim()).filter((f) => f !== '')
+      const slice = rows.slice((page - 1) * perPage, page * perPage)
       const built: FakeResponse = {
         status: 200,
         headers: options.omitPaginationHeaders ? {} : { 'x-wp-total': String(override ?? rows.length), 'x-wp-totalpages': String(totalPages) },
-        body: rows.slice((page - 1) * perPage, page * perPage),
+        body: options.ignoreFields || wantedFields.length === 0 ? slice : slice.map((row) => Object.fromEntries(Object.entries(row as Record<string, unknown>).filter(([name]) => wantedFields.includes(name)))),
       }
       reply(options.intercept ? options.intercept({ ...context, page, attempt, probe: query.status !== undefined && query.status !== 'any', status: query.status ?? 'any' }, built) : built)
     }
