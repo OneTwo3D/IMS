@@ -246,7 +246,7 @@ test('prepare takes the lifecycle of simple products from the bound snapshot: pr
   assert.equal(lifecycle.get('SIM-EOL'), 'EOL', 'Woo publish does not revive a Qoblex EOL')
   assert.equal(lifecycle.get('Q-ONLY'), 'ACTIVE', 'absent from Woo: the Qoblex lifecycle')
   const warning = ran.report.findings.find((f) => f.code === 'LIFECYCLE_NOT_FROM_WOO')
-  assert.match(warning?.message ?? '', /^1 simple, KIT or BOM product\(s\) keep the lifecycle derived from the Qoblex State: WooCommerce has no product with that SKU/)
+  assert.match(warning?.message ?? '', /^1 simple, KIT, BOM or NON_INVENTORY product\(s\) keep the lifecycle derived from the Qoblex State: WooCommerce has no product with that SKU/)
   assert.deepEqual(ran.report.wooProductStatus, { supplied: true, bound: true, rowsRead: 8, productsMatched: 5 })
   // every row reported
   assert.equal(emittedIn(ran.report, 'woo-product-status', 'WOO_STATUS_ROW'), 8)
