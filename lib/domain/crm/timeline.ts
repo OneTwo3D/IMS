@@ -2,16 +2,19 @@
  * CUSTOMER TIMELINE (CRM foundation): one chronological, newest-first list of what happened for a customer or a whole cluster. READ-ONLY.
  *
  * Sources, each its own bounded query (so a customer with thousands of orders never loads them all): the order placed, the order cancelled, the invoice
- * issued, a receipt, a credit note / refund, a refund payment, an expected return, a warehouse return and (behind the `crm_timeline_emails_enabled` switch, off by default) a customer e-mail queued for one of the orders. An event carries ids, numbers, dates, an
+ * issued, a receipt, a credit note / refund, a refund payment, an expected return, a warehouse return and (behind the `crm_timeline_emails_enabled` switch, off by default) a customer e-mail queued for one of the orders.
+ * The e-mail source is ONE bounded raw query (email_outbox joined to sales_orders on referenceId, `customerId = ANY(...)`, the cursor bound, ORDER BY createdAt desc, id desc, LIMIT), so no order id is ever listed in a
+ * query and a cluster with any number of orders stays far below Prisma's bind-value limit (32,766). An event carries ids, numbers, dates, an
  * amount and a status, and NEVER a name, email, address, note or reason text, so rendering the timeline reveals nothing the order page does not.
  *
  * KEYSET PAGINATION. Events sort by (time desc, key desc); the cursor is the last event's `${epochMs}:${key}`. Each source is read with `time <= cursor
  * time` and `take = limit + TIE_ROOM`, then the merged list is cut strictly after the cursor, so a page boundary that falls inside a run of events with
  * the same millisecond neither repeats nor skips one (up to TIE_ROOM ties per source).
  */
-import type { Prisma } from '@/app/generated/prisma/client'
+import { Prisma } from '@/app/generated/prisma/client'
 import { businessDateYmd } from '@/lib/business-date'
 import { ERASURE_PLACEHOLDER_EMAIL } from '@/lib/domain/erasure/erasure-record'
+import { STOREFRONT_CONFIRMATION_KIND, STOREFRONT_DELIVERED_KIND, shipmentIdOfPartialKind } from '@/lib/domain/storefront-customer-email/constants'
 
 export const TIMELINE_PAGE_SIZE = 50
 const TIE_ROOM = 50
@@ -50,9 +53,28 @@ export interface TimelinePage {
   nextCursor: string | null
 }
 
-type Reader = Pick<Prisma.TransactionClient, 'salesOrder' | 'payment' | 'salesOrderRefund' | 'returnExpectation' | 'wmsReturnsInbox' | 'emailOutbox'>
+type Reader = Pick<Prisma.TransactionClient, 'salesOrder' | 'payment' | 'salesOrderRefund' | 'returnExpectation' | 'wmsReturnsInbox' | '$queryRaw'>
 
 const orderLabel = (o: { id: string; orderNumber: string | null; externalOrderNumber: string | null }) => o.orderNumber ?? o.externalOrderNumber ?? o.id.slice(0, 8)
+
+const EMAIL_KIND_LABEL: Record<string, string> = {
+  SALES_ORDER_CONFIRMATION: 'Order confirmation',
+  INVOICE: 'Invoice',
+  ACCOUNTING_INVOICE: 'Invoice',
+  SHIPMENT_DISPATCHED: 'Dispatch notice',
+  SALES_QUOTE: 'Quote',
+  [STOREFRONT_CONFIRMATION_KIND]: 'Order confirmation',
+  [STOREFRONT_DELIVERED_KIND]: 'Delivered notice',
+}
+
+/** A human label for an e-mail kind code. A partial-shipment kind carries the shipment id after a colon, which is dropped; an unknown code is shown in plain words, never raw. */
+export function emailKindLabel(kind: string): string {
+  if (shipmentIdOfPartialKind(kind) !== null) return 'Partial shipment notice'
+  const known = EMAIL_KIND_LABEL[kind]
+  if (known) return known
+  const words = kind.split(':')[0]!.toLowerCase().replace(/_/g, ' ').trim()
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : 'Email'
+}
 
 export function encodeCursor(event: Pick<TimelineEvent, 'at' | 'key'>): string {
   return `${new Date(event.at).getTime()}:${event.key}`
@@ -100,6 +122,8 @@ export function pageEvents(all: TimelineEvent[], cursor: { atMs: number; key: st
   return { events, nextCursor: after.length > limit ? encodeCursor(events[events.length - 1]!) : null }
 }
 
+interface EmailRow { id: string; kind: string; status: string; createdAt: Date; orderId: string; orderNumber: string | null; externalOrderNumber: string | null; customerId: string | null }
+
 export async function loadTimeline(db: Reader, customerIds: string[], options: { cursor?: string | null; limit?: number; includeEmails?: boolean } = {}): Promise<TimelinePage> {
   const limit = Math.min(Math.max(options.limit ?? TIMELINE_PAGE_SIZE, 1), 200)
   const cursor = decodeCursor(options.cursor)
@@ -109,14 +133,24 @@ export async function loadTimeline(db: Reader, customerIds: string[], options: {
   const inOrder = { customerId: { in: customerIds } }
   const orderSelect = { id: true, orderNumber: true, externalOrderNumber: true, customerId: true } as const
 
-  // E-MAILS (switch ON only): the outbox keys an e-mail to an order by (referenceType, referenceId), with no relation, so the cluster's order ids come first (ids and labels only).
-  // The event time is `sentAt ?? createdAt`, which Prisma cannot sort on, so the two populations are read separately: sent rows by sentAt, unsent ones by createdAt.
-  // A row the erasure scrubbed (address replaced by the placeholder) is dropped: it belongs to an erased person and shows nothing about them.
-  const emailOrders = options.includeEmails ? await db.salesOrder.findMany({ where: inOrder, select: orderSelect }) : []
-  const emailWhere = { referenceType: 'SalesOrder', referenceId: { in: emailOrders.map((o) => o.id) }, NOT: { toEmail: ERASURE_PLACEHOLDER_EMAIL } }
-  const emailSelect = { id: true, kind: true, status: true, sentAt: true, createdAt: true, referenceId: true } as const
+  // E-MAILS (switch ON only): the outbox keys an e-mail to an order by (referenceType, referenceId), with no relation, so ONE raw query joins it to the cluster's orders (customerId = ANY(ids): one bound array, never a list of order ids).
+  // Bound parameters only (tagged `Prisma.sql`), no string interpolation. The event time is ALWAYS `createdAt` (when the e-mail was queued): it never changes, so a pending e-mail that is sent between two page loads cannot move
+  // across a cursor and be skipped. `sentAt` is not used. The status shows whether it went.
+  // Only referenceType 'SalesOrder' is read: every customer e-mail IMS queues (confirmation, invoice, dispatch, quote, storefront notices) is keyed to the sales order; other types (a purchase order's e-mail) are for suppliers.
+  // An erased order (erasedAt set) and a row the erasure scrubbed (address replaced by the placeholder) are dropped: they belong to an erased person and show nothing about them.
+  const emailRows = !options.includeEmails ? [] : await db.$queryRaw<EmailRow[]>(Prisma.sql`
+    SELECT m."id", m."kind", m."status"::text AS "status", m."createdAt", o."id" AS "orderId", o."orderNumber", o."externalOrderNumber", o."customerId"
+    FROM "email_outbox" m
+    JOIN "sales_orders" o ON o."id" = m."referenceId"
+    WHERE m."referenceType" = 'SalesOrder'
+      AND o."customerId" = ANY(${customerIds}::text[])
+      AND o."erasedAt" IS NULL
+      AND m."toEmail" <> ${ERASURE_PLACEHOLDER_EMAIL}
+      ${upTo ? Prisma.sql`AND m."createdAt" <= ${upTo}` : Prisma.empty}
+    ORDER BY m."createdAt" DESC, m."id" DESC
+    LIMIT ${take}`)
 
-  const [placed, cancelled, invoiced, payments, refunds, expectations, returns, sentEmails, unsentEmails] = await Promise.all([
+  const [placed, cancelled, invoiced, payments, refunds, expectations, returns] = await Promise.all([
     db.salesOrder.findMany({
       where: { ...inOrder, ...(upTo ? { createdAt: { lte: upTo } } : {}) },
       select: { ...orderSelect, createdAt: true, status: true, currency: true, totalForeign: true },
@@ -155,16 +189,6 @@ export async function loadTimeline(db: Reader, customerIds: string[], options: {
       select: { id: true, reference: true, status: true, createdAt: true, order: { select: orderSelect } },
       orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take,
     }),
-    emailOrders.length === 0 ? Promise.resolve([]) : db.emailOutbox.findMany({
-      where: { ...emailWhere, sentAt: upTo ? { not: null, lte: upTo } : { not: null } },
-      select: emailSelect,
-      orderBy: [{ sentAt: 'desc' }, { id: 'desc' }], take,
-    }),
-    emailOrders.length === 0 ? Promise.resolve([]) : db.emailOutbox.findMany({
-      where: { ...emailWhere, sentAt: null, ...(upTo ? { createdAt: { lte: upTo } } : {}) },
-      select: emailSelect,
-      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }], take,
-    }),
   ])
 
   const events: TimelineEvent[] = []
@@ -175,11 +199,8 @@ export async function loadTimeline(db: Reader, customerIds: string[], options: {
   for (const r of refunds) events.push({ key: `CREDIT_NOTE:${r.id}`, kind: 'CREDIT_NOTE', at: r.createdAt.toISOString(), orderId: r.order.id, orderNumber: orderLabel(r.order), customerId: r.order.customerId, reference: r.creditNoteNumber, amount: r.totalForeign.toString(), currency: r.order.currency, status: null })
   for (const r of expectations) events.push({ key: `RETURN_EXPECTED:${r.id}`, kind: 'RETURN_EXPECTED', at: r.createdAt.toISOString(), orderId: r.order.id, orderNumber: orderLabel(r.order), customerId: r.order.customerId, reference: r.reference, amount: null, currency: null, status: r.status })
   for (const r of returns) events.push({ key: `WAREHOUSE_RETURN:${r.id}`, kind: 'WAREHOUSE_RETURN', at: r.createdAt.toISOString(), orderId: r.order!.id, orderNumber: orderLabel(r.order!), customerId: r.order!.customerId, reference: r.reference, amount: null, currency: null, status: r.status })
-  const emailOrderById = new Map(emailOrders.map((o) => [o.id, o]))
-  for (const m of [...sentEmails, ...unsentEmails]) {
-    const o = emailOrderById.get(m.referenceId!)
-    if (!o) continue
-    events.push({ key: `EMAIL:${m.id}`, kind: 'EMAIL', at: (m.sentAt ?? m.createdAt).toISOString(), orderId: o.id, orderNumber: orderLabel(o), customerId: o.customerId, reference: m.kind, amount: null, currency: null, status: m.status })
+  for (const m of emailRows) {
+    events.push({ key: `EMAIL:${m.id}`, kind: 'EMAIL', at: m.createdAt.toISOString(), orderId: m.orderId, orderNumber: orderLabel({ id: m.orderId, orderNumber: m.orderNumber, externalOrderNumber: m.externalOrderNumber }), customerId: m.customerId, reference: emailKindLabel(m.kind), amount: null, currency: null, status: m.status })
   }
   return pageEvents(events, cursor, limit)
 }
