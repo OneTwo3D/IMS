@@ -31,13 +31,15 @@ type Ledger = {
   total: number
   remaining: number
   amountDue: number
+  /** What Xero says the invoice has received (o3d-0olzx): the refund cap's second witness. Defaults to the receipt the seed records (120). */
+  amountPaid: number
   status: string
   allocations: Array<{ Amount: number; Date: string; Invoice: { InvoiceID: string } }>
   payments: Array<{ PaymentID: string; Amount: number; Status: string; PaymentType: string }>
 }
 let ledger: Ledger = freshLedger()
 function freshLedger(): Ledger {
-  return { currency: 'GBP', total: 24, remaining: 24, amountDue: 120, status: 'AUTHORISED', allocations: [], payments: [] }
+  return { currency: 'GBP', total: 24, remaining: 24, amountDue: 120, amountPaid: 120, status: 'AUTHORISED', allocations: [], payments: [] }
 }
 let pushedCreditNoteId = 'cn-pushed'
 let onBalancesRead: (() => Promise<void>) | null = null
@@ -67,7 +69,7 @@ async function load() {
       ...creditNotes,
       readCreditNoteSettlementBalances: async () => {
         if (onBalancesRead) await onBalancesRead()
-        return { ok: true, remainingCredit: ledger.remaining, amountDue: ledger.amountDue, creditNoteStatus: ledger.status }
+        return { ok: true, remainingCredit: ledger.remaining, amountDue: ledger.amountDue, amountPaid: ledger.amountPaid, creditNoteStatus: ledger.status }
       },
       pushCreditNote: async () => ({ success: true, creditNoteId: pushedCreditNoteId }),
       allocatePurchaseCreditNote: async (params: Allocate) => {

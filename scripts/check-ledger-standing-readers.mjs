@@ -912,6 +912,8 @@ const MIGRATION_OWNERS = new Map([
     'The same index rebuilt to add PURCHASE_CREDIT_NOTE_ALLOCATION. Same predicate, same reason.'],
   ['prisma/migrations/20260819120000_followup_live_unique_anchor_scoped/migration.sql',
     'The same index rebuilt anchor-scoped. Same predicate, same reason.'],
+  ['prisma/migrations/20261122000400_followup_live_unique_add_credit_note_allocation/migration.sql',
+    'The same index rebuilt to add CREDIT_NOTE_ALLOCATION (o3d-o4tkz). Same predicate, same reason; refuses to deploy rather than delete if live duplicates exist.'],
 ])
 
 function censusMigrations(failures) {
