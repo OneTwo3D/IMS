@@ -109,7 +109,7 @@ test('woo gospel: a product with no visible Woo status keeps the Qoblex lifecycl
   for (const lifecycle of ['ACTIVE', 'EOL', 'DRAFT']) {
     // (L7) a listed product with a blank or unmapped status keeps its lifecycle, and is listed, whatever the lifecycle; another row states a status so the column is in use
     for (const status of ['', 'trash']) {
-      const r = simple(lifecycle, status, { 'woo-products': ds('woo-products', [{ sku: 'S-1', ...(status === '' ? {} : { status }) }, { sku: 'OTHER', status: 'publish' }]) })
+      const r = simple(lifecycle, status, { products: ds('products', [product('S-1', 'SIMPLE', { lifecycleStatus: lifecycle }), product('OTHER', 'SIMPLE')]), 'woo-products': ds('woo-products', [{ sku: 'S-1', ...(status === '' ? {} : { status }) }, { sku: 'OTHER', status: 'publish' }]) })
       assert.equal(lifecycleOf(r, 'S-1'), lifecycle, `${lifecycle}/${JSON.stringify(status)}`)
       assert.ok(findingCodes(r, 'WARNING').includes('LIFECYCLE_WOO_STATUS_UNUSABLE'), `${lifecycle}/${JSON.stringify(status)}`)
       assert.equal(findingCodes(r).includes('LIFECYCLE_TAKEN_FROM_WOO'), false)
@@ -318,4 +318,19 @@ test('o3d-gqel4: a rename whose fromSku or toSku is on sku-exclusions is refused
   const fine = run({ ...base, 'sku-exclusions': ds('sku-exclusions', [{ sku: 'AV-1', reason: 'owner: not sold' }]), 'sku-renames': ds('sku-renames', [{ fromSku: 'OK-1', toSku: 'W-3', reason: 'woo spelling' }]) })
   assert.deepEqual(dispositionCodes(fine, 'sku-renames', 'REJECTED'), [])
   assert.equal(emitted(fine, 'sku-renames', 'SKU_RENAMED'), 1)
+})
+
+// [mutation: the stock-lots dataset skips the kit conflict, or the quantity note is counted for a row another selector (State Deleted) skips]
+test('o3d-7lxrt L4/L5: a stated kit/bom/variable type on a non-stock SKU is refused in stock lots too; a Deleted non-stock row reports no ignored quantity', (t) => {
+  for (const type of ['kit', 'bom', 'variable']) {
+    const s = stock(csv(stockRow('SYN-NS', type, ['40', '40', '', '', '', ''])))
+    assert.equal(s.rejected[0]?.code, 'NON_STOCK_DECISION_CONFLICT', type)
+  }
+  const deletedWithQty = stockRow('SYN-NS', 'Unknown', ['5', '5', '', '', '', '']).replace('"Active"', '"Deleted"')
+  const gone = stock(csv(deletedWithQty))
+  precondition(t, 'rows skipped', Object.values(gone.rowsSkipped).reduce((n, c) => n + c, 0))
+  assert.deepEqual(gone.notes ?? [], [], 'a Deleted row is not a row of this dataset: its quantity is not reported')
+  assert.deepEqual((stock(csv(stockRow('SYN-NS', 'Unknown', ['5', '5', '', '', '', '']))).notes ?? []).map((n) => n.code), ['NON_STOCK_QTY_IGNORED'], 'control: an Active one still is')
+  // L9: the decision accepts a stated non-inventory type in any letter case, through the map's own value only
+  for (const type of ['non-inventory', 'Non-Inventory']) assert.equal(prods(csv(stockRow('SYN-NS', type, NONE))).rejected.length, 0, type)
 })
