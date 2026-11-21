@@ -5,7 +5,7 @@ import { revalidatePath } from 'next/cache'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
-import { resolveProductionOrderFx } from '@/lib/domain/manufacturing/production-order-fx'
+import { productionOrderFxActivityMetadata, productionOrderFxCreateData, resolveProductionOrderFx } from '@/lib/domain/manufacturing/production-order-fx'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { enqueueStockSync } from '@/lib/shopping'
 import { queueAccountingSyncTx, getAccountingSettings, accountingPostingVerdictForChart, type AccountingSettings } from '@/lib/accounting'
@@ -132,6 +132,8 @@ export type WarehouseOption = {
 export type SupplierOption = {
   id: string
   name: string
+  /** The supplier's currency; the create dialog defaults the order currency from the chosen manufacturer. */
+  currency: string
 }
 
 type ComponentStockRow = {
@@ -270,7 +272,7 @@ export async function getSuppliers(): Promise<SupplierOption[]> {
   await requireInternalUser()
   return db.supplier.findMany({
     where: { active: true },
-    select: { id: true, name: true },
+    select: { id: true, name: true, currency: true },
     orderBy: { name: 'asc' },
   })
 }
@@ -396,9 +398,10 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
     if (input.qtyPlanned <= 0) return { success: false, error: 'Quantity must be greater than 0.' }
 
     // Foreign-currency cost lines (o3d-hgcj1): the rate is the central fx_rates table rate or a blocking refusal, never a default of 1.
+    const baseCurrency = await getBaseCurrencyCode()
     const fx = await resolveProductionOrderFx(db, {
       currency: input.currency,
-      baseCurrency: await getBaseCurrencyCode(),
+      baseCurrency,
       asOf: new Date(),
       expectedFxRate: input.expectedFxRate,
     })
@@ -501,8 +504,8 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
           qtyPlanned: input.qtyPlanned,
           scheduledAt: input.scheduledAt ? new Date(input.scheduledAt) : null,
           notes: input.notes || null,
-          // Only written when a currency was chosen: an order raised without one keeps the schema defaults exactly as before.
-          ...(fx.chosen && { currency: fx.currency, fxRateToBase: fx.fxRateToBase }),
+          // A chosen currency writes its code and table rate; none chosen writes the organisation's base currency (rate stays the schema default 1).
+          ...productionOrderFxCreateData(fx, baseCurrency),
         },
         select: { id: true },
       })
@@ -537,13 +540,7 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
       description: `Created ${input.orderType.toLowerCase()} order ${reference} for ${claim.sku} — ${claim.name} (${input.qtyPlanned} units)`,
       metadata: {
         reference, sku: claim.sku, orderType: input.orderType, qty: input.qtyPlanned,
-        ...(fx.chosen && {
-          currency: fx.currency,
-          fxRateToBase: fx.fxRateToBase.toString(),
-          fxRateSource: fx.source,
-          fxRateManualOverride: fx.manualOverride,
-          fxRateFetchedAt: fx.fetchedAt.toISOString(),
-        }),
+        ...productionOrderFxActivityMetadata(fx),
       },
     })
 
@@ -1897,7 +1894,7 @@ export async function updateManufacturingCostLines(
     if (!po) return { success: false, error: 'Production order not found.' }
     if (po.status === 'CANCELLED') return { success: false, error: 'Cannot edit manufacturing cost lines on a cancelled production order.' }
 
-    const parsed = parseManufacturingCostLines(lines, Number(po.fxRateToBase))
+    const parsed = parseManufacturingCostLines(lines, po.fxRateToBase)
     if (!parsed.success) return { success: false, error: parsed.error }
     const cleaned = parsed.lines
 

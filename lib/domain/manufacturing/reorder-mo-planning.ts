@@ -12,6 +12,8 @@ export type ReorderMoSkipReason =
   | 'no_active_bom'
   | 'no_warehouse'
   | 'recent_draft_exists'
+  /** The latest order's foreign currency has no usable table rate (or is inactive): the draft is not raised at an invented rate of 1. */
+  | 'fx_rate_unavailable'
 
 export type ReorderMoSkip = { productId: string; sku: string; reason: ReorderMoSkipReason }
 

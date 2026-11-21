@@ -20,6 +20,7 @@ import {
 } from '@/app/actions/manufacturing'
 import { ProductThumb } from '@/components/inventory/product-thumb'
 import { ManufacturingCostLinesEditor } from '@/components/manufacturing/cost-lines-editor'
+import { useBaseCurrency } from '@/components/providers/base-currency-provider'
 import { useFormatDateTime } from '@/components/providers/timezone-provider'
 
 const STATUS_BADGE: Record<string, string> = {
@@ -48,6 +49,7 @@ function fmtQty(value: number | null) {
 }
 
 export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
+  const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const fmtDate = (iso: string | null) =>
     iso ? formatDateTime(iso, { day: 'numeric', month: 'short', year: 'numeric' }) : '—'
@@ -312,6 +314,7 @@ export function ManufacturingOrderDetail({ order }: { order: OrderType }) {
         productionOrderId={order.id}
         reference={order.reference}
         currency={order.currency}
+        baseCurrency={baseCurrency.code}
         fxRateToBase={order.fxRateToBase}
         initialLines={order.manufacturingCostLines}
         isCompleted={order.status === 'COMPLETED'}
