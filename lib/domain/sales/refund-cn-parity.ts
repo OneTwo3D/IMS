@@ -359,3 +359,59 @@ export function storeCreditVerdict(input: {
       + HOLD_TAIL(input.refundId).replace(' The money has ALREADY been returned in the storefront', ' The refund already exists in the storefront').replace(' - do NOT issue another storefront refund.', '.')),
   }
 }
+
+/**
+ * o3d-pnc8p L4: a store-credit refund WooCommerce reports with no readable creation time. The coupon search is bounded by that time (coupons created after it) and so
+ * is the wait; without it the search read every coupon since 1970 and the refund was quarantined at once under a message that blamed the coupons. Said as it is.
+ */
+export function storeCreditUndatedVerdict(refundId: number, attempt: string): StoreCreditVerdict {
+  return {
+    kind: 'quarantine',
+    message: withLedgerCheck(`WooCommerce refund ${refundId} was issued as store credit (attempt ${attempt}), but WooCommerce reports no creation time for it (date_created_gmt), so IMS cannot find the coupon issued for it or tell how long it has waited. `
+      + 'No credit note was raised. Check the order\'s coupons in WooCommerce: if the customer holds the credit (a published coupon for this attempt), settle the credit note in Xero with the accountant and acknowledge this row as settled outside IMS.'
+      + HOLD_TAIL(refundId).replace(' The money has ALREADY been returned in the storefront', ' The refund already exists in the storefront').replace(' - do NOT issue another storefront refund.', '.')),
+  }
+}
+
+/**
+ * o3d-pnc8p (IOSS cases 3 and 4): A VAT-ONLY REFUND, held. The refund's lines carry no net, it pays money back, and no earlier refund carried a landed-cost fee it
+ * could repay. Whether its credit note is ZERO (the invoice is already ex-VAT in Xero: 159049, a 29.67 "refund VAT" against a 141.30 zero-rated invoice) or reverses
+ * the VAT out of 821 on No VAT (an IOSS order whose VAT was taken twice: 162199, 39.71 "VAT paid double") depends on how the invoice was booked, which the refund
+ * does not say. Crediting the amount as an ordinary refund would be wrong in both.
+ */
+export function vatOnlyRefundHold(input: { refundId: number | string; amount: DecimalInput; currency: string }): string {
+  const paid = Math.abs(cents(input.amount))
+  return withLedgerCheck(`WooCommerce refund ${input.refundId} pays ${Number.isFinite(paid) ? money(paid) : 'an unreadable amount'} ${input.currency} back but its lines carry no net amount: it refunds VAT only, and no earlier refund on the order carried a landed-cost fee it could repay. `
+    + 'What its credit note must do depends on how the invoice is booked in Xero: if the invoice is already ex-VAT (zero-rated), there is nothing to reverse and the right credit note is zero; if it is an IOSS order whose VAT was taken twice, the credit note reverses that VAT out of the IOSS VAT account (821) on No VAT. '
+    + 'Settle it in Xero with the accountant, then acknowledge this row as settled outside IMS.'
+    + HOLD_TAIL(input.refundId))
+}
+
+/**
+ * o3d-pnc8p: a parity hold an operator ACKNOWLEDGED AS SETTLED OUTSIDE IMS. The park is resolved with a note beginning with this prefix (who, why, and the hold it
+ * closed); nothing is created in IMS or sent to Xero, and the refund sync treats that WooCommerce refund as handled for good.
+ */
+export const SETTLED_OUTSIDE_IMS_NOTE_PREFIX = 'Settled outside IMS by operator:'
+
+export function settledOutsideImsNote(input: { by: string; reason: string; hold: string | null }): string {
+  return `${SETTLED_OUTSIDE_IMS_NOTE_PREFIX} ${input.by}: ${input.reason.trim()}. Nothing was created in IMS or sent to Xero. The hold it closed: ${input.hold ?? '(none recorded)'}`
+}
+
+/**
+ * o3d-pnc8p (IOSS session case 8, o3d-ioss-xero 0.2.6 `_o3d_ioss_fee_open`): an OPEN FEE REPAYMENT is a record of its own, NOT the refund's or the park's status:
+ * a refund whose credit note credits a landed-cost fee EAS left out of the refund amount stays open until an operator states that the fee's repayment was applied to
+ * that credit note in Xero. Acknowledging a later refund (its repayment park, as settled outside IMS) does not clear it; only "repayment applied" does.
+ */
+export function isFeeRepaymentOpen(refund: { easFeeGapForeign: DecimalInput | null | undefined; feeRepaymentAppliedAt: Date | null | undefined; deletedAt?: Date | null }): boolean {
+  if (refund.deletedAt) return false
+  if (refund.feeRepaymentAppliedAt) return false
+  const gap = cents(refund.easFeeGapForeign ?? 0)
+  return Number.isFinite(gap) && Math.abs(gap) > 0
+}
+
+/** What the open repayment asks of the operator, as the plugin's attention screen words it. */
+export function feeRepaymentInstruction(input: { externalRefundId: number | null; creditNoteNumber: string | null; gapForeign: DecimalInput; storefrontAmountForeign: DecimalInput | null; currency: string }): string {
+  const gap = money(Math.abs(cents(input.gapForeign)))
+  const paid = input.storefrontAmountForeign == null ? null : money(Math.abs(cents(input.storefrontAmountForeign)))
+  return withLedgerCheck(`refund ${input.externalRefundId ?? '(IMS)'}: credit note ${input.creditNoteNumber ?? '(not numbered yet)'} credits the landed-cost fee ${gap} ${input.currency} that EAS left out of the refund amount${paid ? ` ${paid}` : ''} - apply the fee repayment to it in Xero`)
+}

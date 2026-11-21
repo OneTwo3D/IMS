@@ -22,7 +22,7 @@ import { easRefundRefusal, refundStatedTax, refundTaxOnEasRate } from '@/lib/dom
 import { matchRefundedFeeLines, refundedOrderLineId } from './refund-line-link'
 export { refundedOrderLineId }
 import type { WcMeta, WcRefund } from './types'
-import { decideAmountGap, earlierFeeOwedMinor, PARITY_NO_MANUAL_RECORD, feeRepaymentHold, isRefundCnParityEnabled, parityRefundBreakdown, storeCreditAttemptOf, storeCreditVerdict, WCLC_FEE_MARKER_META, type EarlierRefundFacts, type ParityRefundItem, type ParityShippingLine, type RefundParityFactsInput, type StoreCreditCoupon } from '@/lib/domain/sales/refund-cn-parity'
+import { decideAmountGap, earlierFeeOwedMinor, PARITY_NO_MANUAL_RECORD, feeRepaymentHold, isRefundCnParityEnabled, parityRefundBreakdown, SETTLED_OUTSIDE_IMS_NOTE_PREFIX, storeCreditAttemptOf, storeCreditUndatedVerdict, storeCreditVerdict, vatOnlyRefundHold, WCLC_FEE_MARKER_META, type EarlierRefundFacts, type ParityRefundItem, type ParityShippingLine, type RefundParityFactsInput, type StoreCreditCoupon } from '@/lib/domain/sales/refund-cn-parity'
 import type { createRefund as createRefundAction } from '@/app/actions/sales'
 
 type CreateRefundAction = typeof createRefundAction
@@ -59,8 +59,8 @@ export type WcRefundSyncDependencies = {
   parityEnabled?: () => Promise<boolean>
   /** o3d-k26m.17: the WooCommerce order (its meta and shipping lines), read only under the parity switch, for a store-credit refund or an amount gap. Null: it could not be read. */
   fetchWcOrder?: (externalOrderId: number) => Promise<ParityWcOrder | null>
-  /** o3d-k26m.17: the store's coupons that may carry this store-credit attempt (read-only). Null: they could not be read. */
-  fetchStoreCreditCoupons?: (input: { attempt: string; modifiedAfter: string }) => Promise<StoreCreditCoupon[] | null>
+  /** o3d-k26m.17: the store's coupons that may carry this store-credit attempt (read-only): those CREATED after `createdAfter` (o3d-pnc8p L3). Null: they could not be read. */
+  fetchStoreCreditCoupons?: (input: { attempt: string; createdAfter: string }) => Promise<StoreCreditCoupon[] | null>
   /** o3d-k26m.17: every refund WooCommerce holds for the order, when the caller has already read them all (the sweep). Absent: read when the fee-repayment check needs them. */
   orderRefunds?: readonly WcRefund[]
   /** o3d-k26m.17: read the order's refunds from WooCommerce (read-only). Null: the list could not be read completely. */
@@ -71,8 +71,8 @@ export type WcRefundSyncDependencies = {
   now?: () => Date
 }
 
-/** o3d-k26m.17: the parts of a WooCommerce order the parity checks read. */
-export type ParityWcOrder = { meta_data: WcMeta[]; shipping_lines: Array<{ id: number; total: string; total_tax: string }> }
+/** o3d-k26m.17: the parts of a WooCommerce order the parity checks read. o3d-pnc8p MED-5: its fee lines' meta, for the `_wclc_fee` marker on the ORIGINAL item (absent: not read). */
+export type ParityWcOrder = { meta_data: WcMeta[]; shipping_lines: Array<{ id: number; total: string; total_tax: string }>; fee_lines?: Array<{ id: number; meta_data?: WcMeta[] }> }
 
 /** o3d-k26m.17: the parity switch, read from the client the sync was given. A test double with no `setting` delegate reads OFF, so it never reaches a real database. */
 async function readParitySwitch(dependencies: WcRefundSyncDependencies): Promise<boolean> {
@@ -88,30 +88,40 @@ async function fetchParityWcOrder(externalOrderId: number): Promise<ParityWcOrde
   if (error || data === null || typeof data !== 'object') return null
   const meta = (data as { meta_data?: unknown }).meta_data
   const shipping = (data as { shipping_lines?: unknown }).shipping_lines
+  const fees = (data as { fee_lines?: unknown }).fee_lines
   if (!Array.isArray(meta) || !Array.isArray(shipping)) return null
-  return { meta_data: meta as WcMeta[], shipping_lines: shipping as ParityWcOrder['shipping_lines'] }
+  return { meta_data: meta as WcMeta[], shipping_lines: shipping as ParityWcOrder['shipping_lines'], fee_lines: Array.isArray(fees) ? fees as NonNullable<ParityWcOrder['fee_lines']> : [] }
 }
 
-/** How many pages of coupons the store-credit check reads at most (100 each, newest modified first). Past that the credit is unconfirmed, never assumed. */
-const STORE_CREDIT_COUPON_PAGES = 5
+/** How many pages of coupons the store-credit check reads at most (100 asked for each, oldest first). Past that the credit is unconfirmed, never assumed. */
+export const STORE_CREDIT_COUPON_PAGES = 5
 
 /**
- * o3d-k26m.17: the coupons modified since shortly before the refund, in every status (read-only, REST v3 /coupons). The plugin writes its attempt id on the coupon it
- * creates, and publishing it modifies it, so the live coupon of a refund is among these. Null: a page could not be read, or there were more than the cap.
+ * o3d-k26m.17: the coupons CREATED since shortly before the refund, in every status (read-only, REST v3 /coupons), OLDEST FIRST by id. The plugin creates the
+ * coupon carrying its attempt id when it issues the credit, so the coupon of a refund is among the first ones created after it, however many coupons were MODIFIED
+ * since (o3d-pnc8p L3: walking by modification, newest first, lost it behind 500 later edits on a catch-up). Null: a page could not be read, or there were more than
+ * the cap.
+ *
+ * The walk ends on an EMPTY page, or once the store's own X-WP-Total is reached, never on a short page (o3d-pnc8p L2: a store that caps per_page below 100 returns
+ * short pages that are not the last).
  */
-async function fetchStoreCreditCouponsFromWc(input: { attempt: string; modifiedAfter: string }): Promise<StoreCreditCoupon[] | null> {
+export async function fetchStoreCreditCouponsFromWc(
+  input: { attempt: string; createdAfter: string },
+  readPage: typeof wcFetch = wcFetch,
+): Promise<StoreCreditCoupon[] | null> {
   const out: StoreCreditCoupon[] = []
   for (let page = 1; page <= STORE_CREDIT_COUPON_PAGES; page++) {
-    const { data, error } = await wcFetch('/coupons', { status: 'any', modified_after: input.modifiedAfter, per_page: '100', page: String(page), orderby: 'id', order: 'desc' })
+    const { data, error, totalItems, totalItemsPresent } = await readPage('/coupons', { status: 'any', after: input.createdAfter, per_page: '100', page: String(page), orderby: 'id', order: 'asc' })
     if (error || !Array.isArray(data)) return null
+    if (data.length === 0) return out
     out.push(...(data as StoreCreditCoupon[]))
-    if (data.length < 100) return out
+    if (totalItemsPresent === true && out.length >= totalItems) return out
   }
   return null
 }
 
 /** o3d-k26m.17: every refund on the order from WooCommerce, or null when the walk was short. */
-async function fetchOrderRefundsFromWc(externalOrderId: number): Promise<WcRefund[] | null> {
+export async function fetchOrderRefundsFromWc(externalOrderId: number): Promise<WcRefund[] | null> {
   const { refunds, error } = await fetchAllWcRefundsForOrder(externalOrderId)
   return error === undefined ? refunds : null
 }
@@ -739,32 +749,57 @@ export function refundMayStillReachIms(outcome: WcRefundOutcome): boolean {
  * o3d-k26m.17: the refund's items as the parity breakdown reads them. A fee is MARKED when the refund item carries the wclc marker or the order fee line it is
  * matched to does (`matchedFees`, aligned with the refund's fee lines that carry money; null = not matched, every fee then judged on its own meta only).
  */
-function parityItemsOf(
+export function parityItemsOf(
   wcRefund: WcRefund,
   orderLines: ReadonlyArray<{ id: string; wclcFeeKind?: string | null }>,
   matchedFees: ReadonlyArray<string | null> | null,
+  /**
+   * o3d-pnc8p MED-5: the WooCommerce order, when read. A fee is MARKED, as the plugin's `is_marked_fee` judges it, also when the ORIGINAL order fee item the refund
+   * item names (`_refunded_item_id`) carries `_wclc_fee`: an IMS line imported before migration 20261029200000 has no wclcFeeKind (it was never backfilled), and a
+   * refund item need not carry the marker itself.
+   */
+  wcOrder: ParityWcOrder | null = null,
 ): ParityRefundItem[] {
   const metaTrue = (meta: readonly WcMeta[] | undefined, key: string) => {
     const value = (meta ?? []).find((m) => m.key === key)?.value
     return value !== undefined && value !== null && value !== '' && value !== '0' && value !== false && value !== 0
   }
   const markedOrderLine = new Set(orderLines.filter((line) => line.wclcFeeKind != null).map((line) => line.id))
+  const markedWcFee = new Set((wcOrder?.fee_lines ?? []).filter((fee) => metaTrue(fee.meta_data, WCLC_FEE_MARKER_META)).map((fee) => Number(fee.id)))
   const items: ParityRefundItem[] = []
   for (const line of wcRefund.line_items) items.push({ type: 'line', total: line.total, tax: line.total_tax })
   for (const line of wcRefund.shipping_lines ?? []) items.push({ type: 'shipping', total: line.total, tax: line.total_tax })
   const feeLines = (wcRefund.fee_lines ?? []).filter((fee) => parseDecimalAbs(fee.total).gt(0.000001) || parseDecimalAbs(fee.total_tax).gt(0.000001))
   feeLines.forEach((fee, index) => {
     const matched = matchedFees?.[index] ?? null
+    const original = Number((fee.meta_data ?? []).find((m) => m.key === '_refunded_item_id')?.value)
     items.push({
       type: 'fee',
       total: fee.total,
       tax: fee.total_tax,
       name: fee.name,
-      marked: metaTrue(fee.meta_data, WCLC_FEE_MARKER_META) || (matched !== null && markedOrderLine.has(matched)),
-      linked: Number((fee.meta_data ?? []).find((m) => m.key === '_refunded_item_id')?.value) > 0,
+      marked: metaTrue(fee.meta_data, WCLC_FEE_MARKER_META) || (matched !== null && markedOrderLine.has(matched)) || (original > 0 && markedWcFee.has(original)),
+      linked: original > 0,
     })
   })
   return items
+}
+
+/** o3d-pnc8p MED-5: whether a fee item is linked to an order fee but not marked on its own or by its IMS line, so only the WooCommerce order's own item can say. */
+export function needsOrderFeeMarkers(items: readonly ParityRefundItem[]): boolean {
+  return items.some((item) => item.type === 'fee' && item.marked !== true && item.linked === true)
+}
+
+/**
+ * o3d-pnc8p L1: was `other` made BEFORE `self` in the store? By `date_created_gmt`, then by id (order and refund ids share one ascending sequence); by id alone when
+ * either date cannot be read. A refund made later is never one this refund repays.
+ */
+export function isEarlierRefund(other: Pick<WcRefund, 'id' | 'date_created_gmt'>, self: Pick<WcRefund, 'id' | 'date_created_gmt'>): boolean {
+  const gmt = (value: string | undefined) => (value ? Date.parse(`${value.replace(/Z$/, '')}Z`) : NaN)
+  const a = gmt(other.date_created_gmt)
+  const b = gmt(self.date_created_gmt)
+  if (Number.isFinite(a) && Number.isFinite(b) && a !== b) return a < b
+  return other.id < self.id
 }
 
 /** o3d-k26m.17: the refund's shipping lines that carry money, net or VAT (a tax-only line counts), in the refund's order. */
@@ -859,6 +894,17 @@ export async function syncWcRefund(
       }
       // PERMANENT: a WC refund id maps to one order, so this can never become applicable here.
       return { outcome: 'permanent-failure', error: `WooCommerce refund ${wcRefund.id} already exists on a different order (${existing.orderId}); refusing to apply it here.` }
+    }
+
+    // o3d-pnc8p: A PARITY HOLD AN OPERATOR ACKNOWLEDGED AS SETTLED OUTSIDE IMS (in Xero, with the accountant). Its park is resolved, so the active-park guard
+    // below no longer sees it, and the refund is still in WooCommerce: without this every sweep would hold it again, or raise the credit note the hold exists to
+    // prevent. Terminal: nothing in IMS will ever apply it.
+    const settledOutside = await client.shoppingSyncLog.findFirst({
+      where: { recordKind: WC_REFUND_PARK_RECORD_KIND, entityId: so.id, externalId: String(wcRefund.id), status: 'SYNCED', errorMessage: { startsWith: SETTLED_OUTSIDE_IMS_NOTE_PREFIX } },
+      select: { errorMessage: true },
+    })
+    if (typeof settledOutside?.errorMessage === 'string' && settledOutside.errorMessage.startsWith(SETTLED_OUTSIDE_IMS_NOTE_PREFIX)) {
+      return { outcome: 'handled-unapplied-terminal', error: `WooCommerce refund ${wcRefund.id} was acknowledged as settled outside IMS; nothing is recorded for it.` }
     }
 
     // o3d-iup: a refund we deliberately PARKED (a monetary-only refund the order can't tax uniformly)
@@ -1012,12 +1058,13 @@ export async function syncWcRefund(
     if (storeCreditAttempt !== null) {
       const createdAt = Date.parse(wcRefund.date_created_gmt ? `${wcRefund.date_created_gmt.replace(/Z$/, '')}Z` : '')
       const refundCreatedAt = Number.isFinite(createdAt) ? new Date(createdAt) : null
-      const modifiedAfter = new Date((refundCreatedAt?.getTime() ?? 0) - 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, '')
-      const [order, coupons] = await Promise.all([
+      // o3d-pnc8p L4: a refund with no readable creation time cannot bound the coupon search (it read every coupon since 1970) or the wait: said so, held for a person.
+      const createdAfter = refundCreatedAt === null ? null : new Date(refundCreatedAt.getTime() - 60 * 60 * 1000).toISOString().replace(/\.\d{3}Z$/, '')
+      const [order, coupons] = createdAfter === null ? [null, null] : await Promise.all([
         readParityWcOrder(),
-        (dependencies.fetchStoreCreditCoupons ?? fetchStoreCreditCouponsFromWc)({ attempt: storeCreditAttempt, modifiedAfter }),
+        (dependencies.fetchStoreCreditCoupons ?? fetchStoreCreditCouponsFromWc)({ attempt: storeCreditAttempt, createdAfter }),
       ])
-      const verdict = storeCreditVerdict({
+      const verdict = createdAfter === null ? storeCreditUndatedVerdict(wcRefund.id, storeCreditAttempt) : storeCreditVerdict({
         refundId: wcRefund.id, attempt: storeCreditAttempt, refundMeta: wcRefund.meta_data, orderMeta: order?.meta_data ?? null, coupons,
         refundCreatedAt, now: (dependencies.now ?? (() => new Date()))(),
       })
@@ -1285,13 +1332,16 @@ export async function syncWcRefund(
           await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'PENDING', errorMessage: message, payload: wcRefund })
           return { outcome: 'retryable-failure', error: message }
         }
-        const wcOrderForFold = await readParityWcOrder()
         const markedFeeLineIds = new Set(so.lines.filter((line) => line.wclcFeeKind != null).map((line) => line.id))
-        const factsOf = (other: WcRefund, label: string): EarlierRefundFacts => {
+        // o3d-pnc8p L6: the WooCommerce order is read only when an earlier refund needs it (its marked fees' shipping, or a fee only the order item marks).
+        const factsOf = async (other: WcRefund, label: string): Promise<EarlierRefundFacts> => {
           const fees = (other.fee_lines ?? []).filter((fee) => parseDecimalAbs(fee.total).gt(0.000001) || parseDecimalAbs(fee.total_tax).gt(0.000001))
-          const otherBreakdown = parityRefundBreakdown(parityItemsOf(other, so.lines, fees.length > 0 ? matchRefundedFeeLines(fees, so.lines) : []))
+          const matched = fees.length > 0 ? matchRefundedFeeLines(fees, so.lines) : []
+          let items = parityItemsOf(other, so.lines, matched)
+          if (needsOrderFeeMarkers(items)) items = parityItemsOf(other, so.lines, matched, await readParityWcOrder())
+          const otherBreakdown = parityRefundBreakdown(items)
           const verdict = otherBreakdown.markedFees > 0
-            ? decideAmountGap({ refundId: other.id, amount: other.amount, breakdown: otherBreakdown, refundShipping: parityShippingOf(other, wcOrderForFold) })
+            ? decideAmountGap({ refundId: other.id, amount: other.amount, breakdown: otherBreakdown, refundShipping: parityShippingOf(other, await readParityWcOrder()) })
             : { kind: 'not-recognised' as const }
           return { label, carriedMarkedFee: otherBreakdown.markedFees > 0, owedMinor: earlierFeeOwedMinor({ breakdown: otherBreakdown, amount: other.amount, folded: verdict.kind === 'fold' }) }
         }
@@ -1310,20 +1360,25 @@ export async function syncWcRefund(
         const seen = new Set<number>([wcRefund.id])
         const earlier: EarlierRefundFacts[] = []
         const labelOf = (id: number) => `WooCommerce refund ${id}${cnOf.get(id) ? ` (credit note ${cnOf.get(id)})` : ''}`
+        // o3d-pnc8p L1: only refunds made BEFORE this one count as earlier. On a catch-up the store's list (and IMS) also holds refunds made after it, and a later
+        // fee refund is not one this refund can repay.
         for (const other of storeRefunds) {
           if (seen.has(other.id)) continue
           seen.add(other.id)
-          earlier.push(factsOf(other, labelOf(other.id)))
+          if (!isEarlierRefund(other, wcRefund)) continue
+          earlier.push(await factsOf(other, labelOf(other.id)))
         }
         for (const park of parks) {
           const payload = park.payload as WcRefund | null
           const id = Number(park.externalId)
           if (!payload || typeof payload !== 'object' || !Array.isArray(payload.line_items) || seen.has(id)) continue
           seen.add(id)
-          earlier.push(factsOf(payload, `${labelOf(id)}, parked on Sync exceptions`))
+          if (!isEarlierRefund({ id, date_created_gmt: payload.date_created_gmt }, wcRefund)) continue
+          earlier.push(await factsOf(payload, `${labelOf(id)}, parked on Sync exceptions`))
         }
         for (const refund of imsRefunds) {
           if (refund.externalRefundId != null && seen.has(refund.externalRefundId)) continue
+          if (refund.externalRefundId != null && refund.externalRefundId > wcRefund.id) continue
           earlier.push({
             label: refund.externalRefundId != null ? labelOf(refund.externalRefundId) : `credit note ${refund.creditNoteNumber ?? '(no number)'}`,
             carriedMarkedFee: (refund.lines ?? []).some((line) => line.salesOrderLineId != null && markedFeeLineIds.has(line.salesOrderLineId)),
@@ -1344,6 +1399,25 @@ export async function syncWcRefund(
             resolveUser: false,
           })
           return { outcome: 'quarantined-refusal', error: hold }
+        }
+        // o3d-pnc8p (IOSS cases 3 and 4): A VAT-ONLY REFUND. Lines with nothing on them but money paid back, and no fee on the order to repay. What it credits depends
+        // on how the invoice was booked, which IMS cannot see from the refund: on an invoice Xero already holds ex-VAT (159049: 141.30 zero-rated, a 29.67 "refund
+        // VAT") the right credit note is ZERO, nothing to reverse; on an IOSS order whose VAT was taken twice (162199: 39.71 "VAT paid double") it reverses the VAT
+        // out of 821 on No VAT. Crediting it as an ordinary amount (the monetary fallback below) would do neither, so it is HELD for a person.
+        if ((wcRefund.line_items.length > 0 || (wcRefund.shipping_lines ?? []).length > 0)) {
+          const message = vatOnlyRefundHold({ refundId: wcRefund.id, amount: refundAmountForeign, currency: so.currency })
+          await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: message, payload: wcRefund })
+          await writeActivity({
+            entityType: 'SALES_ORDER',
+            entityId: so.id,
+            action: 'refund_sync_vat_only_refund_held',
+            tag: 'sync',
+            level: 'WARNING',
+            description: message,
+            metadata: { externalRefundId: wcRefund.id },
+            resolveUser: false,
+          })
+          return { outcome: 'quarantined-refusal', error: message }
         }
       }
     }
@@ -1406,7 +1480,10 @@ export async function syncWcRefund(
     let parityNote: { action: string; level: 'INFO' | 'WARNING'; description: (creditNote: string) => string } | null = null
     if (parityOn && refundLines.length > 0 && toDecimal(mappedGrossRounded).sub(refundAmountForeign).abs().gt(0.01)) {
       const matchedFees = refundedFeeLines.length > 0 ? matchRefundedFeeLines(refundedFeeLines, so.lines) : []
-      const breakdown = parityRefundBreakdown(parityItemsOf(wcRefund, so.lines, matchedFees))
+      // o3d-pnc8p MED-5: a fee neither the refund item nor its IMS line marks is judged by the ORIGINAL order item's `_wclc_fee`, as the plugin judges it.
+      let gapItems = parityItemsOf(wcRefund, so.lines, matchedFees)
+      if (needsOrderFeeMarkers(gapItems)) gapItems = parityItemsOf(wcRefund, so.lines, matchedFees, await readParityWcOrder())
+      const breakdown = parityRefundBreakdown(gapItems)
       // Each refunded shipping line is compared with its OWN original order line (read from WooCommerce through `_refunded_item_id`), tax-only lines included.
       const wcShipping = parityShippingSourceLines(wcRefund)
       let verdict = breakdown.markedFees > 0

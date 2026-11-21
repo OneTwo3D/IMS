@@ -2984,7 +2984,9 @@ async function reportLostMoneyPostExclusion(
  *
  * A caller that cannot take the lock does not wait — see money-post-lock.ts. It returns a normal
  * retryable failure, which is the same shape as a remote rejection, so the row is re-attempted
- * later and re-probes then, by which time the holder's payment is readable.
+ * later and re-probes then, by which time the holder's payment is readable. (The credit-note
+ * settlement's ORDER-scoped lock, taken outside this one, is different: a miss of it is handed back
+ * unsent without spending a retry, o3d-0lpnb L5.)
  *
  * `lock` is injectable so the fence is testable without PostgreSQL; nothing in production passes
  * it.
@@ -2997,6 +2999,13 @@ export async function postMoneyUnderLedgerFence(
      * call. The fence sets a different receipt's payment aside and does not measure capacity, and a capacity
      * check made BEFORE the lock can be passed by two receipts at once; this one sees what the first of them
      * did while it held the lock. A refusal is returned as a failed outcome and nothing is sent.
+     *
+     * IT RUNS AFTER THE ATTEMPT STAMP (o3d-0lpnb L3). `authoriseMoneyPost` has already written
+     * `remoteAttemptedAt`, so a refusal here leaves the row ATTEMPTED WITHOUT A CALL: from then on it is
+     * replay-only and its pinned amount counts as cash that may have landed. A check passed here must
+     * therefore count only what is out or may be (proven or attempted rows), never work merely in flight,
+     * and a caller should make its sizing refusals BEFORE the stamp (the credit-note settlement does so
+     * under its order lock) so this one refuses only when something really moved in between.
      */
     recheckUnderLock?: () => Promise<{ ok: true } | { ok: false; error: string }>
   },

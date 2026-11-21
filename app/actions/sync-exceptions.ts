@@ -1,6 +1,6 @@
 'use server'
 
-import { isRefundParityHold } from '@/lib/domain/sales/refund-cn-parity'
+import { feeRepaymentInstruction, isRefundParityHold, settledOutsideImsNote } from '@/lib/domain/sales/refund-cn-parity'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { Prisma } from '@/app/generated/prisma/client'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
@@ -157,6 +157,32 @@ import { isWcAdmissionRefusalPayload, wcBlockedOrderQueueWhere } from '@/lib/con
 // preserved — a replay re-attempts the SAME work, never forges a new attempt.
 
 const SECTION_LIMIT = 50
+
+/** o3d-pnc8p: the open fee repayments (see isFeeRepaymentOpen). `gt: 0`: the gap is stored positive. */
+const OPEN_FEE_REPAYMENT_WHERE = { easFeeGapForeign: { gt: 0 }, feeRepaymentAppliedAt: null, deletedAt: null } as const
+
+async function loadOpenFeeRepayments(): Promise<OpenFeeRepaymentRow[]> {
+  const rows = await db.salesOrderRefund.findMany({
+    where: OPEN_FEE_REPAYMENT_WHERE,
+    select: {
+      id: true, orderId: true, externalRefundId: true, creditNoteNumber: true, easFeeGapForeign: true, storefrontAmountForeign: true, createdAt: true,
+      order: { select: { orderNumber: true, currency: true } },
+    },
+    orderBy: { createdAt: 'asc' },
+    take: SECTION_LIMIT,
+  })
+  return rows.map((row) => ({
+    refundId: row.id,
+    orderId: row.orderId,
+    orderNumber: row.order.orderNumber ?? null,
+    externalRefundId: row.externalRefundId,
+    creditNoteNumber: row.creditNoteNumber,
+    currency: row.order.currency,
+    gapForeign: toDecimal(row.easFeeGapForeign ?? 0).toFixed(2),
+    instruction: feeRepaymentInstruction({ externalRefundId: row.externalRefundId, creditNoteNumber: row.creditNoteNumber, gapForeign: row.easFeeGapForeign?.toString() ?? '0', storefrontAmountForeign: row.storefrontAmountForeign?.toString() ?? null, currency: row.order.currency }),
+    createdAt: row.createdAt.toISOString(),
+  }))
+}
 
 /**
  * ══════════════════════════════════════════════════════════════════════════════════════════════════════
@@ -470,11 +496,26 @@ export type RefundSyncParkRow = {
    * opens it: Retry re-reads the refund from WooCommerce and re-parks it with the payload.
    */
   manuallyRecordable: boolean
+  /** o3d-pnc8p: a refund-parity hold, closable only by acknowledging it as settled outside IMS (creates nothing; operator and reason recorded). */
+  settledOutsideAcknowledgeable: boolean
   currency: string | null
   refundGrossForeign: string | null
   allocationTargets: RefundParkAllocationTarget[]
   /** zvec.19: the IMS refunds still waiting for a WooCommerce refund whose amount equals this parked one, each of which a person may confirm this refund settles. */
   confirmableImsRefunds: Array<{ imsRefundId: string; creditNoteNumber: string | null }>
+}
+
+/** o3d-pnc8p (o3d-ioss-xero 0.2.6 `_o3d_ioss_fee_open`): a credit note that credits a landed-cost fee EAS left out of the refund amount, whose repayment is still to be applied in Xero. */
+export type OpenFeeRepaymentRow = {
+  refundId: string
+  orderId: string
+  orderNumber: string | null
+  externalRefundId: number | null
+  creditNoteNumber: string | null
+  currency: string
+  gapForeign: string
+  instruction: string
+  createdAt: string
 }
 
 export type StuckDispatchRow = {
@@ -815,6 +856,8 @@ export type ExceptionInboxSummary = {
   outboxFailures: number
   deadReceiptEvents: number
   refundSyncParks: number
+  /** o3d-pnc8p: open fee repayments, a record of their own (counted in the total until a person acknowledges the repayment applied). */
+  openFeeRepayments: number
   stuckDispatches: number
   pennyMismatches: number
   orderReconcileDrift: number
@@ -877,6 +920,7 @@ export type ExceptionInboxData = {
   outboxFailures: OutboxFailureRow[]
   deadReceiptEvents: DeadReceiptEventRow[]
   refundSyncParks: RefundSyncParkRow[]
+  openFeeRepayments: OpenFeeRepaymentRow[]
   stuckDispatches: StuckDispatchRow[]
   pennyMismatches: PennyMismatchRow[]
   orderReconcileDrift: OrderReconcileDriftRow[]
@@ -1305,6 +1349,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
   ])
 
   const giftCardLinesToResolve = await db.shoppingSyncLog.count({ where: giftCardUnsettledHoldWhere() })
+  const openFeeRepayments = await db.salesOrderRefund.count({ where: OPEN_FEE_REPAYMENT_WHERE })
   const wmsOperatorTasksOpen = await db.wmsOperatorTask.count({ where: { status: 'OPEN' } })
   // HIGH and MEDIUM only: LOW is noise by design (listed on the page, never counted).
   const refusedActionsOpen = await db.refusedAction.count({ where: { resolvedAt: null, severity: { in: ['HIGH', 'MEDIUM'] } } })
@@ -1318,6 +1363,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     outboxFailures,
     deadReceiptEvents,
     refundSyncParks,
+    openFeeRepayments,
     stuckDispatches,
     pennyMismatches,
     orderReconcileDrift,
@@ -1337,7 +1383,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     accountingPostingRefusalsUnconfirmed: unconfirmedPostingRefusals,
     // Not in `total` — see the field's own comment: an operator settling a refusal is not a second debt.
     accountingHandPostClaims: handPostClaims,
-    total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks
+    total: maintenanceRecovery + wmsPushDeadLetters + outboxFailures + deadReceiptEvents + refundSyncParks + openFeeRepayments
       + stuckDispatches + pennyMismatches + orderReconcileDrift + productStructureConflicts + wcOrderEdits + blockedWcOrders + wcCompletionRefusals + doublePostageFlags + giftCardLinesToResolve + wmsOperatorTasksOpen + refusedActionsOpen + wcOrderDivergencesOpen + driftIncidents.length + systemicFailures
       + accountingFollowUpObligations + outstandingPostingRefusals + unconfirmedPostingRefusals,
   }
@@ -1887,12 +1933,14 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         // storefront) — offering a manual credit note for those would invite a duplicate.
         // o3d-k26m.17: never for a refund-parity hold, whose manual credit note would be wrong (see recordRefundParkManually).
         manuallyRecordable: log.status === 'QUARANTINED' && Boolean(log.entityId) && Boolean(log.externalId) && !isRefundParityHold(log.errorMessage),
+        settledOutsideAcknowledgeable: log.status === 'QUARANTINED' && Boolean(log.entityId) && Boolean(log.externalId) && isRefundParityHold(log.errorMessage),
         currency: order?.currency ?? null,
         refundGrossForeign: payloadAmount,
         allocationTargets: buildAllocationTargets(order),
         confirmableImsRefunds,
       }
     })),
+    openFeeRepayments: await loadOpenFeeRepayments(),
     stuckDispatches,
     pennyMismatches: mismatchLinks.map((link) => ({
       orderId: link.orderId,
@@ -5180,6 +5228,111 @@ export async function runPostMaintenanceRecheckNow(): Promise<MutationResult & {
     })
     revalidatePath('/sync/exceptions')
     return { success: true, attempted: result.attempted, failed: result.failed, drained: result.drained }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/** The longest reason an acknowledgement keeps (the audit record, not an essay). */
+const ACKNOWLEDGEMENT_REASON_MAX = 500
+
+/**
+ * o3d-pnc8p: CLOSE A REFUND-PARITY HOLD AS SETTLED OUTSIDE IMS. A parity hold (the fee repayment, a fee-gap or fold near miss, a tax-only shipping line, unconfirmed
+ * store credit, a VAT-only refund) refuses "Record manually" because the credit note it would raise is wrong; the operator settles the credit note in Xero with the
+ * accountant instead. Until now nothing in IMS could close such a park while the refund still exists in WooCommerce (Dismiss refuses it), so it stayed on Sync
+ * exceptions for ever and blocked deleting and rebinding the order.
+ *
+ * This CREATES NOTHING: no refund, no credit note, no stock movement, nothing sent to Xero or WooCommerce. It resolves the park with a note naming who and why (and the
+ * hold it closed), writes an activity entry, and from then on the refund sync treats that WooCommerce refund as handled for good. Returned stock, if any, is not
+ * restocked: the operator adjusts it by hand. An OPEN FEE REPAYMENT on an earlier refund is a separate record and is NOT cleared by this
+ * (`acknowledgeFeeRepaymentApplied`).
+ *
+ * Permissions as "Record manually": `sync`, and a fresh `sales.refund` (it closes a refund's only open record in IMS).
+ */
+export async function acknowledgeRefundParkSettledOutsideIms(parkId: string, reason: string): Promise<MutationResult> {
+  try {
+    await requirePermission('sync')
+    const session = await requireFreshPermission('sales.refund')
+    const why = typeof reason === 'string' ? reason.trim() : ''
+    if (why === '') return { success: false, error: withLedgerCheck('A reason is required: say how the refund was settled outside IMS (for example "CN-11629 raised in Xero by the accountant"). It is the audit record.') }
+    if (why.length > ACKNOWLEDGEMENT_REASON_MAX) return { success: false, error: `Keep the reason under ${ACKNOWLEDGEMENT_REASON_MAX} characters.` }
+    const park = await db.shoppingSyncLog.findFirst({
+      where: { id: parkId, ...REFUND_PARK_WHERE, status: 'QUARANTINED' },
+      select: { id: true, entityId: true, externalId: true, errorMessage: true },
+    })
+    if (!park?.entityId || !park.externalId) return { success: false, error: 'This refund is no longer held (already resolved, retried, or removed).' }
+    if (!isRefundParityHold(park.errorMessage)) {
+      return { success: false, error: withLedgerCheck('Only a refund held by the storefront refund parity checks can be acknowledged as settled outside IMS. Use Retry, Record manually or Wrong order for this row.') }
+    }
+    const by = session.user.name?.trim() || session.user.email || session.user.id
+    const note = settledOutsideImsNote({ by, reason: why, hold: park.errorMessage })
+    const closed = await db.$transaction(async (tx) => {
+      // Compare-and-set on the hold still standing as it was read: a Retry or another acknowledgement in between wins, and this one changes nothing.
+      const updated = await tx.shoppingSyncLog.updateMany({
+        where: { id: park.id, status: 'QUARANTINED', errorMessage: park.errorMessage },
+        data: { status: 'SYNCED', errorMessage: note, syncedAt: new Date() },
+      })
+      if (updated.count !== 1) return false
+      await logActivityInTransaction(tx, {
+        entityType: 'SALES_ORDER',
+        entityId: park.entityId!,
+        tag: 'sync',
+        action: 'refund_park_settled_outside_ims',
+        level: 'WARNING',
+        description: `WooCommerce refund ${park.externalId} acknowledged as settled outside IMS by ${by}: ${why}. Nothing was created in IMS or sent to Xero; the refund is no longer synced.`,
+        metadata: { parkId: park.id, externalRefundId: park.externalId, by, userId: session.user.id, reason: why, hold: park.errorMessage },
+        userId: session.user.id,
+      })
+      return true
+    })
+    if (!closed) return { success: false, error: 'This row changed while you were looking at it (retried or already acknowledged). Reload the page.' }
+    revalidatePath('/sync/exceptions')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * o3d-pnc8p (IOSS case 8, o3d-ioss-xero 0.2.6 "Repayment applied"): THE ONLY WAY AN OPEN FEE REPAYMENT IS CLEARED. The refund's credit note credits a landed-cost fee
+ * EAS left out of the refund amount; the fee money went back separately and the operator has applied that repayment to the credit note in Xero. Records who, when
+ * and what they said; changes nothing else (no Xero call, the fee-gap figures stay as recorded).
+ */
+export async function acknowledgeFeeRepaymentApplied(refundId: string, note: string): Promise<MutationResult> {
+  try {
+    await requirePermission('sync')
+    const session = await requireFreshPermission('sales.refund')
+    const why = typeof note === 'string' ? note.trim() : ''
+    if (why === '') return { success: false, error: 'Say what was applied (for example "3.00 repayment applied to CN-00042 in Xero"). It is the audit record.' }
+    if (why.length > ACKNOWLEDGEMENT_REASON_MAX) return { success: false, error: `Keep the note under ${ACKNOWLEDGEMENT_REASON_MAX} characters.` }
+    const by = session.user.name?.trim() || session.user.email || session.user.id
+    const done = await db.$transaction(async (tx) => {
+      const refund = await tx.salesOrderRefund.findFirst({ where: { id: refundId, ...OPEN_FEE_REPAYMENT_WHERE }, select: { id: true, orderId: true, externalRefundId: true, creditNoteNumber: true, easFeeGapForeign: true } })
+      if (!refund) return null
+      const updated = await tx.salesOrderRefund.updateMany({
+        where: { id: refund.id, feeRepaymentAppliedAt: null },
+        data: { feeRepaymentAppliedAt: new Date(), feeRepaymentAppliedBy: session.user.id, feeRepaymentAppliedNote: `${by}: ${why}` },
+      })
+      if (updated.count !== 1) return null
+      await logActivityInTransaction(tx, {
+        entityType: 'SALES_ORDER',
+        entityId: refund.orderId,
+        tag: 'accounting',
+        action: 'refund_fee_repayment_applied',
+        level: 'INFO',
+        description: `Fee repayment applied, acknowledged by ${by}: ${why} (refund ${refund.externalRefundId ?? refund.id}, credit note ${refund.creditNoteNumber ?? '(no number)'}, fee ${toDecimal(refund.easFeeGapForeign ?? 0).toFixed(2)}).`,
+        metadata: { refundId: refund.id, externalRefundId: refund.externalRefundId, creditNoteNumber: refund.creditNoteNumber, by, userId: session.user.id, note: why },
+        userId: session.user.id,
+      })
+      return refund
+    })
+    if (!done) return { success: false, error: 'This fee repayment is no longer open (already acknowledged, or the refund was deleted). Reload the page.' }
+    revalidatePath('/sync/exceptions')
+    return { success: true }
   } catch (error) {
     const freshAuthFailure = freshAuthFailureResult(error)
     if (freshAuthFailure) return freshAuthFailure

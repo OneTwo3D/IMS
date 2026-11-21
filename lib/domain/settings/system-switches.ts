@@ -102,6 +102,9 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   // o3d-k26m.17: storefront refund -> credit-note parity with the November 2026 plugin fixes (EAS fee gap and shipping fold, fee repayment hold, store-credit hold,
   // SC- numbering and no allocation). Literal, not an import of lib/domain/sales/refund-cn-parity.ts; tests hold it equal to REFUND_CN_PARITY_SETTING_KEY.
   booleanSwitch('wc_refund_credit_note_parity_enabled'),
+  // o3d-0lpnb MED-3 / o3d-pnc8p note 1: before IMS creates a sales credit note, read Xero for one it did not raise that already credits the refund (Xeroom-era, by hand,
+  // SC-<refund id>) and hold rather than duplicate it. Literal, not an import of lib/connectors/xero/order-credit-notes.ts; tests hold it equal to its key there.
+  booleanSwitch('xero_credit_note_duplicate_check_enabled'),
   booleanSwitch(SUPPLIER_CREATE_KEY, undefined, true),
   booleanSwitch(ASN_SEND_SUPPLIER_KEY, undefined, true),
   booleanSwitch(ASN_SUPPLIER_REQUIRED_KEY, [ASN_REQUIRED_NEEDS_SEND], true),

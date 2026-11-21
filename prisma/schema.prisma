@@ -2596,6 +2596,10 @@ model SalesOrderRefund {
   /// o3d-k26m.17: what the storefront refund actually paid out (the WooCommerce `amount`), recorded only when the credit note credits more (the fee gap above).
   /// A gateway refund payment against the credit note is held to this. NULL otherwise.
   storefrontAmountForeign Decimal? @db.Decimal(18, 4) @map("storefront_amount_foreign")
+  /// o3d-pnc8p: the open fee repayment (easFeeGapForeign > 0) is cleared only by an operator's "repayment applied" acknowledgement, as o3d-ioss-xero 0.2.6 keeps `_o3d_ioss_fee_open`.
+  feeRepaymentAppliedAt   DateTime? @map("fee_repayment_applied_at")
+  feeRepaymentAppliedBy   String?   @map("fee_repayment_applied_by")
+  feeRepaymentAppliedNote String?   @map("fee_repayment_applied_note")
   /// A storefront refund that returns quantity owes the storefront a stock correction (the store raised its own
   /// stock for it before IMS heard). Written TRUE in the refund's own transaction, so a refund can never commit
   /// without the obligation; FALSE for every other refund (manual, money-only, chargeback) and every row that

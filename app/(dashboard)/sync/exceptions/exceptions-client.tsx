@@ -71,6 +71,8 @@ import {
   confirmParkedRefundSettlesImsRefund,
   retryRefundSyncPark,
   recoverRefundSyncPark,
+  acknowledgeRefundParkSettledOutsideIms,
+  acknowledgeFeeRepaymentApplied,
   type ExceptionInboxData,
   type RefundParkAllocationInput,
   type RefundParkAllocationTarget,
@@ -106,6 +108,11 @@ export function ExceptionsClient({ data }: Props) {
   // o3d-54p: which refund park (if any) has its recovery panel open. One at a time, and NEVER
   // pre-armed: the panel opens with no outcome chosen, so a stray click cannot assert anything.
   const [recoveringParkId, setRecoveringParkId] = useState<string | null>(null)
+  // o3d-pnc8p: the parity hold being acknowledged as settled outside IMS, and the open fee repayment being acknowledged as applied (each with its own note).
+  const [settlingOutsideParkId, setSettlingOutsideParkId] = useState<string | null>(null)
+  const [settledOutsideReason, setSettledOutsideReason] = useState('')
+  const [applyingFeeRefundId, setApplyingFeeRefundId] = useState<string | null>(null)
+  const [feeAppliedNote, setFeeAppliedNote] = useState('')
   // o3d-w00 (Codex r1 #3): the park currently being hand-recorded, or null.
   const [recordingPark, setRecordingPark] = useState<RefundSyncParkRow | null>(null)
   // o3d-j625 r6 (review H4): the MANUAL-ONLY refusal being marked handled, and the operator's note.
@@ -690,6 +697,19 @@ export function ExceptionsClient({ data }: Props) {
                           <CheckCircle2 className="h-3 w-3 mr-1" />{`Confirm this WooCommerce refund settles IMS refund ${candidate.creditNoteNumber ?? candidate.imsRefundId}`}
                         </Button>
                       ))}
+                      {/* o3d-pnc8p: the only route out of a refund-parity hold, whose manual credit note would be wrong. Creates nothing. */}
+                      {row.settledOutsideAcknowledgeable ? (
+                        <Button
+                          type="button"
+                          variant="outline"
+                          size="sm"
+                          disabled={isPending}
+                          title={withLedgerCheck('For a refund whose credit note was settled in Xero with the accountant. Closes this row and records who and why; nothing is created in IMS or sent to Xero, and the refund is not synced again.')}
+                          onClick={() => { setSettledOutsideReason(''); setSettlingOutsideParkId(settlingOutsideParkId === row.id ? null : row.id) }}
+                        >
+                          <CheckCircle2 className="h-3 w-3 mr-1" />Settled outside IMS
+                        </Button>
+                      ) : null}
                       {/* o3d-w00 (Codex r1 #3): the only route out of a QUARANTINED park. */}
                       {row.manuallyRecordable ? (
                         <Button
@@ -704,6 +724,32 @@ export function ExceptionsClient({ data }: Props) {
                       ) : null}
                     </TableCell>
                   </TableRow>
+                  {settlingOutsideParkId === row.id ? (
+                    <TableRow>
+                      <TableCell colSpan={6} className="bg-muted/30 space-y-2">
+                        <p className="text-xs text-muted-foreground">
+                          Acknowledge that this refund was settled outside IMS (its credit note settled in Xero with the accountant). Nothing is created in IMS or sent to Xero, returned stock is not restocked, and the refund is not synced again. An open fee repayment on an earlier refund stays open until it is acknowledged as applied.
+                        </p>
+                        <Label htmlFor={`settled-outside-${row.id}`} className="text-xs">How was it settled? (recorded with your name)</Label>
+                        <Input id={`settled-outside-${row.id}`} value={settledOutsideReason} maxLength={500} onChange={(event) => setSettledOutsideReason(event.target.value)} />
+                        <div className="space-x-2">
+                          <Button
+                            type="button"
+                            size="sm"
+                            disabled={isPending || settledOutsideReason.trim() === ''}
+                            onClick={() => {
+                              const reason = settledOutsideReason
+                              setSettlingOutsideParkId(null)
+                              runAction(() => acknowledgeRefundParkSettledOutsideIms(row.id, reason), 'Acknowledged as settled outside IMS. Nothing was created; the row is closed.')
+                            }}
+                          >
+                            Acknowledge
+                          </Button>
+                          <Button type="button" size="sm" variant="ghost" disabled={isPending} onClick={() => setSettlingOutsideParkId(null)}>Cancel</Button>
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  ) : null}
                   {recoveringParkId === row.id ? (
                     <TableRow>
                       <TableCell colSpan={6} className="bg-muted/30">
@@ -721,6 +767,66 @@ export function ExceptionsClient({ data }: Props) {
                             )
                           }}
                         />
+                      </TableCell>
+                    </TableRow>
+                  ) : null}
+                </Fragment>
+              ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
+      {data.openFeeRepayments.length > 0 ? (
+        <Card id="open-fee-repayments" className="p-4 space-y-3 scroll-mt-4">
+          <SectionHeading
+            title={`Fee repayments not yet applied in Xero (${data.summary.openFeeRepayments})`}
+            detail={withLedgerCheck('These credit notes WERE posted. Each credits a landed-cost fee that EAS left out of the refund amount, so the fee money is repaid separately. Apply that repayment to the credit note in Xero (do not post it again), then acknowledge it here. Acknowledging a later refund as settled outside IMS does not clear these.')}
+            shown={data.openFeeRepayments.length}
+            total={data.summary.openFeeRepayments}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[820px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Order</TableHead>
+                <TableHead>Fee repayment to apply</TableHead>
+                <TableHead>Recorded</TableHead>
+                <TableHead className="text-right">Action</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.openFeeRepayments.map((row) => (
+                <Fragment key={row.refundId}>
+                  <TableRow>
+                    <TableCell><Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link></TableCell>
+                    <TableCell className="text-xs">{row.instruction}</TableCell>
+                    <TableCell className="text-xs text-muted-foreground">{formatDateTime(row.createdAt)}</TableCell>
+                    <TableCell className="text-right">
+                      <Button type="button" variant="outline" size="sm" disabled={isPending} onClick={() => { setFeeAppliedNote(''); setApplyingFeeRefundId(applyingFeeRefundId === row.refundId ? null : row.refundId) }}>
+                        <CheckCircle2 className="h-3 w-3 mr-1" />Repayment applied
+                      </Button>
+                    </TableCell>
+                  </TableRow>
+                  {applyingFeeRefundId === row.refundId ? (
+                    <TableRow>
+                      <TableCell colSpan={4} className="bg-muted/30 space-y-2">
+                        <Label htmlFor={`fee-applied-${row.refundId}`} className="text-xs">{`What was applied? (for example "${row.gapForeign} repayment applied to ${row.creditNoteNumber ?? 'the credit note'} in Xero"; recorded with your name)`}</Label>
+                        <Input id={`fee-applied-${row.refundId}`} value={feeAppliedNote} maxLength={500} onChange={(event) => setFeeAppliedNote(event.target.value)} />
+                        <div className="space-x-2">
+                          <Button
+                            type="button"
+                            size="sm"
+                            disabled={isPending || feeAppliedNote.trim() === ''}
+                            onClick={() => {
+                              const note = feeAppliedNote
+                              setApplyingFeeRefundId(null)
+                              runAction(() => acknowledgeFeeRepaymentApplied(row.refundId, note), 'Fee repayment acknowledged as applied.')
+                            }}
+                          >
+                            Acknowledge
+                          </Button>
+                          <Button type="button" size="sm" variant="ghost" disabled={isPending} onClick={() => setApplyingFeeRefundId(null)}>Cancel</Button>
+                        </div>
                       </TableCell>
                     </TableRow>
                   ) : null}
