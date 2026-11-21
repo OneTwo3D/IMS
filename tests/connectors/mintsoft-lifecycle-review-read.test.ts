@@ -214,8 +214,8 @@ test('#1123 L3: a FIFO named as the credentials file is refused at once, never w
   execFileSync('mkfifo', ['-m', '600', fifo])
   // In a child process with a deadline: a blocking open would hang this test process itself.
   const probe = path.join(scratch, 'fifo-probe.ts')
-  const module = new URL('../../lib/connectors/mintsoft/lifecycle-review-read.ts', import.meta.url).href
-  writeFileSync(probe, `import { readMintsoftReviewConfig, MintsoftReviewRefused } from ${JSON.stringify(module)}\ntry { readMintsoftReviewConfig(${JSON.stringify(fifo)}); console.log('READ') } catch (e) { console.log(e instanceof MintsoftReviewRefused ? 'REFUSED ' + e.message : 'OTHER') }\n`)
+  const moduleUrl = new URL('../../lib/connectors/mintsoft/lifecycle-review-read.ts', import.meta.url).href
+  writeFileSync(probe, `import { readMintsoftReviewConfig, MintsoftReviewRefused } from ${JSON.stringify(moduleUrl)}\ntry { readMintsoftReviewConfig(${JSON.stringify(fifo)}); console.log('READ') } catch (e) { console.log(e instanceof MintsoftReviewRefused ? 'REFUSED ' + e.message : 'OTHER') }\n`)
   const child = spawnSync(process.execPath, [...process.execArgv.filter((a) => !a.startsWith('--test')), probe], { encoding: 'utf8', timeout: 20_000 })
   assert.equal(child.error, undefined, 'the open returned (no hang until the deadline)')
   assert.match(child.stdout, /^REFUSED the credentials file .* must be a regular file/m, child.stderr)
