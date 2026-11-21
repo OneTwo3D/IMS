@@ -29,13 +29,18 @@ test(
     const orderIds: string[] = []
     // Storefront refund ids no other file uses: a WooCommerce refund id is globally unique on sales_order_refunds.
     const base = 900_000_000 + Math.floor(Math.random() * 90_000_000)
+    let rateId: string | null = null
     try {
+      const rate = await db.taxRate.create({ data: { name: `PAR-Z-${sfx}`, rate: '0', accountingTaxType: `PARZ-${sfx}`, countryCode: 'ZZ' }, select: { id: true, name: true } })
+      rateId = rate.id
       const mkOrder = async () => {
         const o = await db.salesOrder.create({
           data: {
-            orderNumber: `PAR-${randomUUID().slice(0, 8)}`, status: 'PROCESSING', currency: 'GBP', fxRateToBase: new Prisma.Decimal('1'), pricesIncludeVat: false,
+            orderNumber: `PAR-${randomUUID().slice(0, 8)}`, status: 'PROCESSING', currency: 'GBP', fxRateToBase: new Prisma.Decimal('1'), pricesIncludeVat: false, taxRateName: rate.name, taxRatePercent: new Prisma.Decimal('0'),
             subtotalForeign: new Prisma.Decimal('100'), subtotalBase: new Prisma.Decimal('100'), taxForeign: new Prisma.Decimal('0'), taxBase: new Prisma.Decimal('0'),
             totalForeign: new Prisma.Decimal('100'), totalBase: new Prisma.Decimal('100'),
+            // One zero-rated line, so the order is uniformly taxed and a money-only refund of it is determinable (gross is net).
+            lines: { create: [{ description: 'l', qty: new Prisma.Decimal('1'), unitPriceForeign: new Prisma.Decimal('100'), unitPriceBase: new Prisma.Decimal('100'), taxForeign: new Prisma.Decimal('0'), taxBase: new Prisma.Decimal('0'), totalForeign: new Prisma.Decimal('100'), totalBase: new Prisma.Decimal('100'), taxRateId: rate.id }] },
           },
           select: { id: true },
         })
@@ -77,8 +82,10 @@ test(
       for (const orderId of orderIds) {
         await db.salesOrderRefundLine.deleteMany({ where: { refund: { orderId } } }).catch(() => {})
         await db.salesOrderRefund.deleteMany({ where: { orderId } }).catch(() => {})
+        await db.salesOrderLine.deleteMany({ where: { orderId } }).catch(() => {})
         await db.salesOrder.delete({ where: { id: orderId } }).catch(() => {})
       }
+      if (rateId) await db.taxRate.delete({ where: { id: rateId } }).catch(() => {})
       await db.$disconnect()
     }
   },
