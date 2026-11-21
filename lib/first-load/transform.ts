@@ -42,7 +42,9 @@ import { isPurchasableProductStatus } from '@/lib/products/lifecycle'
 import { joinVariantParents, type CatalogueView } from './variant-parents'
 import { planSkuRenames, type SkuRenameItem } from './sku-renames'
 import { boundProblems, type ProductStatusBinding, type VariantParentsBinding } from './snapshot'
-import { LIFECYCLE_DECISION_STATUSES, describeFigure, figureBlocksArchive, type LifecycleDecisionLabel, type LifecycleDecisionsBinding, type StockFigure } from './lifecycle-review/generation'
+import { LIFECYCLE_DECISION_STATUSES, describeFigure, figureBlocksArchive, warehousesBlockArchive, type GenerationBody, type LifecycleDecisionLabel, type LifecycleDecisionsBinding, type ReviewEntry, type StockFigure } from './lifecycle-review/generation'
+import { buildReviewModel, ReviewModelError } from './lifecycle-review/model'
+import type { SnapshotPayload } from './snapshot'
 import {
   accountRows,
   assertWithinImporterLimits,
@@ -116,6 +118,13 @@ export interface PrepareInput {
   lifecycleDecisionsBinding?: LifecycleDecisionsBinding
   /** True for `first-load:prepare --dry-run` (and the review sheet's own preview run): an undecided review-set SKU is a WARNING there, an ERROR otherwise. */
   dryRun?: boolean
+  /**
+   * What the run needs to RECOMPUTE the review set from its own inputs (#1122 R1 MED-1): the verified WooCommerce snapshot payload, and the Qoblex State of
+   * each product as the export states it (before the column map), keyed by skuKey of the Qoblex SKU as read (before sku-renames). The CLI supplies both
+   * when the manifest names a lifecycle review; without them a bound decisions dataset cannot be checked for products that joined the review set since the
+   * sheet was generated (LIFECYCLE_REVIEW_SET_UNCHECKED, an ERROR in a real prepare).
+   */
+  lifecycleReviewInputs?: { snapshot: SnapshotPayload; qoblexStates: ReadonlyMap<string, string> }
 }
 
 export type Severity = 'ERROR' | 'WARNING' | 'INFO'
@@ -778,11 +787,21 @@ const DECISION_LABELS = Object.keys(LIFECYCLE_DECISION_STATUSES) as LifecycleDec
  * WooCommerce-derived one (variant-parents and woo-product-status), so a decided SKU loads with the decided lifecycle whatever those said, and every later check
  * (transfers, purchase orders) sees it. Bound to ONE sheet generation (LifecycleDecisionsBinding): an unbound dataset is refused whole.
  *
- * Every row is reported. Refused (REJECTED, blocking): a bad SKU, a SKU that is not a row of the review sheet (UNKNOWN_SKU: decisions are keyed by the IMS SKU
- * exactly as the sheet shows it), a SKU listed twice (every row of it), a status that is not one of the four labels, a SKU this run does not load, and Archived
- * for a SKU holding stock in Qoblex (at generation or in this run's stock-lots), WooCommerce or the WMS, or whose WooCommerce or WMS figure was not read, unless
- * the override reason is filled (then applied and reported, WARNING ARCHIVED_WITH_STOCK_OVERRIDE). A review-set SKU with no decision (no row, or a blank
- * status) blocks the run (ERROR LIFECYCLE_DECISION_MISSING); a dry run reports it as a WARNING.
+ * THE REVIEW SET IS RECOMPUTED FROM THIS RUN (#1122 R1 MED-1). A fresher Qoblex export or WooCommerce snapshot can hold products that became draft or Archived
+ * after the sheet was generated: the run recomputes the review set from its own inputs (Qoblex Archived, a WooCommerce status or parent status that is not
+ * publish, with the same model the sheet is built with) plus the sheet's WMS-discontinued rows (the WMS is not read again), and every member that is not on
+ * the sheet and has no decision row is the ERROR LIFECYCLE_REVIEW_SET_CHANGED (a WARNING in a dry run): generate the sheet again, or add a decision row for
+ * it. A run that cannot recompute it (no verified snapshot) is LIFECYCLE_REVIEW_SET_UNCHECKED, an ERROR in a real prepare.
+ *
+ * Every row is reported. Refused (REJECTED, blocking): a bad SKU, a SKU that is neither a row of the review sheet nor in this run's review set (UNKNOWN_SKU:
+ * decisions are keyed by the IMS SKU exactly as the sheet shows it), a SKU listed twice (every row of it), a status that is not one of the four labels, a SKU
+ * this run does not load, and Archived for a SKU holding stock unless the override reason is filled (then applied and reported, WARNING
+ * ARCHIVED_WITH_STOCK_OVERRIDE). Stock is held when ANY single figure is above zero or was not read: one Qoblex warehouse at generation or in this run's
+ * stock-lots (never the sum, MED-2), the WooCommerce figure at generation and in this run's snapshot (taken for EVERY product IMS loads, by IMS SKU, also one that
+ * has left the review set since: #1123 R1 MED-1), the WMS figure at generation (the WMS is not read again;
+ * the report names the figures that are older than this run). A VARIABLE parent (MED-3) is refused Archived while any of its variations loads with another
+ * lifecycle (VARIATION_NOT_ARCHIVED, no override), and its variations' stock counts as its own. A review-set SKU with no decision (no row, or a blank status)
+ * blocks the run (ERROR LIFECYCLE_DECISION_MISSING); a dry run reports it as a WARNING.
  */
 function applyLifecycleDecisions(run: Run): void {
   const binding = run.input.lifecycleDecisionsBinding
@@ -801,36 +820,72 @@ function applyLifecycleDecisions(run: Run): void {
     run.find('ERROR', 'LIFECYCLE_DECISIONS_NOT_BOUND', `the owner lifecycle decisions were REFUSED: ${boundProblems(problems).join('; ')}. Generate the sheet with first-load:lifecycle-review, have it filled, and name its generation record in the manifest as lifecycleReview.generation.`, 'lifecycle-decisions')
     return
   }
+  const dry = run.input.dryRun === true
   const generation = binding.generation
   const review = new Map(generation.review.map((entry) => [entry.sku, entry]))
   // The sheet was generated from these inputs: a run on different ones is not refused (a fresher export is normal), but it is never silent.
   const partsOf = (name: DatasetName) => (run.input.datasets[name]?.parts ?? []).map((part) => part.sha256)
   const same = (a: readonly string[], b: readonly string[]) => a.length === b.length && a.every((x, i) => x === b[i])
   const changed: string[] = []
+  const stale: string[] = []
   if (!same(partsOf('products'), generation.inputs.products)) changed.push('the products file(s)')
-  if (!same(partsOf('stock-lots'), generation.inputs.stockLots)) changed.push('the stock-lots file(s)')
+  if (!same(partsOf('stock-lots'), generation.inputs.stockLots)) { changed.push('the stock-lots file(s)'); stale.push('the Qoblex stock at generation (this run\'s Qoblex stock is checked as well)') }
   const statusBinding = run.input.productStatusBinding
-  if (statusBinding?.verified !== true || statusBinding.snapshotPayloadSha256 !== generation.inputs.snapshotPayloadSha256) changed.push('the WooCommerce snapshot')
-  if (changed.length > 0) run.find('WARNING', 'LIFECYCLE_REVIEW_INPUTS_CHANGED', `the review sheet ${binding.sheetId} was generated from other inputs than this run reads (${changed.join(', ')}): its review set and stock figures are those of the sheet's own inputs; this run's Qoblex stock is still checked for an Archived decision. Generate a new sheet if products were added or changed since`, 'lifecycle-decisions')
-  // The Qoblex stock THIS run reads (stock-lots, after renames): a fresher export than the sheet's can only add a reason to refuse an Archived decision.
-  const stockNow = new Map<string, Dec>()
+  const snapshotChanged = statusBinding?.verified !== true || statusBinding.snapshotPayloadSha256 !== generation.inputs.snapshotPayloadSha256
+  if (snapshotChanged) { changed.push('the WooCommerce snapshot'); stale.push('the WooCommerce stock at generation (this run\'s snapshot figure is checked as well, where it can be read)') }
+  if (generation.inputs.wms.read) stale.push('the WMS physical stock (read when the sheet was generated; this run does not read the WMS)')
+  if (changed.length > 0) run.find('WARNING', 'LIFECYCLE_REVIEW_INPUTS_CHANGED', `the review sheet ${binding.sheetId} was generated from other inputs than this run reads (${changed.join(', ')}). Stale figures an Archived decision is checked against: ${stale.join('; ')}. This run's review set is recomputed from its own inputs (LIFECYCLE_REVIEW_SET_CHANGED lists any product the sheet lacks)`, 'lifecycle-decisions')
+
+  // ---- the review set of THIS run (MED-1) ----
+  const recomputed = currentReviewSet(run, generation)
+  const current = recomputed?.set ?? null
+  /** This run's WooCommerce stock figure for a SKU IMS loads, from EVERY model row (#1123 R1 MED-1), not only the review set's: a product that left the review set (published since) still has its stock checked. Undefined: no verified snapshot, or IMS does not load the SKU. */
+  const wooNowOf = (sku: string): StockFigure | undefined => recomputed?.wooNow.get(sku)
+  if (current === null) {
+    run.find(dry ? 'WARNING' : 'ERROR', 'LIFECYCLE_REVIEW_SET_UNCHECKED', `the review set of this run cannot be recomputed (it needs the verified WooCommerce snapshot and the products dataset), so products that became draft or Archived after the review sheet ${binding.sheetId} was generated cannot be found${dry ? ': a real prepare is BLOCKED by this' : ', so the real prepare is blocked'}`, 'lifecycle-decisions')
+  }
+  const known = (sku: string): boolean => review.has(sku) || (current?.has(sku) ?? false)
+
+  // The Qoblex stock THIS run reads (stock-lots, after renames), PER WAREHOUSE: a fresher export than the sheet's can only add a reason to refuse an Archived decision.
+  const stockNow = new Map<string, Map<string, Dec>>()
   for (const row of run.rows('stock-lots')) {
     const sku = parseSku(row.values.sku ?? '')
     const qty = parseDecimal(row.values.qty ?? '', 'qty', NUMERIC_LIMITS.stockQty, { allowNegative: true })
-    if (sku.ok && qty.ok) stockNow.set(sku.key, (stockNow.get(sku.key) ?? new D(0)).add(qty.value))
+    if (!sku.ok || !qty.ok) continue
+    const code = (row.values.warehouseCode ?? '').trim().toUpperCase()
+    const per = stockNow.get(sku.key) ?? new Map<string, Dec>()
+    per.set(code, (per.get(code) ?? new D(0)).add(qty.value))
+    stockNow.set(sku.key, per)
   }
+  const positiveNow = (key: string): string[] => [...(stockNow.get(key)?.entries() ?? [])].filter(([, qty]) => qty.gt(0)).map(([code, qty]) => `${code} ${fmt(qty)}`).sort()
+
+  /** Every reason an Archived decision for this SKU needs an override: each figure above zero, or not read, named with how old it is. */
+  const holdings = (sku: string, prefix: string, at: { qoblexByWarehouse: Record<string, string>; wooStock: StockFigure; wmsStock: StockFigure } | undefined, wooNow: StockFigure | undefined): string[] => {
+    const out: string[] = []
+    const qAt = at === undefined ? [] : warehousesBlockArchive(at.qoblexByWarehouse)
+    if (qAt.length > 0) out.push(`${prefix}Qoblex stock at generation ${qAt.join(', ')}`)
+    const qNow = positiveNow(skuKey(sku))
+    if (qNow.length > 0) out.push(`${prefix}Qoblex stock in this run ${qNow.join(', ')}`)
+    if (at !== undefined && figureBlocksArchive(at.wooStock)) out.push(`${prefix}WooCommerce stock at generation ${describeFigure(at.wooStock)}${snapshotChanged ? ' (stale: this run reads another snapshot)' : ''}`)
+    if ((at === undefined || snapshotChanged) && wooNow !== undefined && figureBlocksArchive(wooNow)) out.push(`${prefix}WooCommerce stock in this run ${describeFigure(wooNow)}`)
+    if (at === undefined && wooNow === undefined) out.push(`${prefix}WooCommerce stock not read`)
+    const wms: StockFigure = at?.wmsStock ?? { kind: 'unknown' }
+    if (figureBlocksArchive(wms)) out.push(`${prefix}WMS physical stock at generation ${describeFigure(wms)}${at === undefined ? ' (not on the review sheet)' : ''}`)
+    return out
+  }
+
   const bySku = new Map<string, CanonRow[]>()
   for (const row of rows) {
     const sku = parseSku(row.values.sku)
     if (!sku.ok) { run.add('lifecycle-decisions', row.line, row.values.sku, 'REJECTED', 'BAD_SKU', sku.reason); continue }
-    if (!review.has(sku.sku)) {
-      run.add('lifecycle-decisions', row.line, sku.sku, 'REJECTED', 'UNKNOWN_SKU', `${sku.sku} is not a row of the review sheet ${binding.sheetId} (a decision is keyed by the IMS SKU exactly as the sheet shows it; a row added to the sheet is never applied)`)
+    if (!known(sku.sku)) {
+      run.add('lifecycle-decisions', row.line, sku.sku, 'REJECTED', 'UNKNOWN_SKU', `${sku.sku} is not a row of the review sheet ${binding.sheetId}, nor in this run's review set (a decision is keyed by the IMS SKU exactly as the sheet shows it; a row added for any other product is never applied)`)
       continue
     }
     bySku.set(sku.sku, [...(bySku.get(sku.sku) ?? []), row])
   }
   const settled = new Set<string>()
-  let applied = 0
+  const valid: Array<{ sku: string; key: string; row: CanonRow; decided: LifecycleDecisionLabel; lifecycle: string; reason: string; entry: CatEntry }> = []
   for (const [sku, list] of [...bySku.entries()].sort((a, b) => cmp(a[0], b[0]))) {
     settled.add(sku)
     if (list.length > 1) {
@@ -850,43 +905,106 @@ function applyLifecycleDecisions(run: Run): void {
       run.add('lifecycle-decisions', row.line, sku, 'REJECTED', 'BAD_STATUS', `status ${JSON.stringify(label.slice(0, 60))} is not one of ${DECISION_LABELS.join(', ')}`)
       continue
     }
-    const lifecycle = LIFECYCLE_DECISION_STATUSES[decided]
     const key = skuKey(sku)
     if (run.exclusions.has(key)) { run.add('lifecycle-decisions', row.line, sku, 'EXCLUDED', 'SKU_EXCLUDED', `${sku} is on sku-exclusions, so it is not loaded and the decision changes nothing`); continue }
     const entry = run.cat.get(key)
     if (entry === undefined || entry.sku !== sku) {
-      run.add('lifecycle-decisions', row.line, sku, 'REJECTED', 'PRODUCT_NOT_LOADED', `${sku} is not in this run's catalogue (its product row was refused, or it is not in the products dataset), so the decision cannot be applied`)
+      run.add('lifecycle-decisions', row.line, sku, 'REJECTED', 'PRODUCT_NOT_LOADED', `${sku} is not in this run's catalogue (its product row was refused, it is not in the products dataset, or it loads under another letter case), so the decision cannot be applied`)
       continue
     }
-    if (lifecycle === 'ARCHIVED') {
-      const at = review.get(sku)!
-      const now = stockNow.get(key)
-      const figures: Array<[string, StockFigure]> = [
-        ['Qoblex stock at generation', { kind: 'qty', qty: at.qoblexStock }],
-        ['Qoblex stock in this run', now === undefined ? { kind: 'absent' } : { kind: 'qty', qty: fmt(now) }],
-        ['WooCommerce stock', at.wooStock],
-        ['WMS physical stock', at.wmsStock],
-      ]
-      const holds = figures.filter(([, f]) => figureBlocksArchive(f)).map(([name, f]) => `${name} ${describeFigure(f)}`)
-      if (holds.length > 0 && reason === '') {
-        run.add('lifecycle-decisions', row.line, sku, 'REJECTED', 'ARCHIVED_WITH_STOCK', `Archived is refused: ${holds.join(', ')} (a figure that was not read cannot prove there is no stock). Fill the Override reason to archive it anyway`)
-        continue
-      }
-      if (holds.length > 0) run.find('WARNING', 'ARCHIVED_WITH_STOCK_OVERRIDE', `${sku} is archived although ${holds.join(', ')}; override reason: ${reason}`, 'lifecycle-decisions', [sku])
-    }
-    const before = entry.lifecycle
-    entry.lifecycle = lifecycle
-    entry.cells.lifecycleStatus = lifecycle
-    run.decidedKeys.add(key)
+    valid.push({ sku, key, row, decided, lifecycle: LIFECYCLE_DECISION_STATUSES[decided], reason, entry })
+  }
+  let applied = 0
+  const apply = (d: (typeof valid)[number]): void => {
+    const before = d.entry.lifecycle
+    d.entry.lifecycle = d.lifecycle
+    d.entry.cells.lifecycleStatus = d.lifecycle
+    run.decidedKeys.add(d.key)
     applied++
-    run.add('lifecycle-decisions', row.line, sku, 'EMITTED', 'LIFECYCLE_DECIDED', `${decided}: loaded as ${lifecycle}`)
-    run.find('INFO', 'LIFECYCLE_FROM_DECISION', `${sku}: owner decision ${decided}, loaded as ${lifecycle} (the first load would otherwise set ${before})${reason === '' ? '' : `; reason: ${reason}`}`, 'lifecycle-decisions', [sku])
+    run.add('lifecycle-decisions', d.row.line, d.sku, 'EMITTED', 'LIFECYCLE_DECIDED', `${d.decided}: loaded as ${d.lifecycle}`)
+    run.find('INFO', 'LIFECYCLE_FROM_DECISION', `${d.sku}: owner decision ${d.decided}, loaded as ${d.lifecycle} (the first load would otherwise set ${before})${d.reason === '' ? '' : `; reason: ${d.reason}`}`, 'lifecycle-decisions', [d.sku])
+  }
+  const archive = (d: (typeof valid)[number], holds: string[]): void => {
+    if (holds.length > 0 && d.reason === '') {
+      run.add('lifecycle-decisions', d.row.line, d.sku, 'REJECTED', 'ARCHIVED_WITH_STOCK', `Archived is refused: ${holds.join(', ')} (a figure that was not read cannot prove there is no stock). Fill the Override reason to archive it anyway`)
+      return
+    }
+    if (holds.length > 0) run.find('WARNING', 'ARCHIVED_WITH_STOCK_OVERRIDE', `${d.sku} is archived although ${holds.join(', ')}; override reason: ${d.reason}`, 'lifecycle-decisions', [d.sku])
+    apply(d)
+  }
+  // Every decision but Archived on a VARIABLE parent first: the parent's check needs the lifecycle each variation finally loads with.
+  const parentArchives = valid.filter((d) => d.lifecycle === 'ARCHIVED' && d.entry.type === 'VARIABLE')
+  for (const d of valid) {
+    if (parentArchives.includes(d)) continue
+    if (d.lifecycle === 'ARCHIVED') archive(d, holdings(d.sku, '', review.get(d.sku), wooNowOf(d.sku)))
+    else apply(d)
+  }
+  for (const d of parentArchives) {
+    const children = [...run.cat.values()].filter((e) => e.parentSku !== '' && skuKey(e.parentSku) === d.key).sort((a, b) => cmp(a.sku, b.sku))
+    const notArchived = children.filter((c) => c.lifecycle !== 'ARCHIVED')
+    if (notArchived.length > 0) {
+      run.add('lifecycle-decisions', d.row.line, d.sku, 'REJECTED', 'VARIATION_NOT_ARCHIVED', `Archived is refused for the VARIABLE parent ${d.sku}: its variation(s) ${notArchived.slice(0, 20).map((c) => `${c.sku} (${c.lifecycle})`).join(', ')}${notArchived.length > 20 ? ` and ${notArchived.length - 20} more` : ''} would still load with another lifecycle. Decide every variation Archived first (an override reason does not lift this)`)
+      continue
+    }
+    const at = review.get(d.sku)
+    const holds = holdings(d.sku, '', at, wooNowOf(d.sku))
+    for (const child of children) {
+      const childAt = at?.variations?.find((v) => v.sku === child.sku) ?? review.get(child.sku)
+      holds.push(...holdings(child.sku, `variation ${child.sku}: `, childAt, wooNowOf(child.sku)))
+    }
+    archive(d, holds)
   }
   if (applied > 0) run.find('INFO', 'LIFECYCLE_FROM_DECISION_COUNT', `${applied} product(s) take their lifecycle from the owner's review sheet ${binding.sheetId}; each is listed as LIFECYCLE_FROM_DECISION`, 'lifecycle-decisions')
   const missing = generation.review.filter((entry) => !settled.has(entry.sku) && !run.exclusions.has(skuKey(entry.sku))).map((entry) => entry.sku)
   if (missing.length > 0) {
-    run.find(run.input.dryRun === true ? 'WARNING' : 'ERROR', 'LIFECYCLE_DECISION_MISSING', `${missing.length} product(s) of the review sheet ${binding.sheetId} have no decision (the New IMS status is blank or the row is missing)${run.input.dryRun === true ? ': a real prepare is BLOCKED until each is decided' : ', so the real prepare is blocked until each is decided'}`, 'lifecycle-decisions', missing)
+    run.find(dry ? 'WARNING' : 'ERROR', 'LIFECYCLE_DECISION_MISSING', `${missing.length} product(s) of the review sheet ${binding.sheetId} have no decision (the New IMS status is blank or the row is missing)${dry ? ': a real prepare is BLOCKED until each is decided' : ', so the real prepare is blocked until each is decided'}`, 'lifecycle-decisions', missing)
   }
+  const added = [...(current?.entries() ?? [])].filter(([sku]) => !review.has(sku) && !settled.has(sku) && !run.exclusions.has(skuKey(sku))).sort((a, b) => cmp(a[0], b[0]))
+  if (added.length > 0) {
+    const list = `${added.slice(0, 20).map(([sku, e]) => `${sku} (${e.reasons.join('; ')})`).join(', ')}${added.length > 20 ? ` and ${added.length - 20} more` : ''}`
+    run.find(dry ? 'WARNING' : 'ERROR', 'LIFECYCLE_REVIEW_SET_CHANGED', `${added.length} product(s) are in the review set of THIS run's inputs but not on the review sheet ${binding.sheetId}, and have no decision: ${list}. They became draft or Archived (or appeared) after the sheet was generated: generate the sheet again and have it filled, or add a decision row for each to the decisions file${dry ? '. A real prepare is BLOCKED until then' : ''}`, 'lifecycle-decisions', added.map(([sku]) => sku))
+  }
+}
+
+/**
+ * The review set of THIS run's inputs (MED-1), by the same model the sheet is built with (lib/first-load/lifecycle-review/model.ts): every product IMS loads
+ * that is Archived in Qoblex (the State as the export states it, before the column map) or not publish in WooCommerce (its own status or its parent's), plus the
+ * sheet's WMS-discontinued rows (the WMS is not read again). Null when it cannot be computed: no verified snapshot was handed over.
+ *
+ * `wooNow` is this run's WooCommerce stock figure of EVERY model row IMS loads, by IMS SKU (#1123 R1 MED-1): an Archived decision is checked against it
+ * whether or not the product is still in the review set (a product draft with stock 0 at generation and published with stock 10 since has left the set, and
+ * its stale 0 must not clear it). A carried WMS-discontinued row takes its figure from there too (L4), never "not read".
+ */
+function currentReviewSet(run: Run, generation: GenerationBody): { set: Map<string, ReviewEntry>; wooNow: Map<string, StockFigure> } | null {
+  const inputs = run.input.lifecycleReviewInputs
+  if (inputs === undefined || run.input.productStatusBinding?.verified !== true || !run.has('products')) return null
+  // The products and stock-lots cells already carry the renamed SKUs; the model joins WooCommerce on the pre-rename spelling too, so it is given back.
+  const fromOf = new Map(run.acceptedRenames.map((r) => [skuKey(r.to), r.from]))
+  const qoblexProducts = run.rows('products').map((row) => {
+    const cell = row.values.sku ?? ''
+    const parsed = parseSku(cell)
+    const raw = parsed.ok ? fromOf.get(parsed.key) ?? cell : cell
+    const state = parsed.ok ? inputs.qoblexStates.get(skuKey(raw.trim())) ?? '' : ''
+    return { sku: raw, name: row.values.name ?? '', type: row.values.type ?? '', state }
+  })
+  const catalogue: CatalogueEntry[] = [...run.cat.values()].map((e) => ({ sku: e.sku, name: e.name, type: e.type, parentSku: e.parentSku, lifecycle: e.lifecycle, lifecycleSource: 'qoblex' as const }))
+  let model
+  try {
+    model = buildReviewModel({ catalogue, skuRenames: run.acceptedRenames, qoblexProducts, qoblexStock: [], snapshot: inputs.snapshot, wms: null })
+  } catch (error) {
+    if (error instanceof ReviewModelError) return null
+    throw error
+  }
+  const wooNow = new Map<string, StockFigure>()
+  for (const row of model.rows) if (row.imsSku !== null) wooNow.set(row.imsSku, row.wooStock)
+  const out = new Map(model.entries.map((e) => [e.sku, e]))
+  for (const entry of generation.review) {
+    if (!entry.reasons.includes('WMS discontinued')) continue
+    if (!run.cat.has(skuKey(entry.sku))) continue
+    const mine = out.get(entry.sku)
+    out.set(entry.sku, mine === undefined ? { ...entry, wooStock: wooNow.get(entry.sku) ?? { kind: 'unknown' } } : { ...mine, reasons: [...mine.reasons, 'WMS discontinued'] })
+  }
+  return { set: out, wooNow }
 }
 
 /**

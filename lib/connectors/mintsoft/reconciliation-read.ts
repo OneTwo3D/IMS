@@ -84,8 +84,11 @@ export async function readMintsoftPackCredentials(client: MintsoftQueryClient, e
 
 const DIGITS = /^[0-9]{1,9}$/
 
-/** The decision the hop gate makes for one hop. A string refuses the hop (nothing is sent). Exported so a test drives it directly. */
-export function mintsoftReadHopRefusal(base: URL, hop: { method: string; url: URL; redirectCount: number }, classify: typeof classifyMintsoftRequest = classifyMintsoftRequest): string | null {
+/**
+ * The decision the hop gate makes for one hop. A string refuses the hop (nothing is sent). Exported so a test drives it directly. `warehouseList` also admits
+ * `GET /api/Warehouse` with no parameter (the first-load lifecycle review's warehouse coverage check); the reconciliation pack never passes it.
+ */
+export function mintsoftReadHopRefusal(base: URL, hop: { method: string; url: URL; redirectCount: number }, classify: typeof classifyMintsoftRequest = classifyMintsoftRequest, options: { warehouseList?: boolean } = {}): string | null {
   if (hop.redirectCount !== 0) return 'redirect'
   if (hop.method !== 'GET') return 'method'
   if (hop.url.origin !== base.origin || hop.url.username || hop.url.password || hop.url.hash) return 'origin'
@@ -93,7 +96,7 @@ export function mintsoftReadHopRefusal(base: URL, hop: { method: string; url: UR
   if (!hop.url.pathname.startsWith(`${prefix}/`)) return 'path'
   const relative = hop.url.pathname.slice(prefix.length)
   // Two exact paths, AND the connector's own read classification must agree (a path the allow-list does not list is a write).
-  const names = relative === '/api/Product/StockLevels' ? ['WarehouseId'] : relative === '/api/Product/List' ? ['PageNo', 'Limit'] : null
+  const names = relative === '/api/Product/StockLevels' ? ['WarehouseId'] : relative === '/api/Product/List' ? ['PageNo', 'Limit'] : relative === '/api/Warehouse' && options.warehouseList === true ? [] : null
   if (names === null || classify('GET', relative).class !== 'read') return 'path'
   const seen = new Map<string, string>()
   for (const [name, value] of hop.url.searchParams) {
@@ -101,6 +104,7 @@ export function mintsoftReadHopRefusal(base: URL, hop: { method: string; url: UR
     seen.set(name, value)
   }
   if (seen.size !== names.length) return 'parameter'
+  if (relative === '/api/Warehouse') return null
   if (relative === '/api/Product/StockLevels') return Number(seen.get('WarehouseId')) >= 1 ? null : 'parameter'
   const limit = Number(seen.get('Limit'))
   const pageNo = Number(seen.get('PageNo'))
@@ -130,7 +134,7 @@ function wholeNumber(value: unknown): number | null {
  * parameters, the connection's own origin, no redirect), the fixed key in `ms-apikey`. Exactly 200 with JSON, else it throws (a short code, never a body,
  * a URL or the key). Shared by the reconciliation pack's port and the first-load lifecycle review reader (lifecycle-review-read.ts).
  */
-export async function mintsoftGuardedGet(creds: MintsoftPackCredentials, relativePath: string, params: Record<string, string>, deps: Pick<MintsoftReadPortDeps, 'env' | 'fetchImpl' | 'timeoutMs'> = {}): Promise<unknown> {
+export async function mintsoftGuardedGet(creds: MintsoftPackCredentials, relativePath: string, params: Record<string, string>, deps: Pick<MintsoftReadPortDeps, 'env' | 'fetchImpl' | 'timeoutMs'> & { warehouseList?: boolean } = {}): Promise<unknown> {
   const send = deps.fetchImpl ?? connectorFetch
   const base = new URL(creds.baseUrl.endsWith('/') ? creds.baseUrl : `${creds.baseUrl}/`)
   const url = new URL(relativePath.replace(/^\/+/, ''), base)
@@ -145,7 +149,7 @@ export async function mintsoftGuardedGet(creds: MintsoftPackCredentials, relativ
     allowE2eLocalHttp: true,
     env: deps.env,
     refuseRedirects: true,
-    hopGate: (hop) => mintsoftReadHopRefusal(new URL(creds.baseUrl), hop),
+    hopGate: (hop) => mintsoftReadHopRefusal(new URL(creds.baseUrl), hop, classifyMintsoftRequest, { warehouseList: deps.warehouseList === true }),
   })
   // Exactly 200 with JSON: a 204, a 3xx that was not followed, a 401 (never refreshed) and every error are unreadable.
   if (response.status !== 200) throw new Error('status')

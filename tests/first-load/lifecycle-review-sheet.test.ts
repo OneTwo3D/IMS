@@ -73,7 +73,8 @@ test('the columns carry the SKU in each system, the Woo name (or the marked Qobl
   assert.deepEqual([row('NEW-ARCH')['Qoblex state'], row('NEW-ARCH')['Woo status'], row('NEW-ARCH')['Qoblex stock total'], row('NEW-ARCH')['Qoblex stock MIL1'], row('NEW-ARCH')['Woo stock'], row('NEW-ARCH')['Mintsoft physical stock']], ['Archived', 'publish', '3', '3', '2', '3'])
   assert.equal(row('NEW-ARCH')['IMS lifecycle the first load would set'], 'ACTIVE (Active)', 'Qoblex Archived, Woo publish: WooCommerce wins today')
   assert.equal(row('SIM-DRAFT')['IMS lifecycle the first load would set'], 'DRAFT (Do not sell yet)')
-  assert.deepEqual([row('VAR-02').Name, row('VAR-02')['Name source'], row('VAR-02').Type, row('VAR-02')['Parent SKU'], row('VAR-02')['Woo status'], row('VAR-02')['Woo parent status'], row('VAR-02')['Woo stock']], ['Mug - Blue', 'WooCommerce', 'VARIANT', 'VAR-PARENT', 'private', 'publish', 'not read'])
+  assert.deepEqual([row('VAR-02').Name, row('VAR-02')['Name source'], row('VAR-02').Type, row('VAR-02')['Parent SKU'], row('VAR-02')['Woo status'], row('VAR-02')['Woo parent status'], row('VAR-02')['Woo stock']], ['Mug - Blue', 'WooCommerce', 'VARIANT', 'VAR-PARENT', 'private', 'publish', '3'], 'MED-5: the variation\'s own Woo stock, from the snapshot\'s variation walk')
+  assert.equal(row('VAR-02')['Stock > 0'], 'yes')
   assert.deepEqual([row('SIM-PRIV')['Woo stock'], row('SIM-PRIV')['Woo id']], ['not managed', '203'])
   assert.deepEqual([row('NEW-1')['Qoblex SKU'], row('NEW-1')['Woo SKU'], row('NEW-1')['Mintsoft SKU'], row('NEW-1')['Mintsoft product id'], row('NEW-1')['Mintsoft status']], ['OLD-1', 'NEW-1', 'OLD-1', '15', 'discontinued'])
   const all = table(tabs(r.out)[ALL_PRODUCTS_TAB])
@@ -139,7 +140,8 @@ test('the generation record binds the sheet: its digest is recomputed, the sheet
   assert.ok(gen.ok, gen.ok ? '' : gen.problem)
   if (!gen.ok) return
   assert.deepEqual(gen.value.body.review.map((e) => e.sku), ['NEW-1', 'NEW-ARCH', 'SIM-DRAFT', 'SIM-PRIV', 'VAR-02'])
-  assert.deepEqual(gen.value.body.review.find((e) => e.sku === 'NEW-ARCH'), { sku: 'NEW-ARCH', proposed: 'ACTIVE', qoblexStock: '3', wooStock: { kind: 'qty', qty: '2' }, wmsStock: { kind: 'qty', qty: '3' } })
+  assert.deepEqual(gen.value.body.review.find((e) => e.sku === 'NEW-ARCH'), { sku: 'NEW-ARCH', proposed: 'ACTIVE', reasons: ['Qoblex Archived'], qoblexStock: '3', qoblexByWarehouse: { MIL1: '3' }, wooStock: { kind: 'qty', qty: '2' }, wmsStock: { kind: 'qty', qty: '3' } })
+  assert.deepEqual(gen.value.body.review.find((e) => e.sku === 'VAR-02')?.wooStock, { kind: 'qty', qty: '3' })
   assert.equal(gen.value.body.inputs.wms.read, true)
   const s = tabs(r.out)
   const review = table(s[REVIEW_TAB])
@@ -221,4 +223,75 @@ test('the document states exactly the command\'s exit codes, the Mintsoft creden
   const script = readFileSync(path.join(process.cwd(), 'scripts/first-load-lifecycle-review.ts'), 'utf8')
   assert.ok(script.includes("flag: '--mintsoft-env-file'") && section.includes('--mintsoft-env-file'), 'the documented option is the one the wrapper registers')
   assert.ok(script.includes('readMintsoftReviewListing(readMintsoftReviewConfig(envFile))'), 'the wrapper supplies the GET-only reader')
+})
+
+// [mutation: the Review tab is not protected, or a locked column (an SKU, the sheet id) is unlocked, or a decision cell stays locked] (#1122 R1 MED-4)
+test('MED-4: the Review tab is protected without a password; only "New IMS status" and "Override reason" of a decidable row are unlocked', async () => {
+  const r = await generate(withWms)
+  const bytes = readFileSync(path.join(r.out, LIFECYCLE_REVIEW_FILE_NAMES.sheet))
+  const parts = unzip(bytes)
+  const xml = parts.get('xl/worksheets/sheet1.xml')!.toString('utf8')
+  assert.match(xml, /<sheetProtection sheet="1" objects="1" scenarios="1" formatColumns="0" autoFilter="0"\/>/)
+  assert.ok(!/password|hashValue/.test(xml))
+  for (const other of ['sheet2', 'sheet3', 'sheet4']) assert.ok(!parts.get(`xl/worksheets/${other}.xml`)!.toString('utf8').includes('sheetProtection'), `${other} is not protected`)
+  const review = table(tabs(r.out)[REVIEW_TAB])
+  const unlocked = new Set<string>()
+  for (const m of xml.matchAll(/<c r="([A-Z]+)(\d+)" s="(\d+)"/g)) if (Number(m[3]) > 24) unlocked.add(`${review.header[m[1].charCodeAt(0) - 65]}|${review.rows[Number(m[2]) - 2]?.['IMS SKU'] ?? 'header'}`)
+  const decidable = review.rows.filter((x) => x['IMS SKU'] !== '').map((x) => x['IMS SKU'])
+  assert.ok(decidable.length > 0, 'precondition: decidable rows')
+  assert.deepEqual([...unlocked].sort(), decidable.flatMap((sku) => [`New IMS status|${sku}`, `Override reason|${sku}`]).sort())
+  const notes = [...tabs(r.out)[NOTES_TAB].rows.values()].map((cells) => cells.get(0)!.text).join('\n')
+  assert.match(notes, /The Review tab is PROTECTED \(no password\)/)
+  assert.doesNotMatch(notes, /You may sort/)
+})
+
+// [mutation: a VARIABLE parent shows only its own (absent) stock] (#1122 R1 MED-3)
+test('MED-3: a VARIABLE parent row shows its variations\' stock (summed) and is highlighted when any variation holds stock', async () => {
+  const r = await generate(withWms)
+  const parent = table(tabs(r.out)[ALL_PRODUCTS_TAB]).rows.find((x) => x['IMS SKU'] === 'VAR-PARENT')!
+  assert.deepEqual([parent['Woo stock'], parent['Stock > 0'], parent['Qoblex stock CAMB']], ['3', 'yes', '0'])
+})
+
+/** The base manifest with a products export that has `extra` rows appended (Qoblex native columns: Product, Sku, State, Product Type). */
+const withExtraProducts = (extra: string[]): string => {
+  const file = path.join(fx.root, 'qoblex', `products-extra-${extra.length}-${Buffer.from(extra.join('|')).toString('hex').slice(0, 12)}.csv`)
+  writeFileSync(file, `${readFileSync(path.join(fx.root, 'qoblex', 'products.csv'), 'utf8')}${extra.map((row) => `${row}\r\n`).join('')}`)
+  return fx.writeManifest((m) => { for (const input of m.inputs as Array<{ dataset: string; file: string }>) if (input.dataset === 'products') input.file = file })
+}
+
+// [mutation: U+FFFD is refused in every cell on read-back (a lost character in a NAME makes generation exit INTERNAL)] (#1123 R1 MED-2)
+test('#1123 MED-2: a product NAME holding U+FFFD is written and the sheet reads back; a review-row SKU holding it is an input error naming the SKU', async () => {
+  const named = await generate(withWms, reader(), withExtraProducts(['Lost � name,Q-ARCH,Archived,simple']))
+  assert.equal(named.code, EXIT_CODES.OK, named.stderr)
+  const review = table(tabs(named.out)[REVIEW_TAB])
+  const row = review.rows.find((r) => r['IMS SKU'] === 'Q-ARCH')
+  assert.ok(row, 'the product is on the Review tab')
+  assert.equal(row!.Name, 'Lost � name', 'the name is shown as the source holds it')
+  const lost = await generate(withWms, reader(), withExtraProducts(['Archived with a lost SKU,Q�ARCH,Archived,simple']))
+  assert.equal(lost.code, EXIT_CODES.INPUT_UNUSABLE, lost.stderr)
+  assert.match(lost.stderr, /the SKU\(s\) "Q�ARCH" hold U\+FFFD, a character lost in a conversion/)
+  assert.equal(existsSync(lost.out), false, 'nothing written')
+})
+
+// [mutation: the format-1 refusal reads like any other bad file; a variation with an extra key is accepted] (#1123 R1 L8)
+test('#1123 L8: a format-1 generation record is refused with the message that says to generate again; a variation with another key than its four is malformed', async () => {
+  const r = await generate(withWms)
+  assert.equal(r.code, EXIT_CODES.OK, r.stderr)
+  const record = JSON.parse(readFileSync(path.join(r.out, LIFECYCLE_REVIEW_FILE_NAMES.generation), 'utf8')) as { formatVersion: number; body: { review: Array<{ variations?: Array<Record<string, unknown>> }> } }
+  const v1 = parseGeneration(JSON.stringify({ ...record, formatVersion: 1 }))
+  assert.equal(v1.ok, false)
+  assert.match(!v1.ok ? v1.problem : '', /is format 1: it was written before the review recorded the stock per warehouse.*Generate the sheet again \(npm run first-load:lifecycle-review\)/)
+  const v3 = parseGeneration(JSON.stringify({ ...record, formatVersion: 3 }))
+  assert.match(!v3.ok ? v3.problem : '', /^the file is not a lifecycle review generation record of format 2$/)
+  const variation = { sku: 'VAR-X', qoblexByWarehouse: {}, wooStock: { kind: 'absent' }, wmsStock: { kind: 'absent' } }
+  const withVariation = (v: Record<string, unknown>) => {
+    const copy = structuredClone(record)
+    copy.body.review[0].variations = [v]
+    return parseGeneration(JSON.stringify(copy))
+  }
+  assert.match((() => { const p = withVariation(variation); return p.ok ? '' : p.problem })(), /digest does not match/, 'precondition: four keys pass the shape check (then the digest refuses the edit)')
+  for (const v of [{ ...variation, extra: 'x' }, { sku: 'VAR-X', qoblexByWarehouse: {}, wooStock: { kind: 'absent' } }]) {
+    const p = withVariation(v)
+    assert.match(p.ok ? '' : p.problem, /carries a malformed variation$/, JSON.stringify(Object.keys(v)))
+  }
 })

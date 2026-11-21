@@ -6,6 +6,10 @@
  * checks). Every text cell is an inline string and no cell is a formula (xlsx.ts); a row holding stock anywhere is filled yellow, the SKU cells of a
  * row with a SKU mismatch orange. The "New IMS status" column carries a drop-down restricted to the four owner statuses.
  *
+ * THE REVIEW TAB IS PROTECTED (#1122 R1 MED-4), without a password (a guard against accidents, not a lock: the spreadsheet's own menu lifts it): every cell is
+ * locked except "New IMS status" and "Override reason" on the rows that can be decided, so a one-column sort, a cut and paste or a row insert that would move
+ * a decision onto another SKU is refused by Excel (and LibreOffice). Filtering and widening columns stay allowed.
+ *
  * PURE. Product data only: SKUs, names, statuses, stock figures and lifecycles; no customer, supplier contact or credential.
  */
 import {
@@ -51,8 +55,9 @@ function columns(model: ReviewModel, options: SheetOptions, review: boolean, she
   ]
   if (review) {
     cols.push(
-      { header: DECISION_HEADERS.status, width: 18, cell: (r, f) => ({ v: '', fill: r.imsSku === null ? 'muted' : f ?? 'input' }) },
-      { header: DECISION_HEADERS.reason, width: 36, cell: (r, f) => ({ v: '', fill: r.imsSku === null ? 'muted' : f ?? 'input' }) },
+      // The only editable cells of the protected Review tab: the two decision columns of a row that can be decided.
+      { header: DECISION_HEADERS.status, width: 18, cell: (r, f) => ({ v: '', fill: r.imsSku === null ? 'muted' : f ?? 'input', unlocked: r.imsSku !== null }) },
+      { header: DECISION_HEADERS.reason, width: 36, cell: (r, f) => ({ v: '', fill: r.imsSku === null ? 'muted' : f ?? 'input', unlocked: r.imsSku !== null }) },
       { header: 'Why in review', width: 30, cell: (r, f) => text(named(`${r.reviewReasons.join('; ')}${r.imsSku === null ? ' (not loaded into IMS: no decision possible)' : ''}`, options))(f) },
     )
   }
@@ -102,6 +107,7 @@ export function renderReviewSheet(model: ReviewModel, generation: GenerationFile
   const reviewSheet: XSheet = {
     name: REVIEW_TAB,
     ...review.sheet,
+    protect: true,
     validations: model.review.length === 0 ? [] : [{
       range: `${statusLetter}2:${statusLetter}${model.review.length + 1}`,
       list: labels,
@@ -146,17 +152,18 @@ export function notesFor(model: ReviewModel, generation: GenerationFile, options
     `The Review tab lists ${model.review.length} product(s) and variation(s) that are draft, private or pending in WooCommerce, Archived in Qoblex, or discontinued in ${w}. ${decidable} of them are loaded into IMS and need a decision.`,
     `Pick a "${DECISION_HEADERS.status}" for EACH of them: ${labels}. Discontinued can be sold but not ordered; Archived can be neither; Do not sell yet can be ordered but not sold; Active is both.`,
     'Your decision wins over the WooCommerce status and the Qoblex state. A row you leave blank BLOCKS the real first load until it is decided.',
-    `Archived is refused for a product that holds stock in Qoblex, WooCommerce or ${w} (yellow rows, "Stock > 0"), or whose stock was not read, unless you write an "${DECISION_HEADERS.reason}" on that row; the reason is then reported.`,
+    `Archived is refused for a product that holds stock in ANY one Qoblex warehouse, in WooCommerce or in ${w} (yellow rows, "Stock > 0"), or whose stock was not read, unless you write an "${DECISION_HEADERS.reason}" on that row; the reason is then reported.`,
+    `A VARIABLE parent shows the sum of its variations' stock and is yellow when any variation holds stock. Archived for a parent is refused while any of its variations would load with another status (decide every variation Archived first), and its variations' stock counts as its own.`,
     'Rows marked "not loaded into IMS" cannot be decided (IMS will not hold the product): leave their status blank.',
-    `Do not edit the SKU columns or the "${DECISION_HEADERS.sheetId}" column, and do not delete the hidden tab: they tie your decisions to this sheet. You may sort, filter and widen columns. Save as .xlsx, or export the Review tab as CSV UTF-8.`,
+    `The Review tab is PROTECTED (no password) so that a decision cannot be moved onto another product by accident: only "${DECISION_HEADERS.status}" and "${DECISION_HEADERS.reason}" can be typed in. You may filter and widen columns; sorting, inserting rows and pasting over the other columns are refused. Do not lift the protection, edit the SKU or "${DECISION_HEADERS.sheetId}" columns, or delete the hidden tab: they tie your decisions to this sheet. Save as .xlsx, or export the Review tab as CSV UTF-8.`,
     '',
     'SKU check (orange cells, and the SKU mismatches tab): SKUs are matched EXACTLY across Qoblex, WooCommerce, ' + `${w} and IMS (as it will load, after the agreed SKU renames), never by name. A flag says a system lacks the SKU, still holds a pre-rename SKU, or holds one that differs only in letter case or whitespace. VARIABLE parents exist only in WooCommerce and IMS; non-inventory products are not expected in ${w}.`,
     '',
     'What was read:',
     `- Qoblex: the stock-on-hand export named by the run manifest (state, stock total and per warehouse ${model.warehouses.join(', ') || '(none)'}).`,
-    '- WooCommerce: the verified snapshot (each product\'s own status, a variation\'s parent status, the Woo stock quantity and title). The Woo stock is a point-in-time read. The snapshot carries NO stock figure for a variation: its Woo stock reads "not read", so an Archived variation needs an override reason unless that is fixed.',
+    '- WooCommerce: the verified snapshot (each product\'s and variation\'s own status and stock quantity, a variation\'s parent status, and the title). The Woo stock is a point-in-time read. A variation whose stock is managed by its parent shows the parent\'s quantity. A variation under a draft (private, pending) parent is reviewed too.',
     options.wmsRead
-      ? `- ${w}: the product list (the status is its discontinued flag) and the physical stock of warehouse(s) ${options.wmsWarehouses.join(', ')}, summed, read with GET requests only.`
+      ? `- ${w}: the product list, read twice (the status is its discontinued flag), and the physical stock of warehouse(s) ${options.wmsWarehouses.join(', ')}, summed; every other warehouse ${w} lists was read and holds none of this client's stock. GET requests only.`
       : `- ${w}: NOT READ. Its columns read "not read", and an Archived decision cannot be cleared by its stock: every Archived row needs an override reason, or generate the sheet again with the ${w} listing.`,
     '- Names: the WooCommerce title (a variation: its parent title and attribute values). A product WooCommerce does not hold shows its Qoblex name, marked in "Name source".',
     '- "IMS lifecycle the first load would set" is the lifecycle before any decision (Qoblex state, then the WooCommerce status, which wins).',

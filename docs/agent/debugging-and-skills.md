@@ -24,7 +24,7 @@ npx prisma db pull   # Sync schema from database
 - Check email delivery in SMTP logs or notification history
 
 **Check Environment Variables:**
-- Verify `.env` file exists and is not in `.gitignore`
+- Verify `.env` file exists and is listed in `.gitignore` (it holds secrets and must never be committed)
 - Never commit secrets; use `.env.example` as template
 - Check `NEXT_PUBLIC_*` variables don't contain secrets
 
@@ -38,7 +38,7 @@ npm run lint          # ESLint style and quality checks
 
 - **Product Owner:** One Two Enterprises Ltd
 - **Repository:** git@github.com:OneTwo3D/IMS.git
-- **Issues:** Document in activity log + GitHub issues
+- **Issues:** Track in bd (beads), as `AGENTS.md` requires; not GitHub issues
 - **Questions:** Reference docs first, then contact dev team
 - **Reporting Bugs:** Include relevant activity log entries and environment details
 

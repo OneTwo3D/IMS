@@ -98,3 +98,154 @@ test('a part that inflates beyond the cap is refused (a ZIP bomb is not expanded
   assert.throws(() => unzip(bomb), /too large/)
   assert.ok(inflateRawSync)
 })
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------------
+// #1122 R1: protection (MED-4), the archive checks (L3, L4, L13) and the XML and grid checks (L1, L2, L5)
+// ---------------------------------------------------------------------------------------------------------------------------------------------------
+
+/** The offsets of each central directory entry of an archive built by zip(), and of its local header. */
+function layout(bytes: Buffer): Array<{ central: number; local: number }> {
+  const eocd = bytes.length - 22
+  const count = bytes.readUInt16LE(eocd + 10)
+  let p = bytes.readUInt32LE(eocd + 16)
+  const out: Array<{ central: number; local: number }> = []
+  for (let i = 0; i < count; i++) {
+    out.push({ central: p, local: bytes.readUInt32LE(p + 42) })
+    p += 46 + bytes.readUInt16LE(p + 28) + bytes.readUInt16LE(p + 30) + bytes.readUInt16LE(p + 32)
+  }
+  return out
+}
+const sample = () => zip([['a.xml', Buffer.from('<a>'.padEnd(1000, ' ') + '</a>')], ['b.xml', Buffer.from('<b/>')]])
+
+// [mutation: protect is ignored, the password-free element gains a password, or the unlocked styles lose locked="0"]
+test('MED-4: a protected sheet carries sheetProtection with NO password (sort and inserts locked, filtering and widths allowed) and only the unlocked cells take an unlocked style', () => {
+  const bytes = writeXlsx([{ name: 'Review', protect: true, autoFilter: true, rows: [[{ v: 'h' }, { v: 'decision' }], [{ v: 'SKU-1' }, { v: '', unlocked: true }], [{ v: 'SKU-2', fill: 'stock' }, { v: 'x', fill: 'stock', unlocked: true }]] }, { name: 'Other', rows: [[{ v: 'y' }]] }])
+  const xml = part(bytes, 'xl/worksheets/sheet1.xml')
+  assert.match(xml, /<\/sheetData><sheetProtection sheet="1" objects="1" scenarios="1" formatColumns="0" autoFilter="0"\/><autoFilter /, 'right after sheetData, before autoFilter (the schema order)')
+  assert.ok(!/password|hashValue|saltValue/.test(xml), 'no password: a guard against accidents only')
+  assert.ok(!part(bytes, 'xl/worksheets/sheet2.xml').includes('sheetProtection'), 'only the sheet asked for is protected')
+  const style = (ref: string) => Number(new RegExp(`<c r="${ref}" s="(\\d+)"`).exec(xml)![1])
+  assert.ok(style('A2') <= 24 && style('A3') <= 24, 'locked cells use the locked styles')
+  assert.ok(style('B2') > 24 && style('B3') > 24, 'the unlocked cells (an empty one is still written) use the unlocked styles')
+  assert.equal(style('B3') - 24, style('A3'), 'the same fill, bold and quote, unlocked')
+  const styles = part(bytes, 'xl/styles.xml')
+  assert.equal((styles.match(/<protection locked="0"\/>/g) ?? []).length, 24)
+  assert.match(styles, /<cellXfs count="49">/)
+  assert.deepEqual(readXlsx(bytes)[0].rows.get(3)!.get(1), { text: 'x', formula: false }, 'a protected sheet reads back')
+})
+
+test('MED-4: a protected sheet as Excel (hashed password, protected ranges) and LibreOffice ("true" flags, legacy password) save it reads like any other', () => {
+  const shared = `<sst xmlns="${W}"><si><t>IMS SKU</t></si><si><t>Archived</t></si></sst>`
+  const body = `<sheetData><row r="1"><c r="A1" t="s"><v>0</v></c></row><row r="2"><c r="A2" t="s"><v>1</v></c></row></sheetData>`
+  for (const [label, protection] of [
+    ['Excel', '<sheetProtection algorithmName="SHA-512" hashValue="c2FsdA==" saltValue="c2FsdA==" spinCount="100000" sheet="1" objects="1" scenarios="1" autoFilter="0"/><protectedRanges><protectedRange sqref="E2:F9" name="Decisions"/></protectedRanges>'],
+    ['LibreOffice', '<sheetProtection sheet="true" password="CC1A" objects="true" scenarios="true" formatColumns="false" autoFilter="false" selectLockedCells="false"/>'],
+    ['no password', '<sheetProtection sheet="1"/>'],
+  ] as const) {
+    const [review] = readXlsx(excelLike(`<worksheet xmlns="${W}">${body}${protection}</worksheet>`, shared))
+    assert.equal(review.rows.get(2)!.get(0)!.text, 'Archived', label)
+  }
+})
+
+// [mutation: the CRC comparison, the duplicate-part check, the encryption check, the ZIP64 checks, the 128 MB total, the directory bound, or maxOutputLength = declared size is removed]
+test('L13: the archive checks each refuse with their own reason', () => {
+  const crc = sample()
+  const [a] = layout(crc)
+  crc.writeUInt32LE((crc.readUInt32LE(a.central + 16) ^ 1) >>> 0, a.central + 16)
+  crc.writeUInt32LE((crc.readUInt32LE(a.local + 14) ^ 1) >>> 0, a.local + 14)
+  assert.throws(() => unzip(crc), /the part a\.xml fails its checksum/)
+
+  assert.throws(() => unzip(zip([['a.xml', Buffer.from('<a/>')], ['a.xml', Buffer.from('<a/>')]])), /the part a\.xml appears twice/)
+
+  const encrypted = sample()
+  encrypted.writeUInt16LE(encrypted.readUInt16LE(layout(encrypted)[0].central + 8) | 1, layout(encrypted)[0].central + 8)
+  assert.throws(() => unzip(encrypted), /is encrypted/)
+  const encryptedLocal = sample()
+  encryptedLocal.writeUInt16LE(encryptedLocal.readUInt16LE(layout(encryptedLocal)[0].local + 6) | 1, layout(encryptedLocal)[0].local + 6)
+  assert.throws(() => unzip(encryptedLocal), /is encrypted/, 'the local header flag counts too')
+
+  for (const offset of [20, 24, 42]) {
+    const z64 = sample()
+    z64.writeUInt32LE(0xffffffff, layout(z64)[1].central + offset)
+    assert.throws(() => unzip(z64), /ZIP64 archives are not supported/, `central offset ${offset}`)
+  }
+  const z64count = sample()
+  z64count.writeUInt16LE(0xffff, z64count.length - 22 + 10)
+  assert.throws(() => unzip(z64count), /ZIP64/)
+
+  // Three parts that each DECLARE 60 MB (below the per-part cap) are refused before anything is inflated.
+  const big = zip([['a.xml', Buffer.from('<a/>')], ['b.xml', Buffer.from('<b/>')], ['c.xml', Buffer.from('<c/>')]])
+  for (const entry of layout(big)) { big.writeUInt32LE(60 * 1024 * 1024, entry.central + 24); big.writeUInt32LE(60 * 1024 * 1024, entry.local + 22) }
+  assert.throws(() => unzip(big), /the \.xlsx archive is too large/)
+
+  const directory = sample()
+  directory.writeUInt32LE(directory.length, directory.length - 22 + 12)
+  assert.throws(() => unzip(directory), /directory is damaged/)
+
+  // L3: a part that inflates beyond the size the directory declares is refused while inflating (never expanded to the cap).
+  const liar = sample()
+  const [first] = layout(liar)
+  liar.writeUInt32LE(10, first.central + 24)
+  liar.writeUInt32LE(10, first.local + 22)
+  assert.throws(() => unzip(liar), /the part a\.xml cannot be decompressed/)
+})
+
+// [mutation: the local header is not compared with the directory]
+test('L4: a local header that disagrees with the directory (name, method, CRC or sizes) is refused; one that defers them to a data descriptor is read', () => {
+  const name = sample()
+  name[layout(name)[0].local + 30] = 'z'.charCodeAt(0)
+  assert.throws(() => unzip(name), /local header that disagrees/)
+  const method = sample()
+  method.writeUInt16LE(0, layout(method)[0].local + 8)
+  assert.throws(() => unzip(method), /local header that disagrees/)
+  const size = sample()
+  size.writeUInt32LE(size.readUInt32LE(layout(size)[0].local + 22) + 1, layout(size)[0].local + 22)
+  assert.throws(() => unzip(size), /local header that disagrees/)
+  const deferred = sample()
+  const local = layout(deferred)[0].local
+  deferred.writeUInt16LE(deferred.readUInt16LE(local + 6) | 0x8, local + 6)
+  for (const at of [14, 18, 22]) deferred.writeUInt32LE(0, local + at)
+  assert.equal(unzip(deferred).get('a.xml')!.length, 1004, 'bit 3: the CRC and sizes are in the directory (and a data descriptor), not the local header')
+})
+
+// [mutation: an unknown entity or a bare & is kept as text; a character reference to a surrogate, NUL or U+FFFE is decoded]
+test('L5: an unknown entity, a bare &, a reference to a character XML cannot carry and a lone surrogate escape are refused', () => {
+  const cell = (inner: string) => excelLike(`<worksheet xmlns="${W}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>${inner}</t></is></c></row></sheetData></worksheet>`, `<sst xmlns="${W}"><si><t>x</t></si></sst>`)
+  assert.equal(readXlsx(cell('A&amp;B &#x41;&#66;'))[0].rows.get(1)!.get(0)!.text, 'A&B AB', 'the five entities and character references still decode')
+  for (const [label, inner, why] of [
+    ['unknown entity', 'a&nbsp;b', /unknown entity/],
+    ['bare &', 'a & b', /unknown entity or a bare &/],
+    ['surrogate reference', '&#xD800;', /malformed character reference/],
+    ['NUL reference', '&#0;', /malformed character reference/],
+    ['U+FFFE reference', '&#xFFFE;', /malformed character reference/],
+    ['literal control character', 'a\u0001b', /a character XML cannot carry/],
+    ['lone surrogate escape', '_xD800_', /unpaired surrogate/],
+    ['a control character in CDATA (#1123 L7)', '<![CDATA[a\u0001b]]>', /a character XML cannot carry/],
+    ['U+FFFE in CDATA (#1123 L7)', '<![CDATA[a\ufffeb]]>', /a character XML cannot carry/],
+  ] as const) assert.throws(() => readXlsx(cell(inner)), why, label)
+  assert.equal(readXlsx(cell('<![CDATA[a<&>b]]>'))[0].rows.get(1)!.get(0)!.text, 'a<&>b', 'CDATA is still read as literal text')
+})
+
+// [mutation: U+FFFD is refused in every cell the reader reads (a product name then blocks generation), or nowhere] (#1123 R1 MED-2)
+test('#1123 MED-2: the reader READS U+FFFD (the read-back refuses it only in the decision columns)', () => {
+  const cell = (inner: string) => excelLike(`<worksheet xmlns="${W}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>${inner}</t></is></c></row></sheetData></worksheet>`, `<sst xmlns="${W}"><si><t>x</t></si></sst>`)
+  assert.equal(readXlsx(cell('Mug \ufffd blue'))[0].rows.get(1)!.get(0)!.text, 'Mug \ufffd blue')
+  assert.equal(readXlsx(cell('&#xFFFD;'))[0].rows.get(1)!.get(0)!.text, '\ufffd')
+  const written = writeXlsx([{ name: 'A', rows: [[{ v: 'name \ufffd' }]] }])
+  assert.equal(readXlsx(written)[0].rows.get(1)!.get(0)!.text, 'name \ufffd', 'what the writer accepts, the reader reads')
+})
+
+// [mutation: a repeated row or cell replaces the earlier one (last wins), or a row or column beyond the sheet limits is read]
+test('L1/L2: a row or cell given twice or out of order, and a row or column beyond the sheet limits, are refused; the last row and column are read', () => {
+  const sheet = (rows: string) => excelLike(`<worksheet xmlns="${W}"><sheetData>${rows}</sheetData></worksheet>`, `<sst xmlns="${W}"><si><t>x</t></si></sst>`)
+  for (const [label, rows, why] of [
+    ['a row twice', '<row r="2"><c r="A2"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row>', /row 2 is given twice or out of order/],
+    ['rows out of order', '<row r="3"><c r="A3"><v>1</v></c></row><row r="2"><c r="A2"><v>2</v></c></row>', /row 2 is given twice or out of order/],
+    ['a cell twice', '<row r="2"><c r="B2"><v>1</v></c><c r="B2"><v>2</v></c></row>', /a cell in row 2 is given twice or out of order/],
+    ['a cell twice by position', '<row r="2"><c r="B2"><v>1</v></c><c r="A2"><v>2</v></c></row>', /a cell in row 2 is given twice or out of order/],
+    ['beyond the last row', '<row r="1048577"><c r="A1048577"><v>1</v></c></row>', /beyond the sheet limit of 1048576 rows/],
+    ['beyond the last column', '<row r="1"><c r="XFE1"><v>1</v></c></row>', /beyond the sheet limit of 16384 columns/],
+  ] as const) assert.throws(() => readXlsx(sheet(rows)), why, label)
+  const [edge] = readXlsx(sheet('<row r="1048576"><c r="XFD1048576"><v>7</v></c></row>'))
+  assert.equal(edge.rows.get(1_048_576)!.get(16_383)!.text, '7')
+})
