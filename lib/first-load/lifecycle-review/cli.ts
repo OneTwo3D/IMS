@@ -18,7 +18,7 @@ import { canonicalJson } from '../snapshot'
 import { EXIT_CODES } from '../spec'
 import { ConfigError, prepare } from '../transform'
 import { buildGeneration, LIFECYCLE_REVIEW_FILE_NAMES, renderGeneration } from './generation'
-import { buildReviewModel, type QoblexProductRow, type QoblexStockRow, type WmsListing } from './model'
+import { buildReviewModel, ReviewModelError, type QoblexProductRow, type QoblexStockRow, type WmsListing } from './model'
 import { readDecisionFile } from './read-back'
 import { notesFor, renderReviewSheet } from './sheet'
 
@@ -159,7 +159,13 @@ export async function runLifecycleReviewCli(argv: string[], io: CliIo, deps: Rev
     sku: row.values.sku ?? '', name: row.values.name ?? '', type: row.values.type ?? '', state: run.rawProductStates.get((row.values.sku ?? '').trim()) ?? '',
   }))
   const qoblexStock: QoblexStockRow[] = run.datasets['stock-lots'].rows.map((row) => ({ sku: row.values.sku ?? '', warehouseCode: row.values.warehouseCode ?? '', qty: row.values.qty ?? '' }))
-  const model = buildReviewModel({ catalogue: result.catalogue, skuRenames: result.skuRenames, qoblexProducts, qoblexStock, snapshot: run.wooSnapshot, wms })
+  let model
+  try {
+    model = buildReviewModel({ catalogue: result.catalogue, skuRenames: result.skuRenames, qoblexProducts, qoblexStock, snapshot: run.wooSnapshot, wms })
+  } catch (error) {
+    if (error instanceof ReviewModelError) return refuse(error.message)
+    throw error
+  }
   const wmsDigest = wms === null ? null : sha256(canonicalJson({ products: [...wms.products].sort((a, b) => (a.sku < b.sku ? -1 : a.sku > b.sku ? 1 : 0)), physical: [...wms.physical.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)), warehouses: wms.warehouses }))
   const generation = buildGeneration({
     inputs: {

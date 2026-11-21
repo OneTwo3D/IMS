@@ -1,7 +1,13 @@
 /**
  * THE OWNER LIFECYCLE REVIEW, as data: one row per product or variation any of the four systems holds (Qoblex, WooCommerce, the WMS, IMS as it will load),
  * joined by EXACT SKU only (never by name), with the SKU each system holds, the stock each reports, the lifecycle the first load would set, and the SKU
- * mismatch flags. The REVIEW SET is every row that is draft (or private or pending) in WooCommerce, Archived in Qoblex, or discontinued in the WMS.
+ * mismatch flags. The REVIEW SET is every row that is draft (or private or pending) in WooCommerce, or whose WooCommerce PARENT is (a published variation under a
+ * draft parent is not on sale either), Archived in Qoblex, or discontinued in the WMS.
+ *
+ * STOCK. A row holds stock when ANY single figure is above zero: one Qoblex warehouse (never the sum: +5 in one warehouse and -5 in another is stock), the
+ * WooCommerce quantity or the WMS physical stock. A VARIABLE parent holds no stock of its own in Qoblex or the WMS: it shows the SUM of its variations' figures
+ * and holds stock when ANY of its variations does (or its own WooCommerce figure is above zero); the generation record keeps each variation's figures, so an
+ * Archived decision on the parent is checked against every one of them.
  *
  * PURE: no file, no clock, no request. lib/first-load/lifecycle-review/cli.ts gathers the inputs, sheet.ts renders the rows.
  *
@@ -89,6 +95,9 @@ export interface ReviewRow {
   stockAboveZero: boolean
 }
 
+/** The model cannot be built from these inputs (a SKU that is both a WooCommerce product and a variation: they would overwrite each other). */
+export class ReviewModelError extends Error {}
+
 export interface ReviewModel {
   rows: ReviewRow[]
   review: ReviewRow[]
@@ -106,6 +115,22 @@ export function looseSku(sku: string): string {
 }
 
 const positive = (f: StockFigure): boolean => f.kind === 'qty' && new D(f.qty).gt(0)
+/** Any single Qoblex warehouse above zero (MED-2: never the sum). */
+const anyWarehousePositive = (byWarehouse: Readonly<Record<string, string>>): boolean => Object.values(byWarehouse).some((qty) => new D(qty).gt(0))
+
+/** A WooCommerce stock figure from the snapshot: a managed product (or variation) with a quantity, not managed, or managed without a readable quantity. */
+function wooFigure(manageStock: boolean | 'parent', stockQuantity: number | null): StockFigure {
+  if (manageStock === false) return { kind: 'unmanaged' }
+  return stockQuantity === null ? { kind: 'unknown' } : { kind: 'qty', qty: String(stockQuantity) }
+}
+
+/** The display figure of a VARIABLE parent: not read when any part was not read, else the sum of the quantities, else not managed / not held. */
+function aggregate(figures: readonly StockFigure[]): StockFigure {
+  if (figures.some((f) => f.kind === 'unknown')) return { kind: 'unknown' }
+  const qtys = figures.filter((f): f is { kind: 'qty'; qty: string } => f.kind === 'qty')
+  if (qtys.length > 0) return { kind: 'qty', qty: fmt(qtys.reduce((a, f) => a.add(new D(f.qty)), new D(0))) }
+  return figures.some((f) => f.kind === 'unmanaged') ? { kind: 'unmanaged' } : { kind: 'absent' }
+}
 
 interface WooRecord { sku: string; id: number; name: string; type: string; status: string; parentStatus: string; parentSku: string; stock: StockFigure }
 
@@ -139,19 +164,25 @@ export function buildReviewModel(input: ReviewInputs): ReviewModel {
   // ---- WooCommerce: every product and variation with a SKU, by exact SKU ----
   const woo = new Map<string, WooRecord>()
   const parents = new Map(input.snapshot.parents.map((p) => [p.id, p]))
+  // L11: a SKU held twice (a product and a variation, or two of either) would silently overwrite one record with the other. The verified snapshot already
+  // refuses that (snapshotProblems); the model refuses it too rather than pick one.
+  const putWoo = (rec: WooRecord) => {
+    if (woo.has(rec.sku)) throw new ReviewModelError(`WooCommerce holds the SKU ${JSON.stringify(rec.sku.slice(0, 60))} twice (ids ${woo.get(rec.sku)!.id} and ${rec.id}): the review cannot tell which one a row is`)
+    woo.set(rec.sku, rec)
+  }
   for (const p of input.snapshot.products) {
     if (p.sku === '') continue
-    woo.set(p.sku, { sku: p.sku, id: p.id, name: p.name, type: p.type, status: p.status, parentStatus: '', parentSku: '', stock: p.stockQuantity === null ? { kind: 'unmanaged' } : { kind: 'qty', qty: String(p.stockQuantity) } })
+    putWoo({ sku: p.sku, id: p.id, name: p.name, type: p.type, status: p.status, parentStatus: '', parentSku: '', stock: wooFigure(p.manageStock, p.stockQuantity) })
   }
   for (const v of input.snapshot.variations) {
     if (v.sku === '') continue
     const parent = parents.get(v.parentId)
     const options = v.attributes.map((a) => a.option).filter((o) => o !== '')
-    woo.set(v.sku, {
+    putWoo({
       sku: v.sku, id: v.id, name: `${parent?.name ?? ''}${options.length > 0 ? ` - ${options.join(', ')}` : ''}`, type: 'variation', status: v.status,
       parentStatus: parent?.status ?? '', parentSku: parent?.sku ?? '',
-      // The snapshot carries no stock figure for a variation: not read, so it can never clear an Archived decision.
-      stock: { kind: 'unknown' },
+      // MED-5: the variation's own stock from the snapshot's variation walk (`parent`: it draws on the parent's stock, which the store reports as its own).
+      stock: wooFigure(v.manageStock, v.stockQuantity),
     })
   }
   // ---- the WMS ----
@@ -263,15 +294,49 @@ export function buildReviewModel(input: ReviewInputs): ReviewModel {
 
     // ---- the review set ----
     if (row.wooSku !== null && row.wooStatus !== 'publish') row.reviewReasons.push(`WooCommerce ${row.wooStatus}`)
+    // L10: a published variation under a draft (private, pending) parent is not on sale either.
+    if (row.wooSku !== null && row.wooParentStatus !== '' && row.wooParentStatus !== 'publish') row.reviewReasons.push(`WooCommerce parent ${row.wooParentStatus}`)
     if (row.qoblexState.trim().toLowerCase() === 'archived') row.reviewReasons.push('Qoblex Archived')
     if (row.wmsStatus === 'discontinued') row.reviewReasons.push('WMS discontinued')
-    row.stockAboveZero = (row.qoblexStock !== null && new D(row.qoblexStock.total).gt(0)) || positive(row.wooStock) || positive(row.wmsStock)
+    row.stockAboveZero = (row.qoblexStock !== null && anyWarehousePositive(row.qoblexStock.byWarehouse)) || positive(row.wooStock) || positive(row.wmsStock)
+  }
+
+  // ---- a VARIABLE parent: its variations' stock (MED-3) ----
+  const childrenOf = new Map<string, ReviewRow[]>()
+  for (const row of rows) {
+    if (row.imsSku === null) continue
+    const entry = cat.get(skuKey(row.imsSku))
+    if (!entry || entry.parentSku === '') continue
+    const key = skuKey(entry.parentSku)
+    childrenOf.set(key, [...(childrenOf.get(key) ?? []), row])
+  }
+  const variationsOf = new Map<ReviewRow, ReviewRow[]>()
+  for (const row of rows) {
+    if (row.imsSku === null || cat.get(skuKey(row.imsSku))?.type !== 'VARIABLE') continue
+    const children = (childrenOf.get(skuKey(row.imsSku)) ?? []).sort((a, b) => cmp(a.matchSku, b.matchSku))
+    variationsOf.set(row, children)
+    if (children.length === 0) continue
+    const byWarehouse = new Map<string, Dec>()
+    for (const child of children) for (const [code, qty] of Object.entries(child.qoblexStock?.byWarehouse ?? {})) byWarehouse.set(code, (byWarehouse.get(code) ?? new D(0)).add(new D(qty)))
+    if (children.some((c) => c.qoblexStock !== null)) {
+      row.qoblexStock = { total: fmt([...byWarehouse.values()].reduce((a, b) => a.add(b), new D(0))), byWarehouse: Object.fromEntries([...byWarehouse.entries()].map(([code, qty]) => [code, fmt(qty)])) }
+    }
+    const own = row.wooStock
+    row.wooStock = aggregate([...(own.kind === 'absent' ? [] : [own]), ...children.map((c) => c.wooStock)])
+    row.wmsStock = aggregate(children.map((c) => c.wmsStock))
+    // Highlighted when ANY variation holds stock (never the sum), or the parent's own WooCommerce figure does.
+    row.stockAboveZero = positive(own) || children.some((c) => c.stockAboveZero)
   }
   rows.sort((a, b) => cmp(a.matchSku, b.matchSku) || cmp(a.wooSku ?? '', b.wooSku ?? '') || cmp(a.wmsSku ?? '', b.wmsSku ?? ''))
   const review = rows.filter((r) => r.reviewReasons.length > 0)
-  const entries: ReviewEntry[] = review.filter((r) => r.imsSku !== null).map((r) => ({
-    sku: r.imsSku!, proposed: r.lifecycle ?? '', qoblexStock: r.qoblexStock?.total ?? '0', wooStock: r.wooStock, wmsStock: r.wmsStock,
-  }))
+  const entries: ReviewEntry[] = review.filter((r) => r.imsSku !== null).map((r): ReviewEntry => {
+    const variations = variationsOf.get(r)
+    return {
+      sku: r.imsSku!, proposed: r.lifecycle ?? '', reasons: [...r.reviewReasons],
+      qoblexStock: r.qoblexStock?.total ?? '0', qoblexByWarehouse: { ...(r.qoblexStock?.byWarehouse ?? {}) }, wooStock: r.wooStock, wmsStock: r.wmsStock,
+      ...(variations === undefined ? {} : { variations: variations.map((c) => ({ sku: c.imsSku!, qoblexByWarehouse: { ...(c.qoblexStock?.byWarehouse ?? {}) }, wooStock: c.wooStock, wmsStock: c.wmsStock })) }),
+    }
+  })
   return { rows, review, warehouses: [...warehouses].sort(cmp), entries }
 }
 

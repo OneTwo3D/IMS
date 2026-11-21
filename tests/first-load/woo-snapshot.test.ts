@@ -100,7 +100,7 @@ test('arm (a): a complete walk over several pages writes the snapshot, its prove
     if (!parsed.ok) return
     assert.equal(parsed.payload.parents.length, 4)
     assert.equal(parsed.payload.variations.length, 10)
-    assert.deepEqual(parsed.payload.variations.find((v) => v.id === 1003), { id: 1003, parentId: 100, sku: 'W-03', status: 'private', attributes: [{ name: 'Colour', option: 'Green' }] }, 'a private variation and its attributes are kept')
+    assert.deepEqual(parsed.payload.variations.find((v) => v.id === 1003), { id: 1003, parentId: 100, sku: 'W-03', status: 'private', attributes: [{ name: 'Colour', option: 'Green' }], manageStock: false, stockQuantity: null }, 'a private variation and its attributes are kept')
     const csv = readFileSync(path.join(r.out, SNAPSHOT_FILE_NAMES.variantParents), 'utf8')
     assert.equal(csv, renderVariantParentsCsv(parsed.payload))
     assert.equal(csv.split('\r\n').filter(Boolean).length, 1 + 9, 'nine variations have a SKU; the one without is counted, not listed')
@@ -487,9 +487,9 @@ test('arm (m2): the canonical form sorts by id whatever order it is given (the s
     { id: 1, sku: 'A', name: 'A', status: 'publish', variationIds: [11, 12] },
     { id: 2, sku: 'B', name: 'B', status: 'publish', variationIds: [21] },
   ], variations: [
-    { id: 11, parentId: 1, sku: 'A-1', status: 'publish', attributes: [{ name: 'a', option: '1' }, { name: 'b', option: '2' }] },
-    { id: 12, parentId: 1, sku: 'A-2', status: 'publish', attributes: [] },
-    { id: 21, parentId: 2, sku: 'B-1', status: 'publish', attributes: [] },
+    { id: 11, parentId: 1, sku: 'A-1', status: 'publish', attributes: [{ name: 'a', option: '1' }, { name: 'b', option: '2' }], manageStock: true, stockQuantity: 3 },
+    { id: 12, parentId: 1, sku: 'A-2', status: 'publish', attributes: [], manageStock: 'parent' as const, stockQuantity: 0 },
+    { id: 21, parentId: 2, sku: 'B-1', status: 'publish', attributes: [], manageStock: false, stockQuantity: null },
   ] }
   const shuffled = {
     source: 'woocommerce' as const,

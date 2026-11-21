@@ -16,7 +16,7 @@ import path from 'node:path'
 import test, { after, before } from 'node:test'
 import { runCli as runPrepare } from '../../lib/first-load/cli.ts'
 import { EXIT_CODES, SNAPSHOT_EXIT_CODES, SNAPSHOT_FILE_NAMES } from '../../lib/first-load/spec.ts'
-import { parseSnapshotFile, renderProductStatusCsv, sha256Hex } from '../../lib/first-load/snapshot.ts'
+import { parseSnapshotFile, reduceVariation, renderProductStatusCsv, sha256Hex } from '../../lib/first-load/snapshot.ts'
 import { runSnapshotCli } from '../../lib/first-load/woo-snapshot/cli.ts'
 import { startFakeCatalogue, type FakeCatalogue, type FakeParent, type FakeProduct } from '../helpers/fake-woocommerce-catalogue.ts'
 import { ds, findingCodes, precondition, product, rowsOf, run, runBare } from './helpers.ts'
@@ -35,7 +35,7 @@ after(() => {
 })
 
 const PARENTS: FakeParent[] = [
-  { id: 100, sku: 'VAR-PARENT', name: 'Variable parent', status: 'publish', variations: [{ id: 1001, sku: 'VAR-01' }, { id: 1002, sku: 'VAR-02', status: 'private' }] },
+  { id: 100, sku: 'VAR-PARENT', name: 'Variable parent', status: 'publish', variations: [{ id: 1001, sku: 'VAR-01', manage_stock: true, stock_quantity: 4 }, { id: 1002, sku: 'VAR-02', status: 'private', manage_stock: 'parent', stock_quantity: 0 }] },
 ]
 /** Every other top-level product: simples in each status, a grouped and an external product, one without a SKU, one that manages stock. */
 const OTHERS: FakeProduct[] = [
@@ -148,7 +148,7 @@ test('the walk reads EVERY product of every type and status with its stock, 100 
   assert.deepEqual(provenance.proof.allProducts.byType, { external: 1, grouped: 1, simple: 6, variable: 1 })
   assert.equal(provenance.productStatusFile.sha256, sha256Hex(csv))
   assert.equal(provenance.productStatusFile.rows, 8)
-  assert.equal(provenance.formatVersion, 2)
+  assert.equal(provenance.formatVersion, 3)
   // GET only, every walk page asks for 100 (the store grants 3 here, so the walk pages)
   assert.ok(b.requests.every((q) => q.method === 'GET'))
   const walkPages = b.requests.filter((q) => q.path.endsWith('/products') && q.query.status === 'any' && q.query.type === undefined)
@@ -216,7 +216,7 @@ test('woo-product-status.csv is bound to the verified snapshot: an edited file, 
 test('an old (format 1) snapshot is refused with a message that says it predates the all-products status', async (t) => {
   const b = await bundle()
   const old = copy(b.dir)
-  edit(file(old, SNAPSHOT_FILE_NAMES.snapshot), (text) => text.replace('"formatVersion": 2', '"formatVersion": 1'))
+  edit(file(old, SNAPSHOT_FILE_NAMES.snapshot), (text) => text.replace('"formatVersion": 3', '"formatVersion": 1'))
   const v = await verify(old)
   precondition(t, 'old snapshot exit', v.code)
   assert.equal(v.code, SNAPSHOT_EXIT_CODES.INCONSISTENT)
@@ -224,8 +224,23 @@ test('an old (format 1) snapshot is refused with a message that says it predates
   assert.match(v.stderr, /Re-run first-load:woo-snapshot/)
   // an old provenance beside a new snapshot says so as well
   const oldProv = copy(b.dir)
-  edit(file(oldProv, SNAPSHOT_FILE_NAMES.provenance), (text) => text.replace('"formatVersion": 2', '"formatVersion": 1'))
-  assert.match((await verify(oldProv)).stderr, /the provenance is format 1, not 2/)
+  edit(file(oldProv, SNAPSHOT_FILE_NAMES.provenance), (text) => text.replace('"formatVersion": 3', '"formatVersion": 1'))
+  assert.match((await verify(oldProv)).stderr, /the provenance is format 1, not 3/)
+})
+
+// [mutation: a version-2 snapshot (no variation stock) is accepted, or its message is the bare "formatVersion must be 3"] (#1122 R1 MED-5)
+test('a format 2 snapshot (taken before variation stock was read) is refused with a message that says so', async (t) => {
+  const b = await bundle()
+  const old = copy(b.dir)
+  edit(file(old, SNAPSHOT_FILE_NAMES.snapshot), (text) => text.replace('"formatVersion": 3', '"formatVersion": 2'))
+  const v = await verify(old)
+  precondition(t, 'format 2 snapshot exit', v.code)
+  assert.equal(v.code, SNAPSHOT_EXIT_CODES.INCONSISTENT)
+  assert.match(v.stderr, /the snapshot is format 2: it was taken before each variation's own stock was read/)
+  assert.match(v.stderr, /Re-run first-load:woo-snapshot/)
+  const oldProv = copy(b.dir)
+  edit(file(oldProv, SNAPSHOT_FILE_NAMES.provenance), (text) => text.replace('"formatVersion": 3', '"formatVersion": 2'))
+  assert.match((await verify(oldProv)).stderr, /the provenance is format 2, not 3: .*format 2: before each variation's stock was read/)
 })
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------------
@@ -425,6 +440,43 @@ test('H1: stock that changes between the two walks does not fail the walk; the f
   assert.equal(r.code, SNAPSHOT_EXIT_CODES.OK, r.stderr)
   assert.equal(r.rounds, 1, 'verified in the first round')
   assert.equal(r.stock, 7, "walk A's stock (7), not walk B's (99)")
+})
+
+const mutateVariations = (change: (row: Record<string, unknown>) => void) => (c: { probe: boolean; route: string; attempt: number }, res: { status: number; headers: Record<string, string>; body: unknown }) => {
+  if (c.probe || c.route !== 'variations' || c.attempt % 2 !== 0) return res
+  return { ...res, body: (res.body as Array<Record<string, unknown>>).map((row) => { const copy = { ...row }; change(copy); return copy }) }
+}
+
+// [mutation: the comparison hash keeps the variations' stock (#1122 R1 MED-5), or the walk stops asking for it]
+test('MED-5: each variation\'s own stock is read (true, false or "parent"); a variation stock that moves between the walks does not fail the walk', async (t) => {
+  const server = await startFakeCatalogue({ key: KEY, secret: SECRET, parents: PARENTS, products: OTHERS, intercept: mutateVariations((row) => { if (row.id === 1001) row.stock_quantity = 99 }) })
+  try {
+    const envFile = fresh('creds')
+    writeFileSync(envFile, `FIRST_LOAD_WOO_URL=${server.url}\nFIRST_LOAD_WOO_KEY=${KEY}\nFIRST_LOAD_WOO_SECRET=${SECRET}\n`, { mode: 0o600 })
+    chmodSync(envFile, 0o600)
+    const out = fresh('bundle')
+    let stderr = ''
+    const code = await runSnapshotCli(['--env-file', envFile, '--out', out, '--allow-origin', server.origin, '--min-interval-ms', '0'], { stdout: () => {}, stderr: (x) => (stderr += x) })
+    precondition(t, 'walk exit', code === 0 ? 1 : 0)
+    assert.equal(code, SNAPSHOT_EXIT_CODES.OK, stderr)
+    const variationPages = server.requests.filter((q) => /\/variations$/.test(q.path) && q.query.status === 'any')
+    assert.ok(variationPages.length > 0 && variationPages.every((q) => ['manage_stock', 'stock_quantity'].every((f) => (q.query._fields ?? '').split(',').includes(f))), 'the variation walk asks for the stock fields')
+    const parsed = parseSnapshotFile(readFileSync(file(out, SNAPSHOT_FILE_NAMES.snapshot), 'utf8'))
+    assert.ok(parsed.ok)
+    if (!parsed.ok) return
+    assert.deepEqual(parsed.payload.variations.map((v) => [v.sku, v.manageStock, v.stockQuantity]), [['VAR-01', true, 4], ['VAR-02', 'parent', 0]], "walk A's figures (4, not walk B's 99)")
+    assert.equal(JSON.parse(readFileSync(file(out, SNAPSHOT_FILE_NAMES.provenance), 'utf8')).verificationRounds, 1)
+  } finally { await server.close() }
+})
+
+// [mutation: a variation stock_quantity that is not a number, or a manage_stock that is not true/false/"parent", is accepted]
+test('MED-5: a variation stock that is not a number, or a manage_stock that is neither true, false nor "parent", is a problem', () => {
+  assert.deepEqual(reduceVariation({ id: 5, sku: 'V', status: 'publish', manage_stock: 'yes' }, 1), { ok: false, problem: 'variation 5 has a manage_stock that is not true, false or "parent" ("yes")' })
+  assert.deepEqual(reduceVariation({ id: 5, sku: 'V', status: 'publish', manage_stock: true, stock_quantity: '3' }, 1), { ok: false, problem: 'variation 5 has a stock_quantity that is not a number ("3")' })
+  const unmanaged = reduceVariation({ id: 5, sku: 'V', status: 'publish', manage_stock: false, stock_quantity: 3 }, 1)
+  assert.ok(unmanaged.ok && unmanaged.variation.stockQuantity === null, 'a quantity on an unmanaged variation is not a stock figure')
+  const old = reduceVariation({ id: 5, sku: 'V', status: 'publish', stock_quantity: 2 }, 1)
+  assert.ok(old.ok && old.variation.manageStock === true && old.variation.stockQuantity === 2, 'an absent manage_stock with a quantity is managed (an old store), as for a product')
 })
 
 // [mutation: the stock-free comparison also ignores status]

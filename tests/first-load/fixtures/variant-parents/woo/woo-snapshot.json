@@ -1,5 +1,5 @@
 {
-  "formatVersion": 2,
+  "formatVersion": 3,
   "kind": "woocommerce-catalogue-snapshot",
   "payload": {
     "parents": [
@@ -121,60 +121,76 @@
       {
         "attributes": [],
         "id": 9001,
+        "manageStock": false,
         "parentId": 9000,
         "sku": "1001-01",
-        "status": "publish"
+        "status": "publish",
+        "stockQuantity": null
       },
       {
         "attributes": [],
         "id": 9002,
+        "manageStock": false,
         "parentId": 9000,
         "sku": "1001-02",
-        "status": "publish"
+        "status": "publish",
+        "stockQuantity": null
       },
       {
         "attributes": [],
         "id": 9101,
+        "manageStock": false,
         "parentId": 9100,
         "sku": "2002-01",
-        "status": "publish"
+        "status": "publish",
+        "stockQuantity": null
       },
       {
         "attributes": [],
         "id": 9201,
+        "manageStock": false,
         "parentId": 9200,
         "sku": "3003-07",
-        "status": "publish"
+        "status": "publish",
+        "stockQuantity": null
       },
       {
         "attributes": [],
         "id": 9301,
+        "manageStock": false,
         "parentId": 9300,
         "sku": "6006",
-        "status": "publish"
+        "status": "publish",
+        "stockQuantity": null
       },
       {
         "attributes": [],
         "id": 9401,
+        "manageStock": false,
         "parentId": 9400,
         "sku": "7007-01",
-        "status": "publish"
+        "status": "publish",
+        "stockQuantity": null
       },
       {
         "attributes": [],
         "id": 9402,
+        "manageStock": false,
         "parentId": 9400,
         "sku": "7007-02",
-        "status": "publish"
+        "status": "publish",
+        "stockQuantity": null
       },
       {
         "attributes": [],
         "id": 9501,
+        "manageStock": false,
         "parentId": 9500,
         "sku": "8008-01",
-        "status": "publish"
+        "status": "publish",
+        "stockQuantity": null
       }
     ]
   },
-  "payloadSha256": "c476c33b320e1475ca830edf527dc86f1a831476ea7be48de3693e9943a368db"
+  "payloadSha256": "c37c66c486c4679989bd115e1e473dbe639810482c2948b4f19d589f7cf49e69"
 }
