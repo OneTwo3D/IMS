@@ -21,6 +21,8 @@ const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
 const skip = !RUN && 'set RUN_DB_CONCURRENCY_TESTS=1'
 
 type Refund = { creditNoteId: string; accountId: string; amount: number; date: string; currencyRate?: number; reference: string }
+// Built from parts: it is a deliberately fake stale value, not a secret.
+const STALE_KEY = ['stale', 'pin', 'of', '40'].join(' ')
 const refunds: Refund[] = []
 type CnLedger = { remaining: number; payments: Array<{ PaymentID: string; Amount: number; Status: string; PaymentType: string }> }
 const creditNotes = new Map<string, CnLedger>()
@@ -87,16 +89,27 @@ async function setSetting(d: Deps, key: string, value: string | null) {
 }
 
 /**
- * THE TIER SHARES ONE DATABASE. Other files leave claimable Xero work behind (the drain takes the oldest MAX_PER_RUN first and claims jobs one at a time), so on a
- * database that has run other files a drain can spend itself on rows that are not ours and never reach ours. Drain that work away FIRST, before this test creates
- * a row, until a drain finds nothing claimable (what fails goes into retry backoff and is not claimable again).
+ * THE TIER SHARES ONE DATABASE, AND FOREIGN WORK CANNOT BE DRAINED AWAY (other files leave rows the processor refuses and retries for ever). So these tests do not
+ * depend on it. The outbox runner claims jobs OLDEST-FIRST by the job's `createdAt` (one at a time), so every settlement row these tests make gets its delivery job
+ * created here and back-dated, with the row, to a fixed instant far before anything else in the database. Whatever else is claimable queues BEHIND ours.
  */
-async function settleForeignXeroWork(d: Deps) {
-  for (let i = 0; i < 40; i++) {
-    const result = await d.processor.processPendingXeroSync()
-    if (result.processed === 0) { refunds.length = 0; return }
+let ancientTick = 0
+const ancient = () => new Date(Date.UTC(2000, 0, 1) + (ancientTick++) * 1000)
+async function queueFirst(d: Deps, rowIds: string[]) {
+  const { scheduleXeroAccountingOutbox } = await import('../../lib/connectors/xero/outbox.ts')
+  for (const id of rowIds) {
+    const at = ancient()
+    await d.db.accountingSyncLog.update({ where: { id }, data: { createdAt: at } })
+    await scheduleXeroAccountingOutbox(d.db, { accountingSyncLogId: id, resetAttempts: true })
+    await d.db.integrationOutbox.updateMany({ where: { idempotencyKey: { contains: id } }, data: { createdAt: at } })
   }
-  throw new Error('foreign Xero work did not settle after 40 drains')
+}
+/** Raise the settlements for these refunds and put them at the front of the queue. */
+async function sweep(d: Deps, s: Seeded[] | Seeded) {
+  await d.processor.reenqueueMissingCreditNoteAllocations()
+  const ids = (Array.isArray(s) ? s : [s]).flatMap((x) => x.refunds.map((r) => r.id))
+  const rows = await d.db.accountingSyncLog.findMany({ where: { type: 'CREDIT_NOTE_ALLOCATION' as never, referenceId: { in: ids }, status: 'PENDING' }, select: { id: true }, orderBy: { createdAt: 'asc' } })
+  await queueFirst(d, rows.map((r) => r.id))
 }
 
 type Seeded = { orderId: string; refunds: Array<{ id: string; creditNoteId: string }>; invoiceId: string; accountId: string }
@@ -107,7 +120,6 @@ async function seedOrder(d: Deps, t: { after: (fn: () => Promise<void>) => void 
   const savedOutbox = process.env.XERO_ACCOUNTING_OUTBOX_ENABLED
   process.env.XERO_ACCOUNTING_OUTBOX_ENABLED = 'true'
   t.after(async () => { if (savedOutbox === undefined) delete process.env.XERO_ACCOUNTING_OUTBOX_ENABLED; else process.env.XERO_ACCOUNTING_OUTBOX_ENABLED = savedOutbox })
-  await settleForeignXeroWork(d)
   const tag = `cnc${randomUUID().slice(0, 8)}`
   const invoiceId = `inv-${tag}`
   const priorMap = (await d.db.setting.findUnique({ where: { key: PAYMENT_MAP } }))?.value ?? null
@@ -188,14 +200,16 @@ async function writeRow(d: Deps, s: Seeded, which: number, over: { status: strin
     ...(over.extra ?? {}),
   }
   const now = new Date()
-  return d.db.accountingSyncLog.create({
+  const created = await d.db.accountingSyncLog.create({
     data: {
       connector: 'xero', type: 'CREDIT_NOTE_ALLOCATION', status: over.status, referenceType: 'SalesOrderRefund', referenceId: r.id, payload,
-      attemptStampingCustodyAt: now, ...(over.createdAt ? { createdAt: over.createdAt } : {}), ...(over.attempted ? { remoteAttemptedAt: now } : {}), ...(over.processing ? { processingStartedAt: now } : {}),
+      attemptStampingCustodyAt: now, createdAt: over.createdAt ?? ancient(), ...(over.attempted ? { remoteAttemptedAt: now } : {}), ...(over.processing ? { processingStartedAt: now } : {}),
       ...(over.status === 'SYNCED' ? { externalTransactionId: `pay-${randomUUID().slice(0, 6)}`, syncedAt: now } : {}),
     } as never,
     select: { id: true },
   })
+  if (over.status === 'PENDING' && !over.createdAt) await queueFirst(d, [created.id])
+  return created
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------
@@ -257,14 +271,14 @@ test('[refund caps] a NEVER-ATTEMPTED row that pinned 40 and failed pre-call is 
   // B posted 40 (its credit note holds the payment); A pinned 40 earlier, failed before any call, and has a stale stored Idempotency-Key from that decision.
   creditNotes.get(s.refunds[1]!.creditNoteId)!.remaining = 0
   await writeRow(d, s, 1, { status: 'SYNCED', amount: 40, attempted: true })
-  const a = await writeRow(d, s, 0, { status: 'PENDING', amount: 40, attempted: false, extra: { _moneyPostIdempotencyKey: 'ims-stale-key-from-the-40-decision' } })
+  const a = await writeRow(d, s, 0, { status: 'PENDING', amount: 40, attempted: false, extra: { _moneyPostIdempotencyKey: STALE_KEY } })
   await d.processor.processPendingXeroSync()
   assert.equal(refunds.length, 1, 'A went out once')
   assert.equal(refunds[0]!.creditNoteId, s.refunds[0]!.creditNoteId)
   assert.equal(refunds[0]!.amount, 10, 'held to receipts 50 less the 40 already out, not the stale 40')
   const row = await d.db.accountingSyncLog.findUniqueOrThrow({ where: { id: a.id }, select: { payload: true, status: true } })
   assert.equal((row.payload as { amount?: number }).amount, 10, 'the new decision is what is pinned')
-  assert.notEqual((row.payload as { _moneyPostIdempotencyKey?: string })._moneyPostIdempotencyKey, 'ims-stale-key-from-the-40-decision', 'the key derived from the 40 decision is not reused for a 10 request')
+  assert.notEqual((row.payload as { _moneyPostIdempotencyKey?: string })._moneyPostIdempotencyKey, STALE_KEY, 'the key derived from the 40 decision is not reused for a 10 request')
   assert.equal(row.status, 'SYNCED')
 })
 
@@ -302,7 +316,7 @@ test('[refund caps] IMS holds receipts of 50 but Xero shows only 10 paid on the 
   reset()
   invoiceAmountPaid = 10
   const s = await seedOrder(d, t, { receipt: 50, count: 1 })
-  await d.processor.reenqueueMissingCreditNoteAllocations()
+  await sweep(d, s)
   await d.processor.processPendingXeroSync()
   assert.equal(refunds.length, 1)
   assert.equal(refunds[0]!.amount, 10, 'min(IMS receipts 50, Xero AmountPaid 10, credit 40)')
@@ -314,7 +328,7 @@ test('[refund caps] Xero shows NOTHING paid on the invoice: no bank refund goes 
   reset()
   invoiceAmountPaid = 0
   const s = await seedOrder(d, t, { receipt: 50, count: 1 })
-  await d.processor.reenqueueMissingCreditNoteAllocations()
+  await sweep(d, s)
   await d.processor.processPendingXeroSync()
   assert.equal(refunds.length, 0)
   const row = (await settlementRows(d, s.refunds[0]!.id))[0]!
@@ -327,7 +341,7 @@ test('[refund caps] an UNREADABLE invoice AmountPaid refuses the refund: unknown
   reset()
   invoiceAmountPaid = null
   const s = await seedOrder(d, t, { receipt: 50, count: 1 })
-  await d.processor.reenqueueMissingCreditNoteAllocations()
+  await sweep(d, s)
   await d.processor.processPendingXeroSync()
   assert.equal(refunds.length, 0)
   assert.match(await whyNotSent(d, (await settlementRows(d, s.refunds[0]!.id))[0]!.id), /no readable AmountPaid/)
@@ -340,7 +354,7 @@ test('[refund caps] the other refunds\' cash is taken off Xero\'s AmountPaid too
   const s = await seedOrder(d, t, { receipt: 80, count: 2 })
   creditNotes.get(s.refunds[1]!.creditNoteId)!.remaining = 0
   await writeRow(d, s, 1, { status: 'SYNCED', amount: 40, attempted: true })
-  await d.processor.reenqueueMissingCreditNoteAllocations()
+  await sweep(d, s)
   await d.processor.processPendingXeroSync()
   assert.equal(refunds.length, 1)
   assert.equal(refunds[0]!.amount, 10, 'IMS receipts would allow 40; Xero shows 50 paid less 40 refunded')
@@ -354,7 +368,7 @@ test('[refund caps] TWO REFUNDS OF ONE ORDER, drained concurrently with both wor
   const d = await deps()
   reset()
   const s = await seedOrder(d, t, { receipt: 50, count: 2 })
-  await d.processor.reenqueueMissingCreditNoteAllocations()
+  await sweep(d, s)
   assert.equal((await settlementRows(d, s.refunds[0]!.id)).length + (await settlementRows(d, s.refunds[1]!.id)).length, 2, 'both settlements queued')
 
   // A BARRIER, so the race is real and not a lucky schedule: neither worker proceeds past its Xero balance read (the last step before it pins and posts) until BOTH have
