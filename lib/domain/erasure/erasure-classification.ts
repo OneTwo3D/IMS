@@ -92,10 +92,11 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   PaymentRemovalReconciliation: { erased: [], notPersonal: ['id', 'orderId', 'connector', 'accountingInvoiceId', 'kind', 'currency', 'matchedPaymentIds', 'ledgerAction', 'refundId'], retained: {} },
   SalesOrderRefund: {
     erased: ['accountingWarning'],
-    notPersonal: ['deletedById', 'id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'returnReasonId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
+    notPersonal: ['feeRepaymentAppliedBy', 'deletedById', 'id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'returnReasonId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
     retained: {
       reason: 'owner decision: the refund reason text is kept',
       deleteReason: 'owner decision (as for the refund reason): the reason an operator gave for deleting a refund is part of the audit record',
+      feeRepaymentAppliedNote: 'o3d-pnc8p: the operator\'s own note (and name) that a fee repayment was applied to the credit note in Xero; an audit record of an accounting act, like the delete reason, never customer text',
     },
   },
   // o3d-ngmt.22: the record that a refund recorded in error was deleted. Keyed to its order by id only (no foreign key, so it outlives a deleted order). Ids, a credit note number,

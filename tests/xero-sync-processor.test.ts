@@ -804,10 +804,11 @@ test('o3d-a3wx r6: neither runner releases a claim with an unfenced write', () =
   // defect. The rule is unchanged and is still enforced on every site that IS here; what changed is
   // that most sites moved, so the shared statement they moved into is asserted below rather than
   // trusted.
+  // o3d-0lpnb: + handBackSettlementWait, the credit-note settlement wait (fenced on the claim and the attempt).
   assert.equal(
     fencedReleases,
-    2,
-    `expected to reach both remaining in-file claim-release sites; found ${fencedReleases}. Either a ` +
+    3,
+    `expected to reach the three remaining in-file claim-release sites; found ${fencedReleases}. Either a ` +
       `release was added (raise this number and confirm it is fenced) or the call shape moved and this ` +
       `test is inspecting nothing`,
   )

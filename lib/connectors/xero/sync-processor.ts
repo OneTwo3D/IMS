@@ -4422,8 +4422,11 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
         // has no claim to give back — the release would match nothing, which is correct but pointless
         // — and `lease-expired` and `dispatch-unrecorded` are the outcomes o3d-xl63 and r1 settled on
         // their own terms, with no replay window running against them.
-        if (handsBackUnsentWithoutAttempt(notPosted.reason)) {
-          // `producer-held` (and o3d-0lpnb's two waits) are handed back the same way (claim released, short fixed delay in the row's next-attempt): a row left PROCESSING would
+        if (isSettlementWait(notPosted.reason)) {
+          // o3d-0lpnb: a credit-note settlement WAIT (a money row): handed back without spending a retry, through its own fenced hand-back.
+          await handBackSettlementWait({ entry, notPosted, lease, attempt })
+        } else if (notPosted.reason === 'transport-refused' || notPosted.reason === 'producer-held') {
+          // `producer-held` is handed back the same way (claim released, short fixed delay in the row's next-attempt): a row left PROCESSING would
           // wait out the stale-claim cut-off for nothing.
           // o3d-jit6 r5 (Codex HIGH): THE EVIDENCE AND THE RELEASE ARE ONE COMMIT.
           //
@@ -4446,8 +4449,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           // THE SAME hand-back as the queued runner, not a copy of it. It fences on the LEASE
           // (never on `held`, which the minting fence has since moved), and a zero-row release does
           // not abort it — see recordAndReleaseUnsentTransportRefusal.
-          if (isSettlementWait(notPosted.reason)) await handBackSettlementWait({ entry, notPosted, lease, attempt })
-          else await handBackUnsentTransportRefusal({ entry, notPosted, lease, attempt })
+          await handBackUnsentTransportRefusal({ entry, notPosted, lease, attempt })
         } else {
           // The other three reasons change nothing about this row here, so no invariant binds the
           // evidence to a state change and the best-effort write is the right default: a failed log
@@ -5063,7 +5065,10 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
         // so rather than letting the fence's own throw escape into the generic failure handler and
         // spend a retry on a row that was never posted.
         try {
-          if (handsBackUnsentWithoutAttempt(notPosted.reason)) {
+          if (isSettlementWait(notPosted.reason)) {
+            // o3d-0lpnb: a credit-note settlement WAIT: its own fenced hand-back, the job deferred without spending an attempt.
+            await handBackSettlementWait({ entry, notPosted, lease, attempt, job })
+          } else if (notPosted.reason === 'transport-refused' || notPosted.reason === 'producer-held') {
             // `producer-held` (the claim boundary found the row's decision not LIVE, or the owner's confirmation absent) takes the SAME hand-back: the
             // sync-log claim is released and the job deferred WITHOUT spending an attempt. The generic arm below would count it toward MAX_RETRIES
             // and dead-letter work that is merely waiting for the owner. (The common case never gets here: the pre-claim ask below claims nothing.)
@@ -5093,8 +5098,7 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
             // complete transaction is re-run within a wall-time budget that cannot itself close the
             // window; only when the bounds are reached is the abort reported, naming the state the
             // row is left in. It still never throws into the per-entry catch.
-            if (isSettlementWait(notPosted.reason)) await handBackSettlementWait({ entry, notPosted, lease, attempt, job })
-            else await handBackUnsentTransportRefusal({ entry, notPosted, lease, attempt, job })
+            await handBackUnsentTransportRefusal({ entry, notPosted, lease, attempt, job })
           } else {
             // The other three reasons take the ordinary failure hand-back, which is not the
             // marker-and-replay-window state the invariant is about, so the evidence stays
@@ -6641,9 +6645,9 @@ async function processCreditNoteAllocation(args: {
   const amount = pin.amount as number
   const rate = operation === 'REFUND_PAYMENT' ? await xeroPaymentCurrencyRate('CREDIT_NOTE_ALLOCATION', payload) : null
   if (rate && !rate.ok) return { success: false, error: rate.error }
-  const moneyPostKey = await resolveXeroMoneyPostIdempotencyKey(db, { entryId, type: 'CREDIT_NOTE_ALLOCATION', payload, operation: 'credit-note-allocation' })
   // ONE fenced post for both operations (the money-branch census reads this shape); a refund payment also passes the order-locked re-check below.
   const fenced = async (recheckUnderLock?: () => Promise<{ ok: true } | { ok: false; error: string }>) => {
+    const moneyPostKey = await resolveXeroMoneyPostIdempotencyKey(db, { entryId, type: 'CREDIT_NOTE_ALLOCATION', payload, operation: 'credit-note-allocation' })
     return postMoneyUnderLedgerFence({
       connector: XERO_CONNECTOR, entryId, type, referenceType, referenceId, payload, db,
       postingDate: settlementDate,
@@ -7389,14 +7393,14 @@ export async function processClaimedEntry(
             select: { order: { select: { customerId: true } } },
           }).catch(() => null))?.order.customerId ?? undefined
         : undefined
-      // The erasure state is read BEFORE the claim is re-taken and fails closed: if it cannot be read, nothing is posted and the entry is retried.
-      const creditContact = await resolveSalesPostContact(referenceType, referenceId, payload)
-      if (!creditContact.ok) return { success: false, error: creditContact.error }
-      const creditNoteBeforePostHook = creditNoteBeforePost(payload as Record<string, unknown>)
       // o3d-pnc8p note 1 / o3d-0lpnb MED-3 (switch xero_credit_note_duplicate_check_enabled, default off): never create a second credit note for a refund Xero already
       // credits (162199 was duplicated on 2026-11-21 because the search was by order id alone). Read-only; unreadable is a refusal.
       const duplicateRefusal = await salesCreditNoteDuplicateRefusal(entryId, referenceType, referenceId, payload)
       if (duplicateRefusal) return duplicateRefusal
+      // The erasure state is read BEFORE the claim is re-taken and fails closed: if it cannot be read, nothing is posted and the entry is retried.
+      const creditContact = await resolveSalesPostContact(referenceType, referenceId, payload)
+      if (!creditContact.ok) return { success: false, error: creditContact.error }
+      const creditNoteBeforePostHook = creditNoteBeforePost(payload as Record<string, unknown>)
       const fence = await lease.fenceBeforeRemoteWrite('credit-note')
       if (!fence.ok) return fence.result
       return pushCreditNote({

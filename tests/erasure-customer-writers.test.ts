@@ -89,7 +89,7 @@ test('every writer of order notes, internal notes and tracking numbers is in the
  *                 updates the status of an existing row
  */
 const SYNC_LOG_CENSUS: Record<string, { writers: number; verdict: string }> = {
-  'app/actions/sync-exceptions.ts': { writers: 5, verdict: 'no-identity (operator resolution: status updateMany)' },
+  'app/actions/sync-exceptions.ts': { writers: 6, verdict: 'no-identity (operator resolution: status updateMany; o3d-pnc8p: the settled-outside-IMS acknowledgement writes status, the operator\'s name and reason and the hold text it closed)' },
   'lib/domain/sales/shop-refund-confirm.ts': { writers: 1, verdict: 'no-identity (marks the parked WooCommerce refund row SYNCED after an operator confirms it settles an IMS refund: status and ids only; no name, address or contact)' },
   'lib/connectors/woocommerce/sync/completion-refusal.ts': { writers: 5, verdict: 'no-identity (completion refusal record: WooCommerce order id, status, refusal kind and the fulfilment refusal message; no address, name or contact)' },
   'lib/connectors/woocommerce/sync/outside-ims-despatch.ts': { writers: 1, verdict: 'no-identity (closes an owed first-seen despatch row: status and text only; the retry schedule and terminal marks are SQL payload merges of flags and timestamps)' },
