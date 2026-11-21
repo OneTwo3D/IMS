@@ -69,6 +69,9 @@ type OrderLineDouble = {
   taxBase: number
   taxRate: { rate: number; reverseCharge: boolean } | null
   totalForeign?: number
+  taxForeign?: number
+  /** o3d-k26m.17: the wclc landed-cost marker on a fee line. */
+  wclcFeeKind?: string | null
 }
 type OrderDouble = {
   // o3d-w00 (Codex r6 #1/#2): the order's CURRENCY (which says how coarsely its money figures could
@@ -180,6 +183,8 @@ function makeDependencies(options: {
   returnReasons?: Array<{ id: string; name: string; active: boolean; sortOrder: number }>
   /** Open "Refund in WooCommerce" tasks on the order (zvec.19). None by default: a refund that began in WooCommerce. */
   openTasks?: Array<{ id: string; externalOrderId: string; payload: unknown }>
+  /** o3d-k26m.17: the order's earlier refunds, as the fee-repayment check reads them. */
+  earlierRefunds?: Array<{ creditNoteNumber: string | null; externalRefundId: number | null; easFeeGapForeign: number | null; lines: Array<{ salesOrderLineId: string | null }> }>
 } = {}) {
   const refunds: Array<{ id: string; externalRefundId: number; orderId: string }> = []
   const syncLogs: unknown[] = []
@@ -302,7 +307,7 @@ function makeDependencies(options: {
       // zvec.19: the open-task match reads these before anything else; with no open task it stops there and the import runs as it always did.
       wmsOperatorTask: { async findMany() { return options.openTasks ?? [] } },
       salesOrderRefund: {
-        async findMany() { return [] },
+        async findMany() { return options.earlierRefunds ?? [] },
         async findFirst(args: { where?: { externalRefundId?: number } }) {
           if (options.alwaysMissExistingRefund) return null
           return refunds.find((refund) => refund.externalRefundId === args.where?.externalRefundId) ?? null
@@ -1923,4 +1928,177 @@ test('zvec.19: a refund that began in WooCommerce (no open Refund in WooCommerce
   assert.deepEqual(result, { outcome: 'applied' })
   assert.equal(state.createRefundCalls, 1, 'one credit note is raised for it')
   assert.equal(state.refunds.length, 1)
+})
+
+// ---------------------------------------------------------------------------
+// o3d-k26m.17: refund -> credit-note parity with o3d-ioss-xero 0.2.4 / o3d-store-credit-refund 1.1.9, behind
+// `wc_refund_credit_note_parity_enabled`. Synthetic refunds whose figures mirror the cited live orders.
+// ---------------------------------------------------------------------------
+const PARITY_ON = { parityEnabled: async () => true }
+const linked = (id: number) => [{ id: 1, key: '_refunded_item_id', value: String(id) }]
+const wclc = (id: number) => [...linked(id), { id: 2, key: '_wclc_fee', value: 'yes' }]
+const goodsLine = (total: string, tax: string) => ({ ...goodsRefundLine, total, total_tax: tax, subtotal: total, subtotal_tax: tax })
+// 166122: an EUR order of goods (14.64 + 3.22 VAT) and the EUR 3 import duty (wclc, no VAT), shipping-free.
+const FEE_GAP_ORDER: Partial<OrderDouble> = {
+  currency: 'EUR', totalBase: 20.86, taxBase: 3.22, taxForeign: 3.22, shippingForeign: 0,
+  lines: [
+    { ...DEFAULT_ORDER_LINE, totalBase: 14.64, taxBase: 3.22, totalForeign: 14.64, taxForeign: 3.22 } as OrderLineDouble,
+    { id: 'duty-1', productId: null, externalLineItemId: null, description: 'EU Import Duty', qty: 1, totalBase: 3, taxBase: 0, taxRate: null, totalForeign: 3, taxForeign: 0, wclcFeeKind: 'duty' } as OrderLineDouble,
+  ],
+}
+const feeGapRefund = (overrides: Partial<WcRefund> = {}) => makeRefund({
+  id: 166128, amount: '17.86',
+  line_items: [goodsLine('-14.64', '-3.22')],
+  fee_lines: [{ id: 920, name: 'EU Import Duty', total: '-3.00', total_tax: '0', meta_data: wclc(9001) }],
+  ...overrides,
+})
+
+test('[k26m.17 rule 1] 166128 shape: EAS left the fee out of the AMOUNT while the fee item stayed: credited at the ITEM total, the gap recorded and flagged', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: FEE_GAP_ORDER })
+  const result = await syncWcRefund(166122, feeGapRefund(), { ...state.dependencies, ...PARITY_ON })
+  assert.deepEqual(result, { outcome: 'applied' })
+  assert.equal(state.createRefundCalls, 1)
+  const options = state.createRefundOptionsSeen[0]!
+  assert.equal(options.statedGrossForeign, 20.86, 'the credit note credits the items, the fee and its VAT included')
+  assert.deepEqual(options.refundParity, { easFeeGapForeign: 3, storefrontAmountForeign: 17.86 })
+  const flag = (state.activityLogs as Array<{ action?: string; level?: string; description?: string }>).find((entry) => entry.action === 'refund_sync_eas_fee_gap_credited')
+  assert.ok(flag, 'the order is flagged so the fee repayment is applied to this credit note')
+  assert.equal(flag.level, 'WARNING')
+  assert.match(flag.description ?? '', /apply that payment to this refund's credit note in Xero/)
+})
+
+test('[k26m.17 rule 1] with the switch OFF the same refund parks exactly as before (amount mismatch, retried)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: FEE_GAP_ORDER })
+  const result = await syncWcRefund(166122, feeGapRefund(), state.dependencies)
+  assert.equal(result.outcome, 'retryable-failure')
+  assert.match(result.error ?? '', /amount mismatch: mapped 20\.86 but refund total is 17\.86/)
+  assert.equal(state.createRefundCalls, 0)
+})
+
+test('[k26m.17 rule 1] a near miss of the signature (a cent off, or an unlinked fee) is NOT credited at the item total: the ordinary mismatch park', async () => {
+  for (const refund of [
+    feeGapRefund({ amount: '17.85' }),
+    feeGapRefund({ fee_lines: [{ id: 920, name: 'EU Import Duty', total: '-3.00', total_tax: '0', meta_data: [{ id: 2, key: '_wclc_fee', value: 'yes' }] }] }),
+  ]) {
+    const state = makeDependencies({ alwaysMissExistingRefund: true, order: FEE_GAP_ORDER })
+    const result = await syncWcRefund(166122, refund, { ...state.dependencies, ...PARITY_ON })
+    assert.equal(result.outcome, 'retryable-failure')
+    assert.match(result.error ?? '', /amount mismatch/)
+    assert.equal(state.createRefundCalls, 0)
+  }
+})
+
+// 177725: goods 61.29 + 12.26, shipping charged 14.06 + 2.67, fees EU Import Duty 3.00 + 0.57 and EU Handling Fee 2.00 + 0.38 (wclc).
+const FOLD_ORDER: Partial<OrderDouble> = {
+  currency: 'EUR', totalBase: 96.23, taxBase: 15.88, taxForeign: 15.88, shippingForeign: 14.06, shippingBase: 14.06, taxRatePercent: null,
+  lines: [
+    { ...DEFAULT_ORDER_LINE, totalBase: 61.29, taxBase: 12.26, totalForeign: 61.29, taxForeign: 12.26 } as OrderLineDouble,
+    { id: 'duty-1', productId: null, externalLineItemId: null, description: 'EU Import Duty', qty: 1, totalBase: 3, taxBase: 0.57, taxRate: null, totalForeign: 3, taxForeign: 0.57, wclcFeeKind: 'duty' } as OrderLineDouble,
+    { id: 'uhf-1', productId: null, externalLineItemId: null, description: 'EU Handling Fee', qty: 1, totalBase: 2, taxBase: 0.38, taxRate: null, totalForeign: 2, taxForeign: 0.38, wclcFeeKind: 'handling' } as OrderLineDouble,
+  ],
+}
+const foldRefund = (shippingTax: string, amount: string) => makeRefund({
+  id: 177730, amount,
+  line_items: [goodsLine('-61.29', '-12.26')],
+  shipping_lines: [{ id: 930, method_title: 'Tracked', method_id: 'calcurates', total: '-19.06', total_tax: shippingTax, taxes: [], meta_data: linked(8001) } as never],
+  fee_lines: [
+    { id: 931, name: 'EU Import Duty', total: '-3.00', total_tax: '-0.57', meta_data: wclc(9001) },
+    { id: 932, name: 'EU Handling Fee', total: '-2.00', total_tax: '-0.38', meta_data: wclc(9002) },
+  ],
+})
+
+test('[k26m.17 rule 3] 177725 shape: EAS folded the fees into the SHIPPING line: shipping is restored to what was charged and the amount is expected', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: FOLD_ORDER })
+  const result = await syncWcRefund(177725, foldRefund('-3.62', '96.23'), { ...state.dependencies, ...PARITY_ON })
+  assert.deepEqual(result, { outcome: 'applied' }, result.error)
+  const shipping = state.createRefundLines.find((line) => line.lineKind === 'shipping')
+  assert.equal(shipping?.totalForeign, 14.06, 'restored to the charged shipping net')
+  assert.equal(shipping?.chargedTaxForeign, 2.67, 'and its VAT')
+  assert.equal(state.createRefundOptionsSeen[0]!.statedGrossForeign, 96.23, 'the credit note totals what was paid back, never the inflated 102.18')
+  assert.equal(state.createRefundOptionsSeen[0]!.refundParity, undefined, 'a fold is no fee gap: nothing more is owed')
+  assert.ok((state.activityLogs as Array<{ action?: string }>).some((entry) => entry.action === 'refund_sync_eas_shipping_fold_restored'))
+})
+
+test('[k26m.17 rule 3] a fold close but not exact (VAT excess a cent off) is QUARANTINED with both readings; never credited at the inflated total', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: FOLD_ORDER })
+  const result = await syncWcRefund(177725, foldRefund('-3.61', '96.22'), { ...state.dependencies, ...PARITY_ON })
+  assert.equal(result.outcome, 'quarantined-refusal')
+  assert.match(result.error ?? '', /its shipping is not what was charged/)
+  assert.equal(state.createRefundCalls, 0)
+  assert.ok(state.syncLogs.some((log) => (log as { data?: { status?: string } }).data?.status === 'QUARANTINED'))
+  assert.ok((state.activityLogs as Array<{ action?: string }>).some((entry) => entry.action === 'refund_sync_eas_amount_gap_held'))
+})
+
+// 166130: the fee comes back as a refund of zero-total goods carrying VAT (1.44 + 1.56), amount 3.00.
+const repaymentRefund = () => makeRefund({
+  id: 166130, amount: '3.00',
+  line_items: [{ ...goodsLine('0', '-1.44'), quantity: 0 }],
+  shipping_lines: [{ id: 940, method_title: 'Tracked', method_id: 'calcurates', total: '0', total_tax: '-1.56', taxes: [] } as never],
+})
+
+test('[k26m.17 rule 2] 166130 shape after a fee-gap credit: HELD (QUARANTINED) with the instruction, never a second credit note', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: FEE_GAP_ORDER, earlierRefunds: [{ creditNoteNumber: 'CN-00042', externalRefundId: 166128, easFeeGapForeign: 3, lines: [{ salesOrderLineId: 'line-1' }, { salesOrderLineId: 'duty-1' }] }] })
+  const result = await syncWcRefund(166122, repaymentRefund(), { ...state.dependencies, ...PARITY_ON })
+  assert.equal(result.outcome, 'quarantined-refusal')
+  assert.match(result.error ?? '', /apply this payment \(3\.00 EUR\) to that credit note in Xero/)
+  assert.equal(state.createRefundCalls, 0, 'no second credit note')
+  assert.ok((state.activityLogs as Array<{ action?: string }>).some((entry) => entry.action === 'refund_sync_fee_repayment_held'))
+})
+
+test('[k26m.17 rule 2] with no earlier fee refund, or with the switch OFF, the same money-only refund is recorded as before', async () => {
+  const none = makeDependencies({ alwaysMissExistingRefund: true, earlierRefunds: [{ creditNoteNumber: 'CN-1', externalRefundId: 1, easFeeGapForeign: null, lines: [{ salesOrderLineId: 'line-1' }] }] })
+  assert.equal((await syncWcRefund(1001, repaymentRefund(), { ...none.dependencies, ...PARITY_ON })).outcome, 'applied')
+  const off = makeDependencies({ alwaysMissExistingRefund: true, earlierRefunds: [{ creditNoteNumber: 'CN-1', externalRefundId: 1, easFeeGapForeign: 3, lines: [] }] })
+  assert.equal((await syncWcRefund(1001, repaymentRefund(), off.dependencies)).outcome, 'applied')
+})
+
+test('[k26m.17 rule 4] refunds WITHOUT product lines get a credit note: shipping-only, fee-only, shipping + fee (166326 / 172767 shape) and amount-only', async () => {
+  const order: Partial<OrderDouble> = { lines: FEE_ORDER_LINES, shippingBase: 5, shippingForeign: 5 }
+  const cases: Array<[string, Partial<WcRefund>, Partial<OrderDouble>]> = [
+    ['shipping only', { amount: '6.00', line_items: [], shipping_lines: [{ id: 950, method_title: 'Tracked', method_id: 'x', total: '-5.00', total_tax: '-1.00', taxes: [] } as never] }, order],
+    ['fee only', { amount: '4.80', line_items: [], fee_lines: [{ name: 'EU Customs Fee', total: '-4.00', total_tax: '-0.80' }] }, order],
+    ['shipping and fee', { amount: '10.80', line_items: [], shipping_lines: [{ id: 951, method_title: 'Tracked', method_id: 'x', total: '-5.00', total_tax: '-1.00', taxes: [] } as never], fee_lines: [{ name: 'EU Customs Fee', total: '-4.00', total_tax: '-0.80' }] }, order],
+    // The amount-only refund is converted at the order's own (coherent) rate: the default order.
+    ['amount only', { amount: '3.00', line_items: [] }, {}],
+  ]
+  for (const [why, overrides, order] of cases) {
+    const state = makeDependencies({ alwaysMissExistingRefund: true, order })
+    const result = await syncWcRefund(1001, makeRefund(overrides), { ...state.dependencies, ...PARITY_ON })
+    assert.equal(refundIsInIms(result.outcome), true, `${why}: ${result.error}`)
+    assert.equal(state.createRefundCalls, 1, `${why}: the refund (and so its credit note) is recorded`)
+  }
+})
+
+const storeCreditRefund = (meta: Array<{ id: number; key: string; value: unknown }> = []) => makeRefund({ id: 177649, refunded_payment: false, meta_data: [{ id: 5, key: '_o3d_scr_attempt', value: 'att-9' }, ...meta] as never })
+
+test('[k26m.17 rule 6] a store-credit refund whose credit is not live yet is NOT recorded (PENDING, retried): no credit note on a failed store-credit refund', async () => {
+  for (const [why, refund, orderMeta] of [
+    ['the order records the attempt as unfinished', storeCreditRefund(), [{ id: 1, key: '_o3d_scr_incomplete', value: { attempt: 'att-9', stage: 'refund-unresolved' } }]],
+    ['the plugin still holds it for Xero', storeCreditRefund([{ id: 6, key: '_o3d_scr_xero_held', value: '1' }]), []],
+    ['the order could not be read', storeCreditRefund(), null],
+  ] as const) {
+    const state = makeDependencies({ alwaysMissExistingRefund: true })
+    const result = await syncWcRefund(1001, refund, { ...state.dependencies, ...PARITY_ON, fetchOrderMeta: async () => orderMeta as never })
+    assert.equal(result.outcome, 'retryable-failure', why)
+    assert.equal(state.createRefundCalls, 0, `${why}: nothing recorded, so no credit note`)
+    assert.ok(state.syncLogs.some((log) => (log as { data?: { status?: string } }).data?.status === 'PENDING'), `${why}: parked PENDING so the sweep retries it`)
+  }
+})
+
+test('[k26m.17 rule 6] once the store credit is live the refund is recorded as a store-credit refund (SC- numbered, never allocated); a gateway refund is not one', async () => {
+  const live = makeDependencies({ alwaysMissExistingRefund: true })
+  assert.equal((await syncWcRefund(1001, storeCreditRefund(), { ...live.dependencies, ...PARITY_ON, fetchOrderMeta: async () => [] })).outcome, 'applied')
+  assert.deepEqual(live.createRefundOptionsSeen[0]!.refundParity, { storeCreditRefund: true })
+  assert.equal(live.createRefundOptionsSeen[0]!.refundedViaGateway, false)
+
+  let fetched = 0
+  const gateway = makeDependencies({ alwaysMissExistingRefund: true })
+  const paid = makeRefund({ refunded_payment: true, meta_data: [{ id: 5, key: '_o3d_scr_attempt', value: 'att-9' }] as never })
+  assert.equal((await syncWcRefund(1001, paid, { ...gateway.dependencies, ...PARITY_ON, fetchOrderMeta: async () => { fetched += 1; return [] } })).outcome, 'applied')
+  assert.equal(gateway.createRefundOptionsSeen[0]!.refundParity, undefined)
+  assert.equal(fetched, 0, 'the order is read only for a store-credit refund')
+
+  const off = makeDependencies({ alwaysMissExistingRefund: true })
+  assert.equal((await syncWcRefund(1001, storeCreditRefund(), off.dependencies)).outcome, 'applied', 'switch off: as before')
+  assert.equal(off.createRefundOptionsSeen[0]!.refundParity, undefined)
 })

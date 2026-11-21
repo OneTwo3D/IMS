@@ -467,3 +467,27 @@ test('[credit note] an untaxed fee is not part of the scheme posting type: its b
   )
   assert.equal(alone.ok, false)
 })
+
+test('[credit note, o3d-k26m.17 rule 1/5] the EAS fee-gap credit (166128 shape): stated gross = the ITEM total, so the ONE VAT line carries goods AND fee VAT off 821 on NONE; goods and shipping stay on the zero-rated type, never a tax override', () => {
+  // goods 14.64 net + 3.22 VAT, shipping 0, the wclc fee 2.44 net + 0.56 VAT (fee VAT from 1 Nov): items 20.86, the storefront paid 17.86.
+  const fx = payload({ lines: [
+    { description: 'Widget', quantity: 1, unitAmount: 14.64, accountCode: '200', taxType: CHARGED, taxRateId: 'r1', taxRateBasis: 'sales_line' },
+    { description: 'EU Import Duty', quantity: 1, unitAmount: 2.44, accountCode: '200', taxType: CHARGED, taxRateId: 'r1', taxRateBasis: 'sales_line' },
+  ] })
+  const figures = refundTaxAndTotal({ net: D('17.08'), pricedTax: D('3.78'), rawGross: D('20.86'), statedGross: D('20.86'), currency: 'EUR', toleranceMinorUnits: 2 })
+  assert.equal(figures.ok, true)
+  if (!figures.ok) return
+  assert.equal(figures.vatAmount, '3.78', 'goods VAT 3.22 + fee VAT 0.56')
+  const result = applyEuVatCreditNoteTreatment(fx, plan({ lineKinds: ['goods', 'marked-fee'], linePostingTypes: ['TAX131', 'TAX131'], vatAmount: figures.vatAmount, refundTotal: figures.refundTotal }))
+  assert.equal(result.ok, true)
+  if (!result.ok) return
+  assert.deepEqual(result.payload.lines.map((l) => [l.description, l.accountCode, l.taxType, l.unitAmount]), [
+    ['Widget', '200', 'TAX131', 14.64],
+    ['EU Import Duty', '232', 'NONE', 2.44],
+    ['IOSS VAT refunded', '821', 'NONE', 3.78],
+  ])
+  assert.equal(result.payload.lines.some((l) => 'taxAmount' in l || 'TaxAmount' in l), false, 'no tax-amount override on any line')
+  // Held to the storefront AMOUNT instead (17.86) it would not total: that is why the gap is credited at the item total, not refused for ever.
+  const atAmount = applyEuVatCreditNoteTreatment(fx, plan({ lineKinds: ['goods', 'marked-fee'], linePostingTypes: ['TAX131', 'TAX131'], vatAmount: '3.78', refundTotal: '17.86' }))
+  assert.equal(atAmount.ok, false)
+})

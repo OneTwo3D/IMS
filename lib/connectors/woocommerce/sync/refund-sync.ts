@@ -21,7 +21,8 @@ import { activeRefundParkWhere, WC_REFUND_PARK_RECORD_KIND } from '@/lib/domain/
 import { easRefundRefusal, refundStatedTax, refundTaxOnEasRate } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { matchRefundedFeeLines, refundedOrderLineId } from './refund-line-link'
 export { refundedOrderLineId }
-import type { WcRefund } from './types'
+import type { WcMeta, WcRefund } from './types'
+import { decideAmountGap, feeRepaymentHold, isRefundCnParityEnabled, parityRefundBreakdown, storeCreditAttemptOf, storeCreditHoldReason, WCLC_FEE_MARKER_META, type ParityRefundItem, type RefundParityFactsInput } from '@/lib/domain/sales/refund-cn-parity'
 import type { createRefund as createRefundAction } from '@/app/actions/sales'
 
 type CreateRefundAction = typeof createRefundAction
@@ -54,6 +55,26 @@ export type WcRefundSyncDependencies = {
   db?: Pick<typeof db, 'salesOrder' | 'salesOrderRefund' | 'warehouse' | 'shoppingSyncLog' | 'wmsOperatorTask' | '$transaction'> & Partial<Pick<typeof db, 'organisation' | 'returnReason'>>
   createRefund?: CreateRefundAction
   logActivity?: typeof logActivity
+  /** o3d-k26m.17: whether `wc_refund_credit_note_parity_enabled` is on. Default: the setting, read from `db` (a `db` double without a `setting` delegate reads OFF). */
+  parityEnabled?: () => Promise<boolean>
+  /** o3d-k26m.17: the WooCommerce order's meta, read only for a store-credit refund under the parity switch. Null: it could not be read (the refund is retried). */
+  fetchOrderMeta?: (externalOrderId: number) => Promise<WcMeta[] | null>
+}
+
+/** o3d-k26m.17: the parity switch, read from the client the sync was given. A test double with no `setting` delegate reads OFF, so it never reaches a real database. */
+async function readParitySwitch(dependencies: WcRefundSyncDependencies): Promise<boolean> {
+  if (dependencies.parityEnabled) return dependencies.parityEnabled()
+  const settingClient = dependencies.db ? (dependencies.db as { setting?: Parameters<typeof isRefundCnParityEnabled>[0]['setting'] }).setting : db.setting
+  if (!settingClient) return false
+  return isRefundCnParityEnabled({ setting: settingClient })
+}
+
+/** o3d-k26m.17: the WooCommerce order's own meta (the store-credit plugin's unfinished-attempt record lives there), or null when it cannot be read. */
+async function fetchWcOrderMeta(externalOrderId: number): Promise<WcMeta[] | null> {
+  const { data, error } = await wcFetch(`/orders/${externalOrderId}`)
+  if (error || data === null || typeof data !== 'object') return null
+  const meta = (data as { meta_data?: unknown }).meta_data
+  return Array.isArray(meta) ? (meta as WcMeta[]) : null
 }
 
 /**
@@ -675,6 +696,45 @@ export function refundMayStillReachIms(outcome: WcRefundOutcome): boolean {
   }
 }
 
+/**
+ * o3d-k26m.17: the refund's items as the parity breakdown reads them. A fee is MARKED when the refund item carries the wclc marker or the order fee line it is
+ * matched to does (`matchedFees`, aligned with the refund's fee lines that carry money; null = not matched, every fee then judged on its own meta only).
+ */
+function parityItemsOf(
+  wcRefund: WcRefund,
+  orderLines: ReadonlyArray<{ id: string; wclcFeeKind?: string | null }>,
+  matchedFees: ReadonlyArray<string | null> | null,
+): ParityRefundItem[] {
+  const metaTrue = (meta: readonly WcMeta[] | undefined, key: string) => {
+    const value = (meta ?? []).find((m) => m.key === key)?.value
+    return value !== undefined && value !== null && value !== '' && value !== '0' && value !== false && value !== 0
+  }
+  const markedOrderLine = new Set(orderLines.filter((line) => line.wclcFeeKind != null).map((line) => line.id))
+  const items: ParityRefundItem[] = []
+  for (const line of wcRefund.line_items) items.push({ type: 'line', total: line.total, tax: line.total_tax })
+  for (const line of wcRefund.shipping_lines ?? []) items.push({ type: 'shipping', total: line.total, tax: line.total_tax })
+  const feeLines = (wcRefund.fee_lines ?? []).filter((fee) => parseDecimalAbs(fee.total).gt(0.000001) || parseDecimalAbs(fee.total_tax).gt(0.000001))
+  feeLines.forEach((fee, index) => {
+    const matched = matchedFees?.[index] ?? null
+    items.push({
+      type: 'fee',
+      total: fee.total,
+      tax: fee.total_tax,
+      name: fee.name,
+      marked: metaTrue(fee.meta_data, WCLC_FEE_MARKER_META) || (matched !== null && markedOrderLine.has(matched)),
+      linked: Number((fee.meta_data ?? []).find((m) => m.key === '_refunded_item_id')?.value) > 0,
+    })
+  })
+  return items
+}
+
+/** o3d-k26m.17: what the order charged for shipping in its own currency: the shipping net, and its VAT (the order's VAT less its lines'). Null when a figure is missing. */
+function chargedShippingOf(order: { shippingForeign?: DecimalInput | null; taxForeign?: DecimalInput | null; lines: ReadonlyArray<{ taxForeign?: DecimalInput | null }> }): { net: DecimalInput; tax: DecimalInput } | null {
+  if (order.shippingForeign == null || order.taxForeign == null || order.lines.some((line) => line.taxForeign == null)) return null
+  const lineTax = order.lines.reduce((sum, line) => sum.add(toDecimal(line.taxForeign ?? 0)), toDecimal(0))
+  return { net: order.shippingForeign, tax: toDecimal(order.taxForeign).sub(lineTax).toDecimalPlaces(2) }
+}
+
 export async function syncWcRefund(
   externalOrderId: number,
   wcRefund: WcRefund,
@@ -729,6 +789,8 @@ export async function syncWcRefund(
             taxBase: true,
             taxForeign: true,
             taxRate: { select: { rate: true, reverseCharge: true } },
+            // o3d-k26m.17: which fee lines carry the wclc landed-cost marker (the EAS fee gap and fold are judged on marked fees only).
+            wclcFeeKind: true,
           },
         },
       },
@@ -890,6 +952,25 @@ export async function syncWcRefund(
       return { outcome: 'quarantined-refusal', error: message }
     }
     const refundAmountForeign = parseDecimalAbs(wcRefund.amount)
+
+    // o3d-k26m.17 - REFUND -> CREDIT-NOTE PARITY (switch `wc_refund_credit_note_parity_enabled`, default off; lib/domain/sales/refund-cn-parity.ts). Off, nothing below
+    // reads anything new and every refund is handled exactly as before.
+    const parityOn = await readParitySwitch(dependencies)
+    const parityFacts: RefundParityFactsInput = {}
+    // STORE CREDIT (o3d-store-credit-refund 1.1.9): no credit note until the store credit is live, so the refund is not recorded until then (PENDING, retried by
+    // every sweep); once it is, its credit note is numbered SC-<refund id> and never allocated (the liability true-up nets it off 813).
+    const storeCreditAttempt = parityOn ? storeCreditAttemptOf(wcRefund) : null
+    if (storeCreditAttempt !== null) {
+      const orderMeta = await (dependencies.fetchOrderMeta ?? fetchWcOrderMeta)(externalOrderId)
+      const hold = orderMeta === null
+        ? `WooCommerce refund ${wcRefund.id} was issued as store credit, and IMS could not read the WooCommerce order to confirm the store credit is live, so no credit note is raised yet. The refund is retried on the next sweep.`
+        : storeCreditHoldReason({ refundId: wcRefund.id, attempt: storeCreditAttempt, refundMeta: wcRefund.meta_data, orderMeta })
+      if (hold !== null) {
+        await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'PENDING', errorMessage: hold, payload: wcRefund })
+        return { outcome: 'retryable-failure', error: hold }
+      }
+      parityFacts.storeCreditRefund = true
+    }
 
     // IOSS CREDIT NOTES (behind the Sales Invoices switch): a refund on a scheme-stamped order whose tax the EAS compliance plugin booked on WooCommerce rate 182 IS recorded: its tax is the sum across ALL the refund's rate ids,
     // handed to the writer, and the credit note books it on the stamped VAT account (the first N held for a person: lib/domain/sales/refund-182-hold.ts). A 182 figure that cannot be read is still refused and parked.
@@ -1118,6 +1199,45 @@ export async function syncWcRefund(
       }
     }
 
+    // o3d-k26m.17 - THE FEE REPAYMENT (rule 2): a refund that refunds no goods and no fee but pays money out is how EAS records a landed-cost fee being paid
+    // back (166130: VAT on zero-total goods). On an order where an earlier refund carried a marked fee it is HELD (QUARANTINED, with the instruction to apply the
+    // payment to that refund's credit note), never a second credit note crediting the fee and its VAT again.
+    if (parityOn && refundLines.length === 0 && refundedFeeLines.length === 0) {
+      const breakdown = parityRefundBreakdown(parityItemsOf(wcRefund, so.lines, null))
+      // soft-delete exception (identity check): a deleted refund's credit note may still stand in Xero, so a fee gap it recorded still counts here.
+      const earlier = await client.salesOrderRefund.findMany({
+        where: { orderId: so.id },
+        select: { creditNoteNumber: true, externalRefundId: true, easFeeGapForeign: true, lines: { select: { salesOrderLineId: true } } },
+      })
+      const markedFeeLineIds = new Set(so.lines.filter((line) => line.wclcFeeKind != null).map((line) => line.id))
+      const hold = feeRepaymentHold({
+        refundId: wcRefund.id,
+        amount: refundAmountForeign,
+        currency: so.currency,
+        breakdown,
+        earlier: earlier.map((refund) => ({
+          creditNoteNumber: refund.creditNoteNumber,
+          externalRefundId: refund.externalRefundId,
+          easFeeGapForeign: refund.easFeeGapForeign,
+          carriedMarkedFee: (refund.lines ?? []).some((line) => line.salesOrderLineId != null && markedFeeLineIds.has(line.salesOrderLineId)),
+        })),
+      })
+      if (hold !== null) {
+        await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: hold, payload: wcRefund })
+        await writeActivity({
+          entityType: 'SALES_ORDER',
+          entityId: so.id,
+          action: 'refund_sync_fee_repayment_held',
+          tag: 'sync',
+          level: 'WARNING',
+          description: hold,
+          metadata: { externalRefundId: wcRefund.id },
+          resolveUser: false,
+        })
+        return { outcome: 'quarantined-refusal', error: hold }
+      }
+    }
+
     if (refundLines.length === 0) {
       // Monetary-only refund (no line items / shipping to break down): the money returned to the customer
       // is GROSS (tax-inclusive), but every refund line is stored NET (o3d-w00) — the credit note grosses
@@ -1166,7 +1286,67 @@ export async function syncWcRefund(
       mappedGrossForeign = refundAmountForeign
     }
 
-    const mappedGrossRounded = roundDecimalNumber(mappedGrossForeign, 4)
+    let mappedGrossRounded = roundDecimalNumber(mappedGrossForeign, 4)
+    // o3d-k26m.17 - THE EAS AMOUNT GAP (rules 1 and 3), judged only when the lines and the amount disagree and the switch is on:
+    //   the FEE GAP (exact signature): the credit note credits the ITEM total, the refund records the fee left out of the amount, and the order is flagged so
+    //     the fee's separate repayment is applied to this credit note (166122 / 166128);
+    //   the SHIPPING FOLD (exact): shipping is restored to what the order charged and the lines then total the amount (177725);
+    //   close to either but not exact: QUARANTINED for a person, never credited at the inflated total.
+    let parityStatedGross: number | null = null
+    let parityNote: { action: string; level: 'INFO' | 'WARNING'; description: string } | null = null
+    if (parityOn && refundLines.length > 0 && toDecimal(mappedGrossRounded).sub(refundAmountForeign).abs().gt(0.01)) {
+      const matchedFees = refundedFeeLines.length > 0 ? matchRefundedFeeLines(refundedFeeLines, so.lines) : []
+      const breakdown = parityRefundBreakdown(parityItemsOf(wcRefund, so.lines, matchedFees))
+      const verdict = decideAmountGap({
+        refundId: wcRefund.id,
+        amount: refundAmountForeign,
+        breakdown,
+        refundShipping: refundedShippingLines.map((line) => ({ total: line.total, tax: line.total_tax, name: line.method_title })),
+        charged: chargedShippingOf(so),
+      })
+      if (verdict.kind === 'hold') {
+        await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: verdict.message, payload: wcRefund })
+        await writeActivity({
+          entityType: 'SALES_ORDER',
+          entityId: so.id,
+          action: 'refund_sync_eas_amount_gap_held',
+          tag: 'sync',
+          level: 'WARNING',
+          description: verdict.message,
+          metadata: { externalRefundId: wcRefund.id },
+          resolveUser: false,
+        })
+        return { outcome: 'quarantined-refusal', error: verdict.message }
+      }
+      if (verdict.kind === 'fee-gap') {
+        const credited = verdict.creditedGrossMinor / 100
+        const gap = verdict.feeGapMinor / 100
+        parityStatedGross = credited
+        parityFacts.easFeeGapForeign = gap
+        parityFacts.storefrontAmountForeign = refundAmountForeign.toNumber()
+        mappedGrossRounded = refundAmountForeign.toNumber()
+        parityNote = {
+          action: 'refund_sync_eas_fee_gap_credited',
+          level: 'WARNING',
+          description: withLedgerCheck(`WooCommerce refund ${wcRefund.id} refunds a landed-cost fee that EAS left out of the refund amount: the credit note credits the items, ${credited.toFixed(2)} ${so.currency} (the fee and its VAT included), while ${refundAmountForeign.toFixed(2)} was paid back. `
+            + `The fee (${gap.toFixed(2)} ${so.currency}) is repaid separately: apply that payment to this refund's credit note in Xero. A later storefront refund that only repays the fee is held, not credited again.`),
+        }
+      } else if (verdict.kind === 'fold') {
+        const shipping = refundLines.find((line) => line.lineKind === 'shipping')
+        if (shipping) {
+          shipping.totalForeign = roundDecimalNumber(verdict.shippingNet, 4)
+          shipping.totalBase = divideRoundedNumber(verdict.shippingNet, fxRate, 4)
+          shipping.chargedTaxForeign = roundDecimalNumber(verdict.shippingTax, 4)
+          if (eas182StatedTaxForeign !== undefined) eas182StatedTaxForeign = toDecimal(eas182StatedTaxForeign).sub(toDecimal(verdict.excessTax)).toNumber()
+          mappedGrossRounded = refundAmountForeign.toNumber()
+          parityNote = {
+            action: 'refund_sync_eas_shipping_fold_restored',
+            level: 'INFO',
+            description: `WooCommerce refund ${wcRefund.id}: EAS put the refunded fees (${verdict.excessNet} + ${verdict.excessTax} VAT) on the refund's shipping line as well as on the fee lines; the shipping line was restored to what was charged (${verdict.shippingNet} + ${verdict.shippingTax} VAT) and the credit note totals the ${refundAmountForeign.toFixed(2)} paid back.`,
+          }
+        }
+      }
+    }
     if (refundLines.length > 0 && toDecimal(mappedGrossRounded).sub(refundAmountForeign).abs().gt(0.01)) {
       const error = `WooCommerce refund ${wcRefund.id} amount mismatch: mapped ${toDecimal(mappedGrossRounded).toFixed(2)} but refund total is ${refundAmountForeign.toDecimalPlaces(2).toFixed(2)}`
       await upsertRefundPark(client, {
@@ -1204,7 +1384,7 @@ export async function syncWcRefund(
         refundLines.filter((l) => l.qty > 0 || l.totalBase > 0),
         wcRefund.reason || 'WooCommerce refund',
         returnWarehouseId,
-        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id, ...(typeof wcRefund.refunded_payment === 'boolean' ? { refundedViaGateway: wcRefund.refunded_payment } : {}), ...(returnReasonId ? { returnReasonId } : {}), statedGrossForeign: refundAmountForeign.toNumber(), ...(eas182StatedTaxForeign !== undefined ? { eas182StatedTaxForeign } : {}), ...(refundedFeeLines.length > 0 ? { enforcePerTargetBalances: true } : {}) },
+        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id, ...(typeof wcRefund.refunded_payment === 'boolean' ? { refundedViaGateway: wcRefund.refunded_payment } : {}), ...(returnReasonId ? { returnReasonId } : {}), statedGrossForeign: parityStatedGross ?? refundAmountForeign.toNumber(), ...(eas182StatedTaxForeign !== undefined ? { eas182StatedTaxForeign } : {}), ...(refundedFeeLines.length > 0 ? { enforcePerTargetBalances: true } : {}), ...(parityOn && Object.keys(parityFacts).length > 0 ? { refundParity: parityFacts } : {}) },
       )
     } catch (error) {
       if (!isExternalRefundIdUniqueConflict(error)) throw error
@@ -1381,6 +1561,18 @@ export async function syncWcRefund(
     // A same-order PENDING/FAILED park intentionally fell through to this retry — now that it landed, clear it.
     await resolveActionableParks(client, so.id, String(wcRefund.id))
 
+    if (parityNote !== null) {
+      await writeActivity({
+        entityType: 'SALES_ORDER',
+        entityId: so.id,
+        action: parityNote.action,
+        tag: 'sync',
+        level: parityNote.level,
+        description: parityNote.description,
+        metadata: { externalRefundId: wcRefund.id, ...(parityFacts.easFeeGapForeign != null ? { easFeeGapForeign: parityFacts.easFeeGapForeign, storefrontAmountForeign: parityFacts.storefrontAmountForeign } : {}) },
+        resolveUser: false,
+      })
+    }
     await writeActivity({
       entityType: 'SALES_ORDER',
       entityId: so.id,

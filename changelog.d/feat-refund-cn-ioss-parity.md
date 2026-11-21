@@ -1,0 +1,7 @@
+### Storefront refund -> credit-note parity with the November 2026 plugin fixes (switch off by default)
+- New system switch `wc_refund_credit_note_parity_enabled` (default off; `npm run settings:set`). Off, every WooCommerce refund is handled exactly as before.
+- EAS fee gap: a refund whose landed-cost fee items stayed on it while EAS left the fee out of the amount is recorded at the item total on the exact signature only, with the gap stored on the refund (`eas_fee_gap_foreign`, `storefront_amount_foreign`) and a warning to apply the fee's repayment to that credit note. A gateway refund payment against it is held to what the gateway paid back. Previously such refunds parked as an amount mismatch for ever.
+- Fee repayment: a refund that refunds no goods and no fee, on an order where an earlier refund carried a landed-cost fee, is held on Sync exceptions instead of becoming a second credit note.
+- Shipping fold: when EAS folds the fees into the refund's shipping line, shipping is restored to what the order charged and the amount is expected; a near miss is held, never credited at the inflated total.
+- Store credit: a store-credit refund is not recorded until the store credit is live (no credit note on a failed store-credit refund); once live its credit note is numbered `SC-<refund id>` and is never allocated or paid out by the credit-note settlement (`store_credit_refund`).
+- Migration `20261122001000_refund_cn_parity` (additive: three columns on `sales_order_refunds`).
