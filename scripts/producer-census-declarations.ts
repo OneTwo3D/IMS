@@ -190,6 +190,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'Queues SALES_INVOICE_UPDATE of an already-posted invoice inside the transaction of an edit of a confirmed order (the update helper is handed the transactional enqueue as its queue, so the hold, the chart and document guards and the refusal inbox apply as on the facade path); xeroom owns this operation, so IMS shadows it in every phase.'),
   d('app/actions/sales.ts::updateSalesOrder::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push the stock of the products an edit of a confirmed order re-reserved (after the edit commits).'),
+  d('lib/connectors/woocommerce/sync/order-unpaid-rewrite.ts::rewriteUnpaidOrderFromWc::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
+    'Asks the shopping facade to push the stock of the products the rewrite of an unpaid order (to WooCommerce\'s own edit, behind wc_order_amendment_unpaid_rewrite_enabled) released and re-reserved (after the rewrite commits); the same stock push an IMS edit of a confirmed order asks for.'),
   d('app/actions/sales.ts::applySalesOrderStatusTransition::enqueueStockSync#1', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',
     'Asks the shopping facade to push the stock of the products whose unshipped allocation was released when the order was closed as shipped, completed or delivered (after the closing commits).'),
   d('app/actions/sales.ts::applySalesOrderStatusTransition::enqueueStockSync#2', 'woocommerce', 'stock', 'queue-producer', 'not-applicable',

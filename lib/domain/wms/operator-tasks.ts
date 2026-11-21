@@ -15,7 +15,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * new task.
  */
 
-export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE', 'SHOP_REFUND_DUE', 'AMENDMENT_NOT_APPLIED', 'ORDER_NOT_FOUND', 'CANCELLED_POSTED_INVOICE', 'WC_EDIT_AFTER_PICKING', 'REFUND_REMAINDER_DUE', 'MERGE_HOLD', 'MERGE_HOLD_OVERDUE', 'MERGE_HOLD_WITHDRAWAL', 'WITHDRAWAL_REJECT_NOT_WRITTEN'] as const
+export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE', 'SHOP_REFUND_DUE', 'AMENDMENT_NOT_APPLIED', 'ORDER_NOT_FOUND', 'CANCELLED_POSTED_INVOICE', 'WC_EDIT_AFTER_PICKING', 'WC_PAID_INCREASE', 'REFUND_REMAINDER_DUE', 'MERGE_HOLD', 'MERGE_HOLD_OVERDUE', 'MERGE_HOLD_WITHDRAWAL', 'WITHDRAWAL_REJECT_NOT_WRITTEN'] as const
 export type WmsOperatorTaskReasonValue = (typeof WMS_OPERATOR_TASK_REASONS)[number]
 
 /** What an operator reads for each reason (the exceptions section). */
@@ -32,6 +32,7 @@ export const WMS_OPERATOR_TASK_REASON_LABELS: Record<WmsOperatorTaskReasonValue,
   ORDER_NOT_FOUND: 'Warehouse order not found on repeated checks: IMS stopped checking its status',
   CANCELLED_POSTED_INVOICE: 'Cancelled order with a posted invoice: the invoice is still uncredited in the ledger',
   WC_EDIT_AFTER_PICKING: 'Order edited in WooCommerce after picking started: IMS sent nothing, apply the change in the warehouse by hand',
+  WC_PAID_INCREASE: 'Paid order increased in WooCommerce: IMS changed nothing, collect the difference or have the edit undone in WooCommerce (not a warehouse change)',
   REFUND_REMAINDER_DUE: 'Returned units were refunded: ask the warehouse to send the remaining units',
   WITHDRAWAL_REJECT_NOT_WRITTEN: 'Withdrawal request filed after despatch: IMS could not reject it on the storefront, reject it in WooCommerce',
   MERGE_HOLD: 'Orders on merge hold in the warehouse: merge them there and confirm the merged order yourself',
@@ -206,6 +207,16 @@ export function wcEditAfterPickingQuery(wmsOrder: string, imsOrder: string, chan
   const what = changes.length > 0 ? changes.join('; ') : 'its lines'
   return `IMS order ${imsOrder} was edited in WooCommerce after warehouse order ${wmsOrder} was picked up for fulfilment, so IMS sent no change to the warehouse. WooCommerce now shows: ${what}. `
     + 'Please check the warehouse order against this and, if it is not yet despatched, make the change there.'
+}
+
+/**
+ * The query for a PAID order WooCommerce INCREASED (more units, an added item, a higher price). IMS changed nothing: the payment and any invoice were made for the original, so the warehouse must NOT ship the extra
+ * until the difference is collected. A person collects it or has the edit undone in WooCommerce. Not a warehouse change. SKUs, quantities and amounts only.
+ */
+export function wcPaidIncreaseQuery(wmsOrder: string | null, imsOrder: string, changes: ReadonlyArray<string>): string {
+  const where = wmsOrder ? ` (warehouse order ${wmsOrder})` : ''
+  return `IMS order ${imsOrder}${where} was PAID and has since been INCREASED in WooCommerce: ${changes.join('; ')}. IMS changed nothing and sent nothing to the warehouse. `
+    + 'Please collect the difference from the customer, or undo the edit in WooCommerce; do not ship the extra goods until it is paid.'
 }
 
 /**

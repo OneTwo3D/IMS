@@ -147,5 +147,6 @@ test('the server action and the order page both go through the helpers (one rule
   const readersOfMarker: string[] = []
   for (const file of readers) if ((await readFile(`${dir}/${file}`, 'utf8')).includes('editedInImsAt')) readersOfMarker.push(file)
   // order-amendment.ts is the third reader on purpose: its latest-edit-wins rule needs to know whether IMS ever edited the order (an unedited order has WooCommerce as its only editor).
-  assert.deepEqual(readersOfMarker.sort(), ['order-amendment.ts', 'order-import.ts', 'refund-sync.ts'])
+  // order-unpaid-rewrite.ts is the fourth, on purpose: the unpaid-order rewrite REFUSES an order edited in IMS (latest edit wins: a person decides) and never overwrites an IMS edit from WooCommerce.
+  assert.deepEqual(readersOfMarker.sort(), ['order-amendment.ts', 'order-import.ts', 'order-unpaid-rewrite.ts', 'refund-sync.ts'])
 })
