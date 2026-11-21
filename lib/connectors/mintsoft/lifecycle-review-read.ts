@@ -8,7 +8,7 @@
  * integration): the key is read from an operator file, never exchanged.
  *
  * CREDENTIALS come from a file named on the command line (never the command line itself, never the IMS database), a regular file readable by its owner
- * only (mode 600), KEY=VALUE lines; an unknown key is refused so a typo cannot silently leave one out. The file is OPENED with O_NOFOLLOW and its mode and
+ * only (mode 600), KEY=VALUE lines; an unknown key is refused so a typo cannot silently leave one out. The file is OPENED with O_NOFOLLOW and O_NONBLOCK (a FIFO cannot hang it) and its mode and
  * type are checked on the open descriptor (fstat), so a link swapped in between a check and the read cannot be followed (L8). No line of the file is ever
  * echoed, and every error is a short message without the key, a URL or a response body.
  *
@@ -59,8 +59,9 @@ export const MIN_INTERVAL_MS = 350
 export function readMintsoftReviewConfig(file: string, env: Readonly<Record<string, string | undefined>> = process.env): MintsoftReviewConfig {
   let fd: number
   try {
-    // O_NOFOLLOW: a symbolic link is never followed, so what is checked below is the file that is read (no lstat-then-open window).
-    fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW)
+    // O_NOFOLLOW: a symbolic link is never followed, so what is checked below is the file that is read (no lstat-then-open window). O_NONBLOCK (#1123 R1 L3):
+    // a FIFO named as the file would otherwise block the open until a writer appears (the command hangs); non-blocking, it opens at once and fstat refuses it.
+    fd = openSync(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === 'ELOOP') throw new MintsoftReviewRefused(`the credentials file ${file} must be a regular file, not a link or a directory`)
     throw new MintsoftReviewRefused(`the credentials file ${file} cannot be read`)

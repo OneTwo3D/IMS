@@ -208,8 +208,8 @@ test('L4: a local header that disagrees with the directory (name, method, CRC or
   assert.equal(unzip(deferred).get('a.xml')!.length, 1004, 'bit 3: the CRC and sizes are in the directory (and a data descriptor), not the local header')
 })
 
-// [mutation: an unknown entity or a bare & is kept as text; a character reference to a surrogate, NUL or U+FFFE is decoded; U+FFFD is accepted]
-test('L5: an unknown entity, a bare &, a reference to a character XML cannot carry, a lone surrogate escape and U+FFFD are refused', () => {
+// [mutation: an unknown entity or a bare & is kept as text; a character reference to a surrogate, NUL or U+FFFE is decoded]
+test('L5: an unknown entity, a bare &, a reference to a character XML cannot carry and a lone surrogate escape are refused', () => {
   const cell = (inner: string) => excelLike(`<worksheet xmlns="${W}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>${inner}</t></is></c></row></sheetData></worksheet>`, `<sst xmlns="${W}"><si><t>x</t></si></sst>`)
   assert.equal(readXlsx(cell('A&amp;B &#x41;&#66;'))[0].rows.get(1)!.get(0)!.text, 'A&B AB', 'the five entities and character references still decode')
   for (const [label, inner, why] of [
@@ -220,9 +220,19 @@ test('L5: an unknown entity, a bare &, a reference to a character XML cannot car
     ['U+FFFE reference', '&#xFFFE;', /malformed character reference/],
     ['literal control character', 'a\u0001b', /a character XML cannot carry/],
     ['lone surrogate escape', '_xD800_', /unpaired surrogate/],
-    ['U+FFFD reference', '&#xFFFD;', /U\+FFFD/],
-    ['literal U+FFFD', 'SKU�1', /U\+FFFD/],
+    ['a control character in CDATA (#1123 L7)', '<![CDATA[a\u0001b]]>', /a character XML cannot carry/],
+    ['U+FFFE in CDATA (#1123 L7)', '<![CDATA[a\ufffeb]]>', /a character XML cannot carry/],
   ] as const) assert.throws(() => readXlsx(cell(inner)), why, label)
+  assert.equal(readXlsx(cell('<![CDATA[a<&>b]]>'))[0].rows.get(1)!.get(0)!.text, 'a<&>b', 'CDATA is still read as literal text')
+})
+
+// [mutation: U+FFFD is refused in every cell the reader reads (a product name then blocks generation), or nowhere] (#1123 R1 MED-2)
+test('#1123 MED-2: the reader READS U+FFFD (the read-back refuses it only in the decision columns)', () => {
+  const cell = (inner: string) => excelLike(`<worksheet xmlns="${W}"><sheetData><row r="1"><c r="A1" t="inlineStr"><is><t>${inner}</t></is></c></row></sheetData></worksheet>`, `<sst xmlns="${W}"><si><t>x</t></si></sst>`)
+  assert.equal(readXlsx(cell('Mug \ufffd blue'))[0].rows.get(1)!.get(0)!.text, 'Mug \ufffd blue')
+  assert.equal(readXlsx(cell('&#xFFFD;'))[0].rows.get(1)!.get(0)!.text, '\ufffd')
+  const written = writeXlsx([{ name: 'A', rows: [[{ v: 'name \ufffd' }]] }])
+  assert.equal(readXlsx(written)[0].rows.get(1)!.get(0)!.text, 'name \ufffd', 'what the writer accepts, the reader reads')
 })
 
 // [mutation: a repeated row or cell replaces the earlier one (last wins), or a row or column beyond the sheet limits is read]

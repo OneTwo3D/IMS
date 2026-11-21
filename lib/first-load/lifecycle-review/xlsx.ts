@@ -19,7 +19,8 @@
  * cell that carries a formula, so the read-back can refuse a computed decision. A protected sheet (its <sheetProtection>, in any program's form, with or
  * without a password hash) reads like any other. It refuses, never guesses: an encrypted or ZIP64 archive, a compression method other than stored or
  * deflate, a part above the size cap or inflating beyond its declared size, a local header that disagrees with the directory, malformed XML, an unknown
- * entity, a character XML cannot carry (a lone surrogate, U+FFFD), a row or cell given twice or out of order, a row or column beyond the sheet limits.
+ * entity, a character XML cannot carry (a lone surrogate; in CDATA too), a row or cell given twice or out of order, a row or column beyond the sheet limits.
+ * U+FFFD (a character already lost in a conversion) is READ: the read-back refuses it in the decision columns, the only cells it trusts (#1123 R1 MED-2).
  */
 import { crc32, deflateRawSync, inflateRawSync } from 'node:zlib'
 
@@ -453,7 +454,10 @@ export function parseXml(text: string): XmlNode {
     if (text.startsWith('<![CDATA[', lt)) {
       const end = text.indexOf(']]>', lt)
       if (end < 0) throw new XlsxError('malformed XML (CDATA)')
-      stack[stack.length - 1].text += text.slice(lt + 9, end)
+      // #1123 R1 L7: CDATA carries no entity, but a character XML cannot carry is refused there as in plain text.
+      const cdata = text.slice(lt + 9, end)
+      if (XML_FORBIDDEN_CHAR.test(cdata)) throw new XlsxError('malformed XML (a character XML cannot carry)')
+      stack[stack.length - 1].text += cdata
       i = end + 3
       continue
     }
@@ -613,9 +617,10 @@ export function readXlsx(bytes: Uint8Array): ReadSheet[] {
           text = t === 'str' ? unescapeXstring(v ?? '') : (v ?? '')
         } else throw new XlsxError(`cell ${c.attrs.r ?? ''} has an unknown type ${JSON.stringify(t)}`)
         const formula = firstChild(c, 'f') !== undefined
-        // L5: a lone surrogate (from an `_xD800_` escape) or U+FFFD (a character already lost in a conversion) is refused, never read as a decision or a SKU.
+        // L5: a lone surrogate (from an `_xD800_` escape) is refused, never read as a decision or a SKU. U+FFFD (a character already lost in a conversion) is
+        // NOT refused here (#1123 R1 MED-2): a product name can carry it from WooCommerce or Qoblex, and the name is never read back. The read-back refuses it in
+        // the cells it does read (read-back.ts: the four decision columns).
         if (!text.isWellFormed()) throw new XlsxError(`cell ${columnLetter(col)}${r} holds an unpaired surrogate character`)
-        if (text.includes('\ufffd')) throw new XlsxError(`cell ${columnLetter(col)}${r} holds U+FFFD, a character lost in a conversion: save the sheet again from the original`)
         if (text !== '' || formula) cells.set(col, { text, formula })
       }
       if (cells.size > 0) rows.set(r, cells)

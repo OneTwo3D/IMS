@@ -25,7 +25,7 @@ import { notesFor, renderReviewSheet } from './sheet'
 export const LIFECYCLE_REVIEW_EXIT_CODE_TABLE: ReadonlyArray<{ code: number; name: string; meaning: string }> = [
   { code: EXIT_CODES.OK, name: 'OK', meaning: 'The sheet and its generation record were written.' },
   { code: EXIT_CODES.USAGE, name: 'USAGE', meaning: 'Bad command line or an invalid run manifest. Nothing was read, requested or written.' },
-  { code: EXIT_CODES.INPUT_UNUSABLE, name: 'INPUT_UNUSABLE', meaning: 'An input cannot be used: a manifest file or column map, the products or stock-lots dataset missing, the WooCommerce snapshot bundle not verified, or the WMS env file refused or its listing unreadable. Nothing was written.' },
+  { code: EXIT_CODES.INPUT_UNUSABLE, name: 'INPUT_UNUSABLE', meaning: 'An input cannot be used: a manifest file or column map, the products or stock-lots dataset missing, the WooCommerce snapshot bundle not verified, a review row whose SKU holds U+FFFD, or the WMS env file refused or its listing unreadable. Nothing was written.' },
   { code: EXIT_CODES.OUTPUT_FAILED, name: 'OUTPUT_FAILED', meaning: 'The output directory is unusable (it exists and is not empty, or a write failed). Files this run had created were removed again.' },
   { code: EXIT_CODES.INTERNAL, name: 'INTERNAL', meaning: 'A self-check of this command failed (the sheet just written does not read back). A defect in the tool.' },
 ]
@@ -166,6 +166,10 @@ export async function runLifecycleReviewCli(argv: string[], io: CliIo, deps: Rev
     if (error instanceof ReviewModelError) return refuse(error.message)
     throw error
   }
+  // #1123 R1 MED-2: the read-back refuses U+FFFD (a character lost in a conversion) in the decision columns, so a review row whose IMS SKU holds it could never
+  // be decided: an input error naming the SKU, before anything is written. A product NAME with U+FFFD is shown as it is (it is never read back).
+  const lostSkus = model.entries.filter((e) => e.sku.includes('\ufffd')).map((e) => JSON.stringify(e.sku.slice(0, 60)))
+  if (lostSkus.length > 0) return refuse(`the SKU(s) ${lostSkus.slice(0, 20).join(', ')}${lostSkus.length > 20 ? ` and ${lostSkus.length - 20} more` : ''} hold U+FFFD, a character lost in a conversion (in Qoblex, WooCommerce or an export): fix the SKU at its source, or rename it with sku-renames, and generate the sheet again`)
   const wmsDigest = wms === null ? null : sha256(canonicalJson({ products: [...wms.products].sort((a, b) => (a.sku < b.sku ? -1 : a.sku > b.sku ? 1 : 0)), physical: [...wms.physical.entries()].sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0)), warehouses: wms.warehouses }))
   const generation = buildGeneration({
     inputs: {
