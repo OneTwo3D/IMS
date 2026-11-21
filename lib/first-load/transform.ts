@@ -615,8 +615,8 @@ function applyLifecycleFromWoo(run: Run): void {
       if (mapped === undefined) { unusable.push(`${entry.sku}: ${entry.lifecycle}${status === '' ? ', no WooCommerce status' : `, unmapped WooCommerce status ${JSON.stringify(status)}`}`); continue }
       takeLifecycleFromWoo(run, entry, entry.type, status, mapped)
     }
+    // No row states a status at all: the column is simply not in the file (woo-products need not carry it), so nothing is listed.
     if (unusable.length > 0 && columnUsed) run.find('WARNING', 'LIFECYCLE_WOO_STATUS_UNUSABLE', `${unusable.length} product(s) are in woo-products but their row carries no usable status (blank or not publish/draft/pending/private), so their lifecycle stays the Qoblex one and cannot be checked against WooCommerce: add the status, or check each by hand`, 'woo-products', unusable)
-    else if (unusable.length > 0) run.find('INFO', 'LIFECYCLE_WOO_STATUS_ABSENT', `woo-products carries no status column (or it is blank on every row): the lifecycle of ${unusable.length} product(s) stays the Qoblex one`, 'woo-products')
   }
   const changed = run.lifecycleFromWoo
   for (const c of [...changed].sort((a, b) => cmp(a.key, b.key))) {

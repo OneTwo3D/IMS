@@ -115,10 +115,11 @@ test('woo gospel: a product with no visible Woo status keeps the Qoblex lifecycl
       assert.equal(findingCodes(r).includes('LIFECYCLE_TAKEN_FROM_WOO'), false)
     }
   }
-  // no row states a status at all: the column is absent, one INFO, no warning
+  // no row states a status at all: the column is absent, nothing is reported
   const noColumn = simple('ACTIVE', '')
   assert.equal(lifecycleOf(noColumn, 'S-1'), 'ACTIVE')
-  assert.ok(findingCodes(noColumn, 'INFO').includes('LIFECYCLE_WOO_STATUS_ABSENT'))
+  assert.equal(findingCodes(noColumn, 'INFO').length, findingCodes(simple('ACTIVE', '', {}), 'INFO').length)
+  assert.equal(findingCodes(noColumn).includes('LIFECYCLE_WOO_STATUS_ABSENT'), false)
   assert.equal(findingCodes(noColumn, 'WARNING').includes('LIFECYCLE_WOO_STATUS_UNUSABLE'), false)
 })
 
