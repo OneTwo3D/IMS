@@ -13,7 +13,7 @@ import { fakeStore, noSleep } from './woo-fixtures.ts'
  * R14 over doubles of the four systems. Mutations are listed in the PR.
  */
 
-const imsProduct = (sku: string, type = 'SIMPLE'): ProductRow => ({ id: `p-${sku}`, sku, type, active: true, lifecycleStatus: 'ACTIVE' })
+const imsProduct = (sku: string, type = 'SIMPLE'): ProductRow => ({ id: `p-${sku}`, sku, type, active: true, lifecycleStatus: 'ACTIVE', parentId: null })
 const wooProduct = (id: number, sku: string) => ({ id, sku, status: 'publish', type: 'simple' })
 const qobProduct = (sku: string, type = 'SIMPLE') => ({ sku, type })
 
@@ -163,6 +163,20 @@ test('R14 sets aside, listed and never a finding, the storefront side of a varia
   assert.equal(qobOnly.outcome, 'pass')
 })
 
+// [mutation: only type VARIANT set aside, so a KIT/BOM variation (a product with a parentId) fails R14 as missing from the storefront walk]
+test('R14 sets aside the storefront side of a KIT or BOM variation (any IMS product with a parent), and still requires it elsewhere', async () => {
+  const child = (sku: string, type: string): ProductRow => ({ ...imsProduct(sku, type), parentId: 'p-A' })
+  const rig: Rig = { ims: [imsProduct('A'), child('K-1', 'KIT'), child('B-1', 'BOM')], qoblex: [qobProduct('A'), qobProduct('K-1', 'KIT'), qobProduct('B-1', 'BOM')], mintsoft: ['A', 'K-1', 'B-1'], woo: [[1, 'A']] }
+  const item = await runCoverageItem(ctx(rig))
+  assert.equal(item.outcome, 'pass', JSON.stringify([item.reasons, keys(item, 'onlyIms')]))
+  assert.deepEqual(keys(item, 'outOfPopulation'), ['B-1|woocommerce', 'K-1|woocommerce'])
+  const missing = await runCoverageItem(ctx({ ...rig, mintsoft: ['A', 'B-1'] }))
+  assert.deepEqual(keys(missing, 'onlyIms'), ['K-1|mintsoft'])
+  // a top-level KIT (no parent) is still expected in the storefront walk
+  const topLevel = await runCoverageItem(ctx({ ...rig, ims: [imsProduct('A'), imsProduct('K-1', 'KIT'), child('B-1', 'BOM')] }))
+  assert.deepEqual(keys(topLevel, 'onlyIms'), ['K-1|woocommerce'])
+})
+
 test('R14 refuses a repeated SKU inside one system, a SKU that is not plain, and every unreadable leg, as inconclusive', async () => {
   const dupWoo = await runCoverageItem(ctx({ woo: [[1, 'A'], [2, 'A'], [3, 'B']] }))
   assert.deepEqual([dupWoo.outcome, dupWoo.reasons], ['inconclusive', ['DUPLICATE_KEY']])
@@ -217,4 +231,16 @@ test('R14 needs the export to agree with itself: a stocked SKU missing from the 
   // no stock part to cross-check the list against
   const noStock = await runCoverageItem(ctx({ ims: ['A'], woo: [[1, 'A']], qoblex: [qobProduct('A')], mintsoft: ['A'], stock: 'fail' }))
   assert.deepEqual([noStock.outcome, noStock.reasons], ['inconclusive', ['SOURCE_UNREADABLE']])
+})
+
+// [mutation: the rows the Qoblex read skipped, dropped or renamed are not handed to the item]
+test('R14 lists, REPORTED NOT JUDGED, the ghost rows, the skipped-row counts and the renames of the Qoblex read', async () => {
+  const evidence = {
+    stock: { rowsSkipped: { kit: 2 }, ghostRows: [], blankAsZero: [] },
+    products: { rowsSkipped: { Deleted: 3, 'ghost row dropped': 1 }, ghostRows: [{ sku: 'G-1', quantity: '0' }], blankAsZero: [] },
+    skuRenames: [{ from: 'OLD-1', to: 'B', cells: 2 }, { from: 'TYPO-1', to: 'ZZ', cells: 0 }],
+  }
+  const item = await runCoverageItem(ctx({}, { qoblex: sourceOf({ products: [qobProduct('A'), qobProduct('B')], stock: [], evidence }) }))
+  assert.equal(item.outcome, 'pass', JSON.stringify(item.reasons))
+  assert.deepEqual(keys(item, 'outOfPopulation'), ['G-1|qoblex-ghost-row', 'OLD-1|qoblex-sku-renamed|B', 'TYPO-1|qoblex-sku-rename-unused', 'qoblex-rows-skipped|products|deleted|3', 'qoblex-rows-skipped|products|ghost-row-dropped|1', 'qoblex-rows-skipped|stock|kit|2'].sort())
 })

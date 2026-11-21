@@ -35,7 +35,7 @@ function ims(fixture: Fixture = {}) {
       values: snaps.map((s): SnapshotValueRow => ({ productId: pid(s.sku), warehouseId: wid(s.code), qty: s.qty, valueBase: s.value ?? '0', valueReplayReliable: s.reliable !== false })),
       balances: [],
     },
-    products: skus.map((sku) => ({ id: pid(sku), sku, type: 'SIMPLE', active: true, lifecycleStatus: 'ACTIVE' })),
+    products: skus.map((sku) => ({ id: pid(sku), sku, type: 'SIMPLE', active: true, lifecycleStatus: 'ACTIVE', parentId: null })),
     warehouses: (fixture.warehouses ?? ['MIL1', 'CAMBRIDGE', 'RXT2']).map((code) => ({ id: wid(code), code, active: !(fixture.inactive ?? []).includes(code) })),
     wmsBindings: (fixture.bindings ?? ['RXT2']).map((code) => ({ connector: 'x', warehouseId: wid(code), warehouseCode: code, externalWarehouseId: '1', active: true, stockSyncMode: 'NOTIFICATION_ONLY', alignmentConfirmed: false })),
   }
@@ -318,4 +318,19 @@ test('R5 rounds each Qoblex product half-up to the snapshot\'s six decimals befo
 test('R5 no run: a throwing IMS port is INTERNAL_ERROR and nothing escapes', async () => {
   const item = await runQoblexItem('R5', { asOf: ASOF, ims: async () => { throw new Error('boom') }, qoblex: sourceOf({ stock: [lot('SKU-1', 'MIL1', '1', '1')] }) })
   assert.deepEqual([item.outcome, item.reasons], ['inconclusive', ['INTERNAL_ERROR']])
+})
+
+// ---- evidence of what the read changed ------------------------------------------------------------
+
+// [mutation: the pack drops the ingest's notes again (the evidence never reaches the item)]
+test('R2 lists, REPORTED NOT JUDGED, every SKU read as 0 on hand (blank total) and every ghost row dropped, from the read evidence', async () => {
+  const evidence = { stock: { rowsSkipped: { 'ghost row dropped': 2 }, ghostRows: [{ sku: 'SKU-9', quantity: '0' }, { sku: 'SKU-9', quantity: '' }], blankAsZero: ['SKU-7', 'SKU-8'] }, products: { rowsSkipped: {}, ghostRows: [], blankAsZero: [] }, skuRenames: [] }
+  const port = ims({ snaps: [{ sku: 'SKU-1', code: 'MIL1', qty: '10' }] })
+  const item = await runQoblexItem('R2', { asOf: ASOF, ims: port.port, qoblex: sourceOf({ stock: [lot('SKU-1', 'MIL1', '10')], evidence }) })
+  assert.equal(item.outcome, 'pass', JSON.stringify(item.reasons))
+  assert.deepEqual(keys(item, 'outOfPopulation'), ['SKU-7|qoblex-blank-as-zero', 'SKU-8|qoblex-blank-as-zero', 'SKU-9|qoblex-ghost-row'])
+  assert.deepEqual((item.entries?.outOfPopulation ?? []).map((e) => e.vendor), ['0', '0', '0'])
+  // no evidence, nothing listed
+  const none = await runQoblexItem('R2', { asOf: ASOF, ims: ims({ snaps: [{ sku: 'SKU-1', code: 'MIL1', qty: '10' }] }).port, qoblex: sourceOf({ stock: [lot('SKU-1', 'MIL1', '10')] }) })
+  assert.deepEqual(keys(none, 'outOfPopulation'), [])
 })
