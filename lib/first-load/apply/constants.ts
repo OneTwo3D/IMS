@@ -202,7 +202,7 @@ export const WAREHOUSE_PROFILE_KEYS = ['type', 'availableForSale', 'syncToStore'
 export const APPLY_MANIFEST_KEYS = [
   'formatVersion', 'runId', 'preparedDir', 'baseCurrency', 'steps', 'expectWarehouses', 'acceptZeroCost', 'forbidSkus', 'restorePointDir', 'wooSnapshot', 'stockExtractedAt',
 ] as const
-export const APPLY_WOO_SNAPSHOT_KEYS = ['snapshot', 'provenance', 'variantParents', 'origin', 'visibilityChecked'] as const
+export const APPLY_WOO_SNAPSHOT_KEYS = ['snapshot', 'provenance', 'variantParents', 'productStatus', 'origin', 'visibilityChecked'] as const
 
 // ---------------------------------------------------------------------------
 // Which apply-time checks the runner core covers (every id of APPLY_TIME_CHECKS has exactly one entry)

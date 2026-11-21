@@ -41,7 +41,7 @@ import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
 import { isPurchasableProductStatus } from '@/lib/products/lifecycle'
 import { joinVariantParents, type CatalogueView } from './variant-parents'
 import { planSkuRenames, type SkuRenameItem } from './sku-renames'
-import { boundProblems, type VariantParentsBinding } from './snapshot'
+import { boundProblems, type ProductStatusBinding, type VariantParentsBinding } from './snapshot'
 import {
   accountRows,
   assertWithinImporterLimits,
@@ -102,6 +102,11 @@ export interface PrepareInput {
    * VARIANT_PARENTS_NOT_BOUND), no parent is assigned from it, and no parent is emitted.
    */
   variantParentsBinding?: VariantParentsBinding
+  /**
+   * The same proof for the woo-product-status dataset, which gives the Woo-gospel lifecycle of a simple, KIT or BOM product. Supplied and not proved, the dataset is
+   * refused (ERROR PRODUCT_STATUS_NOT_BOUND): a lifecycle is never taken from a file that was not verified against the snapshot.
+   */
+  productStatusBinding?: ProductStatusBinding
 }
 
 export type Severity = 'ERROR' | 'WARNING' | 'INFO'
@@ -212,6 +217,8 @@ export interface PrepareReport {
   recipes: { cycles: string[][] }
   /** The join of Qoblex variants to WooCommerce variation parents (dataset `variant-parents`); `supplied` is false when it was not given. */
   variantParents: { supplied: boolean; rowsRead: number; variantsJoined: number; parentsEmitted: number; parentsWithoutQoblexVariant: number }
+  /** The WooCommerce own-status dataset (`woo-product-status`): rows read and how many products it set the lifecycle of. */
+  wooProductStatus: { supplied: boolean; bound: boolean; rowsRead: number; productsMatched: number }
   purchaseOrders: { orders: number; ordersNothingOutstanding: number; linesEmitted: number }
   transfers: { transfers: number; linesEmitted: number }
   /** Every warehouse code the import files use. The importers refuse a code that does not exist in IMS; the tool cannot check that. */
@@ -385,6 +392,7 @@ class Run {
   /** True when the variant-parents dataset was supplied but refused because it is not bound to a verified snapshot. */
   variantParentsRefused = false
   variantParentSummary = { supplied: false, rowsRead: 0, variantsJoined: 0, parentsEmitted: 0, parentsWithoutQoblexVariant: 0 }
+  productStatusSummary = { supplied: false, bound: false, rowsRead: 0, productsMatched: 0 }
 
   constructor(public input: PrepareInput) {}
 
@@ -594,38 +602,105 @@ function takeLifecycleFromWoo(run: Run, entry: CatEntry, kind: string, wooStatus
 const wooLifecycleOf = (status: string): 'ACTIVE' | 'DRAFT' | undefined => (Object.prototype.hasOwnProperty.call(VARIANT_PARENT_STATUS_LIFECYCLE, status) ? VARIANT_PARENT_STATUS_LIFECYCLE[status] : undefined)
 
 /**
+ * The WooCommerce own status per SKU key from ONE dataset, or the SKUs whose rows disagree. A SKU repeated with the same status is the same fact twice; a SKU repeated with two
+ * different statuses cannot be decided (the old behaviour, last row wins, would silently pick one), so it is reported and no status is taken for it. A blank status is no statement.
+ */
+function statusBySku(run: Run, dataset: DatasetName): { status: Map<string, string>; conflicts: Array<{ key: string; text: string }> } {
+  const seen = new Map<string, { sku: string; statuses: Set<string> }>()
+  for (const row of run.rows(dataset)) {
+    const sku = parseSku(row.values.sku)
+    if (!sku.ok) continue
+    const entry = seen.get(sku.key) ?? { sku: sku.sku, statuses: new Set<string>() }
+    entry.statuses.add((row.values.status ?? '').trim().toLowerCase())
+    seen.set(sku.key, entry)
+  }
+  const status = new Map<string, string>()
+  const conflicts: Array<{ key: string; text: string }> = []
+  for (const [key, { sku, statuses }] of [...seen.entries()].sort((a, b) => cmp(a[0], b[0]))) {
+    const stated = [...statuses].filter((st) => st !== '').sort(cmp)
+    if (stated.length > 1) conflicts.push({ key, text: `${sku}: ${stated.join(' / ')}` })
+    else status.set(key, stated[0] ?? '')
+  }
+  return { status, conflicts }
+}
+
+/** The woo-product-status dataset: refused unless bound to the verified snapshot; every row reported either way. Returns the per-SKU status (empty when refused). */
+function loadProductStatus(run: Run): ReturnType<typeof statusBySku> {
+  const none: ReturnType<typeof statusBySku> = { status: new Map<string, string>(), conflicts: [] }
+  if (!run.has('woo-product-status')) return none
+  const dataset = run.input.datasets['woo-product-status']!
+  const rows = run.rows('woo-product-status')
+  const binding = run.input.productStatusBinding
+  const problems: string[] = []
+  if (binding === undefined) problems.push('no proof was given that this dataset comes from a verified WooCommerce snapshot (the run manifest must name wooSnapshot)')
+  else if (!binding.verified) problems.push(...binding.problems)
+  else if (dataset.parts.length !== 1 || dataset.parts[0].sha256 !== binding.csvSha256) problems.push('the woo-product-status bytes read are not the bytes that were verified against the snapshot')
+  run.productStatusSummary = { supplied: true, bound: false, rowsRead: rows.length, productsMatched: 0 }
+  if (problems.length > 0) {
+    for (const row of rows) run.add('woo-product-status', row.line, row.values.sku, 'EXCLUDED', 'NOT_BOUND_TO_SNAPSHOT', 'the dataset is not bound to a verified WooCommerce snapshot, so no lifecycle is taken from it')
+    run.find('ERROR', 'PRODUCT_STATUS_NOT_BOUND', `the woo-product-status dataset was REFUSED: it is not bound to a verified WooCommerce snapshot, so no lifecycle was taken from it. Problems: ${boundProblems(problems).join('; ')}. Re-run first-load:woo-snapshot (or --verify it) and name its snapshot, provenance and the expected store origin in the manifest as wooSnapshot.`, 'woo-product-status')
+    return none
+  }
+  run.productStatusSummary.bound = true
+  if (!run.has('products')) {
+    for (const row of rows) run.add('woo-product-status', row.line, row.values.sku, 'EXCLUDED', 'NO_CATALOGUE', 'the Qoblex products dataset was not supplied, so there is no product to take a lifecycle for')
+    run.find('ERROR', 'PRODUCT_STATUS_NEEDS_CATALOGUE', 'the woo-product-status dataset was supplied but the Qoblex products dataset was not: no lifecycle can be taken', 'woo-product-status')
+    return none
+  }
+  for (const row of rows) {
+    const sku = parseSku(row.values.sku)
+    if (!sku.ok) run.add('woo-product-status', row.line, row.values.sku, 'REJECTED', 'BAD_SKU', sku.reason)
+    else run.add('woo-product-status', row.line, sku.sku, 'EMITTED', 'WOO_STATUS_ROW', 'the WooCommerce own status of this product, from the verified snapshot')
+  }
+  return statusBySku(run, 'woo-product-status')
+}
+
+/**
  * Right after the catalogue is read (so the transfer, stock and purchase-order checks all see the final lifecycle): a simple, KIT or BOM product (not a variation) takes its lifecycle from
- * woo-products `status` when that column carries one. Variations and VARIABLE parents were handled by the variant-parents join. A product with no usable Woo status keeps the Qoblex lifecycle.
+ * its OWN WooCommerce status: the woo-product-status dataset (read by the snapshot, bound to it) and, when a status column is supplied, woo-products (a hand-made export; the bound
+ * snapshot wins where both name a SKU). Variations and VARIABLE parents were handled by the variant-parents join. A product that WooCommerce does not hold (in neither dataset) keeps the
+ * Qoblex lifecycle and is listed as LIFECYCLE_NOT_FROM_WOO. A SKU whose rows disagree on the status inside one dataset is refused (LIFECYCLE_WOO_STATUS_CONFLICT, blocking) and takes none.
  * Then every change is reported: one INFO per SKU (LIFECYCLE_TAKEN_FROM_WOO) and a count. A mismatch is never a blocker or a warning.
  */
 function applyLifecycleFromWoo(run: Run): void {
-  if (run.has('woo-products') && run.has('products')) {
-    const wooStatus = new Map<string, string>()
-    for (const row of run.rows('woo-products')) {
-      const sku = parseSku(row.values.sku)
-      if (sku.ok) wooStatus.set(sku.key, (row.values.status ?? '').trim().toLowerCase())
-    }
-    const columnUsed = [...wooStatus.values()].some((status) => status !== '')
+  const fromSnapshot = loadProductStatus(run)
+  const fromExport = run.has('woo-products') ? statusBySku(run, 'woo-products') : { status: new Map<string, string>(), conflicts: [] }
+  const conflicts = [...fromSnapshot.conflicts.map((c) => ({ key: c.key, text: `${c.text} (woo-product-status)` })), ...fromExport.conflicts.map((c) => ({ key: c.key, text: `${c.text} (woo-products)` }))]
+  if (conflicts.length > 0) run.find('ERROR', 'LIFECYCLE_WOO_STATUS_CONFLICT', `${conflicts.length} SKU(s) appear more than once with different WooCommerce statuses, so their lifecycle cannot be decided and none is taken from WooCommerce for them (fix the source rows): ${conflicts.slice(0, 20).map((c) => c.text).join('; ')}${conflicts.length > 20 ? `; ... and ${conflicts.length - 20} more` : ''}`, undefined, conflicts.map((c) => c.text.split(':')[0]))
+  const conflicted = new Set<string>(conflicts.map((c) => c.key))
+  const wooStatus = new Map<string, string>()
+  const stated = (map: Map<string, string>) => [...map.values()].some((status) => status !== '')
+  // A woo-products export with no status in any row has no status column: it states nothing (and is not listed as unusable).
+  for (const [key, status] of fromExport.status) if (status !== '' || stated(fromExport.status)) wooStatus.set(key, status)
+  // The bound snapshot is authoritative over a hand-made export.
+  for (const [key, status] of fromSnapshot.status) wooStatus.set(key, status)
+  if (run.has('products')) {
     const unusable: string[] = []
+    const absent: string[] = []
+    let matched = 0
     for (const entry of run.cat.values()) {
       if (entry.type === 'VARIABLE' || entry.type === 'VARIANT' || entry.parentSku !== '') continue
+      if (conflicted.has(entry.key)) continue
       const status = wooStatus.get(entry.key)
-      if (status === undefined) continue
+      if (status === undefined) {
+        if (entry.type === 'SIMPLE' || entry.type === 'KIT' || entry.type === 'BOM') absent.push(entry.sku)
+        continue
+      }
+      if (fromSnapshot.status.has(entry.key)) matched++
       const mapped = wooLifecycleOf(status)
       if (mapped === undefined) { unusable.push(`${entry.sku}: ${entry.lifecycle}${status === '' ? ', no WooCommerce status' : `, unmapped WooCommerce status ${JSON.stringify(status)}`}`); continue }
       takeLifecycleFromWoo(run, entry, entry.type, status, mapped)
     }
+    run.productStatusSummary.productsMatched = matched
     // No row states a status at all: the column is simply not in the file (woo-products need not carry it), so nothing is listed.
-    if (unusable.length > 0 && columnUsed) run.find('WARNING', 'LIFECYCLE_WOO_STATUS_UNUSABLE', `${unusable.length} product(s) are in woo-products but their row carries no usable status (blank or not publish/draft/pending/private), so their lifecycle stays the Qoblex one and cannot be checked against WooCommerce: add the status, or check each by hand`, 'woo-products', unusable)
-  }
-  // The real load has no woo-products file (the snapshot lists variable products only): a simple, KIT or BOM product then keeps its Qoblex lifecycle, which a later IMS to WooCommerce push
-  // may turn into a different WooCommerce status (DRAFT writes draft; ACTIVE and EOL write publish). Say so, with the count, rather than staying silent.
-  if (run.has('products')) {
-    const woo = run.has('woo-products') ? run.rows('woo-products') : []
-    const statusSupplied = woo.some((row) => (row.values.status ?? '').trim() !== '')
-    if (!statusSupplied) {
-      const fromQoblex = [...run.cat.values()].filter((entry) => (entry.type === 'SIMPLE' || entry.type === 'KIT' || entry.type === 'BOM') && entry.parentSku === '')
-      if (fromQoblex.length > 0) run.find('WARNING', 'LIFECYCLE_NOT_FROM_WOO', `${fromQoblex.length} simple, KIT or BOM product(s) keep the lifecycle derived from the Qoblex State, because no woo-products status was supplied (only variations and VARIABLE parents are read from the WooCommerce snapshot): a later IMS to WooCommerce push may change their WooCommerce status (DRAFT writes draft; ACTIVE and EOL write publish; private and pending are unpublished and are also written back as draft). Supply woo-products with a status column to take their lifecycle from WooCommerce`, 'products')
+    if (unusable.length > 0 && (stated(fromExport.status) || stated(fromSnapshot.status))) run.find('WARNING', 'LIFECYCLE_WOO_STATUS_UNUSABLE', `${unusable.length} product(s) are in woo-products or woo-product-status but their row carries no usable status (blank or not publish/draft/pending/private), so their lifecycle stays the Qoblex one and cannot be checked against WooCommerce: add the status, or check each by hand`, 'woo-products', unusable)
+    // A simple, KIT or BOM product that WooCommerce does not hold keeps its Qoblex lifecycle, which a later IMS to WooCommerce push may turn into a WooCommerce status (DRAFT writes draft; ACTIVE and EOL write publish).
+    // With the snapshot's woo-product-status that is only a product genuinely absent from WooCommerce; without any status source it is every one of them.
+    if (absent.length > 0) {
+      const sourceNote = run.productStatusSummary.bound || stated(fromExport.status)
+        ? 'WooCommerce has no product with that SKU (it is absent from the woo-product-status snapshot and from woo-products)'
+        : 'no WooCommerce status was supplied (supply woo-product-status from the WooCommerce snapshot: first-load:woo-snapshot writes it)'
+      run.find('WARNING', 'LIFECYCLE_NOT_FROM_WOO', `${absent.length} simple, KIT or BOM product(s) keep the lifecycle derived from the Qoblex State: ${sourceNote}. A later IMS to WooCommerce push may create or change their WooCommerce status (DRAFT writes draft; ACTIVE and EOL write publish; private and pending are unpublished and are also written back as draft)`, 'products', absent)
     }
   }
   const changed = run.lifecycleFromWoo
@@ -2407,6 +2482,7 @@ export function prepare(input: PrepareInput): PrepareResult {
     },
     recipes: { cycles: run.recipeCycles },
     variantParents: run.variantParentSummary,
+    wooProductStatus: run.productStatusSummary,
     purchaseOrders: { orders: run.poOutputs.length, ordersNothingOutstanding: run.poOrdersNothingOutstanding, linesEmitted: emittedByTarget['purchase-orders'] },
     transfers: { transfers: run.transferOutputs.length, linesEmitted: emittedByTarget.transfers },
     warehouseCodesUsed: [...run.warehouses].sort(cmp),

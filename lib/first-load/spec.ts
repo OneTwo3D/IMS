@@ -223,6 +223,7 @@ export const DATASET_NAMES = [
   'wms-stock',
   'woo-products',
   'variant-parents',
+  'woo-product-status',
   'sku-exclusions',
   'non-stock-skus',
   'sku-name-overrides',
@@ -322,6 +323,15 @@ export const DATASETS: Record<DatasetName, DatasetSpec> = {
     purpose:
       'One row per WooCommerce variation: the variation SKU and the VARIABLE parent it belongs to. Written by the read-only WooCommerce snapshot command '
       + '(first-load:woo-snapshot). Qoblex variants are joined to it by EXACT variation SKU; each parent reached is emitted once as a VARIABLE product.',
+  },
+  'woo-product-status': {
+    columns: ['sku', 'wooProductId', 'type', 'status', 'stockQuantity', 'name'],
+    required: ['sku', 'status'],
+    sources: ['woocommerce'],
+    purpose:
+      'One row per WooCommerce product with a SKU, ANY type (simple, variable, grouped, external, ...), with its OWN status, Woo stock quantity and title. Written by the read-only WooCommerce snapshot command '
+      + '(first-load:woo-snapshot) and bound to the verified snapshot like variant-parents. The lifecycle of a Qoblex simple, KIT or BOM product is taken from its status (WooCommerce is gospel); '
+      + 'the stock quantity is carried for the owner lifecycle review and is not loaded.',
   },
   'sku-exclusions': {
     columns: ['sku', 'reason'],
@@ -444,13 +454,13 @@ export const SNAPSHOT_EXIT_CODES = {
 export type SnapshotExitCodeName = keyof typeof SNAPSHOT_EXIT_CODES
 
 export const SNAPSHOT_EXIT_CODE_TABLE: ReadonlyArray<{ code: number; name: SnapshotExitCodeName; meaning: string }> = [
-  { code: SNAPSHOT_EXIT_CODES.OK, name: 'OK', meaning: 'The snapshot is complete: every count matches the store\'s own totals. The snapshot, provenance and variant-parents files were written.' },
+  { code: SNAPSHOT_EXIT_CODES.OK, name: 'OK', meaning: 'The snapshot is complete: every count matches the store\'s own totals. The snapshot, provenance, variant-parents and woo-product-status files were written.' },
   {
     code: SNAPSHOT_EXIT_CODES.INCONSISTENT,
     name: 'INCONSISTENT',
     meaning:
-      'The store answered, but what it returned cannot be trusted as a complete, consistent catalogue (a count does not match its total header, a parent is not variable or has no SKU, a variation SKU repeats, '
-      + 'the store changed during the walk, a status the key cannot enumerate) or --verify found a damaged snapshot or derived files (provenance, variant-parents.csv, inspection copy) that do not match it, or recorded from a store other than the declared --expect-origin. No final file was written.',
+      'The store answered, but what it returned cannot be trusted as a complete, consistent catalogue (a count does not match its total header, a variable parent has no SKU, a product or variation SKU repeats, '
+      + 'the store changed during the walk, a status the key cannot enumerate) or --verify found a damaged snapshot or derived files (provenance, variant-parents.csv, woo-product-status.csv, inspection copy) that do not match it, or recorded from a store other than the declared --expect-origin. No final file was written.',
   },
   { code: SNAPSHOT_EXIT_CODES.USAGE, name: 'USAGE', meaning: 'Bad command line. Nothing was read, requested or written.' },
   {
@@ -474,6 +484,7 @@ export const SNAPSHOT_FILE_NAMES = {
   provenance: 'woo-snapshot.provenance.json',
   variantParents: 'variant-parents.csv',
   variantParentsInspection: 'variant-parents.inspect.csv',
+  productStatus: 'woo-product-status.csv',
   partial: 'woo-snapshot.partial.json',
 } as const
 

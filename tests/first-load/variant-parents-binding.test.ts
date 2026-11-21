@@ -48,7 +48,7 @@ function catalogue(variant: 'a' | 'b'): FakeParent[] {
 /** The origin the operator declares for each bundle written below (the fake store it was really read from). */
 const declaredOrigin = new Map<string, string>()
 /** What the shop's admin shows for the bundle's catalogue (2 variable products, 3 variations, all published). */
-const ATTESTED = { products: { publish: 2, draft: 0, private: 0, pending: 0 }, variations: { publish: 3, draft: 0, private: 0, pending: 0 } }
+const ATTESTED = { allProducts: { publish: 2, draft: 0, private: 0, pending: 0 }, products: { publish: 2, draft: 0, private: 0, pending: 0 }, variations: { publish: 3, draft: 0, private: 0, pending: 0 } }
 
 async function bundle(variant: 'a' | 'b' = 'a'): Promise<string> {
   const server = await startFakeCatalogue({ key: KEY, secret: SECRET, parents: catalogue(variant) })

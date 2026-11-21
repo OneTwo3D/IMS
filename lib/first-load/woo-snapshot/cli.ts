@@ -2,9 +2,9 @@
  * The first-load WooCommerce snapshot command line, as a function so tests can drive it without a subprocess.
  * scripts/first-load-woo-snapshot.ts is a thin wrapper around `runSnapshotCli`.
  *
- * READ-ONLY, END TO END. It reads a WooCommerce store's variable products and their variations through the connector's read function and writes
- * three files into a new directory: the checksummed snapshot, a provenance file (store origin, time, request and page counts), and the canonical
- * `variant-parents.csv` that `first-load:prepare` joins Qoblex variants to. It writes nothing to the store, to the IMS database or to any setting.
+ * READ-ONLY, END TO END. It reads a WooCommerce store's products (every type and status, with stock) and the variations of its variable products through the
+ * connector's read function and writes files into a new directory: the checksummed snapshot, a provenance file (store origin, time, request and page counts), the
+ * canonical `variant-parents.csv` that `first-load:prepare` joins Qoblex variants to, and the canonical `woo-product-status.csv` it takes the lifecycle of a simple, KIT or BOM product from. It writes nothing to the store, to the IMS database or to any setting.
  *
  * CREDENTIALS come from a file given by path (never from the command line, never from the IMS database): a READ-ONLY WooCommerce REST key, in a file
  * only its owner can read. Putting a store key into the target IMS would make its stock-sync paths live, which a first load must not do.
@@ -15,7 +15,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import path from 'node:path'
 import { SNAPSHOT_EXIT_CODES, SNAPSHOT_EXIT_CODE_TABLE, SNAPSHOT_FILE_NAMES } from '../spec'
-import { SNAPSHOT_FORMAT_VERSION, formulaLeadingCells, parseSnapshotFile, parseVisibilityAttestation, renderSnapshotFile, renderVariantParentsCsv, renderVariantParentsInspectionCsv, sha256Hex, verifyWooSnapshotBundle, type VisibilityAttestation } from '../snapshot'
+import { SNAPSHOT_FORMAT_VERSION, formulaLeadingCells, parseSnapshotFile, parseVisibilityAttestation, productStatusFormulaLeadingCells, renderProductStatusCsv, renderSnapshotFile, renderVariantParentsCsv, renderVariantParentsInspectionCsv, sha256Hex, verifyWooSnapshotBundle, type VisibilityAttestation } from '../snapshot'
 import { WALK_MAX_ATTEMPTS, SnapshotFetchError, SnapshotInconsistentError, freshState, walkStore, type PageResult, type WalkState } from './walk'
 
 export interface CliIo {
@@ -47,7 +47,7 @@ export function usageText(): string {
     'Usage: first-load-woo-snapshot --env-file <credentials> --out <dir> (--allow-origin <origin> ... | --allow-any-origin) [--resume] [--min-interval-ms <n>]',
     '       first-load-woo-snapshot --verify <woo-snapshot.json> --expect-origin <origin> --expect-visibility <counts.json>',
     '',
-    'Reads a WooCommerce store\'s variable products and their variations (GET requests only) and writes the snapshot, its provenance and variant-parents.csv.',
+    'Reads a WooCommerce store\'s products (every type and status, with stock) and the variations of its variable products (GET requests only) and writes the snapshot, its provenance, variant-parents.csv and woo-product-status.csv.',
     '',
     `  --env-file <file>      credentials: ${ENV_KEYS.url}, ${ENV_KEYS.key}, ${ENV_KEYS.secret} (a READ-ONLY REST key), optionally ${ENV_KEYS.allowedOrigins}.`,
     '                         The file must be readable by its owner only (mode 600). Credentials are never accepted on the command line.',
@@ -57,9 +57,9 @@ export function usageText(): string {
     '  --resume               continue an unfinished walk kept in --out (same store only)',
     `  --min-interval-ms <n>  minimum milliseconds between two requests (default ${DEFAULT_MIN_INTERVAL_MS})`,
     `  --max-resume-age-minutes <n>  an unfinished walk older than this is not resumed (default ${DEFAULT_MAX_RESUME_AGE_MINUTES})`,
-    '  --verify <file>        offline: recompute the checksum of a snapshot, re-run its consistency rules, and require the provenance, variant-parents.csv and the inspection copy beside it to match (the CSV must equal the rows regenerated from the snapshot); no request, no credentials',
+    '  --verify <file>        offline: recompute the checksum of a snapshot, re-run its consistency rules, and require the provenance, variant-parents.csv, woo-product-status.csv and the inspection copy beside it to match (each CSV must equal the rows regenerated from the snapshot); no request, no credentials',
     '  --expect-origin <o>    with --verify (required there): the WooCommerce origin YOU declare the snapshot must come from; the provenance\'s recorded origin must equal it. It is an expectation you state, checked against the recorded origin, not proof of provenance',
-    '  --expect-visibility <f>  with --verify (required there): a JSON file {"products": {"publish": n, "draft": n, "private": n, "pending": n}, "variations": {...}} holding the counts the shop\'s OWN ADMIN shows; the per-status counts the walk recorded must equal them',
+    '  --expect-visibility <f>  with --verify (required there): a JSON file {"allProducts": {"publish": n, "draft": n, "private": n, "pending": n}, "products": {...}, "variations": {...}} holding the counts the shop\'s OWN ADMIN shows (allProducts: every product of every type; products: variable products only; variations: the variations of those); the per-status counts the walk recorded must equal them',
     '  --help                 this text',
     '',
     'Exit codes:',
@@ -215,6 +215,7 @@ function runVerify(file: string, expectOrigin: string | null, attestation: Visib
     snapshotBytes: readBytesOrNull(file),
     provenanceBytes: readBytesOrNull(path.join(dir, SNAPSHOT_FILE_NAMES.provenance)),
     csvBytes: readBytesOrNull(path.join(dir, SNAPSHOT_FILE_NAMES.variantParents)),
+    productStatusBytes: readBytesOrNull(path.join(dir, SNAPSHOT_FILE_NAMES.productStatus)),
     inspectionBytes: readBytesOrNull(path.join(dir, SNAPSHOT_FILE_NAMES.variantParentsInspection)),
     requireInspection: true,
     expectedOrigin: expectOrigin,
@@ -224,7 +225,7 @@ function runVerify(file: string, expectOrigin: string | null, attestation: Visib
     io.stderr(`first-load-woo-snapshot: the snapshot ${file} and the files derived from it cannot be trusted:\n${verdict.problems.map((p) => `  - ${p}`).join('\n')}\n`)
     return SNAPSHOT_EXIT_CODES.INCONSISTENT
   }
-  io.stdout(`Snapshot verified: payload SHA-256 ${verdict.payloadSha256}; ${verdict.payload.parents.length} variable product(s), ${verdict.payload.variations.length} variation(s); no consistency problem. ${SNAPSHOT_FILE_NAMES.variantParents} is byte-identical to the rows regenerated from it and the provenance hashes match.\n`)
+  io.stdout(`Snapshot verified: payload SHA-256 ${verdict.payloadSha256}; ${verdict.payload.products.length} product(s) of any type (${verdict.payload.parents.length} variable), ${verdict.payload.variations.length} variation(s); no consistency problem. ${SNAPSHOT_FILE_NAMES.variantParents} and ${SNAPSHOT_FILE_NAMES.productStatus} are byte-identical to the rows regenerated from it and the provenance hashes match.\n`)
   return SNAPSHOT_EXIT_CODES.OK
 }
 
@@ -378,6 +379,7 @@ export async function runSnapshotCli(argv: string[], rawIo: CliIo, deps: Snapsho
   }
   const csv = renderVariantParentsCsv(reread.payload)
   const inspection = renderVariantParentsInspectionCsv(reread.payload)
+  const productStatus = renderProductStatusCsv(reread.payload)
   const provenance = {
     formatVersion: SNAPSHOT_FORMAT_VERSION,
     source: 'woocommerce',
@@ -390,8 +392,10 @@ export async function runSnapshotCli(argv: string[], rawIo: CliIo, deps: Snapsho
     proof: result.proof,
     snapshotFile: { name: SNAPSHOT_FILE_NAMES.snapshot, sha256: sha256Hex(snapshotText), bytes: Buffer.byteLength(snapshotText, 'utf8'), payloadSha256: reread.payloadSha256 },
     formulaLeadingCells: formulaLeadingCells(reread.payload),
+    productStatusFormulaLeadingCells: productStatusFormulaLeadingCells(reread.payload),
     variantParentsFile: { name: SNAPSHOT_FILE_NAMES.variantParents, sha256: sha256Hex(csv), rows: csv.split('\r\n').filter((l) => l !== '').length - 1 },
     variantParentsInspectionFile: { name: SNAPSHOT_FILE_NAMES.variantParentsInspection, sha256: sha256Hex(inspection) },
+    productStatusFile: { name: SNAPSHOT_FILE_NAMES.productStatus, sha256: sha256Hex(productStatus), rows: productStatus.split('\r\n').filter((l) => l !== '').length - 1 },
   }
   const created: string[] = []
   try {
@@ -400,6 +404,7 @@ export async function runSnapshotCli(argv: string[], rawIo: CliIo, deps: Snapsho
       [SNAPSHOT_FILE_NAMES.provenance, redact(`${JSON.stringify(provenance, null, 2)}\n`)],
       [SNAPSHOT_FILE_NAMES.variantParents, csv],
       [SNAPSHOT_FILE_NAMES.variantParentsInspection, inspection],
+      [SNAPSHOT_FILE_NAMES.productStatus, productStatus],
     ] as const) {
       const target = path.join(outDir, name)
       writeFileSync(target, content, { flag: 'wx', encoding: 'utf8', mode: 0o600 })
@@ -415,9 +420,10 @@ export async function runSnapshotCli(argv: string[], rawIo: CliIo, deps: Snapsho
   const p = result.proof
   io.stdout([
     `Snapshot of ${origin} written to ${args.out}${resumed ? ' (resumed)' : ''}.`,
-    `  variable products: ${p.parents.rowsRead} read = ${p.parents.totalHeader} (X-WP-Total) in ${p.parents.pages} page(s)`,
+    `  products (every type): ${p.allProducts.rowsRead} read = ${p.allProducts.totalHeader} (X-WP-Total) in ${p.allProducts.pages} page(s); by type ${statusLine(p.allProducts.byType)}; without a SKU (not in ${SNAPSHOT_FILE_NAMES.productStatus}): ${p.allProducts.withoutSku}`,
+    `  variable products: ${p.parents.rowsRead} read = ${p.parents.totalHeader} (X-WP-Total of the variable filter)`,
     `  variations: ${p.variations.rowsRead} read = ${p.variations.totalHeaderSum} (sum of X-WP-Total over ${p.variations.parentsWithVariations} product(s)) and equal to the ids the products list`,
-    `  by status (compare with the shop's own admin counts): products ${statusLine(p.parents.statusTotals)}; variations ${statusLine(p.variations.statusTotals)}`,
+    `  by status (compare with the shop's own admin counts): all products ${statusLine(p.allProducts.statusTotals)}; variable products ${statusLine(p.parents.statusTotals)}; variations ${statusLine(p.variations.statusTotals)}`,
     `  variations without a SKU (cannot be joined, not in ${SNAPSHOT_FILE_NAMES.variantParents}): ${p.variationsWithoutSku}`,
     `  verified by a second complete walk (round ${result.verificationRounds}); requests this run: ${result.requests}; payload SHA-256 ${reread.payloadSha256}`,
     '  every request was a GET.',

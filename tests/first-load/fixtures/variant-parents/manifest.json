@@ -6,6 +6,7 @@
     "provenance": "woo/woo-snapshot.provenance.json",
     "origin": "https://synthetic.invalid",
     "visibilityChecked": {
+      "allProducts": { "publish": 4, "draft": 1, "private": 1, "pending": 0 },
       "products": { "publish": 4, "draft": 1, "private": 1, "pending": 0 },
       "variations": { "publish": 8, "draft": 0, "private": 0, "pending": 0 }
     }

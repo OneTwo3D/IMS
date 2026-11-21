@@ -1,13 +1,13 @@
 {
-  "formatVersion": 1,
+  "formatVersion": 2,
   "source": "woocommerce",
   "origin": "https://synthetic.invalid",
   "note": "SYNTHETIC fixture: no store was contacted",
   "snapshotFile": {
     "name": "woo-snapshot.json",
-    "sha256": "2c68f6a7cfdf23671091f2c23a7bc4cb7fcfd95f4e832fcf84870795ce0a4c95",
-    "bytes": 2434,
-    "payloadSha256": "527094e6a44983841eae2609221277227078440a8a2a91375757d53ddc3a0841"
+    "sha256": "421c5caa2f58c887b3d2a9dff5b56b724ca7f1df75702461abcb6d83cce7f00e",
+    "bytes": 3688,
+    "payloadSha256": "c476c33b320e1475ca830edf527dc86f1a831476ea7be48de3693e9943a368db"
   },
   "formulaLeadingCells": 0,
   "variantParentsFile": {
@@ -20,6 +20,14 @@
     "sha256": "550cd9c3e1dcd7fc1943179ed1e0d624b688f8136dd281875e234dc8514dc436"
   },
   "proof": {
+    "allProducts": {
+      "statusTotals": {
+        "publish": 4,
+        "draft": 1,
+        "private": 1,
+        "pending": 0
+      }
+    },
     "parents": {
       "statusTotals": {
         "publish": 4,
