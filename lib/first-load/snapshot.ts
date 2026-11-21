@@ -18,8 +18,12 @@ import { serializeCsv } from './csv'
 import { DATASETS } from './spec'
 import { FORMULA_LEADING, skuKey } from './validate'
 
-/** 2: `products` (every product, any type) was added. A version-1 snapshot holds variable products only and is refused with a message that says so. */
-export const SNAPSHOT_FORMAT_VERSION = 2
+/**
+ * 2: `products` (every product, any type) was added. A version-1 snapshot holds variable products only and is refused with a message that says so.
+ * 3: each variation's own stock (`manageStock`, `stockQuantity`) was added, for the owner lifecycle review. A version-2 snapshot carries no variation stock
+ * and is refused with a message that says so (re-run first-load:woo-snapshot).
+ */
+export const SNAPSHOT_FORMAT_VERSION = 3
 
 export interface SnapshotAttribute {
   name: string
@@ -52,6 +56,13 @@ export interface SnapshotVariation {
   sku: string
   status: string
   attributes: SnapshotAttribute[]
+  /**
+   * WooCommerce's `manage_stock` for the variation: true (its own stock), false (none), or `parent` (the variation draws on its parent's stock, which the
+   * store reports as the variation's `stock_quantity`).
+   */
+  manageStock: boolean | 'parent'
+  /** `stock_quantity` when the variation (or, for `parent`, its parent) manages stock, else null. A point-in-time read (walk A), info only. */
+  stockQuantity: number | null
 }
 
 export interface SnapshotPayload {
@@ -95,6 +106,7 @@ export function normalizePayload(payload: SnapshotPayload): SnapshotPayload {
       .map((v) => ({
         id: v.id, parentId: v.parentId, sku: v.sku, status: v.status,
         attributes: [...v.attributes].map((a) => ({ name: a.name, option: a.option })).sort((a, b) => cmp(a.name, b.name) || cmp(a.option, b.option)),
+        manageStock: v.manageStock, stockQuantity: v.stockQuantity,
       }))
       .sort((a, b) => a.id - b.id),
   }
@@ -105,13 +117,18 @@ export function payloadSha256(payload: SnapshotPayload): string {
 }
 
 /**
- * The checksum the TWO WALKS are compared by: the payload WITHOUT the stock figures (manageStock, stockQuantity). Stock moves with every order and every stock push, and the
- * verifying walk runs minutes after the first, so comparing it would refuse a live store that is merely trading. Status, SKU, type, title, ids and variations still must agree.
- * The stock figures kept in the file are walk A's: a point-in-time read, for information only (the file's own checksum still covers them).
+ * The checksum the TWO WALKS are compared by: the payload WITHOUT the stock figures (manageStock, stockQuantity) of the products AND of the variations. Stock moves
+ * with every order and every stock push, and the verifying walk runs minutes after the first, so comparing it would refuse a live store that is merely trading.
+ * Status, SKU, type, title, ids and variations still must agree. The stock figures kept in the file are walk A's: a point-in-time read, for information only
+ * (the file's own checksum still covers them).
  */
 export function comparisonSha256(payload: SnapshotPayload): string {
   const n = normalizePayload(payload)
-  return sha256Hex(canonicalJson({ ...n, products: n.products.map(({ manageStock: _m, stockQuantity: _q, ...rest }) => rest) }))
+  return sha256Hex(canonicalJson({
+    ...n,
+    products: n.products.map(({ manageStock: _m, stockQuantity: _q, ...rest }) => rest),
+    variations: n.variations.map(({ manageStock: _m, stockQuantity: _q, ...rest }) => rest),
+  }))
 }
 
 /** The snapshot file: pretty, key-sorted JSON carrying the payload and the checksum of its canonical form. */
@@ -193,7 +210,12 @@ export function reduceVariation(raw: unknown, parentId: number): { ok: true; var
       attributes.push({ name: a.name, option: a.option })
     }
   }
-  return { ok: true, variation: { id, parentId, sku: raw.sku.trim(), status: raw.status, attributes } }
+  // Stock as the store states it, as for a product; a variation may also say `parent` (it draws on the parent's stock, reported as its own stock_quantity).
+  const manageStock = raw.manage_stock === undefined || raw.manage_stock === null ? raw.stock_quantity !== undefined && raw.stock_quantity !== null : raw.manage_stock
+  if (typeof manageStock !== 'boolean' && manageStock !== 'parent') return { ok: false, problem: `variation ${id} has a manage_stock that is not true, false or "parent" (${short(raw.manage_stock)})` }
+  const q = raw.stock_quantity
+  if (q !== undefined && q !== null && (typeof q !== 'number' || !Number.isFinite(q))) return { ok: false, problem: `variation ${id} has a stock_quantity that is not a number (${short(q)})` }
+  return { ok: true, variation: { id, parentId, sku: raw.sku.trim(), status: raw.status, attributes, manageStock, stockQuantity: manageStock !== false && typeof q === 'number' ? q : null } }
 }
 
 // ---------------------------------------------------------------------------
@@ -265,6 +287,7 @@ export function parseSnapshotFile(text: string): ParsedSnapshot {
   const allowed = new Set(['formatVersion', 'kind', 'payloadSha256', 'payload'])
   const unknown = Object.keys(raw).filter((k) => !allowed.has(k))
   if (unknown.length > 0) return { ok: false, problems: [`unknown key(s) in the snapshot: ${unknown.join(', ')}`] }
+  if (raw.formatVersion === 2) return { ok: false, problems: [`the snapshot is format 2: it was taken before each variation's own stock was read, so the owner lifecycle review cannot show (or check an Archived decision against) a variation's WooCommerce stock. Re-run first-load:woo-snapshot to take a new snapshot (format ${SNAPSHOT_FORMAT_VERSION}) and regenerate the files derived from it`] }
   if (raw.formatVersion === 1) return { ok: false, problems: [`the snapshot is format 1: it was taken before every product's own status and stock were read (it holds variable products and their variations only), so it cannot give the lifecycle of a simple, KIT or BOM product. Re-run first-load:woo-snapshot to take a new snapshot (format ${SNAPSHOT_FORMAT_VERSION}) and regenerate the files derived from it`] }
   if (raw.formatVersion !== SNAPSHOT_FORMAT_VERSION) return { ok: false, problems: [`snapshot formatVersion must be ${SNAPSHOT_FORMAT_VERSION}`] }
   if (raw.kind !== 'woocommerce-catalogue-snapshot') return { ok: false, problems: ['the file is not a WooCommerce catalogue snapshot'] }
@@ -289,7 +312,8 @@ export function parseSnapshotFile(text: string): ParsedSnapshot {
   for (const entry of payload.variations) {
     const parentId = isRecord(entry) ? wholeId(entry.parentId) : null
     if (parentId === null) return { ok: false, problems: ['a snapshot variation has no usable parentId'] }
-    const reduced = reduceVariation(entry, parentId)
+    // The stored form names the stock fields in camel case, as for a product.
+    const reduced = reduceVariation(isRecord(entry) ? { ...entry, manage_stock: entry.manageStock, stock_quantity: entry.stockQuantity } : entry, parentId)
     if (!reduced.ok) return { ok: false, problems: [reduced.problem] }
     variations.push(reduced.variation)
   }
@@ -535,7 +559,7 @@ export function verifyWooSnapshotBundle(input: {
     }
   }
   const snapRec = recorded('snapshotFile', 'the snapshot file')
-  if (provenance !== null && provenance.formatVersion !== SNAPSHOT_FORMAT_VERSION) problems.push(`the provenance is format ${JSON.stringify(provenance.formatVersion)}, not ${SNAPSHOT_FORMAT_VERSION}: it was written before every product's own status was read. Re-run first-load:woo-snapshot`)
+  if (provenance !== null && provenance.formatVersion !== SNAPSHOT_FORMAT_VERSION) problems.push(`the provenance is format ${JSON.stringify(provenance.formatVersion)}, not ${SNAPSHOT_FORMAT_VERSION}: it was written by an older snapshot command (format 1: before every product's own status was read; format 2: before each variation's stock was read). Re-run first-load:woo-snapshot`)
   const csvRec = input.csvBytes === undefined ? { sha256: null } : recorded('variantParentsFile', 'variant-parents.csv')
   const statusRec = input.productStatusBytes === undefined ? { sha256: null } : recorded('productStatusFile', 'woo-product-status.csv')
   const inspectRec = input.requireInspection ? recorded('variantParentsInspectionFile', 'the inspection copy') : { sha256: null }

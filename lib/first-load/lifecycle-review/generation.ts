@@ -11,7 +11,11 @@
  */
 import { canonicalJson, sha256Hex } from '../snapshot'
 
-export const LIFECYCLE_REVIEW_FORMAT_VERSION = 1
+/**
+ * 2 (#1122 R1): each review entry carries WHY it is in the review set, the Qoblex stock PER WAREHOUSE (an Archived decision is refused when any one warehouse is
+ * above zero, never on the sum), and, for a VARIABLE parent, each variation's figures. A version-1 record is refused: generate the sheet again.
+ */
+export const LIFECYCLE_REVIEW_FORMAT_VERSION = 2
 export const LIFECYCLE_REVIEW_KIND = 'first-load-lifecycle-review'
 
 export const LIFECYCLE_REVIEW_FILE_NAMES = {
@@ -56,15 +60,29 @@ export type StockFigure =
   /** Not read: the WMS listing was not taken, or WooCommerce's snapshot does not carry the figure (a variation). */
   | { kind: 'unknown' }
 
+/** One variation of a VARIABLE parent, at generation: what an Archived decision on the parent is checked against. */
+export interface VariationStock {
+  sku: string
+  qoblexByWarehouse: Record<string, string>
+  wooStock: StockFigure
+  wmsStock: StockFigure
+}
+
 export interface ReviewEntry {
   /** The SKU as IMS will load it (after sku-renames). Decisions are keyed by it, exactly. */
   sku: string
   /** The lifecycle the first load would set without a decision. */
   proposed: string
-  /** The Qoblex stock on hand at generation, summed over the warehouses (a plain decimal). */
+  /** Why the row is in the review set, in the model's words (`WooCommerce draft`, `WooCommerce parent draft`, `Qoblex Archived`, `WMS discontinued`). */
+  reasons: string[]
+  /** The Qoblex stock on hand at generation, summed over the warehouses (a plain decimal; for display: an Archived decision is checked per warehouse). */
   qoblexStock: string
+  /** The Qoblex stock on hand at generation per warehouse code. */
+  qoblexByWarehouse: Record<string, string>
   wooStock: StockFigure
   wmsStock: StockFigure
+  /** A VARIABLE parent only: every variation IMS loads under it, with its figures. */
+  variations?: VariationStock[]
 }
 
 export interface GenerationBody {
@@ -128,6 +146,7 @@ export function parseGeneration(text: string): { ok: true; value: GenerationFile
     return bad('the lifecycle review generation record is not valid JSON')
   }
   if (!isRecord(raw)) return bad('the lifecycle review generation record is not a JSON object')
+  if (raw.kind === LIFECYCLE_REVIEW_KIND && raw.formatVersion === 1) return bad('the lifecycle review generation record is format 1: it was written before the review recorded the stock per warehouse and each variation of a VARIABLE parent. Generate the sheet again (npm run first-load:lifecycle-review) and have the new sheet filled')
   if (raw.kind !== LIFECYCLE_REVIEW_KIND || raw.formatVersion !== LIFECYCLE_REVIEW_FORMAT_VERSION) return bad(`the file is not a lifecycle review generation record of format ${LIFECYCLE_REVIEW_FORMAT_VERSION}`)
   const body = raw.body
   if (!isRecord(body) || !isRecord(body.inputs) || !Array.isArray(body.review)) return bad('the generation record body is malformed')
@@ -139,14 +158,39 @@ export function parseGeneration(text: string): { ok: true; value: GenerationFile
     || !isRecord(wms) || typeof wms.read !== 'boolean' || !(wms.digest === null || (typeof wms.digest === 'string' && SHA.test(wms.digest)))) return bad('the generation record inputs are malformed')
   const review: ReviewEntry[] = []
   const seen = new Set<string>()
+  const warehouseMap = (v: unknown): Record<string, string> | null => {
+    if (!isRecord(v)) return null
+    const out: Record<string, string> = {}
+    for (const [code, qty] of Object.entries(v)) {
+      if (code === '' || typeof qty !== 'string' || !QTY.test(qty)) return null
+      out[code] = qty
+    }
+    return out
+  }
+  const ENTRY_KEYS = new Set(['sku', 'proposed', 'reasons', 'qoblexStock', 'qoblexByWarehouse', 'wooStock', 'wmsStock', 'variations'])
   for (const entry of body.review) {
-    if (!isRecord(entry) || typeof entry.sku !== 'string' || entry.sku === '' || typeof entry.proposed !== 'string' || typeof entry.qoblexStock !== 'string' || !QTY.test(entry.qoblexStock)) return bad('a review entry of the generation record is malformed')
+    if (!isRecord(entry) || Object.keys(entry).some((k) => !ENTRY_KEYS.has(k)) || typeof entry.sku !== 'string' || entry.sku === '' || typeof entry.proposed !== 'string'
+      || typeof entry.qoblexStock !== 'string' || !QTY.test(entry.qoblexStock) || !Array.isArray(entry.reasons) || !entry.reasons.every((r) => typeof r === 'string')) return bad('a review entry of the generation record is malformed')
+    const sku = JSON.stringify(entry.sku.slice(0, 60))
     const woo = figure(entry.wooStock)
     const wmsStock = figure(entry.wmsStock)
-    if (woo === null || wmsStock === null) return bad(`the review entry ${JSON.stringify(entry.sku.slice(0, 60))} carries a malformed stock figure`)
-    if (seen.has(entry.sku)) return bad(`the review entry ${JSON.stringify(entry.sku.slice(0, 60))} appears twice`)
+    const byWarehouse = warehouseMap(entry.qoblexByWarehouse)
+    if (woo === null || wmsStock === null || byWarehouse === null) return bad(`the review entry ${sku} carries a malformed stock figure`)
+    let variations: VariationStock[] | undefined
+    if (entry.variations !== undefined) {
+      if (!Array.isArray(entry.variations)) return bad(`the review entry ${sku} carries a malformed variation list`)
+      variations = []
+      for (const v of entry.variations) {
+        const vw = isRecord(v) ? warehouseMap(v.qoblexByWarehouse) : null
+        const vWoo = isRecord(v) ? figure(v.wooStock) : null
+        const vWms = isRecord(v) ? figure(v.wmsStock) : null
+        if (!isRecord(v) || Object.keys(v).length !== 4 || typeof v.sku !== 'string' || v.sku === '' || vw === null || vWoo === null || vWms === null) return bad(`the review entry ${sku} carries a malformed variation`)
+        variations.push({ sku: v.sku, qoblexByWarehouse: vw, wooStock: vWoo, wmsStock: vWms })
+      }
+    }
+    if (seen.has(entry.sku)) return bad(`the review entry ${sku} appears twice`)
     seen.add(entry.sku)
-    review.push({ sku: entry.sku, proposed: entry.proposed, qoblexStock: entry.qoblexStock, wooStock: woo, wmsStock })
+    review.push({ sku: entry.sku, proposed: entry.proposed, reasons: entry.reasons as string[], qoblexStock: entry.qoblexStock, qoblexByWarehouse: byWarehouse, wooStock: woo, wmsStock, ...(variations === undefined ? {} : { variations }) })
   }
   const parsedBody: GenerationBody = {
     inputs: { products: inputs.products as string[], stockLots: inputs.stockLots as string[], snapshotPayloadSha256: inputs.snapshotPayloadSha256, productStatusSha256: inputs.productStatusSha256, wms: { read: wms.read, digest: wms.digest as string | null } },
@@ -166,6 +210,11 @@ export function parseGeneration(text: string): { ok: true; value: GenerationFile
 export type LifecycleDecisionsBinding =
   | { verified: true; sheetId: string; generation: GenerationBody; fileSha256: string | null }
   | { verified: false; problems: string[] }
+
+/** Any single warehouse above zero (MED-2: +5 in one warehouse and -5 in another is stock, never a sum of 0). */
+export function warehousesBlockArchive(byWarehouse: Readonly<Record<string, string>>): string[] {
+  return Object.entries(byWarehouse).filter(([, qty]) => figureBlocksArchive({ kind: 'qty', qty })).map(([code, qty]) => `${code} ${qty}`).sort()
+}
 
 /** Is this figure a reason an Archived decision needs an override: stock above zero, or a figure that was not read. */
 export function figureBlocksArchive(f: StockFigure): boolean {

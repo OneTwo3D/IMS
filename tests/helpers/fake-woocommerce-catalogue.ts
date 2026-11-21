@@ -22,6 +22,9 @@ export interface FakeVariation {
   attributes?: Array<{ id?: number; name: string; option: string }>
   /** Sent as `parent_id` when set (WooCommerce versions differ on whether the field exists). */
   parent_id?: number
+  /** WooCommerce sends `manage_stock` as true, false or "parent" for a variation (default false). */
+  manage_stock?: boolean | 'parent'
+  stock_quantity?: number | null
 }
 
 export interface FakeParent {
@@ -183,6 +186,7 @@ export async function startFakeCatalogue(options: FakeCatalogueOptions): Promise
       const sorted = parent.variations.filter((v) => keep(v.status ?? 'publish')).sort((a, b) => a.id - b.id)
       return paged(sorted.map((v) => ({
         id: v.id, sku: v.sku, status: v.status ?? 'publish', attributes: v.attributes ?? [],
+        manage_stock: v.manage_stock ?? false, stock_quantity: v.stock_quantity ?? null,
         ...(v.parent_id === undefined ? {} : { parent_id: v.parent_id }),
       })), { route: 'variations', parentId: parent.id })
     }

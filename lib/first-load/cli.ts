@@ -11,8 +11,9 @@ import path from 'node:path'
 import { InputError, decisionSkuKey, ingestDataset, type IngestDecisions, mergeIngested, parseColumnMap, type ColumnMap, type DatasetMapping, type IngestedDataset } from './ingest'
 import { renderAccountingTable, renderJson, renderMarkdown } from './report'
 import { DATASET_NAMES, EXIT_CODES, EXIT_CODE_TABLE, IN_TRANSIT_CONVENTIONS, type DatasetName, type InTransitConvention } from './spec'
-import { bindingFromVerification, productStatusBindingFromVerification, normaliseStoreOrigin, parseVisibilityAttestation, verifyWooSnapshotBundle, type SnapshotPayload, type VisibilityAttestation, type ProductStatusBinding, type VariantParentsBinding } from './snapshot'
-import { ConfigError, prepare, type PrepareConfig } from './transform'
+import { bindingFromVerification, productStatusBindingFromVerification, normaliseStoreOrigin, parseVisibilityAttestation, verifyWooSnapshotBundle, type SnapshotBundleVerdict, type SnapshotPayload, type VisibilityAttestation, type ProductStatusBinding, type VariantParentsBinding } from './snapshot'
+import { ConfigError, prepare, type PrepareConfig, type PrepareInput } from './transform'
+import { skuKey } from './validate'
 import { parseGeneration, type LifecycleDecisionsBinding } from './lifecycle-review/generation'
 import { readDecisionFile } from './lifecycle-review/read-back'
 
@@ -195,12 +196,14 @@ export interface LoadedRun {
   productStatusBinding: ProductStatusBinding | undefined
   lifecycleDecisionsBinding: LifecycleDecisionsBinding | undefined
   /**
-   * With `rawProductStates`: the products dataset's lifecycle cell per SKU (as read, before renames) BEFORE the column map's value map turned it into a
+   * With `rawProductStates` (or whenever the manifest names lifecycleReview): the products dataset's lifecycle cell per SKU (as read, before renames) BEFORE the column map's value map turned it into a
    * lifecycle (Qoblex "State": Active, Inactive, Archived), for the review sheet. Later files win where they state one.
    */
   rawProductStates: Map<string, string>
   /** The verified snapshot payload, when woo-product-status was verified against it (the review sheet reads names, statuses and stock from it). */
   wooSnapshot: SnapshotPayload | null
+  /** For `prepare()`: the inputs it recomputes the owner review set with (#1122 R1 MED-1). Only when the manifest names lifecycleReview and the snapshot verified. */
+  lifecycleReviewInputs: PrepareInput['lifecycleReviewInputs']
 }
 
 export interface LoadOptions {
@@ -243,7 +246,7 @@ export function loadPrepareRun(manifestPath: string, io: CliIo, options: LoadOpt
   const datasets: Partial<Record<DatasetName, IngestedDataset>> = {}
   const problems: string[] = []
   const rawProductStates = new Map<string, string>()
-  let decisionsFile: { sheetIds: string[]; bindingTab: { sheetId: string; digest: string } | null; kind: string; sha256: string } | null = null
+  let decisionsFile: { sheetIds: string[]; bindingTab: { sheetId: string; digest: string } | null; kind: string; sha256: string; decidedWithoutSheetId: number[] } | null = null
   try {
     // Pass 1: resolve every column map and check the manifest as a whole BEFORE any dataset file is read, so a missing or malformed data
     // file cannot turn a manifest error (exit 2) into an input error (exit 3).
@@ -322,11 +325,11 @@ export function loadPrepareRun(manifestPath: string, io: CliIo, options: LoadOpt
           const fileSha = sha256(bytes)
           const ingested = ingestDataset('lifecycle-decisions', Buffer.from(read.canonicalCsv, 'utf8'), input.file, null, decisions)
           ;(parts[input.dataset] ??= []).push({ ingested: { ...ingested, sha256: fileSha, bytes: bytes.length, parts: [{ file: input.file, sha256: fileSha, bytes: bytes.length }] }, supersedes: false })
-          decisionsFile = { sheetIds: read.sheetIds, bindingTab: read.bindingTab, kind: read.kind, sha256: fileSha }
+          decisionsFile = { sheetIds: read.sheetIds, bindingTab: read.bindingTab, kind: read.kind, sha256: fileSha, decidedWithoutSheetId: read.decidedWithoutSheetId }
           continue
         }
         ;(parts[input.dataset] ??= []).push({ ingested: ingestDataset(input.dataset, bytes, input.file, mapping, decisions), supersedes: input.supersedesEarlier })
-        if (options.rawProductStates && input.dataset === 'products') {
+        if ((options.rawProductStates || manifest.lifecycleReview !== null) && input.dataset === 'products') {
           // The same file again with the lifecycle cell left as the source states it (the value map removed): the Qoblex State the review sheet shows.
           const raw = mapping === null ? null : { ...mapping, valueMaps: Object.fromEntries(Object.entries(mapping.valueMaps).filter(([column]) => column !== 'lifecycleStatus')) }
           const again = raw === null ? parts[input.dataset]!.at(-1)!.ingested : ingestDataset(input.dataset, bytes, input.file, raw, decisions)
@@ -369,11 +372,12 @@ export function loadPrepareRun(manifestPath: string, io: CliIo, options: LoadOpt
       return null
     }
   }
-  const bindingFor = (dataset: 'variant-parents' | 'woo-product-status'): VariantParentsBinding | undefined => {
+  // L12: the verification is a value, not a side effect: the snapshot payload is taken from the woo-product-status verdict explicitly, below.
+  const verify = (dataset: 'variant-parents' | 'woo-product-status'): { binding: VariantParentsBinding; verdict: SnapshotBundleVerdict | null } | undefined => {
     if (datasets[dataset] === undefined) return undefined
     const listed = manifest.inputs.filter((i) => i.dataset === dataset)
-    if (listed.length !== 1 || listed[0].columnMap !== null) return { verified: false, problems: [`the ${dataset} dataset must be exactly one canonical file written by first-load:woo-snapshot (no column map, listed once)`] }
-    if (manifest.wooSnapshot === null) return { verified: false, problems: [`the manifest does not name wooSnapshot (the snapshot and provenance that ${dataset}.csv was written with), so ${dataset}.csv cannot be verified`] }
+    if (listed.length !== 1 || listed[0].columnMap !== null) return { binding: { verified: false, problems: [`the ${dataset} dataset must be exactly one canonical file written by first-load:woo-snapshot (no column map, listed once)`] }, verdict: null }
+    if (manifest.wooSnapshot === null) return { binding: { verified: false, problems: [`the manifest does not name wooSnapshot (the snapshot and provenance that ${dataset}.csv was written with), so ${dataset}.csv cannot be verified`] }, verdict: null }
     const verdict = verifyWooSnapshotBundle({
       snapshotBytes: readOrNull(manifest.wooSnapshot.snapshot),
       provenanceBytes: readOrNull(manifest.wooSnapshot.provenance),
@@ -381,10 +385,13 @@ export function loadPrepareRun(manifestPath: string, io: CliIo, options: LoadOpt
       expectedOrigin: manifest.wooSnapshot.origin,
       visibilityChecked: manifest.wooSnapshot.visibilityChecked,
     })
-    if (dataset === 'woo-product-status' && verdict.ok && verdict.productStatusSha256 !== null) wooSnapshot = verdict.payload
-    return dataset === 'variant-parents' ? bindingFromVerification(verdict) : productStatusBindingFromVerification(verdict)
+    return { binding: dataset === 'variant-parents' ? bindingFromVerification(verdict) : productStatusBindingFromVerification(verdict), verdict }
   }
-  let wooSnapshot: SnapshotPayload | null = null
+  const variantCheck = verify('variant-parents')
+  const statusCheck = verify('woo-product-status')
+  const statusVerdict = statusCheck?.verdict ?? null
+  // The verified snapshot payload, only when woo-product-status itself was verified against it (the review sheet and the review-set recompute read it).
+  const wooSnapshot: SnapshotPayload | null = statusVerdict !== null && statusVerdict.ok && statusVerdict.productStatusSha256 !== null && statusCheck?.binding.verified === true ? statusVerdict.payload : null
   // The owner's decisions are only taken from the review sheet the manifest names (lifecycleReview.generation): the decisions file must carry that sheet's id,
   // and an .xlsx also its hidden binding tab with the generation digest. Absent the record, a supplied decisions dataset is refused by the transform.
   const decisionsBinding = (): LifecycleDecisionsBinding | undefined => {
@@ -395,8 +402,10 @@ export function loadPrepareRun(manifestPath: string, io: CliIo, options: LoadOpt
     if (!parsed.ok) return { verified: false, problems: [parsed.problem] }
     const generation = parsed.value
     if (decisionsFile === null) return { verified: true, sheetId: generation.sheetId, generation: generation.body, fileSha256: null }
-    const found: { sheetIds: string[]; bindingTab: { sheetId: string; digest: string } | null; kind: string } = decisionsFile
+    const found: { sheetIds: string[]; bindingTab: { sheetId: string; digest: string } | null; kind: string; decidedWithoutSheetId: number[] } = decisionsFile
     const why: string[] = []
+    // L6: a decided row must carry the sheet id itself: a blank one beside other rows that carry it is not proof it was made on this sheet.
+    if (found.decidedWithoutSheetId.length > 0) why.push(`${found.decidedWithoutSheetId.length} decided row(s) carry no Sheet id (line(s) ${found.decidedWithoutSheetId.slice(0, 10).join(', ')}${found.decidedWithoutSheetId.length > 10 ? ', ...' : ''}): every decided row must carry the id of the sheet it was made on`)
     if (found.sheetIds.length === 0) why.push(`no decision row carries a Sheet id (the review sheet ${generation.sheetId} writes it on every row)`)
     else if (found.sheetIds.length > 1 || found.sheetIds[0] !== generation.sheetId) why.push(`the decisions carry the sheet id(s) ${found.sheetIds.slice(0, 3).join(', ')}, not ${generation.sheetId} (the sheet the generation record describes): the decisions were made on another sheet`)
     if (found.kind === 'xlsx') {
@@ -409,11 +418,13 @@ export function loadPrepareRun(manifestPath: string, io: CliIo, options: LoadOpt
     ok: true,
     run: {
       manifest, manifestDir, config, datasets,
-      variantParentsBinding: bindingFor('variant-parents'),
-      productStatusBinding: bindingFor('woo-product-status'),
+      variantParentsBinding: variantCheck?.binding,
+      productStatusBinding: statusCheck?.binding,
       lifecycleDecisionsBinding: decisionsBinding(),
       rawProductStates,
       wooSnapshot,
+      // MED-1: what the transform recomputes the review set with (only when the manifest names a review, so a run without one reads its products once).
+      lifecycleReviewInputs: manifest.lifecycleReview === null || wooSnapshot === null ? undefined : { snapshot: wooSnapshot, qoblexStates: new Map([...rawProductStates].map(([sku, state]) => [skuKey(sku), state])) },
     },
   }
 }
@@ -435,10 +446,10 @@ export async function runCli(argv: string[], io: CliIo, deps: CliDeps = {}): Pro
   }
   const loaded = loadPrepareRun(args.manifest, io, { runId: args.runId })
   if (!loaded.ok) return loaded.exit
-  const { config, datasets, variantParentsBinding, productStatusBinding, lifecycleDecisionsBinding } = loaded.run
+  const { config, datasets, variantParentsBinding, productStatusBinding, lifecycleDecisionsBinding, lifecycleReviewInputs } = loaded.run
   let result
   try {
-    result = (deps.prepare ?? prepare)({ config, datasets, variantParentsBinding, productStatusBinding, lifecycleDecisionsBinding, dryRun: args.dryRun })
+    result = (deps.prepare ?? prepare)({ config, datasets, variantParentsBinding, productStatusBinding, lifecycleDecisionsBinding, lifecycleReviewInputs, dryRun: args.dryRun })
   } catch (error) {
     if (error instanceof ConfigError) {
       io.stderr(`first-load-prepare: invalid run configuration: ${error.message}\n`)
