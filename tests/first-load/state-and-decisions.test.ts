@@ -88,7 +88,7 @@ test('a purchase order line on a DRAFT product is accepted; on an EOL product it
 test('a Qoblex lifecycle that disagrees with the WooCommerce status of a VARIABLE product is a WARNING; agreement is silent', (t) => {
   const vp = (status: string) => ({ variantSku: 'M-01', wooVariationId: '11', parentSku: 'M', parentName: 'Parent M', parentStatus: status, wooParentId: '5001' })
   const disagree = run({ products: ds('products', [product('M', 'VARIABLE', { lifecycleStatus: 'DRAFT' }), product('M-01', 'VARIANT', { parentSku: 'M' })]), 'variant-parents': ds('variant-parents', [vp('publish')]) })
-  const agree = run({ products: ds('products', [product('M', 'VARIABLE', { lifecycleStatus: 'DRAFT' }), product('M-01', 'VARIANT', { parentSku: 'M' })]), 'variant-parents': ds('variant-parents', [vp('draft')]) })
+  const agree = run({ products: ds('products', [product('M', 'VARIABLE', { lifecycleStatus: 'DRAFT' }), product('M-01', 'VARIANT', { parentSku: 'M', lifecycleStatus: 'DRAFT' })]), 'variant-parents': ds('variant-parents', [vp('draft')]) })
   precondition(t, 'runs examined', [disagree, agree].filter((x) => x.report.findings !== undefined).length)
   assert.ok(findingCodes(disagree, 'WARNING').includes('LIFECYCLE_DISAGREES_WITH_WOO'))
   assert.ok(!findingCodes(agree).includes('LIFECYCLE_DISAGREES_WITH_WOO'))
