@@ -151,6 +151,14 @@ Shown when the WooCommerce integration is enabled. Toggle the delivery tracking 
 - **Delivery status cron** — the endpoint `/api/cron/delivery-status` polls for delivery status updates on a schedule.
 - The **DELIVERED** order status becomes available in the order workflow.
 
+### Exchanges inside a return
+
+A switch (off by default; the `return_exchange_enabled` setting) that lets the refund dialog record replacement items together with the return. They become new lines on the same order, linked to the refund. See *Exchanges inside a return* in [Sales Orders](sales.md).
+
+### Emails on the customer timeline
+
+A switch (off by default; the `crm_timeline_emails_enabled` setting). When **On**, the timeline on a customer page also lists the emails IMS sent for the customer's orders as **Email** lines: the kind of email, its status and when it was queued. The subject, the message text and the address are never shown. See [Customers](customers.md).
+
 ### Recent tax-rate fallbacks and invoice PDF signals
 
 Two read-only lists sit at the bottom of **Settings > Sales**:

@@ -1,0 +1,2 @@
+### CRM timeline emails follow-ups (crm)
+- CRM timeline emails: the email source is now one bounded query (no list of order ids, so a customer with tens of thousands of orders no longer fails the timeline); lines read **Email** with their status instead of "Email sent", kinds show human labels (the storefront partial-shipment code no longer leaks a shipment id), emails are always placed at the time they were queued, and erased orders are skipped. Settings help lists the new cards.
