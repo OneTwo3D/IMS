@@ -934,9 +934,11 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
   // 400'd and nothing ever posted. The fix (o3d-lgo.6.1, Jan's call) is SUPPRESS-FOR-XERO: Xero revalues
   // foreign AR/AP itself, so an IMS journal for the same movement was both illegal and double-counting.
   //
-  // So this is the period-end mirror of PP-08's assertion: with a genuine unrealised movement to revalue,
-  // the sweep still runs and still BUILDS the journal, and nothing is queued for Xero.
-  test('X-03: the period-end FX revaluation finds a real unrealised movement and SUPPRESSES the UNREALISED_FX_JOURNAL for Xero (o3d-lgo.6.1)', async ({ page }) => {
+  // Since the owner retired the revaluation (2026-11-22: Xero revalues open foreign invoices, bills and bank
+  // balances itself), the cron no longer runs the sweep at all. So with a genuine unrealised movement in
+  // place, the cron must answer the RETIRED skip (not a real run, not a failure) and no UNREALISED_FX_JOURNAL
+  // row may exist for the date.
+  test('X-03: with a real unrealised movement open, the RETIRED FX revaluation cron skips by name and queues NO UNREALISED_FX_JOURNAL', async ({ page }) => {
     test.setTimeout(900_000)
 
     // An open (unpaid) FOREIGN payable is the input the revaluation needs: getOpenPayables selects bills
@@ -1012,17 +1014,15 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
 
       const result = await runFxRevaluation(page, { valuationDate })
 
-      // The sweep RAN — { skipped } means sync was disarmed or the date was already revalued, either of
-      // which would make the zero-row assertion below meaningless.
-      expect(result.skipped, `the revaluation must actually run: ${JSON.stringify(result)}`).toBeFalsy()
-      expect(result.success, `the revaluation reported failure: ${JSON.stringify(result)}`).toBe(true)
-      // And it found real work: `documents` counts the open foreign documents it revalued, `revalued` counts
-      // the journals it ENQUEUED — incremented after queueAccountingSync returns, so revalued >= 1 proves
-      // the enqueue was ATTEMPTED with lines built. This is what stops "no rows" from passing vacuously.
-      expect(Number(result.documents), 'the sweep revalued at least the open EUR bill').toBeGreaterThanOrEqual(1)
-      expect(Number(result.revalued), 'the sweep built and enqueued at least one revaluation journal').toBeGreaterThanOrEqual(1)
+      // The RETIRED answer, by name: a skip that did nothing. A real run (documents/revalued counted) would mean
+      // the sweep is wired back in; success: false would make a server cron that still calls it alert.
+      expect(result.success, `the retired revaluation reported failure: ${JSON.stringify(result)}`).toBe(true)
+      expect(result.skipped, `the revaluation must answer the retired skip: ${JSON.stringify(result)}`).toBe(true)
+      expect(String(result.reason), 'the skip names the retirement').toMatch(/^Retired: Xero revalues open foreign-currency invoices/)
+      expect(Number(result.documents), 'the retired cron reads no documents').toBe(0)
+      expect(Number(result.revalued), 'the retired cron queues no journal').toBe(0)
 
-      // THE POINT (o3d-lgo.6.1): the enqueue was attempted and NOTHING was written for Xero. Not a FAILED
+      // THE POINT: NOTHING was written for Xero. Not a FAILED
       // row — the defect state, "Account code 800 is not a valid code for this document" — and not a SYNCED
       // one, which would double-count Xero's own revaluation.
       const fxRows = await syncLogRowsFor({ type: 'UNREALISED_FX_JOURNAL', referenceId: valuationDate })

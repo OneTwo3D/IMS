@@ -238,7 +238,7 @@ The Gross Margin and COGS reports use the same invoiced orders for revenue and c
 | **AP Aging** | Outstanding purchase-invoice balances by supplier and aging bucket. |
 | **Currency Summary** | Sales, purchases, AR and AP grouped by document currency, with foreign and base-currency totals. |
 | **GR/IR** | The open goods accrual by supplier and purchase order, as of the end date: **received not billed**, **billed not received** (a prepaid supplier's bill ahead of the goods, or goods billed and then returned and not yet credited), the order's return credit notes, the net, the bills' price difference against the order, and the **age** in days of the oldest movement still open. See *GR/IR* below. |
-| **FX Gain/Loss** | Booked versus settlement FX delta for multi-currency transactions using IMS FX-rate semantics (realised + unrealised). |
+| **FX Gain/Loss** | Realised FX: booked versus settlement delta for each settled multi-currency receivable and payable, using IMS FX-rate semantics. Information only: IMS posts no FX journal, because Xero books realised and unrealised currency gains itself. |
 
 Finance period-end reports are limited to finance and admin roles.
 

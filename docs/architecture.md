@@ -300,7 +300,7 @@ Every monetary row that can hold a foreign-currency amount also stores `fxRateTo
 - `SalesOrder` and `SalesOrderLine` (locked at order creation)
 - `Payment` and `SalesOrderRefund` (rate at payment/refund time)
 
-Realised FX gain/loss is computed at payment/refund settlement against the stamped rate; unrealised FX adjustments revalue open AR/AP at month end.
+Realised FX gain/loss is computed at payment/refund settlement against the stamped rate, for the FX Gain/Loss report only; Xero books it itself from the settlement rate IMS sends on each payment. Unrealised FX is not posted by IMS: Xero revalues open foreign invoices, bills and bank balances in its own reports, and the IMS period-revaluation cron is retired.
 
 
 ## Module Boundaries
