@@ -111,7 +111,7 @@ test('a Mintsoft product with no stock row in any configured warehouse is refuse
 
 test('--execute without a wired writer and target is refused before anything is read', async () => {
   const calls: string[] = []
-  const r = await run(['--manifest', manifestWith(ALL_ARCHIVED), ...ENV, '--execute', '--plan-token', 'MSA-0123456789abcdef', '--env-file', 'x', '--expect-db', 'd', '--expect-system-id', '1', '--operator', 'Synthetic'], reader(census(), calls))
+  const r = await run(['--manifest', manifestWith(ALL_ARCHIVED), ...ENV, '--execute', '--plan-token', ('MSA-' + '0'.repeat(16)), '--env-file', 'x', '--expect-db', 'd', '--expect-system-id', '1', '--operator', 'Synthetic'], reader(census(), calls))
   assert.equal(r.code, EXIT_CODES.USAGE)
   assert.match(r.stderr, /--execute is not wired/)
   assert.deepEqual(calls, [])
