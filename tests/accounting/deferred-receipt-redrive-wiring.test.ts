@@ -86,6 +86,8 @@ mock.module('@/lib/db', {
 
 function txClient() {
   return {
+    // #1132 MED-4: the pending-delete fence the enqueue reads under the order lock (no delete pending here).
+    accountingDocumentDeletion: { findFirst: async () => null },
     accountingSyncLog: {
       findMany: async () => state.syncRows,
       // o3d-0bfh r15: the obligation release now happens INSIDE the fenced transaction, so the
