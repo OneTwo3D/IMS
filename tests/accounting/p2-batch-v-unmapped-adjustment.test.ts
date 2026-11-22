@@ -50,6 +50,8 @@ const loadApply = async () => (await import('@/lib/domain/inventory/stock-adjust
 function fakeTx(reason: { name: string; accountCode: string | null } | null) {
   return {
     adjustmentReason: { findUnique: async () => reason },
+    // o3d-0ypv9: the switch is read through the transaction; absent = off, the behaviour these tests pin.
+    setting: { findUnique: async () => null },
     stockMovement: { create: async () => ({ id: 'mv-1', createdAt: new Date() }), findUnique: async () => null, update: async () => ({}) },
     stockLevel: { upsert: async () => ({}) },
     product: { findUnique: async () => ({ sku: 'SKU1', name: 'Thing' }) },
