@@ -359,7 +359,7 @@ test('[#1127 R2 H-A] the lease renewal keeps stamping custody ONLY for CREDIT_NO
   const { readFile } = await import('node:fs/promises')
   const src = await readFile('lib/connectors/xero/sync-processor.ts', 'utf8')
   const fn = src.slice(src.indexOf('export async function renewClaimForRemoteWrite('), src.indexOf('What to say when a claim was lost before anything was sent'))
-  const plain = fn.slice(fn.indexOf('} : {'))
+  const plain = fn.slice(fn.indexOf('keepCustody : {'))
   assert.match(plain, /where: \{ \.\.\.heldClaimWhere\(entryId, held\), connector: XERO_CONNECTOR, \.\.\.xeroNotBeforeCutoffWhere\(xeroCutoffFloor\(\)\) \},/, 'the default statement: development\'s where')
   assert.match(plain, /data: write \? \{ processingStartedAt: renewedAt, \.\.\.write \} : \{ processingStartedAt: renewedAt \},/, 'and development\'s data: custody is left to the trigger')
   assert.ok(fn.includes('updateMany(options?.keepStampingCustody ? keepCustody : {'), 'the custody statement is the opt-in branch of the one write')
