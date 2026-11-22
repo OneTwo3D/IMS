@@ -629,6 +629,9 @@ async function retireSyncRow(tx: Tx, row: SyncRow, reason: string): Promise<void
   if (retired.count === 0) throw new RefundDeleteRefused([refundDeleteRefusals.accountingInFlight('accounting entry')])
 }
 
+/** Why phase 2 stopped after the ledger confirmed the void. */
+const phase2Stopped = (detail: string): string => `The credit note is closed in the accounting system, but the refund could not be deleted in IMS yet: ${detail}`
+
 /** The worker's follow-ups after a committed phase 2, reported to it (it records them), never swallowed and never undoing the delete. */
 export type RefundDeleteFollowUps = { stockSyncFailed: boolean; reallocationWarning: string | null }
 
@@ -639,7 +642,7 @@ export type RefundDeleteFollowUps = { stockSyncFailed: boolean; reallocationWarn
  * person (the reallocation sweep also picks up an order left short), never as a failure of the committed delete.
  */
 async function runRefundDeleteFollowUps(orderId: string | null, productIds: string[]): Promise<RefundDeleteFollowUps> {
-  let reallocationWarning: string | null = null
+  let reallocationFailure: string | null = null
   if (orderId) {
     try {
       const { db: appDb } = await import('@/lib/db')
@@ -647,10 +650,10 @@ async function runRefundDeleteFollowUps(orderId: string | null, productIds: stri
       if (order && (order.status === 'PROCESSING' || order.status === 'ALLOCATED')) {
         const [{ autoAllocateOrder }, { INTERNAL_ACTION_BYPASS }] = await Promise.all([import('@/app/actions/allocation'), import('@/lib/internal-action-bypass')])
         const allocated = await autoAllocateOrder(orderId, { internalBypassToken: INTERNAL_ACTION_BYPASS, refuseIfShipmentsExist: true, requireStatusUnderLock: ['PROCESSING', 'ALLOCATED'] })
-        if (!allocated.success) reallocationWarning = `The order's stock could not be re-reserved automatically${allocated.error ? ` (${allocated.error})` : ''}; allocate it from the order page.`
+        if (!allocated.success) reallocationFailure = `The order's stock could not be re-reserved automatically${allocated.error ? ` (${allocated.error})` : ''}; allocate it from the order page.`
       }
     } catch (error) {
-      reallocationWarning = `The order's stock could not be re-reserved automatically (${error instanceof Error ? error.message : String(error)}); allocate it from the order page.`
+      reallocationFailure = `The order's stock could not be re-reserved automatically (${error instanceof Error ? error.message : String(error)}); allocate it from the order page.`
     }
   }
   let stockSyncFailed = false
@@ -662,7 +665,7 @@ async function runRefundDeleteFollowUps(orderId: string | null, productIds: stri
       stockSyncFailed = true
     }
   }
-  return { stockSyncFailed, reallocationWarning }
+  return { stockSyncFailed, reallocationWarning: reallocationFailure }
 }
 
 /**
@@ -675,7 +678,7 @@ export async function completeRefundDeletionAfterVoid(
   input: { refundId: string; voidSyncLogId: string; actorUserId: string | null; reason: string | null },
 ): Promise<{ ok: true; productIds: string[]; stockSyncFailed: boolean; reallocationWarning: string | null } | { ok: false; error: string }> {
   const result = await deleteSalesOrderRefund(client, { refundId: input.refundId, actorUserId: input.actorUserId, reason: input.reason, voidConfirmed: { syncLogId: input.voidSyncLogId } })
-  if (!result.success) return { ok: false, error: `The credit note is closed in the accounting system, but the refund could not be deleted in IMS yet: ${result.error}` }
+  if (!result.success) return { ok: false, error: phase2Stopped(result.error) }
   if (result.alreadyDeleted) return { ok: true, productIds: [], stockSyncFailed: false, reallocationWarning: null }
   // The delete is committed; the follow-ups are reported to the caller (it records them), never swallowed.
   const followUps = await runRefundDeleteFollowUps(result.orderId, result.productIds)
@@ -706,12 +709,12 @@ export type VoidThenCompleteResult =
  *                            retry's void read finds the credit note already voided and phase 2 runs again under the same fence.
  *
  * `voidInLedger` must do the claim fence and the void itself, as the last thing before the socket (the caller's lease is checked there, after
- * the lock waits, not before them).
+ * the lock waits, not before them). Its failure is handed back whole as `passthrough` (the worker returns it as the entry's result).
  */
 export async function voidCreditNoteThenCompleteRefundDeletion(
   client: typeof db,
   input: { refundId: string; voidSyncLogId: string; actorUserId: string | null; reason: string | null },
-  voidInLedger: () => Promise<{ success: true } | { success: false; error: string; passthrough?: unknown }>,
+  voidInLedger: () => Promise<{ success: boolean; error?: string }>,
 ): Promise<VoidThenCompleteResult> {
   type Inner = { ok: true; alreadyDeleted: boolean; orderId: string | null; productIds: string[] } | { ok: false; voided: boolean; error: string; passthrough?: unknown }
   const inner = await client.$transaction(async (tx): Promise<Inner> => {
@@ -721,7 +724,7 @@ export async function voidCreditNoteThenCompleteRefundDeletion(
     if (located?.deletedAt || tombstone) {
       // Phase 2 already committed, which happens only after the ledger confirmed the void: the (idempotent) void read is repeated, as before.
       const voided = await voidInLedger()
-      if (!voided.success) return { ok: false, voided: false, error: voided.error, passthrough: voided.passthrough }
+      if (!voided.success) return { ok: false, voided: false, error: voided.error ?? 'the void failed', passthrough: voided }
       return { ok: true, alreadyDeleted: true, orderId: located?.orderId ?? tombstone?.orderId ?? null, productIds: [] }
     }
     if (!located) return { ok: false, voided: false, error: 'The credit note was not voided: the refund it belongs to no longer exists in IMS.' }
@@ -738,9 +741,9 @@ export async function voidCreditNoteThenCompleteRefundDeletion(
       return { ok: false, voided: false, error: `The credit note was not voided, so the refund and its credit note both stand: ${verdict.refusals.map((refusal) => refusal.message).join(' ')}` }
     }
     const voided = await voidInLedger()
-    if (!voided.success) return { ok: false, voided: false, error: voided.error, passthrough: voided.passthrough }
+    if (!voided.success) return { ok: false, voided: false, error: voided.error ?? 'the void failed', passthrough: voided }
     const done = await deleteSalesOrderRefund(tx, { refundId: input.refundId, actorUserId: input.actorUserId, reason: input.reason, voidConfirmed: { syncLogId: input.voidSyncLogId } })
-    if (!done.success) return { ok: false, voided: true, error: `The credit note is closed in the accounting system, but the refund could not be deleted in IMS yet: ${done.error}` }
+    if (!done.success) return { ok: false, voided: true, error: phase2Stopped(done.error) }
     return { ok: true, alreadyDeleted: done.alreadyDeleted, orderId: done.orderId, productIds: done.productIds }
   }, { maxWait: 10_000, timeout: REFUND_DELETE_VOID_TX_TIMEOUT_MS })
   if (!inner.ok) return { ok: false, voided: inner.voided, error: inner.error, ...(inner.passthrough !== undefined ? { passthrough: inner.passthrough } : {}) }

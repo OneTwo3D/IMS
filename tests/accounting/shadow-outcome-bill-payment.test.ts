@@ -67,6 +67,7 @@ mock.module('@/lib/accounting', {
 function transactionClient(pending: Array<() => void>) {
   return {
     accountingSyncLog: { findMany: async () => [], updateMany: async () => ({ count: 0 }) },
+    accountingDocumentDeletion: { findFirst: async () => null }, // o3d-668a2: the fence is read inside the transaction now
     purchaseInvoice: {
       updateMany: async (args: { data?: unknown }) => { pending.push(() => state.committedPaid.push(args.data)); return { count: 1 } },
     },

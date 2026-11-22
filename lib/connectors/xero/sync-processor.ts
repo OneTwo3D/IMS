@@ -7549,9 +7549,9 @@ export async function processClaimedEntry(
       const voidCreditNoteId = typeof payload.creditNoteId === 'string' ? payload.creditNoteId : ''
       if (!voidCreditNoteId) return { success: false, error: 'Missing creditNoteId for CREDIT_NOTE_VOID' }
       // The claim fence and the void, as the last thing before the socket.
-      const voidInLedger = async (): Promise<{ success: true } | { success: false; error: string; passthrough?: unknown }> => {
+      const voidInLedger = async (): Promise<EntryResult> => {
         const fence = await lease.fenceBeforeRemoteWrite('credit-note-void')
-        if (!fence.ok) return { success: false, error: 'the claim was lost before the void', passthrough: fence.result }
+        if (!fence.ok) return fence.result
         const voided = await voidCreditNote(
           { creditNoteId: voidCreditNoteId, creditNoteNumber: typeof payload.creditNoteNumber === 'string' ? payload.creditNoteNumber : null },
           { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note-void') },
@@ -7560,7 +7560,7 @@ export async function processClaimedEntry(
       }
       if (referenceType !== 'SalesOrderRefund') {
         const voided = await voidInLedger()
-        if (!voided.success) return voided.passthrough !== undefined ? voided.passthrough as EntryResult : { success: false, error: voided.error }
+        if (!voided.success) return voided
         // The id returned is the credit note's own: the void acts on a document that already stood (UPDATE_DOCUMENT).
         return { success: true, externalId: voidCreditNoteId }
       }
