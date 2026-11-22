@@ -1171,6 +1171,8 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'scripts/first-load-apply.ts': 'operator-run-write',
   // The first-load fx_rates export: the operator-run command that reads fx_rates, the base currency and the server identity in ONE `BEGIN READ ONLY` transaction on a connection opened default_transaction_read_only=on, and writes two files. It writes nothing to the database.
   'scripts/first-load-export-fx-rates.ts': 'operator-run-read',
+  // The first-load Mintsoft archive: an operator-run command. --execute reads the switch, the server identity and the products' lifecycle in ONE READ ONLY transaction (the import proof, behind the env-file, --expect-db and --expect-system-id confirmation), then INSERTs one activity_logs row per attempt and per verified or failed write, each in its own transaction. The dry run opens no connection.
+  'scripts/first-load-mintsoft-archive.ts': 'operator-run-write',
   // The ECB history backfill: an operator-run command that writes fx_rates (source ecb-history) in ONE transaction under the exclusive FX table lock, behind the env-file, --expect-db and --expect-system-id confirmation.
   'scripts/fx-backfill-ecb.ts': 'operator-run-write',
   'scripts/lib/first-load-rehearse.ts': 'operator-run-read',
