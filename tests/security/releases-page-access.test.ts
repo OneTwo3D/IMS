@@ -15,5 +15,5 @@ test('the release-notes page permission (internal) is held by every internal rol
 
 test('the release notification targets /help/releases', async () => {
   const { readFileSync } = await import('node:fs')
-  assert.match(readFileSync('lib/releases.ts', 'utf8'), /const actionUrl = '\/help\/releases'/)
+  assert.match(readFileSync('lib/release-notifications.ts', 'utf8'), /const actionUrl = '\/help\/releases'/)
 })

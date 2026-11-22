@@ -44,7 +44,9 @@ A PR records its changelog entry as a new file in `changelog.d/`, not as an edit
 
 ## Documentation Updates
 
-Keep documentation in the same PR as the behavior it describes. When changing a feature, check the affected documentation surfaces and update every one that would become stale:
+Documentation updates are **mandatory** in the same PR as the code change they describe, and CI enforces it. Code is the source of truth: where a doc and the code disagree, fix the doc. If the code looks wrong, do not document the wrong behaviour as intended; file a bead for the code instead.
+
+When changing a feature, check the affected documentation surfaces and update every one that would become stale:
 
 - `README.md` for high-level setup, feature, or support-entry changes
 - `docs/development.md` for validation, branch workflow, guardrails, and agent workflow rules
@@ -52,9 +54,34 @@ Keep documentation in the same PR as the behavior it describes. When changing a 
 - `docs/installation.md` and `.env.example` for configuration, deployment, secrets, storage, and connector setup changes
 - connector/runbook docs such as `docs/woocommerce.md`, `docs/xero-sync.md`, `docs/woocommerce-live-runbook.md`, and WMS/Mintsoft docs for integration behavior changes
 - `docs/workflows.md` and `npm run docs:workflows` when workflow state transitions change
-- `help-docs/` when user-facing screens, labels, available actions, or support workflows change
+- `help-docs/` when user-facing screens, labels, available actions, or support workflows change. A flagged feature that is switched off is documented as built and switched off, not as live.
 
-If a code change intentionally has no documentation impact, state that in the PR summary or review response so reviewers do not have to infer it.
+### The docs-required check
+
+`npm run check:docs-required` (`scripts/check-docs-required.mjs`) fails a PR that changes a behaviour-bearing path unless the same PR also changes a documentation path, or adds a reasoned opt-out. It runs ungated in `.github/workflows/static-guards.yml` (job `docs-required`), in `npm run validate` and at the end of `npm run check:all`.
+
+It compares `merge-base(base, HEAD)..HEAD`, like `check:migration-conventions`: a pull request against `origin/<base branch>`, a push against the event's `before` SHA (`DOCS_REQUIRED_BASE_REF`, or the first argument). Changes that landed on the base after the branch forked do not count either way. In CI an empty range fails rather than passing on nothing. Locally the default base is `origin/development`, so `git fetch origin` first.
+
+Behaviour-bearing paths:
+
+- `app/**`, `lib/**`, `components/**`
+- `prisma/schema.prisma`, `prisma/migrations/**`
+- `scripts/**` (the operator CLIs, install/update/deploy and one-off scripts that ship), except the tooling listed below
+- `deploy/**`
+- `proxy.ts`, `next.config.ts`, `instrumentation.ts`, `instrumentation-client.ts`, `sentry.*.config.ts`, `prisma.config.ts`
+- `prisma/seed.ts` and `Dockerfile`
+
+Excluded from those (nothing else is): test files (`*.test.*`, `*.spec.*`, `__tests__/`, `__mocks__/`, `deploy/tests/`), type-only declarations (`*.d.ts`), Markdown files (`*.md`), `lib/releases.ts` (release notes data only, written by the release cut; the notification code that reads it is `lib/release-notifications.ts`, which counts as behaviour), and repo tooling under `scripts/`: the CI-only guards listed in `CI_ONLY_GUARDS` in `scripts/check-docs-required.mjs` (each backs a `check:*` script that a workflow runs, and no shipped shell script references it), guard declaration tables (`scripts/*-declarations.ts|mjs`), guard data files (`decimal-boundary-targets.json`, `documented-env-var-allowlist.json`, `archive-sealed-manifest.tsv`), e2e fixtures (`scripts/*-e2e-fixture.ts`), `validate-local.sh`, `validate-db.sh` and `e2e-select.mjs`. Every other `scripts/check-*` file is behaviour, because it ships: `check-db-writers.mjs`, `check-app-db-object-access.mjs`, `check-prisma-drift.mjs` and `check-wms-push-state-enum.mjs` run on hosts from `deploy.sh`, `update.sh` or `install.sh`, `check-so.ts` and `check-bom-recipe-consistency.ts` are operator CLIs, and a new `check-*` script is behaviour until it is added to the list. `tests/scripts/check-docs-required.test.ts` derives the CI-only list from `package.json`, the workflows and the shipped shell scripts (`scripts/{deploy,update,install}.sh`, `deploy/**`), and fails if it drifts or if any excluded `scripts/` file is referenced by a shipped shell script. Paths outside the list (`tests/`, `e2e/`, `.github/`, `package.json`, `types/`, `public/`) never need docs, so a dependency bump passes.
+
+Documentation paths: `docs/**`, `help-docs/**`, `README.md`, `deploy/README.md` and `.env.example`. Plans and notes do not count: `docs/scratch/`, `docs/todo/`, `docs/completed/` and `docs/archive/`. `CLAUDE.md`, `AGENTS.md` and `CHANGELOG.md` do not count either.
+
+**Opt-out.** If a change truly needs no documentation (an internal refactor, a pure bug fix that restores documented behaviour), add one line to the PR's `changelog.d` fragment:
+
+```markdown
+Docs: none — internal refactor of the FIFO consumer, no behaviour or UI change
+```
+
+The separator may be an em dash, an en dash, `-`, `--` or `:`, and the line may be a list item. The reason must be at least 20 characters and not a placeholder (`n/a`, `none`, `tbd`, `<reason>`). Only lines the PR **adds** to a `changelog.d/*.md` fragment count, so an older fragment's marker is never reused. A malformed marker (`Docs: none` with no reason) fails the check even when docs did change. The check prints every reason it accepted, the reviewer sees the line in the diff, and the release cut carries it into `CHANGELOG.md`, so each opt-out stays auditable. The opt-out is in the fragment rather than the PR body because it then travels with the commit, is reviewed in the diff, and the check gives the same answer locally and in CI.
 
 ## Test Commands
 
