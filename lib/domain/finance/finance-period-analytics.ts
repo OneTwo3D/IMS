@@ -120,11 +120,13 @@ export type GrirReportTotals = {
   creditNotesBase: string
   netBase: string
   priceVarianceBase: string
+  /** Per-event FX: the bills' FX difference against the receipt-date valuation (BILL_FX_VARIANCE); informational, outside the balance. */
+  fxVarianceBase: string
   orderCount: string
 }
 
 export const FINANCE_ANALYTICS_EMPTY_TOTALS = {
-  grir: { receivedNotBilledBase: '0', billedNotReceivedBase: '0', creditNotesBase: '0', netBase: '0', priceVarianceBase: '0', orderCount: '0' } satisfies GrirReportTotals,
+  grir: { receivedNotBilledBase: '0', billedNotReceivedBase: '0', creditNotesBase: '0', netBase: '0', priceVarianceBase: '0', fxVarianceBase: '0', orderCount: '0' } satisfies GrirReportTotals,
   vat: { taxableBase: '0', salesTaxBase: '0', purchaseTaxBase: '0', taxBase: '0' } satisfies VatReportTotals,
   arAging: { outstandingBase: '0', creditBalanceBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ArAgingReportTotals,
   apAging: { outstandingBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ApAgingReportTotals,
@@ -180,6 +182,8 @@ export type GrirReportRow = {
   netBase: string
   /** Bills' price difference against the PO valuation (billed - ordered value); informational, outside the balance. */
   priceVarianceBase: string
+  /** Per-event FX: the bills' FX difference (bill-date rate against receipt-date rate) of the billed goods; informational, outside the balance. */
+  fxVarianceBase: string
   /** The date of the oldest event on a line (or credit) that still has a balance, and the whole days from it to the as-of date. */
   oldestOpenDate: string | null
   ageDays: number
@@ -1242,6 +1246,15 @@ type GrirGroupRow = {
  * days from the oldest source event of any line or credit that still has a balance to the as-of date. `dateFrom` plays no part: a balance is cumulative.
  * Orders whose every figure is zero are not listed.
  */
+/**
+ * The GR/IR sub-ledger source types this report knows: the ones it sums into the balance, and the two variances it shows beside it. Literals (this module
+ * does not import the sub-ledger writer); tests/accounting/purchase-event-fx-census.test.ts holds them equal to GRIR_BALANCE_SOURCE_TYPES and
+ * GRIR_VARIANCE_SOURCE_TYPES in lib/domain/accounting/grir-subledger-movement.ts, so a new source type cannot be added without this report learning it.
+ */
+export const GRIR_REPORT_BALANCE_SOURCE_TYPES: readonly string[] = ['RECEIPT', 'BILL', 'BILL_UPDATE', 'SUPPLIER_RETURN', 'SUPPLIER_CREDIT_NOTE', 'OPENING_BALANCE']
+export const GRIR_REPORT_VARIANCE_SOURCE_TYPES: readonly string[] = ['BILL_PRICE_VARIANCE', 'BILL_FX_VARIANCE']
+const GRIR_REPORT_BALANCE_SET: ReadonlySet<string> = new Set(GRIR_REPORT_BALANCE_SOURCE_TYPES)
+
 export async function getGrirReport(
   filters: FinanceAnalyticsFilters = {},
   options: { paginate?: boolean; deps?: FinanceAnalyticsDeps } = {},
@@ -1271,19 +1284,29 @@ export async function getGrirReport(
     creditsShown: Prisma.Decimal
     creditOldest: Date | null
     variance: Prisma.Decimal
+    fxVariance: Prisma.Decimal
   }
   const byPo = new Map<string, PoAccumulator>()
   const older = (a: Date | null, b: Date | null): Date | null => (a === null ? b : b === null ? a : (b.getTime() < a.getTime() ? b : a))
   for (const group of groups) {
     let po = byPo.get(group.poId)
     if (!po) {
-      po = { lines: new Map(), credits: new Prisma.Decimal(0), creditsShown: new Prisma.Decimal(0), creditOldest: null, variance: new Prisma.Decimal(0) }
+      po = { lines: new Map(), credits: new Prisma.Decimal(0), creditsShown: new Prisma.Decimal(0), creditOldest: null, variance: new Prisma.Decimal(0), fxVariance: new Prisma.Decimal(0) }
       byPo.set(group.poId, po)
     }
     const base = toDecimal(group._sum.baseDelta)
+    // EXHAUSTIVE over the sub-ledger's source types (GRIR_REPORT_*_SOURCE_TYPES above): the two variances are
+    // outside the balance, every other known type is a balance movement, and a type this report does not know is refused rather than summed.
     if (group.sourceType === 'BILL_PRICE_VARIANCE') {
       po.variance = po.variance.add(base)
       continue
+    }
+    if (group.sourceType === 'BILL_FX_VARIANCE') {
+      po.fxVariance = po.fxVariance.add(base)
+      continue
+    }
+    if (!GRIR_REPORT_BALANCE_SET.has(group.sourceType)) {
+      throw new Error(`GR/IR report: the sub-ledger holds a movement of source type ${JSON.stringify(group.sourceType)}, which this report does not know; nothing is reported rather than a wrong balance`)
     }
     if (group.sourceType === 'SUPPLIER_CREDIT_NOTE') po.creditsShown = po.creditsShown.add(base)
     if (group.poLineId === null) {
@@ -1335,6 +1358,7 @@ export async function getGrirReport(
       creditNotesBase: moneyString(acc.creditsShown, baseCurrency),
       netBase: moneyString(net, baseCurrency),
       priceVarianceBase: moneyString(acc.variance, baseCurrency),
+      fxVarianceBase: moneyString(acc.fxVariance, baseCurrency),
       oldestOpenDate: oldest ? dateOnly(oldest) : null,
       ageDays: oldest ? Math.max(0, ageDays(asOf, oldest)) : 0,
     })
@@ -1347,6 +1371,7 @@ export async function getGrirReport(
     creditNotesBase: moneyString(sum((row) => row.creditNotesBase), baseCurrency),
     netBase: moneyString(sum((row) => row.netBase), baseCurrency),
     priceVarianceBase: moneyString(sum((row) => row.priceVarianceBase), baseCurrency),
+    fxVarianceBase: moneyString(sum((row) => row.fxVarianceBase), baseCurrency),
     orderCount: String(rows.length),
   }, [
     `The GR/IR balance is as of ${dateOnly(asOf)} (cumulative: the start date plays no part). It holds the GOODS value at the purchase-order valuation; freight and landed cost stay on the Stock in Transit path and are not in it.`,

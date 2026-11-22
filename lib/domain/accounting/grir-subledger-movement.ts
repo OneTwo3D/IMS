@@ -28,6 +28,11 @@ import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib
  *                         variance or landed-cost path exists for a bill whose price differs from the order, so it is kept as its own movement,
  *                         OUTSIDE the GR/IR balance and outside the Xero reclass: the difference stays on Stock in Transit as it always has (the bill
  *                         debits transit at the billed price, the receipt credits it at the PO valuation), now visible per order instead of buried.
+ *   BILL_FX_VARIANCE      per-event FX (switch `purchase_event_fx_rates_enabled`): the base-currency difference between the rate the received
+ *                         goods were valued at and the rate the bill is valued at (positive = the bill costs more in base currency). THE FX
+ *                         DIFFERENCE. A variance like the price difference: OUTSIDE the balance and outside the reclass. RESERVED: no writer
+ *                         yet (the valuation is a later step); every reader already treats it as a variance, so the first row cannot be
+ *                         misread as an accrual.
  *
  * `baseDelta` is written at 6dp; the balance is the sum of the BALANCE source types. Idempotent on `idempotencyKey` (first write wins), so a
  * replayed source event records exactly once. Every writer calls this INSIDE the transaction of its source event, and records whether or not the
@@ -35,8 +40,14 @@ import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib
  */
 export const GRIR_BALANCE_SOURCE_TYPES = ['RECEIPT', 'BILL', 'BILL_UPDATE', 'SUPPLIER_RETURN', 'SUPPLIER_CREDIT_NOTE', 'OPENING_BALANCE'] as const
 export const GRIR_PRICE_VARIANCE_SOURCE_TYPE = 'BILL_PRICE_VARIANCE' as const
+export const GRIR_FX_VARIANCE_SOURCE_TYPE = 'BILL_FX_VARIANCE' as const
+/** The movements kept OUTSIDE the balance and the reclass: the price difference and the FX difference. */
+export const GRIR_VARIANCE_SOURCE_TYPES = [GRIR_PRICE_VARIANCE_SOURCE_TYPE, GRIR_FX_VARIANCE_SOURCE_TYPE] as const
 export type GrirBalanceSourceType = (typeof GRIR_BALANCE_SOURCE_TYPES)[number]
-export type GrirSourceType = GrirBalanceSourceType | typeof GRIR_PRICE_VARIANCE_SOURCE_TYPE
+export type GrirVarianceSourceType = (typeof GRIR_VARIANCE_SOURCE_TYPES)[number]
+export type GrirSourceType = GrirBalanceSourceType | GrirVarianceSourceType
+/** Every source type the sub-ledger records; a reader that meets any other value must treat it as unreadable. */
+export const GRIR_SOURCE_TYPES: readonly GrirSourceType[] = [...GRIR_BALANCE_SOURCE_TYPES, ...GRIR_VARIANCE_SOURCE_TYPES]
 
 export type GrirClient = Pick<Prisma.TransactionClient, 'grirSubledgerMovement' | 'purchaseOrder' | 'purchaseOrderLine' | 'purchaseInvoiceLine'>
 

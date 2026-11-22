@@ -783,11 +783,13 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
   },
 }
 
-/** Every source type the transit sub-ledger records (lib/domain/accounting/transit-subledger-movement.ts), and nothing else is read. */
+/** Every source type the transit sub-ledger records (lib/domain/accounting/transit-subledger-movement.ts TRANSIT_SUBLEDGER_SOURCE_TYPES, held equal by tests/accounting/purchase-event-fx-census.test.ts), and nothing else is read. */
 export const TRANSIT_SOURCE_TYPES: ReadonlyArray<{ type: string }> = [
   { type: 'PURCHASE_BILL' }, { type: 'PURCHASE_BILL_UPDATE' }, { type: 'SUPPLIER_CREDIT_NOTE' }, { type: 'STOCK_RECEIPT' }, { type: 'LANDED_COST_RECLASS' },
   { type: 'LANDED_COST_CONSUMED_OFFSET' }, { type: 'PURCHASE_ORDER_CANCEL' }, { type: 'SUPPLIER_RETURN' }, { type: 'CUSTOMER_RETURN_IN_TRANSIT' },
   { type: 'GRIR_RECLASS' },
+  // Per-event FX (reserved, no writer yet): a purchase FX variance row names its purchase order in source_ref, so it falls to the ELSE branch above.
+  { type: 'PURCHASE_FX_VARIANCE' },
 ]
 
 /**

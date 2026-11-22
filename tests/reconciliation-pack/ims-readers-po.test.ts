@@ -276,3 +276,11 @@ test('xeroPostedRates: reads the connector-confirmed creates of the six posting 
   assert.equal(await reason([row(), row()]), 'DUPLICATE_KEY')
   assert.equal(await reason([row(), row({ id: 'l2' })], 1), 'CAP_EXCEEDED')
 })
+
+// o3d-hqvrp.51 [mutation: PURCHASE_FX_VARIANCE dropped from TRANSIT_SOURCE_TYPES => the section is unreadable]
+test('transitSchedule: a purchase FX variance row (reserved for the per-event FX journal) is read as a row of the order it names', async () => {
+  const client = fake(transitAnswer({ net: [netRow(), netRow({ source_type: 'PURCHASE_FX_VARIANCE', net: '-1.250000' })], orders: [tOrder()], open: [tOrder()] }))
+  const section = await sectionOf('transitSchedule', client, '2026-10-19')
+  assert.ok(section.ok)
+  assert.deepEqual(section.value.net, [{ poId: 'po1', sourceType: 'PURCHASE_BILL', net: '100.500000' }, { poId: 'po1', sourceType: 'PURCHASE_FX_VARIANCE', net: '-1.250000' }])
+})

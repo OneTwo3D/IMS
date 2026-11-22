@@ -219,3 +219,20 @@ test('accounting mapping blocks a save that CHANGES a collision to a different s
   const after = { xero_transit_account: '999', xero_allocated_inventory_account: '999' }
   assert.equal(validateAccountingAccountMapping(after, before).length, 1)
 })
+
+// o3d-hqvrp.51 [mutation: drop the PPV account field, its Xero-only restriction, or any of its three distinct-account rules]
+test('the purchase price variance account is a Xero-only field, saved with the mapping, and may not share Stock in Transit\'s, GR/IR\'s or Inventory Asset\'s code', () => {
+  const ppv = ACCOUNT_FIELDS.find((f) => f.suffix === 'purchase_price_variance_account')!
+  assert.ok(ppv, 'the field exists')
+  assert.equal(isFieldAvailableForConnector(ppv, 'xero'), true)
+  assert.equal(isFieldAvailableForConnector(ppv, OTHER_CONNECTOR), false)
+  assert.equal(buildAccountingSettingsPayload('xero', { xero_purchase_price_variance_account: '510' }).xero_purchase_price_variance_account, '510')
+  for (const [other, pattern] of [['xero_transit_account', /Stock in Transit/], ['xero_grir_account', /GR\/IR/], ['xero_inventory_account', /Inventory Asset/]] as const) {
+    const errors = validateAccountingAccountMapping({ [other]: '510', xero_purchase_price_variance_account: '510' })
+    assert.equal(errors.length, 1, other)
+    assert.match(errors[0]!.message, pattern)
+    assert.match(errors[0]!.message, /Purchase Price Variance/)
+    assert.deepEqual(validateAccountingAccountMapping({ [other]: '511', xero_purchase_price_variance_account: '510' }), [], other)
+  }
+  assert.deepEqual(validateAccountingAccountMapping({ xero_transit_account: '631', xero_purchase_price_variance_account: '' }), [], 'blank is unmapped, not a collision')
+})

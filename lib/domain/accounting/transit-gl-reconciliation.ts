@@ -45,6 +45,8 @@ export { isTransitLedgerCoverageSatisfied }
  *   - PURCHASE_ORDER_CANCEL      (+ reversal DR transit / CR inventory)
  *   - SUPPLIER_RETURN            (+ reversal DR transit / CR inventory)
  *   - CUSTOMER_RETURN_IN_TRANSIT (+ refund COGS reversal DR transit / CR COGS, goods not yet back)
+ *   - GRIR_RECLASS               (± daily-batch GR/IR reclass, only while grir_xero_posting_enabled is on)
+ *   - PURCHASE_FX_VARIANCE       (± per-event FX variance journal vs transit; reserved, no writer yet)
  * Each records a signed row at post time, so Σ subledger movement over the window
  * equals ΔGL transit up to per-posting 2dp rounding — the residue the guarded sweep
  * absorbs. Material gaps (a missing/double posting, or a new uninstrumented transit
