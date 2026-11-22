@@ -2,12 +2,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { getFxRateToBase } from '@/lib/currencies/fx-lookup'
-import { accountingIdProvenanceFor, accountingIdProvenanceMatches } from '@/lib/connectors/accounting-id-provenance'
-import {
-  readXeroSupplierPrepaymentsByReference,
-  type PrepaymentReadDeps,
-  type XeroSupplierPrepayment,
-} from '@/lib/connectors/xero/prepayments'
+import type { PrepaymentReadDeps, XeroSupplierPrepayment } from '@/lib/connectors/xero/prepayments'
 import { headerDiscountFactorForPo } from '@/lib/domain/purchasing/landed-cost-allocation'
 import { isPurchaseEventFxEnabled } from '@/lib/domain/purchasing/purchase-event-fx-settings'
 import { PURCHASE_PRICE_VARIANCE_ACCOUNT_KEY, REALISED_FX_ACCOUNT_KEY } from '@/lib/domain/settings/system-switches'
@@ -88,7 +83,7 @@ export function matchSupplierPrepayment(params: {
     return {
       kind: 'refused',
       reason: `${prepayments.length} Xero supplier prepayments carry the reference ${params.poReference} (${prepayments.map((p) => p.prepaymentId).join(', ')}). `
-        + 'IMS does not choose between them: keep one prepayment per purchase order (void or re-reference the others in Xero), then retry.',
+        + 'IMS does not choose between them: check them in Xero and keep one prepayment per purchase order (void or re-reference the others), then retry.',
     }
   }
   const prepayment = prepayments[0]!
@@ -110,7 +105,7 @@ export function matchSupplierPrepayment(params: {
     return {
       kind: 'refused',
       reason: `The Xero prepayment ${prepayment.prepaymentId} for ${params.poReference} was paid to a different contact (${prepayment.contactId}) than `
-        + `the order's supplier (${params.supplierContactId}). Correct the contact or the reference in Xero, then retry.`,
+        + `the order's supplier (${params.supplierContactId}). Check the prepayment in Xero and correct its contact or reference, then retry.`,
     }
   }
   return { kind: 'found', prepayment }
@@ -153,9 +148,10 @@ async function loadPoForPrepayment(poId: string): Promise<PoForPrepayment | null
 }
 
 /** The supplier's Xero contact id, only if it was issued by the organisation that answered the read (provenance `xero:<tenant>`). */
-function supplierContactFor(po: PoForPrepayment, tenantId: string): string | null {
+async function supplierContactFor(po: PoForPrepayment, tenantId: string): Promise<string | null> {
   const contactId = po.supplier.accountingContactId?.trim()
   if (!contactId) return null
+  const { accountingIdProvenanceFor, accountingIdProvenanceMatches } = await import('@/lib/connectors/accounting-id-provenance')
   if (!accountingIdProvenanceMatches(po.supplier.accountingContactProvenance, accountingIdProvenanceFor('xero', tenantId))) return null
   return contactId
 }
@@ -189,6 +185,8 @@ export async function lookUpPurchaseOrderPrepayment(
   po: PoForPrepayment,
   deps?: PrepaymentReadDeps,
 ): Promise<{ ok: true; match: PrepaymentMatch; tenantId: string } | { ok: false; error: string }> {
+  // Imported where it is used: the receipt action's module graph (which every purchase-order test loads) never pulls in the Xero client.
+  const { readXeroSupplierPrepaymentsByReference } = await import('@/lib/connectors/xero/prepayments')
   const read = await readXeroSupplierPrepaymentsByReference(po.reference, deps)
   if (!read.ok) return { ok: false, error: read.error }
   return {
@@ -197,7 +195,7 @@ export async function lookUpPurchaseOrderPrepayment(
     match: matchSupplierPrepayment({
       poReference: po.reference,
       poCurrency: po.currency,
-      supplierContactId: supplierContactFor(po, read.tenantId),
+      supplierContactId: await supplierContactFor(po, read.tenantId),
       prepayments: read.prepayments,
     }),
   }
@@ -397,7 +395,7 @@ export async function readPurchaseOrderPrepaymentOnDemand(
       return {
         status: 'refused',
         reason: `Receipts of ${po.reference} were already valued at the locked prepayment ${existing.xeroPrepaymentId} (${existing.rateToBase.toString()}); `
-          + `Xero now holds ${found.xeroPrepaymentId} (${found.rateToBase.toString()}). The lock is kept and never revalued; correct it in Xero.`,
+          + `Xero now holds ${found.xeroPrepaymentId} (${found.rateToBase.toString()}). The lock is kept and never revalued; check the prepayment in Xero.`,
       } as const
     }
     await tx.purchaseOrderFxLock.update({ where: { id: existing.id }, data: { ...found, readAt: now, readById: userId } })
