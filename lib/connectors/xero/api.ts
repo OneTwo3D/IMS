@@ -677,7 +677,7 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
     noteRequest(auth.tenantId)
     firstCallAt ??= Date.now()
 
-    const res = await connectorFetch(url, bounded ? { ...init, signal: AbortSignal.timeout(bounded.timeoutMs) } : init, { connectorName: 'Xero' })
+    const res = await connectorFetch(url, init, { connectorName: 'Xero' })
     noteLimitHeaders(auth.tenantId, res)
     if (res.status !== 429) return res
     // A bounded call hands Xero's 429 straight back: no Retry-After sleep, no second attempt.
@@ -876,7 +876,8 @@ async function xeroFetchWithAuth<T = unknown>(
       headers['If-Modified-Since'] = formatIfModifiedSince(opts.ifModifiedSince)
     }
 
-    init = { method, headers }
+    // A bounded call (o3d-0syfq) carries its own hard timeout: the one attempt it makes is aborted past it.
+    init = { method, headers, ...(opts?.bounded ? { signal: AbortSignal.timeout(opts.bounded.timeoutMs) } : {}) }
 
     if (body) {
       headers['Content-Type'] = 'application/json'
