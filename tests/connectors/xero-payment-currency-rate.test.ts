@@ -8,7 +8,8 @@ import test, { mock } from 'node:test'
  * Driven through the REAL processPendingXeroSync with the wire mocked (the harness is the one
  * accounting-payload-connection-provenance.test.ts uses), so what is read back is the exact body that would have left for Xero.
  *
- *  - a foreign bill payment posts `CurrencyRate` = 1 / its stored settlement rate, 6 dp, exactly;
+ *  - a foreign bill payment posts `CurrencyRate` = its stored settlement rate as is, 6 dp, exactly (Xero's payment CurrencyRate is foreign
+ *    per base, IMS's convention; these exact values were 1 / rate until that was found wrong, and were changed deliberately);
  *  - a foreign invoice payment does the same;
  *  - a foreign payment WITHOUT a stored rate sends nothing and fails with a named reason (it is never sent unrated, so Xero never applies its
  *    XE.com day rate);
@@ -274,26 +275,26 @@ async function post(payload: Record<string, unknown>, type: 'BILL_PAYMENT' | 'IN
   return { result, payments, row: state.rows[0]! }
 }
 
-test('a foreign BILL payment posts CurrencyRate = 1 / the stored settlement rate, to 6 dp', async () => {
-  // 1 GBP = 1.17 EUR  ->  1 EUR = 0.854701 GBP (6 dp).
+test('a foreign BILL payment posts CurrencyRate = the stored settlement rate as is, to 6 dp', async () => {
+  // 1 GBP = 1.17 EUR, and Xero holds 1.17 (never 1 / 1.17 = 0.854701).
   const { result, payments } = await post({ ...BILL, currency: 'EUR', settlementRateToBase: 1.17 }, 'BILL_PAYMENT', 'EUR')
   assert.equal(result.succeeded, 1, state.rows[0]!.errorMessage ?? '')
   assert.equal(payments.length, 1)
-  assert.equal((payments[0]!.body as Record<string, unknown>).CurrencyRate, 0.854701)
+  assert.equal((payments[0]!.body as Record<string, unknown>).CurrencyRate, 1.17)
 })
 
-test('a foreign INVOICE payment posts CurrencyRate = 1 / the stored settlement rate, to 6 dp', async () => {
+test('a foreign INVOICE payment posts CurrencyRate = the stored settlement rate as is, to 6 dp', async () => {
   const { result, payments } = await post({ ...BILL, currency: 'USD', settlementRateToBase: 1.25 }, 'INVOICE_PAYMENT', 'USD')
   assert.equal(result.succeeded, 1, JSON.stringify(state.rows[0]))
   assert.equal(payments.length, 1)
-  assert.equal((payments[0]!.body as Record<string, unknown>).CurrencyRate, 0.8)
+  assert.equal((payments[0]!.body as Record<string, unknown>).CurrencyRate, 1.25)
 })
 
 test('the rate sent is the STORED one: a different stored rate gives a different CurrencyRate (no fixed or looked-up value)', async () => {
   const a = await post({ ...BILL, currency: 'EUR', settlementRateToBase: 1.17 }, 'BILL_PAYMENT', 'EUR')
   const b = await post({ ...BILL, currency: 'EUR', settlementRateToBase: 1.3 }, 'BILL_PAYMENT', 'EUR')
-  assert.equal((a.payments[0]!.body as Record<string, unknown>).CurrencyRate, 0.854701)
-  assert.equal((b.payments[0]!.body as Record<string, unknown>).CurrencyRate, 0.769231)
+  assert.equal((a.payments[0]!.body as Record<string, unknown>).CurrencyRate, 1.17)
+  assert.equal((b.payments[0]!.body as Record<string, unknown>).CurrencyRate, 1.3)
 })
 
 for (const type of ['BILL_PAYMENT', 'INVOICE_PAYMENT'] as const) {

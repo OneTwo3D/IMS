@@ -21,8 +21,8 @@
  *   THE RATE RULE. A business date maps to the END of that day, UTC (endOfBusinessDateUtc, lib/currencies/fx-select.ts: the one date rule). The
  *   IMS rate is selectFxRateFromRows over the fx_rates rows read in one snapshot, with that instant (the pure half of lib/currencies/fx-lookup.ts
  *   getFxRateToBase: the latest row on or before the instant, a tie accepted only when the rows agree, a bad row refused). IMS stores 1 base = r
- *   foreign; Xero's CurrencyRate is 1 foreign = x base, so the IMS rate is converted by imsRateToXeroCurrencyRate (x = 1 / r, six decimals: the
- *   function that produced the rate IMS sent). Both rates are then rounded half up to six decimal places and must be EQUAL: the catalogue's
+ *   foreign and Xero's CurrencyRate is the SAME convention (1 base = x foreign), so the IMS rate is put in Xero's form by imsRateToXeroCurrencyRate
+ *   (x = r to six decimals, never inverted: the function that produced the rate IMS sent). Both rates are then rounded half up to six decimal places and must be EQUAL: the catalogue's
  *   tolerance is absolute 0, so a difference of one millionth is a finding.
  *
  *   IMS POSTINGS (Codex round 2). A record IMS posted (an IMS sync record, connector-confirmed, names its Xero id) is held to the rate that posting CARRIED, converted

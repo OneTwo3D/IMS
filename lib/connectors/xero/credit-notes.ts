@@ -885,7 +885,7 @@ export function deriveCreditNoteRefundIdempotencyKey(rowKey: string, creditNoteI
 
 /**
  * Pay a posted sales credit note OUT as a refund: a Xero Payment against the credit note (`CreditNote.CreditNoteID`, the refund shape of the Payments
- * API) from the bank or clearing account the original receipt used. `currencyRate` is IMS's settlement rate for the cash-out (1 / rate, 6 dp, absent
+ * API) from the bank or clearing account the original receipt used. `currencyRate` is IMS's settlement rate for the cash-out (the rate as is, 6 dp, never inverted; absent
  * for a base-currency refund), so Xero books the realised FX gain or loss at IMS's rate - the same field and the same rate source a receipt carries.
  *
  * Idempotent: the credit note's RemainingCredit is read first and a refund larger than it is REFUSED (nothing sent). A retry of a refund that

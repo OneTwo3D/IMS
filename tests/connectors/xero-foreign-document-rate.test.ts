@@ -11,13 +11,14 @@ import type { BillData, CreditNoteData, InvoiceData } from '@/lib/connectors/typ
  *
  *  - a foreign sales invoice, bill, sales credit note and supplier credit note WITHOUT a usable rate is refused BEFORE any request: no contact is
  *    created, no item is created, nothing is posted (the pure builders THROW, the push functions return a named failure);
- *  - a foreign document WITH a rate carries CurrencyRate = 1 / rate, to 6 dp, exactly;
+ *  - a foreign document WITH a rate carries CurrencyRate = the rate as is, to 6 dp, exactly (Xero's CurrencyRate is foreign per base, IMS's
+ *    convention: never inverted; the exact values here were 1 / rate until that was found wrong, and were changed deliberately);
  *  - a BASE-currency document is unchanged: with no rate it carries none, with a rate it carries it.
  *
  * Named mutations (each shown red, restored from a copy, md5-verified):
  *  a  rate-check-removed     xeroCurrencyRateOrRefuse returns undefined instead of throwing for a foreign document: every "refused" arm goes red
  *  b  every-currency-base    isForeignCurrency always answers false: every "refused" arm goes red
- *  c  rate-not-inverted      the rate is sent as given instead of 1/rate: every exact-value arm goes red
+ *  c  rate-inverted          the rate is sent as 1/rate instead of as given: every exact-value arm goes red
  *  d  prepare-check-late     the early check in a push function is removed (the builder still throws): the "no contact created" arm goes red
  */
 
@@ -63,7 +64,7 @@ const credit = (extra: Partial<CreditNoteData> = {}): CreditNoteData => ({
 
 const UNUSABLE: Array<[string, unknown]> = [
   ['missing', undefined], ['null', null], ['zero', 0], ['negative', -1.17], ['NaN', Number.NaN], ['Infinity', Number.POSITIVE_INFINITY],
-  ['so large it rounds to zero', 1e12],
+  ['so small it rounds to zero', 1e-7], ['too large for Decimal(18,6)', 1e12],
 ]
 
 // ---- the pure builders THROW ---------------------------------------------------------------------------------------------------------
@@ -80,11 +81,11 @@ for (const [label, rate] of UNUSABLE) {
   })
 }
 
-test('builders: a foreign document WITH a rate carries CurrencyRate = 1 / rate, to 6 dp, exactly', async () => {
+test('builders: a foreign document WITH a rate carries CurrencyRate = the rate as is, to 6 dp, exactly', async () => {
   const { buildSalesInvoicePayload } = await import('@/lib/connectors/xero/invoices')
   const { buildPurchaseBillPayload } = await import('@/lib/connectors/xero/bills')
   const { buildXeroPurchaseCreditNote } = await import('@/lib/connectors/xero/credit-notes')
-  for (const [rate, expected] of [[1.17, 0.854701], [1.25, 0.8], [0.8, 1.25], [3, 0.333333], [1.1234567, 0.89011]] as const) {
+  for (const [rate, expected] of [[1.17, 1.17], [1.25, 1.25], [0.8, 0.8], [3, 3], [1.1234567, 1.123457], [1.3125, 1.3125], [190, 190]] as const) {
     assert.equal(buildSalesInvoicePayload(invoice({ currencyRateToBase: rate }), 'AUTHORISED', 'c1', new Set(), 'GBP').CurrencyRate, expected, `invoice ${rate}`)
     assert.equal(buildPurchaseBillPayload(billData({ currencyRateToBase: rate }), 'AUTHORISED', 'c1', 'GBP').CurrencyRate, expected, `bill ${rate}`)
     assert.equal(buildXeroPurchaseCreditNote(credit({ currencyRateToBase: rate }), 'AUTHORISED', 'c1', 'GBP').CurrencyRate, expected, `credit note ${rate}`)
@@ -142,7 +143,7 @@ test('push: a foreign SUPPLIER credit note without a rate is refused before the 
   assert.equal(contactResolves, 0)
 })
 
-test('push: a foreign document WITH a rate posts, carrying 1 / rate on the body that leaves', async () => {
+test('push: a foreign document WITH a rate posts, carrying the rate as is on the body that leaves', async () => {
   const { pushSalesInvoice } = await import('@/lib/connectors/xero/invoices')
   const { pushPurchaseBill } = await import('@/lib/connectors/xero/bills')
   const { pushCreditNote, pushPurchaseCreditNote } = await import('@/lib/connectors/xero/credit-notes')
@@ -154,7 +155,7 @@ test('push: a foreign document WITH a rate posts, carrying 1 / rate on the body 
   })).success, true)
   const posts = wire.filter((w) => w.method !== 'GET')
   assert.equal(posts.length, 4)
-  for (const post of posts) assert.equal(post.body!.CurrencyRate, 0.854701, post.path)
+  for (const post of posts) assert.equal(post.body!.CurrencyRate, 1.17, post.path)
 })
 
 test('push: a base-currency document posts exactly as before - no rate, no CurrencyRate', async () => {
