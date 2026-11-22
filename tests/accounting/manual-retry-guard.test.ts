@@ -698,11 +698,12 @@ test('a LIVE sibling blocks the revival, whatever the token says (o3d-0m56)', ()
   }
 })
 
-test('BILL_PAYMENT is fenced by the MONEY argument, not the index (o3d-0m56)', () => {
-  // accounting_sync_logs_followup_live_unique does not cover BILL_PAYMENT, so nothing in the
-  // database stops two live rows for one bill. Two live rows is two supplier payments.
-  assert.equal(isLiveUniqueFollowUpType('BILL_PAYMENT'), false, 'the index really does not cover it')
-  assert.equal(revivesAtMostOnePerScope('BILL_PAYMENT'), true, 'and the guard must cover it anyway')
+test('BILL_PAYMENT is fenced per BILL: the index keys it on its document anchors, and the money argument decides (o3d-0m56, o3d-0lpnb L7)', () => {
+  // accounting_sync_logs_followup_live_unique covers BILL_PAYMENT since 20260819120000, keyed on the
+  // payload's accountingInvoiceId as well as the scope, so it stops two live rows for one BILL but
+  // not two live rows for two bills of one scope. Two live rows for one bill is two supplier payments.
+  assert.equal(isLiveUniqueFollowUpType('BILL_PAYMENT'), true, 'the index covers it (per bill)')
+  assert.equal(revivesAtMostOnePerScope('BILL_PAYMENT'), true, 'and the guard covers it')
 
   const shared = 'bill-payment:1'
   const bill = (accountingInvoiceId: string) =>
@@ -748,21 +749,28 @@ test('at most ONE row per scope is revived, and it is the oldest POSTABLE one (o
   assert.match(deferredRevivalReason('SalesOrder so-1', 'log-mid'), /Only one entry for SalesOrder so-1/)
 })
 
-test('the guard\'s live-unique type set matches the migration (o3d-0m56)', async () => {
+test('the guard\'s live-unique type set matches the LATEST migration that defines the index (o3d-0m56, o3d-0lpnb L7)', async () => {
   // The guard decides what may be revived from a copy of the index's WHERE clause. A migration
-  // that adds a type without updating the copy reintroduces the bulk-rollback bug silently.
-  const sql = await readFile(
-    path.join(process.cwd(), 'prisma/migrations/20260615000000_followup_unique_index_add_credit_note_allocation/migration.sql'),
-    'utf8',
-  )
-  const create = sql.slice(sql.lastIndexOf('CREATE UNIQUE INDEX "accounting_sync_logs_followup_live_unique"'))
-  const types = [...create.matchAll(/'([A-Z_]+)'/g)].map((m) => m[1]!)
+  // that adds a type without updating the copy reintroduces the bulk-rollback bug silently. The
+  // newest migration that (re)creates the index is the one in force, so that is the one read.
+  const { readdir } = await import('node:fs/promises')
+  const dir = path.join(process.cwd(), 'prisma/migrations')
+  const MARK = 'CREATE UNIQUE INDEX "accounting_sync_logs_followup_live_unique"'
+  let latest: string | null = null
+  for (const name of (await readdir(dir)).sort()) {
+    const sql = await readFile(path.join(dir, name, 'migration.sql'), 'utf8').catch(() => '')
+    if (sql.includes(MARK)) latest = sql
+  }
+  assert.ok(latest, 'a migration defines the index')
+  const create = latest!.slice(latest!.lastIndexOf(MARK))
+  const where = create.slice(create.indexOf('WHERE'), create.indexOf(';'))
+  const types = [...where.matchAll(/'([A-Z_]+)'/g)].map((m) => m[1]!)
     .filter((t) => !['PENDING', 'PROCESSING', 'SYNCED'].includes(t))
-  assert.ok(types.length >= 6, 'the index must still list its types')
+  assert.ok(types.includes('CREDIT_NOTE_ALLOCATION') && types.includes('BILL_PAYMENT'), `the latest index lists its types (${types.join(', ')})`)
   for (const type of types) {
     assert.equal(isLiveUniqueFollowUpType(type), true, `${type} is in the index and must be in the guard`)
   }
-  for (const type of ['SALES_INVOICE', 'COGS_JOURNAL', 'BILL_PAYMENT']) {
+  for (const type of ['SALES_INVOICE', 'COGS_JOURNAL', 'CREDIT_NOTE']) {
     assert.equal(isLiveUniqueFollowUpType(type), false, `${type} is NOT in the index`)
   }
 })

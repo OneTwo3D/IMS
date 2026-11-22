@@ -2596,6 +2596,14 @@ model SalesOrderRefund {
   /// o3d-k26m.17: what the storefront refund actually paid out (the WooCommerce `amount`), recorded only when the credit note credits more (the fee gap above).
   /// A gateway refund payment against the credit note is held to this. NULL otherwise.
   storefrontAmountForeign Decimal? @db.Decimal(18, 4) @map("storefront_amount_foreign")
+  /// o3d-pnc8p: the open fee repayment (easFeeGapForeign > 0) is cleared only by an operator's "repayment applied" acknowledgement, as o3d-ioss-xero 0.2.6 keeps `_o3d_ioss_fee_open`.
+  feeRepaymentAppliedAt   DateTime? @map("fee_repayment_applied_at")
+  feeRepaymentAppliedBy   String?   @map("fee_repayment_applied_by")
+  feeRepaymentAppliedNote String?   @map("fee_repayment_applied_note")
+  /// #1127 R1 M6: the Xero credit notes IMS did not raise that the duplicate check last held this refund on ({ creditNoteId, creditNoteNumber, status, total, date }[]); null when none.
+  creditNoteDuplicateHold Json?     @map("credit_note_duplicate_hold")
+  /// #1127 R1 M6: the operator's "not a duplicate" acknowledgements ({ creditNoteId, creditNoteNumber, by, reason, at }[]); the duplicate test skips those credit notes.
+  creditNoteNotDuplicate  Json?     @map("credit_note_not_duplicate")
   /// A storefront refund that returns quantity owes the storefront a stock correction (the store raised its own
   /// stock for it before IMS heard). Written TRUE in the refund's own transaction, so a refund can never commit
   /// without the obligation; FALSE for every other refund (manual, money-only, chargeback) and every row that
@@ -6514,4 +6522,13 @@ model WcWithdrawalOutcome {
 
   @@unique([orderId, requestKey, outcomeKind], map: "wc_withdrawal_outcomes_once_key")
   @@map("wc_withdrawal_outcomes")
+}
+
+/// #1127 R2 MED-1: the Xero calls credit-note settlements and duplicate checks spent per UTC day (lib/connectors/xero/sync-processor.ts spendSettlementXeroCalls),
+/// shared by every sync run on every host; the daily cap keeps them well clear of the organisation's Xero allowance, which Xeroom shares.
+model XeroSettlementCallBudget {
+  day  DateTime @id @db.Date
+  used Int      @default(0)
+
+  @@map("xero_settlement_call_budget")
 }

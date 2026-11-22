@@ -774,7 +774,18 @@ export async function allocatePurchaseCreditNote(
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 
 export type CreditNoteSettlementBalances =
-  | { ok: true; remainingCredit: number; amountDue: number | null; /** The invoice's AmountPaid in Xero (cash receipts and applied credit); null when no invoice was asked for. */ amountPaid: number | null; creditNoteStatus: string | null }
+  | {
+      ok: true
+      remainingCredit: number
+      amountDue: number | null
+      /** The invoice's AmountPaid in Xero: "sum of payments received for invoice", cash receipts only (applied credit is AmountCredited, not read). Null when no invoice was asked for or it is unreadable. */
+      amountPaid: number | null
+      creditNoteStatus: string | null
+      /** o3d-0lpnb: the credit note's Total (null when unreadable), so a credit note IMS did not raise that credits exactly this much can be held as a possible duplicate. */
+      creditNoteTotal?: number | null
+      /** o3d-pnc8p (IOSS case 2): the invoice's Status; a VOIDED invoice (a combined order) is never settled against. Null when not asked for or unreadable. */
+      invoiceStatus?: string | null
+    }
   | { ok: false; error: string }
 
 /**
@@ -783,26 +794,29 @@ export type CreditNoteSettlementBalances =
  * Reads only; it is called before the claim fence and writes nothing.
  */
 export async function readCreditNoteSettlementBalances(creditNoteId: string, invoiceId: string | null): Promise<CreditNoteSettlementBalances> {
-  const cnRes = await xeroGet<{ CreditNotes?: Array<{ CreditNoteID?: string; RemainingCredit?: unknown; Status?: unknown }> }>(`CreditNotes/${creditNoteId}`)
+  const cnRes = await xeroGet<{ CreditNotes?: Array<{ CreditNoteID?: string; RemainingCredit?: unknown; Status?: unknown; Total?: unknown }> }>(`CreditNotes/${creditNoteId}`)
   if (!cnRes.ok) return { ok: false, error: cnRes.error ?? 'Credit note not found in Xero for allocation' }
-  const cnRead = readSingleXeroDocument<{ CreditNoteID?: string; RemainingCredit?: unknown; Status?: unknown }>(cnRes.data, 'CreditNotes', 'CreditNoteID', creditNoteId)
+  const cnRead = readSingleXeroDocument<{ CreditNoteID?: string; RemainingCredit?: unknown; Status?: unknown; Total?: unknown }>(cnRes.data, 'CreditNotes', 'CreditNoteID', creditNoteId)
   if (cnRead.status === 'unreadable') return { ok: false, error: `Credit note not read from Xero for settlement: ${cnRead.reason}` }
   const remainingCredit = readXeroBalance(cnRead.document.RemainingCredit)
   if (remainingCredit === null) return { ok: false, error: 'Credit note read from Xero states no readable RemainingCredit, so IMS cannot tell how much can be settled' }
   const creditNoteStatus = typeof cnRead.document.Status === 'string' ? cnRead.document.Status : null
+  const creditNoteTotal = readXeroBalance(cnRead.document.Total)
   let amountDue: number | null = null
   let amountPaid: number | null = null
+  let invoiceStatus: string | null = null
   if (invoiceId) {
     const invRes = await xeroGet<XeroInvoiceDueResponse>(`Invoices/${invoiceId}`)
     if (!invRes.ok) return { ok: false, error: invRes.error ?? 'Invoice not found in Xero for settlement' }
-    const invRead = readSingleXeroDocument<{ InvoiceID?: string; AmountDue?: unknown; AmountPaid?: unknown }>(invRes.data, 'Invoices', 'InvoiceID', invoiceId)
+    const invRead = readSingleXeroDocument<{ InvoiceID?: string; AmountDue?: unknown; AmountPaid?: unknown; Status?: unknown }>(invRes.data, 'Invoices', 'InvoiceID', invoiceId)
     if (invRead.status === 'unreadable') return { ok: false, error: `Invoice not read from Xero for settlement: ${invRead.reason}` }
     amountDue = readXeroBalance(invRead.document.AmountDue)
     if (amountDue === null) return { ok: false, error: 'Invoice read from Xero states no readable AmountDue, so IMS cannot tell how much can be allocated' }
     // o3d-0olzx: what Xero says the invoice has RECEIVED. Unreadable is UNKNOWN (null), never zero: the refund path refuses on it, the allocation path does not need it.
     amountPaid = readXeroBalance(invRead.document.AmountPaid)
+    invoiceStatus = typeof invRead.document.Status === 'string' ? invRead.document.Status.toUpperCase() : null
   }
-  return { ok: true, remainingCredit, amountDue, amountPaid, creditNoteStatus }
+  return { ok: true, remainingCredit, amountDue, amountPaid, creditNoteStatus, creditNoteTotal, invoiceStatus }
 }
 
 /** The Idempotency-Key for ONE refund payment (<= 128 chars): the row's key plus the exact request, so a changed request never reuses a key. */

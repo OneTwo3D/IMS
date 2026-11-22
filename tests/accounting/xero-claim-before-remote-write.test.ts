@@ -287,7 +287,7 @@ test('both sweep paths open the lease before posting and anchor the persist to t
   }
 
   // And the outbox path must pass its job in, or the queue-side lock is never renewed.
-  const outboxLease = lines.findIndex((line) => line.includes('openRemoteWriteLease(entry.id, claimedAt, job)'))
+  const outboxLease = lines.findIndex((line) => line.includes('openRemoteWriteLease(entry.id, claimedAt, job') /* #1127 R2: followed by the custody options for STAMPING_CUSTODY_KEPT_TYPES */)
   assert.ok(outboxLease > 0,
     'the outbox path must hand its job to the lease so every fence renews the OUTBOX lock as well as the row claim')
 })
