@@ -454,8 +454,8 @@ test('o3d-jit6 r1#2: the fence writes the claim renewal and the dispatch record 
     source.indexOf('function lostClaimMessage('),
   )
   assert.equal((renew.match(/await db\.accountingSyncLog\./g) ?? []).length, 1, 'exactly one write')
-  assert.match(renew, /data: write \? \{ processingStartedAt: renewedAt, \.\.\.write \} : \{ processingStartedAt: renewedAt \}/)
-  assert.match(renew, /where: \{ \.\.\.heldClaimWhere\(entryId, held\), connector: XERO_CONNECTOR, \.\.\.xeroNotBeforeCutoffWhere\(xeroCutoffFloor\(\)\) \}/,
+  assert.match(renew, /data: write \? \{ processingStartedAt: renewedAt, attemptStampingCustodyAt: renewedAt, \.\.\.write \} : \{ processingStartedAt: renewedAt, attemptStampingCustodyAt: renewedAt \}/ /* #1127 R1 M1: the renewal re-asserts stamping custody in the same statement */)
+  assert.match(renew, /where: \{ \.\.\.heldClaimWhere\(entryId, held\), connector: XERO_CONNECTOR, \.\.\.xeroNotBeforeCutoffWhere\(xeroCutoffFloor\(\)\), AND: \[CUSTODY_MAY_BE_RESTORED\] \}/ /* #1127 R1 M1: and the claim's custody refusal */,
     'and the mint is scoped to the claim (and to the cut-off of that moment), so only the worker that owns the row can record a dispatch for it')
 })
 
