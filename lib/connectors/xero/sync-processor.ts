@@ -5368,6 +5368,157 @@ export const REALISED_FX_JOURNAL_RETIRED_REASON =
 export const UNREALISED_FX_JOURNAL_RETIRED_REASON =
   'Retired, not sent: Xero revalues open foreign-currency invoices, bills and bank balances itself in its reports (unrealised currency gains), so an IMS-generated revaluation or reversal journal would count the same movement twice.'
 
+/**
+ * o3d-n2ci4 (#1135 review MED-1): THE NOTICE FOR A RETIRED FX JOURNAL ROW THAT MAY HAVE REACHED XERO. Exported so a test pins the words.
+ *
+ * A row whose record carries a create-dispatch marker, a remote-attempt stamp or a document id was, or may have been, sent by an earlier
+ * attempt: "Retired, not sent" would be a claim IMS cannot make. It is parked FAILED for a person instead, naming where to look.
+ */
+export function fxJournalMayHavePostedNotice(params: { type: 'REALISED_FX_JOURNAL' | 'UNREALISED_FX_JOURNAL'; reference: string | null; evidence: string }): string {
+  const where = params.type === 'UNREALISED_FX_JOURNAL'
+    ? `Xero Manual Journals with the reference ${params.reference ?? 'FXREV-<valuation date>'}`
+    : `Xero Manual Journals for ${params.reference ? `the reference ${params.reference}` : 'this settlement'} (narration "Realised FX ...")`
+  return withLedgerCheck(`Not sent now, and NOT retired as "not sent": this ${params.type} may have posted on an earlier attempt (${params.evidence}). `
+    + `IMS no longer posts this journal because Xero books currency gains itself, so if it did post it is a second booking. `
+    + `Check ${where}: if it is there, reverse it by hand in Xero; if it is not, nothing is owed. IMS will not send or re-queue this row.`)
+}
+
+/**
+ * o3d-n2ci4 (#1135 review MED-2): THE ACTIVITY TEXT FOR A RETIRED REVERSAL WHOSE SOURCE REVALUATION POSTED. Exported so a test pins the words.
+ *
+ * The generic retirement reason says sending the journal would count a movement twice, which is true of a revaluation and FALSE of the
+ * reversal of one that already posted: not sending it is what leaves the IMS revaluation standing in Xero beside Xero's own.
+ */
+export function fxReversalOfPostedRevaluationNotice(params: { sourceEntryId: string; sourceJournalId: string | null; reference: string | null; sourceValuationDate: string | null }): string {
+  const journal = params.sourceJournalId ? `Xero manual journal ${params.sourceJournalId}` : 'its Xero manual journal (no id recorded on the row)'
+  return `Retired, not sent: the reversal of the unrealised FX revaluation${params.sourceValuationDate ? ` of ${params.sourceValuationDate}` : ''} `
+    + `(sync row ${params.sourceEntryId}). That revaluation POSTED to Xero as ${journal}${params.reference ? `, reference ${params.reference}` : ''}, `
+    + 'and IMS no longer posts revaluation journals or their reversals, so it stays in Xero\'s books beside Xero\'s own revaluation and '
+    + 'counts the same movement twice until someone reverses it. Reverse that journal by hand in Xero, then mark the exception-inbox row handled.'
+}
+
+type FxRetirementSource = { status: string; externalTransactionId: string | null; connector: string } | null
+
+/**
+ * THE ONE RETIREMENT OF A RETIRED FX JOURNAL ROW (REALISED_FX_JOURNAL / UNREALISED_FX_JOURNAL). Sends nothing in any branch.
+ *
+ *   - MAY HAVE POSTED (createDispatchedAt / remoteAttemptedAt / externalTransactionId on the row): parked FAILED, retries spent, claim- and
+ *     attempt-fenced, with the mirrored event, as every terminal failure (the escalateWait pattern; retire-held-backlog's PARK). Never
+ *     CANCELLED "not sent", which would tell the operator the wrong thing.
+ *   - OTHERWISE: CANCELLED with the reason, claim-fenced (retireOverSettlingInvoicePayment), as #1135 shipped.
+ *   - AND a reversal whose source revaluation is SYNCED (or carries a document id): logged at ERROR with the corrected text, and recorded
+ *     in the exception inbox (AccountingPostingRefusal, kind unrealised_fx_journal) naming the Xero journal, where it stands until someone
+ *     marks it handled. Only when THIS attempt retired the row: a lost claim retires nothing and the new holder reports it.
+ */
+async function retireFxJournalRow(args: {
+  entryId: string
+  type: 'REALISED_FX_JOURNAL' | 'UNREALISED_FX_JOURNAL'
+  referenceType: string
+  referenceId: string
+  payload: SyncPayload
+  lease: RemoteWriteLease
+  attempt: AttemptRef
+}): Promise<EntryResult> {
+  const { entryId, type, referenceType, referenceId, payload, lease, attempt } = args
+  const realised = type === 'REALISED_FX_JOURNAL'
+  const reason = realised ? REALISED_FX_JOURNAL_RETIRED_REASON : UNREALISED_FX_JOURNAL_RETIRED_REASON
+  const action = realised ? 'xero_realised_fx_journal_retired' : 'xero_unrealised_fx_journal_retired'
+  const kind = typeof payload.kind === 'string' ? payload.kind : null
+  const reference = typeof payload.reference === 'string' && payload.reference ? payload.reference : null
+
+  const own = await db.accountingSyncLog.findUnique({
+    where: { id: entryId },
+    select: { createDispatchedAt: true, remoteAttemptedAt: true, externalTransactionId: true },
+  })
+  const evidence = [
+    own?.createDispatchedAt ? `a create-dispatch marker at ${own.createDispatchedAt.toISOString()}` : null,
+    own?.remoteAttemptedAt ? `a remote attempt at ${own.remoteAttemptedAt.toISOString()}` : null,
+    own?.externalTransactionId ? `the document id ${own.externalTransactionId}` : null,
+  ].filter((e): e is string => e !== null)
+
+  if (evidence.length > 0) {
+    const notice = fxJournalMayHavePostedNotice({ type, reference, evidence: evidence.join(', ') })
+    const parked = await db.$transaction(async (tx) => {
+      const written = await tx.accountingSyncLog.updateMany({
+        where: { ...heldClaimWhere(entryId, lease), attemptRevision: attempt.attemptRevision, connector: XERO_CONNECTOR },
+        data: { status: 'FAILED', retryCount: MAX_RETRIES, errorMessage: notice, processingStartedAt: null },
+      })
+      if (written.count === 1) {
+        await updateMirroredEventForSyncLog(tx, { syncLogId: entryId, type, referenceType, referenceId, payload, status: 'FAILED', message: notice })
+      }
+      return written.count === 1
+    })
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: realised ? 'xero_realised_fx_journal_parked_may_have_posted' : 'xero_unrealised_fx_journal_parked_may_have_posted',
+      tag: 'accounting',
+      level: parked ? 'ERROR' : 'INFO',
+      description: parked
+        ? `${notice} (sync row ${entryId}, ${referenceType} ${referenceId}).`
+        : `Not parked by this attempt: sync row ${entryId} (${type}, ${referenceType} ${referenceId}) is no longer held by it, so the attempt that now holds it decides. Nothing was sent.`,
+      metadata: { syncLogId: entryId, referenceType, referenceId, kind, parked, evidence },
+    }).catch(() => { /* logging must never turn a safe park into a failure */ })
+    return { success: true, skipped: true }
+  }
+
+  // A reversal names the revaluation it undoes. Read BEFORE the retirement, so the report below states what the reversal was for.
+  const sourceEntryId = !realised && kind === 'reversal' && typeof payload.sourceEntryId === 'string' ? payload.sourceEntryId : null
+  const source: FxRetirementSource = sourceEntryId
+    ? await db.accountingSyncLog.findUnique({ where: { id: sourceEntryId }, select: { status: true, externalTransactionId: true, connector: true } })
+    : null
+  const sourcePosted = source !== null && source.connector === XERO_CONNECTOR && (source.status === 'SYNCED' || source.externalTransactionId != null)
+
+  const retired = await db.$transaction((tx) => retireOverSettlingInvoicePayment(tx, { entryId, claim: lease, reason }))
+
+  if (sourcePosted && sourceEntryId) {
+    const sourceValuationDate = typeof payload.sourceValuationDate === 'string' ? payload.sourceValuationDate : null
+    const description = fxReversalOfPostedRevaluationNotice({ sourceEntryId, sourceJournalId: source.externalTransactionId, reference, sourceValuationDate })
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: retired ? 'xero_unrealised_fx_reversal_retired_source_posted' : 'xero_unrealised_fx_journal_not_retired_claim_moved',
+      tag: 'accounting',
+      level: retired ? 'ERROR' : 'INFO',
+      description: retired
+        ? `${description} (sync row ${entryId}, ${referenceType} ${referenceId}).`
+        : `Not retired by this attempt: sync row ${entryId} (${type}, ${referenceType} ${referenceId}) is no longer held by it, so the attempt that now holds it decides. Nothing was sent.`,
+      metadata: { syncLogId: entryId, referenceType, referenceId, kind, retired, sourceEntryId, sourceStatus: source.status, sourceJournalId: source.externalTransactionId },
+    }).catch(() => { /* logging must never turn a safe retirement into a failure */ })
+    if (retired) {
+      // THE STANDING FINDING: outstanding work in the exception inbox, keyed on this reversal's own posting, so it stays listed until a
+      // person marks it handled (nothing will ever queue this posting again: the enqueue chokepoint suppresses it).
+      try {
+        await recordAccountingPostingRefusal(
+          db as unknown as PostingRefusalClient,
+          accountingPostingKey({ type, referenceType, referenceId, idempotencyKey: typeof payload._idempotencyKey === 'string' ? payload._idempotencyKey : undefined, payload }),
+          {
+            kind: 'unrealised_fx_journal',
+            chartConnector: XERO_CONNECTOR,
+            activeConnector: XERO_CONNECTOR,
+            reason: 'retired_reversal_source_posted',
+            committed: `the unrealised FX revaluation${sourceValuationDate ? ` of ${sourceValuationDate}` : ''} posted to Xero as ${source.externalTransactionId ? `manual journal ${source.externalTransactionId}` : 'a manual journal (no id recorded)'} and its reversal was retired unsent`,
+            remedy: `Reverse ${source.externalTransactionId ? `Xero manual journal ${source.externalTransactionId}` : 'that Xero manual journal'}${reference ? ` (reference ${reference})` : ''} by hand in Xero, then mark this row handled.`,
+            detail: { syncLogId: entryId, sourceEntryId, sourceJournalId: source.externalTransactionId, sourceStatus: source.status, sourceValuationDate, reference },
+          },
+        )
+      } catch { /* the ERROR above already names it */ }
+    }
+    return { success: true, skipped: true }
+  }
+
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: retired ? action : realised ? 'xero_realised_fx_journal_not_retired_claim_moved' : 'xero_unrealised_fx_journal_not_retired_claim_moved',
+    tag: 'accounting',
+    // #1135 review LOW-1: only a retirement this attempt made is reported as one.
+    level: retired ? 'WARNING' : 'INFO',
+    description: retired
+      ? `${reason} (sync row ${entryId}, ${referenceType} ${referenceId}).`
+      : `Not retired by this attempt: sync row ${entryId} (${type}, ${referenceType} ${referenceId}) is no longer held by it, so the attempt that now holds it decides. Nothing was sent.`,
+    metadata: { syncLogId: entryId, referenceType, referenceId, ...(realised ? {} : { kind }), retired },
+  }).catch(() => { /* logging must never turn a safe retirement into a failure */ })
+  return { success: true, skipped: true }
+}
+
 function resolveInvoiceStatus(mode: unknown): string {
   return mode === 'draft' ? 'DRAFT' : 'AUTHORISED'
 }
@@ -7713,20 +7864,8 @@ export async function processClaimedEntry(
       // reason on the row, claim-fenced, before any request. Skipping it is the safe direction in both ways it could be wrong: if its payment
       // was also queued, sending both would book the gain or loss twice; if its payment already posted without a rate, the journal would
       // still be a second booking of what Xero already recorded. `computeRealisedFx` stays, for the IMS FX gain/loss report only.
-      const retired = await db.$transaction((tx) => retireOverSettlingInvoicePayment(tx, {
-        entryId,
-        claim: lease,
-        reason: REALISED_FX_JOURNAL_RETIRED_REASON,
-      }))
-      await logActivity({
-        entityType: 'SYSTEM',
-        action: 'xero_realised_fx_journal_retired',
-        tag: 'accounting',
-        level: 'WARNING',
-        description: `${REALISED_FX_JOURNAL_RETIRED_REASON} (sync row ${entryId}, ${referenceType} ${referenceId}).`,
-        metadata: { syncLogId: entryId, referenceType, referenceId, retired },
-      }).catch(() => { /* logging must never turn a safe retirement into a failure */ })
-      return { success: true, skipped: true }
+      // o3d-n2ci4: a row whose record shows it MAY have reached Xero is parked FAILED for a person, never CANCELLED as "not sent".
+      return retireFxJournalRow({ entryId, type, referenceType, referenceId, payload, lease, attempt })
     }
 
     case 'UNREALISED_FX_JOURNAL': {
@@ -7737,20 +7876,11 @@ export async function processClaimedEntry(
       // retired (lib/accounting-fx-revaluation.ts). Any row already queued, of either kind, is retired here exactly as the realised journal
       // is above: CANCELLED with the reason on the row, claim-fenced, before any request. Sending less is the only safe direction: Xero's
       // own revaluation is already in its reports.
-      const retired = await db.$transaction((tx) => retireOverSettlingInvoicePayment(tx, {
-        entryId,
-        claim: lease,
-        reason: UNREALISED_FX_JOURNAL_RETIRED_REASON,
-      }))
-      await logActivity({
-        entityType: 'SYSTEM',
-        action: 'xero_unrealised_fx_journal_retired',
-        tag: 'accounting',
-        level: 'WARNING',
-        description: `${UNREALISED_FX_JOURNAL_RETIRED_REASON} (sync row ${entryId}, ${referenceType} ${referenceId}).`,
-        metadata: { syncLogId: entryId, referenceType, referenceId, kind: typeof payload.kind === 'string' ? payload.kind : null, retired },
-      }).catch(() => { /* logging must never turn a safe retirement into a failure */ })
-      return { success: true, skipped: true }
+      //
+      // o3d-n2ci4: and honestly. A row whose record shows it MAY have reached Xero (a create-dispatch marker or a remote-attempt stamp) is
+      // parked FAILED for a person instead, and a reversal whose source revaluation POSTED is retired with an ERROR and a standing
+      // exception-inbox row naming the Xero journal that is now left unreversed (retireFxJournalRow).
+      return retireFxJournalRow({ entryId, type, referenceType, referenceId, payload, lease, attempt })
     }
 
     case 'COGS_JOURNAL':
