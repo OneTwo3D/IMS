@@ -579,7 +579,7 @@ test('a run started before an M rollback stops before its next POST once a faili
   const cases: Array<[ArchiveSwitchoverCheckRow | null | Error, RegExp]> = [
     [switchoverCheckRow({ level: 'ERROR', report: { verdict: 'double-claim' } }), /STOPPED at SIM-PRIV: the target's switchover check no longer passes, so nothing was sent: .*did not pass \(level ERROR, verdict double-claim\)/],
     [null, /STOPPED at SIM-PRIV: the target's switchover check no longer passes, so nothing was sent: .*holds no writers:check record/],
-    [new Error('connection lost'), /STOPPED at SIM-PRIV: the target's switchover-check record could not be read again, so nothing was sent/],
+    [new Error('connection lost'), /STOPPED at SIM-PRIV: the target's newest switchover-check entry could not be read again, so nothing was sent/],
   ]
   for (const [later, why] of cases) {
     const s = await setup(tenant(), { switchoverAgain: [switchoverCheckRow(), later] })

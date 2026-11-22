@@ -183,7 +183,7 @@ export async function executeArchivePlan(plan: ArchivePlan, deps: ArchiveExecute
       try {
         check = await deps.switchoverCheckStillPasses()
       } catch {
-        throw new Stop('the target\'s switchover-check record could not be read again, so nothing was sent', false)
+        throw new Stop('the target\'s newest switchover-check entry could not be read again, so nothing was sent', false)
       }
       if (!check.ok) throw new Stop(`the target's switchover check no longer passes, so nothing was sent: ${check.problem}`, false)
       base.switchoverEvidence = check.evidence
