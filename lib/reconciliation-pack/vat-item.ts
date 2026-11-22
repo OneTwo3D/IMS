@@ -314,6 +314,11 @@ async function runR12(context: VatItemContext): Promise<ItemInput> {
     for (const entry of split) {
       const share = D(String(entry.taxBase))
       if (share.isZero()) continue
+      // A part the invoice does not post is not taken off either: invoiceDiscountParts drops a part whose amount, rounded to the penny, is not positive, so an entry that rounds to no positive penny
+      // on either basis the invoice may use (net, or gross when the lines are sent inclusive) posts no discount line and leaves its VAT with the goods in Xero. (Two such entries merged onto one
+      // code can still make a penny part; that and the converse, a net-basis part with a positive gross, move a fraction of a penny and are accepted.)
+      const net = D(String(entry.netForeign))
+      if (!net.toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP).gt(0) && !net.add(D(String(entry.taxForeign))).toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP).gt(0)) continue
       const place = catalogue.place(entry.taxRateId)
       if (place === null) return inconclusive([LEDGER], 'VAT_MAPPING_UNVERIFIED')
       imsRows += 1
