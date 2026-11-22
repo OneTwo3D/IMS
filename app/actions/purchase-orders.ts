@@ -141,6 +141,9 @@ import {
 } from '@/lib/domain/purchasing/landed-cost-service'
 import { headerDiscountFactorForPo, unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
 import {
+  isPurchaseFxRefusalError, preparePurchaseReceiptFx, purchaseFxLayerFields, resolveReceiptFxValuation, type PrepaymentChecks,
+} from '@/lib/domain/purchasing/purchase-receipt-fx'
+import {
   assertFreightTotalNotNegative,
   buildFreightCostLineRows,
   FREIGHT_COST_KINDS,
@@ -2923,6 +2926,16 @@ export async function receivePurchaseOrder(
     // unaffected, which is exactly what makes it dangerous: the guard still works and the types stop
     // being able to say so. A property of an object is re-widened by the intervening call.
     const receiptPostingOutcome: { outcome?: EnqueueOutcomeLike } = {}
+    // Per-event FX (o3d-hqvrp.51 step 2): read the order's Xero supplier prepayment, at most once, BEFORE the transaction (a network call never runs
+    // inside it). A no-op while the switch is off or for a base-currency order. A refusal (ambiguous prepayment, failed read) returns here, unwritten.
+    let purchaseFxChecks: PrepaymentChecks
+    try {
+      purchaseFxChecks = await preparePurchaseReceiptFx([id])
+    } catch (refusal) {
+      if (isPurchaseFxRefusalError(refusal)) return { success: false, error: refusal.message }
+      throw refusal
+    }
+    const receiptInstant = new Date()
     const receiptResult = await db.$transaction(async (tx) => {
       // Lock the PO row to prevent concurrent receipts from over-receiving
       await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${id} FOR UPDATE`
@@ -3001,6 +3014,10 @@ export async function receivePurchaseOrder(
         throw new Error(canFullyReceive.error)
       }
 
+      // Per-event FX: the goods unit cost at the locked rate, under the PO row lock (null = switch off or a base-currency order: the PO rate, as
+      // before). Refuses (rolls back, nothing written) on a missing fx_rates rate, an unmapped variance account or a prepayment not read.
+      const fxValuation = await resolveReceiptFxValuation(tx, { poId: id, at: receiptInstant, checks: purchaseFxChecks })
+
       // THE ONE ALLOCATION (landed-cost-allocation.ts): the same cost recalculation will compute for these
       // units, so a receipt followed by a recalculation with unchanged cost lines posts nothing. A negative
       // landed cost is applied, and the zero floor's footprint comes back in `floors`.
@@ -3014,6 +3031,7 @@ export async function receivePurchaseOrder(
           landedUnitCostBase: line.landedUnitCostBase,
           weight: line.product?.weight ?? null,
           headerDiscountFactor,
+          goodsUnitCostBase: fxValuation?.goodsUnitCostBaseByLine.get(line.id) ?? null,
         })),
         directCostLines: currentPo.freightCostLines.map((costLine) => ({
           id: costLine.id,
@@ -3063,6 +3081,7 @@ export async function receivePurchaseOrder(
           poId: id,
           reference: receiptRef,
           notes: notes || null,
+          ...(fxValuation ? { fxRateToBase: fxValuation.storedRateToBase, fxRateSource: fxValuation.source } : {}),
           lines: {
             create: linesWithQty.map((rl) => ({
               poLineId: rl.poLineId,
@@ -3161,6 +3180,7 @@ export async function receivePurchaseOrder(
           unitCostBase,
           poLineId: poLine.id,
           isOpeningStock: false,
+          ...purchaseFxLayerFields(fxValuation, poLine.id),
         })
 
         await tx.purchaseOrderLine.update({
@@ -3169,7 +3189,10 @@ export async function receivePurchaseOrder(
         })
         grirReceiptLines.push({ poLineId: poLine.id, qty: qtyReceived })
       }
-      await recordGrirReceipt(tx, { poId: id, sourceRef: createdReceipt.id, keyBase: createdReceipt.id, at: new Date(), lines: grirReceiptLines })
+      await recordGrirReceipt(tx, {
+        poId: id, sourceRef: createdReceipt.id, keyBase: createdReceipt.id, at: new Date(), lines: grirReceiptLines,
+        ...(fxValuation ? { goodsUnitCostByLine: fxValuation.goodsUnitCostBaseByLine } : {}),
+      })
 
       const updatedLines = await tx.purchaseOrderLine.findMany({
         where: { poId: id },
@@ -3260,7 +3283,7 @@ export async function receivePurchaseOrder(
         const payload = {
           date: businessDateYmd(new Date()),
           reference: `Receipt: ${po.reference}`,
-          narration: `Stock receipt for PO ${po.reference} — ${linesWithQty.length} lines into ${warehouseNamesList}`,
+          narration: `Stock receipt for PO ${po.reference} — ${linesWithQty.length} lines into ${warehouseNamesList}${fxValuation ? `; ${fxValuation.narration}` : ''}`,
           lines: [
             { accountCode: inventoryAccount, description: `Stock receipt: ${po.reference}`, debit: amount },
             { accountCode: transitAccount, description: `Stock receipt: ${po.reference}`, credit: amount },
@@ -3445,6 +3468,8 @@ export async function receivePurchaseOrder(
       description: `Failed to receive PO ${id}: ${String(e)}`,
       metadata: null,
     })
+    // Per-event FX refusals carry an operator remedy: return the message itself, not the error's class name.
+    if (isPurchaseFxRefusalError(e) || isMissingFxRateError(e)) return { success: false, error: e.message }
     return { success: false, error: String(e) }
   }
 }

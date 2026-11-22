@@ -75,6 +75,12 @@ import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { recordGrirReceipt } from '@/lib/domain/accounting/grir-subledger-movement'
 import {
+  NO_PREPAYMENT_CHECKS, isPurchaseFxRefusalError, preparePurchaseReceiptFx, purchaseFxLayerFields, resolveReceiptFxValuation,
+  type PrepaymentChecks, type ReceiptFxValuation,
+} from '@/lib/domain/purchasing/purchase-receipt-fx'
+import { isPurchaseEventFxEnabled } from '@/lib/domain/purchasing/purchase-event-fx-settings'
+import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
+import {
   CONTRIBUTING_LANDED_COST_LINK_WHERE,
   computeLandedCostForPendingLines,
 } from '@/lib/domain/purchasing/landed-cost-service'
@@ -1383,6 +1389,8 @@ type AlignmentPurchaseLineCost = {
   grossUnitCostBase: Prisma.Decimal
   /** Set when a negative landed cost was larger than the goods cost and the floor held this line at zero. */
   floor: LandedAllocationFloor | null
+  /** Per-event FX: the order's goods valuation at its locked rate (o3d-hqvrp.51 step 2), or null (switch off, a base-currency order: as before). */
+  fxValuation: ReceiptFxValuation | null
 }
 
 /**
@@ -1412,6 +1420,7 @@ async function loadAlignmentPurchaseLineCost(
   tx: Prisma.TransactionClient,
   poLineId: string,
   cache: Map<string, AlignmentPurchaseLineCost>,
+  purchaseFx: { checks: PrepaymentChecks; at: Date },
 ): Promise<AlignmentPurchaseLineCost> {
   const cached = cache.get(poLineId)
   if (cached) return cached
@@ -1470,6 +1479,8 @@ async function loadAlignmentPurchaseLineCost(
     throw new Error(`Purchase order line ${poLineId} is missing for alignment.`)
   }
 
+  // Per-event FX: once per order (every line of it is cached below), under the step-2 order lock.
+  const fxValuation = await resolveReceiptFxValuation(tx, { poId: poLine.po.id, at: purchaseFx.at, checks: purchaseFx.checks })
   const headerDiscountFactor = headerDiscountFactorForPo(poLine.po)
   const landedAllocation = computeLandedCostForPendingLines({
     lines: poLine.po.lines.map((line) => ({
@@ -1480,6 +1491,7 @@ async function loadAlignmentPurchaseLineCost(
       landedUnitCostBase: line.landedUnitCostBase,
       weight: line.product?.weight ?? null,
       headerDiscountFactor,
+      goodsUnitCostBase: fxValuation?.goodsUnitCostBaseByLine.get(line.id) ?? null,
     })),
     directCostLines: poLine.po.freightCostLines.map((costLine) => ({
       id: costLine.id,
@@ -1512,6 +1524,7 @@ async function loadAlignmentPurchaseLineCost(
       // alignment allocation of positive quantity. It is deliberately NOT `landedUnitCostBase`.
       grossUnitCostBase: grossByLine.get(line.id) ?? new Prisma.Decimal(line.unitCostBase),
       floor: floorByLine.get(line.id) ?? null,
+      fxValuation,
     }
     cache.set(line.id, entry)
     if (line.id === poLine.id) requested = entry
@@ -1520,6 +1533,16 @@ async function loadAlignmentPurchaseLineCost(
     throw new Error(`Purchase order line ${poLineId} is not a line of its own purchase order ${poLine.po.id}.`)
   }
   return requested
+}
+
+/** Per-event FX: the purchase orders this product's open Mintsoft ASN lines in this warehouse belong to (an unlocked superset, read before the transaction). */
+async function alignmentPurchaseOrderIds(binding: SyncBinding, productId: string): Promise<string[]> {
+  const lineIds = (await db.wmsAsnLineMap.findMany({
+    where: { productId, sourceType: 'PURCHASE_ORDER_LINE', asn: { connector: 'mintsoft', warehouseId: binding.warehouseId, closedAt: null } },
+    select: { sourceLineId: true },
+  })).map((row) => row.sourceLineId)
+  if (lineIds.length === 0) return []
+  return (await db.purchaseOrderLine.findMany({ where: { id: { in: lineIds } }, select: { poId: true } })).map((line) => line.poId)
 }
 
 /**
@@ -1581,6 +1604,19 @@ export async function applyMintsoftAlignmentForProduct(params: {
   // an operator-triggered preview, not a sweep hot path.
   const accountingConnector = await getActiveAccountingConnectorId()
   const accountingSettings = await getAccountingSettingsFor(accountingConnector)
+
+  // Per-event FX (o3d-hqvrp.51 step 2): the Xero supplier prepayment of every order this product's open ASN lines can absorb into, read at most once
+  // per order and BEFORE the transaction (an unlocked superset; the valuation inside re-reads under the order lock). Not for a dry run, which returns
+  // before any cost is read. A refusal leaves stock unchanged and is reported as this alignment's reason, like any other refusal here.
+  let purchaseFxChecks: PrepaymentChecks = NO_PREPAYMENT_CHECKS
+  if (!params.dryRun && await isPurchaseEventFxEnabled(db)) {
+    try {
+      purchaseFxChecks = await preparePurchaseReceiptFx(await alignmentPurchaseOrderIds(params.binding, params.productId))
+    } catch (refusal) {
+      if (!isPurchaseFxRefusalError(refusal)) throw refusal
+      return { applied: false, dryRun: false, correctedQty: 0, reason: refusal.message }
+    }
+  }
 
   const outcome = await db.$transaction(async (tx) => {
     // THE LOCKS, IN THE GLOBAL ORDER (6oyu.19, Codex round-9 HIGH-1).
@@ -1907,7 +1943,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
       assertPurchaseOrderWasLocked(candidate, lockedPurchaseOrderIds)
       costByAsnLineMapId.set(
         candidate.id,
-        await loadAlignmentPurchaseLineCost(tx, candidate.sourceLineId, purchaseLineCostCache),
+        await loadAlignmentPurchaseLineCost(tx, candidate.sourceLineId, purchaseLineCostCache, { checks: purchaseFxChecks, at: now }),
       )
     }
 
@@ -2004,6 +2040,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
           unitCostBase,
           poLineId: candidate.sourceLineId,
           adjustmentMovementId: movement.id,
+          ...purchaseFxLayerFields(purchaseCost.fxValuation, candidate.sourceLineId),
         })
 
         // ─── o3d-6nd55: THE RECEIPT JOURNAL, IN THE SAME TRANSACTION AS THE STOCK ───
@@ -2060,6 +2097,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
           keyBase: `wms-align-up:${candidate.id}:${movement.id}`,
           at: now,
           lines: [{ poLineId: candidate.sourceLineId, qty: allocation.qty }],
+          ...(purchaseCost.fxValuation ? { goodsUnitCostByLine: purchaseCost.fxValuation.goodsUnitCostBaseByLine } : {}),
         })
         const receiptValueBase = multiplyMoney(toDecimal(allocation.qty), toDecimal(unitCostBase))
         if (accountingConnector && accountingSettings.syncEnabled && receiptValueBase.gt(0)) {
@@ -2076,7 +2114,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
             date: businessDateYmd(now),
             reference: `Receipt: ${purchaseCost.poReference}`,
             narration: `Stock receipt for PO ${purchaseCost.poReference} via Mintsoft alignment against ASN `
-              + `${candidate.asn.externalAsnId}`,
+              + `${candidate.asn.externalAsnId}${purchaseCost.fxValuation ? `; ${purchaseCost.fxValuation.narration}` : ''}`,
             lines: [
               {
                 accountCode: accounts.inventoryAccount,
@@ -2311,7 +2349,14 @@ export async function applyMintsoftAlignmentForProduct(params: {
         }
       }),
     }
-  }, { maxWait: 5000, timeout: 30000 })
+  }, { maxWait: 5000, timeout: 30000 }).catch((error: unknown) => {
+    // A per-event FX refusal inside the transaction (a missing fx_rates rate, an unmapped variance account, a prepayment not read) rolled it back:
+    // nothing was written. Reported as this alignment's reason; anything else is thrown as before.
+    if (isPurchaseFxRefusalError(error) || isMissingFxRateError(error)) {
+      return { kind: 'unavailable' as const, correctedQty: 0, reason: `Per-event FX refused the alignment, stock unchanged: ${error.message}` }
+    }
+    throw error
+  })
 
   let alignEnqueue: StockEnqueueOutcome = 'ok'
   if (outcome.kind === 'applied') {

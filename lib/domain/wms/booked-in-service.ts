@@ -58,6 +58,10 @@ import {
   computeLandedCostForPendingLines,
   CONTRIBUTING_LANDED_COST_LINK_WHERE,
 } from '@/lib/domain/purchasing/landed-cost-service'
+import {
+  NO_PREPAYMENT_CHECKS, preparePurchaseReceiptFx, purchaseFxLayerColumns, resolveReceiptFxValuation,
+} from '@/lib/domain/purchasing/purchase-receipt-fx'
+import { isPurchaseEventFxEnabled } from '@/lib/domain/purchasing/purchase-event-fx-settings'
 import { headerDiscountFactorForPo, unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
 import { logFlooredLandedCredit } from '@/lib/domain/purchasing/landed-cost-floor-activity'
 import type { FlooredLandedCreditEntry } from '@/lib/domain/purchasing/landed-cost-floor-text'
@@ -430,6 +434,22 @@ export async function processBookedInEvent(
     // One entry per PO line this book-in laid a layer for at that floored cost, reported AFTER the commit for
     // the same reason as the declines above (an activity write uses its own connection).
     const creditFloorReports: Array<{ poId: string; poReference: string; entries: Map<string, FlooredLandedCreditEntry> }> = []
+
+    // Per-event FX (o3d-hqvrp.51 step 2): the Xero supplier prepayment of every order this ASN can book against, read at most once per order and
+    // BEFORE the transaction (a network call never runs inside it). An unlocked superset read is enough: the valuation inside re-reads everything
+    // under the order's row lock and refuses an order it holds no evidence for. A no-op while the switch is off. A refusal fails this event (it is
+    // retried) with the reason in the activity log.
+    let purchaseFxChecks = NO_PREPAYMENT_CHECKS
+    if (mappedAsn && await isPurchaseEventFxEnabled(db)) {
+      const purchaseLineIds = (await db.wmsAsnLineMap.findMany({
+        where: { asnMapId: mappedAsn.id, sourceType: 'PURCHASE_ORDER_LINE' },
+        select: { sourceLineId: true },
+      })).map((row) => row.sourceLineId)
+      if (purchaseLineIds.length > 0) {
+        const purchaseLines = await db.purchaseOrderLine.findMany({ where: { id: { in: purchaseLineIds } }, select: { poId: true } })
+        purchaseFxChecks = await preparePurchaseReceiptFx(purchaseLines.map((line) => line.poId))
+      }
+    }
 
     const processed = await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM wms_inbound_receipt_events WHERE id = ${event.id} FOR UPDATE`
@@ -1028,6 +1048,9 @@ export async function processBookedInEvent(
           throw new Error(`Purchase order ${po.reference} is ${po.status} and cannot be received against for ASN ${lockedEvent.externalAsnId}`)
         }
 
+        // Per-event FX: the goods unit cost at the locked rate, under the order's row lock (null = switch off or a base-currency order: as before).
+        const fxValuation = await resolveReceiptFxValuation(tx, { poId, at: now, checks: purchaseFxChecks })
+
         // ─── o3d-8f0p6 r2: ONE COST FOR THE MOVEMENT, THE LAYER AND THE JOURNAL ───
         //
         // THE DEFECT THIS REPLACES was `Number(poLine.landedUnitCostBase ?? poLine.unitCostBase)`.
@@ -1071,6 +1094,7 @@ export async function processBookedInEvent(
             landedUnitCostBase: line.landedUnitCostBase,
             weight: line.product?.weight ?? null,
             headerDiscountFactor,
+            goodsUnitCostBase: fxValuation?.goodsUnitCostBaseByLine.get(line.id) ?? null,
           })),
           directCostLines: po.freightCostLines.map((costLine) => ({
             id: costLine.id,
@@ -1145,6 +1169,7 @@ export async function processBookedInEvent(
               reference: formatReceiptReference(lockedEvent.externalAsnId, po.reference),
               externalKey: `mintsoft:po:${poId}:event:${lockedEvent.id}`,
               notes: `Mintsoft ASN booked-in webhook ${lockedEvent.externalAsnId}`,
+              ...(fxValuation ? { fxRateToBase: fxValuation.storedRateToBase, fxRateSource: fxValuation.source } : {}),
               lines: {
                 create: createdReceiptLines.map((receiptLine) => ({
                   poLineId: receiptLine.poLineId,
@@ -1231,6 +1256,7 @@ export async function processBookedInEvent(
                   unitCostBase,
                   poLineId: poLine.id,
                   isOpeningStock: false,
+                  ...purchaseFxLayerColumns(fxValuation, poLine.id),
                 },
               })
 
@@ -1242,6 +1268,7 @@ export async function processBookedInEvent(
                 keyBase: wmsPurchaseReceiptMovementKey({ asnLineMapId: receiptLine.asnLineMapId, receiptEventId: lockedEvent.id }),
                 at: now,
                 lines: [{ poLineId: poLine.id, qty: receiptLine.stockQtyToAdd }],
+                ...(fxValuation ? { goodsUnitCostByLine: fxValuation.goodsUnitCostBaseByLine } : {}),
               })
 
               // o3d-8f0p6: accumulated HERE, beside the layer it is the value of, and deliberately
@@ -1411,7 +1438,7 @@ export async function processBookedInEvent(
           const payload = {
             date: businessDateYmd(now),
             reference: `Receipt: ${po.reference}`,
-            narration: `Stock receipt for PO ${po.reference} via WMS ASN ${lockedEvent.externalAsnId}`,
+            narration: `Stock receipt for PO ${po.reference} via WMS ASN ${lockedEvent.externalAsnId}${fxValuation ? `; ${fxValuation.narration}` : ''}`,
             lines: [
               { accountCode: accounts.inventoryAccount, description: `Stock receipt: ${po.reference}`, debit: amount },
               { accountCode: accounts.transitAccount, description: `Stock receipt: ${po.reference}`, credit: amount },
