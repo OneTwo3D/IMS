@@ -63,7 +63,7 @@ export const POSTING_REFUSAL_KINDS = {
   },
   unrealised_fx_journal: {
     type: 'UNREALISED_FX_JOURNAL', referenceType: 'FxRevaluation', clearing: 'retried',
-    how: 'The FX revaluation raises this journal only for the date it runs for; the daily run values today, so a refused journal for an earlier date is not raised again unless that date is re-run.',
+    how: 'Retired: IMS no longer raises this journal (Xero revalues open foreign balances itself) and the revaluation run queues nothing, so nothing raises it again. A row here is either from before the retirement, or the reversal of a revaluation that had already posted to Xero: reverse that journal by hand in Xero, then mark it handled.',
   },
   landed_cost_cogs_journal: {
     type: 'COGS_JOURNAL', referenceType: 'PurchaseOrder', clearing: 'retried',
@@ -124,11 +124,11 @@ export const POSTING_REFUSAL_KINDS = {
   },
   realised_fx_bill_payment: {
     type: 'REALISED_FX_JOURNAL', referenceType: 'PurchaseInvoice', clearing: 'manual',
-    how: 'The realised gain/loss is queued once, when the bill is paid; the FX revaluation raises unrealised journals, not this one.',
+    how: 'Retired: Xero books the realised gain/loss itself, at the settlement rate IMS sends on the payment, so IMS no longer queues this journal (when the bill is paid or otherwise) and nothing raises it again; the kind stays so a row already in the inbox can still be marked handled.',
   },
   realised_fx_receipt: {
     type: 'REALISED_FX_JOURNAL', referenceType: 'Payment', clearing: 'manual',
-    how: 'The realised gain/loss is queued once, when the receipt settles; the FX revaluation raises unrealised journals, not this one.',
+    how: 'Retired: Xero books the realised gain/loss itself, at the settlement rate IMS sends on the payment, so IMS no longer queues this journal (when the receipt settles or otherwise) and nothing raises it again; the kind stays so a row already in the inbox can still be marked handled.',
   },
   manufacturing_journal: {
     type: 'MANUFACTURING_JOURNAL', referenceType: 'ProductionOrder', clearing: 'manual',
