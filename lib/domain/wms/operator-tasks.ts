@@ -39,7 +39,7 @@ export const WMS_OPERATOR_TASK_REASON_LABELS: Record<WmsOperatorTaskReasonValue,
   MERGE_HOLD_OVERDUE: 'Merge hold overdue: merge and confirm the order in the warehouse',
   MERGE_HOLD_WITHDRAWAL: 'Withdrawal or cancel on an order on merge hold: act in the warehouse',
   REFUND_DELETE_VOIDED_NOT_UNWOUND: 'Credit note voided in Xero for a refund being deleted, but the IMS refund still stands',
-  REFUND_DELETE_VOID_STUCK: 'Refund delete stopped: the credit note void in Xero gave up after repeated failures, the IMS refund still stands',
+  REFUND_DELETE_VOID_STUCK: 'Credit note void in Xero gave up after repeated failures for a refund being deleted, the IMS refund still stands',
 }
 
 export type WmsOperatorTaskInput = {
