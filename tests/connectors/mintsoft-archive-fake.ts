@@ -7,6 +7,9 @@
 import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import type { MintsoftReviewConfig } from '../../lib/connectors/mintsoft/lifecycle-review-read.ts'
+import { bridgePayloadFromReport, parseBridgeStatusOutput } from '../../lib/domain/writer-attestation/bridge-status.ts'
+import type { ArchiveRetirementRow, ArchiveSwitchoverCheckRow } from '../../lib/first-load/wms-discontinue/execute.ts'
+import { sampleReport } from '../ops/bridge-status-fixtures.ts'
 
 export const KEY = 'ms_fixed_key_archive_0123456789_test_only'
 export const CLIENT = 89
@@ -17,8 +20,11 @@ export type FakeTenant = {
   stock: Record<string, Array<Record<string, unknown>>>
   /** The warehouse list (`GET /api/Warehouse`); default: warehouse 5 only. */
   warehouses?: Array<Record<string, unknown>>
-  /** Called on a partial POST before it is applied; return a body to answer instead (the write is then NOT applied), or 'drop' to destroy the connection without an answer. */
-  onPost?: (body: Record<string, unknown>) => { status?: number; body: unknown } | 'drop' | undefined
+  /**
+   * Called on a partial POST before it is applied; return a body to answer instead (the write is then NOT applied), `text` to answer a raw body with
+   * its own content type, or 'drop' to destroy the connection without an answer.
+   */
+  onPost?: (body: Record<string, unknown>) => { status?: number; body: unknown } | { status?: number; text: string; contentType: string } | 'drop' | undefined
   /** Called after an accepted write instead of setting DisCont (a write Mintsoft reports as done that did not take). */
   ignoreDisCont?: boolean
   /** Called after an accepted write, to change the stored product further (a write that touched other fields). */
@@ -65,6 +71,7 @@ export async function fakeMintsoft(tenant: FakeTenant, track: Rig[]): Promise<Ri
         if ('PalletSizes' in sent) return json({ Success: false, Message: 'One or more pallet sizes are not valid!', ID: sent.ID })
         const override = tenant.onPost?.(sent)
         if (override === 'drop') { req.socket.destroy(); return }
+        if (override && 'text' in override) { res.writeHead(override.status ?? 200, { 'content-type': override.contentType }); res.end(override.text); return }
         if (override) return json(override.body, override.status ?? 200)
         const p = tenant.products.get(String(sent.ID))
         if (!p || p.SKU !== sent.SKU) return json({ Success: false, Message: 'Product not found' })
@@ -91,3 +98,33 @@ export const LIVE_FROM = '2026-01-01T00:00:00Z'
 export const liveEnv = (rig: Rig) => ({ ...grantedEnv(rig), MINTSOFT_WRITES_LIVE_FROM: LIVE_FROM })
 export const stockRow = (id: number, sku: string, level: number, warehouse = 5) => ({ SKU: sku, ProductId: id, WarehouseId: warehouse, ClientId: CLIENT, Bundle: false, TotalStockLevel: level, Level: level })
 
+
+/** An ISO instant in the bridge report's own format (whole seconds, Z). */
+export const reportInstant = (ms: number) => new Date(Math.floor(ms / 1000) * 1000).toISOString().replace('.000Z', 'Z')
+
+/**
+ * The target's newest `bridge-units-masked` attestation as the command reads it (#1128 R2 MED-A): by default a clean report (units masked and inactive,
+ * last trigger before LIVE_FROM) generated an hour before `now` and recorded five minutes later. Options make it say otherwise.
+ */
+export function retirementRow(options: { now?: number; generatedAt?: string; attestedAt?: string; lastTrigger?: string; units?: Record<string, string> } = {}): ArchiveRetirementRow {
+  const now = options.now ?? Date.now()
+  const generatedAt = options.generatedAt ?? reportInstant(now - 3_600_000)
+  const raw = sampleReport({ generatedAt, lastTrigger: options.lastTrigger ?? '2025-12-31T23:55:01Z', units: options.units })
+  const parsed = parseBridgeStatusOutput(raw)
+  if (!parsed.ok) throw new Error(`the synthetic bridge report does not parse: ${parsed.error}`)
+  return { attestedAt: options.attestedAt ?? new Date(Date.parse(generatedAt) + 5 * 60_000).toISOString(), payload: bridgePayloadFromReport(parsed.report, raw) }
+}
+
+/**
+ * The target's newest scheduled writers:check record as the command reads it (#1129 R1 MED-1): by default a PASSING check (level INFO, verdict ok,
+ * phase P2-M, step M live since LIVE_FROM) generated ten minutes before `now`. `report` overrides fields of the stored report.
+ */
+export function switchoverCheckRow(options: { now?: number; level?: string; generatedAt?: string; report?: Record<string, unknown> } = {}): ArchiveSwitchoverCheckRow {
+  const now = options.now ?? Date.now()
+  const generatedAt = options.generatedAt ?? new Date(now - 10 * 60_000).toISOString()
+  return {
+    level: options.level ?? 'INFO',
+    createdAt: generatedAt,
+    metadata: { report: { schemaVersion: 1, generatedAt, phase: 'P2-M', verdict: 'ok', steps: [{ step: 'mintsoft', env: 'MINTSOFT_WRITES_LIVE_FROM', liveFrom: new Date(LIVE_FROM).toISOString(), state: 'live' }, { step: 'woocommerce', env: 'WC_WRITES_LIVE_FROM', liveFrom: null, state: 'unset' }, { step: 'xero', env: 'XERO_WRITES_LIVE_FROM', liveFrom: null, state: 'unset' }], findings: [], ...options.report } },
+  }
+}

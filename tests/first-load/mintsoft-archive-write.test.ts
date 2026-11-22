@@ -13,10 +13,12 @@ import { runLifecycleReviewCli, type WmsReader } from '../../lib/first-load/life
 import { LIFECYCLE_REVIEW_FILE_NAMES } from '../../lib/first-load/lifecycle-review/generation.ts'
 import { runWmsArchiveCli, type WmsArchiveExecuteDeps, type WmsCensusReader } from '../../lib/first-load/wms-discontinue/cli.ts'
 import type { WmsCensus } from '../../lib/first-load/wms-discontinue/plan.ts'
-import { ARCHIVE_ACTIVITY_ACTIONS, ARCHIVE_TARGET_STATEMENTS, type ArchiveTargetPort } from '../../lib/first-load/wms-discontinue/target.ts'
+import { ARCHIVE_ACTIVITY_ACTIONS, ARCHIVE_TARGET_STATEMENTS, SWITCHOVER_CHECK_RECORD_ACTION, type ArchiveTargetPort } from '../../lib/first-load/wms-discontinue/target.ts'
 import { FIRST_LOAD_WMS_ARCHIVE_SWITCH_KEY, findSwitch } from '../../lib/domain/settings/system-switches.ts'
-import { createMintsoftArchiveWriter } from '../../lib/connectors/mintsoft/first-load-archive-write.ts'
-import { LIVE_FROM, configOf, fakeMintsoft, grantedEnv, liveEnv, stockRow, syntheticProduct, type FakeTenant, type Rig } from '../connectors/mintsoft-archive-fake.ts'
+import { ARCHIVE_RETIREMENT_ATTESTATION_KIND, createMintsoftArchiveWriter } from '../../lib/connectors/mintsoft/first-load-archive-write.ts'
+import { LIVE_FROM, configOf, fakeMintsoft, grantedEnv, liveEnv, retirementRow, stockRow, switchoverCheckRow, syntheticProduct, type FakeTenant, type Rig } from '../connectors/mintsoft-archive-fake.ts'
+import type { ArchiveRetirementRow, ArchiveSwitchoverCheckRow, WmsArchiveWriter } from '../../lib/first-load/wms-discontinue/execute.ts'
+import { WRITERS_CHECK_RECORD_ACTION } from '../../lib/security/writers-check-constants.ts'
 import { buildFixture, fakeWms, type Fixture } from './lifecycle-review-fixture.ts'
 
 let fx: Fixture
@@ -65,17 +67,33 @@ function census(rig: Rig): WmsCensus {
 }
 
 type Target = { queries: Array<{ sql: string; values?: unknown[] }>; records: Array<{ action: string; level: string; entityId: string; metadata: Record<string, unknown>; description: string }>; opened: number; locks: number; unlocked: number; closed: number }
-type TargetOpts = { switchValue?: string | null; lifecycle?: Record<string, string | null>; db?: string; sid?: string; failRecord?: boolean; env?: Record<string, string>; envOf?: (rig: Rig) => Record<string, string>; lockHeld?: boolean; switchAgain?: string[] }
+type TargetOpts = { switchValue?: string | null; lifecycle?: Record<string, string | null>; db?: string; sid?: string; failRecord?: boolean | 'VERIFIED'; env?: Record<string, string>; envOf?: (rig: Rig) => Record<string, string>; lockHeld?: boolean; switchAgain?: Array<string | Error>; retirement?: ArchiveRetirementRow | null; switchoverCheck?: ArchiveSwitchoverCheckRow | null; switchoverAgain?: Array<ArchiveSwitchoverCheckRow | null | Error> }
 function fakeTarget(opts: TargetOpts = {}): { deps: Pick<WmsArchiveExecuteDeps, 'openTarget'>; target: Target } {
   const target: Target = { queries: [], records: [], opened: 0, locks: 0, unlocked: 0, closed: 0 }
   const again = [...(opts.switchAgain ?? [])]
+  const checkAgain = [...(opts.switchoverAgain ?? [])]
   const lifecycle = opts.lifecycle ?? { 'SIM-DRAFT': 'ARCHIVED', 'SIM-PRIV': 'ARCHIVED' }
   const port: ArchiveTargetPort = {
     query: async <T,>(sql: string, values?: unknown[]) => {
       target.queries.push({ sql, values })
       const rows = (r: unknown[]) => ({ rows: r as T[] })
       if (sql === ARCHIVE_TARGET_STATEMENTS.switchAgain) {
-        return rows([{ value: again.length > 0 ? again.shift()! : 'true' }])
+        const next = again.length > 0 ? again.shift()! : 'true'
+        if (next instanceof Error) throw next
+        return rows([{ value: next }])
+      }
+      if (sql === ARCHIVE_TARGET_STATEMENTS.switchoverCheck) {
+        assert.deepEqual(values, [SWITCHOVER_CHECK_RECORD_ACTION])
+        // The first read is the preflight's (in the transaction); every later one is the re-check before a write.
+        const read = target.queries.filter((q) => q.sql === ARCHIVE_TARGET_STATEMENTS.switchoverCheck).length
+        const next = read > 1 && checkAgain.length > 0 ? checkAgain.shift()! : opts.switchoverCheck === undefined ? switchoverCheckRow() : opts.switchoverCheck
+        if (next instanceof Error) throw next
+        return rows(next === null ? [] : [next])
+      }
+      if (sql === ARCHIVE_TARGET_STATEMENTS.retirement) {
+        assert.deepEqual(values, [ARCHIVE_RETIREMENT_ATTESTATION_KIND])
+        const row = opts.retirement === undefined ? retirementRow() : opts.retirement
+        return rows(row === null ? [] : [row])
       }
       if (sql === ARCHIVE_TARGET_STATEMENTS.identity) return rows([{ db: opts.db ?? 'ims_test', sid: opts.sid ?? '7000000000000000001' }])
       if (sql === ARCHIVE_TARGET_STATEMENTS.switch) {
@@ -88,7 +106,7 @@ function fakeTarget(opts: TargetOpts = {}): { deps: Pick<WmsArchiveExecuteDeps, 
         return rows(skus.filter((s) => lifecycle[s] != null).map((s) => ({ id: `ims-${s}`, sku: s, lifecycle: lifecycle[s] })))
       }
       if (sql === ARCHIVE_TARGET_STATEMENTS.record) {
-        if (opts.failRecord) throw new Error('insert failed')
+        if (opts.failRecord === true || (opts.failRecord === 'VERIFIED' && values![2] === ARCHIVE_ACTIVITY_ACTIONS.VERIFIED)) throw new Error('insert failed')
         target.records.push({ entityId: values![1] as string, action: values![2] as string, level: values![3] as string, description: values![4] as string, metadata: JSON.parse(values![5] as string) })
       }
       return rows([])
@@ -114,7 +132,7 @@ function fakeTarget(opts: TargetOpts = {}): { deps: Pick<WmsArchiveExecuteDeps, 
 const ENV = ['--mintsoft-env-file', '/only/for/the/fake']
 const EXEC = (token: string, extra: string[] = []) => ['--execute', '--plan-token', token, '--env-file', '/only/for/the/fake.env', '--expect-db', 'ims_test', '--expect-system-id', '7000000000000000001', '--operator', 'Synthetic Operator', ...extra]
 
-async function setup(t: FakeTenant = tenant(), targetOpts: TargetOpts = {}, censusChange?: (c: WmsCensus) => void, censusAtDryRun?: (c: WmsCensus) => void, dryExit: number = EXIT_CODES.OK) {
+async function setup(t: FakeTenant = tenant(), targetOpts: TargetOpts = {}, censusChange?: (c: WmsCensus) => void, censusAtDryRun?: (c: WmsCensus) => void, dryExit: number = EXIT_CODES.OK, wrapWriter?: (w: WmsArchiveWriter) => WmsArchiveWriter) {
   const rig = await fakeMintsoft(t, rigs)
   const reads: string[] = []
   const c = census(rig)
@@ -130,7 +148,8 @@ async function setup(t: FakeTenant = tenant(), targetOpts: TargetOpts = {}, cens
   const { deps, target } = fakeTarget({ env: targetOpts.envOf ? targetOpts.envOf(rig) : liveEnv(rig), ...targetOpts })
   const execDeps: WmsArchiveExecuteDeps = {
     switchKey: FIRST_LOAD_WMS_ARCHIVE_SWITCH_KEY,
-    openWriter: (_file, env) => createMintsoftArchiveWriter(configOf(rig), { env, sleep: async () => {} }),
+    retirementEvidenceKind: ARCHIVE_RETIREMENT_ATTESTATION_KIND,
+    openWriter: (_file, env) => (wrapWriter ?? ((w) => w))(createMintsoftArchiveWriter(configOf(rig), { env, sleep: async () => {} })),
     newId: (() => { let n = 0; return () => `log-${++n}` })(),
     ...deps,
   }
@@ -162,10 +181,22 @@ test('--execute writes each WOULD_ARCHIVE SKU once with the verified partial bod
   assert.deepEqual(s.target.records[1]!.metadata, {
     sku: 'SIM-DRAFT', wms: 'Mintsoft', wmsProductId: '12', discontinuedBefore: false, discontinuedAfter: true, operator: 'Synthetic Operator', planToken: s.token, sheetId: sheetId(), outcome: 'VERIFIED', problem: null,
     stepEvidence: (s.target.records[1]!.metadata.stepEvidence as string),
+    retirementEvidence: (s.target.records[1]!.metadata.retirementEvidence as string),
+    switchoverEvidence: (s.target.records[1]!.metadata.switchoverEvidence as string),
   })
   assert.match(s.target.records[1]!.metadata.stepEvidence as string, new RegExp(`^Mintsoft step live in the target since ${LIVE_FROM.replace('Z', '')}`))
-  // The lock first, then the read in ONE READ ONLY REPEATABLE READ transaction (the exact text pinned), and the lock released at the end.
-  assert.deepEqual(s.target.queries.slice(0, 2).map((q) => q.sql), ['LOCK', 'BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ'])
+  // The target-resident retirement evidence, recorded with every row (#1128 R2 MED-A).
+  for (const rec of s.target.records) assert.match(rec.metadata.retirementEvidence as string, /^bridge-units-masked attestation recorded .* in the target \(report generated /)
+  // The target's passing writers:check record, judged again right before each row's write (#1129 R1 MED-1).
+  for (const rec of s.target.records) assert.match(rec.metadata.switchoverEvidence as string, /^writers:check record of the target: verdict ok, phase P2-M, generated /)
+  assert.equal(s.target.queries.filter((q) => q.sql === ARCHIVE_TARGET_STATEMENTS.switchoverCheck).length, 3, 'once in the transaction, then before each of the two POSTs')
+  assert.equal(SWITCHOVER_CHECK_RECORD_ACTION, WRITERS_CHECK_RECORD_ACTION)
+  // The lock first, then the read in ONE READ ONLY REPEATABLE READ transaction (the exact text pinned), the retirement attestation inside it, and the
+  // lock released at the end.
+  assert.deepEqual(s.target.queries.slice(0, 8).map((q) => q.sql), ['LOCK', 'BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ', ARCHIVE_TARGET_STATEMENTS.identity, ARCHIVE_TARGET_STATEMENTS.switch, ARCHIVE_TARGET_STATEMENTS.products, ARCHIVE_TARGET_STATEMENTS.retirement, ARCHIVE_TARGET_STATEMENTS.switchoverCheck, 'ROLLBACK'])
+  // The newest row of each kind, ties broken by id (#1129 R1 LOW-3): the exact text pinned.
+  assert.equal(ARCHIVE_TARGET_STATEMENTS.retirement, `select to_char("attested_at", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "attestedAt", "payload" from "writer_attestations" where "kind" = $1 order by "attested_at" desc, "id" desc limit 1`)
+  assert.equal(ARCHIVE_TARGET_STATEMENTS.switchoverCheck, `select "level"::text as "level", to_char("createdAt", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "createdAt", "metadata" from "activity_logs" where "action" = $1 order by "createdAt" desc, "id" desc limit 1`)
   assert.equal(ARCHIVE_TARGET_STATEMENTS.begin, 'BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ')
   assert.equal(s.target.unlocked, 1)
   assert.equal(s.target.closed, 1)
@@ -198,7 +229,7 @@ test('a plan token that does not match the plan made now is refused (exit 3): no
   const r = await s.exec(EXEC(s.token))
   assert.equal(r.code, EXIT_CODES.INPUT_UNUSABLE)
   assert.match(r.err, /is not the token of the plan made now/)
-  const other = await s.exec(EXEC('MSA-0000000000000000'))
+  const other = await s.exec(EXEC('MSA-' + '0'.repeat(16)))
   assert.equal(other.code, EXIT_CODES.INPUT_UNUSABLE)
   assert.deepEqual(s.rig.seen, [])
   assert.deepEqual(s.target.records, [])
@@ -344,7 +375,7 @@ test('a real prepare blocked by another finding: the dry run exits 1 and says so
   const readsBefore = reads.length
   err = ''
   const code = await runWmsArchiveCli(['--manifest', blocked, ...ENV, ...EXEC(('MSA-' + '0'.repeat(16)))], io, reader, 'first-load-mintsoft-archive', {
-    switchKey: FIRST_LOAD_WMS_ARCHIVE_SWITCH_KEY, openWriter: () => { throw new Error('not opened') }, newId: () => 'x', ...deps,
+    switchKey: FIRST_LOAD_WMS_ARCHIVE_SWITCH_KEY, retirementEvidenceKind: ARCHIVE_RETIREMENT_ATTESTATION_KIND, openWriter: () => { throw new Error('not opened') }, newId: () => 'x', ...deps,
   })
   assert.equal(code, EXIT_CODES.INPUT_UNUSABLE)
   assert.match(err, /blocked by other findings, so the import cannot have been made from it/)
@@ -442,4 +473,120 @@ test('the switch turned off during the run stops it before the next POST: nothin
   assert.match(r.err, /STOPPED at SIM-PRIV: the system switch no longer reads on in the target, so nothing was sent/)
   assert.deepEqual(posts(s.rig).map((p) => JSON.parse(p.body).SKU), ['SIM-DRAFT'])
   assert.deepEqual(s.target.records.map((x) => x.action), [ARCHIVE_ACTIVITY_ACTIONS.ATTEMPT, ARCHIVE_ACTIVITY_ACTIONS.VERIFIED])
+})
+
+// [mutation: the retirement evidence is not required, or not read from the target] (#1128 R2 MED-A)
+test('stage\'s situation (LIVE_FROM and the grant set, no bridge attestation), a host report showing the bridge back, and a stale report refuse (exit 3) before Mintsoft is read', async () => {
+  const cases: Array<[string, ArchiveRetirementRow | null, RegExp]> = [
+    ['stage: no attestation in the target', null, /the target installation holds no bridge-units-masked attestation/],
+    ['the bridge units unmasked again', retirementRow({ units: { 'wc-mintsoft-webhook.service': 'LoadState=loaded ActiveState=active UnitFileState=enabled' } }), /does not show the bridge retired, as writers:check judges it/],
+    ['a stale report', retirementRow({ generatedAt: '2026-01-02T00:00:00Z' }), /more than 24 hours before this run/],
+  ]
+  for (const [label, retirement, why] of cases) {
+    const s = await setup(tenant(), { retirement })
+    const readsBefore = s.reads.length
+    const r = await s.exec(EXEC(s.token))
+    assert.equal(r.code, EXIT_CODES.INPUT_UNUSABLE, label)
+    assert.match(r.err, /the write may not leave under the target installation's rules/, label)
+    assert.match(r.err, why, label)
+    assert.equal(s.reads.length, readsBefore, `${label}: the census was not read`)
+    assert.deepEqual(s.rig.seen, [], label)
+    assert.deepEqual(s.target.records, [], label)
+  }
+})
+
+// [mutation: a bundle flag or a discontinued flag that is absent or null passes, or the answer's product id is not compared] (#1128 R2 MED-B execute.ts:120, :123, :124)
+test('a re-read product whose answer names another product id, or does not state Bundle or DisCont (absent or null), stops the run before anything is sent', async () => {
+  const cases: Array<[(p: Record<string, unknown>) => void, RegExp]> = [
+    [(p) => { p.ID = 99 }, /the Mintsoft answer for product 12 names product 99/],
+    [(p) => { delete p.Bundle }, /the Mintsoft product 12 does not say whether it is a bundle/],
+    [(p) => { p.Bundle = null }, /the Mintsoft product 12 does not say whether it is a bundle/],
+    [(p) => { delete p.DisCont }, /the Mintsoft product 12 carries no discontinued flag/],
+    [(p) => { p.DisCont = null }, /the Mintsoft product 12 carries no discontinued flag/],
+  ]
+  for (const [change, why] of cases) {
+    const t = tenant()
+    change(t.products.get('12')!)
+    const s = await setup(t)
+    const r = await s.exec(EXEC(s.token))
+    assert.equal(r.code, EXIT_CODES.OUTPUT_FAILED, String(why))
+    assert.match(r.err, why)
+    assert.match(r.err, /nothing was sent for it/)
+    assert.deepEqual(posts(s.rig), [])
+    assert.deepEqual(s.target.records, [])
+  }
+})
+
+// [mutation: only positive stock stops the run] (#1128 R2 MED-B execute.ts:129) The Mintsoft reader refuses a negative level itself (the connector
+// test); execute.ts is connector-agnostic, so a WMS that reports one must stop too.
+test('a stock re-read that reports negative stock stops the run before anything is sent', async () => {
+  const s = await setup(tenant(), {}, undefined, undefined, EXIT_CODES.OK, (w) => ({ ...w, readStock: async () => ({ ok: true, value: { stockRow: true, onHand: -1 } }) }))
+  const r = await s.exec(EXEC(s.token))
+  assert.equal(r.code, EXIT_CODES.OUTPUT_FAILED)
+  assert.match(r.err, /the Mintsoft product 12 now shows physical stock -1: never archived unless it is exactly 0/)
+  assert.deepEqual(posts(s.rig), [])
+})
+
+// [mutation: a VERIFIED record that cannot be written is ignored] (#1128 R2 MED-B execute.ts:158)
+test('a verified write whose activity-log entry cannot be written stops the run (exit 4): sent, a FAILED record attempted, nothing after it', async () => {
+  const s = await setup(tenant(), { failRecord: 'VERIFIED' })
+  const r = await s.exec(EXEC(s.token))
+  assert.equal(r.code, EXIT_CODES.OUTPUT_FAILED)
+  assert.match(r.err, /STOPPED at SIM-DRAFT: the Mintsoft product 12 was set discontinued and verified, but the IMS activity log entry could not be written/)
+  assert.match(r.err, /the request WAS sent/)
+  assert.deepEqual(posts(s.rig).map((p) => JSON.parse(p.body).SKU), ['SIM-DRAFT'])
+  assert.equal(s.rig.tenant.products.get('12')!.DisCont, true)
+  assert.deepEqual(s.target.records.map((x) => x.action), [ARCHIVE_ACTIVITY_ACTIONS.ATTEMPT, ARCHIVE_ACTIVITY_ACTIONS.FAILED])
+  assert.equal(s.target.records[1]!.metadata.discontinuedAfter, true)
+  assert.match(r.out, /not attempted: 1 \(SIM-PRIV\)/)
+})
+
+// [mutation: a switch re-read that throws is taken as on] (#1128 R2 LOW-F)
+test('a switch re-read that fails stops the run before the next POST: nothing more is sent', async () => {
+  const s = await setup(tenant(), { switchAgain: ['true', new Error('connection lost')] })
+  const r = await s.exec(EXEC(s.token))
+  assert.equal(r.code, EXIT_CODES.OUTPUT_FAILED)
+  assert.match(r.err, /STOPPED at SIM-PRIV: the system switch could not be read again, so nothing was sent/)
+  assert.deepEqual(posts(s.rig).map((p) => JSON.parse(p.body).SKU), ['SIM-DRAFT'])
+  assert.deepEqual(s.target.records.map((x) => x.action), [ARCHIVE_ACTIVITY_ACTIONS.ATTEMPT, ARCHIVE_ACTIVITY_ACTIONS.VERIFIED])
+})
+
+// [mutation: the switchover-check record is not required, or a failing, stale or pre-M one passes] (#1129 R1 MED-1)
+test('the target\'s writers:check record: none, not passing (ERROR or WARNING), stale, or of a phase before M refuses (exit 3) before Mintsoft is read', async () => {
+  const cases: Array<[string, ArchiveSwitchoverCheckRow | null, RegExp]> = [
+    ['no record', null, /holds no writers:check record/],
+    ['not ok (ERROR)', switchoverCheckRow({ level: 'ERROR', report: { verdict: 'double-claim' } }), /did not pass \(level ERROR, verdict double-claim\)/],
+    ['WARNING', switchoverCheckRow({ level: 'WARNING' }), /did not pass \(level WARNING/],
+    ['stale', switchoverCheckRow({ generatedAt: new Date(Date.now() - 7 * 3_600_000).toISOString() }), /more than 6 hours before this run/],
+    ['phase below M', switchoverCheckRow({ report: { phase: 'P1' } }), /is of phase P1, not P2-M or later/],
+  ]
+  for (const [label, switchoverCheck, why] of cases) {
+    const s = await setup(tenant(), { switchoverCheck })
+    const readsBefore = s.reads.length
+    const r = await s.exec(EXEC(s.token))
+    assert.equal(r.code, EXIT_CODES.INPUT_UNUSABLE, label)
+    assert.match(r.err, /the write may not leave under the target installation's rules/, label)
+    assert.match(r.err, why, label)
+    assert.equal(s.reads.length, readsBefore, `${label}: the census was not read`)
+    assert.deepEqual(s.rig.seen, [], label)
+    assert.deepEqual(s.target.records, [], label)
+  }
+})
+
+// [mutation: the switchover check is judged once per run only] (#1129 R1 MED-1) A run started before an M rollback: the check recorded after the
+// rollback resumed the bridge fails, and the run stops before its next write. A record that cannot be read stops it too.
+test('a run started before an M rollback stops before its next POST once a failing writers:check is recorded; a re-read that fails stops it too', async () => {
+  const cases: Array<[ArchiveSwitchoverCheckRow | null | Error, RegExp]> = [
+    [switchoverCheckRow({ level: 'ERROR', report: { verdict: 'double-claim' } }), /STOPPED at SIM-PRIV: the target's switchover check no longer passes, so nothing was sent: .*did not pass \(level ERROR, verdict double-claim\)/],
+    [null, /STOPPED at SIM-PRIV: the target's switchover check no longer passes, so nothing was sent: .*holds no writers:check record/],
+    [new Error('connection lost'), /STOPPED at SIM-PRIV: the target's newest switchover-check entry could not be read again, so nothing was sent/],
+  ]
+  for (const [later, why] of cases) {
+    const s = await setup(tenant(), { switchoverAgain: [switchoverCheckRow(), later] })
+    const r = await s.exec(EXEC(s.token))
+    assert.equal(r.code, EXIT_CODES.OUTPUT_FAILED, String(why))
+    assert.match(r.err, why)
+    assert.deepEqual(posts(s.rig).map((p) => JSON.parse(p.body).SKU), ['SIM-DRAFT'], 'nothing after the stop')
+    assert.deepEqual(s.target.records.map((x) => x.action), [ARCHIVE_ACTIVITY_ACTIONS.ATTEMPT, ARCHIVE_ACTIVITY_ACTIONS.VERIFIED])
+  }
 })

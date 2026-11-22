@@ -630,6 +630,20 @@ export function evaluateWritersCheck(inputs: WritersCheckInputs): WritersCheckRe
   }
 }
 
+/**
+ * writers:check's own verdict on ONE step-evidence reading alone, under the given environment and instant: the findings the check would give that kind
+ * (the same evaluator, every other input left unread, and only that kind's findings kept). Empty means the check would not fail on that kind; a phase
+ * that does not require the kind yields nothing, so a caller that needs the kind required checks the phase itself. Used by the first-load Mintsoft
+ * archive (lib/connectors/mintsoft/first-load-archive-write.ts) to judge the bridge attestation exactly as the check does.
+ */
+export function stepEvidenceFindings(kind: StepEvidenceKind, reading: StepEvidenceReading, env: Record<string, string | undefined>, now: Date): WritersCheckFinding[] {
+  const report = evaluateWritersCheck({
+    env, now, windowDays: 1, settings: null, cronEnabled: null, pluginEnabled: null, evidence: null, evidenceUnrecorded: null, unknownEvidenceKinds: null,
+    stepEvidence: { [kind]: reading },
+  })
+  return report.findings.filter((finding) => finding.subject === kind)
+}
+
 export function renderWritersCheckText(report: WritersCheckReport): string {
   const lines = [`Writers check ${report.generatedAt} (evidence window ${report.windowDays} days): ${report.verdict.toUpperCase()}`]
   lines.push(`  phase ${report.phase}: ${report.steps.map((step) => `${step.step} ${step.state}${step.liveFrom ? ` (${step.liveFrom})` : ''}`).join(', ')}`)
