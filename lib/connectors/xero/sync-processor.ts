@@ -5348,6 +5348,13 @@ async function xeroPaymentCurrencyRate(
 export const REALISED_FX_JOURNAL_RETIRED_REASON =
   'Retired, not sent: Xero books the realised FX gain/loss itself, at the settlement rate IMS sends on the payment, so an IMS-generated realised-FX journal would book it twice.'
 
+/**
+ * Why a queued UNREALISED_FX_JOURNAL row (a period revaluation or the reversal of one) is retired instead of sent. Exported so a test pins
+ * the exact words.
+ */
+export const UNREALISED_FX_JOURNAL_RETIRED_REASON =
+  'Retired, not sent: Xero revalues open foreign-currency invoices, bills and bank balances itself in its reports (unrealised currency gains), so an IMS-generated revaluation or reversal journal would count the same movement twice.'
+
 function resolveInvoiceStatus(mode: unknown): string {
   return mode === 'draft' ? 'DRAFT' : 'AUTHORISED'
 }
@@ -7709,6 +7716,30 @@ export async function processClaimedEntry(
       return { success: true, skipped: true }
     }
 
+    case 'UNREALISED_FX_JOURNAL': {
+      // RETIRED, NOT SENT (owner decision 2026-11-22). With multi-currency on, Xero revalues open foreign-currency invoices, bills and bank
+      // balances itself, at its report date, into its system Unrealised Currency Gains account, so an IMS revaluation journal (or the
+      // reversal of one) is a second statement of the same movement; and its control leg is the AR/AP control account, which Xero rejects on
+      // a manual journal. IMS no longer queues it (isFxGainLossJournalSuppressed at the enqueue chokepoint) and the period revaluation cron is
+      // retired (lib/accounting-fx-revaluation.ts). Any row already queued, of either kind, is retired here exactly as the realised journal
+      // is above: CANCELLED with the reason on the row, claim-fenced, before any request. Sending less is the only safe direction: Xero's
+      // own revaluation is already in its reports.
+      const retired = await db.$transaction((tx) => retireOverSettlingInvoicePayment(tx, {
+        entryId,
+        claim: lease,
+        reason: UNREALISED_FX_JOURNAL_RETIRED_REASON,
+      }))
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'xero_unrealised_fx_journal_retired',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: `${UNREALISED_FX_JOURNAL_RETIRED_REASON} (sync row ${entryId}, ${referenceType} ${referenceId}).`,
+        metadata: { syncLogId: entryId, referenceType, referenceId, kind: typeof payload.kind === 'string' ? payload.kind : null, retired },
+      }).catch(() => { /* logging must never turn a safe retirement into a failure */ })
+      return { success: true, skipped: true }
+    }
+
     case 'COGS_JOURNAL':
     case 'INVENTORY_ADJUSTMENT':
     case 'STOCK_IN_TRANSIT':
@@ -7726,7 +7757,6 @@ export async function processClaimedEntry(
     // o3d-0i5y r9: the orphaned-allocation reversal. A plain manual journal like every other type
     // in this group — the amount is decided (and evidenced) at staging time, not here.
     case 'ALLOCATION_REVERSAL':
-    case 'UNREALISED_FX_JOURNAL':
     case 'MANUFACTURING_JOURNAL':
     case 'MANUFACTURING_RECLASS': {
       const idempotencySource = typeof payload._idempotencyKey === 'string'

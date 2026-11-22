@@ -296,6 +296,95 @@ test('sales_order_discount_tax_apportion_enabled ON: a mixed-rate order with a d
   assert.equal((stored.discountTaxSplit as unknown[]).length, 3)
 })
 
+/**
+ * A discounted order with a line that has NO tax rate (an EXEMPT product: no rate is configured for its category) priced with the per-rate split on. The no-rate line's group of the split is posted
+ * on the order default rate's code; `orderRateName` names that rate (created by the caller, or none).
+ */
+async function noRateWorld(w: World, t: { after: (fn: () => Promise<void>) => void }) {
+  const { db } = await import('@/lib/db')
+  const KEY = 'sales_order_discount_tax_apportion_enabled'
+  const extraRates: string[] = []
+  const exempt = await db.product.create({ data: { sku: `EC-EXM-${w.tag}`, name: 'Edit confirmed exempt', type: 'SIMPLE', taxCategory: 'EXEMPT', oversellAllowed: false }, select: { id: true, sku: true } })
+  await db.stockLevel.create({ data: { productId: exempt.id, warehouseId: w.warehouseId, quantity: 20 } })
+  t.after(async () => {
+    await db.setting.deleteMany({ where: { key: KEY } })
+    await db.orderAllocation.deleteMany({ where: { orderId: { in: w.orderIds } } })
+    await w.teardown()
+    await db.product.deleteMany({ where: { id: exempt.id } })
+    await db.taxRate.deleteMany({ where: { id: { in: extraRates } } })
+  })
+  await enableXeroInvoicing(w)
+  for (const [key, value] of [['xero_discount_account', '270']] as const) { await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } }); w.settingKeys.push(key) }
+  await db.setting.upsert({ where: { key: KEY }, create: { key: KEY, value: 'true' }, update: { value: 'true' } })
+  const input = (orderRateName: string, isDraft: boolean) => ({
+    ...inputFor(w, [{ p: 'p1', qty: 1, price: 100 }], { taxRateName: orderRateName, taxRateValue: 0, shippingForeign: 0, orderDiscountForeign: 20, isDraft }),
+    lines: [
+      { productId: w.p1.id, sku: w.p1.sku, description: 'Standard', qty: 1, unitPriceForeign: 100 },
+      { productId: exempt.id, sku: exempt.sku, description: 'Exempt', qty: 1, unitPriceForeign: 100 },
+    ],
+  })
+  return { db, exempt, extraRates, input }
+}
+
+// [mutation: the save and finalise refusal (discountSplitTaxCodeRefusalFor) removed, and the backstop in queueSalesInvoiceForOrder with it]
+test('sales_order_discount_tax_apportion_enabled ON: a discounted order whose no-rate line has NO tax code (no order default rate) is refused live and at FINALISATION, not left for the sync processor; the draft saves', SKIP, async (t) => {
+  process.env.SETTINGS_ENCRYPTION_KEY ??= 'a1'.repeat(32)
+  const w = await seedWorld()
+  const { db, exempt, input } = await noRateWorld(w, t)
+  const { createSalesOrder, updateSalesOrderStatus } = await import('@/app/actions/sales')
+  const missing = `ZQEC No such rate ${w.tag}`
+
+  // LIVE: refused at the save, nothing written, nothing queued.
+  const before = await db.salesOrder.count()
+  const live = await createSalesOrder(input(missing, false) as never)
+  assert.equal(live.success, false)
+  assert.match(live.error ?? '', /the lines with no tax rate \(0%\) have no accounting tax code/)
+  assert.equal(await db.salesOrder.count(), before, 'nothing was written')
+
+  // DRAFT: saves, the no-rate line carries no rate and the split has its group.
+  const draft = await createSalesOrder(input(missing, true) as never)
+  assert.equal(draft.success, true, draft.error)
+  const id = draft.order!.id
+  w.orderIds.push(id)
+  const stored = await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { discountTaxSplit: true, lines: { select: { productId: true, taxRateId: true } } } })
+  assert.equal(stored.lines.find((l) => l.productId === exempt.id)!.taxRateId, null)
+  assert.ok((stored.discountTaxSplit as Array<{ taxRateId: string | null }>).some((e) => e.taxRateId === null))
+
+  // FINALISED: refused with the reason, the order is still the draft it was, nothing is queued and nothing is allocated.
+  const finalised = await updateSalesOrderStatus(id, 'PROCESSING')
+  assert.equal(finalised.success, false, 'without the refusal the invoice is queued here and refused later by the sync processor')
+  assert.match(finalised.error ?? '', /no accounting tax code/)
+  assert.equal((await db.salesOrder.findUniqueOrThrow({ where: { id }, select: { status: true } })).status, 'DRAFT')
+  assert.equal(await db.accountingSyncLog.count({ where: { referenceId: id } }), 0, 'no invoice was queued')
+  assert.equal(await db.orderAllocation.count({ where: { orderId: id } }), 0)
+})
+
+test('sales_order_discount_tax_apportion_enabled ON: a no-rate line that DOES resolve through the order default rate at finalisation finalises, and the queued invoice passes salesDocumentTaxTypeRefusal', SKIP, async (t) => {
+  process.env.SETTINGS_ENCRYPTION_KEY ??= 'a1'.repeat(32)
+  const w = await seedWorld()
+  const { db, exempt, extraRates, input } = await noRateWorld(w, t)
+  const { createSalesOrder, updateSalesOrderStatus } = await import('@/app/actions/sales')
+  const { salesDocumentTaxTypeRefusal } = await import('@/lib/domain/accounting/sales-document-tax-types')
+  // The order's default rate is a 0% rate with a code, INACTIVE when the draft is saved (so the exempt line resolves to no rate) and active when it is finalised: the check reads the rates as the invoice does, then.
+  const noVat = await db.taxRate.create({ data: { name: `ZQEC No VAT ${w.tag}`, rate: '0', usedFor: 'SALES', taxCategory: 'ZERO', accountingTaxType: 'ADNOVAT', active: false }, select: { id: true } })
+  extraRates.push(noVat.id)
+  const draft = await createSalesOrder(input(`ZQEC No VAT ${w.tag}`, true) as never)
+  assert.equal(draft.success, true, draft.error)
+  const id = draft.order!.id
+  w.orderIds.push(id)
+  const lines = await db.salesOrderLine.findMany({ where: { orderId: id }, select: { productId: true, taxRateId: true } })
+  assert.equal(lines.find((l) => l.productId === exempt.id)!.taxRateId, null, 'the exempt line was saved with no rate')
+
+  await db.taxRate.update({ where: { id: noVat.id }, data: { active: true } })
+  const finalised = await updateSalesOrderStatus(id, 'PROCESSING')
+  assert.equal(finalised.success, true, finalised.error)
+  const row = await db.accountingSyncLog.findFirstOrThrow({ where: { referenceId: id, type: 'SALES_INVOICE' } })
+  const payload = row.payload as { invoiceNumber?: string; discountAmount: number; discountParts?: Array<{ amount: number; taxType?: string }>; lines: Array<{ taxType?: string }> }
+  assert.deepEqual(payload.discountParts!.map((p) => [p.taxType, p.amount]).sort(), [['ADNOVAT', 10], ['OUTPUT2', 10]], 'the no-rate group is posted on the order default code')
+  assert.deepEqual(payload.lines.map((l) => l.taxType).sort(), ['ADNOVAT', 'OUTPUT2'])
+  assert.equal(salesDocumentTaxTypeRefusal('Sales invoice', payload as never), null, 'the sync processor would accept it')
+})
+
 test('an invoice that is queued but not posted refuses the edit and writes nothing', SKIP, async (t) => {
   process.env.SETTINGS_ENCRYPTION_KEY ??= 'a1'.repeat(32)
   const w = await seedWorld()

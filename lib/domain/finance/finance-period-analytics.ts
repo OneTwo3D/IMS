@@ -120,11 +120,13 @@ export type GrirReportTotals = {
   creditNotesBase: string
   netBase: string
   priceVarianceBase: string
+  /** Per-event FX: the bills' FX difference against the receipt-date valuation (BILL_FX_VARIANCE); informational, outside the balance. */
+  fxVarianceBase: string
   orderCount: string
 }
 
 export const FINANCE_ANALYTICS_EMPTY_TOTALS = {
-  grir: { receivedNotBilledBase: '0', billedNotReceivedBase: '0', creditNotesBase: '0', netBase: '0', priceVarianceBase: '0', orderCount: '0' } satisfies GrirReportTotals,
+  grir: { receivedNotBilledBase: '0', billedNotReceivedBase: '0', creditNotesBase: '0', netBase: '0', priceVarianceBase: '0', fxVarianceBase: '0', orderCount: '0' } satisfies GrirReportTotals,
   vat: { taxableBase: '0', salesTaxBase: '0', purchaseTaxBase: '0', taxBase: '0' } satisfies VatReportTotals,
   arAging: { outstandingBase: '0', creditBalanceBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ArAgingReportTotals,
   apAging: { outstandingBase: '0', bucket1Days: '30', bucket2Days: '60', bucket3Days: '90' } satisfies ApAgingReportTotals,
@@ -180,6 +182,8 @@ export type GrirReportRow = {
   netBase: string
   /** Bills' price difference against the PO valuation (billed - ordered value); informational, outside the balance. */
   priceVarianceBase: string
+  /** Per-event FX: the bills' FX difference (bill-date rate against receipt-date rate) of the billed goods; informational, outside the balance. */
+  fxVarianceBase: string
   /** The date of the oldest event on a line (or credit) that still has a balance, and the whole days from it to the as-of date. */
   oldestOpenDate: string | null
   ageDays: number
@@ -1242,6 +1246,15 @@ type GrirGroupRow = {
  * days from the oldest source event of any line or credit that still has a balance to the as-of date. `dateFrom` plays no part: a balance is cumulative.
  * Orders whose every figure is zero are not listed.
  */
+/**
+ * The GR/IR sub-ledger source types this report knows: the ones it sums into the balance, and the two variances it shows beside it. Literals (this module
+ * does not import the sub-ledger writer); tests/accounting/purchase-event-fx-census.test.ts holds them equal to GRIR_BALANCE_SOURCE_TYPES and
+ * GRIR_VARIANCE_SOURCE_TYPES in lib/domain/accounting/grir-subledger-movement.ts, so a new source type cannot be added without this report learning it.
+ */
+export const GRIR_REPORT_BALANCE_SOURCE_TYPES: readonly string[] = ['RECEIPT', 'BILL', 'BILL_UPDATE', 'SUPPLIER_RETURN', 'SUPPLIER_CREDIT_NOTE', 'OPENING_BALANCE']
+export const GRIR_REPORT_VARIANCE_SOURCE_TYPES: readonly string[] = ['BILL_PRICE_VARIANCE', 'BILL_FX_VARIANCE']
+const GRIR_REPORT_BALANCE_SET: ReadonlySet<string> = new Set(GRIR_REPORT_BALANCE_SOURCE_TYPES)
+
 export async function getGrirReport(
   filters: FinanceAnalyticsFilters = {},
   options: { paginate?: boolean; deps?: FinanceAnalyticsDeps } = {},
@@ -1271,19 +1284,29 @@ export async function getGrirReport(
     creditsShown: Prisma.Decimal
     creditOldest: Date | null
     variance: Prisma.Decimal
+    fxVariance: Prisma.Decimal
   }
   const byPo = new Map<string, PoAccumulator>()
   const older = (a: Date | null, b: Date | null): Date | null => (a === null ? b : b === null ? a : (b.getTime() < a.getTime() ? b : a))
   for (const group of groups) {
     let po = byPo.get(group.poId)
     if (!po) {
-      po = { lines: new Map(), credits: new Prisma.Decimal(0), creditsShown: new Prisma.Decimal(0), creditOldest: null, variance: new Prisma.Decimal(0) }
+      po = { lines: new Map(), credits: new Prisma.Decimal(0), creditsShown: new Prisma.Decimal(0), creditOldest: null, variance: new Prisma.Decimal(0), fxVariance: new Prisma.Decimal(0) }
       byPo.set(group.poId, po)
     }
     const base = toDecimal(group._sum.baseDelta)
+    // EXHAUSTIVE over the sub-ledger's source types (GRIR_REPORT_*_SOURCE_TYPES above): the two variances are
+    // outside the balance, every other known type is a balance movement, and a type this report does not know is refused rather than summed.
     if (group.sourceType === 'BILL_PRICE_VARIANCE') {
       po.variance = po.variance.add(base)
       continue
+    }
+    if (group.sourceType === 'BILL_FX_VARIANCE') {
+      po.fxVariance = po.fxVariance.add(base)
+      continue
+    }
+    if (!GRIR_REPORT_BALANCE_SET.has(group.sourceType)) {
+      throw new Error(`GR/IR report: the sub-ledger holds a movement of source type ${JSON.stringify(group.sourceType)}, which this report does not know; nothing is reported rather than a wrong balance`)
     }
     if (group.sourceType === 'SUPPLIER_CREDIT_NOTE') po.creditsShown = po.creditsShown.add(base)
     if (group.poLineId === null) {
@@ -1335,6 +1358,7 @@ export async function getGrirReport(
       creditNotesBase: moneyString(acc.creditsShown, baseCurrency),
       netBase: moneyString(net, baseCurrency),
       priceVarianceBase: moneyString(acc.variance, baseCurrency),
+      fxVarianceBase: moneyString(acc.fxVariance, baseCurrency),
       oldestOpenDate: oldest ? dateOnly(oldest) : null,
       ageDays: oldest ? Math.max(0, ageDays(asOf, oldest)) : 0,
     })
@@ -1347,6 +1371,7 @@ export async function getGrirReport(
     creditNotesBase: moneyString(sum((row) => row.creditNotesBase), baseCurrency),
     netBase: moneyString(sum((row) => row.netBase), baseCurrency),
     priceVarianceBase: moneyString(sum((row) => row.priceVarianceBase), baseCurrency),
+    fxVarianceBase: moneyString(sum((row) => row.fxVarianceBase), baseCurrency),
     orderCount: String(rows.length),
   }, [
     `The GR/IR balance is as of ${dateOnly(asOf)} (cumulative: the start date plays no part). It holds the GOODS value at the purchase-order valuation; freight and landed cost stay on the Stock in Transit path and are not in it.`,
@@ -1740,10 +1765,10 @@ export async function getFxGainLossReport(
     rowCount: String(rows.length),
     unconvertedCount: String(rows.filter((row) => row.outcome === 'not_computable').length),
   }, [
-    `FX gain/loss uses IMS FxRate semantics where rate means 1 ${baseCurrency} = foreign currency; base value is foreign amount divided by the rate, matching the Xero realised-FX posting helper.`,
+    `FX gain/loss uses IMS FxRate semantics where rate means 1 ${baseCurrency} = foreign currency; base value is foreign amount divided by the rate, the same arithmetic as computeRealisedFx. This report is information only: IMS posts no FX journal, and Xero books realised currency gains itself at the settlement rate IMS sends on each payment, and revalues open foreign balances in its own reports.`,
     'Receivable FX rows are one row per Payment.id so partial settlements keep their own paidAt settlement rate; purchase-invoice rows remain one row per paid invoice because supplier partial payments are not modelled.',
     'Base-currency settlements are excluded from FX rows because they have no FX exposure; rowCount is therefore foreign-currency settlement count, not total settlement count.',
     'Settlement rate is the latest FxRate row on or before the end of the paidAt day (an instant when paidAt carries a time). When no settlement rate exists the row is listed as NOT COMPUTABLE with the reason, shows no rate or gain/loss, and is excluded from the totals: it is never valued at the document booking rate or at 1. Add the rate in Settings -> Currencies to include it.',
-    `Rows surface the configured realised FX account (${settings.realisedFxGainLossAccount || 'not configured'}) plus the AR/AP control account used by the Xero journal path.`,
+    `Rows surface the configured realised FX account (${settings.realisedFxGainLossAccount || 'not configured'}) plus the AR/AP control account, for reference only (no journal is posted to either).`,
   ], options.paginate !== false)
 }

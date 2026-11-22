@@ -477,9 +477,9 @@ Disconnect) is ignored and re-resolved rather than used against a ledger that ne
 | Sales Revenue | Revenue | Income from sales invoices |
 | Shipping Income | Revenue | Shipping charges on sales |
 | Discounts Given | Revenue / Expense | Order-level discounts |
-| Purchases | Direct Cost | Default account for purchase bills |
-| Stock in Transit | Asset | Goods ordered but not yet received, and (when refund returns are held in transit) refunded goods not yet back |
+| Stock in Transit | Asset | Every supplier bill line (product and cost lines alike) posts here; it also holds goods ordered but not yet received, and (when refund returns are held in transit) refunded goods not yet back. IMS has no separate Purchases account for bills |
 | GR/IR (goods received, not invoiced) | Liability / Current liability | Clearing account the daily batch moves goods received but not yet billed into, out of Stock in Transit. Used only while **GR/IR accrual posting** is switched on; must differ from Stock in Transit |
+| Purchase Price Variance | Profit and loss (cost of sales) | The difference between a supplier bill and the order price, posted on its own bill line while **per-event FX rates for purchasing** are switched on (off by default; not used yet). Leave blank otherwise; must differ from Stock in Transit, GR/IR and Inventory Asset |
 | Inventory Asset | Asset | Stock on hand (available) |
 | Allocated Inventory | Asset | Stock reserved for paid orders awaiting dispatch (stock on an order that ships before it is paid goes straight from Inventory to COGS and never passes through here) |
 | Cost of Goods Sold | Direct Cost | COGS booked when goods ship |
@@ -487,8 +487,8 @@ Disconnect) is ignored and re-resolved rather than used against a ledger that ne
 | Manufacturing Overhead | Profit and loss | Overhead absorbed into manufactured stock cost (optional) |
 | Inventory Revaluation | Profit and loss | Offset for retrospective cost corrections on goods already sold (optional) |
 | Rounding Difference | Profit and loss | Absorbs sub-penny rounding so the inventory sub-ledger ties to the ledger. Also receives the one untaxed "Rounding adjustment" line that makes an invoice, bill or credit note total exactly what IMS holds, when a unit price IMS keeps to six decimal places is kept to four by Xero (see below). Needed only for such documents |
-| Accounts Receivable / Accounts Payable | Your control accounts | Control accounts for the foreign-exchange journals |
-| Realised and Unrealised FX Gain/Loss | Profit and loss | Settlement-rate variances and period revaluation |
+| Accounts Receivable / Accounts Payable | Your control accounts | Shown on the FX Gain/Loss report for reference only. IMS posts no foreign-exchange journal to them (Xero refuses manual-journal lines to its AR/AP system accounts) |
+| Realised and Unrealised FX Gain/Loss | Profit and loss | Not used for postings. Xero books realised currency gains (at the settlement rate IMS sends on each payment) and unrealised currency gains (its own revaluation of open foreign balances) to its own system accounts. The realised account is shown on the FX Gain/Loss report; the unrealised account is not read at all |
 | EU IOSS/VOEC VAT collected, EU DDP charges collected, EU landed-cost fees | See the EU sections below | Three roles for the EU VAT treatment. Configuration only and **not yet switched on**: leave them blank until told otherwise (see the EU sections below) |
 
 **Rounding adjustment on documents (invoices, bills, credit notes, supplier credits).** IMS keeps unit prices to six decimal places and Xero keeps four, so for a line such as 1,000 x 0.333333 Xero's own total, with its per-line tax, can differ from IMS's by a few pence, and a full payment would not settle the document. IMS predicts the whole total Xero will hold (each line rounded to the penny, tax worked out per line and rounded, for tax-exclusive and tax-inclusive documents), and when it differs adds one "Rounding adjustment" line (quantity 1, tax type No VAT) on the Rounding Difference account for exactly the difference. The document is then predicted again and must equal the IMS total. If it cannot be, nothing is sent and the sync row says why: no Rounding account is mapped, the tax rate of a line is not in the stored Xero tax-rate list (or the list is stale or the type has several components), or the difference is more than rounding can explain.
@@ -891,7 +891,9 @@ Every sales invoice, purchase bill, credit note and **payment** pushed to Xero i
 **Rate flow:**
 
 ```
-frankfurter.dev (ECB) → /api/cron/fx-rates → FxRate table
+rate source chosen by fx_rate_source → /api/cron/fx-rates → fx_rates table (FxRate)
+  (Aelia, the store's currency switcher, is the master: owner ruling 2026-10-26;
+   ECB via frankfurter.dev is the default until the source is switched)
        ↓
 fxRateToBase stamped on SalesOrder / PurchaseOrder / SalesOrderRefund at creation
 (a PurchaseOrder: ALWAYS the fx_rates table rate, never a typed one)
@@ -902,6 +904,8 @@ Xero adapter inverts to Xero's convention (1 doc-ccy = X base) at 6dp
        ↓
 CurrencyRate sent on Invoice / Bill / CreditNote API call
 ```
+
+`fx_rates` is the one table every IMS rate read uses. Which source fills it is the **Exchange-rate source** setting (`fx_rate_source`, Settings → Accounting → FX Rates): Aelia is the exchange-rate master by owner ruling, and ECB (frankfurter.dev) is the default until that setting is switched to Aelia. See [Aelia as the FX master](woocommerce.md#aelia-as-the-fx-master-flag-default-off).
 
 **Direction conventions:**
 
@@ -934,7 +938,7 @@ CurrencyRate sent on Invoice / Bill / CreditNote API call
 
 **Refunds and credit notes use the booked rate, and refuse without one.** A refund, a chargeback's discount line, a supplier credit note and a hand-recorded WooCommerce refund are all converted at the exchange rate stored on the order or bill they reverse (never a fresh table rate). A document in the base currency is 1 because its currency is the base currency. A foreign document whose stored rate is missing, zero or negative is **refused by name before anything is written** (`<document> is in USD but has no usable stored FX rate to GBP`): the refund or credit note is not created and nothing is converted at 1. A WooCommerce refund that hits this is not lost: it is parked as a quarantined refund (the sync-exceptions inbox, with the message above and an `refund_sync_missing_order_fx_rate` activity entry). **Operator action: correct the document's exchange rate, then record or retry the refund from the inbox.**
 
-**Connector-agnostic design:** the optional `currencyRateToBase` field is on the generic `InvoiceData` / `BillData` / `CreditNoteData` types (`lib/connectors/types.ts`). Each accounting connector decides how to translate it. Xero sends the inverse form (`1 / x`) as `CurrencyRate`; QuickBooks also inverts the IMS rate before setting `ExchangeRate`, rounded to the connector's supported precision.
+**Connector-agnostic design:** the optional `currencyRateToBase` field is on the generic `InvoiceData` / `BillData` / `CreditNoteData` types (`lib/connectors/types.ts`). The Xero connector sends the inverse form (`1 / x`) as `CurrencyRate`, rounded to 6 dp.
 
 **Downstream push to WooCommerce (retired).** IMS no longer pushes exchange rates to the store: the onetwoInventory Helper plugin 1.3.0 refuses every rate push and no longer overrides Aelia's rate, so Aelia, the store's currency switcher, owns the storefront rates. A push attempt is recorded as a skipped row in the push log. IMS takes its rates from the daily ECB fetch; reading Aelia's rates into IMS (setting `fx_rate_source`, default ECB) is built but **not yet switched on**. See `docs/woocommerce.md` for the plugin.
 
@@ -960,7 +964,7 @@ A customer receipt IMS holds but Xero does not (a manual payment recorded after 
 
 A receipt that already has a payment row in the sync log is never a candidate: its registration, in whatever state, belongs to the retry paths described below.
 
-**Manual overrides and push log.** Settings → Accounting → **FX Rates** shows the current rate per currency, with a source badge (`ECB (frankfurter)`, `Aelia (before markup)` or `Manual override`). Pin a manual rate via the pencil icon — the daily fetch will then skip that currency until the override is cleared (the undo icon re-fetches from frankfurter). The same panel includes a recent-pushes table (one row per fan-out attempt to a shopping connector) so you can see whether the latest push to WooCommerce succeeded.
+**Manual overrides and push log.** Settings → Accounting → **FX Rates** shows the current rate per currency, with a source badge (`ECB (frankfurter)`, `Aelia (before markup)` or `Manual override`). Pin a manual rate via the pencil icon — the daily fetch will then skip that currency until the override is cleared (the undo icon re-fetches from the configured source: frankfurter under ECB, the store under Aelia). The same panel includes a recent-pushes table (one row per fan-out attempt to a shopping connector) so you can see whether the latest push to WooCommerce succeeded.
 
 The full unified-FX rollout plan is tracked in `docs/todo/unified-fx-rates-plan.md`.
 
@@ -983,6 +987,10 @@ When enabled, the nightly cron job runs three groups in sequence:
 **Refunds entered before the first run.** A refund recorded before an order's first batch run (a net refund, from this release's refund writer) is netted out of that order's revenue deferral, so a partial refund no longer leaves Unearned Revenue holding the refunded value. The deferral journal itself stays at the full amount on the day the order was paid, and each such refund is posted as its own adjustment (DR Unearned Revenue / CR Sales) dated the day of the refund (never before the payment), so a refund entered in a later period never changes an earlier period's journal. Each refund records the adjustment journal that netted it, so a lost adjustment is rebuilt exactly once by the missing-batch sweep and reported by the accounting checks (`refund_deferral_adjustment_without_sync_evidence`) until it is. Refunds recorded after the deferral keep using the refund reversal journals described above. A refund from before refunds were stored net is not netted (its tax-inclusive total cannot be subtracted from a tax-exclusive deferral) and is left for the lifecycle tie-out to report.
 
 Group A1 reads each order's subtotal, shipping and discount to work out how much revenue to defer, and it reads them before it opens the transaction that writes the journal. If any of those orders changes in that window — in practice only the one-off WooCommerce coupon backfill does this — the whole group is **refused rather than posted**, because the journal it had prepared would no longer match the orders it names. Nothing is staged and no order is marked as deferred, so the next night's run simply recalculates from the corrected figures. The refusal appears in the run's errors and as an `accounting_daily_batch_stale_order_discount` entry in the activity log, naming each affected order and both amounts. The same applies to the QuickBooks daily batch.
+
+### Per-event FX rates for purchasing (off, being built)
+
+A switch, **`purchase_event_fx_rates_enabled`**, is being prepared to value foreign-currency purchases at the rate of each accounting event instead of the rate the order was raised at, with any bill-vs-order price difference on its own line on the bill, coded to **Purchase Price Variance**, and the exchange difference to **Realised FX Gain/Loss**. **It is off and changes nothing yet**: receipts, bills, stock layers, journals and everything sent to Xero are exactly as before. It is set by an admin from the command line (`npm run settings:set`), and it refuses to turn on while Xero sync is on and either the **Realised FX Gain/Loss** or the **Purchase Price Variance** account is unmapped. The GR/IR report already has an **FX difference** column for it, which stays at zero.
 
 ### GR/IR accrual posting (goods received, not invoiced)
 
@@ -2527,7 +2535,7 @@ settles expire normally.
 | `/api/cron/accounting-daily-batch` | Daily (02:00 by default) | Run sub-ledger Groups A1, A2, B |
 | `/api/cron/accounting-payment-poll` | Every 15 min | Detect paid invoices and bills in the active accounting connector |
 | `/api/cron/accounting-payment-reconcile` | Daily (03:00) | Backlog sweep: check every locally-linked invoice/bill against its current Xero status by id (report-only unless `xero_payment_reconcile_apply`) |
-| `/api/cron/accounting-fx-revaluation` | Daily | Periodic unrealised FX revaluation of open AR/AP balances |
+| `/api/cron/accounting-fx-revaluation` | **Retired** (do not schedule) | Answers a successful skip and does nothing: Xero revalues open foreign balances itself (see *Unrealised FX* below). Remove it from the server's crontab if it is still there |
 | `/api/cron/xero-chart-sync` | Daily (00:30 by default) | Refresh the stored Xero chart of accounts (read-only) before the balance snapshot |
 | `/api/cron/account-balance-snapshot` | Daily (01:00 by default) | Snapshot Xero account balances for period reporting |
 | `/api/cron/xero-tax-rate-drift` | Hourly | Read the full Xero tax-rate list into the tax-rate master store (rows, header and read-sync stamp in one transaction) and record IMS-vs-Xero tax-rate drift |
@@ -2559,7 +2567,7 @@ The snapshot pull reads Xero's Trial Balance and stores, per configured account,
 
 ## Realised and Unrealised FX
 
-The system tracks both kinds of foreign-currency P&L impact separately.
+Xero books both kinds of foreign-currency gain and loss itself. IMS posts no FX journal of either kind; it sends its own rate on every foreign document and payment, and keeps an FX Gain/Loss report for information.
 
 ### Realised FX (at settlement)
 
@@ -2572,34 +2580,24 @@ When a multi-currency invoice or bill is paid, the actual settlement exchange ra
 
 **A missing settlement rate refuses; there is no fallback.** The settlement rate is the latest `fx_rates` row on or before the end of the payment date (a date picked in the form is a whole business day, so a rate fetched at 09:00 that day is that day's rate). If the currency has no rate for that date, or its stored rate is zero, negative or ambiguous, the payment is **refused before anything is written**: no customer receipt or bill-paid status is recorded, nothing is queued, and the message names the currency and date. The old behaviour (use the document's booked rate, then 1, with an `fx_rate_fallback_used` warning) is gone. **Operator action: add the rate in Settings → Currencies for that date (or earlier), then record the payment again.** Refund payments and base-currency documents never need a rate.
 
-### Unrealised FX (period revaluation)
+### Unrealised FX (period revaluation) — retired
 
-For open multi-currency AR and AP balances, the daily `accounting-fx-revaluation` cron job:
+**IMS no longer revalues open foreign balances, and posts no unrealised FX journal.** With multi-currency switched on, Xero revalues open foreign-currency invoices, bills and bank balances itself: its system *Unrealised Currency Gains* account is calculated on unpaid invoices and bills at the current exchange rate, cannot be posted to, and shows on the Profit and Loss and Executive Summary; the *Bank Revaluation* account does the same for foreign-currency bank accounts; and Xero's **Foreign Currency Gains and Losses** report shows the balances revalued in the base currency (Xero Central: *Foreign currency accounts in the chart of accounts*, *Foreign Currency Gains and Losses report*). An IMS revaluation journal for the same balances would state the movement a second time, and its control leg is the AR/AP control account, which Xero refuses on a manual journal.
 
-- Computes the current base-currency value of every open invoice/bill at today's rate
-- Compares against the originally-booked base value
-- Posts an unrealised FX gain/loss journal to balance the difference
-- Reverses yesterday's revaluation journal on the next run so the entries don't accumulate
+What changed (owner decision 2026-11-22):
 
-This ensures month-end financial reports correctly reflect what your foreign-currency exposure is worth today, without double-counting movements.
+- **The cron does nothing.** `/api/cron/accounting-fx-revaluation` still authenticates and rate-limits, then answers `success: true, skipped: true` with the reason *Retired: Xero revalues open foreign-currency invoices, bills and bank balances itself …*. It reads no documents, looks up no rate, reverses nothing, queues nothing and writes no activity entry. It is not in the Scheduler; remove it from the server's crontab if you added it.
+- **Nothing is queued.** The enqueue suppresses `UNREALISED_FX_JOURNAL` for Xero, for a revaluation and for the reversal of one.
+- **A row already queued is retired, not sent.** The Xero processor marks any `UNREALISED_FX_JOURNAL` row (either kind) **Cancelled** with the reason *Retired, not sent: Xero revalues open foreign-currency invoices, bills and bank balances itself …* and logs an `xero_unrealised_fx_journal_retired` warning, before any request to Xero.
+- **The Unrealised FX Gain/Loss account mapping and the Unrealised FX Revaluation switch are not used.** Leaving them set changes nothing.
 
-**A document with no rate is carried forward, not valued.** The valuation date is a whole business day (the latest rate on or before the end of it). Every open document's rate is resolved before anything is reversed or posted. The previous journal for a side is reversed in full and replaced by one journal whose amount is the new valuation of every open document that has a rate, plus the **share of the previous unrealised amount that still belongs to what is outstanding** for every open document that has no rate. A document that has closed (paid in full) contributes nothing, so its old amount leaves the books at once. A document with no rate that was not in the previous journal contributes nothing yet and is reported. Nothing is ever valued at 1 or at a booked rate.
+**A revaluation that did post before this change.** None is expected: IMS has suppressed the journal for Xero since 2026-07, and before that Xero refused it (its control leg is the AR/AP system account). If one did post, IMS raised its reversal on the next run, so a revaluation whose reversal never posted would leave its amount standing in Xero next to Xero's own revaluation. IMS will not post a final reversal. Find any such journal in Xero (Manual Journals, narration *Unrealised AR FX revaluation at …* or *Unrealised AP FX revaluation at …*, reference `FXREV-<date>`) with no matching *Reverse unrealised FX revaluation from <date>* journal, and reverse it by hand in Xero after checking with your accountant.
 
-The carried share is `previous amount x (outstanding foreign balance now / outstanding foreign balance when the previous journal was struck)`, computed in Decimal and rounded half-up to 2 places (the posting precision). So a document part-paid since the last journal carries only its remaining share (half paid carries exactly half), and an unchanged balance carries the full amount. Each revaluation records, per document, its amount **and the outstanding foreign balance it was struck on** in its own payload (`documents`), which is what the next run carries from.
-
-Each carried or left-out document is named in the run result (`skippedNoRate`, with `treatment`: `carried_forward` and the amount, `excluded_closed`, or `excluded_not_in_prior`) and in an `unrealised_fx_document_skipped_no_rate` WARNING. **Operator action: add the missing rate in Settings -> Currencies; the document is valued normally on the next run date** (the journal for a date and side is posted once, so a same-day rerun does not replace the carried amount).
-
-**When the share cannot be established safely the whole side is withheld** (`side_withheld_missing_rate`, with the document and reason in `withheldSides[].detail`): nothing is reversed or posted, the previous valuation stays in force (closed documents' amounts stay on the books until it is resolved), and a same-day rerun after the rate is added does the side. That happens when any journal in force for the side has no per-document record or cannot be routed by this build (journals posted before this change, the first-run limit), when the previous record has no outstanding balance (same limit), when the previous outstanding balance is zero or negative, when the document's currency changed, when its current outstanding balance cannot be read, or when its outstanding balance has **grown** since the previous journal (for example an amendment).
-
-**A side is queued as one unit.** For each side, the reversal(s) of its previous journal and its replacement are queued together in one database transaction. If the queue refuses any of them (for example an earlier FAILED attempt for the same date whose outcome is unresolved), nothing is queued for that side: no reversal without a replacement. The side is reported as `side_blocked_enqueue_refused` (result `withheldSides` and an `unrealised_fx_side_blocked_enqueue_refused` WARNING naming the cause), counted under `refused`, and its previous valuation stays in force. Resolve the cause (retry or cancel the failed attempt) and rerun; the other side is unaffected.
-
-The **FX Gain/Loss report** (Analytics → FX Gain/Loss) lists a settlement with no rate as *Not computable*, with the reason, an empty rate and gain/loss, and counts it under "Not computable (no rate)"; it is excluded from the totals and never valued at the booked rate or 1.
-
-Configure the Unrealised FX Gain/Loss account separately from Realised in Xero account mapping.
+The **FX Gain/Loss report** (Analytics → FX Gain/Loss) is kept as **information only**: it lists realised gain or loss per settled foreign receivable and payable at IMS's rates, and posts nothing. A settlement with no rate is listed as *Not computable*, with the reason, an empty rate and gain/loss, and counted under "Not computable (no rate)"; it is excluded from the totals and never valued at the booked rate or 1.
 
 ### FX rate staleness
 
-Settlement and revaluation no longer write `fx_rate_fallback_used` entries: they use the latest rate on or before the date, and refuse (settlement) or skip with a named reason (revaluation) when there is none. Period-movement queries for accounts strictly require a previous-day snapshot — if no snapshot exists, the report shows a notice rather than silently using a stale value.
+Settlement no longer writes `fx_rate_fallback_used` entries: it uses the latest rate on or before the date, and refuses when there is none. Period-movement queries for accounts strictly require a previous-day snapshot — if no snapshot exists, the report shows a notice rather than silently using a stale value.
 
 
 ## Daily Batch Caps
@@ -2734,7 +2732,7 @@ there is nothing to settle, and if it is not, reverse it in Xero before recordin
 
 - **A refund** that has to net an earlier reversal journal you settled this way (an order-level reversal, an Allocated Inventory reversal, the order's A2 batch journal, or an earlier refund's reversal) **withholds its Allocated Inventory reversal** instead of crediting against a figure not verified against the ledger: nothing is credited, the order keeps its A2 stamp, and the refund row's allocation-basis note says "settled as posted by an OPERATOR" and gives the steps. It is announced twice: a warning in the activity log at the moment it is withheld, and the standing **critical** accounting finding `sales_order_refund_allocation_basis_unresolved` for that refund. **What you must do today:** check the journal in Xero, then raise the credit by hand in Xero (DR Inventory / CR Allocated Inventory). What to credit depends on the refund. For a **full** refund it is the open balance (the recorded A2 debit less relief already credited; the note states each figure). For a **partial** refund it is **the lesser of two figures** the note states side by side: what the refunded units value, and the order's open A2 balance (recorded debit less relief already credited). Never credit more than the open balance, and credit nothing for the units the customer still holds, whose part of the A2 debit comes out when they are dispatched or refunded. If you already applied a manual credit for this order, deduct it. If the note says it could not establish the figure, work it out from the refunded lines; it never prescribes the order's whole debit for a partial refund; the same is said when the open balance itself cannot be established (for example, another reversal it depends on is also settled by hand). The IMS does **not** yet have a screen that records that credit or clears the finding, and checking the journal does not change what the IMS stored, so neither a later refund nor a full refund resolves it; the finding stays listed until that action exists. An unearned-revenue reversal you settled this way is still counted (arithmetic unchanged for now) and the refund adds a warning to the activity log.
 - **The deferred-revenue true-up** of the daily batch and its preview count the same rows as before and now say, per order, which rows they rest on that were not verified against the ledger (an asserted row they counted, or a cancelled row that may have posted and they left out). The Daily Batch panel shows the warnings above the preview figures (an amber box, one line per order); the batch logs them. Nothing is held back yet.
-- **The unrealised FX run** still treats a journal you typed in as existing (so it does not post it twice) and logs a warning for each one it relied on.
+- **The unrealised FX run** is retired (see *Unrealised FX (period revaluation) — retired*): it no longer reads journals at all.
 - **A discount restated or reversed from a posted document** (chargebacks, the restated-discount handoff, credit-note netting) goes to **manual** when the posted document's mirror records only your assertion, or records no confirmation at all (every mirror written before the IMS recorded how a post was confirmed). Raise the credit note or adjustment by hand.
 
 **What the sync pages now show: whose word a row rests on.** A row's badge and its document id are no longer
@@ -2976,18 +2974,15 @@ before, nothing is queued, because there is nothing for it to post to.
 not only to the sales invoice and credit note: stock receipts and supplier returns, purchase bills and
 bill edits, supplier credit notes, bill payments and invoice payments, manufacturing overhead and
 manufacturing reclass journals, landed-cost reclass and COGS journals, shipment COGS revaluations,
-inventory adjustments, allocation and unearned-revenue reversals, tax-rate syncs and the unrealised FX
-revaluation. Every one of them now records which connector's chart of accounts it was built from, and
+inventory adjustments, allocation and unearned-revenue reversals and tax-rate syncs (the unrealised FX
+revaluation, once on this list, is retired). Every one of them now records which connector's chart of accounts it was built from, and
 every one of them is refused rather than mis-routed.
 
 **Three postings behave slightly differently, and it is worth knowing why.**
 
-* **Reversing a previous FX revaluation.** The reversal's account numbers are copied from the journal it
-  reverses, which may have been posted under the *other* connector. So the reversal is routed by the
-  connector that journal was posted under — not by whichever is active now — and it is refused if that
-  connector is no longer the active one. You cannot reverse a QuickBooks journal by posting to Xero: if
-  the unrealised FX from an earlier period needs unwinding after a connector switch, it has to be
-  unwound in the accounting system that holds it.
+* **Reversing a previous FX revaluation.** Retired with the unrealised FX revaluation: IMS raises no
+  reversal. A revaluation that needs unwinding is reversed by hand in Xero (see *Unrealised FX (period
+  revaluation) — retired*).
 * **A sales invoice held waiting for a WooCommerce invoice number.** These holds can sit for days, and
   the account numbers are frozen when the order is imported. A hold parked by an older version of IMS,
   before it recorded which connector those numbers came from, cannot be released automatically: the
@@ -3186,10 +3181,8 @@ Two consequences worth knowing:
 * **The landed-cost journal backstop.** When a landed-cost recalculation's journals cannot be queued, its
   background retry job is kept retrying (and fails visibly once its attempts are spent) instead of being
   marked done.
-* **Unrealised FX revaluation.** The run's result now includes `refused` — journals it owed and could not
-  queue — and those are no longer counted in `reversed` or `revalued`. A run with refusals is never
-  reported as "already queued for this date". The "already revalued today" check is also per connector: a
-  revaluation posted to Xero earlier the same day no longer stops the QuickBooks revaluation after a switch.
+* **Unrealised FX revaluation.** Retired: the run queues nothing, so it has nothing to refuse (see
+  *Unrealised FX (period revaluation) — retired*).
 
 ### Rows stranded on a connector you switched away from
 

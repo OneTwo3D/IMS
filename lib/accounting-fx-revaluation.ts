@@ -693,6 +693,42 @@ async function reportSkippedRevaluations(valuationDate: string, skipped: Skipped
   }
 }
 
+/**
+ * THE PERIOD REVALUATION IS RETIRED FOR XERO (owner decision 2026-11-22).
+ *
+ * With multi-currency on, Xero revalues open foreign-currency invoices, bills and bank balances itself, at the report date, into its system
+ * Unrealised Currency Gains account (Xero Central, "Foreign currency accounts in the chart of accounts" and "Foreign Currency Gains and
+ * Losses report"). An IMS UNREALISED_FX_JOURNAL for the same balances is a second statement of the same movement, and its control leg is the
+ * AR/AP control account, which Xero rejects on a manual journal. So:
+ *   - the cron route (GET /api/cron/accounting-fx-revaluation) answers {@link retiredArApFxRevaluation} and runs nothing: no read of open
+ *     documents, no rate lookup, no reversal, no journal, no activity entry. The route stays so a server cron still pointing at it gets a
+ *     clean, named skip instead of a 404;
+ *   - the enqueue chokepoint suppresses UNREALISED_FX_JOURNAL for Xero (isFxGainLossJournalSuppressed), revaluations and reversals alike;
+ *   - the Xero processor retires any row already queued, with UNREALISED_FX_JOURNAL_RETIRED_REASON, and sends nothing.
+ * Xero is the only accounting connector this build ships, so {@link runArApFxRevaluation} below has no production caller. It is kept, with
+ * its tests, until it is deleted outright; nothing may call it for Xero.
+ */
+export const UNREALISED_FX_REVALUATION_RETIRED_REASON =
+  'Retired: Xero revalues open foreign-currency invoices, bills and bank balances itself (unrealised currency gains in its reports), so IMS posts no unrealised FX revaluation journal. Nothing was read, queued or posted.'
+
+/** The cron's answer since the retirement: a successful, named skip that did nothing. */
+export function retiredArApFxRevaluation(input?: { valuationDate?: Date | string }): FxRevaluationResult {
+  return {
+    success: true,
+    skipped: true,
+    reason: UNREALISED_FX_REVALUATION_RETIRED_REASON,
+    // A malformed ?date= no longer matters (nothing is valued), so it is not an error: today's business date is reported instead.
+    valuationDate: (() => { try { return asDateOnly(input?.valuationDate) } catch { return asDateOnly() } })(),
+    reversed: 0,
+    revalued: 0,
+    documents: 0,
+    refused: 0,
+    skippedNoRate: [],
+    withheldSides: [],
+  }
+}
+
+/** RETIRED for Xero: see {@link UNREALISED_FX_REVALUATION_RETIRED_REASON}. No production caller; the cron answers retiredArApFxRevaluation. */
 export async function runArApFxRevaluation(input?: {
   valuationDate?: Date | string
 }): Promise<FxRevaluationResult> {

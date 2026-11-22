@@ -141,7 +141,7 @@ import { NO_TAX_TYPE, connectorEmitsDiscount, connectorEmitsShipping, droppedExt
 import { describeAllocationAttempt } from '@/lib/domain/sales/allocation-activity'
 import { matchContinuedOrderLines } from '@/lib/domain/sales/order-edit-lines'
 import { resolveOrderEditWmsGate } from '@/lib/domain/sales/order-edit-wms-gate'
-import { SalesInvoiceDoesNotReconcileError, SalesInvoiceOriginalDateUnknownError, SalesInvoiceExtraNotMappedError, SalesInvoiceDiscountSplitError, SalesInvoiceNotQueuedError, SalesInvoiceReverseChargeSwapNotSetError, reverseChargeSwapMissing, assertInvoiceQueuedOrNotOwed, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
+import { SalesInvoiceDoesNotReconcileError, SalesInvoiceOriginalDateUnknownError, SalesInvoiceExtraNotMappedError, SalesInvoiceDiscountSplitError, SalesInvoiceDiscountSplitTaxCodeError, SalesInvoiceNotQueuedError, SalesInvoiceReverseChargeSwapNotSetError, reverseChargeSwapMissing, assertInvoiceQueuedOrNotOwed, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
 import {
   INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
   STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
@@ -149,7 +149,7 @@ import {
   storedAmountsIncludeVat,
 } from '@/lib/domain/sales/sales-order-vat-basis'
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
-import { invoiceDiscountParts, parseDiscountTaxSplit, type DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
+import { discountSplitEntryTaxType, discountSplitTaxCodeRefusal, invoiceDiscountParts, parseDiscountTaxSplit, type DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
 import { decideChargebackOrderDiscount, resolvePostedOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
 import { claimDocumentNumber, mintCommittedDocumentNumber, retryWhenNumberTaken } from '@/lib/domain/numbering/mint'
 import { invoiceNumberIsExternallySupplied, resolveInvoiceNumberToRecord, resolveSalesInvoiceNumberForPost } from '@/lib/domain/accounting/sales-invoice-number'
@@ -1197,7 +1197,26 @@ export type CreateSalesOrderResult = { success: boolean; order?: SoRow; error?: 
  * (manual override, else the category / destination resolver, else the order default), the inclusive-prices-without-a-rate refusal and the caller's tax assertions. Shared by createSalesOrder and
  * updateSalesOrder so an edited draft is priced by the same path as a fresh one (no second pricing path). Writes nothing.
  */
-async function prepareSalesOrderWrite(input: CreateSoInput, options?: { pinnedFxRate?: number }) {
+/**
+ * THE SAVE / FINALISE TWIN OF THE INVOICE'S DISCOUNT PART CODES: whether a discounted order's per-rate split has a group the invoice could post on no tax code (discountSplitTaxCodeRefusal), read the way
+ * queueSalesInvoiceForOrder reads it: the order default code is the ACTIVE rate the order names (the same lookup), the reverse-charge swap is the accounting settings' one, and each group's code is
+ * discountSplitEntryTaxType, the function the invoice's parts use. Null for an order with no split or no discount the invoice would post (a header-rate order asks nothing and reads nothing).
+ */
+async function discountSplitTaxCodeRefusalFor(
+  reader: Pick<typeof db, 'taxRate'>,
+  order: { discountAmount: DecimalInput | null; discountTaxSplit: unknown; taxRateName: string | null },
+): Promise<string | null> {
+  if (!(roundDecimalNumber(order.discountAmount ?? 0, 2) > 0)) return null
+  const split = parseDiscountTaxSplit(order.discountTaxSplit)
+  if (!split) return null
+  const orderDefaultTaxType = order.taxRateName
+    ? (await reader.taxRate.findFirst({ where: { name: order.taxRateName, active: true }, select: { accountingTaxType: true } }))?.accountingTaxType ?? null
+    : null
+  const { reverseChargeSalesTaxType } = await getAccountingSettings()
+  return discountSplitTaxCodeRefusal(split, { orderDefaultTaxType, reverseChargeSalesTaxType })
+}
+
+async function prepareSalesOrderWrite(input: CreateSoInput, options?: { pinnedFxRate?: number; liveOrder?: boolean }) {
   // THE ORDER'S RATE IS THE TABLE RATE (owner ruling 2026-10-25, one rate). There is no typed rate: a foreign order is priced by the central lookup at the moment it is created
   // (end-of-day rule inside getFxRateToBase), and a missing rate REFUSES the order ("Missing <base> FX rate for <cur> on or before <date>"); it is never read as 1:1. The base currency is 1.
   // A CONFIRMED order's edit pins the rate the order was booked at (its invoice, its payment and its base-currency figures were made at it): `pinnedFxRate` replaces the lookup and the form's expected-rate check.
@@ -1355,6 +1374,12 @@ async function prepareSalesOrderWrite(input: CreateSoInput, options?: { pinnedFx
     apportionDiscountTax,
     lines: input.lines.map((l, idx) => ({ input: l, rate: lineResolved[idx].taxRateValue, taxRateId: lineResolved[idx].taxRateId, accountingTaxType: lineResolved[idx].accountingTaxType, reverseCharge: lineResolved[idx].reverseCharge })),
   })
+  // A LIVE order (a create that is not a draft, an edit of a confirmed order) whose split has a group with no tax code is refused here, as it was before the no-rate lines were allowed into the split:
+  // its invoice would be refused at the sync processor instead. A draft (a manual draft, every CSV import) still saves; its finalisation is refused the same way. Only an order that carries a split asks.
+  if (options?.liveOrder && model.discountTaxSplit) {
+    const refusal = await discountSplitTaxCodeRefusalFor(db, { discountAmount: model.totals.discountAmount, discountTaxSplit: model.discountTaxSplit, taxRateName: input.taxRateName ?? null })
+    if (refusal) return { ok: false as const, error: refusal }
+  }
   return { ok: true as const, fxRate, vatRate, inclVat, model, lineResolved, taxValidation, destCountry, productCategoryById, orderDefaultRate }
 }
 
@@ -1468,7 +1493,7 @@ export async function createSalesOrder(input: CreateSoInput): Promise<CreateSale
       if (existing) return { success: false, error: `Order ${externalOrderNumber} already exists` }
     }
 
-    const prepared = await prepareSalesOrderWrite(input)
+    const prepared = await prepareSalesOrderWrite(input, { liveOrder: !input.isDraft })
     if (!prepared.ok) return { success: false, error: prepared.error }
     const { orderDefaultRate } = prepared
     const lineData = prepared.model.lines
@@ -1724,7 +1749,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
       await requirePermission('sales.process')
     }
 
-    const prepared = await prepareSalesOrderWrite(input, confirmedEdit ? { pinnedFxRate: Number(preRead.fxRateToBase) } : undefined)
+    const prepared = await prepareSalesOrderWrite(input, confirmedEdit ? { pinnedFxRate: Number(preRead.fxRateToBase), liveOrder: true } : undefined)
     if (!prepared.ok) return { success: false, error: prepared.error }
     const lineData = prepared.model.lines
     const editToday = await quoteTodayYmd()
@@ -2147,10 +2172,14 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
         split: discountSplit,
         lineAmountsIncludeTax,
         totalAmount: discountForeign,
-        taxTypeOf: (entry) => resolveSalesLineTaxType({ baseTaxType: entry.accountingTaxType ?? orderDefaultTaxType, reverseCharge: entry.reverseCharge, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }) ?? null,
+        taxTypeOf: (entry) => discountSplitEntryTaxType(entry, { orderDefaultTaxType, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }),
       })
     : []
   if (discountPartsOrNull === null) throw new SalesInvoiceDiscountSplitError(discountForeign, so.currency)
+  // A group with no tax code would reach the sync processor and be refused there ("NOTHING WAS SENT"): refused here, so the create, edit or finalisation that queues it is rolled back with a reason.
+  // The same rule the save and the finalisation ask first (discountSplitTaxCodeRefusalFor); this is the backstop under the order's own transaction.
+  const discountSplitCodeRefusal = discountSplit ? discountSplitTaxCodeRefusal(discountSplit, { orderDefaultTaxType, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }) : null
+  if (discountSplitCodeRefusal) throw new SalesInvoiceDiscountSplitTaxCodeError(discountSplitCodeRefusal, so.currency)
   const discountParts = discountPartsOrNull
 
   // o3d-k26m.1: prefer the number already recorded on the order over one derived here. See
@@ -2479,6 +2508,10 @@ export async function applySalesOrderStatusTransition(
         // The VAT basis a draft's invoice will be built from (see lib/domain/sales/sales-order-vat-basis.ts).
         pricesIncludeVat: true,
         taxRatePercent: true,
+        // The discount's per-rate split, read so a draft whose split has a group with no tax code is not finalised (discountSplitTaxCodeRefusalFor).
+        taxRateName: true,
+        discountAmount: true,
+        discountTaxSplit: true,
         lines: { select: { id: true, productId: true, sku: true, qty: true, taxForeign: true } },
       },
     })
@@ -2545,6 +2578,11 @@ export async function applySalesOrderStatusTransition(
     }
     // The invoice that finalisation will queue is built and reconciled to the order's total BEFORE anything moves; a mismatch refuses the
     // finalisation (any other failure of the dry build surfaces where the invoice is really queued, as it always did).
+    // A draft whose discount split has a group with no tax code is not finalised (the save of a draft allows it; a live order is refused at its save): the rule and the lookups the invoice uses.
+    if (isDraftFinalization) {
+      const splitCodeRefusal = await discountSplitTaxCodeRefusalFor(db, so)
+      if (splitCodeRefusal) return { success: false, error: splitCodeRefusal }
+    }
     if (isDraftFinalization) {
       try {
         await queueSalesInvoiceForOrder(id, { checkOnly: true })

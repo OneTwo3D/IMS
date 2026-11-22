@@ -41,6 +41,8 @@ export type XeroSettings = {
   xero_accounts_receivable_account: string
   xero_accounts_payable_account: string
   xero_realised_fx_gain_loss_account: string
+  /** Per-event FX (switch `purchase_event_fx_rates_enabled`): the P&L account a small bill-vs-order price difference posts to. Blank = unmapped; the switch refuses to turn on while Xero sync is on and this is blank. */
+  xero_purchase_price_variance_account: string
   xero_unrealised_fx_gain_loss_account: string
   xero_manufacturing_overhead_account: string
   xero_daily_batch_enabled: string
@@ -80,6 +82,7 @@ export const XERO_SETTING_KEYS = [
   'xero_eu_vat_ioss_account', 'xero_eu_vat_ddp_account', 'xero_eu_fee_account',
   'xero_accounts_receivable_account', 'xero_accounts_payable_account',
   'xero_realised_fx_gain_loss_account', 'xero_unrealised_fx_gain_loss_account',
+  'xero_purchase_price_variance_account',
   'xero_manufacturing_overhead_account',
   'xero_daily_batch_enabled', 'xero_payment_polling_enabled',
   'grir_xero_posting_enabled',
@@ -124,6 +127,7 @@ const XERO_DEFAULTS: XeroSettings = {
   xero_accounts_receivable_account: '',
   xero_accounts_payable_account: '',
   xero_realised_fx_gain_loss_account: '',
+  xero_purchase_price_variance_account: '',
   xero_unrealised_fx_gain_loss_account: '',
   xero_manufacturing_overhead_account: '',
   xero_daily_batch_enabled: 'false',
