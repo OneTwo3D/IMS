@@ -65,7 +65,8 @@ test('#1132 R2-LOW-6: the refund delete\'s tasks are listed in their own section
   // Done for these reasons is the plain arm: the only connector read is the partial-removal check's.
   const done = readFileSync('lib/domain/wms/operator-task-done.ts', 'utf8')
   assert.match(done, /const partial = task\.reason === 'PARTIAL_REMOVAL_CHECK'/)
-  assert.equal((done.match(/readLines\)\(/g) ?? []).length, 1, 'one connector read, behind the partial-removal check')
+  assert.equal((done.match(/\(params\.readLines \?\? defaultReadLines\)\(/g) ?? []).length, 1, 'one connector read')
+  assert.ok(done.indexOf('if (partial) {') < done.indexOf('(params.readLines ?? defaultReadLines)('), 'behind the partial-removal check')
   assert.match(done, /IMS changed nothing in Xero, the warehouse or the refund/)
 })
 
