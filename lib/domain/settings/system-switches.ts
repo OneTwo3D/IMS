@@ -109,6 +109,9 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   // o3d-0lpnb MED-3 / o3d-pnc8p note 1: before IMS creates a sales credit note, read Xero for one it did not raise that already credits the refund (Xeroom-era, by hand,
   // SC-<refund id>) and hold rather than duplicate it. Literal, not an import of lib/connectors/xero/order-credit-notes.ts; tests hold it equal to its key there.
   booleanSwitch('xero_credit_note_duplicate_check_enabled'),
+  // o3d-l9gej: a recorded refund payment against a sales credit note is dated and rated on the day its cash went out, not the credit note's day. Literal, not an
+  // import of lib/domain/accounting/credit-note-allocation.ts; tests hold it equal to REFUND_CASH_OUT_DATE_SETTING_KEY.
+  booleanSwitch('xero_refund_payment_cash_out_date_enabled'),
   booleanSwitch(SUPPLIER_CREATE_KEY, undefined, true),
   booleanSwitch(ASN_SEND_SUPPLIER_KEY, undefined, true),
   booleanSwitch(ASN_SUPPLIER_REQUIRED_KEY, [ASN_REQUIRED_NEEDS_SEND], true),
