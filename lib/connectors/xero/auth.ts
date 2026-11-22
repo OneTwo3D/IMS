@@ -129,6 +129,11 @@ const XERO_EXPECTED_TENANT_KEY = XERO_TENANT_PIN_SETTING_KEY
  */
 const XERO_PIN_RELEASE_WITNESS_KEY = XERO_PIN_RELEASE_WITNESS_SETTING_KEY
 const REFRESH_EARLY_MS = 2 * 60 * 1000
+/**
+ * #1132 R2-MED-1: a grant getAccessToken() returns stays valid for at least this long, so a caller that resolves it before a bounded window
+ * (the refund delete's locked transaction) can use it for the whole window without a refresh inside it. Pinned against that window by a test.
+ */
+export const XERO_TOKEN_MIN_VALIDITY_MS = REFRESH_EARLY_MS
 
 let refreshInFlight: Promise<XeroAccessGrant | null> | null = null
 

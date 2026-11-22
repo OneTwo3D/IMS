@@ -15,7 +15,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
  * new task.
  */
 
-export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE', 'SHOP_REFUND_DUE', 'AMENDMENT_NOT_APPLIED', 'ORDER_NOT_FOUND', 'CANCELLED_POSTED_INVOICE', 'WC_EDIT_AFTER_PICKING', 'WC_PAID_INCREASE', 'REFUND_REMAINDER_DUE', 'MERGE_HOLD', 'MERGE_HOLD_OVERDUE', 'MERGE_HOLD_WITHDRAWAL', 'WITHDRAWAL_REJECT_NOT_WRITTEN', 'REFUND_DELETE_VOIDED_NOT_UNWOUND'] as const
+export const WMS_OPERATOR_TASK_REASONS = ['MERGED_LINES_REMOVED', 'PARTIAL_REMOVAL_CHECK', 'COURIER_FALLBACK', 'PUSH_CONFLICT', 'CANCEL_NOTICE', 'REFUND_NOTE', 'MERGE_CANDIDATE', 'SHOP_REFUND_DUE', 'AMENDMENT_NOT_APPLIED', 'ORDER_NOT_FOUND', 'CANCELLED_POSTED_INVOICE', 'WC_EDIT_AFTER_PICKING', 'WC_PAID_INCREASE', 'REFUND_REMAINDER_DUE', 'MERGE_HOLD', 'MERGE_HOLD_OVERDUE', 'MERGE_HOLD_WITHDRAWAL', 'WITHDRAWAL_REJECT_NOT_WRITTEN', 'REFUND_DELETE_VOIDED_NOT_UNWOUND', 'REFUND_DELETE_VOID_STUCK'] as const
 export type WmsOperatorTaskReasonValue = (typeof WMS_OPERATOR_TASK_REASONS)[number]
 
 /** What an operator reads for each reason (the exceptions section). */
@@ -39,6 +39,7 @@ export const WMS_OPERATOR_TASK_REASON_LABELS: Record<WmsOperatorTaskReasonValue,
   MERGE_HOLD_OVERDUE: 'Merge hold overdue: merge and confirm the order in the warehouse',
   MERGE_HOLD_WITHDRAWAL: 'Withdrawal or cancel on an order on merge hold: act in the warehouse',
   REFUND_DELETE_VOIDED_NOT_UNWOUND: 'Credit note voided in Xero for a refund being deleted, but the IMS refund still stands',
+  REFUND_DELETE_VOID_STUCK: 'Refund delete stopped: the credit note void in Xero gave up after repeated failures, the IMS refund still stands',
 }
 
 export type WmsOperatorTaskInput = {
