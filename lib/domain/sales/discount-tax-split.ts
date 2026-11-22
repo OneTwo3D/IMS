@@ -10,6 +10,7 @@
  */
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { discountSplitKey, type DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split-plan'
+import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
 
 export { discountSplitKey, type DiscountTaxSplitEntry }
 
@@ -107,4 +108,36 @@ export function invoiceDiscountParts(input: {
   parts.forEach((p, i) => { if (p.amount > parts[largest]!.amount) largest = i })
   parts[largest]!.amount = round(toDecimal(parts[largest]!.amount).add(gap), 2)
   return parts.filter((p) => p.amount > 0)
+}
+
+/**
+ * THE TAX CODE ONE GROUP OF THE SPLIT IS POSTED ON, the ONE derivation shared by the invoice (its discount parts), the refund (its per-rate discount reversal) and the save / finalise
+ * refusal below, so none of them can name a different code for the same group. It is the goods line's own rule (queueSalesInvoiceForOrder): the group's rate code, else the order default
+ * rate's code (a group with no code of its own is the lines that fell back to the order default), then the reverse-charge swap. Null when neither gives a code.
+ */
+export function discountSplitEntryTaxType(
+  entry: Pick<DiscountTaxSplitEntry, 'accountingTaxType' | 'reverseCharge'>,
+  ctx: { orderDefaultTaxType: string | null | undefined; reverseChargeSalesTaxType: string | null | undefined },
+): string | null {
+  return resolveSalesLineTaxType({ baseTaxType: entry.accountingTaxType ?? ctx.orderDefaultTaxType ?? null, reverseCharge: entry.reverseCharge, reverseChargeSalesTaxType: ctx.reverseChargeSalesTaxType }) ?? null
+}
+
+const pct = (rate: number): string => `${toDecimal(rate).mul(100).toDecimalPlaces(4).toString()}%`
+
+/**
+ * The refusal of a split with a group that has NO tax code to post its share of the discount on (discountSplitEntryTaxType answers null), or null. Such a group is, in practice, the
+ * lines with no tax rate of a discounted order whose default rate does not resolve to a rate with a code: its invoice would carry a discount part (and goods lines) with no tax code
+ * and be refused at the sync processor ("NOTHING WAS SENT"), so a live order is refused when it is saved or finalised instead. Stricter than the invoice (which drops a part that rounds
+ * to nothing), never weaker.
+ */
+export function discountSplitTaxCodeRefusal(
+  split: ReadonlyArray<DiscountTaxSplitEntry> | null,
+  ctx: { orderDefaultTaxType: string | null | undefined; reverseChargeSalesTaxType: string | null | undefined },
+): string | null {
+  if (!split) return null
+  const uncoded = split.filter((entry) => discountSplitEntryTaxType(entry, ctx) === null)
+  if (uncoded.length === 0) return null
+  const groups = [...new Set(uncoded.map((entry) => (entry.taxRateId ? `the lines at ${pct(entry.rate)}` : `the lines with no tax rate (${pct(entry.rate)})`)))]
+  return `The order discount is taxed per line rate, but ${groups.join(' and ')} have no accounting tax code, so the invoice could not post their share of the discount (or the lines) and would be refused when it is sent. `
+    + 'Choose an order default VAT rate that has an accounting tax code, or give those lines a tax rate that has one, and try again. A draft can still be saved.'
 }

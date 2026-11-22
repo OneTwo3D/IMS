@@ -36,7 +36,7 @@ import { refundWouldExceedOrderTotal } from '@/lib/domain/sales/o2c-guards'
 import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-manual-resolution'
 import { findGrossOverPaidBalance, findOverAllocatedRefundTarget, invalidQuantityRefusal, nonSaleRowRefusal, overAllocatedRefundTargetMessage, publicRefundLineRefusal } from '@/lib/domain/sales/refund-target-balances'
 import { orderDiscountReversal, refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
-import { parseDiscountTaxSplit } from '@/lib/domain/sales/discount-tax-split'
+import { discountSplitEntryTaxType, parseDiscountTaxSplit } from '@/lib/domain/sales/discount-tax-split'
 import { planSplitDiscountReversal } from '@/lib/domain/sales/discount-tax-split-plan'
 import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basis'
 import { resolveSchemePostingSnapshot } from '@/lib/domain/sales/refund-scheme-posting'
@@ -4458,6 +4458,11 @@ export async function createSalesOrderRefund(
             minorUnits: currencyMinorUnits(so.currency),
           }),
         })
+        // Each share posts on the code the INVOICE posted that rate's discount part on (discountSplitEntryTaxType, the one derivation): the group's own code, else the order default rate's (the same
+        // active-rate-by-name lookup the invoice and the snapshot below make), so a group with no code of its own (the no-rate lines) is reversed on the code its sale was discounted on.
+        const splitOrderDefaultTaxType = so.taxRateName
+          ? (await tx.taxRate.findFirst({ where: { name: so.taxRateName, active: true }, select: { accountingTaxType: true } }))?.accountingTaxType ?? null
+          : null
         for (const part of plan) {
           refundLines.push({
             lineId: null,
@@ -4469,7 +4474,7 @@ export async function createSalesOrderRefund(
             lineKind: 'discount',
             discountTaxIdentity: {
               taxRateId: part.entry.taxRateId ?? '',
-              accountingTaxType: resolveSalesLineTaxType({ baseTaxType: part.entry.accountingTaxType ?? null, reverseCharge: part.entry.reverseCharge, reverseChargeSalesTaxType: input.accountingSettings?.reverseChargeSalesTaxType }) ?? null,
+              accountingTaxType: discountSplitEntryTaxType(part.entry, { orderDefaultTaxType: splitOrderDefaultTaxType, reverseChargeSalesTaxType: input.accountingSettings?.reverseChargeSalesTaxType }),
               reverseCharge: part.entry.reverseCharge,
               rate: part.entry.rate,
             },
