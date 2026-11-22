@@ -98,6 +98,15 @@ export class SalesInvoiceDiscountSplitError extends SalesInvoiceDoesNotReconcile
   }
 }
 
+/** A group of the order discount's per-rate split has no tax code to be posted on (discountSplitTaxCodeRefusal): refused here rather than queued for the sync processor to refuse. */
+export class SalesInvoiceDiscountSplitTaxCodeError extends SalesInvoiceDoesNotReconcileError {
+  constructor(message: string, currency: string) {
+    super({ expected: 0, orderTotal: 0, difference: 0 }, currency)
+    this.message = `${message} It was not queued and the order was not moved or saved.`
+    this.name = 'SalesInvoiceDiscountSplitTaxCodeError'
+  }
+}
+
 /**
  * A positive shipping or order-discount amount the connector would DROP because its account is not mapped: the invoice would book short of (or over) that
  * money. Named so the message says which mapping is missing; still a reconciliation refusal, so every caller that refuses a mismatch refuses this.

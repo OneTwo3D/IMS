@@ -45,8 +45,9 @@ test('getXeroSyncReadiness derives `ready` from syncReadinessVerdict, not from a
   assert.match(ready, /syncReadinessVerdict\(\{[^}]*ownership: ownership\.state/)
 })
 
-test('the mapping key list covers 19 roles, the payment map and the two reverse-charge types', () => {
-  assert.equal(XERO_ACCOUNT_MAPPING_KEYS.length, 22)
+test('the mapping key list covers 20 roles, the payment map and the two reverse-charge types', () => {
+  assert.equal(XERO_ACCOUNT_MAPPING_KEYS.length, 23)
+  assert.ok(XERO_ACCOUNT_MAPPING_KEYS.includes('xero_purchase_price_variance_account'), 'o3d-hqvrp.51: cleared with the other account codes when the organisation changes')
   assert.ok(XERO_ACCOUNT_MAPPING_KEYS.includes('accounting_payment_account_map'))
   assert.ok(XERO_ACCOUNT_MAPPING_KEYS.includes('xero_rounding_difference_account'))
 })

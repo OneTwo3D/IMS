@@ -181,3 +181,42 @@ test('a split that disagrees with the discount by more than rounding is refused 
   assert.equal(run(65), null, 'a stale split 5 short of the discount')
   assert.deepEqual(run(60.01)!.map((p) => p.amount), [20.01, 20, 20], 'a rounding penny lands on the largest part')
 })
+
+// ---- the tax code of a group of the split: one derivation for the invoice, the refund and the save refusal ----------------------------------------
+
+test('discountSplitEntryTaxType: the group\'s own code, else the order default code, then the reverse-charge swap; null when neither gives one', async () => {
+  const { discountSplitEntryTaxType } = await import('@/lib/domain/sales/discount-tax-split')
+  const ctx = { orderDefaultTaxType: 'DEFCODE', reverseChargeSalesTaxType: 'RCSALES' }
+  assert.equal(discountSplitEntryTaxType({ accountingTaxType: 'OWN', reverseCharge: false }, ctx), 'OWN')
+  assert.equal(discountSplitEntryTaxType({ accountingTaxType: null, reverseCharge: false }, ctx), 'DEFCODE', 'a group with no code of its own takes the order default code, as the goods line does')
+  assert.equal(discountSplitEntryTaxType({ accountingTaxType: 'OWN', reverseCharge: true }, ctx), 'RCSALES')
+  assert.equal(discountSplitEntryTaxType({ accountingTaxType: 'OWN', reverseCharge: true }, { ...ctx, reverseChargeSalesTaxType: '' }), 'OWN')
+  assert.equal(discountSplitEntryTaxType({ accountingTaxType: null, reverseCharge: false }, { orderDefaultTaxType: null, reverseChargeSalesTaxType: '' }), null)
+})
+
+test('discountSplitTaxCodeRefusal: refuses a split with a group that has no code, naming the group and its rate; null when every group has one or there is no split', async () => {
+  const { discountSplitTaxCodeRefusal } = await import('@/lib/domain/sales/discount-tax-split')
+  const e = (taxRateId: string | null, accountingTaxType: string | null, rate: number) => ({ taxRateId, accountingTaxType, reverseCharge: false, rate, netForeign: 10, taxForeign: 10 * rate, netBase: 10, taxBase: 10 * rate })
+  const none = { orderDefaultTaxType: null, reverseChargeSalesTaxType: '' }
+  assert.equal(discountSplitTaxCodeRefusal(null, none), null)
+  assert.equal(discountSplitTaxCodeRefusal([e('r20', 'OUTPUT2', 0.2)], none), null)
+  const refused = discountSplitTaxCodeRefusal([e('r20', 'OUTPUT2', 0.2), e(null, null, 0.2)], none)
+  assert.match(refused ?? '', /the lines with no tax rate \(20%\) have no accounting tax code/, 'the no-rate group is at the header rate, here 20%, not 0%')
+  assert.match(refused ?? '', /A draft can still be saved/)
+  // The same group with an order default code is posted on it, so nothing is refused.
+  assert.equal(discountSplitTaxCodeRefusal([e('r20', 'OUTPUT2', 0.2), e(null, null, 0.2)], { orderDefaultTaxType: 'OUTPUT2', reverseChargeSalesTaxType: '' }), null)
+  assert.match(discountSplitTaxCodeRefusal([e('rX', null, 0.05)], none) ?? '', /the lines at 5% have no accounting tax code/)
+})
+
+test('the invoice\'s discount parts, the refund\'s per-rate reversal and the save / finalise refusal all derive a group\'s code through discountSplitEntryTaxType, with the order default code', async () => {
+  const { readFileSync } = await import('node:fs')
+  const sales = readFileSync('app/actions/sales.ts', 'utf8')
+  assert.match(sales, /taxTypeOf: \(entry\) => discountSplitEntryTaxType\(entry, \{ orderDefaultTaxType, reverseChargeSalesTaxType: settings\.reverseChargeSalesTaxType \}\)/)
+  assert.match(sales, /discountSplitTaxCodeRefusal\(discountSplit, \{ orderDefaultTaxType, reverseChargeSalesTaxType: settings\.reverseChargeSalesTaxType \}\)/, 'the invoice build backstop')
+  assert.match(sales, /prepareSalesOrderWrite\(input, \{ liveOrder: !input\.isDraft \}\)/, 'create: live orders only')
+  assert.match(sales, /liveOrder: true \} : undefined\)/, 'edit: confirmed orders only')
+  assert.match(sales, /const splitCodeRefusal = await discountSplitTaxCodeRefusalFor\(db, so\)/, 'draft finalisation')
+  const refund = readFileSync('lib/domain/sales/refund-service.ts', 'utf8')
+  assert.match(refund, /accountingTaxType: discountSplitEntryTaxType\(part\.entry, \{ orderDefaultTaxType: splitOrderDefaultTaxType,/)
+  assert.doesNotMatch(refund, /baseTaxType: part\.entry\.accountingTaxType \?\? null/, 'the refund no longer drops the order default fallback')
+})

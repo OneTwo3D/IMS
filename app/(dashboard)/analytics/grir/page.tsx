@@ -16,6 +16,7 @@ const columns: Array<FinanceAnalyticsColumn<GrirReportRow>> = [
   { key: 'credits', label: 'Return credit notes', align: 'right', render: (row) => row.creditNotesBase },
   { key: 'net', label: 'Net GR/IR', align: 'right', render: (row) => row.netBase },
   { key: 'ppv', label: 'Price difference', align: 'right', render: (row) => row.priceVarianceBase },
+  { key: 'fxv', label: 'FX difference', align: 'right', render: (row) => row.fxVarianceBase },
   { key: 'oldest', label: 'Oldest open', render: (row) => row.oldestOpenDate ?? '' },
   { key: 'age', label: 'Age (days)', align: 'right', render: (row) => row.ageDays },
 ]

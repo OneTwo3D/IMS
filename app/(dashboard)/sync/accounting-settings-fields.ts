@@ -48,10 +48,12 @@ export const ACCOUNT_FIELDS: AccountFieldDef[] = [
   { suffix: 'eu_vat_ddp_account', label: 'EU DDP charges collected', description: 'Account for the VAT and duty collected on over-threshold (DDP) EU sales. Leave blank until the EU VAT treatment is switched on.', connectors: ['xero'] },
   { suffix: 'eu_fee_account', label: 'EU landed-cost fees', description: 'Account for marked landed-cost fee lines (customs, handling) on EU sales, posted without VAT. Leave blank until the EU VAT treatment is switched on.', connectors: ['xero'] },
   { suffix: 'unearned_revenue_account', label: 'Unearned Revenue', description: 'Liability account for revenue deferred until shipment' },
-  { suffix: 'accounts_receivable_account', label: 'Accounts Receivable', description: 'Your Accounts Receivable control account — used as the control side of realised and unrealised FX journals on foreign-currency customer balances' },
-  { suffix: 'accounts_payable_account', label: 'Accounts Payable', description: 'Your Accounts Payable control account — used as the control side of realised and unrealised FX journals on foreign-currency supplier balances' },
-  { suffix: 'realised_fx_gain_loss_account', label: 'Realised FX Gain/Loss', description: 'P&L account for settlement-rate variances' },
-  { suffix: 'unrealised_fx_gain_loss_account', label: 'Unrealised FX Gain/Loss', description: 'Account for open AR/AP revaluation journals' },
+  { suffix: 'accounts_receivable_account', label: 'Accounts Receivable', description: 'Your Accounts Receivable control account. Shown as the control side on the FX Gain/Loss report (information only); IMS posts no FX journal to it, because Xero books realised and unrealised currency gains itself' },
+  { suffix: 'accounts_payable_account', label: 'Accounts Payable', description: 'Your Accounts Payable control account. Shown as the control side on the FX Gain/Loss report (information only); IMS posts no FX journal to it, because Xero books realised and unrealised currency gains itself' },
+  { suffix: 'realised_fx_gain_loss_account', label: 'Realised FX Gain/Loss', description: 'Shown on the FX Gain/Loss report (information only). Xero books realised currency gains to its own system account, at the settlement rate IMS sends on each payment' },
+  { suffix: 'unrealised_fx_gain_loss_account', label: 'Unrealised FX Gain/Loss', description: 'Not used: IMS no longer posts unrealised FX revaluation journals. Xero revalues open foreign-currency invoices, bills and bank balances itself' },
+  // Xero-only: the per-event FX purchase journals are the Xero connector's (no quickbooks_* key).
+  { suffix: 'purchase_price_variance_account', label: 'Purchase Price Variance', description: 'P&L (cost of sales) account for any difference between a supplier bill and the order price, posted as its own line on the bill. Used only while per-event FX rates for purchasing are switched on; leave blank otherwise. Must differ from Stock in Transit, GR/IR and Inventory Asset.', connectors: ['xero'] },
 ]
 
 export const SYNC_TYPE_TOGGLES: AccountFieldDef[] = [
@@ -63,8 +65,8 @@ export const SYNC_TYPE_TOGGLES: AccountFieldDef[] = [
   { suffix: 'sync_stock_receipt', label: 'Stock Receipts', description: 'Journal: DR Inventory / CR Stock in Transit on goods received' },
   { suffix: 'sync_cogs_reversal', label: 'COGS Reversals', description: 'Reverse COGS on stock returns' },
   { suffix: 'sync_inventory_adjustment', label: 'Inventory Adjustments', description: 'Journal for manual stock adjustments' },
-  { suffix: 'sync_realised_fx_journal', label: 'Realised FX Journals', description: 'Post settlement-rate gains and losses on foreign payments' },
-  { suffix: 'sync_unrealised_fx_journal', label: 'Unrealised FX Revaluation', description: 'Post reversible open AR/AP revaluation journals' },
+  { suffix: 'sync_realised_fx_journal', label: 'Realised FX Journals', description: 'Retired: nothing is posted. Xero books realised currency gains itself, at the settlement rate IMS sends on each payment' },
+  { suffix: 'sync_unrealised_fx_journal', label: 'Unrealised FX Revaluation', description: 'Retired: nothing is posted. Xero revalues open foreign-currency invoices, bills and bank balances itself' },
 ]
 
 // Connector-prefixed setting suffixes persisted by the form alongside the
@@ -93,6 +95,23 @@ export function settingKeyFor(connectorId: AccountingConnectorId, suffix: string
  * if they do. Pure data so the rule is reviewable next to the fields it governs.
  */
 const MUST_BE_DISTINCT: Array<{ a: string; b: string; why: string }> = [
+  {
+    a: 'transit_account',
+    b: 'purchase_price_variance_account',
+    why:
+      'the purchase price variance journal moves value from Stock in Transit to the variance account, so on one code it would post a journal that nets to ' +
+      'nothing and the price difference would stay in Stock in Transit',
+  },
+  {
+    a: 'grir_account',
+    b: 'purchase_price_variance_account',
+    why: 'GR/IR holds goods received and not billed; a price difference written to it would read as an open accrual that no bill ever clears',
+  },
+  {
+    a: 'inventory_account',
+    b: 'purchase_price_variance_account',
+    why: 'a price difference at or below the capitalise threshold is an expense, never stock cost; on the inventory code it would revalue stock the layers do not hold',
+  },
   {
     a: 'transit_account',
     b: 'grir_account',

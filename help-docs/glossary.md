@@ -112,13 +112,16 @@ The value of goods received against a purchase order that no supplier bill cover
 The currency in which the system reports value (stock, COGS, revenue). Set once during initial setup. All multi-currency transactions are converted to base currency for valuation. **Cannot be changed without a database reset** once live data exists.
 
 **FX rate**
-Foreign exchange rate. The system stores rates as `1 base = X foreign currency`. Rates are fetched daily from the European Central Bank via frankfurter.dev and stamped on documents at creation time so the same rate is used end-to-end (storefront → IMS → Xero).
+Foreign exchange rate. The system stores rates as `1 base = X foreign currency`. Every rate IMS uses comes from its `fx_rates` table, filled daily from the source the **Exchange-rate source** setting (`fx_rate_source`) selects: Aelia, the store's currency switcher, is the exchange-rate master, and the European Central Bank rates via frankfurter.dev are the default until that setting is switched. Rates are stamped on documents at creation time so the same rate is used end-to-end (storefront → IMS → Xero).
 
 **fxRateToBase**
 The FX rate stored on a document (Sales Order, Purchase Order, Refund) that locks in the conversion the document was created under. Even if the daily rate changes tomorrow, this document's base-currency totals don't drift.
 
 **Realised FX gain/loss**
-The difference between the base-currency value of a foreign-currency invoice when it was issued vs when it was settled. The system books realised FX at payment time. Example: a EUR invoice booked at €1 = £0.85 but paid two months later at €1 = £0.88 books an £0.03/EUR FX gain.
+The difference between the base-currency value of a foreign-currency invoice when it was issued vs when it was settled. Xero books it at payment time, at the settlement rate IMS sends on the payment; IMS shows it on the FX Gain/Loss report for information and posts no journal for it. Example: a EUR invoice booked at €1 = £0.85 but paid two months later at €1 = £0.88 gives a £0.03/EUR FX gain.
+
+**Unrealised FX gain/loss**
+The change in base-currency value of a foreign-currency invoice, bill or bank balance that is still open, measured at today's rate. Xero calculates it itself in its reports (its Unrealised Currency Gains and Bank Revaluation accounts); IMS no longer posts revaluation journals for it.
 
 **VAT (sales tax)**
 Value Added Tax. Stored as a named rate (e.g. "UK Standard 20%") with a country code and Xero tax type. Each line on a sales or purchase order can use a different rate. The system supports both inclusive pricing (price includes VAT) and exclusive pricing (price is net, VAT added).
