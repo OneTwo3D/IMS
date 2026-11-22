@@ -2134,7 +2134,7 @@ is written at all** and a WARNING goes to the activity log
 document in Xero: until you do, that sale is in no reporting period. An invoice date the order
 already has is never overwritten.
 
-**A row still marked as owing follow-ups needs nothing from you.** Xero has a
+**A Xero row still marked as owing follow-ups needs nothing from you.** Xero has a
 back-reference repair sweep bound (`repairXeroBackReferences`, run by the accounting-sync cron and by
 a manual sync), so a Xero row whose deferred receipt is still unregistered is retained *work* rather
 than stranded work: the sweep re-reads the marker and re-enqueues the follow-ups idempotently, and
@@ -2145,12 +2145,27 @@ Xero UI races work already queued, producing a second payment no request id can 
 is still marked after the next accounting-sync run, read the invoice in Xero, record what is present,
 and escalate that reading.
 
+**A row from a connector this build no longer ships is different.** No sweep is bound for it, so
+nothing will come back for it. Such rows are listed under **Sync → Exceptions**, in the section
+**"Accounting follow-ups owed, with nothing to re-drive them"**. The remedy is READ AND ESCALATE: open
+the document in the accounting system that holds it, record what is actually there (payment, PDF,
+email, attachment) and hand that reading to accounting. Do not settle one of these rows by hand. The
+follow-ups were separate local queue rows, so a payment may already be sitting `PENDING` locally,
+and a payment created in the ledger UI cannot be deduplicated against it.
+
 **When the id itself is the blocker.** One case cannot be resolved by linking the document by hand:
 the write was refused because *another local record already holds that id*.
-A manual link is refused for exactly the same reason, so the stale claim has to come off first. IMS
-logs `xero_backreference_id_conflict` at ERROR, writes the same text onto the sync row's error
-message, and names both the blocking record and the command that resolves it. See *Releasing a stale
-external id* below.
+A manual link is refused for exactly the same reason, so the stale claim has to come off first.
+On Xero it surfaces in one of two places:
+
+- **When the post's own back-reference is refused,** the processor writes the refusal text into the
+  sync row's error message and lets the row retry, so it ends up `FAILED` — still carrying the
+  external id, which is stored before the local write is attempted.
+- **When the repair sweep hits it,** it logs `xero_backreference_id_conflict` as a WARNING naming
+  the id, the row and the release command, and defers the row for a recheck interval rather than
+  retrying it on every run. The warning repeats until the claim is resolved.
+
+See *Releasing a stale external id* below.
 
 **It refuses to guess.** Sync rows created before the bill-keyed change name the *purchase order*,
 not the bill. When such a row cannot be attributed to exactly one bill, the sweep writes a WARNING
