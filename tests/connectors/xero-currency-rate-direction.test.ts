@@ -25,7 +25,7 @@ import { toDecimal } from '@/lib/domain/math/decimal'
  *  3. EVERY SENDER: the invoice, bill and supplier credit note builders and the payment/refund rate function (sales credit notes and payments
  *     are driven end to end in xero-foreign-document-rate.test.ts and xero-payment-currency-rate.test.ts) carry the rate as is.
  *  4. CENSUS: every place in lib/ that writes a Xero `CurrencyRate` field is listed, each takes its value from the one helper in fx.ts, and no
- *     reciprocal of a rate appears in the Xero connector, the reconciliation pack or the accounting domain.
+ *     reciprocal of a rate (`1 / rate` or `Decimal(1).div(rate)`) appears anywhere in lib/, app/ or scripts/.
  *
  * Named mutations (each shown red, restored from a copy):
  *  a  helper-inverts        imsRateToXeroCurrencyRate returns 1 / rate again: arms 1, 2 and 3 go red
@@ -146,17 +146,38 @@ test('CENSUS: every Xero CurrencyRate write in lib/ is listed, and each file tak
   }
 })
 
-test('CENSUS: no reciprocal of a rate in the Xero connector, the reconciliation pack or the accounting domain, and the helper itself does not divide', () => {
-  const dirs = ['lib/connectors/xero', 'lib/reconciliation-pack', 'lib/domain/accounting']
-  let scanned = 0
+/**
+ * The two spellings of a rate's reciprocal: `1 / x.rate` and `Decimal(1).div(x.rate)` / `toDecimal(1).div(x.rate)`. The Decimal form is
+ * qualified by what it divides by (a rate or a ...ToBase value): the bare `Decimal(1).div(` also builds one minor unit
+ * (`toDecimal(1).div(toDecimal(10).pow(dp))`) or an equal share (`new Prisma.Decimal(1).div(lines.length)`), and about ten such legitimate
+ * sites exist in lib/. Listing those would make the census flag correct code.
+ */
+const RECIPROCAL_PATTERNS: ReadonlyArray<[string, RegExp]> = [
+  ['1 / rate', /\b1\s*\/\s*\(?\s*[A-Za-z_$][\w$.!?]*(?:[Rr]ate|ToBase)\b/g],
+  ['Decimal(1).div(rate)', /\b(?:Decimal|toDecimal)\(\s*1\s*\)\.div\(\s*[^)]*(?:[Rr]ate|ToBase)\b/g],
+]
+
+test('CENSUS: no reciprocal of a rate anywhere in lib/, app/ or scripts/, and the helper itself does not divide', () => {
+  const dirs = ['lib', 'app', 'scripts']
+  const scanned: Record<string, number> = {}
   for (const dir of dirs) {
     for (const file of tsFiles(join(ROOT, dir))) {
-      scanned += 1
-      const hits = code(readFileSync(file, 'utf8')).match(/\b1\s*\/\s*\(?\s*[A-Za-z_$][\w$.!?]*(?:[Rr]ate|ToBase)\b/g)
-      assert.equal(hits, null, `${relative(ROOT, file)}: ${hits?.join(', ')}`)
+      scanned[dir] = (scanned[dir] ?? 0) + 1
+      const text = code(readFileSync(file, 'utf8'))
+      for (const [name, pattern] of RECIPROCAL_PATTERNS) {
+        const hits = text.match(pattern)
+        assert.equal(hits, null, `${relative(ROOT, file)} (${name}): ${hits?.join(', ')}`)
+      }
     }
   }
-  assert.ok(scanned > 50, `the scan saw the three trees (${scanned} files)`)
+  console.log(`precondition: reciprocal census scanned ${JSON.stringify(scanned)}`)
+  assert.ok((scanned.lib ?? 0) > 200 && (scanned.app ?? 0) > 50 && (scanned.scripts ?? 0) > 20, `the scan saw the three trees (${JSON.stringify(scanned)})`)
+  // The patterns catch what they are for (so a clean scan is not a vacuous one), and not a minor unit.
+  const matches = (i: number, text: string) => new RegExp(RECIPROCAL_PATTERNS[i]![1].source).test(text)
+  assert.ok(matches(0, 'const x = 1 / data.currencyRateToBase'))
+  assert.ok(matches(1, 'const x = toDecimal(1).div(order.fxRateToBase)'))
+  assert.ok(matches(1, 'new Prisma.Decimal(1).div(settlementRate)'))
+  assert.ok(!matches(1, 'toDecimal(1).div(toDecimal(10).pow(dp))'), 'a minor unit is not a reciprocal of a rate')
   const helper = code(readFileSync(join(ROOT, 'lib/connectors/xero/fx.ts'), 'utf8'))
   const body = helper.slice(helper.indexOf('export function imsRateToXeroCurrencyRate'), helper.indexOf('export class XeroForeignCurrencyRateError'))
   assert.ok(body.length > 0)
