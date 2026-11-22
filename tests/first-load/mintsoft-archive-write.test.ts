@@ -343,7 +343,7 @@ test('a real prepare blocked by another finding: the dry run exits 1 and says so
   const { deps, target } = fakeTarget()
   const readsBefore = reads.length
   err = ''
-  const code = await runWmsArchiveCli(['--manifest', blocked, ...ENV, ...EXEC('MSA-0123456789abcdef')], io, reader, 'first-load-mintsoft-archive', {
+  const code = await runWmsArchiveCli(['--manifest', blocked, ...ENV, ...EXEC(('MSA-' + '0'.repeat(16)))], io, reader, 'first-load-mintsoft-archive', {
     switchKey: FIRST_LOAD_WMS_ARCHIVE_SWITCH_KEY, openWriter: () => { throw new Error('not opened') }, newId: () => 'x', ...deps,
   })
   assert.equal(code, EXIT_CODES.INPUT_UNUSABLE)
