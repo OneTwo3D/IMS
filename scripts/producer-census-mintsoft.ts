@@ -175,6 +175,7 @@ export const MINT_SEAM_FUNCTIONS: readonly MintSeamFunction[] = [
  */
 export const MINT_OPERATIONS_GOVERNED_ELSEWHERE: Readonly<Record<string, string>> = {
   'auth.login': 'Key minting is not a business write (map owner nobody) and has no seam: requestMintsoftAuthSession refuses it itself (assertMintsoftKeyMintingAllowed) while the producer hold is enforced and the installation is not live; the outbound-write hold\'s login grant governs it as well.',
+  'product.discontinue': 'The first-load archive command (an operator runs it once at the cut-over, never the application): it refuses unless the producer disposition of product.discontinue is LIVE on the TARGET installation\'s environment (step M live), asks the producer hold itself on that environment (mintsoftEgressHold before the POST, targetHoldRefusal on every hop), and the transport\'s outbound-write grant, read from the same environment, governs the POST; its transport site is declared in MINT_OPERATOR_TRANSPORT.',
   'order.comment': 'IMS writes no order comment any more (the warehouse does not read them: owner ruling 2026-11-15; IMS raises an operator task instead). Nothing calls the connector\'s addOrderComment, and tests/wms-no-order-comment-writes.test.ts is red if a call is reintroduced; were one added, MINT-5 still requires it to pass a clearance.',
 }
 
@@ -182,6 +183,14 @@ export const MINT_OPERATIONS_GOVERNED_ELSEWHERE: Readonly<Record<string, string>
 export const MINT_LOGIN_TRANSPORT: Readonly<Record<string, string>> = {
   'lib/connectors/mintsoft/api/auth.ts::requestMintsoftAuthSession': 'POST /api/Auth mints a key: not a business write; it is refused before sending while the producer hold is enforced and not live (assertMintsoftKeyMintingAllowed), and the outbound-write hold\'s login grant governs it (ownership-map row auth.login).',
   'lib/connectors/mintsoft/api/auth.ts::testMintsoftFixedApiKey': 'A literal GET /api/Warehouse that only tests a key: a read.',
+}
+/**
+ * Operator-run transports outside the barrier: a one-off operator command whose credentials come from an operator file, not the IMS settings that
+ * mintsoftRequest reads. MINT-3 requires a hop gate on the call and a stale entry is red; that the gate composes the producer hold (targetHoldRefusal, on the target's environment) with
+ * its own exact-path gate is pinned by the entry's own test (tests/connectors/mintsoft-first-load-archive-write.test.ts).
+ */
+export const MINT_OPERATOR_TRANSPORT: Readonly<Record<string, string>> = {
+  'lib/connectors/mintsoft/first-load-archive-write.ts::sendMintsoftArchiveRequest': 'The first-load archive command (scripts/first-load-mintsoft-archive.ts): the fixed key of the operator\'s credentials file, exactly GET /api/Product/{id}, GET /api/Warehouse, GET /api/Product/StockLevels and POST /api/Product {ID, SKU, DisCont} (archiveHopRefusal), the producer hold per hop on the target installation\'s environment (targetHoldRefusal), no redirect, and the outbound-write grant of that environment on the POST (ownership-map row product.discontinue).',
 }
 export const MINT_BARRIER_FILE = 'lib/connectors/mintsoft/api/client.ts'
 export const MINT_BARRIER_ENTRY = 'mintsoftRequest'
@@ -544,6 +553,7 @@ export function mintCensusFindings(input: MintCensusInput): { failures: string[]
   }
   const sendSeen = new Set<string>()
   const loginSeen = new Set<string>()
+  const operatorSeen = new Set<string>()
   for (const site of input.transport) {
     const key = `${site.file}::${site.decl}`
     if (site.gated === false) {
@@ -561,12 +571,21 @@ export function mintCensusFindings(input: MintCensusInput): { failures: string[]
       } else counts.transportSitesBehindBarrier++
       continue
     }
+    if (Object.prototype.hasOwnProperty.call(MINT_OPERATOR_TRANSPORT, key)) {
+      operatorSeen.add(key)
+      if (site.gated !== true) failures.push(`MINT-3 ${site.file}:${site.line} (${site.decl}) is declared an operator transport but passes no hop gate.`)
+      else counts.transportSitesBehindBarrier++
+      continue
+    }
     failures.push(`MINT-3 ${site.file}:${site.line} (${site.decl}) calls ${site.callee} on Mintsoft (method ${site.method}) outside the barrier. A Mintsoft request goes through mintsoftRequest, which refuses a held write before it leaves; `
       + 'Mintsoft mutates through GET too, so no method makes a direct call safe. Route it through mintsoftRequest, or declare a login helper in MINT_LOGIN_TRANSPORT with the reason.')
   }
   if (!sendSeen.has(`${MINT_BARRIER_FILE}::${MINT_BARRIER_SEND}`)) failures.push(`MINT-3 the transport call in ${MINT_BARRIER_FILE}::${MINT_BARRIER_SEND} was not found, so the barrier guards nothing. The row is stale.`)
   for (const key of Object.keys(MINT_LOGIN_TRANSPORT)) {
     if (!loginSeen.has(key)) failures.push(`MINT-3 the login helper ${key} matches no Mintsoft transport call. Delete its entry from MINT_LOGIN_TRANSPORT.`)
+  }
+  for (const key of Object.keys(MINT_OPERATOR_TRANSPORT)) {
+    if (!operatorSeen.has(key)) failures.push(`MINT-3 the operator transport ${key} matches no Mintsoft transport call. Delete its entry from MINT_OPERATOR_TRANSPORT.`)
   }
 
   // ---- MINT-4 ----
