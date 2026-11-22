@@ -39,6 +39,9 @@ type SyncRow = {
   /** o3d-n2ci4: the send evidence an earlier attempt leaves on the row. */
   createDispatchedAt?: Date | null
   remoteAttemptedAt?: Date | null
+  /** The ledger-standing columns (o3d-n2ci4 reads the source revaluation through ledgerStanding). */
+  settlementBasis: string | null
+  abandonedBeforeRemoteCall: boolean | null
 }
 
 const state = {
@@ -77,6 +80,8 @@ function blankRow(payload: Record<string, unknown>): SyncRow {
     createdAt: new Date('2026-01-01T00:00:00Z'),
     backReferenceCheckedAt: null,
     backReferenceFollowUpsPendingAt: null,
+    settlementBasis: null,
+    abandonedBeforeRemoteCall: null,
   }
 }
 

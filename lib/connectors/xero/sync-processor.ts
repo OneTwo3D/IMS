@@ -34,6 +34,8 @@ import {
   LEDGER_STANDING_SELECT,
   WORK_SLOT_OCCUPIED_WHERE,
   isProvenLedgerFact,
+  ledgerStanding,
+  namesADocument,
   type LedgerStandingRow,
 } from '@/lib/domain/accounting/ledger-standing'
 import { logActivity, logActivityInTransaction, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
@@ -6953,12 +6955,12 @@ async function retireFxJournalRow(args: {
 
   const own = await db.accountingSyncLog.findUnique({
     where: { id: entryId },
-    select: { createDispatchedAt: true, remoteAttemptedAt: true, externalTransactionId: true },
+    select: { ...LEDGER_STANDING_SELECT, createDispatchedAt: true, remoteAttemptedAt: true },
   })
   const evidence = [
     own?.createDispatchedAt ? `a create-dispatch marker at ${own.createDispatchedAt.toISOString()}` : null,
     own?.remoteAttemptedAt ? `a remote attempt at ${own.remoteAttemptedAt.toISOString()}` : null,
-    own?.externalTransactionId ? `the document id ${own.externalTransactionId}` : null,
+    own && namesADocument(own) ? 'a document id on the row' : null,
   ].filter((e): e is string => e !== null)
 
   if (evidence.length > 0) {
@@ -6989,15 +6991,19 @@ async function retireFxJournalRow(args: {
   // A reversal names the revaluation it undoes. Read BEFORE the retirement, so the report below states what the reversal was for.
   const sourceEntryId = !realised && kind === 'reversal' && typeof payload.sourceEntryId === 'string' ? payload.sourceEntryId : null
   const source = sourceEntryId
-    ? await db.accountingSyncLog.findUnique({ where: { id: sourceEntryId }, select: { status: true, externalTransactionId: true, connector: true } })
+    ? await db.accountingSyncLog.findUnique({ where: { id: sourceEntryId }, select: { ...LEDGER_STANDING_SELECT, connector: true } })
     : null
-  const sourcePosted = source !== null && source.connector === XERO_CONNECTOR && (source.status === 'SYNCED' || source.externalTransactionId != null)
+  // POSTED in the one reading of a row's ledger standing: the connector's writeback, or an operator's assertion that it posted.
+  const sourceStanding = source !== null && source.connector === XERO_CONNECTOR ? ledgerStanding(source) : null
+  const sourcePosted = sourceStanding === 'CONFIRMED_POSTED' || sourceStanding === 'ASSERTED_POSTED'
 
   const retired = await db.$transaction((tx) => retireOverSettlingInvoicePayment(tx, { entryId, claim: lease, reason }))
 
-  if (sourcePosted && sourceEntryId) {
+  if (source !== null && sourcePosted && sourceEntryId) {
+    // The Xero journal to name to the operator: read once, for the text and the inbox row only.
+    const sourceJournalId = source.externalTransactionId
     const sourceValuationDate = typeof payload.sourceValuationDate === 'string' ? payload.sourceValuationDate : null
-    const description = fxReversalOfPostedRevaluationNotice({ sourceEntryId, sourceJournalId: source.externalTransactionId, reference, sourceValuationDate })
+    const description = fxReversalOfPostedRevaluationNotice({ sourceEntryId, sourceJournalId, reference, sourceValuationDate })
     await logActivity({
       entityType: 'SYSTEM',
       action: retired ? 'xero_unrealised_fx_reversal_retired_source_posted' : 'xero_unrealised_fx_journal_not_retired_claim_moved',
@@ -7006,7 +7012,7 @@ async function retireFxJournalRow(args: {
       description: retired
         ? `${description} (sync row ${entryId}, ${referenceType} ${referenceId}).`
         : `Not retired by this attempt: sync row ${entryId} (${type}, ${referenceType} ${referenceId}) is no longer held by it, so the attempt that now holds it decides. Nothing was sent.`,
-      metadata: { syncLogId: entryId, referenceType, referenceId, kind, retired, sourceEntryId, sourceStatus: source.status, sourceJournalId: source.externalTransactionId },
+      metadata: { syncLogId: entryId, referenceType, referenceId, kind, retired, sourceEntryId, sourceStatus: source.status, sourceStanding, sourceJournalId },
     }).catch(() => { /* logging must never turn a safe retirement into a failure */ })
     if (retired) {
       // The key of the posting THIS ROW carries, derived from exactly the fields its enqueue stored (accountingPostingKeyForRow equals
@@ -7023,9 +7029,9 @@ async function retireFxJournalRow(args: {
           chartConnector: XERO_CONNECTOR,
           activeConnector: XERO_CONNECTOR,
           reason: 'retired_reversal_source_posted',
-          committed: `the unrealised FX revaluation${sourceValuationDate ? ` of ${sourceValuationDate}` : ''} posted to Xero as ${source.externalTransactionId ? `manual journal ${source.externalTransactionId}` : 'a manual journal (no id recorded)'} and its reversal was retired unsent`,
-          remedy: `Reverse ${source.externalTransactionId ? `Xero manual journal ${source.externalTransactionId}` : 'that Xero manual journal'}${reference ? ` (reference ${reference})` : ''} by hand in Xero, then mark this row handled.`,
-          detail: { syncLogId: entryId, sourceEntryId, sourceJournalId: source.externalTransactionId, sourceStatus: source.status, sourceValuationDate, reference },
+          committed: `the unrealised FX revaluation${sourceValuationDate ? ` of ${sourceValuationDate}` : ''} posted to Xero as ${sourceJournalId ? `manual journal ${sourceJournalId}` : 'a manual journal (no id recorded)'} and its reversal was retired unsent`,
+          remedy: `Reverse ${sourceJournalId ? `Xero manual journal ${sourceJournalId}` : 'that Xero manual journal'}${reference ? ` (reference ${reference})` : ''} by hand in Xero, then mark this row handled.`,
+          detail: { syncLogId: entryId, sourceEntryId, sourceJournalId, sourceStatus: source.status, sourceValuationDate, reference },
         },
       )
     }
