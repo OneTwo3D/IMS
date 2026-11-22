@@ -12,6 +12,7 @@ import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subled
 import { XERO_BOOKS_LOCK_DATE_KEY } from '@/lib/connectors/xero/books-lock-date'
 import { lockSalesOrder, lockStockLevels } from '@/lib/domain/sales/allocation-service'
 import { resolveRefundReservationReleaseOutbox } from '@/lib/domain/sales/refund-reservation-release-outbox'
+import { REFUND_DELETE_TASK_REASONS } from '@/lib/domain/sales/refund-delete-task-reasons'
 import { buildOutboxIdempotencyKey } from '@/lib/domain/integrations/outbox'
 import { ADOPTION_RECLASS_POSTING_SCOPE } from '@/lib/domain/accounting/posting-refusal-kinds'
 import { toDecimal } from '@/lib/domain/math/decimal'
@@ -826,8 +827,6 @@ export function voidRowProvenNeverSent(row: VoidRowFacts): boolean {
 
 const VOID_ROW_FACTS_SELECT = { retryCount: true, attemptRevision: true, remoteAttemptedAt: true, createDispatchedAt: true, attemptStampingCustodyAt: true, payload: true } as const
 
-/** The operator task reasons the refund delete raises (Sync > Exceptions, its own section: not a warehouse query). */
-export const REFUND_DELETE_TASK_REASONS = ['REFUND_DELETE_VOIDED_NOT_UNWOUND', 'REFUND_DELETE_VOID_STUCK'] as const
 
 /** The operator task for the one state the delete cannot repair itself: Xero holds the credit note voided, IMS still holds the refund. */
 async function raiseVoidedButStandingTask(client: typeof db, input: { refundId: string; orderId: string; creditNoteNumber: string | null; why: string }): Promise<void> {

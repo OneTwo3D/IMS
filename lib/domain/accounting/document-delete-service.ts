@@ -520,28 +520,40 @@ export async function completeAccountingDocumentDeletion(externalDocumentId: str
 }
 
 /** What was recorded against the document after the delete was requested; empty when nothing was. Read under the document's lock. */
-async function lateActivityOn(tx: Client, deletion: { kind: string; documentId: string }): Promise<string[]> {
+async function lateActivityOn(tx: Client, deletion: { kind: string; documentId: string; externalDocumentId: string; requestedAt: Date; snapshot?: unknown }): Promise<string[]> {
   const late: string[] = []
+  // #1132 MED-4: an invoice or bill UPDATE queued after the request (the request itself refuses while one is open) is activity on the document
+  // too: it was built for a document Xero has now removed. Any row but a cancelled one counts (a failed one may have reached the ledger).
   if (deletion.kind === 'SALES_INVOICE') {
-    const [payments, refunds, order] = await Promise.all([
+    const [payments, refunds, order, updates] = await Promise.all([
       tx.payment.count({ where: { orderId: deletion.documentId } }),
       // soft-delete exception: as above, a deleted refund keeps blocking an order delete.
       // soft-delete exception (ledger cascade): includes soft-deleted refunds on purpose, their credit-note and reversal rows are still in the ledger and must be netted.
       tx.salesOrderRefund.count({ where: { orderId: deletion.documentId } }),
       tx.salesOrder.findUnique({ where: { id: deletion.documentId }, select: { paidAt: true } }),
+      tx.accountingSyncLog.count({ where: { type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: deletion.documentId, status: { not: 'CANCELLED' }, createdAt: { gte: deletion.requestedAt } } }),
     ])
     if (payments > 0) late.push(`${payments} payment(s)`)
     if (order?.paidAt && payments === 0) late.push('a paid flag')
     if (refunds > 0) late.push(`${refunds} refund(s) or credit note(s)`)
+    if (updates > 0) late.push(`${updates} invoice update(s)`)
   } else {
-    const [bill, credits, payments] = await Promise.all([
+    const poId = (deletion.snapshot as { purchaseOrderId?: string } | null | undefined)?.purchaseOrderId ?? null
+    const [bill, credits, payments, updates] = await Promise.all([
       tx.purchaseInvoice.findUnique({ where: { id: deletion.documentId }, select: { paidAt: true, poId: true } }),
       tx.supplierCreditNote.count({ where: { purchaseInvoiceId: deletion.documentId } }),
       tx.accountingSyncLog.count({ where: { type: 'BILL_PAYMENT', status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] }, referenceId: { in: [deletion.documentId] } } }),
+      tx.accountingSyncLog.count({
+        where: {
+          type: 'PURCHASE_INVOICE_UPDATE', status: { not: 'CANCELLED' }, createdAt: { gte: deletion.requestedAt },
+          OR: [{ referenceType: 'PurchaseInvoice', referenceId: deletion.documentId }, ...(poId ? [{ referenceType: 'PurchaseOrder', referenceId: poId, payload: { path: ['accountingInvoiceId'], equals: deletion.externalDocumentId } }] : [])],
+        },
+      }),
     ])
     if (bill?.paidAt) late.push('a payment')
     if (credits > 0) late.push(`${credits} supplier credit note(s)`)
     if (payments > 0) late.push(`${payments} bill payment posting(s)`)
+    if (updates > 0) late.push(`${updates} bill update(s)`)
   }
   return late
 }

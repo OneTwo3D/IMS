@@ -822,6 +822,12 @@ async function logStaleRefreshDiscarded(token: StoredAccountingToken): Promise<v
  */
 export type XeroAccessGrant = { accessToken: string; tenantId: string; connectionGeneration: string | null }
 
+/** #1132 LOW-7: the organisation the stored Xero connection is for, read from the token row alone (no decryption, no refresh), or null. */
+export async function getStoredXeroTenantId(): Promise<string | null> {
+  const row = await db.accountingToken.findUnique({ where: { connector: XERO_CONNECTOR }, select: { tenantId: true } })
+  return row?.tenantId ?? null
+}
+
 export async function getAccessToken(): Promise<XeroAccessGrant | null> {
   const token = await readStoredToken()
   if (!token) return null

@@ -3,7 +3,7 @@
 import { businessDateYmd } from '@/lib/business-date'
 import { creditNoteDocumentDay, originalSalesInvoiceDay, readCreditNoteDocumentDay, salesInvoiceUpdateDateDecision } from '@/lib/domain/accounting/document-date'
 import { readPostedSalesInvoiceDate } from '@/lib/domain/accounting/posted-invoice-date'
-import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
+import { assertNoPendingDeletion, pendingDeletionError, PendingDocumentDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import type { InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
 import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
 import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
@@ -1924,6 +1924,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
     if (e instanceof CustomerAnonymisedError) return { success: false, error: e.message }
     if (e instanceof EditedOrderAllocationError) return { success: false, error: `Stock could not be re-reserved for the edited order, so nothing was changed: ${e.message}` }
     if (e instanceof SalesInvoiceOriginalDateUnknownError) return { success: false, error: `The edit was refused, so nothing was changed: ${e.message}` }
+    if (e instanceof PendingDocumentDeletionError) return { success: false, error: e.message }
     if (e instanceof SalesInvoiceDoesNotReconcileError || e instanceof SalesInvoiceNotQueuedError) return { success: false, error: `The edit would leave the order's invoice out of step with its total, so nothing was changed: ${e.message}` }
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -2275,6 +2276,8 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     if (!options.client) throw new Error('queueSalesInvoiceForOrder: updateInTx needs the transaction')
     if (!so.accountingInvoiceId) throw new Error('queueSalesInvoiceForOrder: updateInTx is for an order that already has an accounting invoice')
     const tx = options.client as unknown as Prisma.TransactionClient
+    // #1132 MED-4: no update of an invoice whose delete is pending, read under the order lock the caller holds (the lock the delete request takes).
+    await assertNoPendingDeletion(so.id, tx)
     const updatePayload = { ...payload, accountingInvoiceId: so.accountingInvoiceId }
     const idempotencyKey = accountingPayloadKey(`sales-invoice-update:${so.id}:${so.accountingInvoiceId}`, updatePayload)
     const { getActiveAccountingConnectorInfo } = await import('@/lib/accounting')
@@ -4042,6 +4045,7 @@ export async function createRefund(
   } catch (e) {
     if (e instanceof CustomerAnonymisedError) return { success: false, error: e.message }
     if (e instanceof SalesInvoiceOriginalDateUnknownError) return { success: false, error: `The exchange was refused, so nothing was recorded: ${e.message}` }
+    if (e instanceof PendingDocumentDeletionError) return { success: false, error: e.message }
     if (e instanceof SalesInvoiceDoesNotReconcileError || e instanceof SalesInvoiceNotQueuedError) return { success: false, error: `The exchange would leave the order's invoice out of step with its total, so nothing was recorded: ${e.message}` }
     if (options?.externalRefundId && isExternalRefundIdUniqueConflict(e)) {
       // o3d-7yf: externalRefundId is globally unique, so this conflict may be a CROSS-ORDER race — the

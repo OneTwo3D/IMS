@@ -5,6 +5,7 @@ import { getWmsConnector } from '@/lib/connectors/wms/registry'
 import { isWmsConnectorId, type WmsOrderItemRef } from '@/lib/connectors/wms/types'
 import { removalNoteKey } from './removal-note-obligation'
 import type { WmsOperatorTaskPayload } from './operator-tasks'
+import { isRefundDeleteTaskReason } from '@/lib/domain/sales/refund-delete-task-reasons'
 
 /**
  * THE DONE ACTION OF AN OPERATOR QUERY TASK.
@@ -106,6 +107,8 @@ export async function completeWmsOperatorTask(params: {
             ? `Operator task done for order ${orderLabel} on warehouse order ${task.externalOrderId}: merge hold, marked done by a person. IMS did not release or change the hold; it clears when the warehouse order leaves the held status.`
           : task.reason === 'CANCELLED_POSTED_INVOICE'
             ? `Operator task done for order ${orderLabel}: the posted invoice (${task.externalOrderId}) was credited by hand, marked done by a person. IMS did not check the ledger.`
+          : isRefundDeleteTaskReason(task.reason)
+            ? `Operator task done for order ${orderLabel}: refund delete (${task.reason === 'REFUND_DELETE_VOID_STUCK' ? 'the credit note void gave up' : 'credit note voided in Xero, IMS refund standing'}), marked done by a person. IMS changed nothing in Xero, the warehouse or the refund.`
           : `Operator task done for order ${orderLabel} on warehouse order ${task.externalOrderId}: the query was raised in the warehouse's system.`,
       metadata: { taskId, connector: task.connector, reason: task.reason, externalOrderId: task.externalOrderId, ...(partial ? { linkSettled: settled } : {}) },
     })
@@ -115,7 +118,9 @@ export async function completeWmsOperatorTask(params: {
         ? (settled ? 'Every line is gone from the warehouse order. The link was closed as cancelled.' : 'Every line is gone from the warehouse order. The link had already moved on, so it was not changed.')
         : task.reason === 'SHOP_REFUND_DUE'
           ? 'Marked done. If the refund in WooCommerce has not been imported into IMS yet, IMS can no longer link it to this credit note.'
-          : 'Marked done.',
+          : isRefundDeleteTaskReason(task.reason)
+            ? 'Marked done. Nothing was changed in Xero, the warehouse or the refund.'
+            : 'Marked done.',
     }
   }, { maxWait: 5_000, timeout: 20_000 })
 }
