@@ -36,6 +36,8 @@ export function StockAdjustmentForm({ productId, warehouses, reasons, reasonCost
   // the client value legitimately differ (random per environment), so the hidden
   // input is suppressHydrationWarning. Rotated on each successful save (see below).
   const [idempotencyToken, setIdempotencyToken] = useState(() => crypto.randomUUID())
+  // o3d-0ypv9: the selected warehouse, tracked only so the switch-on cost default follows it.
+  const [warehouseId, setWarehouseId] = useState(warehouses[0]?.id ?? '')
 
   // Show success message immediately (render-time state adjustment)
   if (state.success && !prevSuccess) {
@@ -64,7 +66,6 @@ export function StockAdjustmentForm({ productId, warehouses, reasons, reasonCost
 
   const hasReasons = reasons.length > 0
   // o3d-0ypv9 (switch on): show the unit cost a blank addition defaults to (the latest cost layer, never an average).
-  const [warehouseId, setWarehouseId] = useState(warehouses[0]?.id ?? '')
   const [costDefault, setCostDefault] = useState<{ key: string; value: AdjustmentDefaultUnitCost | null } | null>(null)
   const costKey = `${productId}:${warehouseId}`
   useEffect(() => {

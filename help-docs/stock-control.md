@@ -28,6 +28,20 @@ Saving the same batch twice by accident (a double click or a retry) does not boo
 
 The page also offers **Import Opening Stock** (a CSV of `sku`, `warehouseCode`, `qty` and `unitCostBase`; each product and warehouse can have opening stock applied only once), a stock-levels export with warehouse and "Include bundles" options, and a CSV **Template**, **Export** and **Import** for adjustments. Below the buttons the history lists every adjustment; use the pencil on a row to change its quantity or note. A valued adjustment that has no reason (every row of an adjustments CSV import, which has no reason column), a reason with no account, or no mapped inventory account cannot post a journal: with Xero sync and the inventory-adjustment sync type on, it appears in the exception inbox as a stock adjustment journal to post by hand. Nothing is raised while Xero sync or that sync type is off.
 
+### Reason and unit cost required (not yet switched on)
+
+A system setting, `stock_adjustment_reason_cost_required`, is **off by default**, and everything described above is how IMS behaves while it is off. The owner turns it on at go-live. Once it is on, so that stock value in IMS and the inventory account in Xero cannot drift because of an adjustment:
+
+- **Every adjustment needs a reason**: a single adjustment, every bulk line (the "No reason" choice is gone), every row of an adjustments CSV import (a new `reason` column, holding the name of an active adjustment reason; the template then includes it), and every stock count variance.
+- **The reason needs an account.** An adjustment that moves value while Xero sync and the inventory-adjustment sync type are on is refused, with a message naming the reason to map, when that reason has no account (or no inventory account is mapped). Nothing is saved and nothing goes to the exception inbox; map the account in Settings and save again. Adjustments that move no value (an entered unit cost of 0) and adjustments made while Xero sync is off are not refused for this.
+- **A blank unit cost on an addition uses the latest cost layer**, never an average: the unit cost of the most recently received stock of that product in that warehouse, or, if it has none there, in any warehouse (stock received at a cost of 0 is skipped). The form shows that figure in the unit cost box (roles that may not see cost figures see only that a default exists). If the product has no costed stock anywhere, enter a unit cost; the adjustment is refused until you do. Enter **0** only for genuinely free stock.
+- **Removals** still take the cost of the oldest layers (FIFO), as before.
+- **Stock counts** post their variances under the **Variance reason** you pick or, if you pick none, under an active adjustment reason called **Stock count** (create it, with its account, before the setting is turned on). With neither, posting is refused and nothing is booked. A surplus on a count is valued at the latest cost layer in the same way.
+- **Editing** an adjustment so that a removal becomes an addition values it at the latest cost layer; with none, the edit is refused and you make a new adjustment with a unit cost instead.
+- **Opening stock** is not affected: it already needs an explicit unit cost and is its own movement type.
+
+Before turning it on: map an account to every adjustment reason in use (including the one used by the Mintsoft align-down), create the **Stock count** reason with its account, and make sure the inventory account is mapped.
+
 ### Adjustment Reasons
 
 When adjustment reasons are configured, a single adjustment requires one (a bulk line can be saved without). With none configured the form shows a free-text **Reason / Note** box instead. Common reasons include:

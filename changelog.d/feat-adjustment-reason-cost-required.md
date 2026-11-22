@@ -1,0 +1,6 @@
+### Stock adjustments: a reason with an account and a non-average unit cost, behind a switch (inventory)
+- New system setting `stock_adjustment_reason_cost_required`, **off by default**; the owner turns it on at go-live. With it off, every adjustment writer behaves exactly as before.
+- With it on, every stock adjustment (single, bulk line, adjustments CSV row, stock count variance, in-place edit, Mintsoft align-down) needs an active adjustment reason; the bulk dialog drops "No reason" and the adjustments CSV takes a `reason` column (matched by reason name, case-insensitive, or id), which the template then includes.
+- With it on, a valued adjustment whose reason has no account, or with no inventory account mapped, is refused while Xero would post it, naming the reason to map, instead of committing a stock change that only reaches the ledger through the exception inbox.
+- With it on, a blank unit cost on an addition defaults to the unit cost of the product's latest costed layer in that warehouse, else in any warehouse, shown in the form; never an average. With no such layer the addition is refused until a cost is entered; 0 is booked only when entered. Removals keep FIFO consumption.
+- With it on, a stock count with no variance reason chosen posts under the active reason named "Stock count", or is refused. No migration; no data is changed.
