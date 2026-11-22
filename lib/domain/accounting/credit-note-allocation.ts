@@ -30,9 +30,24 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { toDecimal, addMoney, type Decimal } from '@/lib/domain/math/decimal'
 import { MAY_HAVE_REACHED_LEDGER_WHERE, PROVEN_LEDGER_FACT_WHERE } from '@/lib/domain/accounting/ledger-standing'
+import { businessDateYmd } from '@/lib/business-date'
 
 export const CREDIT_NOTE_ALLOCATION_SETTING_KEY = 'xero_credit_note_allocation_enabled'
 export const CREDIT_NOTE_ALLOCATION_CONNECTOR = 'xero'
+
+/**
+ * o3d-l9gej: date a RECORDED refund payment on the day the cash went out, and rate it on that day. Behind its own system switch (default off), because it changes
+ * the Date and CurrencyRate IMS sends to Xero on the refund payment; off, the payment is dated and rated on the credit note's date, as before.
+ */
+export const REFUND_CASH_OUT_DATE_SETTING_KEY = 'xero_refund_payment_cash_out_date_enabled'
+
+/** ON only for the exact string `true`, like every system switch. */
+export async function isRefundCashOutDateEnabled(
+  client: Pick<Prisma.TransactionClient, 'setting'>,
+): Promise<boolean> {
+  const row = await client.setting.findUnique({ where: { key: REFUND_CASH_OUT_DATE_SETTING_KEY }, select: { value: true } })
+  return row?.value === 'true'
+}
 
 export type CreditNoteSettlementOperation = 'ALLOCATE' | 'REFUND_PAYMENT'
 
@@ -79,7 +94,10 @@ export type CreditNoteSettlementFacts = {
   invoicePaymentRows: number
   recordedRefundCash: Decimal
   refundPaymentMethod: string | null
+  /** The LATEST recorded refund payment's `paidAt` (the day the last of the refund's cash left the bank). */
   refundPaymentPaidAt: Date | null
+  /** That payment's `paidAtExplicitInstant` (null = the operator picked a date, not an instant). Absent = unknown, read as date-only. */
+  refundPaymentPaidAtExplicitInstant?: Date | null
   originalReceiptMethod: string | null
   /** WooCommerce `refunded_payment` as stored: true = through the gateway, false = refunded manually, null = unknown. */
   refundedViaGateway: boolean | null
@@ -173,6 +191,29 @@ export function planCreditNoteSettlement(facts: CreditNoteSettlementFacts): Cred
   return notNow('CASH_REFUND_NOT_RECORDED', 'the invoice was paid and no refund payment is recorded for this refund, so nothing says cash left the bank')
 }
 
+/**
+ * THE DAY A RECORDED REFUND'S CASH LEFT THE BANK (o3d-l9gej). Only for RECORDED cash evidence: the operator's refund `Payment` carries the day it was paid
+ * (`paidAt`), and a refund paid days after the credit note must be booked on that bank date and at that day's rate, not the credit note's. With several
+ * refund payments the LATEST is the day the refund was completed (the one Xero payment carries their sum).
+ *
+ * Null (the credit note's date stands, as before) for a GATEWAY refund (no Payment row: the storefront refund is the credit note's own day), for no recorded
+ * payment date, and for a payment dated BEFORE the credit note: Xero's payment is never dated before the document it settles.
+ *
+ * `explicitInstant` is the stored `paidAtExplicitInstant`, for the rate's as-of (lib/accounting-fx.ts settlementAsOfFromStored). Pure.
+ */
+export function refundCashOutDate(
+  facts: Pick<CreditNoteSettlementFacts, 'refundPaymentPaidAt' | 'refundPaymentPaidAtExplicitInstant'>,
+  plan: CreditNoteSettlementPlan | null,
+  creditNoteDate: string,
+): { date: string; paidAt: Date; explicitInstant: Date | null } | null {
+  if (!plan || plan.kind !== 'REFUND_PAYMENT' || plan.cashEvidence !== 'RECORDED') return null
+  const paidAt = facts.refundPaymentPaidAt
+  if (!(paidAt instanceof Date) || !Number.isFinite(paidAt.getTime())) return null
+  const date = businessDateYmd(paidAt)
+  if (/^\d{4}-\d{2}-\d{2}$/.test(creditNoteDate) && date < creditNoteDate) return null
+  return { date, paidAt, explicitInstant: facts.refundPaymentPaidAtExplicitInstant ?? null }
+}
+
 /** The payment method the refund goes out under: the one the operator recorded on the refund payment, else the original receipt's, else the order's own. */
 export function refundPaymentMethodOf(facts: Pick<CreditNoteSettlementFacts, 'refundPaymentMethod' | 'originalReceiptMethod'> & { order: Pick<CreditNoteSettlementFacts['order'], 'paymentMethod'> }): string | null {
   // The ORIGINAL receipt first: the refund returns the money by the route it came in on, and that is the account the payment map was set up for.
@@ -232,8 +273,8 @@ export async function readCreditNoteSettlementFacts(
   const [payments, invoicePaymentRows, creditNoteRows, invoiceRows, siblings, postedSettlements] = await Promise.all([
     client.payment.findMany({
       where: { orderId: order.id },
-      select: { refundId: true, amount: true, currency: true, method: true, paidAt: true },
-      orderBy: { paidAt: 'asc' },
+      select: { refundId: true, amount: true, currency: true, method: true, paidAt: true, paidAtExplicitInstant: true },
+      orderBy: [{ paidAt: 'asc' }, { id: 'asc' }],
     }),
     client.accountingSyncLog.count({
       where: {
@@ -349,6 +390,7 @@ export async function readCreditNoteSettlementFacts(
     recordedRefundCash: refundPayments.reduce<Decimal>((sum, p) => addMoney(sum, abs(toDecimal(p.amount))), toDecimal(0)),
     refundPaymentMethod: refundPayments.find((p) => p.method)?.method ?? null,
     refundPaymentPaidAt: refundPayments.length > 0 ? refundPayments[refundPayments.length - 1]!.paidAt : null,
+    refundPaymentPaidAtExplicitInstant: refundPayments.length > 0 ? refundPayments[refundPayments.length - 1]!.paidAtExplicitInstant : null,
     originalReceiptMethod: payments.find((p) => p.refundId === null && p.method)?.method ?? null,
     refundedViaGateway: refund.refundedViaGateway,
     priorCashOut,
