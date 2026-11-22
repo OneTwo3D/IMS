@@ -14,7 +14,6 @@ import { LIFECYCLE_REVIEW_FILE_NAMES } from '../../lib/first-load/lifecycle-revi
 import { runWmsArchiveCli, type WmsArchiveExecuteDeps, type WmsCensusReader } from '../../lib/first-load/wms-discontinue/cli.ts'
 import type { WmsCensus } from '../../lib/first-load/wms-discontinue/plan.ts'
 import { ARCHIVE_ACTIVITY_ACTIONS, ARCHIVE_TARGET_STATEMENTS, type ArchiveTargetPort } from '../../lib/first-load/wms-discontinue/target.ts'
-import { FIRST_LOAD_WMS_ARCHIVE_LOCK_KEY } from '../../lib/db/advisory-locks.ts'
 import { FIRST_LOAD_WMS_ARCHIVE_SWITCH_KEY, findSwitch } from '../../lib/domain/settings/system-switches.ts'
 import { createMintsoftArchiveWriter } from '../../lib/connectors/mintsoft/first-load-archive-write.ts'
 import { LIVE_FROM, configOf, fakeMintsoft, grantedEnv, liveEnv, stockRow, syntheticProduct, type FakeTenant, type Rig } from '../connectors/mintsoft-archive-fake.ts'
@@ -65,18 +64,16 @@ function census(rig: Rig): WmsCensus {
   }
 }
 
-type Target = { queries: Array<{ sql: string; values?: unknown[] }>; records: Array<{ action: string; level: string; entityId: string; metadata: Record<string, unknown>; description: string }>; opened: number; unlocked: number }
+type Target = { queries: Array<{ sql: string; values?: unknown[] }>; records: Array<{ action: string; level: string; entityId: string; metadata: Record<string, unknown>; description: string }>; opened: number; locks: number; unlocked: number; closed: number }
 type TargetOpts = { switchValue?: string | null; lifecycle?: Record<string, string | null>; db?: string; sid?: string; failRecord?: boolean; env?: Record<string, string>; envOf?: (rig: Rig) => Record<string, string>; lockHeld?: boolean; switchAgain?: string[] }
 function fakeTarget(opts: TargetOpts = {}): { deps: Pick<WmsArchiveExecuteDeps, 'openTarget'>; target: Target } {
-  const target: Target = { queries: [], records: [], opened: 0, unlocked: 0 }
+  const target: Target = { queries: [], records: [], opened: 0, locks: 0, unlocked: 0, closed: 0 }
   const again = [...(opts.switchAgain ?? [])]
   const lifecycle = opts.lifecycle ?? { 'SIM-DRAFT': 'ARCHIVED', 'SIM-PRIV': 'ARCHIVED' }
   const port: ArchiveTargetPort = {
     query: async <T,>(sql: string, values?: unknown[]) => {
       target.queries.push({ sql, values })
       const rows = (r: unknown[]) => ({ rows: r as T[] })
-      if (sql === ARCHIVE_TARGET_STATEMENTS.lock) { assert.deepEqual(values, [FIRST_LOAD_WMS_ARCHIVE_LOCK_KEY]); return rows([{ locked: opts.lockHeld !== true }]) }
-      if (sql === ARCHIVE_TARGET_STATEMENTS.unlock) { target.unlocked++; return rows([{ unlocked: true }]) }
       if (sql === ARCHIVE_TARGET_STATEMENTS.switchAgain) {
         return rows([{ value: again.length > 0 ? again.shift()! : 'true' }])
       }
@@ -97,7 +94,21 @@ function fakeTarget(opts: TargetOpts = {}): { deps: Pick<WmsArchiveExecuteDeps, 
       return rows([])
     },
   }
-  return { target, deps: { openTarget: async () => { target.opened++; return { port, env: opts.env ?? {}, close: async () => {} } } } }
+  return {
+    target,
+    deps: {
+      openTarget: async () => {
+        target.opened++
+        return {
+          port,
+          env: opts.env ?? {},
+          tryLock: async () => { target.locks++; target.queries.push({ sql: 'LOCK' }); return opts.lockHeld !== true },
+          unlock: async () => { target.unlocked++ },
+          close: async () => { target.closed++ },
+        }
+      },
+    },
+  }
 }
 
 const ENV = ['--mintsoft-env-file', '/only/for/the/fake']
@@ -154,9 +165,10 @@ test('--execute writes each WOULD_ARCHIVE SKU once with the verified partial bod
   })
   assert.match(s.target.records[1]!.metadata.stepEvidence as string, new RegExp(`^Mintsoft step live in the target since ${LIVE_FROM.replace('Z', '')}`))
   // The lock first, then the read in ONE READ ONLY REPEATABLE READ transaction (the exact text pinned), and the lock released at the end.
-  assert.deepEqual(s.target.queries.slice(0, 2).map((q) => q.sql), [ARCHIVE_TARGET_STATEMENTS.lock, 'BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ'])
+  assert.deepEqual(s.target.queries.slice(0, 2).map((q) => q.sql), ['LOCK', 'BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ'])
   assert.equal(ARCHIVE_TARGET_STATEMENTS.begin, 'BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ')
   assert.equal(s.target.unlocked, 1)
+  assert.equal(s.target.closed, 1)
   // The switch is read again before each POST (#1128 R1 LOW-4).
   assert.equal(s.target.queries.filter((q) => q.sql === ARCHIVE_TARGET_STATEMENTS.switchAgain).length >= 2, true)
   assert.match(r.out, /written and verified: 2/)
@@ -415,8 +427,9 @@ test('another run holding the target lock refuses (exit 3) before anything is re
   const r = await s.exec(EXEC(s.token))
   assert.equal(r.code, EXIT_CODES.INPUT_UNUSABLE)
   assert.match(r.err, /another run of this command holds the target's lock/)
-  assert.deepEqual(s.target.queries.map((q) => q.sql), [ARCHIVE_TARGET_STATEMENTS.lock])
+  assert.deepEqual(s.target.queries.map((q) => q.sql), ['LOCK'], 'nothing is read after the lock is refused')
   assert.equal(s.target.unlocked, 0, 'a lock not taken is not released')
+  assert.equal(s.target.closed, 1)
   assert.equal(s.reads.length, readsBefore)
   assert.deepEqual(s.rig.seen, [])
 })

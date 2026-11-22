@@ -8,13 +8,15 @@
  * and is still in force (an operator who changed the product back since is not overruled in the WMS). The target is confirmed the same way as
  * first-load:apply: named by an env file, and confirmed by what the server says about itself (--expect-db, --expect-system-id).
  *
+ * ONE RUN AT A TIME per target (#1128 R1 LOW-3): the script's connection (lib/db/first-load-archive-target.ts) is built by the session-lock factory and
+ * takes the advisory lock FIRST_LOAD_WMS_ARCHIVE_LOCK_KEY before anything is read; the command refuses when another run holds it.
+ *
  * ONE READ ONLY REPEATABLE READ transaction reads the server's identity, the switch and the products; nothing else is read.
  *
  * THE RECORD. Each write is recorded in `activity_logs` (entity PRODUCT, the IMS product id), in its own transaction: the attempt before the request is
  * sent, then the verified write or the failure, with the SKU, the WMS product id, the discontinued flag before and after, the operator, the plan token
  * and the sheet id. These INSERTs are the only statements that write.
  */
-import { FIRST_LOAD_WMS_ARCHIVE_LOCK_KEY } from '@/lib/db/advisory-locks'
 import type { ArchiveWriteRecord } from './execute'
 
 export const ARCHIVE_TARGET_STATEMENTS = {
@@ -23,9 +25,6 @@ export const ARCHIVE_TARGET_STATEMENTS = {
   switch: 'select "value" from "settings" where "key" = $1',
   products: 'select "id", "sku", "lifecycleStatus"::text as lifecycle from "products" where "sku" = any($1::text[])',
   rollback: 'ROLLBACK',
-  /** One run at a time per target (#1128 R1 LOW-3): a session lock taken before anything is read, released when the run ends. */
-  lock: 'select pg_try_advisory_lock($1::bigint) as locked',
-  unlock: 'select pg_advisory_unlock($1::bigint) as unlocked',
   /** The switch, read again before each write, outside any transaction. */
   switchAgain: 'select "value" as value from "settings" where "key" = $1',
   writeBegin: 'BEGIN',
@@ -50,16 +49,6 @@ export interface ArchiveTargetRead {
   switchValue: string | null
   /** The IMS products found under exactly the SKUs asked for. */
   products: Map<string, { id: string; lifecycle: string }>
-}
-
-/** Takes the run's session lock. False when another run holds it. */
-export async function lockArchiveTarget(port: ArchiveTargetPort): Promise<boolean> {
-  const rows = (await port.query<{ locked: boolean }>(ARCHIVE_TARGET_STATEMENTS.lock, [FIRST_LOAD_WMS_ARCHIVE_LOCK_KEY])).rows
-  return rows.length === 1 && rows[0]!.locked === true
-}
-
-export async function unlockArchiveTarget(port: ArchiveTargetPort): Promise<void> {
-  await port.query(ARCHIVE_TARGET_STATEMENTS.unlock, [FIRST_LOAD_WMS_ARCHIVE_LOCK_KEY])
 }
 
 /** The switch, read again: true only when its row reads exactly 'true'. */

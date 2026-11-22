@@ -192,8 +192,8 @@ export const INVARIANT_WARNING_BASELINE_LOCK_KEY = 918_274_601
 export const INVENTORY_SNAPSHOT_FLOOR_LOCK_KEY = 918_274_701
 
 /**
- * The first-load WMS archive write (scripts/first-load-mintsoft-archive.ts --execute): one run at a time per target database. A session lock
- * (`pg_try_advisory_lock`) on the command's own connection, taken before the import proof is read and held until the run ends; a second run refuses.
+ * The first-load WMS archive write (scripts/first-load-<wms>-archive.ts --execute): one run at a time per target database. A session lock
+ * (`pg_try_advisory_lock`) on the command's own connection (built by the session-lock factory, lib/db/first-load-archive-target.ts), taken before the import proof is read and held until the run ends; a second run refuses.
  */
 export const FIRST_LOAD_WMS_ARCHIVE_LOCK_KEY = 918_274_801
 

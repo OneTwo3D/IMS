@@ -25,7 +25,7 @@ import { EXIT_CODES } from '../spec'
 import { ConfigError, prepare } from '../transform'
 import { executeArchivePlan, type ArchiveExecuteResult, type WmsArchiveWriter } from './execute'
 import { buildArchivePlan, isRefused, type ArchivePlan, type WmsCensus } from './plan'
-import { archiveSwitchStillOn, lockArchiveTarget, readArchiveTarget, recordArchiveWrite, unlockArchiveTarget, unprovenImports, type ArchiveTargetPort } from './target'
+import { archiveSwitchStillOn, readArchiveTarget, recordArchiveWrite, unprovenImports, type ArchiveTargetPort } from './target'
 
 export const WMS_ARCHIVE_EXIT_CODE_TABLE: ReadonlyArray<{ code: number; name: string; meaning: string }> = [
   { code: EXIT_CODES.OK, name: 'OK', meaning: 'Dry run: the plan was printed, no SKU is refused and a real prepare of the manifest is not blocked (the plan may be empty). --execute: every WOULD_ARCHIVE SKU was written and verified.' },
@@ -54,13 +54,23 @@ export class WmsCensusFailed extends Error {}
  */
 export type WmsArchiveOpenWriter = (envFile: string, targetEnv: Readonly<Record<string, string | undefined>>) => WmsArchiveWriter
 
+/** The IMS target of --execute: one session (the run's advisory lock lives on it), and the variables of its env file. */
+export interface ArchiveTarget {
+  port: ArchiveTargetPort
+  env: Readonly<Record<string, string | undefined>>
+  /** Takes the run's session lock; false when another run holds it. */
+  tryLock: () => Promise<boolean>
+  unlock: () => Promise<void>
+  close: () => Promise<void>
+}
+
 /** What --execute needs besides the reader; the script supplies it (the WMS writer from the same credentials file, the IMS target from its env file). */
 export interface WmsArchiveExecuteDeps {
   /** The system switch that must read exactly `true`. */
   switchKey: string
   openWriter: WmsArchiveOpenWriter
-  /** Opens the IMS target from its env file, with that file's environment. Throws with a short message (never a credential) when it cannot. */
-  openTarget: (envFile: string) => Promise<{ port: ArchiveTargetPort; env: Readonly<Record<string, string | undefined>>; close: () => Promise<void> }>
+  /** Opens the IMS target from its env file, with that file's environment and the run's lock. Throws with a short message (never a credential) when it cannot. */
+  openTarget: (envFile: string) => Promise<ArchiveTarget>
   /** A new activity-log id. */
   newId: () => string
 }
@@ -191,7 +201,7 @@ export async function runWmsArchiveCli(argv: string[], io: CliIo, reader: WmsCen
 
   // ---- --execute: the IMS target first (identity, switch, import proof read), before the WMS is touched ----
   const archived = result.catalogue.filter((e) => e.lifecycleSource === 'decision' && e.lifecycle === 'ARCHIVED').map((e) => e.sku)
-  let target: { port: ArchiveTargetPort; env: Readonly<Record<string, string | undefined>>; close: () => Promise<void> } | null = null
+  let target: ArchiveTarget | null = null
   let locked = false
   try {
     let proof: Awaited<ReturnType<typeof readArchiveTarget>> | null = null
@@ -203,7 +213,7 @@ export async function runWmsArchiveCli(argv: string[], io: CliIo, reader: WmsCen
       if (result.blocking) return refuse(['a real first-load:prepare of this manifest is blocked by other findings, so the import cannot have been made from it: nothing is written'])
       try {
         target = await deps.openTarget(ex.envFile)
-        locked = await lockArchiveTarget(target.port)
+        locked = await target.tryLock()
         if (!locked) return refuse(['another run of this command holds the target\'s lock: one run at a time'])
         proof = await readArchiveTarget(target.port, deps.switchKey, archived)
       } catch (error) {
@@ -272,7 +282,7 @@ export async function runWmsArchiveCli(argv: string[], io: CliIo, reader: WmsCen
     }
     return EXIT_CODES.OK
   } finally {
-    if (locked) await unlockArchiveTarget(target!.port).catch(() => undefined)
+    if (locked) await target!.unlock().catch(() => undefined)
     await target?.close().catch(() => undefined)
   }
 }

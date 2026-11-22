@@ -20,9 +20,8 @@
  */
 import { randomUUID } from 'node:crypto'
 import process from 'node:process'
-import pg from 'pg'
-import { runWmsArchiveCli } from '../lib/first-load/wms-discontinue/cli'
-import type { ArchiveTargetPort } from '../lib/first-load/wms-discontinue/target'
+import { runWmsArchiveCli, type ArchiveTarget } from '../lib/first-load/wms-discontinue/cli'
+import { openArchiveTargetConnection } from '../lib/db/first-load-archive-target'
 import { buildExportEnv } from '../lib/first-load/export-fx-rates'
 import { createMintsoftArchiveWiring } from '../lib/connectors/mintsoft/first-load-archive-write'
 import { readEnvFile } from './lib/first-load-apply-files'
@@ -31,19 +30,24 @@ const APPLICATION_NAME = 'first-load-mintsoft-archive'
 /** A literal, not an import of lib/domain/settings/system-switches.ts (it loads the settings store); tests/first-load/mintsoft-archive-write.test.ts holds it equal. */
 export const ARCHIVE_SWITCH_KEY = 'first_load_mintsoft_archive_enabled'
 
-/** The target: its env file's DATABASE_URL, and its variables (the installation's own rules for the write: grant, live-from, producer hold). */
-async function openTarget(envFile: string): Promise<{ port: ArchiveTargetPort; env: Record<string, string>; close: () => Promise<void> }> {
+/**
+ * The target: its env file's DATABASE_URL (never an inherited one), on one session built by the session-lock factory (the run's advisory lock lives on
+ * it), and its variables (the installation's own rules for the write: grant, live-from, producer hold).
+ */
+async function openTarget(envFile: string): Promise<ArchiveTarget> {
   const file = readEnvFile(envFile)
   if (!file.ok) throw new Error(file.problem)
   const built = buildExportEnv(file.env, process.env, process.env.HOME ?? '/tmp')
   if (built.problems.length > 0) throw new Error(built.problems.join('; '))
-  const client = new pg.Client({ connectionString: built.env.DATABASE_URL, connectionTimeoutMillis: 10_000, application_name: APPLICATION_NAME })
+  // The direct-session override would move the session (and the run's lock) off the file's DATABASE_URL: this command connects directly or not at all.
+  if (built.env.DATABASE_SESSION_LOCK_URL !== undefined) throw new Error('the env file sets DATABASE_SESSION_LOCK_URL; this command uses the file\'s DATABASE_URL as a direct session only: run it with a direct (non-pooled) DATABASE_URL in a copy of the file without that variable')
+  let connection
   try {
-    await client.connect()
+    connection = await openArchiveTargetConnection({ databaseUrl: built.env.DATABASE_URL! }, APPLICATION_NAME)
   } catch {
-    throw new Error('the database named by the env file could not be reached')
+    throw new Error('the database named by the env file could not be reached on a direct session')
   }
-  return { port: { query: async (sql, values) => ({ rows: (await client.query(sql, values as unknown[] | undefined)).rows as never[] }) }, env: built.env, close: () => client.end() }
+  return { port: { query: connection.query }, env: built.env, tryLock: connection.tryLock, unlock: connection.unlock, close: connection.close }
 }
 
 // The credentials file is parsed once, for both the census and the writer.
