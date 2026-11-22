@@ -53,6 +53,8 @@ const allReceipts = [payment, secondReceipt]
 
 function client() {
   return {
+    // #1132 MED-4: the pending-delete fence the enqueue reads under the order lock (no delete pending here).
+    accountingDocumentDeletion: { findFirst: async () => null },
     accountingSyncLog: { findMany: async () => [], findFirst: async () => null, updateMany: async () => ({ count: 0 }), count: async () => 0 },
     payment: {
       findUnique: async ({ where }: { where: { id: string } }) => allReceipts.find((row) => row.id === where.id) ?? null,
