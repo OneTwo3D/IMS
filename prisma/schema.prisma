@@ -1013,6 +1013,13 @@ model CostLayer {
   /// The RETURN_INBOUND stock movement that created this layer (a refund that restocked its returned units). NULL for every other layer and for every layer written before the column existed.
   /// Lets a deleted refund remove exactly the layers its own return created; a refund whose layers are not tagged cannot have its return reversed and is refused.
   returnMovementId String?  @map("return_movement_id")
+  /// Per-event FX (switch `purchase_event_fx_rates_enabled`): the GOODS part of this layer's unit cost, in base currency, valued at the exchange
+  /// rate of the receipt's own business date (the line's discounted ex-VAT foreign unit cost / that rate, 6dp HALF_UP). The landed-cost
+  /// recalculation revalues the layer as this plus the freight share, never from the PO line. NULL = valued from the PO line at the PO rate:
+  /// every layer written while the switch was off, every layer that is not a purchase receipt, and a base-currency order (rate 1).
+  goodsUnitCostBase Decimal? @db.Decimal(18, 6) @map("goods_unit_cost_base")
+  /// The rate the receipt that laid this layer used (1 base = rate foreign, from fx_rates). NULL = the PO rate (switch off, or not a receipt).
+  fxRateToBase    Decimal?  @db.Decimal(18, 8) @map("fx_rate_to_base")
 
   product         Product   @relation(fields: [productId], references: [id])
   warehouse       Warehouse @relation(fields: [warehouseId], references: [id])
@@ -1121,7 +1128,7 @@ model TransitSubledgerMovement {
   id             String   @id @default(cuid())
   // 'PURCHASE_BILL' | 'PURCHASE_BILL_UPDATE' | 'SUPPLIER_CREDIT_NOTE' | 'STOCK_RECEIPT'
   // | 'LANDED_COST_RECLASS' | 'LANDED_COST_CONSUMED_OFFSET' | 'PURCHASE_ORDER_CANCEL'
-  // | 'SUPPLIER_RETURN' | 'CUSTOMER_RETURN_IN_TRANSIT' | 'GRIR_RECLASS'
+  // | 'SUPPLIER_RETURN' | 'CUSTOMER_RETURN_IN_TRANSIT' | 'GRIR_RECLASS' | 'PURCHASE_FX_VARIANCE'
   sourceType     String   @map("source_type")
   // originating entity (purchaseOrderId / creditNoteId) for traceability
   sourceRef      String   @map("source_ref")
@@ -1144,7 +1151,7 @@ model TransitSubledgerMovement {
 /// it did before this ledger existed). No foreign keys: a plain id snapshot, like the other sub-ledgers.
 model GrirSubledgerMovement {
   id             String    @id @default(cuid())
-  // 'RECEIPT' | 'BILL' | 'BILL_UPDATE' | 'SUPPLIER_RETURN' | 'SUPPLIER_CREDIT_NOTE' | 'OPENING_BALANCE' | 'BILL_PRICE_VARIANCE'
+  // 'RECEIPT' | 'BILL' | 'BILL_UPDATE' | 'SUPPLIER_RETURN' | 'SUPPLIER_CREDIT_NOTE' | 'OPENING_BALANCE' | 'BILL_PRICE_VARIANCE' | 'BILL_FX_VARIANCE'
   sourceType     String    @map("source_type")
   // the originating entity (receipt / bill / return / credit note id) for traceability
   sourceRef      String    @map("source_ref")
@@ -1706,6 +1713,9 @@ model PurchaseReceipt {
   externalKey String?   @unique
   receivedAt  DateTime  @default(now())
   notes       String?
+  /// Per-event FX (switch `purchase_event_fx_rates_enabled`): the exchange rate of this receipt's business date that valued its goods
+  /// (1 base = rate foreign, from fx_rates). NULL = valued at the PO rate (written while the switch was off).
+  fxRateToBase Decimal? @db.Decimal(18, 8) @map("fx_rate_to_base")
   createdAt   DateTime  @default(now())
 
   po          PurchaseOrder        @relation(fields: [poId], references: [id])
