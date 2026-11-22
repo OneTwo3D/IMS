@@ -1035,7 +1035,8 @@ export async function voidCreditNoteThenCompleteRefundDeletion(
  */
 async function voidLockDateRefusal(tx: Tx, voidSyncLogId: string, creditNoteDayKnown: string | null): Promise<string | null> {
   const row = creditNoteDayKnown ? null : await tx.accountingSyncLog.findUnique({ where: { id: voidSyncLogId }, select: { payload: true } })
-  const day = creditNoteDayKnown ?? parseBatchDay(payloadRecord(row?.payload).date)
+  const voidDay = payloadRecord(row?.payload).date
+  const day = creditNoteDayKnown ?? parseBatchDay(typeof voidDay === 'string' ? voidDay : null)
   const lockDate = await readLockDate(tx)
   if (!day || !isOnOrBeforeLockDate(day, lockDate)) return null
   return refundDeleteRefusals.booksLocked(day, lockDate as string).message
