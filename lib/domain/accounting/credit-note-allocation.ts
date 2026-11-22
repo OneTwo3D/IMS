@@ -85,6 +85,16 @@ export type CreditNoteSettlementFacts = {
   refundedViaGateway: boolean | null
   /** Cash already paid out, in flight or possibly landed against the order's OTHER refunds (recorded refund payments, or settlement rows posted / PROCESSING / attempted, whichever is larger per refund). */
   priorCashOut: Decimal
+  /**
+   * o3d-0lpnb MED-1/MED-2: the same, WITHOUT the in-flight arm (another refund's row that is PROCESSING and older but has not attempted its call). This is what the
+   * order-locked re-checks count: under the order lock a sibling that has not stamped its attempt cannot post before this row, and when it takes the lock it sees
+   * this row's stamp. The in-flight arm is kept only for the first sizing decision, where it makes the younger refund WAIT (it is handed back unsent) rather than
+   * settle short for good against an older pinned row that may still fail before its call. Absent (a hand-built fact set) = the same as `priorCashOut`.
+   */
+  priorCashOutSettled?: Decimal
+  /** Per OTHER refund (IMS refund id), the cash counted in `priorCashOut` / `priorCashOutSettled`, so a Xero reading can be merged per refund without counting a payment twice. */
+  cashOutByRefund?: ReadonlyMap<string, Decimal>
+  cashOutSettledByRefund?: ReadonlyMap<string, Decimal>
   /** ANOTHER CREDIT_NOTE_ALLOCATION row for this refund is SYNCED, or carries post evidence. */
   siblingSettled: boolean
 }
@@ -120,8 +130,10 @@ export function invoiceHasReceiptEvidence(facts: Pick<CreditNoteSettlementFacts,
  * shadowed INVOICE_PAYMENT) makes AmountPaid smaller, and the bank refund is held to what Xero actually holds. `xeroAmountPaid` null = unreadable: the cap
  * is then ZERO (refuse), never the IMS-only figure.
  *
- * KNOWN LIMIT, stated rather than hidden: AmountPaid also counts credit applied to the invoice and does not fall when a credit note is paid out in Xero, so an
- * operator's manual Xero refund of a credit note IMS does not know about stays invisible to this figure.
+ * AmountPaid is Xero's "sum of payments received for invoice": cash receipts only. Credit applied to the invoice (credit notes, over- and pre-payments) is
+ * AmountCredited, which is not read (o3d-0lpnb L1; the Xero Accounting API Invoice schema, and lib/connectors/xero/invoice-delta.ts XeroInvoice). AmountPaid does
+ * not fall when a credit note is paid out in Xero, so cash paid out on credit notes IMS did not raise (Xeroom-era, or by hand) is read from Xero separately and
+ * merged into `priorCashOut` before this is asked (`withXeroCashOut`, o3d-0lpnb MED-3).
  */
 export function refundPaymentCap(facts: Pick<CreditNoteSettlementFacts, 'receiptTotal' | 'priorCashOut'>, xeroAmountPaid: number | null): Decimal {
   if (xeroAmountPaid === null || !Number.isFinite(xeroAmountPaid)) return toDecimal(0)
@@ -263,33 +275,50 @@ export async function readCreditNoteSettlementFacts(
     // The refund payments this order's OTHER refunds posted OR MAY HAVE POSTED (their pinned amounts), for the cap (o3d-qrm47). Cash that is out, cash that is
     // in flight (PROCESSING: the call may be leaving right now) and cash that may have landed (an attempted row, whatever its status now: a lost response) all
     // count. A row that never attempted a call and is merely queued or failed pre-call holds no cash and does not.
+    // o3d-0lpnb: read in two parts, the proven-or-attempted rows and the in-flight-only ones, so the order-locked re-checks can count the first part alone.
     client.accountingSyncLog.findMany({
       where: {
         connector: CREDIT_NOTE_ALLOCATION_CONNECTOR, type: 'CREDIT_NOTE_ALLOCATION', referenceType: 'SalesOrderRefund', referenceId: { not: refund.id },
         payload: { path: ['orderId'], equals: order.id },
-        AND: [MAY_HAVE_REACHED_LEDGER_WHERE, { OR: [PROVEN_LEDGER_FACT_WHERE, { remoteAttemptedAt: { not: null } }, inFlightBefore(self)] }],
+        AND: [MAY_HAVE_REACHED_LEDGER_WHERE, { OR: [PROVEN_LEDGER_FACT_WHERE, { remoteAttemptedAt: { not: null } }] }],
       },
-      select: { referenceId: true, payload: true },
+      select: { id: true, referenceId: true, payload: true },
     }),
   ])
+  const inFlightSettlements = await client.accountingSyncLog.findMany({
+    where: {
+      connector: CREDIT_NOTE_ALLOCATION_CONNECTOR, type: 'CREDIT_NOTE_ALLOCATION', referenceType: 'SalesOrderRefund', referenceId: { not: refund.id },
+      payload: { path: ['orderId'], equals: order.id },
+      AND: [MAY_HAVE_REACHED_LEDGER_WHERE, inFlightBefore(self)],
+    },
+    select: { id: true, referenceId: true, payload: true },
+  })
 
   const receipts = payments.filter((p) => p.refundId === null && p.currency === order.currency)
   const refundPayments = payments.filter((p) => p.refundId === refund.id && p.currency === order.currency)
   const abs = (value: Decimal) => (value.lt(0) ? value.neg() : value)
   // Per OTHER refund: the larger of what an operator recorded and what a settlement row posted, so one payment is never counted twice.
-  const outByRefund = new Map<string, Decimal>()
+  const recordedByRefund = new Map<string, Decimal>()
   for (const p of payments) {
     if (p.refundId === null || p.refundId === refund.id || p.currency !== order.currency) continue
-    outByRefund.set(p.refundId, addMoney(outByRefund.get(p.refundId) ?? toDecimal(0), abs(toDecimal(p.amount))))
+    recordedByRefund.set(p.refundId, addMoney(recordedByRefund.get(p.refundId) ?? toDecimal(0), abs(toDecimal(p.amount))))
   }
-  for (const row of postedSettlements) {
-    const body = row.payload as { operation?: unknown; amount?: unknown } | null
-    if (!body || body.operation !== 'REFUND_PAYMENT' || (typeof body.amount !== 'number' && typeof body.amount !== 'string')) continue
-    const posted = toDecimal(body.amount)
-    const recorded = outByRefund.get(row.referenceId) ?? toDecimal(0)
-    outByRefund.set(row.referenceId, posted.gt(recorded) ? posted : recorded)
+  const cashOutOf = (rows: ReadonlyArray<{ referenceId: string; payload: unknown }>) => {
+    const out = new Map<string, Decimal>(recordedByRefund)
+    for (const row of rows) {
+      const body = row.payload as { operation?: unknown; amount?: unknown } | null
+      if (!body || body.operation !== 'REFUND_PAYMENT' || (typeof body.amount !== 'number' && typeof body.amount !== 'string')) continue
+      const posted = toDecimal(body.amount)
+      const recorded = out.get(row.referenceId) ?? toDecimal(0)
+      out.set(row.referenceId, posted.gt(recorded) ? posted : recorded)
+    }
+    return out
   }
-  const priorCashOut = [...outByRefund.values()].reduce<Decimal>((sum, v) => addMoney(sum, v), toDecimal(0))
+  const settledIds = new Set(postedSettlements.map((row) => row.id))
+  const cashOutSettledByRefund = cashOutOf(postedSettlements)
+  const cashOutByRefund = cashOutOf([...postedSettlements, ...inFlightSettlements.filter((row) => !settledIds.has(row.id))])
+  const sumOf = (map: ReadonlyMap<string, Decimal>) => [...map.values()].reduce<Decimal>((sum, v) => addMoney(sum, v), toDecimal(0))
+  const priorCashOut = sumOf(cashOutByRefund)
   return {
     refund: {
       id: refund.id,
@@ -323,6 +352,111 @@ export async function readCreditNoteSettlementFacts(
     originalReceiptMethod: payments.find((p) => p.refundId === null && p.method)?.method ?? null,
     refundedViaGateway: refund.refundedViaGateway,
     priorCashOut,
+    priorCashOutSettled: sumOf(cashOutSettledByRefund),
+    cashOutByRefund,
+    cashOutSettledByRefund,
     siblingSettled: siblings.length > 0,
   }
+}
+
+/** The facts with the cash counted for the order-locked re-checks: the in-flight arm left out (o3d-0lpnb MED-1). */
+export function settledCashOutFacts(facts: CreditNoteSettlementFacts): CreditNoteSettlementFacts {
+  return {
+    ...facts,
+    priorCashOut: facts.priorCashOutSettled ?? facts.priorCashOut,
+    ...(facts.cashOutSettledByRefund ? { cashOutByRefund: facts.cashOutSettledByRefund } : {}),
+  }
+}
+
+/**
+ * WHAT XERO SAYS WAS PAID OUT ON THE ORDER'S OTHER CREDIT NOTES (o3d-0lpnb MED-3): Payments on a credit note, never its allocations. Per IMS refund (its credit note
+ * IMS knows by id) and, for a credit note IMS never raised (Xeroom-era, or by hand), unattributed. Built by `decideXeroCreditNoteWitness`.
+ */
+export type XeroCreditNoteWitness = {
+  paidOutByRefund: ReadonlyMap<string, Decimal>
+  unattributedPaidOut: Decimal
+}
+
+/**
+ * MERGE XERO'S CASH-OUT INTO THE FACTS: per other refund the LARGER of IMS's figure and Xero's payments on that refund's credit note (the same payment is never
+ * counted twice), plus every payment on a credit note IMS did not raise. Both the full and the settled figure are merged. The merge only ever raises the cash out,
+ * so the cap only ever falls. Pure.
+ */
+export function withXeroCashOut(facts: CreditNoteSettlementFacts, witness: XeroCreditNoteWitness): CreditNoteSettlementFacts {
+  const merge = (ims: ReadonlyMap<string, Decimal> | undefined, fallback: Decimal) => {
+    if (!ims) {
+      // A hand-built fact set with no per-refund figures: Xero's per-refund cash is added only where it exceeds what IMS counts in total.
+      const xero = [...witness.paidOutByRefund.values()].reduce<Decimal>((sum, v) => addMoney(sum, v), toDecimal(0))
+      return addMoney(xero.gt(fallback) ? xero : fallback, witness.unattributedPaidOut)
+    }
+    const ids = new Set([...ims.keys(), ...witness.paidOutByRefund.keys()])
+    let total = toDecimal(0)
+    for (const id of ids) {
+      const a = ims.get(id) ?? toDecimal(0)
+      const b = witness.paidOutByRefund.get(id) ?? toDecimal(0)
+      total = addMoney(total, a.gt(b) ? a : b)
+    }
+    return addMoney(total, witness.unattributedPaidOut)
+  }
+  return {
+    ...facts,
+    priorCashOut: merge(facts.cashOutByRefund, facts.priorCashOut),
+    priorCashOutSettled: merge(facts.cashOutSettledByRefund, facts.priorCashOutSettled ?? facts.priorCashOut),
+  }
+}
+
+/** One credit note as Xero holds it, as the witness reads it (lib/connectors/xero/order-credit-notes.ts OrderCreditNoteRead). */
+export type WitnessCreditNote = {
+  creditNoteId: string
+  creditNoteNumber: string | null
+  reference: string | null
+  status: string
+  total: number | null
+  date?: string | null
+  byOrder: readonly string[]
+  byRefund: readonly string[]
+  paidOutCents: number
+}
+
+export type XeroCreditNoteWitnessDecision =
+  | { kind: 'ok'; witness: XeroCreditNoteWitness }
+  /** Xero already holds a credit note IMS did not raise that credits THIS refund: nothing is settled; a person decides which one stands. */
+  | { kind: 'duplicate'; creditNotes: WitnessCreditNote[] }
+
+/**
+ * READ THE ORDER'S CREDIT NOTES IN XERO AGAINST WHAT IMS HOLDS (o3d-0lpnb MED-3, o3d-pnc8p note 1). Pure.
+ *
+ *   `settlingCreditNoteId` the credit note being settled: never counted, never a duplicate of itself.
+ *   `imsCreditNotes`       every credit note id IMS recorded for the order's refunds, to its IMS refund id: their payments are attributed to that refund.
+ *   `isDuplicate`          the duplicate test (lib/connectors/xero/order-credit-notes.ts duplicateVerdict), asked of every other live credit note.
+ *
+ * Every other live credit note's PAYMENTS are counted as unattributed cash out (allocations never: credit moved to a replacement order's invoice is correct).
+ * Voided and deleted credit notes are ignored.
+ */
+export function decideXeroCreditNoteWitness(input: {
+  creditNotes: readonly WitnessCreditNote[]
+  settlingCreditNoteId: string | null
+  imsCreditNotes: ReadonlyMap<string, string>
+  isDuplicate: (cn: WitnessCreditNote) => boolean
+}): XeroCreditNoteWitnessDecision {
+  const known = new Map([...input.imsCreditNotes].map(([cn, refundId]) => [cn.trim().toLowerCase(), refundId]))
+  const settling = input.settlingCreditNoteId?.trim().toLowerCase() ?? null
+  const paidOutByRefund = new Map<string, Decimal>()
+  let unattributed = toDecimal(0)
+  const duplicates: WitnessCreditNote[] = []
+  for (const cn of input.creditNotes) {
+    if (cn.status === 'VOIDED' || cn.status === 'DELETED') continue
+    const id = cn.creditNoteId.trim().toLowerCase()
+    if (id === settling) continue
+    const paid = toDecimal(cn.paidOutCents).div(100)
+    const imsRefund = known.get(id)
+    if (imsRefund !== undefined) {
+      paidOutByRefund.set(imsRefund, addMoney(paidOutByRefund.get(imsRefund) ?? toDecimal(0), paid))
+      continue
+    }
+    if (input.isDuplicate(cn)) duplicates.push(cn)
+    else unattributed = addMoney(unattributed, paid)
+  }
+  if (duplicates.length > 0) return { kind: 'duplicate', creditNotes: duplicates }
+  return { kind: 'ok', witness: { paidOutByRefund, unattributedPaidOut: unattributed } }
 }

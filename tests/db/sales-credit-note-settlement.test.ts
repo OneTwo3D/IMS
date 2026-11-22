@@ -56,6 +56,8 @@ async function load() {
     namedExports: {
       ...api,
       xeroGet: async (path: string) => {
+        // o3d-0lpnb MED-3: the search for the order's other credit notes (Xeroom-era or by hand) finds none here.
+        if (path.startsWith('CreditNotes?where=')) return { ok: true, status: 200, data: { CreditNotes: [] } }
         if (path.startsWith('CreditNotes/')) {
           return { ok: true, status: 200, data: { CreditNotes: [{ CreditNoteID: path.split('/')[1], CurrencyCode: ledger.currency, Total: ledger.total, RemainingCredit: ledger.remaining, Allocations: ledger.allocations, Payments: ledger.payments }] } }
         }

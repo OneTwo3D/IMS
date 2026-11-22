@@ -125,20 +125,32 @@ export function isMoneyMovingSyncType(type: string): boolean {
 
 /**
  * The types `accounting_sync_logs_followup_live_unique` covers: a PARTIAL UNIQUE index on
- * (connector, type, referenceType, referenceId) restricted to PENDING/PROCESSING/SYNCED rows.
+ * (connector, type, referenceType, referenceId, and the payload's accountingInvoiceId / creditNoteId /
+ * paymentId) restricted to PENDING/PROCESSING/SYNCED rows.
  *
  * Mirrored here because the retry decides what to revive, and a decision that ignores the index
  * does not fail safely — it fails with a constraint error that rolls back the whole statement.
- * Kept in step with the migration by a test that reads the SQL.
+ * Kept in step with the LATEST migration that defines the index by a test that reads the SQL
+ * (o3d-0lpnb L7: BILL_PAYMENT since 20260819120000, CREDIT_NOTE_ALLOCATION since 20261122000400).
  */
 const LIVE_UNIQUE_FOLLOW_UP_TYPES = new Set([
   'INVOICE_PAYMENT',
+  'BILL_PAYMENT',
   'BILL_ATTACHMENT',
   'INVOICE_PDF',
   'INVOICE_EMAIL',
   'WC_INVOICE_NOTE',
   'PURCHASE_CREDIT_NOTE_ALLOCATION',
+  'CREDIT_NOTE_ALLOCATION',
 ])
+
+/**
+ * Of those, the ones whose live rows in one scope may still be DIFFERENT documents (the index keys on
+ * the payload's document anchors as well): a live sibling blocks a retry only when it could be the same
+ * document, which is what the rule-2 check asks for them. INVOICE_PAYMENT has its own per-receipt
+ * reading (`differentIds`).
+ */
+const ANCHOR_KEYED_LIVE_UNIQUE_TYPES = new Set(['BILL_PAYMENT'])
 
 export function isLiveUniqueFollowUpType(type: string): boolean {
   return LIVE_UNIQUE_FOLLOW_UP_TYPES.has(type)
@@ -148,8 +160,8 @@ export function isLiveUniqueFollowUpType(type: string): boolean {
  * Types where at most ONE row per scope may be live at a time — either because the database says
  * so, or because two live money rows for one document are two payments.
  *
- * BILL_PAYMENT is in the second group only: the index does not cover it, so nothing would stop
- * "Retry All" reviving two failed bill payments for one bill and posting both.
+ * BILL_PAYMENT is in both: it moves money, and the index covers it per bill (its anchors), so two
+ * failed bill payments for one bill are never both revived by "Retry All".
  */
 export function revivesAtMostOnePerScope(type: string): boolean {
   return isMoneyMovingSyncType(type) || isLiveUniqueFollowUpType(type)
@@ -340,9 +352,8 @@ export function planManualRetry(params: {
   }
 
   // Rule 2. A live sibling is an attempt in flight or already posted. For an index-covered type
-  // ANY live sibling in the scope blocks the write; for BILL_PAYMENT, which the index does not
-  // cover, the money argument is what blocks it, so only a sibling that could be the same
-  // document counts.
+  // ANY live sibling in the scope blocks the write; for BILL_PAYMENT, which the index keys per
+  // bill, only a sibling that could be the same document counts.
   if (revivesAtMostOnePerScope(type)) {
     const live = siblings.filter((row) =>
       row.id !== target.id
@@ -350,7 +361,7 @@ export function planManualRetry(params: {
       // The live-unique index for an INVOICE_PAYMENT is per receipt, so a live row of a different
       // payment does not occupy this one's slot.
       && !differentIds.has(row.id)
-      && (isLiveUniqueFollowUpType(type) || couldBeTheSameDocument(type, row.payload, target.payload)))
+      && ((isLiveUniqueFollowUpType(type) && !ANCHOR_KEYED_LIVE_UNIQUE_TYPES.has(type)) || couldBeTheSameDocument(type, row.payload, target.payload)))
     if (live.length > 0) {
       return {
         action: 'refuse',

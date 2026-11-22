@@ -6,7 +6,7 @@ import { isRegisteredAccountingConnector } from '@/lib/connectors/accounting-reg
 import { queueAccountingSyncTxWithOutcome } from '@/lib/accounting'
 import { ledgerStanding, mayHaveReachedLedger, namesADocument } from '@/lib/domain/accounting/ledger-standing'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
-import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from '@/lib/domain/accounting/money-attempt-provenance'
+import { ATTEMPT_PROVEN_NEVER_MADE_WHERE, STAMPED_MONEY_TYPES } from '@/lib/domain/accounting/money-attempt-provenance'
 import { voidMirroredAccountingEventsForOrder } from '@/lib/domain/accounting/accounting-event-mirror'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { XERO_BOOKS_LOCK_DATE_KEY } from '@/lib/connectors/xero/books-lock-date'
@@ -99,9 +99,18 @@ function payloadRecord(payload: unknown): Record<string, unknown> {
   return typeof payload === 'object' && payload !== null && !Array.isArray(payload) ? (payload as Record<string, unknown>) : {}
 }
 
-/** A queued row that has provably never been attempted: nothing could have reached the ledger from it. */
+/**
+ * A queued row that has provably never been attempted: nothing could have reached the ledger from it.
+ *
+ * #1127 R2 (defence in depth): `remoteAttemptedAt` is stamped by the MONEY fence only (STAMPED_MONEY_TYPES). A credit note, a COGS reversal or any other type is
+ * never stamped, so for those a null stamp under custody proves nothing about a claim whose response was lost; such a row counts as never attempted only while it
+ * has never been CLAIMED (attemptRevision still UNCLAIMED_ATTEMPT_REVISION; a claim mints revision >= 1), as the orphan sweep and the cancelled-order retirement
+ * require.
+ */
 function neverAttempted(row: SyncRow): boolean {
+  const stampedType = (STAMPED_MONEY_TYPES as readonly string[]).includes(row.type)
   return row.remoteAttemptedAt === null && row.attemptStampingCustodyAt !== null && !namesADocument(row)
+    && (stampedType || row.attemptRevision === UNCLAIMED_ATTEMPT_REVISION)
 }
 
 export type SyncDisposition =
