@@ -6532,3 +6532,13 @@ model XeroSettlementCallBudget {
 
   @@map("xero_settlement_call_budget")
 }
+
+/// o3d-hvzdx: Xero's own X-DayLimit-Remaining for a tenant as last seen by any worker (lib/connectors/xero/day-limit-observation.ts), so a worker
+/// that has made no Xero call yet still sees the organisation's shared allowance. One row per tenant, overwritten; a stale row reads as unknown.
+model XeroDayLimitObservation {
+  tenantId     String   @id @map("tenant_id")
+  dayRemaining Int      @map("day_remaining")
+  observedAt   DateTime @map("observed_at")
+
+  @@map("xero_day_limit_observations")
+}

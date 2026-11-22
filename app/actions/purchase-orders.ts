@@ -3,7 +3,7 @@
 import { claimDocumentNumber, mintCommittedDocumentNumber, retryWhenNumberTaken } from '@/lib/domain/numbering/mint'
 import { businessDateYmd } from '@/lib/business-date'
 import { supplierCreditNoteDocumentDay } from '@/lib/domain/accounting/document-date'
-import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
+import { assertNoPendingDeletion, pendingDeletionError, PendingDocumentDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import { type MoneyLike, assertPoApprovedForSend, PoApprovalRequiredError, approvalSpendBase, CLEARED_APPROVAL, editInvalidatesApproval, evaluatePoApproval, PO_APPROVAL_FACTS_SELECT, PO_APPROVAL_SELF_MESSAGE, PO_APPROVAL_CREATOR_UNKNOWN_MESSAGE, PO_APPROVAL_STATUSES_OPEN_FOR_APPROVAL, PO_APPROVAL_THRESHOLD_SETTING_KEY, approverIsRequester, readApprovalThreshold, validateApprovalThresholdInput } from '@/lib/domain/purchasing/po-approval'
 import { effectiveLineEta, parseLineEtaInput } from '@/lib/domain/purchasing/line-eta'
 import { assertNoLiveAsnForReceipt, ManualReceiptRefusedByLiveAsnError } from '@/lib/domain/wms/po-receipt-asn-guard'
@@ -3840,6 +3840,10 @@ export async function returnPurchaseOrder(
         })
         suppressedReturnCreditForeign = suppressedForeign
         if (draft) {
+          // o3d-ngmt.21: the bill the return would credit must not be on its way out of Xero. Read under the purchase order's lock (taken first,
+          // above), which the bill delete's request and its completion take before the bill: a request committed first refuses the return here,
+          // one that arrives later waits and then refuses on this credit note.
+          await assertNoPendingDeletion(draft.invoiceId, tx)
           const cn = await tx.supplierCreditNote.create({
             data: {
               poId: id,
@@ -4890,8 +4894,12 @@ export async function updateInvoice(
     // True when the edit was written into the bill's still-unsent first posting instead of being queued as an update.
     let firstPostingRefreshed = false
     await db.$transaction(async (tx) => {
-      await tx.$queryRaw`SELECT id FROM purchase_invoices WHERE id = ${invoice.id} FOR UPDATE`
+      // The purchase order FIRST, then the bill: the order every other writer of a bill's PO takes (the supplier return, the bill delete's request
+      // and its completion). Bill-then-order here would deadlock against them.
       await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${invoice.poId} FOR UPDATE`
+      await tx.$queryRaw`SELECT id FROM purchase_invoices WHERE id = ${invoice.id} FOR UPDATE`
+      // o3d-ngmt.21: the binding pending-delete check, under the locks the delete request takes (the read before the transaction is only an early answer).
+      await assertNoPendingDeletion(invoice.id, tx)
       await tx.$queryRaw`SELECT id FROM purchase_invoice_lines WHERE "invoiceId" = ${invoice.id} FOR UPDATE`
       await tx.$queryRaw`SELECT id FROM purchase_order_lines WHERE "poId" = ${invoice.poId} FOR UPDATE`
       await tx.$queryRaw`SELECT id FROM freight_cost_lines WHERE "poId" = ${invoice.poId} FOR UPDATE`
@@ -5227,7 +5235,7 @@ export async function updateInvoice(
       description: `Failed to update bill ${invoiceId}: ${String(e)}`,
       metadata: { invoiceId },
     })
-    if (e instanceof PurchaseInvoiceInputsChangedError || e instanceof PurchaseBillFirstPostingInFlightError || e instanceof PurchaseBillEditedMeanwhileError) return { success: false, error: e.message }
+    if (e instanceof PurchaseInvoiceInputsChangedError || e instanceof PurchaseBillFirstPostingInFlightError || e instanceof PurchaseBillEditedMeanwhileError || e instanceof PendingDocumentDeletionError) return { success: false, error: e.message }
     return { success: false, error: String(e) }
   }
 }
@@ -5372,6 +5380,10 @@ export async function markBillPaid(
     const billPaymentOutcome: { outcome?: EnqueueOutcomeLike } = {}
     try {
       settlement = await db.$transaction(async (tx) => {
+        // o3d-ngmt.21: the binding pending-delete check, under the bill's row lock (the delete request holds it while it records the delete), so a
+        // request committed first is seen and a later one waits for this payment and then refuses on it.
+        await tx.$queryRaw`SELECT id FROM purchase_invoices WHERE id = ${invoiceId} FOR UPDATE`
+        await assertNoPendingDeletion(invoiceId, tx)
         const result = await markBillPaidSupersedingStaleRegistrations(tx, {
           invoiceId,
           paidAt: paymentDate,
@@ -5471,6 +5483,7 @@ export async function markBillPaid(
         return { requestedIds: result.requestedIds, retiredCount: result.retiredCount, queued }
       }, STOCK_TX_OPTIONS)
     } catch (rollback) {
+      if (rollback instanceof PendingDocumentDeletionError) return { success: false, error: rollback.message }
       if (rollback instanceof BillPaymentSupersessionRollback) {
         if (rollback.result.outcome === 'already-paid') {
           return { success: false, error: 'Bill is already marked as paid' }
@@ -5785,7 +5798,12 @@ export async function recordSupplierFreightCreditNote(input: {
     // fxRateToBase is foreign units per ONE base unit: DIVIDE, as every purchase-order conversion does.
     const amountBase = supplierCreditNoteAmountBase(roundQuantity(input.amountForeign, 4).toString(), fxRateToBase).toNumber()
 
-    const creditNote = await db.supplierCreditNote.create({
+    // o3d-ngmt.21: the binding pending-delete check, under the purchase order's lock (the bill delete's request takes it before it records the
+    // delete), so a request committed first is seen and a later one waits for this credit note and then refuses on it.
+    const creditNote = await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${po.id} FOR UPDATE`
+      if (selectedInvoice) await assertNoPendingDeletion(selectedInvoice.id, tx)
+      return tx.supplierCreditNote.create({
       data: {
         poId: po.id,
         purchaseInvoiceId: selectedInvoice?.id ?? null,
@@ -5802,6 +5820,7 @@ export async function recordSupplierFreightCreditNote(input: {
         createdBy: session.user.id,
       },
       select: { id: true },
+      })
     })
 
     revalidatePath(`/purchase-orders/${po.id}`)
@@ -5816,6 +5835,7 @@ export async function recordSupplierFreightCreditNote(input: {
     })
     return { success: true, id: creditNote.id }
   } catch (e) {
+    if (e instanceof PendingDocumentDeletionError) return { success: false, error: e.message }
     return { success: false, error: String(e) }
   }
 }

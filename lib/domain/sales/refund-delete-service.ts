@@ -629,26 +629,122 @@ async function retireSyncRow(tx: Tx, row: SyncRow, reason: string): Promise<void
   if (retired.count === 0) throw new RefundDeleteRefused([refundDeleteRefusals.accountingInFlight('accounting entry')])
 }
 
+/** The worker's follow-ups after a committed phase 2, reported to it (it records them), never swallowed and never undoing the delete. */
+export type RefundDeleteFollowUps = { stockSyncFailed: boolean; reallocationWarning: string | null }
+
 /**
- * PHASE 2 of deleting a refund whose credit note was posted, run by the void worker once the ledger has CONFIRMED the void. It unwinds the rest exactly as the
- * one-step delete does. If it cannot (the stock moved meanwhile, a rule now refuses), it returns the refusal: the worker leaves the entry failed, the void is
- * already done in the ledger, and a retry of the entry repeats the (idempotent) void read and then this step, so the delete resumes once the cause is cleared.
+ * o3d-0syfq (finding 2): what the server action does after a delete commits, for the worker's phase 2 too. The refund released the order's
+ * reservation when it was recorded; deleting it restores the order's demand, so the order is re-reserved (PROCESSING / ALLOCATED only, re-asserted
+ * under the order lock, and never once a shipment exists), and the stock change is queued for the storefront. A failure is reported as a warning for a
+ * person (the reallocation sweep also picks up an order left short), never as a failure of the committed delete.
  */
-export async function completeRefundDeletionAfterVoid(
-  client: RefundDeleteClient,
-  input: { refundId: string; voidSyncLogId: string; actorUserId: string | null; reason: string | null },
-): Promise<{ ok: true; productIds: string[]; stockSyncFailed: boolean } | { ok: false; error: string }> {
-  const result = await deleteSalesOrderRefund(client, { refundId: input.refundId, actorUserId: input.actorUserId, reason: input.reason, voidConfirmed: { syncLogId: input.voidSyncLogId } })
-  if (!result.success) return { ok: false, error: `The credit note is closed in the accounting system, but the refund could not be deleted in IMS yet: ${result.error}` }
-  // The delete is committed; a storefront stock push that could not be queued is reported to the caller (it records it), never swallowed.
+async function runRefundDeleteFollowUps(orderId: string | null, productIds: string[]): Promise<RefundDeleteFollowUps> {
+  let reallocationWarning: string | null = null
+  if (orderId) {
+    try {
+      const { db: appDb } = await import('@/lib/db')
+      const order = await appDb.salesOrder.findUnique({ where: { id: orderId }, select: { status: true } })
+      if (order && (order.status === 'PROCESSING' || order.status === 'ALLOCATED')) {
+        const [{ autoAllocateOrder }, { INTERNAL_ACTION_BYPASS }] = await Promise.all([import('@/app/actions/allocation'), import('@/lib/internal-action-bypass')])
+        const allocated = await autoAllocateOrder(orderId, { internalBypassToken: INTERNAL_ACTION_BYPASS, refuseIfShipmentsExist: true, requireStatusUnderLock: ['PROCESSING', 'ALLOCATED'] })
+        if (!allocated.success) reallocationWarning = `The order's stock could not be re-reserved automatically${allocated.error ? ` (${allocated.error})` : ''}; allocate it from the order page.`
+      }
+    } catch (error) {
+      reallocationWarning = `The order's stock could not be re-reserved automatically (${error instanceof Error ? error.message : String(error)}); allocate it from the order page.`
+    }
+  }
   let stockSyncFailed = false
-  if (result.productIds.length > 0) {
+  if (productIds.length > 0) {
     try {
       const { enqueueStockSync } = await import('@/lib/shopping')
-      await enqueueStockSync(result.productIds, 'IMS_CHANGE')
+      await enqueueStockSync(productIds, 'IMS_CHANGE')
     } catch {
       stockSyncFailed = true
     }
   }
-  return { ok: true, productIds: result.productIds, stockSyncFailed }
+  return { stockSyncFailed, reallocationWarning }
+}
+
+/**
+ * PHASE 2 of deleting a refund whose credit note was posted, for a void the ledger has ALREADY confirmed (a resume). It unwinds the rest exactly as the
+ * one-step delete does. If it cannot (a rule now refuses), it returns the refusal. The void worker does not call this: it runs
+ * voidCreditNoteThenCompleteRefundDeletion, which re-checks and fences the refund's stock before it lets the void reach the ledger.
+ */
+export async function completeRefundDeletionAfterVoid(
+  client: RefundDeleteClient,
+  input: { refundId: string; voidSyncLogId: string; actorUserId: string | null; reason: string | null },
+): Promise<{ ok: true; productIds: string[]; stockSyncFailed: boolean; reallocationWarning: string | null } | { ok: false; error: string }> {
+  const result = await deleteSalesOrderRefund(client, { refundId: input.refundId, actorUserId: input.actorUserId, reason: input.reason, voidConfirmed: { syncLogId: input.voidSyncLogId } })
+  if (!result.success) return { ok: false, error: `The credit note is closed in the accounting system, but the refund could not be deleted in IMS yet: ${result.error}` }
+  if (result.alreadyDeleted) return { ok: true, productIds: [], stockSyncFailed: false, reallocationWarning: null }
+  // The delete is committed; the follow-ups are reported to the caller (it records them), never swallowed.
+  const followUps = await runRefundDeleteFollowUps(result.orderId, result.productIds)
+  return { ok: true, productIds: result.productIds, ...followUps }
+}
+
+/** The void worker's whole transaction may wait behind the stock it fences and then make the (idempotent) ledger void: bounded, well above a normal void. */
+export const REFUND_DELETE_VOID_TX_TIMEOUT_MS = 90_000
+
+export type VoidThenCompleteResult =
+  | { ok: true; alreadyDeleted: boolean; orderId: string | null; productIds: string[]; stockSyncFailed: boolean; reallocationWarning: string | null }
+  /** `voided`: the ledger confirmed the void (false: refused before it, or the void itself failed; IMS is unchanged). `passthrough`: what `voidInLedger` handed back with its failure (the claim fence's own result). */
+  | { ok: false; voided: boolean; error: string; passthrough?: unknown }
+
+/**
+ * o3d-0syfq (finding 1): THE VOID WORKER'S PHASE 1 -> PHASE 2, FENCED.
+ *
+ * Phase 1 leaves the refund, its returned stock and its cost layers in place while the void waits in the queue, so another order can draw on them.
+ * Voiding first and finding out afterwards that phase 2 refuses left Xero without the credit note while IMS still records the refund, and no retry
+ * could fix a consumed layer. So the worker now takes, in ONE transaction, the locks every stock writer takes (the order, then the stock levels,
+ * then the refund's own cost layers, in that order), re-decides the delete under them, and only then lets the void reach the ledger; phase 2 runs in
+ * the same transaction while the locks are still held, so nothing can move the stock between the void and the unwind.
+ *
+ *   refused under the locks  the ledger is NOT asked: the credit note stays, the refund stays, and the entry fails with the reason (stricter than
+ *                            before, when the void was sent regardless).
+ *   the void fails           nothing was written in IMS; the entry fails and retries (the void reads the document first, so a retry converges).
+ *   the void succeeds        phase 2 commits with it. Should the transaction still be lost after the void (a crash, the bounded timeout), the
+ *                            retry's void read finds the credit note already voided and phase 2 runs again under the same fence.
+ *
+ * `voidInLedger` must do the claim fence and the void itself, as the last thing before the socket (the caller's lease is checked there, after
+ * the lock waits, not before them).
+ */
+export async function voidCreditNoteThenCompleteRefundDeletion(
+  client: typeof db,
+  input: { refundId: string; voidSyncLogId: string; actorUserId: string | null; reason: string | null },
+  voidInLedger: () => Promise<{ success: true } | { success: false; error: string; passthrough?: unknown }>,
+): Promise<VoidThenCompleteResult> {
+  type Inner = { ok: true; alreadyDeleted: boolean; orderId: string | null; productIds: string[] } | { ok: false; voided: boolean; error: string; passthrough?: unknown }
+  const inner = await client.$transaction(async (tx): Promise<Inner> => {
+    // soft-delete exception: the worker reads the refund row it is about to delete (a deleted one is the idempotent retry).
+    const located = await tx.salesOrderRefund.findUnique({ where: { id: input.refundId }, select: { orderId: true, deletedAt: true } })
+    const tombstone = located && !located.deletedAt ? null : await tx.salesOrderRefundDeletion.findUnique({ where: { refundId: input.refundId }, select: { orderId: true } })
+    if (located?.deletedAt || tombstone) {
+      // Phase 2 already committed, which happens only after the ledger confirmed the void: the (idempotent) void read is repeated, as before.
+      const voided = await voidInLedger()
+      if (!voided.success) return { ok: false, voided: false, error: voided.error, passthrough: voided.passthrough }
+      return { ok: true, alreadyDeleted: true, orderId: located?.orderId ?? tombstone?.orderId ?? null, productIds: [] }
+    }
+    if (!located) return { ok: false, voided: false, error: 'The credit note was not voided: the refund it belongs to no longer exists in IMS.' }
+    await lockSalesOrder(tx, located.orderId)
+    const pre = await evaluateRefundDeletion(tx, input.refundId, { voidConfirmed: true })
+    if (!pre.plan) return { ok: false, voided: false, error: 'The credit note was not voided: the refund it belongs to no longer exists in IMS.' }
+    const productIds = [...new Set(pre.plan.movements.map((movement) => movement.productId))]
+    const warehouseIds = [...new Set(pre.plan.movements.map((movement) => movement.warehouseId))]
+    await lockStockLevels(tx, productIds, warehouseIds)
+    const layerIds = pre.plan.layers.map((layer) => layer.id).sort()
+    if (layerIds.length > 0) await tx.$queryRaw(Prisma.sql`SELECT id FROM cost_layers WHERE id IN (${Prisma.join(layerIds)}) ORDER BY id FOR UPDATE`)
+    const verdict = await evaluateRefundDeletion(tx, input.refundId, { voidConfirmed: true })
+    if (!verdict.eligible) {
+      return { ok: false, voided: false, error: `The credit note was not voided, so the refund and its credit note both stand: ${verdict.refusals.map((refusal) => refusal.message).join(' ')}` }
+    }
+    const voided = await voidInLedger()
+    if (!voided.success) return { ok: false, voided: false, error: voided.error, passthrough: voided.passthrough }
+    const done = await deleteSalesOrderRefund(tx, { refundId: input.refundId, actorUserId: input.actorUserId, reason: input.reason, voidConfirmed: { syncLogId: input.voidSyncLogId } })
+    if (!done.success) return { ok: false, voided: true, error: `The credit note is closed in the accounting system, but the refund could not be deleted in IMS yet: ${done.error}` }
+    return { ok: true, alreadyDeleted: done.alreadyDeleted, orderId: done.orderId, productIds: done.productIds }
+  }, { maxWait: 10_000, timeout: REFUND_DELETE_VOID_TX_TIMEOUT_MS })
+  if (!inner.ok) return { ok: false, voided: inner.voided, error: inner.error, ...(inner.passthrough !== undefined ? { passthrough: inner.passthrough } : {}) }
+  if (inner.alreadyDeleted) return { ok: true, alreadyDeleted: true, orderId: inner.orderId, productIds: [], stockSyncFailed: false, reallocationWarning: null }
+  const followUps = await runRefundDeleteFollowUps(inner.orderId, inner.productIds)
+  return { ok: true, alreadyDeleted: false, orderId: inner.orderId, productIds: inner.productIds, ...followUps }
 }

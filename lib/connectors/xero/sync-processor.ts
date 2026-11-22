@@ -7543,28 +7543,40 @@ export async function processClaimedEntry(
     }
 
     case 'CREDIT_NOTE_VOID': {
-      // o3d-ngmt.22: the refund this credit note was raised for was deleted in IMS (recorded in error). The row carries the ledger id the
-      // credit note was posted under; nothing here consults the refund, which no longer exists. The void READS the document first and decides
-      // from what is there (voidCreditNote), so a retry after a lost response or a partial failure converges instead of erroring.
+      // o3d-ngmt.22: the refund this credit note was raised for is being deleted in IMS (recorded in error). The row carries the ledger id the
+      // credit note was posted under. The void READS the document first and decides from what is there (voidCreditNote), so a retry after a lost
+      // response or a partial failure converges instead of erroring.
       const voidCreditNoteId = typeof payload.creditNoteId === 'string' ? payload.creditNoteId : ''
       if (!voidCreditNoteId) return { success: false, error: 'Missing creditNoteId for CREDIT_NOTE_VOID' }
-      const fence = await lease.fenceBeforeRemoteWrite('credit-note-void')
-      if (!fence.ok) return fence.result
-      const voided = await voidCreditNote(
-        { creditNoteId: voidCreditNoteId, creditNoteNumber: typeof payload.creditNoteNumber === 'string' ? payload.creditNoteNumber : null },
-        { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note-void') },
-      )
-      // The id returned is the credit note's own: the void acts on a document that already stood (UPDATE_DOCUMENT).
-      if (!voided.success) return { success: false, error: voided.error }
-      // Phase 2 of a refund delete: the ledger has confirmed the void, so IMS now unwinds the refund (idempotent: an already deleted refund is a success).
-      if (referenceType === 'SalesOrderRefund') {
-        const meta = (payload as { _refundDelete?: { actorUserId?: string | null; reason?: string | null } })._refundDelete
-        const { completeRefundDeletionAfterVoid } = await import('@/lib/domain/sales/refund-delete-service')
-        const finished = await completeRefundDeletionAfterVoid(db, { refundId: referenceId, voidSyncLogId: entryId, actorUserId: meta?.actorUserId ?? null, reason: meta?.reason ?? null })
-        if (!finished.ok) return { success: false, error: finished.error }
-        if (finished.stockSyncFailed) {
-          await logActivity({ entityType: 'SALES_ORDER', entityId: referenceId, action: 'refund_delete_stock_sync_failed', tag: 'sales', level: 'WARNING', description: 'The refund was deleted, but its stock change could not be queued for the storefront. It will go with the next stock sync; push the stock from the product page if it is urgent.', metadata: { refundId: referenceId } }).catch(() => { /* the delete is done; the warning is advisory */ })
-        }
+      // The claim fence and the void, as the last thing before the socket.
+      const voidInLedger = async (): Promise<{ success: true } | { success: false; error: string; passthrough?: unknown }> => {
+        const fence = await lease.fenceBeforeRemoteWrite('credit-note-void')
+        if (!fence.ok) return { success: false, error: 'the claim was lost before the void', passthrough: fence.result }
+        const voided = await voidCreditNote(
+          { creditNoteId: voidCreditNoteId, creditNoteNumber: typeof payload.creditNoteNumber === 'string' ? payload.creditNoteNumber : null },
+          { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note-void') },
+        )
+        return voided.success ? { success: true } : { success: false, error: voided.error ?? 'the void failed' }
+      }
+      if (referenceType !== 'SalesOrderRefund') {
+        const voided = await voidInLedger()
+        if (!voided.success) return voided.passthrough !== undefined ? voided.passthrough as EntryResult : { success: false, error: voided.error }
+        // The id returned is the credit note's own: the void acts on a document that already stood (UPDATE_DOCUMENT).
+        return { success: true, externalId: voidCreditNoteId }
+      }
+      // A refund delete (o3d-0syfq): the refund's stock is fenced and the delete re-decided under the locks BEFORE the void reaches the ledger, and
+      // phase 2 (the IMS unwind) commits under the same locks, so the returned stock cannot move between the void and the unwind. Refused under the
+      // locks, the ledger is not asked at all (idempotent: an already deleted refund is a success).
+      const meta = (payload as { _refundDelete?: { actorUserId?: string | null; reason?: string | null } })._refundDelete
+      const { voidCreditNoteThenCompleteRefundDeletion } = await import('@/lib/domain/sales/refund-delete-service')
+      const finished = await voidCreditNoteThenCompleteRefundDeletion(db, { refundId: referenceId, voidSyncLogId: entryId, actorUserId: meta?.actorUserId ?? null, reason: meta?.reason ?? null }, voidInLedger)
+      if (!finished.ok) return finished.passthrough !== undefined ? finished.passthrough as EntryResult : { success: false, error: finished.error }
+      if (finished.stockSyncFailed) {
+        await logActivity({ entityType: 'SALES_ORDER', entityId: finished.orderId ?? referenceId, action: 'refund_delete_stock_sync_failed', tag: 'sales', level: 'WARNING', description: 'The refund was deleted, but its stock change could not be queued for the storefront. It will go with the next stock sync; push the stock from the product page if it is urgent.', metadata: { refundId: referenceId } }).catch(() => { /* the delete is done; the warning is advisory */ })
+      }
+      if (!finished.alreadyDeleted) {
+        // The same follow-up row the server action writes, so an order the worker could not re-reserve is visible to a person.
+        await logActivity({ entityType: 'SALES_ORDER', entityId: finished.orderId, action: 'refund_delete_follow_up', tag: 'sales', level: finished.reallocationWarning ? 'WARNING' : 'INFO', description: finished.reallocationWarning ? `The refund was deleted. ${finished.reallocationWarning}` : 'Refund deleted; the order was re-reserved and the stock change queued.', metadata: { refundId: referenceId } }).catch(() => { /* the delete is done; the row is advisory */ })
       }
       return { success: true, externalId: voidCreditNoteId }
     }

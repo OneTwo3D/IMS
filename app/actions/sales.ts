@@ -3672,7 +3672,8 @@ export async function createRefund(
     // A PUBLIC caller is always capped per target (never above a line's stored net) and has its itemised lines re-cut from what each order line has left.
     const { enforcePerTargetBalances, deriveSaleLineNetsFromStoredBalance } = refundSafeguards({ isInternal, requestedPerTargetCap: options?.enforcePerTargetBalances })
 
-    // o3d-ngmt.21: no refund or credit note against an invoice whose delete is pending.
+    // o3d-ngmt.21: no refund or credit note against an invoice whose delete is pending. An early answer only: the binding check is the one
+    // createSalesOrderRefund makes under the order lock (a delete requested between this read and that lock is refused there).
     const deletePendingForRefund = await pendingDeletionError(orderId)
     if (deletePendingForRefund) return { success: false, error: deletePendingForRefund }
     let returnReasonId: string | null = null
@@ -4846,9 +4847,6 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
 export async function markSalesOrderPaid(id: string): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('sales.refund')
-    // o3d-ngmt.21: marking paid is a payment as far as a pending delete is concerned.
-    const deletePendingForPaid = await pendingDeletionError(id)
-    if (deletePendingForPaid) return { success: false, error: deletePendingForPaid }
     // audit-mmvp: lock the order row (same FOR UPDATE pattern as addPayment) so a
     // concurrent addPayment/markSalesOrderPaid can't both observe paidAt=null,
     // both flip it, and both run the warn/generate block — double-warning the
@@ -4859,6 +4857,10 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
       await assertNotQuoteUnderLock(tx, id, 'it cannot be marked paid')
       const row = await tx.salesOrder.findUnique({ where: { id }, select: { orderNumber: true, externalOrderNumber: true, paidAt: true, invoiceNumber: true, status: true, unregisteredPaidAt: true } })
       if (!row) return null
+      // o3d-ngmt.21: marking paid is a payment as far as a pending delete is concerned. Read UNDER the order lock the delete request also
+      // takes, so a request committed first is seen and a later one waits for this and then refuses on the paid flag.
+      const deletePendingForPaid = await pendingDeletionError(id, tx)
+      if (deletePendingForPaid) return { refusal: deletePendingForPaid }
       const markingAsPaid = !row.paidAt // transitioning from unpaid to paid
       const paymentCount = await tx.payment.count({ where: { orderId: id, refundId: null } })
       const refusal = markPaidRefusal({ status: row.status, markingAsPaid, hasUnregisteredPaidMarker: row.unregisteredPaidAt != null, paymentCount })

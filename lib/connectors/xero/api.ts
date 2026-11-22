@@ -10,6 +10,7 @@ import { accountingEgressRefusal } from '@/lib/connectors/accounting-egress-auth
 import { outboundWriteRefusal, OutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { recordOutboundWriteRefusal } from '@/lib/security/outbound-write-refusal-log'
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
+import { persistDayLimitObservation } from './day-limit-observation'
 
 const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
 const XERO_CONNECTOR = 'xero'
@@ -414,6 +415,8 @@ function noteLimitHeaders(tenantId: string, res: { headers?: { get(name: string)
   }
   if (snapshot.dayRemaining == null && snapshot.minuteRemaining == null) return // not a Xero API response
   limitSnapshots.set(tenantId, snapshot)
+  // o3d-hvzdx: shared with every other worker (throttled, best effort, never awaited by the call that observed it).
+  if (snapshot.dayRemaining != null) void persistDayLimitObservation(tenantId, snapshot.dayRemaining, snapshot.at)
 
   // Loud once it is genuinely tight. Silence here is what let a day's budget vanish unnoticed
   // twice in one week.
