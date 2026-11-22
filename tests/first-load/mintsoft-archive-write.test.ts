@@ -211,7 +211,7 @@ test('a plan token that does not match the plan made now is refused (exit 3): no
   const r = await s.exec(EXEC(s.token))
   assert.equal(r.code, EXIT_CODES.INPUT_UNUSABLE)
   assert.match(r.err, /is not the token of the plan made now/)
-  const other = await s.exec(EXEC('MSA-0000000000000000'))
+  const other = await s.exec(EXEC('MSA-' + '0'.repeat(16)))
   assert.equal(other.code, EXIT_CODES.INPUT_UNUSABLE)
   assert.deepEqual(s.rig.seen, [])
   assert.deepEqual(s.target.records, [])
