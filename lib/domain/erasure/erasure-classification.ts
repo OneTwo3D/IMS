@@ -92,10 +92,11 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   PaymentRemovalReconciliation: { erased: [], notPersonal: ['id', 'orderId', 'connector', 'accountingInvoiceId', 'kind', 'currency', 'matchedPaymentIds', 'ledgerAction', 'refundId'], retained: {} },
   SalesOrderRefund: {
     erased: ['accountingWarning'],
-    notPersonal: ['feeRepaymentAppliedBy', 'deletedById', 'id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'returnReasonId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
+    notPersonal: ['feeRepaymentAppliedBy', 'creditNoteDuplicateHold', 'deletedById', 'id', 'orderId', 'creditNoteNumber', 'accountingCreditNoteId', 'accountingCreditNoteConnector', 'returnWarehouseId', 'returnReasonId', 'totalsBasis', 'source', 'allocationBasisUnresolved', 'accountingRetrySyncs', 'reversalStagingState', 'returnCostSplit', 'returnShipmentQty', 'deferralAdjustmentRef'],
     retained: {
       reason: 'owner decision: the refund reason text is kept',
       deleteReason: 'owner decision (as for the refund reason): the reason an operator gave for deleting a refund is part of the audit record',
+      creditNoteNotDuplicate: 'o3d-pnc8p: the operator\'s own audit acknowledgements (name, reason, a Xero credit note id and number) that a credit note is not a duplicate; kept like the delete reason',
       feeRepaymentAppliedNote: 'o3d-pnc8p: the operator\'s own audit note (with their name) on an open fee repayment, kept like the delete reason; never customer text',
     },
   },

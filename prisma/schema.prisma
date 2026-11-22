@@ -2600,6 +2600,10 @@ model SalesOrderRefund {
   feeRepaymentAppliedAt   DateTime? @map("fee_repayment_applied_at")
   feeRepaymentAppliedBy   String?   @map("fee_repayment_applied_by")
   feeRepaymentAppliedNote String?   @map("fee_repayment_applied_note")
+  /// #1127 R1 M6: the Xero credit notes IMS did not raise that the duplicate check last held this refund on ({ creditNoteId, creditNoteNumber, status, total, date }[]); null when none.
+  creditNoteDuplicateHold Json?     @map("credit_note_duplicate_hold")
+  /// #1127 R1 M6: the operator's "not a duplicate" acknowledgements ({ creditNoteId, creditNoteNumber, by, reason, at }[]); the duplicate test skips those credit notes.
+  creditNoteNotDuplicate  Json?     @map("credit_note_not_duplicate")
   /// A storefront refund that returns quantity owes the storefront a stock correction (the store raised its own
   /// stock for it before IMS heard). Written TRUE in the refund's own transaction, so a refund can never commit
   /// without the obligation; FALSE for every other refund (manual, money-only, chargeback) and every row that

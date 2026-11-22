@@ -412,6 +412,7 @@ export type WitnessCreditNote = {
   reference: string | null
   status: string
   total: number | null
+  date?: string | null
   byOrder: readonly string[]
   byRefund: readonly string[]
   paidOutCents: number
@@ -419,25 +420,24 @@ export type WitnessCreditNote = {
 
 export type XeroCreditNoteWitnessDecision =
   | { kind: 'ok'; witness: XeroCreditNoteWitness }
-  /** Xero already holds a credit note IMS did not raise that credits THIS refund (or one IMS cannot tell from it): nothing is settled; a person adopts or voids. */
+  /** Xero already holds a credit note IMS did not raise that credits THIS refund: nothing is settled; a person decides which one stands. */
   | { kind: 'duplicate'; creditNotes: WitnessCreditNote[] }
 
 /**
  * READ THE ORDER'S CREDIT NOTES IN XERO AGAINST WHAT IMS HOLDS (o3d-0lpnb MED-3, o3d-pnc8p note 1). Pure.
  *
- *   `settlingCreditNoteId` the credit note being settled (or, on create, none): never counted, never a duplicate of itself.
- *   `imsCreditNotes`       every credit note id IMS recorded for the order's refunds, to its IMS refund id.
- *   `self`                 this refund: its WooCommerce refund id, and the credit note's total in Xero where known.
+ *   `settlingCreditNoteId` the credit note being settled: never counted, never a duplicate of itself.
+ *   `imsCreditNotes`       every credit note id IMS recorded for the order's refunds, to its IMS refund id: their payments are attributed to that refund.
+ *   `isDuplicate`          the duplicate test (lib/connectors/xero/order-credit-notes.ts duplicateVerdict), asked of every other live credit note.
  *
- * A live credit note IMS did not raise is a DUPLICATE of this refund when it names this refund (Reference or `SC-<id>`), or when it names only the order and credits
- * exactly this refund's total: IMS cannot tell it from this refund's own credit, so it holds rather than credit or pay twice. Any other such credit note is the
- * credit of another (earlier) refund, and only its Payments are counted, unattributed. Voided and deleted credit notes are ignored.
+ * Every other live credit note's PAYMENTS are counted as unattributed cash out (allocations never: credit moved to a replacement order's invoice is correct).
+ * Voided and deleted credit notes are ignored.
  */
 export function decideXeroCreditNoteWitness(input: {
   creditNotes: readonly WitnessCreditNote[]
   settlingCreditNoteId: string | null
   imsCreditNotes: ReadonlyMap<string, string>
-  self: { externalRefundId: string | null; totalCents: number | null }
+  isDuplicate: (cn: WitnessCreditNote) => boolean
 }): XeroCreditNoteWitnessDecision {
   const known = new Map([...input.imsCreditNotes].map(([cn, refundId]) => [cn.trim().toLowerCase(), refundId]))
   const settling = input.settlingCreditNoteId?.trim().toLowerCase() ?? null
@@ -454,9 +454,7 @@ export function decideXeroCreditNoteWitness(input: {
       paidOutByRefund.set(imsRefund, addMoney(paidOutByRefund.get(imsRefund) ?? toDecimal(0), paid))
       continue
     }
-    const namesSelf = input.self.externalRefundId !== null && cn.byRefund.includes(input.self.externalRefundId)
-    const orderOnlySameTotal = cn.byRefund.length === 0 && input.self.totalCents !== null && cn.total !== null && Math.round(cn.total * 100) === input.self.totalCents
-    if (namesSelf || orderOnlySameTotal) duplicates.push(cn)
+    if (input.isDuplicate(cn)) duplicates.push(cn)
     else unattributed = addMoney(unattributed, paid)
   }
   if (duplicates.length > 0) return { kind: 'duplicate', creditNotes: duplicates }

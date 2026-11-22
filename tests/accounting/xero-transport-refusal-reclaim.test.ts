@@ -97,6 +97,7 @@ type Row = {
    * `type` is COGS_JOURNAL because that is the only producer of `reason: 'transport-refused'` —
    * the manual-journal path is the one create that mints a dispatch marker. `remoteAttemptedAt`
    * is null because "nothing was sent" is this file's whole premise, and custody is null because
+   * (before o3d-0lpnb R1 M1, which made the renewal re-assert it; the state is kept as the hardest case)
    * the minting fence has just forfeited it (`renewClaimForRemoteWrite` moves
    * `processingStartedAt` without re-asserting custody, so the database trigger nulls it). That
    * is the exact row state a real hand-back releases, and it is one conjunct — the type — away
@@ -392,7 +393,10 @@ test('o3d-jit6 r4 x o3d-anu8 r3: the custody refusal is carried, evaluated, and 
   // positive proof. That refusal now sits in front of THIS release too, and the row a transport
   // refusal produces is two-thirds of the way to matching it:
   //
-  //   custody NULL             — `renewClaimForRemoteWrite` moves `processingStartedAt` when it opens
+  //   (o3d-0lpnb R1 M1: the renewal now RE-ASSERTS custody, so a row this binary held throughout keeps
+  //   it. The state below is kept as the row a renewal by a non-stamping binary, or a row that genuinely
+  //   lost custody, leaves; the refusal must still behave on it exactly as described.)
+  //   custody NULL             — before M1, `renewClaimForRemoteWrite` moved `processingStartedAt` when it opened
   //                              the lease and again in the fence that mints the marker, and neither
   //                              re-asserts custody, so the forfeit trigger takes it. A releasing
   //                              worker holding its own claim is therefore NOT a worker holding
@@ -1779,7 +1783,7 @@ test('o3d-gvzu: the fence write for that basis is the CONSUMPTION, and the fence
   assert.match(fence.slice(0, fence.indexOf('if (!again)')), /if \(!createDispatchWrite\) throw error/)
   assert.match(
     processor.slice(processor.indexOf('export async function renewClaimForRemoteWrite(')),
-    /data: write \? \{ processingStartedAt: renewedAt, \.\.\.write \} : \{ processingStartedAt: renewedAt \}/,
+    /data: write \? \{ processingStartedAt: renewedAt, attemptStampingCustodyAt: renewedAt, \.\.\.write \} : \{ processingStartedAt: renewedAt, attemptStampingCustodyAt: renewedAt \}/,
     'and it rides inside the claim proof, exactly as the mint does',
   )
 })

@@ -66,8 +66,11 @@ const WRITERS: Record<string, Record<string, number>> = {
   wmsOrderDiscrepancy: { 'app/actions/sync-exceptions.ts': 2, 'lib/domain/wms/dispatch-sweep.ts': 3, 'lib/domain/wms/order-reconcile-sweep.ts': 12 },
   wmsReturnsInbox: { 'app/actions/mintsoft-sync.ts': 2, 'lib/connectors/mintsoft/sync/returns-sync.ts': 1 },
   salesOrderRefund: {
-    // o3d-pnc8p: "Repayment applied" stamps fee_repayment_applied_at/_by/_note (the operator's own note, retained): no customer text; pinned on purpose.
-    'app/actions/sync-exceptions.ts': 1,
+    // o3d-pnc8p: "Repayment applied" stamps fee_repayment_applied_at/_by/_note (the operator's own note, retained), and #1127 R1 M6 "Not a duplicate" writes the
+    // operator's acknowledgement and the shrunk hold (ids, numbers, totals, dates): no customer text; pinned on purpose.
+    'app/actions/sync-exceptions.ts': 2,
+    // #1127 R1 M6: the Xero sync records the credit notes a refund is held on (ids, numbers, status, totals, dates; never the reference): no customer text.
+    'lib/connectors/xero/sync-processor.ts': 1,
     'app/actions/sales.ts': 2, 'lib/domain/accounting/back-reference.ts': 1, 'lib/domain/sales/refund-accounting-discharge.ts': 1,
     'lib/domain/sales/refund-basis-backfill.ts': 1, 'lib/domain/sales/refund-service.ts': 9,
     // Stamps `stockCorrectionQueuedAt`, a timestamp: not a free-text column, so the trigger is irrelevant to it; pinned all the same.

@@ -44,6 +44,8 @@ export type CreditNoteMatch = {
   status: string
   currency: string | null
   total: number | null
+  /** The credit note's date (YYYY-MM-DD) as Xero states it; null when unreadable. */
+  date: string | null
   /** The order ids the credit note names. */
   byOrder: string[]
   /** The refund ids it names (by Reference, by number, or as `SC-<id>`). */
@@ -54,7 +56,7 @@ const digitRuns = (text: string | null): string[] => (text ?? '').match(/\d+/g) 
 
 /** The credit note's tie to the order, or null when it names neither the order nor any of its refunds. Pure. */
 export function matchOrderCreditNote(
-  row: { CreditNoteID?: unknown; CreditNoteNumber?: unknown; Reference?: unknown; Status?: unknown; Type?: unknown; CurrencyCode?: unknown; Total?: unknown },
+  row: { CreditNoteID?: unknown; CreditNoteNumber?: unknown; Reference?: unknown; Status?: unknown; Type?: unknown; CurrencyCode?: unknown; Total?: unknown; DateString?: unknown; Date?: unknown },
   keys: OrderCreditNoteKeys,
 ): CreditNoteMatch | null {
   const id = typeof row.CreditNoteID === 'string' ? row.CreditNoteID.trim() : ''
@@ -73,9 +75,21 @@ export function matchOrderCreditNote(
     status: typeof row.Status === 'string' ? row.Status.toUpperCase() : 'UNKNOWN',
     currency: typeof row.CurrencyCode === 'string' ? row.CurrencyCode.toUpperCase() : null,
     total: typeof row.Total === 'number' && Number.isFinite(row.Total) ? row.Total : null,
+    date: xeroDocumentDate(row),
     byOrder,
     byRefund,
   }
+}
+
+/** A Xero document's date as YYYY-MM-DD: `DateString` ("2026-11-10T00:00:00"), else the `/Date(ms+0000)/` form. Null when neither reads. Pure. */
+export function xeroDocumentDate(row: { DateString?: unknown; Date?: unknown }): string | null {
+  if (typeof row.DateString === 'string' && /^\d{4}-\d{2}-\d{2}/.test(row.DateString)) return row.DateString.slice(0, 10)
+  if (typeof row.Date === 'string') {
+    const ms = /\/Date\((-?\d+)/.exec(row.Date)
+    if (ms) return new Date(Number(ms[1])).toISOString().slice(0, 10)
+    if (/^\d{4}-\d{2}-\d{2}/.test(row.Date)) return row.Date.slice(0, 10)
+  }
+  return null
 }
 
 /** A void or deleted credit note credits nothing and holds no cash. */
@@ -110,7 +124,7 @@ export type OrderCreditNoteRead = CreditNoteMatch & { paidOutCents: number }
 
 export type OrderCreditNotesResult =
   | { ok: true; creditNotes: OrderCreditNoteRead[] }
-  | { ok: false; error: string }
+  | { ok: false; error: string; /** The run's Xero call budget ran out: a wait, not a failure. */ budget?: true }
 
 type Get = <T>(path: string) => Promise<{ ok: boolean; status: number; data?: T; error?: string }>
 
@@ -121,8 +135,10 @@ type Get = <T>(path: string) => Promise<{ ok: boolean; status: number; data?: T;
 export async function readOrderCreditNotesFromXero(
   keys: OrderCreditNoteKeys,
   currency: string,
-  deps: { get: Get } = { get: (path) => xeroGet(path) },
+  deps: { get?: Get; /** o3d-0lpnb R1 H1: spends one call from the run's Xero budget; false = none left (nothing is asked). */ spend?: () => boolean } = {},
 ): Promise<OrderCreditNotesResult> {
+  const spend = deps.spend ?? (() => true)
+  const get: Get = deps.get ?? ((path) => xeroGet(path))
   const clean = {
     orderIds: [...new Set(keys.orderIds.map((id) => String(id).trim()).filter((id) => id !== ''))],
     refundIds: [...new Set(keys.refundIds.map((id) => String(id).trim()).filter((id) => id !== ''))],
@@ -133,8 +149,9 @@ export async function readOrderCreditNotesFromXero(
   if (bad !== undefined) return { ok: false, error: `the id ${JSON.stringify(bad)} is not a WooCommerce number, so IMS cannot search Xero for credit notes by it` }
 
   let res: Awaited<ReturnType<Get>>
+  if (!spend()) return { ok: false, budget: true, error: 'this run\'s Xero call budget for credit-note settlements is spent' }
   try {
-    res = await deps.get<{ CreditNotes?: unknown[]; pagination?: { pageCount?: unknown } }>(`CreditNotes?where=${encodeURIComponent(orderCreditNoteSearchWhere(clean))}&page=1&pageSize=${PAGE_SIZE}`)
+    res = await get<{ CreditNotes?: unknown[]; pagination?: { pageCount?: unknown } }>(`CreditNotes?where=${encodeURIComponent(orderCreditNoteSearchWhere(clean))}&page=1&pageSize=${PAGE_SIZE}`)
   } catch (error) {
     return { ok: false, error: `the search of Xero for the order's credit notes threw: ${String(error)}` }
   }
@@ -154,13 +171,14 @@ export async function readOrderCreditNotesFromXero(
   const out: OrderCreditNoteRead[] = matches.filter((match) => isDeadCreditNote(match.status)).map((match) => ({ ...match, paidOutCents: 0 }))
   for (const match of live) {
     let one: Awaited<ReturnType<Get>>
+    if (!spend()) return { ok: false, budget: true, error: 'this run\'s Xero call budget for credit-note settlements is spent' }
     try {
-      one = await deps.get(`CreditNotes/${encodeURIComponent(match.creditNoteId)}`)
+      one = await get(`CreditNotes/${encodeURIComponent(match.creditNoteId)}`)
     } catch (error) {
       return { ok: false, error: `reading credit note ${match.creditNoteNumber ?? match.creditNoteId} from Xero threw: ${String(error)}` }
     }
     if (!one.ok) return { ok: false, error: `credit note ${match.creditNoteNumber ?? match.creditNoteId} could not be read from Xero: ${one.error ?? `HTTP ${one.status}`}` }
-    const read = readSingleXeroDocument<{ Payments?: unknown; CurrencyCode?: unknown; Total?: unknown; Status?: unknown }>(one.data, 'CreditNotes', 'CreditNoteID', match.creditNoteId)
+    const read = readSingleXeroDocument<{ Payments?: unknown; CurrencyCode?: unknown; Total?: unknown; Status?: unknown; DateString?: unknown; Date?: unknown }>(one.data, 'CreditNotes', 'CreditNoteID', match.creditNoteId)
     if (read.status === 'unreadable') return { ok: false, error: `credit note ${match.creditNoteNumber ?? match.creditNoteId} was not read from Xero: ${read.reason}` }
     const paidOutCents = creditNotePaidOutCents(read.document.Payments)
     if (paidOutCents === null) return { ok: false, error: `credit note ${match.creditNoteNumber ?? match.creditNoteId} states payments IMS cannot read, so the cash it paid out is unknown` }
@@ -170,7 +188,7 @@ export async function readOrderCreditNotesFromXero(
     }
     const total = typeof read.document.Total === 'number' && Number.isFinite(read.document.Total) ? read.document.Total : match.total
     const status = typeof read.document.Status === 'string' ? read.document.Status.toUpperCase() : match.status
-    out.push({ ...match, currency: cnCurrency, total, status, paidOutCents })
+    out.push({ ...match, currency: cnCurrency, total, status, date: xeroDocumentDate(read.document) ?? match.date, paidOutCents })
   }
   return { ok: true, creditNotes: out }
 }
@@ -180,64 +198,160 @@ export function describeCreditNote(cn: Pick<CreditNoteMatch, 'creditNoteNumber' 
   return `${cn.creditNoteNumber ?? cn.creditNoteId}${cn.reference ? ` (reference "${cn.reference}")` : ''}, ${cn.status}`
 }
 
-/** The DB delegates the key reader asks. */
+/** One IMS refund of the order, as the duplicate test reads it. */
+export type OrderRefundKey = {
+  id: string
+  externalRefundId: string | null
+  /** The credit note IMS recorded for it (null: none, e.g. a Xeroom-era refund). */
+  creditNoteId: string | null
+  /** The gross the storefront returned, in minor units (null: unknown). */
+  grossCents: number | null
+  /** The refund's own date (YYYY-MM-DD). */
+  refundedOn: string | null
+  /** Credit notes an operator acknowledged as NOT this refund's duplicate (lower-cased ids). */
+  notDuplicateOf: string[]
+}
+
+/** The DB delegates the key reader asks (a Prisma client or transaction satisfies it). */
 export type OrderCreditNoteKeyReader = {
   shoppingOrderLink: { findMany(args: { where: { orderId: string; connector: string }; select: { externalOrderId: true } }): Promise<Array<{ externalOrderId: string }>> }
-  salesOrderRefund: { findMany(args: { where: { orderId: string }; select: { id: true; externalRefundId: true; accountingCreditNoteId: true } }): Promise<Array<{ id: string; externalRefundId: number | null; accountingCreditNoteId: string | null }>> }
+  salesOrderRefund: { findMany(args: { where: { orderId: string }; select: { id: true; externalRefundId: true; accountingCreditNoteId: true; statedGrossForeign: true; refundedAt: true; creditNoteNotDuplicate: true } }): Promise<Array<{ id: string; externalRefundId: number | null; accountingCreditNoteId: string | null; statedGrossForeign: { toString(): string } | null; refundedAt: Date; creditNoteNotDuplicate: unknown }>> }
   shoppingSyncLog: { findMany(args: { where: { entityId: string; recordKind: string; connector: string }; select: { externalId: true } }): Promise<Array<{ externalId: string | null }>> }
+}
+
+/** The acknowledgements stored on a refund (`creditNoteNotDuplicate`): `[{ creditNoteId, creditNoteNumber, by, reason, at }]`. */
+export type NotDuplicateAck = { creditNoteId: string; creditNoteNumber: string | null; by: string; reason: string; at: string }
+export function readNotDuplicateAcks(value: unknown): NotDuplicateAck[] {
+  if (!Array.isArray(value)) return []
+  return value.filter((entry): entry is NotDuplicateAck => typeof entry === 'object' && entry !== null && typeof (entry as { creditNoteId?: unknown }).creditNoteId === 'string')
 }
 
 /**
  * What IMS knows that ties a Xero credit note to the order: its WooCommerce order id, EVERY refund id (IMS refunds, deleted ones included, and refunds parked on Sync
- * exceptions, in any status), and the credit notes IMS itself recorded for those refunds (id -> IMS refund id).
+ * exceptions, in any status), and per IMS refund the credit note IMS recorded, its gross, its date and the operator's "not a duplicate" acknowledgements.
  */
-export async function readOrderCreditNoteKeys(client: OrderCreditNoteKeyReader, orderId: string): Promise<{ keys: OrderCreditNoteKeys; imsCreditNotes: Map<string, string>; externalRefundIdOf: Map<string, string> }> {
+export async function readOrderCreditNoteKeys(client: OrderCreditNoteKeyReader, orderId: string): Promise<{ keys: OrderCreditNoteKeys; imsCreditNotes: Map<string, string>; externalRefundIdOf: Map<string, string>; refunds: OrderRefundKey[] }> {
   const [links, refunds, parks] = await Promise.all([
     client.shoppingOrderLink.findMany({ where: { orderId, connector: 'woocommerce' }, select: { externalOrderId: true } }),
     // soft-delete exception (identity check): a deleted refund's credit note may still stand in Xero, and its refund id still names it.
-    client.salesOrderRefund.findMany({ where: { orderId }, select: { id: true, externalRefundId: true, accountingCreditNoteId: true } }),
+    client.salesOrderRefund.findMany({ where: { orderId }, select: { id: true, externalRefundId: true, accountingCreditNoteId: true, statedGrossForeign: true, refundedAt: true, creditNoteNotDuplicate: true } }),
     client.shoppingSyncLog.findMany({ where: { entityId: orderId, recordKind: 'WC_REFUND_PARK', connector: 'woocommerce' }, select: { externalId: true } }),
   ])
   const imsCreditNotes = new Map<string, string>()
   const externalRefundIdOf = new Map<string, string>()
+  const keyed: OrderRefundKey[] = []
   for (const refund of refunds) {
     if (refund.accountingCreditNoteId) imsCreditNotes.set(refund.accountingCreditNoteId, refund.id)
     if (refund.externalRefundId != null) externalRefundIdOf.set(refund.id, String(refund.externalRefundId))
+    const gross = refund.statedGrossForeign == null ? NaN : Number(refund.statedGrossForeign.toString())
+    keyed.push({
+      id: refund.id,
+      externalRefundId: refund.externalRefundId == null ? null : String(refund.externalRefundId),
+      creditNoteId: refund.accountingCreditNoteId,
+      grossCents: Number.isFinite(gross) ? Math.round(Math.abs(gross) * 100) : null,
+      refundedOn: refund.refundedAt.toISOString().slice(0, 10),
+      notDuplicateOf: readNotDuplicateAcks(refund.creditNoteNotDuplicate).map((ack) => ack.creditNoteId.trim().toLowerCase()),
+    })
   }
   return {
     keys: {
       orderIds: links.map((link) => link.externalOrderId),
+      // EVERY refund id of the order, older and newer than the one being decided: a hand-raised credit note may name any of them, and one naming another refund
+      // is that refund's, never a duplicate of this one (but its cash is still counted).
       refundIds: [...externalRefundIdOf.values(), ...parks.map((park) => park.externalId ?? '').filter((id) => /^\d+$/.test(id))],
     },
     imsCreditNotes,
     externalRefundIdOf,
+    refunds: keyed,
   }
 }
 
 /** The system switch (lib/domain/settings/system-switches.ts) for the check made before IMS CREATES a sales credit note. ON only for the exact string `true`. */
 export const CREDIT_NOTE_DUPLICATE_CHECK_SETTING_KEY = 'xero_credit_note_duplicate_check_enabled'
 
-/**
- * BEFORE IMS CREATES A SALES CREDIT NOTE (o3d-pnc8p note 1): does Xero already hold one, raised by Xeroom or by hand, for THIS refund? Pure.
- *
- * A live credit note IMS did not record is this refund's when it names the refund (Reference, or the number `SC-<refund id>`), when it names only the order and
- * credits exactly this credit note's total, or when it carries the very number IMS minted for this one and no earlier attempt of this row was made (so it cannot be
- * IMS's own, landed after a lost response: a re-post of that converges, since POST /CreditNotes is create-or-update on the number). Null: nothing found.
- */
-export function creditNoteCreateDuplicates(input: {
-  creditNotes: readonly OrderCreditNoteRead[]
+/** Everything the duplicate test reads about the refund being decided and its order. */
+export type DuplicateContext = {
+  self: { refundId: string; externalRefundId: string | null; totalCents: number | null; refundedOn: string | null; creditNoteNumber: string | null }
+  /** Every credit note id IMS recorded for the order's refunds, to its IMS refund id. */
   imsCreditNotes: ReadonlyMap<string, string>
-  selfExternalRefundId: string | null
-  creditNoteNumber: string | null
-  totalCents: number | null
-  attemptedBefore: boolean
-}): OrderCreditNoteRead[] {
-  const known = new Set([...input.imsCreditNotes.keys()].map((id) => id.trim().toLowerCase()))
-  const own = input.creditNoteNumber?.trim().toLowerCase() ?? null
-  return input.creditNotes.filter((cn) => {
-    if (isDeadCreditNote(cn.status) || known.has(cn.creditNoteId.trim().toLowerCase())) return false
-    if (own !== null && cn.creditNoteNumber?.toLowerCase() === own) return !input.attemptedBefore
-    if (input.selfExternalRefundId !== null && cn.byRefund.includes(input.selfExternalRefundId)) return true
-    return cn.byRefund.length === 0 && input.totalCents !== null && cn.total !== null && Math.round(cn.total * 100) === input.totalCents
-  })
+  /** The order's IMS refunds (self included; it is skipped). */
+  refunds: readonly OrderRefundKey[]
+}
+
+/**
+ * IS THIS XERO CREDIT NOTE A DUPLICATE OF THE REFUND BEING DECIDED? (o3d-pnc8p note 1, #1127 R1 M4/M5/M6). Pure.
+ *   'own'        IMS's: a credit note IMS recorded for one of the order's refunds, or one under the very number IMS minted for this refund (POST /CreditNotes is
+ *                create-or-update on the number, so a re-post after a lost response converges on it; IMS's numbers are minted, never reused).
+ *   'duplicate'  a live credit note IMS did not raise that credits THIS refund: it names this refund (its id, or `SC-<id>`), or it names only the order, credits
+ *                exactly this refund's total, is not dated before this refund, and cannot belong to another refund of the order (no other refund without an IMS
+ *                credit note credits the same total). An operator's "not a duplicate" acknowledgement for this refund and this credit note overrides it.
+ *   'other'      anything else: a voided one, one naming another refund, an order-only one of another total or dated before this refund, or one another refund of
+ *                the order could own. Its PAYMENTS are still cash out of the order.
+ */
+export function duplicateVerdict(cn: { creditNoteId: string; creditNoteNumber: string | null; status: string; total: number | null; date?: string | null; byRefund: readonly string[] }, ctx: DuplicateContext): 'own' | 'duplicate' | 'other' {
+  if (isDeadCreditNote(cn.status)) return 'other'
+  const id = cn.creditNoteId.trim().toLowerCase()
+  if ([...ctx.imsCreditNotes.keys()].some((known) => known.trim().toLowerCase() === id)) return 'own'
+  const ownNumber = ctx.self.creditNoteNumber?.trim().toLowerCase()
+  if (ownNumber && cn.creditNoteNumber?.trim().toLowerCase() === ownNumber) return 'own'
+  const self = ctx.refunds.find((refund) => refund.id === ctx.self.refundId)
+  if (self?.notDuplicateOf.includes(id)) return 'other'
+  if (ctx.self.externalRefundId !== null && cn.byRefund.includes(ctx.self.externalRefundId)) return 'duplicate'
+  if (cn.byRefund.length > 0) return 'other'
+  if (ctx.self.totalCents === null || cn.total === null || Math.round(cn.total * 100) !== ctx.self.totalCents) return 'other'
+  if (cn.date != null && ctx.self.refundedOn !== null && cn.date < ctx.self.refundedOn) return 'other'
+  const anotherOwner = ctx.refunds.some((refund) => refund.id !== ctx.self.refundId && refund.creditNoteId === null && (refund.grossCents === null || refund.grossCents === ctx.self.totalCents))
+  return anotherOwner ? 'other' : 'duplicate'
+}
+
+/** Before IMS creates a sales credit note: the live credit notes Xero already holds that credit this refund (see duplicateVerdict). Pure. */
+export function creditNoteCreateDuplicates(creditNotes: readonly OrderCreditNoteRead[], ctx: DuplicateContext): OrderCreditNoteRead[] {
+  return creditNotes.filter((cn) => duplicateVerdict(cn, ctx) === 'duplicate')
+}
+
+/**
+ * The gross a credit note payload credits, in minor units (#1127 R1 M5): the refund's stated gross where IMS kept it; else the payload's own lines when they are
+ * tax-inclusive; else its `orderTotal` (a full refund or a chargeback). Null when none of those can be read (the same-total test is then not made).
+ */
+export function creditNotePayloadGrossCents(payload: { lines?: unknown; lineAmountsIncludeTax?: unknown; orderTotal?: unknown }, statedGross: number | null): number | null {
+  if (statedGross !== null && Number.isFinite(statedGross)) return Math.round(Math.abs(statedGross) * 100)
+  if (payload.lineAmountsIncludeTax === true && Array.isArray(payload.lines)) {
+    let cents = 0
+    for (const line of payload.lines as Array<{ quantity?: unknown; unitAmount?: unknown }>) {
+      const qty = Number(line?.quantity)
+      const unit = Number(line?.unitAmount)
+      if (!Number.isFinite(qty) || !Number.isFinite(unit)) return null
+      cents += Math.round(qty * unit * 100)
+    }
+    return Math.abs(cents)
+  }
+  if (typeof payload.orderTotal === 'number' && Number.isFinite(payload.orderTotal)) return Math.round(Math.abs(payload.orderTotal) * 100)
+  return null
+}
+
+/**
+ * o3d-pnc8p #1127 R1 L10: IS THERE A SALES CREDIT NOTE UNDER THIS NUMBER IN XERO? Read only (one GET). For the operator acknowledgements that name the credit note
+ * a refund was settled with. `found` carries the live (not voided or deleted) documents under the number.
+ */
+export async function lookupSalesCreditNoteByNumber(
+  creditNoteNumber: string,
+  deps: { get: Get } = { get: (path) => xeroGet(path) },
+): Promise<{ ok: true; found: Array<{ creditNoteId: string; status: string; reference: string | null; total: number | null }> } | { ok: false; error: string }> {
+  const wanted = creditNoteNumber.trim()
+  if (!/^[A-Za-z0-9][A-Za-z0-9 ._/-]{0,49}$/.test(wanted)) return { ok: false, error: `"${creditNoteNumber}" is not a credit note number IMS can look up` }
+  let res: Awaited<ReturnType<Get>>
+  try {
+    res = await deps.get(`CreditNotes?where=${encodeURIComponent(`Type == "${XERO_SALES_CREDIT_NOTE_TYPE}" AND CreditNoteNumber == "${wanted}"`)}&page=1&pageSize=${PAGE_SIZE}`)
+  } catch (error) {
+    return { ok: false, error: `the credit-note lookup threw: ${String(error)}` }
+  }
+  if (!res.ok) return { ok: false, error: res.error ?? `the credit-note lookup failed with HTTP ${res.status}` }
+  const rows = (res.data as { CreditNotes?: unknown[] } | undefined)?.CreditNotes
+  if (!Array.isArray(rows)) return { ok: false, error: 'the credit-note lookup returned no CreditNotes list' }
+  const found = rows
+    .filter((row): row is Record<string, unknown> => typeof row === 'object' && row !== null)
+    .filter((row) => typeof row.CreditNoteNumber === 'string' && row.CreditNoteNumber.trim().toLowerCase() === wanted.toLowerCase() && typeof row.CreditNoteID === 'string')
+    .map((row) => ({ creditNoteId: row.CreditNoteID as string, status: typeof row.Status === 'string' ? row.Status.toUpperCase() : 'UNKNOWN', reference: typeof row.Reference === 'string' ? row.Reference : null, total: typeof row.Total === 'number' ? row.Total : null }))
+    .filter((row) => !isDeadCreditNote(row.status))
+  return { ok: true, found }
 }

@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import test, { mock } from 'node:test'
 import { config } from 'dotenv'
+import { Prisma } from '../../app/generated/prisma/client'
 
 /**
  * THE SALES CREDIT-NOTE REFUND CAPS (o3d-jqmgb, o3d-qrm47, o3d-0olzx, o3d-o4tkz), against a real PostgreSQL.
@@ -368,21 +369,29 @@ test('[refund caps] Xero shows NOTHING paid on the invoice: no bank refund goes 
 
 /** The row was handed back unsent WITHOUT spending a retry (o3d-0lpnb MED-5 / L5): PENDING, not attempted, retryCount 0, its job's attempts not spent, gated to a later time. */
 async function assertWaiting(d: Deps, rowId: string) {
-  const row = await d.db.accountingSyncLog.findUniqueOrThrow({ where: { id: rowId }, select: { status: true, retryCount: true, remoteAttemptedAt: true, processingStartedAt: true } })
+  const row = await d.db.accountingSyncLog.findUniqueOrThrow({ where: { id: rowId }, select: { status: true, retryCount: true, remoteAttemptedAt: true, processingStartedAt: true, attemptStampingCustodyAt: true } })
   assert.equal(row.status, 'PENDING')
   assert.equal(row.retryCount, 0)
   assert.equal(row.remoteAttemptedAt, null)
   assert.ok(row.processingStartedAt && row.processingStartedAt.getTime() > Date.now(), 'offered again later, not every tick')
+  // #1127 R1 M1: the hand-back keeps stamping custody (the lease renewal no longer forfeits it), so the next run's repair does NOT stamp this row as attempted.
+  assert.ok(row.attemptStampingCustodyAt, 'stamping custody kept: the row stays provably unattempted')
   const job = await d.db.integrationOutbox.findFirst({ where: { idempotencyKey: { contains: rowId } }, select: { attempts: true, status: true } })
   if (job) assert.equal(job.attempts, 0, 'the outbox job spent no attempt')
 }
 
-/** Time passing for these rows (stamping custody kept, as a real reclaim re-asserts it), and their jobs due again. */
+/**
+ * TIME PASSING for these rows: their gate (`processingStartedAt`) and their jobs moved 30 days into the past, as the clock would. #1127 R1 M2: custody is NOT
+ * fabricated. A row whose custody equalled its gate (what the release wrote) keeps that equality, shifted by the same interval; a row without custody stays
+ * without it. The rows are not otherwise touched: what the processor does next is production behaviour.
+ */
 async function due(d: Deps, rowIds: string[]) {
-  const longAgo = new Date(Date.now() - 24 * 3_600_000)
   for (const id of rowIds) {
-    await d.db.accountingSyncLog.updateMany({ where: { id }, data: { status: 'PENDING', processingStartedAt: longAgo, attemptStampingCustodyAt: longAgo } })
-    await d.db.integrationOutbox.updateMany({ where: { idempotencyKey: { contains: id } }, data: { status: 'PENDING', nextAttemptAt: longAgo, lockedAt: null } }).catch(() => undefined)
+    await d.db.$executeRaw`UPDATE "accounting_sync_logs"
+       SET "attemptStampingCustodyAt" = CASE WHEN "attemptStampingCustodyAt" = "processingStartedAt" THEN "attemptStampingCustodyAt" - interval '30 days' ELSE "attemptStampingCustodyAt" END,
+           "processingStartedAt" = "processingStartedAt" - interval '30 days'
+     WHERE id = ${id} AND status = 'PENDING'`
+    await d.db.integrationOutbox.updateMany({ where: { idempotencyKey: { contains: id } }, data: { status: 'PENDING', nextAttemptAt: new Date(Date.now() - 24 * 3_600_000), lockedAt: null } }).catch(() => undefined)
   }
 }
 
@@ -676,4 +685,83 @@ test('[0lpnb MED-3] the Xero search failing refuses the settlement (nothing sent
   await d.processor.processPendingXeroSync()
   assert.equal(refunds.length, 0)
   assert.match(await whyNotSent(d, (await settlementRows(d, v.refunds[0]!.id))[0]!.id), /the invoice is VOIDED in Xero/)
+})
+
+test('[#1127 R1 H1] a wait EPISODE: the delay doubles, ONE evidence row per episode, and past 10 waits the row is FAILED for a person (never left waiting)', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  invoiceAmountPaid = 0
+  const s = await seedOrder(d, t, { receipt: 50, count: 1 })
+  await sweep(d, s)
+  const row = (await settlementRows(d, s.refunds[0]!.id))[0]!
+  const gateAfter = async () => (await d.db.accountingSyncLog.findUniqueOrThrow({ where: { id: row.id }, select: { processingStartedAt: true } })).processingStartedAt!.getTime() - Date.now()
+  await d.processor.processPendingXeroSync()
+  const first = await gateAfter()
+  assert.ok(first > 13 * 60_000 && first <= 15 * 60_000, `first wait about 15 minutes (${first})`)
+  await due(d, [row.id])
+  await d.processor.processPendingXeroSync()
+  const second = await gateAfter()
+  assert.ok(second > 28 * 60_000 && second <= 30 * 60_000, `second wait about 30 minutes (${second})`)
+  await assertWaiting(d, row.id)
+  assert.equal(await d.db.activityLog.count({ where: { entityId: row.id, action: 'xero_sync_awaiting_receipt_before_post' } }), 1, 'one evidence row for the episode, not one per cycle')
+  // The tenth wait is the last: the next one fails the row with its retries spent and an operator warning.
+  const p = await d.db.accountingSyncLog.findUniqueOrThrow({ where: { id: row.id }, select: { payload: true } })
+  await d.db.accountingSyncLog.update({ where: { id: row.id }, data: { payload: { ...(p.payload as object), _settlementWait: { reason: 'awaiting-receipt', since: new Date().toISOString(), count: 10 } } } })
+  await due(d, [row.id])
+  await d.processor.processPendingXeroSync()
+  const failed = await d.db.accountingSyncLog.findUniqueOrThrow({ where: { id: row.id }, select: { status: true, retryCount: true, errorMessage: true, payload: true } })
+  assert.equal(failed.status, 'FAILED')
+  assert.equal(failed.retryCount, 5)
+  assert.match(failed.errorMessage ?? '', /stopped waiting and failed it for a person/)
+  assert.equal((failed.payload as { _settlementWait?: unknown })._settlementWait, undefined, 'a Retry starts a fresh episode')
+  assert.equal(await d.db.activityLog.count({ where: { entityId: s.refunds[0]!.id, action: 'credit_note_settlement_wait_escalated' } }), 1)
+  assert.equal(refunds.length, 0)
+})
+
+test('[#1127 R1 H1] a waiting row reads only the invoice: the credit-note search is skipped while AmountPaid is the reason', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  invoiceAmountPaid = 0
+  const s = await seedOrder(d, t, { receipt: 50, count: 1 })
+  xeroSearchFails = true
+  await sweep(d, s)
+  await d.processor.processPendingXeroSync()
+  const row = (await settlementRows(d, s.refunds[0]!.id))[0]!
+  assert.match(await whyNotSent(d, row.id), /Xero shows only 0\.00 paid/, 'the receipt wait, not the (failing) search')
+  await assertWaiting(d, row.id)
+})
+
+test('[#1127 R1 L6] the DIRECT runner hands a settlement wait back the same way (no retry spent, custody kept)', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  invoiceAmountPaid = 0
+  const s = await seedOrder(d, t, { receipt: 50, count: 1 })
+  process.env.XERO_ACCOUNTING_OUTBOX_ENABLED = 'false'
+  await sweep(d, s)
+  await d.processor.processPendingXeroSync()
+  const row = (await settlementRows(d, s.refunds[0]!.id))[0]!
+  assert.match(row.errorMessage ?? '', /Xero shows only 0\.00 paid/)
+  await assertWaiting(d, row.id)
+})
+
+test('[#1127 R1 M6] a held possible duplicate is listed on the refund, and an operator\'s "not a duplicate" acknowledgement releases it (settled in full)', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  const s = await seedOrder(d, t, { receipt: 50, count: 1 })
+  xeroSearch = [{ CreditNoteID: 'hand-cn', CreditNoteNumber: 'CN-11573', Reference: s.externalIds[0]!, Status: 'AUTHORISED', Type: 'ACCRECCREDIT', CurrencyCode: 'GBP', Total: 40 }]
+  foreignCreditNotes.set('hand-cn', { CreditNoteID: 'hand-cn', CurrencyCode: 'GBP', Total: 40, Status: 'AUTHORISED', Payments: [] })
+  await sweep(d, s)
+  await d.processor.processPendingXeroSync()
+  assert.equal(refunds.length, 0)
+  const held = await d.db.salesOrderRefund.findUniqueOrThrow({ where: { id: s.refunds[0]!.id }, select: { creditNoteDuplicateHold: true } })
+  assert.deepEqual((held.creditNoteDuplicateHold as Array<{ creditNoteId: string }>).map((cn) => cn.creditNoteId), ['hand-cn'])
+  const row = (await settlementRows(d, s.refunds[0]!.id))[0]!
+  assert.doesNotMatch(await whyNotSent(d, row.id), /\bvoid\b/i, 'never told to void a credit note on IMS\'s reading')
+  // The acknowledgement (what acknowledgeCreditNoteNotDuplicate writes), then a retry.
+  await d.db.salesOrderRefund.update({ where: { id: s.refunds[0]!.id }, data: { creditNoteNotDuplicate: [{ creditNoteId: 'hand-cn', creditNoteNumber: 'CN-11573', by: 'Jan', reason: 'another refund', at: new Date().toISOString() }], creditNoteDuplicateHold: Prisma.DbNull } })
+  await d.db.accountingSyncLog.update({ where: { id: row.id }, data: { status: 'PENDING', retryCount: 0 } })
+  await queueFirst(d, [row.id])
+  await due(d, [row.id])
+  await d.processor.processPendingXeroSync()
+  assert.deepEqual(refunds.map((r) => r.amount), [40])
 })

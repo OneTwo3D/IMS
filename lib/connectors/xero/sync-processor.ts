@@ -52,7 +52,6 @@ import {
   settledCashOutFacts,
   withXeroCashOut,
   type CreditNoteSettlementOperation,
-  type XeroCreditNoteWitness,
 } from '@/lib/domain/accounting/credit-note-allocation'
 import { computeRealisedFx, describeFxRefusal, resolveSettlementFxRateToBase, settlementAsOfFromInput } from '@/lib/accounting-fx'
 import { isMissingFxRateError } from '@/lib/currencies/fx-select'
@@ -69,7 +68,7 @@ import {
 } from '@/lib/connectors/accounting-connection-provenance'
 import { withAccountingPostingIntent } from '@/lib/connectors/accounting-posting-intent'
 import { xeroUploadAttachment, xeroPost } from './api'
-import { CREDIT_NOTE_DUPLICATE_CHECK_SETTING_KEY, creditNoteCreateDuplicates, describeCreditNote, readOrderCreditNoteKeys, readOrderCreditNotesFromXero, type OrderCreditNoteRead } from './order-credit-notes'
+import { CREDIT_NOTE_DUPLICATE_CHECK_SETTING_KEY, creditNoteCreateDuplicates, creditNotePayloadGrossCents, describeCreditNote, duplicateVerdict, readOrderCreditNoteKeys, readOrderCreditNotesFromXero, type DuplicateContext } from './order-credit-notes'
 import { accountingBankAccountBelongsTo, accountingPostingKey, lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { parsePaymentAccountMap } from '@/lib/accounting/payment-account-map'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
@@ -148,7 +147,7 @@ import {
   isOperatorAssertedSettlement,
   OPERATOR_ASSERTION_SETTLEMENT_BASIS,
 } from '@/lib/domain/accounting/sync-row-settlement'
-import { repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
+import { CUSTODY_MAY_BE_RESTORED, repairMoneyAttemptsOutsideStampingCustody, stampingCustodyOnClaim, stampingCustodyOnCreate } from '@/lib/domain/accounting/money-attempt-provenance'
 import { ledgerClearsFollowUpRevival, postMoneyUnderLedgerFence } from '@/lib/connectors/accounting-settlement-probe'
 import { MONEY_POST_KEY_FIELD, countReversedEpisodes, moneyPostIdempotencySource, settlementDocumentAnchorFilters } from '@/lib/domain/accounting/money-post-document'
 import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
@@ -174,7 +173,7 @@ import {
   updateAtAttemptRevision,
   type AttemptRef,
 } from '@/lib/domain/accounting/sync-log-attempt'
-import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
+import { Prisma, type AccountingSyncType } from '@/app/generated/prisma/client'
 import {
   claimIntegrationOutboxWork,
   wooAccountingPostJobIds,
@@ -2423,7 +2422,14 @@ export async function renewClaimForRemoteWrite(
     // the caller obtained the claim is the instant this re-take fences on (o3d-xl63 r6).
     // THE WRITER-SIDE CUT-OFF, RE-DERIVED AT EVERY REMOTE WRITE: the floor of THIS moment is a clause of the statement that proves the claim
     // immediately before a request leaves, so a row that is (or has become) older than the live-from instant cannot take the fence and nothing is sent.
-    where: { ...heldClaimWhere(entryId, held), connector: XERO_CONNECTOR, ...xeroNotBeforeCutoffWhere(xeroCutoffFloor()) },
+    // o3d-0lpnb R1 M1: AND THE RENEWAL RE-ASSERTS STAMPING CUSTODY, as the claim statement does (`stampingCustodyOnClaim`). It moves `processingStartedAt`, and the
+    // forfeit trigger (migration 20260819090000) nulls custody on any such move that does not write custody equal to it in the same statement, so a renewal that
+    // left custody out forfeited it on EVERY claim this binary took: a money row that then stopped before its call was stamped as possibly attempted by the next
+    // run's repair, and replayed a stale pin, was counted as a sibling's cash and could no longer be retired. This binary is a stamping binary and holds the claim
+    // continuously, so its renewal keeps custody exactly as its claim took it. The refusal welded into the claim (CUSTODY_MAY_BE_RESTORED) is carried here too: a
+    // money row that already holds neither custody nor a stamp (a row that genuinely lost custody, which the repair stamps before any claim) is not given custody
+    // back; it is not renewed at all, and that is the closed direction (the claim reads as lost and nothing is sent).
+    where: { ...heldClaimWhere(entryId, held), connector: XERO_CONNECTOR, ...xeroNotBeforeCutoffWhere(xeroCutoffFloor()), AND: [CUSTODY_MAY_BE_RESTORED] },
     // `processingStartedAt` is this host's clock and `createDispatchedAt` is the DATABASE's, read by
     // `planCreateDispatch` one statement ago. They are deliberately not the same instant: the claim is
     // only ever compared against itself, while the dispatch instant is aged against `clock_timestamp()`
@@ -2432,7 +2438,7 @@ export async function renewClaimForRemoteWrite(
     // proceeding under a release. Both belong in this statement for the same reason — the fact and the
     // claim proof must land together, or not at all — and the union means the fence can never be
     // handed both at once.
-    data: write ? { processingStartedAt: renewedAt, ...write } : { processingStartedAt: renewedAt },
+    data: write ? { processingStartedAt: renewedAt, attemptStampingCustodyAt: renewedAt, ...write } : { processingStartedAt: renewedAt, attemptStampingCustodyAt: renewedAt },
   })
   return renewed.count === 1 ? renewedAt : null
 }
@@ -2953,7 +2959,9 @@ function unsentPostEvidence(
                 ? 'xero_sync_awaiting_receipt_before_post'
                 : notPosted.reason === 'awaiting-sibling'
                   ? 'xero_sync_awaiting_sibling_before_post'
-                  : 'xero_sync_claim_lost_before_post',
+                  : notPosted.reason === 'awaiting-budget'
+                    ? 'xero_sync_awaiting_budget_before_post'
+                    : 'xero_sync_claim_lost_before_post',
     tag: 'sync',
     level: 'WARNING' as const,
     description: notPosted.message,
@@ -3608,21 +3616,13 @@ async function reportUnsentHandBackAcknowledgementLost(
  */
 /** o3d-0lpnb: the two credit-note settlement WAITS (see handBackSettlementWait). */
 export function isSettlementWait(reason: NonNullable<EntryResult['notPosted']>['reason']): boolean {
-  return reason === 'awaiting-receipt' || reason === 'awaiting-sibling'
+  return reason === 'awaiting-receipt' || reason === 'awaiting-sibling' || reason === 'awaiting-budget'
 }
 
 /**
- * o3d-0lpnb MED-5 / MED-2 / L5: HAND A WAITING SETTLEMENT ROW BACK WITHOUT SPENDING A RETRY. The row is PENDING again, gated to `unsentHandBackDelayMs`, its retry
- * count untouched; its outbox job is deferred the same way; the evidence row is written in the same transaction. Claim- and attempt-fenced: a displaced owner
- * writes nothing.
- *
- * NOT `releaseClaimForRetry`, and why. That release restores stamping custody and refuses a MONEY row that holds neither custody nor an attempt stamp
- * (CUSTODY_MAY_BE_RESTORED). A claimed money row always is such a row by the time it gets here: opening the remote-write lease renews `processingStartedAt`
- * without re-asserting custody, so the forfeit trigger has taken it (pinned in tests/accounting/xero-transport-refusal-reclaim.test.ts). Custody is therefore
- * NOT restored here, and the consequence is stated rather than hidden: the next run's repair (`repairMoneyAttemptsOutsideStampingCustody`) stamps the row as
- * possibly attempted, exactly as it does for every money row that failed before its call. The settlement treats such a row as one whose call may have landed
- * (ledger-check wording; replay only of a PINNED decision), which is why a wait leaves no pinned amount behind (processCreditNoteAllocation unpins before it
- * waits).
+ * o3d-0lpnb MED-5 / MED-2 / L5: HAND A WAITING SETTLEMENT ROW BACK WITHOUT SPENDING A RETRY. Through the one fenced release (`releaseClaimForRetry`: claim and
+ * attempt fenced, stamping custody re-asserted, so a row that sent nothing stays provably unattempted), gated to its own backoff (`notPosted.retryDelayMs`); its
+ * outbox job is deferred the same way, without an attempt. One INFO evidence row per wait EPISODE (`recordEvidence`), not per cycle (#1127 R1 H1).
  */
 async function handBackSettlementWait(args: {
   entry: { id: string; type: string }
@@ -3632,17 +3632,13 @@ async function handBackSettlementWait(args: {
   job?: IntegrationOutboxRow | null
 }): Promise<void> {
   const { entry, notPosted, lease, attempt, job } = args
-  const delayMs = unsentHandBackDelayMs(notPosted.reason)
+  const delayMs = notPosted.retryDelayMs ?? unsentHandBackDelayMs(notPosted.reason)
   try {
     await db.$transaction(async (tx) => {
-      const released = await tx.accountingSyncLog.updateMany({
-        where: { ...heldClaimWhere(entry.id, lease), attemptRevision: attempt.attemptRevision, connector: XERO_CONNECTOR },
-        // A future `processingStartedAt` on a PENDING row is the retry gate both runners read.
-        data: { status: 'PENDING', errorMessage: notPosted.message, processingStartedAt: new Date(Date.now() + delayMs) },
-      })
-      if (released.count !== 1) return
+      const released = await releaseClaimForRetry(tx, entry.id, lease, { errorMessage: notPosted.message, nextAttemptAt: new Date(Date.now() + delayMs) }, attempt)
+      if (!released) return
       if (job) await deferOutboxWithoutSpendingAnAttempt(tx, job, notPosted.message, delayMs)
-      await logActivityInTransaction(tx, { ...unsentPostEvidence(entry, notPosted, job?.id), level: 'INFO', userId: null })
+      if (notPosted.recordEvidence !== false) await logActivityInTransaction(tx, { ...unsentPostEvidence(entry, notPosted, job?.id), level: 'INFO', userId: null })
     })
   } catch (error) {
     // Never into the per-entry catch: that would spend a retry on a row that sent nothing. The row waits for the stale-claim cut-off instead, and it is said.
@@ -4210,6 +4206,8 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
   // costs a five-minute delay, whereas posting into a fence that cannot see its rivals costs a
   // duplicate payment. The cron treats a throw here as it treats any other sync failure.
   await reportMoneyAttemptCustodyRepair(await repairMoneyAttemptsOutsideStampingCustody(), XERO_CONNECTOR)
+  // o3d-0lpnb #1127 R1 H1: every run starts with a fresh Xero call budget for credit-note settlements and duplicate checks.
+  beginSettlementXeroCallBudget()
   if (!isXeroAccountingOutboxEnabled()) {
     return processPendingXeroSyncDirect()
   }
@@ -5389,9 +5387,13 @@ type EntryResult = {
      * the same order is posting, or holds capacity it has not yet attempted) are WAITS, not failures: the row is handed back unsent, after a delay, without spending
      * a retry, exactly like `producer-held` (see handsBackUnsentWithoutAttempt).
      */
-    reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused' | 'producer-held' | 'producer-shadowed' | 'before-cutoff' | 'awaiting-receipt' | 'awaiting-sibling'
+    reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused' | 'producer-held' | 'producer-shadowed' | 'before-cutoff' | 'awaiting-receipt' | 'awaiting-sibling' | 'awaiting-budget'
     operation: string
     message: string
+    /** #1127 R1 H1: a settlement wait's own delay (its bounded backoff); absent = the reason's default (unsentHandBackDelayMs). */
+    retryDelayMs?: number
+    /** #1127 R1 H1: false = not the first wait of its episode, so no evidence row is written (one INFO row per episode, not per cycle). */
+    recordEvidence?: boolean
     /**
      * o3d-gvzu — PRESENT ONLY WHEN THE HAND-BACK MUST ALSO RELEASE THE DISPATCH MARKER, and carrying
      * the two facts that licensed it so the evidence row can name them.
@@ -5409,13 +5411,31 @@ type EntryResult = {
 export const AWAITING_RECEIPT_RETRY_DELAY_MS = 15 * 60_000
 /** o3d-0lpnb: how long a credit-note refund payment waits for another refund of its order to finish posting. */
 export const AWAITING_SIBLING_RETRY_DELAY_MS = 60_000
+/** #1127 R1 H1: a wait's delay doubles from its base up to this cap. */
+export const SETTLEMENT_WAIT_MAX_DELAY_MS = 12 * 3_600_000
+/** #1127 R1 H1: an episode of waits ends in FAILED (an operator item) after this long, or after this many waits (15 min doubling: about 2.7 days for a receipt). */
+export const SETTLEMENT_WAIT_MAX_MS = 3 * 24 * 3_600_000
+export const SETTLEMENT_WAIT_MAX_COUNT = 10
+
+/** One episode of waits, kept on the row's payload as `_settlementWait`. */
+export type SettlementWait = { reason: 'awaiting-receipt' | 'awaiting-sibling'; since: string; count: number }
+export function readSettlementWait(payload: unknown): SettlementWait | null {
+  const raw = (payload as { _settlementWait?: unknown } | null)?._settlementWait as Partial<SettlementWait> | undefined
+  if (!raw || (raw.reason !== 'awaiting-receipt' && raw.reason !== 'awaiting-sibling') || typeof raw.since !== 'string' || !Number.isFinite(Date.parse(raw.since)) || typeof raw.count !== 'number' || raw.count < 1) return null
+  return { reason: raw.reason, since: raw.since, count: Math.floor(raw.count) }
+}
+/** The n-th wait's delay: the reason's base, doubled each time, capped at SETTLEMENT_WAIT_MAX_DELAY_MS. */
+export function settlementWaitDelayMs(reason: 'awaiting-receipt' | 'awaiting-sibling', count: number): number {
+  const base = reason === 'awaiting-receipt' ? AWAITING_RECEIPT_RETRY_DELAY_MS : AWAITING_SIBLING_RETRY_DELAY_MS
+  return Math.min(base * 2 ** Math.max(0, count - 1), SETTLEMENT_WAIT_MAX_DELAY_MS)
+}
 
 /**
  * THE notPosted REASONS WHOSE ROW IS HANDED BACK HERE (claim released, the outbox job deferred) WITHOUT SPENDING A RETRY. The others keep their own settled
  * handling (see the runners). One predicate, so the direct and the outbox runner cannot disagree.
  */
 export function handsBackUnsentWithoutAttempt(reason: NonNullable<EntryResult['notPosted']>['reason']): boolean {
-  return reason === 'transport-refused' || reason === 'producer-held' || reason === 'awaiting-receipt' || reason === 'awaiting-sibling'
+  return reason === 'transport-refused' || reason === 'producer-held' || isSettlementWait(reason)
 }
 
 /** The delay before a handed-back row is offered again. */
@@ -5423,6 +5443,7 @@ export function unsentHandBackDelayMs(reason: NonNullable<EntryResult['notPosted
   if (reason === 'producer-held') return PRODUCER_HELD_RETRY_DELAY_MS
   if (reason === 'awaiting-receipt') return AWAITING_RECEIPT_RETRY_DELAY_MS
   if (reason === 'awaiting-sibling') return AWAITING_SIBLING_RETRY_DELAY_MS
+  if (reason === 'awaiting-budget') return AWAITING_BUDGET_RETRY_DELAY_MS
   return 0
 }
 
@@ -6330,55 +6351,74 @@ async function processEntry(
   )
 }
 
-/**
- * o3d-pnc8p note 1: the duplicate check before a sales credit note is CREATED (see creditNoteCreateDuplicates). Null when the switch is off, the row is not a
- * refund's, or Xero holds nothing for this refund; otherwise the refusal (nothing is sent).
- */
-async function salesCreditNoteDuplicateRefusal(entryId: string, referenceType: string, referenceId: string, payload: SyncPayload): Promise<EntryResult | null> {
-  if (referenceType !== 'SalesOrderRefund') return null
-  const flag = await db.setting.findUnique({ where: { key: CREDIT_NOTE_DUPLICATE_CHECK_SETTING_KEY }, select: { value: true } })
-  if (flag?.value !== 'true') return null
-  // soft-delete exception: the credit note of a refund is built by id.
-  const refund = await db.salesOrderRefund.findUnique({ where: { id: referenceId }, select: { orderId: true, order: { select: { currency: true } } } })
-  if (!refund) return { success: false, error: 'Not sent: the refund this credit note is for could not be read, so IMS could not check Xero for a credit note already raised for it.' }
-  const { keys, imsCreditNotes, externalRefundIdOf } = await readOrderCreditNoteKeys(db as never, refund.orderId)
-  const read = await readOrderCreditNotesFromXero(keys, refund.order.currency)
-  if (!read.ok) return { success: false, error: withLedgerCheck(`Not sent: ${read.error}. IMS reads Xero for the order's credit notes before it creates one, so that a credit note raised by Xeroom or by hand is never duplicated. Retry once Xero answers.`) }
-  const attemptedBefore = (await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { remoteAttemptedAt: true } }))?.remoteAttemptedAt != null
-  const total = typeof payload.orderTotal === 'number' && Number.isFinite(payload.orderTotal) ? Math.round(payload.orderTotal * 100) : null
-  const found = creditNoteCreateDuplicates({
-    creditNotes: read.creditNotes, imsCreditNotes, selfExternalRefundId: externalRefundIdOf.get(referenceId) ?? null,
-    creditNoteNumber: typeof payload.creditNoteNumber === 'string' ? payload.creditNoteNumber : null, totalCents: total, attemptedBefore,
-  })
-  if (found.length === 0) return null
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// o3d-0lpnb #1127 R1 H1: THE XERO CALL BUDGET FOR CREDIT-NOTE SETTLEMENTS AND DUPLICATE CHECKS, per run. The day allowance (1,000 calls) is the ORGANISATION's,
+// shared with Xeroom's live invoicing; a settlement costs 2 balance reads, one credit-note search and one read per matched credit note (and 2 more under the
+// order lock). Past the budget a row waits (`awaiting-budget`, 30 minutes, no retry spent, no wait counted) instead of reading.
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+export const SETTLEMENT_XERO_CALL_BUDGET = 60
+export const AWAITING_BUDGET_RETRY_DELAY_MS = 30 * 60_000
+let settlementXeroCallsLeft = SETTLEMENT_XERO_CALL_BUDGET
+/** Reset at the start of every processPendingXeroSync run. */
+export function beginSettlementXeroCallBudget(budget: number = SETTLEMENT_XERO_CALL_BUDGET): void {
+  settlementXeroCallsLeft = budget
+}
+/** Spend `n` calls from this run's budget; false (and nothing spent) when fewer are left. */
+export function spendSettlementXeroCalls(n: number = 1): boolean {
+  if (settlementXeroCallsLeft < n) return false
+  settlementXeroCallsLeft -= n
+  return true
+}
+
+/** The duplicate context for one refund: its own figures and the order's refunds (see duplicateVerdict). */
+function duplicateContextFor(args: { refundId: string; keys: Awaited<ReturnType<typeof readOrderCreditNoteKeys>>; totalCents: number | null; creditNoteNumber: string | null }): DuplicateContext {
+  const self = args.keys.refunds.find((refund) => refund.id === args.refundId)
   return {
-    success: false,
-    error: withLedgerCheck(`Not sent: Xero already holds ${found.map(describeCreditNote).join('; ')}, which IMS did not raise and which credits this refund (it names refund ${externalRefundIdOf.get(referenceId) ?? '(none)'}, carries this credit note's number, or credits exactly its total on the same order). Creating another would credit the customer twice. `
-      + 'Check it in Xero with the accountant: if it is this refund\'s credit note, settle this row as posted with its id; if it is not, void or correct it, then retry.'),
+    self: { refundId: args.refundId, externalRefundId: self?.externalRefundId ?? null, totalCents: args.totalCents, refundedOn: self?.refundedOn ?? null, creditNoteNumber: args.creditNoteNumber },
+    imsCreditNotes: args.keys.imsCreditNotes,
+    refunds: args.keys.refunds,
   }
 }
 
 /**
- * o3d-0lpnb MED-3: the order's credit notes AS XERO HOLDS THEM, read-only, with what IMS knows to tie them to the order (its WooCommerce order id, every refund id,
- * the credit notes IMS recorded). The cash witness is computed WITHOUT the same-total duplicate test (the credit note's own total is read later, with the balances);
- * the caller runs `decideXeroCreditNoteWitness` again with it. A credit note that names this refund is a duplicate either way.
+ * #1127 R1 M6: record (or clear) the credit notes a refund is held on as possible duplicates, so Sync exceptions can list them with a "Not a duplicate"
+ * acknowledgement. Ids, numbers, status, total and date only (never the reference, which can carry a customer's name). Best effort: the refusal stands either way.
  */
-async function readXeroSettlementWitness(args: { orderId: string; refundId: string; creditNoteId: string | null; currency: string; creditNoteTotal: number | null }): Promise<
-  | { ok: true; witness: XeroCreditNoteWitness; creditNotes: OrderCreditNoteRead[]; imsCreditNotes: Map<string, string>; selfExternalRefundId: string | null }
-  | { ok: false; error: string }
-> {
-  const { keys, imsCreditNotes, externalRefundIdOf } = await readOrderCreditNoteKeys(db as never, args.orderId)
-  const read = await readOrderCreditNotesFromXero(keys, args.currency)
-  if (!read.ok) return read
-  const selfExternalRefundId = externalRefundIdOf.get(args.refundId) ?? null
-  const decision = decideXeroCreditNoteWitness({
-    creditNotes: read.creditNotes, settlingCreditNoteId: args.creditNoteId, imsCreditNotes,
-    self: { externalRefundId: selfExternalRefundId, totalCents: args.creditNoteTotal === null ? null : Math.round(args.creditNoteTotal * 100) },
-  })
-  if (decision.kind === 'duplicate') {
-    return { ok: false, error: `Xero already holds ${decision.creditNotes.map(describeCreditNote).join('; ')}, which IMS did not raise and which names this refund, so settling IMS's credit note as well would credit the customer twice; decide in Xero with the accountant which one stands and void the other` }
+async function recordDuplicateHold(refundId: string, found: ReadonlyArray<{ creditNoteId: string; creditNoteNumber: string | null; status: string; total: number | null; date?: string | null }>): Promise<void> {
+  const hold = found.length === 0 ? Prisma.DbNull : found.map((cn) => ({ creditNoteId: cn.creditNoteId, creditNoteNumber: cn.creditNoteNumber, status: cn.status, total: cn.total, date: cn.date ?? null }))
+  await db.salesOrderRefund.updateMany({ where: { id: refundId }, data: { creditNoteDuplicateHold: hold } }).catch(() => { /* advisory: the row's own refusal names the credit notes */ })
+}
+
+/** The operator's way out of a duplicate hold, worded for every caller: decide which credit note stands; never void one on IMS's word. */
+const DUPLICATE_HOLD_REMEDY = 'Decide in Xero, with the accountant, which credit note stands for this refund. If the credit note Xero holds is not this refund\'s, record that with "Not a duplicate" under Credit notes held as possible duplicates on Sync exceptions and retry this row; if it is this refund\'s, settle this row as posted with it (or cancel this row).'
+
+/**
+ * o3d-pnc8p note 1: the duplicate check before a sales credit note is CREATED (see duplicateVerdict). Null when the switch is off, the row is not a refund's, or
+ * Xero holds nothing for this refund; otherwise the refusal (nothing is sent).
+ */
+async function salesCreditNoteDuplicateRefusal(referenceType: string, referenceId: string, payload: SyncPayload): Promise<EntryResult | null> {
+  if (referenceType !== 'SalesOrderRefund') return null
+  const flag = await db.setting.findUnique({ where: { key: CREDIT_NOTE_DUPLICATE_CHECK_SETTING_KEY }, select: { value: true } })
+  if (flag?.value !== 'true') return null
+  // soft-delete exception: the credit note of a refund is built by id.
+  const refund = await db.salesOrderRefund.findUnique({ where: { id: referenceId }, select: { orderId: true, statedGrossForeign: true, order: { select: { currency: true } } } })
+  if (!refund) return { success: false, error: 'Not sent: the refund this credit note is for could not be read, so IMS could not check Xero for a credit note already raised for it.' }
+  const keys = await readOrderCreditNoteKeys(db, refund.orderId)
+  const read = await readOrderCreditNotesFromXero(keys.keys, refund.order.currency, { spend: () => spendSettlementXeroCalls(1) })
+  if (!read.ok) {
+    const message = `Not sent yet: ${read.error}. IMS reads Xero for the order's credit notes before it creates one, so that a credit note raised by Xeroom or by hand is never duplicated; it tries again later.`
+    return read.budget ? { success: false, error: message, notPosted: { reason: 'awaiting-budget', operation: 'credit-note', message, retryDelayMs: AWAITING_BUDGET_RETRY_DELAY_MS } } : { success: false, error: message }
   }
-  return { ok: true, witness: decision.witness, creditNotes: read.creditNotes, imsCreditNotes, selfExternalRefundId }
+  const gross = refund.statedGrossForeign == null ? null : Number(refund.statedGrossForeign.toString())
+  const found = creditNoteCreateDuplicates(read.creditNotes, duplicateContextFor({
+    refundId: referenceId, keys, totalCents: creditNotePayloadGrossCents(payload, gross), creditNoteNumber: typeof payload.creditNoteNumber === 'string' ? payload.creditNoteNumber : null,
+  }))
+  await recordDuplicateHold(referenceId, found)
+  if (found.length === 0) return null
+  return {
+    success: false,
+    error: withLedgerCheck(`Not sent: Xero already holds ${found.map(describeCreditNote).join('; ')}, which IMS did not raise and which may already credit this refund (it names refund ${keys.externalRefundIdOf.get(referenceId) ?? '(none)'}, or names only the order and credits exactly this credit note's total). Creating another could credit the customer twice. ${DUPLICATE_HOLD_REMEDY}`),
+  }
 }
 
 /**
@@ -6477,34 +6517,47 @@ async function processCreditNoteAllocation(args: {
       settlementRateToBase: undefined, [MONEY_POST_KEY_FIELD]: undefined,
     } as SyncPayload
   }
-  // o3d-0lpnb: A WAIT hands the row back unsent without spending a retry (handBackSettlementWait). A row never attempted is UNPINNED first, in the database:
-  // the next run's custody repair stamps it as possibly attempted, and a pinned amount left behind would then be replayed and counted as cash out.
-  const unpinnedPayload = payload
-  const waitFor = async (reason: 'awaiting-receipt' | 'awaiting-sibling', message: string): Promise<EntryResult> => {
-    if (!reading.attempted) {
-      await db.accountingSyncLog.updateMany({
-        where: { ...heldClaimWhere(entryId, lease), connector: XERO_CONNECTOR },
-        data: { payload: unpinnedPayload as unknown as Prisma.InputJsonValue },
-      })
-    }
-    return { success: false, error: message, notPosted: { reason, operation: 'credit-note-refund-payment', message } }
+  // o3d-0lpnb / #1127 R1 H1: A WAIT hands the row back unsent without spending a retry (handBackSettlementWait), on a BOUNDED backoff. Each wait of one reason in a
+  // row is one EPISODE, recorded on the row (`_settlementWait`: reason, since, count): the delay doubles from the reason's base up to a 12-hour cap, and once an
+  // episode has lasted SETTLEMENT_WAIT_MAX_MS or reached SETTLEMENT_WAIT_MAX_COUNT waits the row is FAILED with an operator warning instead (an invoice paid by an
+  // allocated overpayment shows AmountPaid 0 for ever, and a receipt that failed for good never posts). A budget wait (`awaiting-budget`) is counted in no episode.
+  // A row never attempted is unpinned in the same write: its next attempt decides afresh.
+  const priorWait = readSettlementWait(args.payload)
+  const waitBase = { ...(reading.attempted ? args.payload : payload), _settlementWait: undefined } as SyncPayload
+  const writeRowPayload = async (next: SyncPayload) => {
+    await db.accountingSyncLog.updateMany({ where: { ...heldClaimWhere(entryId, lease), connector: XERO_CONNECTOR }, data: { payload: next as unknown as Prisma.InputJsonValue } })
   }
-  // o3d-0lpnb MED-3: WHAT XERO ALREADY HOLDS FOR THIS ORDER, read before anything is sized. A credit note IMS did not raise that credits THIS refund is a duplicate:
-  // nothing is settled (allocating or paying out IMS's own would credit the customer twice). Cash paid out on the order's other credit notes, Xeroom-era or by hand,
-  // is merged into the cash out the cap counts. Unreadable is a refusal: nothing is sent.
-  const witnessRead = await readXeroSettlementWitness({ orderId: facts.order.id, refundId: referenceId, creditNoteId, currency: facts.order.currency, creditNoteTotal: null })
-  if (!witnessRead.ok) return { success: false, error: withLedgerCheck(`Nothing was settled: ${witnessRead.error}. IMS reads Xero for the order's other credit notes before it settles one, so that a credit note raised by Xeroom or by hand is neither duplicated nor paid out again. Retry once Xero answers.`) }
-  const sizedFacts = withXeroCashOut(facts, witnessRead.witness)
-  const sizedPlan = plan.kind === 'REFUND_PAYMENT' ? planCreditNoteSettlement(sizedFacts) : plan
-  if (sizedPlan.kind === 'NOT_NOW') {
-    // The in-flight arm alone (an older sibling still to attempt its call) makes the capacity zero: wait for it, never retire on it (o3d-0lpnb MED-2).
-    if (planCreditNoteSettlement(settledCashOutFacts(sizedFacts)).kind === 'REFUND_PAYMENT') {
-      const message = 'Not sent yet: another refund of this order has claimed the received cash and has not yet made its call. This settlement waits for it and is decided again once it has.'
-      return waitFor('awaiting-sibling', message)
+  const waitFor = async (reason: 'awaiting-receipt' | 'awaiting-sibling' | 'awaiting-budget', message: string): Promise<EntryResult> => {
+    const operationName = 'credit-note-settlement'
+    if (reason === 'awaiting-budget') {
+      if (!reading.attempted) await writeRowPayload({ ...waitBase, ...(priorWait ? { _settlementWait: priorWait } : {}) } as SyncPayload)
+      return { success: false, error: message, notPosted: { reason, operation: operationName, message, retryDelayMs: AWAITING_BUDGET_RETRY_DELAY_MS, recordEvidence: false } }
     }
-    return retire(`${sizedPlan.message} (counting what Xero shows paid out on the order's other credit notes)`, sizedPlan.reason)
+    const now = Date.now()
+    const episode = priorWait && priorWait.reason === reason ? { reason, since: priorWait.since, count: priorWait.count + 1 } : { reason, since: new Date(now).toISOString(), count: 1 }
+    if (episode.count > SETTLEMENT_WAIT_MAX_COUNT || now - Date.parse(episode.since) > SETTLEMENT_WAIT_MAX_MS) return escalateWait(episode, message)
+    await writeRowPayload({ ...waitBase, _settlementWait: episode } as SyncPayload)
+    return { success: false, error: message, notPosted: { reason, operation: operationName, message, retryDelayMs: settlementWaitDelayMs(reason, episode.count), recordEvidence: episode.count === 1 } }
   }
-  const refundPlan = sizedPlan.kind === 'REFUND_PAYMENT' ? sizedPlan : null
+  const escalateWait = async (episode: SettlementWait, message: string): Promise<EntryResult> => {
+    const why = withLedgerCheck(`Not sent: this settlement has waited ${episode.count - 1} times since ${episode.since} (${episode.reason === 'awaiting-receipt' ? 'Xero does not show the receipt it would return' : 'another refund of the order held the cash or the order lock'}), so IMS stopped waiting and failed it for a person. The last reason: ${message} `
+      + 'Check the invoice and the credit note in Xero with the accountant (a receipt that never posted, an invoice paid by an allocated overpayment, a stuck sibling settlement), then retry this row or settle the credit note in Xero.')
+    const failed = await db.accountingSyncLog.updateMany({
+      where: { ...heldClaimWhere(entryId, lease), connector: XERO_CONNECTOR },
+      // FAILED with its retries spent: an ordinary failure on /sync, which Retry revives (with a fresh episode: the wait record is cleared here).
+      data: { status: 'FAILED', retryCount: MAX_RETRIES, errorMessage: why, processingStartedAt: null, payload: waitBase as unknown as Prisma.InputJsonValue },
+    })
+    if (failed.count !== 1) {
+      const lost = lostClaimMessage(entryId, 'credit-note-settlement-wait')
+      return { success: false, error: lost, notPosted: { reason: 'claim-lost', operation: 'credit-note-settlement-wait', message: lost } }
+    }
+    await logActivity({
+      entityType: 'SALES_ORDER', entityId: referenceId, action: 'credit_note_settlement_wait_escalated', tag: 'accounting', level: 'WARNING',
+      description: why, metadata: { syncLogId: entryId, refundId: referenceId, creditNoteId, accountingInvoiceId, wait: episode },
+    }).catch(() => { /* the FAILED row is the operator item; the activity row is its echo */ })
+    return { success: true, skipped: true }
+  }
+
   const scopeRequired = operation === 'REFUND_PAYMENT' ? blockingScopeFor('INVOICE_PAYMENT', await getGrantedScopes()) : null
   if (scopeRequired) return { success: false, error: scopeBlockedError('INVOICE_PAYMENT', scopeRequired) }
 
@@ -6512,7 +6565,9 @@ async function processCreditNoteAllocation(args: {
   if (!posting.ok) return { success: false, error: `Cannot date this settlement: ${posting.reason}` }
   const settlementDate = posting.date
 
-  // What Xero says is left on the documents sizes the settlement. READS ONLY, before the fence.
+  // What Xero says is left on the documents sizes the settlement. READS ONLY, before the fence; FIRST of the Xero reads (#1127 R1 H1), so a row that only waits for
+  // its receipt never pays for the credit-note search.
+  if (!spendSettlementXeroCalls(2)) return waitFor('awaiting-budget', 'Not sent yet: this run\'s Xero call budget for credit-note settlements is spent (the day allowance is shared with Xeroom); it is offered again later.')
   const balances = await readCreditNoteSettlementBalances(creditNoteId, accountingInvoiceId)
   if (!balances.ok) return { success: false, error: balances.error }
   if (balances.creditNoteStatus !== 'AUTHORISED') {
@@ -6523,22 +6578,55 @@ async function processCreditNoteAllocation(args: {
   if (balances.invoiceStatus === 'VOIDED' || balances.invoiceStatus === 'DELETED') {
     return { success: false, error: withLedgerCheck(`Nothing was settled: the invoice is ${balances.invoiceStatus} in Xero, so the credit note cannot be allocated to it or refunded against it. If the order was combined into another, its charges (shipping included) are on the surviving invoice and this refund may already be netted there. Settle the credit note in Xero with the accountant, then settle or cancel this row.`) }
   }
-  // The duplicate test, now that the credit note's own total is known.
-  const duplicate = decideXeroCreditNoteWitness({
-    creditNotes: witnessRead.creditNotes, settlingCreditNoteId: creditNoteId, imsCreditNotes: witnessRead.imsCreditNotes,
-    self: { externalRefundId: witnessRead.selfExternalRefundId, totalCents: typeof balances.creditNoteTotal === 'number' ? Math.round(balances.creditNoteTotal * 100) : null },
-  })
-  if (duplicate.kind === 'duplicate') {
-    return {
-      success: false,
-      error: withLedgerCheck(`Nothing was settled: Xero already holds ${duplicate.creditNotes.map(describeCreditNote).join('; ')}, which IMS did not raise and which credits this refund (it names refund ${witnessRead.selfExternalRefundId ?? '(none)'} or credits exactly this credit note's total on the same order). Settling IMS's credit note as well would credit the customer twice. `
-        + 'Decide in Xero with the accountant which credit note stands: void the duplicate, then retry; or, if IMS\'s is the duplicate, void it and cancel this row.'),
+  const replayAccount = operation === 'REFUND_PAYMENT' && replay && typeof payload.bankAccountId === 'string' && typeof payload.paymentMethod === 'string' && payload.rateDecided === true
+  // o3d-0olzx / MED-5: the AmountPaid waits are decided BEFORE the credit-note search; what Xero shows paid out on other credit notes can only lower the cap.
+  if (operation === 'REFUND_PAYMENT' && !replayAccount) {
+    if (balances.amountPaid === null) {
+      return waitFor('awaiting-receipt', 'Nothing was paid: the invoice read from Xero states no readable AmountPaid, so IMS cannot tell how much cash the invoice has received and does not pay a refund out against it. It is offered again later.')
+    }
+    const settledOnly = settledCashOutFacts(facts)
+    const capWithoutSearch = Math.floor(refundPaymentCap(settledOnly, balances.amountPaid).toNumber() * 100) / 100
+    if (!(capWithoutSearch > 0) && settledOnly.receiptTotal.minus(settledOnly.priorCashOut).gt(0)) {
+      return waitFor('awaiting-receipt', `Nothing was paid: IMS records ${facts.receiptTotal.toFixed(2)} received for the order, but Xero shows only ${balances.amountPaid.toFixed(2)} paid on the invoice and ${settledOnly.priorCashOut.toFixed(2)} is already refunded or may have been against the order's other refunds, so there is no received cash left to return. It is offered again later, on a growing interval, and failed for a person if Xero still does not show the receipt after 3 days.`)
     }
   }
 
+  // o3d-0lpnb MED-3: WHAT XERO ALREADY HOLDS FOR THIS ORDER. A credit note IMS did not raise that credits THIS refund is a duplicate: nothing is settled (allocating or
+  // paying out IMS's own would credit the customer twice). Cash paid out on the order's other credit notes, Xeroom-era or by hand, is merged into the cash out the
+  // cap counts. Unreadable is a refusal: nothing is sent.
+  const witnessKeys = await readOrderCreditNoteKeys(db, facts.order.id)
+  const witnessRead = await readOrderCreditNotesFromXero(witnessKeys.keys, facts.order.currency, { spend: () => spendSettlementXeroCalls(1) })
+  if (!witnessRead.ok) {
+    if (witnessRead.budget) return waitFor('awaiting-budget', `Not sent yet: ${witnessRead.error}; it is offered again later.`)
+    return { success: false, error: `Nothing was sent: ${witnessRead.error}. Before a settlement IMS reads the order's other credit notes in Xero; the row is retried.` }
+  }
+  const dupCtx = duplicateContextFor({ refundId: referenceId, keys: witnessKeys, totalCents: typeof balances.creditNoteTotal === 'number' ? Math.round(balances.creditNoteTotal * 100) : null, creditNoteNumber: null })
+  const witnessDecision = decideXeroCreditNoteWitness({
+    creditNotes: witnessRead.creditNotes, settlingCreditNoteId: creditNoteId, imsCreditNotes: witnessKeys.imsCreditNotes,
+    isDuplicate: (cn) => duplicateVerdict({ ...cn, date: cn.date ?? null }, dupCtx) === 'duplicate',
+  })
+  await recordDuplicateHold(referenceId, witnessDecision.kind === 'duplicate' ? witnessDecision.creditNotes : [])
+  if (witnessDecision.kind === 'duplicate') {
+    return {
+      success: false,
+      error: withLedgerCheck(`Nothing was settled: Xero already holds ${witnessDecision.creditNotes.map(describeCreditNote).join('; ')}, which IMS did not raise and which may already credit this refund (it names refund ${dupCtx.self.externalRefundId ?? '(none)'}, or names only the order and credits exactly this credit note's total). Settling IMS's credit note as well could credit the customer twice. ${DUPLICATE_HOLD_REMEDY}`),
+    }
+  }
+  const xeroWitness = witnessDecision.witness
+  const sizedFacts = withXeroCashOut(facts, xeroWitness)
+  const sizedPlan = plan.kind === 'REFUND_PAYMENT' ? planCreditNoteSettlement(sizedFacts) : plan
+  if (sizedPlan.kind === 'NOT_NOW') {
+    // The in-flight arm alone (an older sibling still to attempt its call) makes the capacity zero: wait for it, never retire on it (o3d-0lpnb MED-2).
+    if (planCreditNoteSettlement(settledCashOutFacts(sizedFacts)).kind === 'REFUND_PAYMENT') {
+      return waitFor('awaiting-sibling', 'Not sent yet: another refund of this order has claimed the received cash and has not yet made its call. This settlement waits for it and is decided again once it has.')
+    }
+    return retire(`${sizedPlan.message} (counting what Xero shows paid out on the order's other credit notes)`, sizedPlan.reason)
+  }
+  const refundPlan = sizedPlan.kind === 'REFUND_PAYMENT' ? sizedPlan : null
+
   // A decision pinned for THIS operation on a row that may have left (`replay`, decided above) is replayed as it is: the same amount, account, method and rate, so a
   // retry sends exactly the same payment under the same Idempotency-Key. Nothing below is recomputed for it.
-  const pin: Record<string, unknown> = { operation, currency: facts.order.currency, orderId: facts.order.id }
+  const pin: Record<string, unknown> = { operation, currency: facts.order.currency, orderId: facts.order.id, _settlementWait: undefined }
   if (operation === 'ALLOCATE') {
     const pinnedAmount = typeof payload.amount === 'number' ? payload.amount : null
     const amount = pinnedAmount ?? resolveCreditNoteAllocationAmount({ requested: Number.MAX_SAFE_INTEGER, remainingCredit: balances.remainingCredit, amountDue: balances.amountDue ?? 0 })
@@ -6554,7 +6642,6 @@ async function processCreditNoteAllocation(args: {
     }
     pin.amount = amount
   } else {
-    const replayAccount = replay && typeof payload.bankAccountId === 'string' && typeof payload.paymentMethod === 'string' && payload.rateDecided === true
     if (replayAccount) {
       pin.amount = payload.amount
       pin.bankAccountId = payload.bankAccountId
@@ -6574,20 +6661,14 @@ async function processCreditNoteAllocation(args: {
     if (!account) return { success: false, error: `Bank account ${mapped} not found in synced Xero chart of accounts` }
     const recorded = refundPlan?.recordedAmount != null ? Math.round(refundPlan.recordedAmount.toNumber() * 100) / 100 : null
     // o3d-0olzx: the cap is held to what XERO says the invoice has received, not only to IMS's receipts (a recorded receipt Xero never booked is not cash in
-    // the bank). An unreadable AmountPaid is a refusal, never the IMS-only figure. o3d-0lpnb MED-5: both refusals below are WAITS (`awaiting-receipt`): the row is
-    // handed back unsent, without spending a retry, and offered again until the receipt is in Xero.
-    if (balances.amountPaid === null) {
-      const message = 'Nothing was paid: the invoice read from Xero states no readable AmountPaid, so IMS cannot tell how much cash the invoice has received and refuses to pay a refund out against it. It is offered again until Xero answers.'
-      return waitFor('awaiting-receipt', message)
-    }
+    // the bank). An unreadable AmountPaid was a wait above (#1127 R1 H1: decided before the credit-note search); here it is read as known.
+    if (balances.amountPaid === null) return waitFor('awaiting-receipt', 'Nothing was paid: the invoice read from Xero states no readable AmountPaid. It is offered again later.')
     const settledSized = settledCashOutFacts(sizedFacts)
     const capNumber = refundPlan ? Math.floor(refundPaymentCap(sizedFacts, balances.amountPaid).toNumber() * 100) / 100 : 0
     const settledCapNumber = refundPlan ? Math.floor(refundPaymentCap(settledSized, balances.amountPaid).toNumber() * 100) / 100 : 0
     const imsSettledCap = settledSized.receiptTotal.minus(settledSized.priorCashOut)
     if (refundPlan && !(settledCapNumber > 0) && imsSettledCap.gt(0)) {
-      const message = withLedgerCheck(`Nothing was paid: IMS records ${facts.receiptTotal.toFixed(2)} received for the order, but Xero shows only ${balances.amountPaid.toFixed(2)} paid on the invoice and ${settledSized.priorCashOut.toFixed(2)} is already refunded or may have been against the order's other refunds (in IMS or in Xero), so there is no received cash left to return. `
-        + 'If the receipt is still queued for Xero, this is offered again (without spending a retry) until it posts; otherwise record it in Xero (or settle the credit note there by hand).')
-      return waitFor('awaiting-receipt', message)
+      return waitFor('awaiting-receipt', `Nothing was paid: IMS records ${facts.receiptTotal.toFixed(2)} received for the order, but Xero shows only ${balances.amountPaid.toFixed(2)} paid on the invoice and ${settledSized.priorCashOut.toFixed(2)} is already refunded or may have been against the order's other refunds (in IMS or in Xero), so there is no received cash left to return. It is offered again later, on a growing interval.`)
     }
     // EVERY refund payment is capped at min(the credit left in Xero, receipts recorded less cash already out). A recorded refund payment is the requested figure;
     // a gateway refund asks for the whole credit left.
@@ -6596,8 +6677,7 @@ async function processCreditNoteAllocation(args: {
     // o3d-0lpnb MED-2: an older sibling that has claimed capacity but not attempted its call makes this one smaller than what has actually gone out allows. It may
     // still fail before its call, so settling short now would be for good: this one waits instead and is decided again once the sibling has attempted (or failed).
     if (refundPlan && amount < Math.min(asked, settledCapNumber)) {
-      const message = withLedgerCheck(`Not sent yet: another refund of this order has claimed ${sizedFacts.priorCashOut.minus(settledSized.priorCashOut).toFixed(2)} of the received cash and has not yet made its call, so this refund payment would be settled short. It waits for that refund and is decided again once it has.`)
-      return waitFor('awaiting-sibling', message)
+      return waitFor('awaiting-sibling', `Not sent yet: another refund of this order has claimed ${sizedFacts.priorCashOut.minus(settledSized.priorCashOut).toFixed(2)} of the received cash and has not yet made its call, so this refund payment would come out short. This row waits until that refund has made its call.`)
     }
     if (!(amount > 0)) {
       return { success: false, error: withLedgerCheck(`Nothing was paid: the credit note has ${balances.remainingCredit.toFixed(2)} credit remaining in Xero (it was allocated or refunded already). Resolve in Xero, then retry.`) }
@@ -6709,7 +6789,7 @@ async function processCreditNoteAllocation(args: {
       return readCreditNoteSettlementFacts(tx, referenceId, entryId)
     })
     if (!read) return stop('Not sent: the refund or its order could not be read under the order lock.')
-    const fresh = withXeroCashOut(settledCashOutFacts(read), witnessRead.witness)
+    const fresh = withXeroCashOut(settledCashOutFacts(read), xeroWitness)
     const freshPlan = planCreditNoteSettlement(fresh)
     if (freshPlan.kind !== 'REFUND_PAYMENT') return stop(`Not sent: under the order lock IMS no longer reads this as a refund payment (${freshPlan.kind === 'NOT_NOW' ? freshPlan.message : `it needs a ${freshPlan.kind}`}).`)
     const cap = Math.floor(refundPaymentCap(fresh, lockedAmountPaid).toNumber() * 100) / 100
@@ -6718,17 +6798,21 @@ async function processCreditNoteAllocation(args: {
     }
     return { ok: true }
   }
-  type Guarded = { refused: { error: string; wait: boolean } } | { outcome: Awaited<ReturnType<typeof postMoneyUnderLedgerFence>> }
+  type Wait = 'awaiting-receipt' | 'awaiting-sibling' | 'awaiting-budget'
+  type Guarded = { refused: { error: string; wait: Wait | null } } | { outcome: Awaited<ReturnType<typeof postMoneyUnderLedgerFence>> }
   const outer = await withMoneyPostLock(
     { connector: XERO_CONNECTOR, type, referenceType: 'SalesOrder', referenceId: facts.order.id, documentKey: JSON.stringify(['credit_note_refund_order', facts.order.id]) },
     async (held): Promise<Guarded> => {
       orderLock = held
+      if (!spendSettlementXeroCalls(2)) return { refused: { error: 'Not sent yet: this run\'s Xero call budget for credit-note settlements is spent; it is offered again later.', wait: 'awaiting-budget' } }
       const lockedBalances = await readCreditNoteSettlementBalances(creditNoteId, accountingInvoiceId)
-      if (!lockedBalances.ok) return { refused: { error: lockedBalances.error, wait: false } }
+      if (!lockedBalances.ok) return { refused: { error: lockedBalances.error, wait: null } }
       lockedAmountPaid = lockedBalances.amountPaid
+      // #1127 R1 L4: AmountPaid unreadable under the lock is the same wait as outside it, never a cap refusal.
+      if (lockedAmountPaid === null) return { refused: { error: 'Nothing was paid: the invoice read from Xero under the order lock states no readable AmountPaid. It is offered again later.', wait: 'awaiting-receipt' } }
       const guard = await capGuard('before-stamp')
       // Before the stamp nothing was sent and the row stays unattempted, so it is decided afresh next time: a wait, unless an earlier attempt may have landed.
-      if (!guard.ok) return { refused: { error: guard.error, wait: !reading.attempted } }
+      if (!guard.ok) return { refused: { error: guard.error, wait: reading.attempted ? null : 'awaiting-sibling' } }
       return { outcome: await fenced(() => capGuard('after-stamp')) }
     },
   )
@@ -6738,7 +6822,7 @@ async function processCreditNoteAllocation(args: {
   }
   if ('refused' in outer.result) {
     const { error, wait } = outer.result.refused
-    return wait ? waitFor('awaiting-sibling', error) : { success: false, error }
+    return wait ? waitFor(wait, error) : { success: false, error }
   }
   return outer.result.outcome
 }
@@ -7395,7 +7479,7 @@ export async function processClaimedEntry(
         : undefined
       // o3d-pnc8p note 1 / o3d-0lpnb MED-3 (switch xero_credit_note_duplicate_check_enabled, default off): never create a second credit note for a refund Xero already
       // credits (162199 was duplicated on 2026-11-21 because the search was by order id alone). Read-only; unreadable is a refusal.
-      const duplicateRefusal = await salesCreditNoteDuplicateRefusal(entryId, referenceType, referenceId, payload)
+      const duplicateRefusal = await salesCreditNoteDuplicateRefusal(referenceType, referenceId, payload)
       if (duplicateRefusal) return duplicateRefusal
       // The erasure state is read BEFORE the claim is re-taken and fails closed: if it cannot be read, nothing is posted and the entry is retried.
       const creditContact = await resolveSalesPostContact(referenceType, referenceId, payload)

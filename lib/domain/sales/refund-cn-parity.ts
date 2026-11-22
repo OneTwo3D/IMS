@@ -162,11 +162,14 @@ export type AmountGapVerdict =
  * Said on every parity hold and quarantine, and how the Sync exceptions page recognises one (`isRefundParityHold`): "Record manually" raises a credit note,
  * which here would credit the fee a second time, credit an inflated total, or raise a non-SC credit note for store credit that was never issued.
  */
-export const PARITY_NO_MANUAL_RECORD = ' Do not use "Record manually" on this row: the credit note it raises is wrong here (it would credit the landed-cost fee a second time, credit an inflated total, or raise an ordinary credit note for store credit). This refund is settled in Xero, with the accountant, and the row stays on Sync exceptions as the record of it.'
+export const PARITY_NO_MANUAL_RECORD = ' Do not use "Record manually" on this row: the credit note it raises is wrong here (it would credit the landed-cost fee a second time, credit an inflated total, or raise an ordinary credit note for store credit). This refund is settled in Xero, with the accountant, and this row is closed with "Settled outside IMS", naming the Xero credit note it was settled with.'
+
+/** #1127 R1 L9: the sentence the first parity holds were written with; still recognised, so a park written before the rewording stays a parity hold. */
+const PARITY_NO_MANUAL_RECORD_LEGACY = 'Do not use "Record manually" on this row: the credit note it raises is wrong here (it would credit the landed-cost fee a second time, credit an inflated total, or raise an ordinary credit note for store credit). This refund is settled in Xero, with the accountant, and the row stays on Sync exceptions as the record of it.'
 
 /** Whether a refund park was written by one of the parity holds (its message carries PARITY_NO_MANUAL_RECORD). */
 export function isRefundParityHold(errorMessage: string | null | undefined): boolean {
-  return typeof errorMessage === 'string' && errorMessage.includes(PARITY_NO_MANUAL_RECORD.trim())
+  return typeof errorMessage === 'string' && (errorMessage.includes(PARITY_NO_MANUAL_RECORD.trim()) || errorMessage.includes(PARITY_NO_MANUAL_RECORD_LEGACY))
 }
 
 const HOLD_TAIL = (refundId: number | string) => ` Nothing was recorded and nothing was sent to Xero. The money has ALREADY been returned in the storefront (refund ${refundId}) - do NOT issue another storefront refund.${PARITY_NO_MANUAL_RECORD}`
@@ -368,7 +371,7 @@ export function storeCreditUndatedVerdict(refundId: number, attempt: string): St
   return {
     kind: 'quarantine',
     message: withLedgerCheck(`WooCommerce refund ${refundId} was issued as store credit (attempt ${attempt}), but WooCommerce reports no creation time for it (date_created_gmt), so IMS cannot find the coupon issued for it or tell how long it has waited. `
-      + 'No credit note was raised. Check the order\'s coupons in WooCommerce: if the customer holds the credit (a published coupon for this attempt), settle the credit note in Xero with the accountant and acknowledge this row as settled outside IMS.'
+      + 'No credit note was raised. Check the order\'s coupons in WooCommerce: if the customer holds the credit (a published coupon for this attempt), settle the credit note in Xero with the accountant.'
       + HOLD_TAIL(refundId).replace(' The money has ALREADY been returned in the storefront', ' The refund already exists in the storefront').replace(' - do NOT issue another storefront refund.', '.')),
   }
 }
@@ -383,7 +386,7 @@ export function vatOnlyRefundHold(input: { refundId: number | string; amount: De
   const paid = Math.abs(cents(input.amount))
   return withLedgerCheck(`WooCommerce refund ${input.refundId} pays ${Number.isFinite(paid) ? money(paid) : 'an unreadable amount'} ${input.currency} back but its lines carry no net amount: it refunds VAT only, and no earlier refund on the order carried a landed-cost fee it could repay. `
     + 'What its credit note must do depends on how the invoice is booked in Xero: if the invoice is already ex-VAT (zero-rated), there is nothing to reverse and the right credit note is zero; if it is an IOSS order whose VAT was taken twice, the credit note reverses that VAT out of the IOSS VAT account (821) on No VAT. '
-    + 'Settle it in Xero with the accountant, then acknowledge this row as settled outside IMS.'
+    + 'Settle it in Xero with the accountant.'
     + HOLD_TAIL(input.refundId))
 }
 
@@ -393,8 +396,8 @@ export function vatOnlyRefundHold(input: { refundId: number | string; amount: De
  */
 export const SETTLED_OUTSIDE_IMS_NOTE_PREFIX = 'Settled outside IMS by operator:'
 
-export function settledOutsideImsNote(input: { by: string; reason: string; hold: string | null }): string {
-  return `${SETTLED_OUTSIDE_IMS_NOTE_PREFIX} ${input.by}: ${input.reason.trim()}. Nothing was created in IMS or sent to Xero. The hold it closed: ${input.hold ?? '(none recorded)'}`
+export function settledOutsideImsNote(input: { by: string; reason: string; hold: string | null; creditNoteNumber?: string | null }): string {
+  return `${SETTLED_OUTSIDE_IMS_NOTE_PREFIX} ${input.by}: ${input.reason.trim()}${input.creditNoteNumber ? ` (settled with Xero credit note ${input.creditNoteNumber})` : ''}. Nothing was created in IMS or sent to Xero. The hold it closed: ${input.hold ?? '(none recorded)'}`
 }
 
 /**

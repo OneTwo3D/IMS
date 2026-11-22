@@ -73,6 +73,7 @@ import {
   recoverRefundSyncPark,
   acknowledgeRefundParkSettledOutsideIms,
   acknowledgeFeeRepaymentApplied,
+  acknowledgeCreditNoteNotDuplicate,
   type ExceptionInboxData,
   type RefundParkAllocationInput,
   type RefundParkAllocationTarget,
@@ -111,6 +112,10 @@ export function ExceptionsClient({ data }: Props) {
   // o3d-pnc8p: the parity hold being acknowledged as settled outside IMS, and the open fee repayment being acknowledged as applied (each with its own note).
   const [settlingOutsideParkId, setSettlingOutsideParkId] = useState<string | null>(null)
   const [settledOutsideReason, setSettledOutsideReason] = useState('')
+  const [settledOutsideCreditNote, setSettledOutsideCreditNote] = useState('')
+  // #1127 R1 M6: the held credit note being acknowledged as not a duplicate ("refundId:creditNoteId"), and why.
+  const [notDuplicateKey, setNotDuplicateKey] = useState<string | null>(null)
+  const [notDuplicateReason, setNotDuplicateReason] = useState('')
   const [applyingFeeRefundId, setApplyingFeeRefundId] = useState<string | null>(null)
   const [feeAppliedNote, setFeeAppliedNote] = useState('')
   // o3d-w00 (Codex r1 #3): the park currently being hand-recorded, or null.
@@ -705,7 +710,7 @@ export function ExceptionsClient({ data }: Props) {
                           size="sm"
                           disabled={isPending}
                           title={withLedgerCheck('For a refund whose credit note was settled in Xero with the accountant. Closes this row and records who and why; nothing is created in IMS or sent to Xero, and the refund is not synced again.')}
-                          onClick={() => { setSettledOutsideReason(''); setSettlingOutsideParkId(settlingOutsideParkId === row.id ? null : row.id) }}
+                          onClick={() => { setSettledOutsideReason(''); setSettledOutsideCreditNote(''); setSettlingOutsideParkId(settlingOutsideParkId === row.id ? null : row.id) }}
                         >
                           <CheckCircle2 className="h-3 w-3 mr-1" />Settled outside IMS
                         </Button>
@@ -730,17 +735,20 @@ export function ExceptionsClient({ data }: Props) {
                         <p className="text-xs text-muted-foreground">
                           Acknowledge that this refund was settled outside IMS (its credit note settled in Xero with the accountant). Nothing is created in IMS or sent to Xero, returned stock is not restocked, and the refund is not synced again. An open fee repayment on an earlier refund stays open until it is acknowledged as applied.
                         </p>
+                        <Label htmlFor={`settled-outside-cn-${row.id}`} className="text-xs">The Xero credit note it was settled with (its number; IMS checks it exists in Xero)</Label>
+                        <Input id={`settled-outside-cn-${row.id}`} value={settledOutsideCreditNote} maxLength={50} onChange={(event) => setSettledOutsideCreditNote(event.target.value)} />
                         <Label htmlFor={`settled-outside-${row.id}`} className="text-xs">How was it settled? (recorded with your name)</Label>
                         <Input id={`settled-outside-${row.id}`} value={settledOutsideReason} maxLength={500} onChange={(event) => setSettledOutsideReason(event.target.value)} />
                         <div className="space-x-2">
                           <Button
                             type="button"
                             size="sm"
-                            disabled={isPending || settledOutsideReason.trim() === ''}
+                            disabled={isPending || settledOutsideReason.trim() === '' || settledOutsideCreditNote.trim() === ''}
                             onClick={() => {
                               const reason = settledOutsideReason
+                              const creditNote = settledOutsideCreditNote
                               setSettlingOutsideParkId(null)
-                              runAction(() => acknowledgeRefundParkSettledOutsideIms(row.id, reason), 'Acknowledged as settled outside IMS. Nothing was created; the row is closed.')
+                              runAction(() => acknowledgeRefundParkSettledOutsideIms(row.id, reason, creditNote), 'Acknowledged as settled outside IMS. Nothing was created; the row is closed.')
                             }}
                           >
                             Acknowledge
@@ -832,6 +840,69 @@ export function ExceptionsClient({ data }: Props) {
                   ) : null}
                 </Fragment>
               ))}
+            </TableBody>
+          </Table>
+        </Card>
+      ) : null}
+
+      {data.creditNoteDuplicateHolds.length > 0 ? (
+        <Card id="credit-note-duplicate-holds" className="p-4 space-y-3 scroll-mt-4">
+          <SectionHeading
+            title={`Credit notes held as possible duplicates (${data.summary.creditNoteDuplicateHolds})`}
+            detail={withLedgerCheck('Xero holds a credit note IMS did not raise (Xeroom-era, or raised by hand) that names the refund, or names only the order and credits exactly the same total. IMS creates or settles nothing for these refunds until it is decided which credit note stands. If a listed credit note belongs to another refund, record that here with a reason; IMS then retries this refund. If it is this refund\'s credit note, settle the refund\'s row on /sync as posted with it.')}
+            shown={data.creditNoteDuplicateHolds.length}
+            total={data.summary.creditNoteDuplicateHolds}
+          />
+          <Table containerClassName="rounded-lg border" className="min-w-[820px]">
+            <TableHeader className="bg-muted/40">
+              <TableRow>
+                <TableHead>Order</TableHead>
+                <TableHead>Refund</TableHead>
+                <TableHead>Credit note in Xero</TableHead>
+                <TableHead className="text-right">Action</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {data.creditNoteDuplicateHolds.flatMap((row) => row.candidates.map((cn) => {
+                const key = `${row.refundId}:${cn.creditNoteId}`
+                return (
+                  <Fragment key={key}>
+                    <TableRow>
+                      <TableCell><Link className="underline underline-offset-2" href={`/sales/${row.orderId}`}>{row.orderNumber ?? row.orderId}</Link></TableCell>
+                      <TableCell className="text-xs font-mono">{row.externalRefundId ?? '—'}{row.creditNoteNumber ? ` (${row.creditNoteNumber})` : ''}</TableCell>
+                      <TableCell className="text-xs">{`${cn.creditNoteNumber ?? cn.creditNoteId}, ${cn.status}${cn.total !== null ? `, ${cn.total.toFixed(2)}` : ''}${cn.date ? `, ${cn.date}` : ''}`}</TableCell>
+                      <TableCell className="text-right">
+                        <Button type="button" variant="outline" size="sm" disabled={isPending} onClick={() => { setNotDuplicateReason(''); setNotDuplicateKey(notDuplicateKey === key ? null : key) }}>
+                          <XCircle className="h-3 w-3 mr-1" />Not a duplicate
+                        </Button>
+                      </TableCell>
+                    </TableRow>
+                    {notDuplicateKey === key ? (
+                      <TableRow>
+                        <TableCell colSpan={4} className="bg-muted/30 space-y-2">
+                          <Label htmlFor={`not-duplicate-${key}`} className="text-xs">Whose credit note is it? (recorded with your name)</Label>
+                          <Input id={`not-duplicate-${key}`} value={notDuplicateReason} maxLength={500} onChange={(event) => setNotDuplicateReason(event.target.value)} />
+                          <div className="space-x-2">
+                            <Button
+                              type="button"
+                              size="sm"
+                              disabled={isPending || notDuplicateReason.trim() === ''}
+                              onClick={() => {
+                                const reason = notDuplicateReason
+                                setNotDuplicateKey(null)
+                                runAction(() => acknowledgeCreditNoteNotDuplicate(row.refundId, cn.creditNoteId, reason), 'Recorded as not a duplicate. The refund is retried as usual.')
+                              }}
+                            >
+                              Acknowledge
+                            </Button>
+                            <Button type="button" size="sm" variant="ghost" disabled={isPending} onClick={() => setNotDuplicateKey(null)}>Cancel</Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ) : null}
+                  </Fragment>
+                )
+              }))}
             </TableBody>
           </Table>
         </Card>
