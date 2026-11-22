@@ -897,7 +897,9 @@ const RUNS_RUNTIME_ASSEMBLED_SQL = /\$(?:execute|query)RawUnsafe/
  * `install.sh` — appeared in no inventory at all. A repository writer does not have to spawn
  * anything to be a writer.
  */
-const CONSTRUCTS_A_DATABASE_CLIENT = /new\s+PrismaClient\s*\(|new\s+(?:pg\.)?(?:Client|Pool)\s*\(/
+// `createSessionAdvisoryLock(Client|Pool)(` builds a pg client or pool too, through the session-lock factory (lib/db/session-lock-pool.ts): a file that
+// calls it opens its own session to this database exactly as `new pg.Client(` does, and was invisible to this scan until #1128 R2 LOW-B.
+const CONSTRUCTS_A_DATABASE_CLIENT = /new\s+PrismaClient\s*\(|new\s+(?:pg\.)?(?:Client|Pool)\s*\(|\bcreateSessionAdvisoryLock(?:Client|Pool)\s*\(/
 /**
  * Roots where constructing a client is itself notable — the shipped app, the seed, and `scripts`.
  *
@@ -1092,6 +1094,8 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   | 'seed'
   | 'throwaway-cluster-rehearsal'
 > = {
+  // Also builds the restore selection-lock client through the session-lock factory (createSessionAdvisoryLockClient, #1128 R2 LOW-B); it is classified
+  // by the stronger of the two things it does: it replays an external SQL dump into this database.
   'app/api/backup/restore/route.ts': 'replays-external-sql',
   'app/api/backup/create/route.ts': 'dump-only',
   'app/api/cron/backup/route.ts': 'dump-only',
@@ -1263,6 +1267,16 @@ const DATABASE_EXECUTION_PATHS: Record<string,
   'lib/db/pinned-advisory-lock.ts': 'pinned-lock-session',
   'lib/connectors/xero/payment-write-lock.ts': 'pinned-lock-session',
   'lib/domain/wms/dispatch-sweep-lock.ts': 'pinned-lock-session',
+  // Found once the scan saw factory callers (#1128 R2 LOW-B). Both hold ONE session advisory lock on a factory pool and run nothing on it but
+  // pg_advisory_lock / pg_try_advisory_lock, pg_advisory_unlock and SET / RESET lock_timeout: the work they guard runs on the app's own client.
+  'lib/connectors/woocommerce/sync/first-import-lock.ts': 'pinned-lock-session',
+  'lib/connectors/woocommerce/sync/erasure-sweep-lease.ts': 'pinned-lock-session',
+  // The first-load WMS archive's session (#1128 R2 LOW-B): its only caller is the operator-run command scripts/first-load-mintsoft-archive.ts (through
+  // scripts/lib/first-load-archive-open-target.ts), so it is classified for what the command does on it. --execute takes the run lock, reads the server
+  // identity, the switch, the products' lifecycle and the newest bridge-units-masked attestation in ONE READ ONLY transaction (behind the env-file,
+  // --expect-db and --expect-system-id confirmation), reads the switch again before each write, then INSERTs one activity_logs row per attempt and per
+  // verified or failed write, each in its own transaction. It writes no settings row, so it cannot move a plugin key. The dry run opens no connection.
+  'lib/db/first-load-archive-target.ts': 'operator-run-write',
   'lib/ops/production-preflight.ts': 'pinned-lock-session',
   // The readiness gate's operator text (docs source) names `prisma migrate status` and `prisma migrate diff` while
   // saying what the gate runs INSTEAD of validate:db. It executes nothing: the commands are run by the three

@@ -22,6 +22,14 @@
  * `mintsoft / product.discontinue`, which is LIVE only once the Mintsoft step (M) is live there: the grant set and `MINTSOFT_WRITES_LIVE_FROM` reached.
  * Step M is the retirement of the woo-mintsoft plugin's product sync, which may reset DisCont, so the write is refused before it (`archivePreflight`).
  *
+ * THE RETIREMENT EVIDENCE (#1128 R2 MED-A). The env file being at step M is NOT proof that the plugin and the bridge product sync are retired: stage
+ * carries MINTSOFT_WRITES_LIVE_FROM and the grant during its stage proof (wired to the LIVE Mintsoft client while production's plugin and bridge still
+ * sync), and an M rollback hands back to the bridge. So the preflight also requires evidence that lives in the TARGET installation: the newest
+ * `bridge-units-masked` writer attestation there (read in the command's READ ONLY transaction), judged exactly as `writers:check` judges it from step M
+ * (lib/ops/writers-check.ts stepEvidenceFindings: units masked and inactive, report generated and recorded at or after the step-M instant, last trigger
+ * before it), and generated no more than ARCHIVE_RETIREMENT_MAX_AGE_MS before the run (a rollback resumes the bridge, and an old report says nothing
+ * about the host after it).
+ *
  * Requests are sequential and paced (`MIN_INTERVAL_MS` between any two). Every failure is a short reason without the key, a URL or a response body;
  * Mintsoft's own `Message` is passed on, cut to 200 printable characters.
  */
@@ -35,6 +43,10 @@ import { classifyMintsoftRequest } from './api/read-allowlist'
 import { normalizeMintsoftStockLevels } from './api/normalizers'
 import type { MintsoftReviewConfig } from './lifecycle-review-read'
 import { mintsoftEgressHold, mintsoftEgressRefusalText } from './producer-egress'
+import { BRIDGE_ATTESTATION_KIND } from '@/lib/domain/writer-attestation/bridge-status'
+import { stepEvidenceFindings } from '@/lib/ops/writers-check'
+import { bridgeAttestationReading, stepLiveFrom } from '@/lib/ops/writers-check-step-evidence'
+import type { ArchivePreflightFacts, ArchiveRetirementRow } from '@/lib/first-load/wms-discontinue/execute'
 
 export const ARCHIVE_USER_AGENT = 'onetwo3d-ims-first-load-archive/1'
 export const MIN_INTERVAL_MS = 1000
@@ -92,19 +104,52 @@ export function targetHoldRefusal(hop: { method: string; url: URL; redirectCount
   return mintsoftEgressRefusalText(hold, { method: hop.method.toUpperCase(), target: hop.url.pathname })
 }
 
+/** The writer-attestation kind whose newest row in the target is the evidence that the bridge and the plugin's product sync are retired. */
+export const ARCHIVE_RETIREMENT_ATTESTATION_KIND = BRIDGE_ATTESTATION_KIND
+/** The bridge host report must have been generated at most this long before the run (run the status script again and record it otherwise). */
+export const ARCHIVE_RETIREMENT_MAX_AGE_MS = 24 * 3_600_000
+
 /**
- * Before anything is read for the write (#1128 R1 LOW-2, MED-3): on the TARGET's environment, the ownership row `product.discontinue` is LIVE (the
- * Mintsoft step is live: the grant is set and its live-from instant reached, so the plugin's product sync is retired), the producer hold does not hold
- * Mintsoft, and the outbound-write grant admits `POST /api/Product` to exactly this tenant. A string refuses (nothing sent); the evidence is recorded.
+ * The target-resident retirement evidence (#1128 R2 MED-A): the newest `bridge-units-masked` attestation of the TARGET, judged by writers:check's own
+ * rule under the target's environment, at the run's instant. Refuses without one, before step M is live in that environment, on any finding the check
+ * gives the attestation, and on a report older than ARCHIVE_RETIREMENT_MAX_AGE_MS. Sends nothing.
  */
-export function archivePreflight(config: MintsoftReviewConfig, env: OutboundEnv): { ok: true; evidence: string } | { ok: false; problem: string } {
+export function archiveRetirementEvidence(row: ArchiveRetirementRow | null, env: OutboundEnv, now: Date): { ok: true; evidence: string } | { ok: false; problem: string } {
+  const flat = env as Record<string, string | undefined>
+  const remedy = `run scripts/bridge/bridge_writers_status.py on the bridge host after step M and record it in the target with npm run writers:attest -- --kind ${ARCHIVE_RETIREMENT_ATTESTATION_KIND}`
+  if (row === null) return { ok: false, problem: `the target installation holds no ${ARCHIVE_RETIREMENT_ATTESTATION_KIND} attestation, so nothing there shows the bridge and the woo-mintsoft plugin's product sync retired: ${remedy}` }
+  const liveFrom = stepLiveFrom(flat, 'mintsoft')
+  if (!(liveFrom instanceof Date) || liveFrom.getTime() > now.getTime()) return { ok: false, problem: 'the Mintsoft step (M) is not live in the target installation, so its bridge attestation cannot be judged against the step-M instant' }
+  const attestedMs = Date.parse(row.attestedAt)
+  if (!Number.isFinite(attestedMs)) return { ok: false, problem: `the target's newest ${ARCHIVE_RETIREMENT_ATTESTATION_KIND} attestation carries a time that cannot be read` }
+  const reading = bridgeAttestationReading({ attestedAt: new Date(attestedMs), payload: row.payload })
+  const findings = stepEvidenceFindings('BRIDGE_ATTESTATION', reading, flat, now).filter((f) => f.severity === 'fail')
+  if (findings.length > 0) return { ok: false, problem: `the target's newest ${ARCHIVE_RETIREMENT_ATTESTATION_KIND} attestation does not show the bridge retired, as writers:check judges it: ${findings.map((f) => f.message).join(' ')}` }
+  if (reading.state !== 'present' || reading.generatedAt === undefined) return { ok: false, problem: `the target's newest ${ARCHIVE_RETIREMENT_ATTESTATION_KIND} attestation cannot be read` }
+  const generatedMs = Date.parse(reading.generatedAt)
+  if (!(now.getTime() - generatedMs <= ARCHIVE_RETIREMENT_MAX_AGE_MS)) return { ok: false, problem: `the target's newest ${ARCHIVE_RETIREMENT_ATTESTATION_KIND} report was generated at ${reading.generatedAt}, more than 24 hours before this run, so it says nothing about the bridge now (an M rollback resumes it): ${remedy}` }
+  return { ok: true, evidence: `${ARCHIVE_RETIREMENT_ATTESTATION_KIND} attestation recorded ${reading.at} in the target (report generated ${reading.generatedAt}, last trigger ${reading.lastTriggerAt ?? 'never'}; units masked and inactive), judged as writers:check judges it against MINTSOFT_WRITES_LIVE_FROM ${liveFrom.toISOString()}` }
+}
+
+/**
+ * Before anything is read for the write (#1128 R1 LOW-2, MED-3; R2 MED-A): on the TARGET's environment, the ownership row `product.discontinue` is LIVE
+ * (the Mintsoft step is live: the grant is set and its live-from instant reached), the outbound-write grant admits `POST /api/Product` to exactly this
+ * tenant, and the target holds the evidence that the bridge and the plugin's product sync are retired (`archiveRetirementEvidence`). A string refuses
+ * (nothing sent); both evidences are recorded with every write.
+ *
+ * The producer-hold check here is defence in depth and cannot refuse on its own (#1128 R2 LOW-H): a LIVE disposition is exactly the live phase the
+ * hold releases, so with the disposition LIVE the hold never holds Mintsoft. It is kept so a change to either rule fails closed.
+ */
+export function archivePreflight(config: MintsoftReviewConfig, env: OutboundEnv, facts: ArchivePreflightFacts): { ok: true; evidence: string; retirementEvidence: string } | { ok: false; problem: string } {
   const decision = explainProducerDisposition('mintsoft', 'product.discontinue', undefined, { env })
   if (decision.disposition !== 'LIVE') return { ok: false, problem: `the Mintsoft step (M) is not live in the target installation (producer decision ${decision.disposition}: ${decision.reason}): the woo-mintsoft plugin's product sync, which may reset DisCont, is not retired there. Set MINTSOFT_WRITE_ALLOWED and MINTSOFT_WRITES_LIVE_FROM in the target's env file at the cut-over first` }
   if (mintsoftEgressHold({ env }).held) return { ok: false, problem: 'the producer hold holds Mintsoft in the target installation' }
   const base = new URL(config.baseUrl.endsWith('/') ? config.baseUrl : `${config.baseUrl}/`)
   const refusal = outboundWriteRefusal({ connectorName: 'Mintsoft', method: 'POST', url: new URL('api/Product', base), headers: {}, body: '{}', writeScopeId: config.clientId, env })
   if (refusal !== null) return { ok: false, problem: `the target's outbound-write grant does not admit POST /api/Product to the credentials file's tenant (${refusal.code}): MINTSOFT_WRITE_ALLOWED in the target env file must name exactly this base URL and client id` }
-  return { ok: true, evidence: `Mintsoft step live in the target since ${decision.cutoff === null ? 'unknown' : decision.cutoff.toISOString()} (producer decision LIVE, ${decision.phase}, owner ${decision.owner})` }
+  const retired = archiveRetirementEvidence(facts.retirement, env, facts.now)
+  if (!retired.ok) return retired
+  return { ok: true, evidence: `Mintsoft step live in the target since ${decision.cutoff === null ? 'unknown' : decision.cutoff.toISOString()} (producer decision LIVE, ${decision.phase}, owner ${decision.owner})`, retirementEvidence: retired.evidence }
 }
 
 /**
@@ -285,12 +330,14 @@ export function createMintsoftArchiveWriter(config: MintsoftReviewConfig, deps: 
             if (line.sku === sku.trim()) return { ok: false, problem: `the stock of warehouse ${warehouse} holds the SKU under another product id (${rowId ?? 'none'}), not product ${productId}` }
             continue
           }
+          // A repeated row is refused on its second occurrence, before its SKU is compared: the normalizer already refuses an exact repeat, so the
+          // repeat that reaches here differs in SKU spelling (case), and it is reported as the repeat it is.
+          rows++
+          if (rows > 1) return { ok: false, problem: `product ${productId} appears more than once in the stock of warehouse ${warehouse}` }
           if (raw!.WarehouseId !== Number(warehouse) || raw!.ClientId !== client) return { ok: false, problem: `a stock row of warehouse ${warehouse} for product ${productId} does not name that warehouse and our client` }
           if (line.sku !== sku.trim()) return { ok: false, problem: `the stock of warehouse ${warehouse} names product ${productId} under another SKU` }
-          rows++
           onHand += line.onHand
         }
-        if (rows > 1) return { ok: false, problem: `product ${productId} appears more than once in the stock of warehouse ${warehouse}` }
         if (rows === 1 && config.warehouseIds.includes(warehouse)) stockRow = true
       }
       return { ok: true, value: { stockRow, onHand } }
@@ -299,7 +346,7 @@ export function createMintsoftArchiveWriter(config: MintsoftReviewConfig, deps: 
       return paced(() => discontinueMintsoftProduct(config, productId, sku, deps))
     },
     changedFields: changedMintsoftProductFields,
-    preflight: () => archivePreflight(config, deps.env),
+    preflight: (facts) => archivePreflight(config, deps.env, facts),
   }
 }
 

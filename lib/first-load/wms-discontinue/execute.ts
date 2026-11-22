@@ -12,8 +12,9 @@
  *      left: refused before it left (nothing was sent) or dispatched without a usable answer (it may have reached the WMS);
  *   5. re-read the product: the flag must now read discontinued and NO other field may differ from the read of step 1 (the writer names the fields that
  *      are allowed to move with any update, such as a last-updated stamp);
- *   6. record the verified write (or the failure) in the activity log, with the SKU, the WMS product id, the flag before and after, the operator and the
- *      evidence that the WMS step is live in the target. Every attempt that was recorded gets its outcome recorded, sent or not.
+ *   6. record the verified write (or the failure) in the activity log, with the SKU, the WMS product id, the flag before and after, the operator, the
+ *      evidence that the WMS step is live in the target and the target-resident evidence that the incumbent product sync is retired there. Every attempt
+ *      that was recorded gets its outcome recorded, sent or not.
  */
 import type { ArchivePlan, ArchivePlanRow } from './plan'
 
@@ -35,6 +36,21 @@ export interface WmsProductRead {
 /** The answer to the discontinue request. A failure says whether the request may have reached the WMS: `false` refused before it left, `'unknown'` dispatched. */
 export type WmsDiscontinueAnswer = { ok: true; value: { accepted: boolean; message: string } } | { ok: false; problem: string; sent: false | 'unknown' }
 
+/**
+ * The newest retirement attestation of the kind the command names (WmsArchiveExecuteDeps.retirementEvidenceKind), as the TARGET installation holds it,
+ * read in the same READ ONLY transaction as the import proof; null when none is recorded there. `attestedAt` is an ISO instant (UTC).
+ */
+export interface ArchiveRetirementRow {
+  attestedAt: string
+  payload: unknown
+}
+
+/** What the preflight judges besides the target's environment: the target-resident retirement evidence and the instant of the run. */
+export interface ArchivePreflightFacts {
+  retirement: ArchiveRetirementRow | null
+  now: Date
+}
+
 /** The WMS side of the write, supplied by the connector module (the only place the WMS is named). */
 export interface WmsArchiveWriter {
   label: string
@@ -47,9 +63,10 @@ export interface WmsArchiveWriter {
   changedFields(before: unknown, after: unknown): string[]
   /**
    * Once, before anything is read for the write: whether the write may leave at all under the TARGET installation's rules (the WMS step live, the hold,
-   * the grant). The evidence is recorded with every write.
+   * the grant) and its own evidence that the incumbent's product sync is retired (`facts.retirement`, read from the target). Both evidences are
+   * recorded with every write.
    */
-  preflight(): { ok: true; evidence: string } | { ok: false; problem: string }
+  preflight(facts: ArchivePreflightFacts): { ok: true; evidence: string; retirementEvidence: string } | { ok: false; problem: string }
 }
 
 export type ArchiveWriteOutcome = 'ATTEMPT' | 'VERIFIED' | 'FAILED'
@@ -70,6 +87,8 @@ export interface ArchiveWriteRecord {
   sheetId: string
   /** Why the write was allowed to leave: the WMS step live in the target, as the writer's preflight found it. */
   stepEvidence: string
+  /** The target-resident evidence that the incumbent's product sync is retired, as the writer's preflight found it. */
+  retirementEvidence: string
   problem: string | null
 }
 
@@ -82,6 +101,8 @@ export interface ArchiveExecuteDeps {
   operator: string
   /** The writer's preflight evidence, recorded with every write. */
   stepEvidence: string
+  /** The writer's preflight retirement evidence, recorded with every write. */
+  retirementEvidence: string
   /** Reads the system switch again; true only when it still reads on. Called before each request that writes. */
   switchStillOn: () => Promise<boolean>
   /** Called once per line of progress. */
@@ -110,7 +131,7 @@ export async function executeArchivePlan(plan: ArchivePlan, deps: ArchiveExecute
   for (let index = 0; index < targets.length; index++) {
     const row = targets[index]!
     const productId = row.productId!
-    const base = { sku: row.sku, imsProductId: deps.imsProductIdOf(row.sku), wmsProductId: productId, wms: label, discontinuedBefore: false, operator: deps.operator, planToken: plan.token, sheetId: plan.sheetId, stepEvidence: deps.stepEvidence }
+    const base = { sku: row.sku, imsProductId: deps.imsProductIdOf(row.sku), wmsProductId: productId, wms: label, discontinuedBefore: false, operator: deps.operator, planToken: plan.token, sheetId: plan.sheetId, stepEvidence: deps.stepEvidence, retirementEvidence: deps.retirementEvidence }
     let attempted = false
     try {
       // 1. the product, read again right before the write

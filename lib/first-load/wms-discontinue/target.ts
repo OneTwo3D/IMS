@@ -11,19 +11,23 @@
  * ONE RUN AT A TIME per target (#1128 R1 LOW-3): the script's connection (lib/db/first-load-archive-target.ts) is built by the session-lock factory and
  * takes the advisory lock FIRST_LOAD_WMS_ARCHIVE_LOCK_KEY before anything is read; the command refuses when another run holds it.
  *
- * ONE READ ONLY REPEATABLE READ transaction reads the server's identity, the switch and the products; nothing else is read.
+ * ONE READ ONLY REPEATABLE READ transaction reads the server's identity, the switch, the products and the newest retirement attestation of the kind the
+ * command names (#1128 R2 MED-A: the target's own evidence that the incumbent's product sync is retired, judged by the writer's preflight); nothing else
+ * is read.
  *
  * THE RECORD. Each write is recorded in `activity_logs` (entity PRODUCT, the IMS product id), in its own transaction: the attempt before the request is
  * sent, then the verified write or the failure, with the SKU, the WMS product id, the discontinued flag before and after, the operator, the plan token
  * and the sheet id. These INSERTs are the only statements that write.
  */
-import type { ArchiveWriteRecord } from './execute'
+import type { ArchiveRetirementRow, ArchiveWriteRecord } from './execute'
 
 export const ARCHIVE_TARGET_STATEMENTS = {
   begin: 'BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ',
   identity: `select current_database() as db, (select system_identifier::text from pg_control_system()) as sid`,
   switch: 'select "value" from "settings" where "key" = $1',
   products: 'select "id", "sku", "lifecycleStatus"::text as lifecycle from "products" where "sku" = any($1::text[])',
+  /** The newest writer attestation of one kind; the instant as UTC text (the column is TIMESTAMP(3) without time zone, written in UTC). */
+  retirement: `select to_char("attested_at", 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') as "attestedAt", "payload" from "writer_attestations" where "kind" = $1 order by "attested_at" desc, "id" desc limit 1`,
   rollback: 'ROLLBACK',
   /** The switch, read again before each write, outside any transaction. */
   switchAgain: 'select "value" as value from "settings" where "key" = $1',
@@ -49,6 +53,8 @@ export interface ArchiveTargetRead {
   switchValue: string | null
   /** The IMS products found under exactly the SKUs asked for. */
   products: Map<string, { id: string; lifecycle: string }>
+  /** The newest attestation of the retirement kind asked for, or null when the target holds none. */
+  retirement: ArchiveRetirementRow | null
 }
 
 /** The switch, read again: true only when its row reads exactly 'true'. */
@@ -57,7 +63,7 @@ export async function archiveSwitchStillOn(port: ArchiveTargetPort, switchKey: s
   return rows.length === 1 && rows[0]!.value === 'true'
 }
 
-export async function readArchiveTarget(port: ArchiveTargetPort, switchKey: string, skus: readonly string[]): Promise<ArchiveTargetRead> {
+export async function readArchiveTarget(port: ArchiveTargetPort, switchKey: string, skus: readonly string[], retirementKind: string): Promise<ArchiveTargetRead> {
   await port.query(ARCHIVE_TARGET_STATEMENTS.begin)
   try {
     const id = (await port.query<{ db: string; sid: string }>(ARCHIVE_TARGET_STATEMENTS.identity)).rows[0]
@@ -66,7 +72,9 @@ export async function readArchiveTarget(port: ArchiveTargetPort, switchKey: stri
     const rows = (await port.query<{ id: string; sku: string; lifecycle: string }>(ARCHIVE_TARGET_STATEMENTS.products, [[...skus]])).rows
     const products = new Map<string, { id: string; lifecycle: string }>()
     for (const r of rows) products.set(r.sku, { id: r.id, lifecycle: r.lifecycle })
-    return { database: id.db, systemId: id.sid, switchValue: sw.length === 1 ? sw[0]!.value : null, products }
+    const attested = (await port.query<{ attestedAt: string; payload: unknown }>(ARCHIVE_TARGET_STATEMENTS.retirement, [retirementKind])).rows
+    const retirement = attested.length === 0 ? null : { attestedAt: attested[0]!.attestedAt, payload: attested[0]!.payload }
+    return { database: id.db, systemId: id.sid, switchValue: sw.length === 1 ? sw[0]!.value : null, products, retirement }
   } finally {
     await port.query(ARCHIVE_TARGET_STATEMENTS.rollback)
   }
@@ -101,6 +109,7 @@ export async function recordArchiveWrite(port: ArchiveTargetPort, newId: () => s
       planToken: entry.planToken,
       sheetId: entry.sheetId,
       stepEvidence: entry.stepEvidence,
+      retirementEvidence: entry.retirementEvidence,
       outcome: entry.outcome,
       problem: entry.problem,
     }

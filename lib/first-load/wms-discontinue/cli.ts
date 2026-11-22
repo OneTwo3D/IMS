@@ -12,7 +12,8 @@
  *
  * --execute WRITES, and only when every one of these holds (else nothing is sent to the WMS):
  *   - the IMS target is confirmed (env file, --expect-db, --expect-system-id), its advisory lock is free, the writer's preflight passes under the TARGET's
- *     environment (the WMS step live there, no hold, its grant for exactly this tenant), and its system switch (the one the script names, registered in lib/domain/settings/system-switches.ts, default OFF)
+ *     environment (the WMS step live there, no hold, its grant for exactly this tenant) and on the target's own evidence that the incumbent's product
+ *     sync is retired (the newest retirement attestation, read in the same READ ONLY transaction), and its system switch (the one the script names, registered in lib/domain/settings/system-switches.ts, default OFF)
  *     reads exactly `true`;
  *   - the decisions would import and a real prepare of the manifest is not blocked;
  *   - the plan recomputed now from a fresh WMS read has exactly the token the operator reviewed (--plan-token), and refuses no SKU;
@@ -31,7 +32,7 @@ export const WMS_ARCHIVE_EXIT_CODE_TABLE: ReadonlyArray<{ code: number; name: st
   { code: EXIT_CODES.OK, name: 'OK', meaning: 'Dry run: the plan was printed, no SKU is refused and a real prepare of the manifest is not blocked (the plan may be empty). --execute: every WOULD_ARCHIVE SKU was written and verified.' },
   { code: EXIT_CODES.BLOCKING_FINDINGS, name: 'BLOCKING_FINDINGS', meaning: 'The plan was printed and at least one Archived SKU is refused (not found, a bundle, no discontinued flag, no stock row, or physical stock other than zero), or a real prepare of the manifest is blocked by other findings: resolve each before any write. With --execute nothing was written.' },
   { code: EXIT_CODES.USAGE, name: 'USAGE', meaning: 'Bad command line or an invalid run manifest. Nothing was read or requested.' },
-  { code: EXIT_CODES.INPUT_UNUSABLE, name: 'INPUT_UNUSABLE', meaning: 'An input cannot be used: a manifest file, the decisions not bound to a verified review sheet, a refused or missing decision, a review set that changed or cannot be checked, or the WMS credentials file refused or its census unreadable. With --execute also: the IMS target not confirmed or unreadable, another run holding its lock, the switch not on, the WMS step not live in the target (or its hold or grant refusing the write), a plan token that does not match the plan made now, or an import that is not proven. Nothing was written.' },
+  { code: EXIT_CODES.INPUT_UNUSABLE, name: 'INPUT_UNUSABLE', meaning: 'An input cannot be used: a manifest file, the decisions not bound to a verified review sheet, a refused or missing decision, a review set that changed or cannot be checked, or the WMS credentials file refused or its census unreadable. With --execute also: the IMS target not confirmed or unreadable, another run holding its lock, the switch not on, the WMS step not live in the target (or its hold or grant refusing the write), no target-resident evidence that the incumbent product sync is retired, a plan token that does not match the plan made now, or an import that is not proven. Nothing was written.' },
   { code: EXIT_CODES.OUTPUT_FAILED, name: 'WRITE_STOPPED', meaning: '--execute stopped at the first answer that was not exactly the expected one (a re-read that differs, stock that appeared, the switch turned off, a write the WMS refused or that got no usable answer, a read-back that does not verify, or a record that could not be written). The SKUs written and verified before it are listed and recorded; nothing after it was attempted.' },
 ]
 
@@ -68,6 +69,10 @@ export interface ArchiveTarget {
 export interface WmsArchiveExecuteDeps {
   /** The system switch that must read exactly `true`. */
   switchKey: string
+  /** The writer-attestation kind whose newest row in the target is the evidence that the incumbent's product sync is retired (the script names it). */
+  retirementEvidenceKind: string
+  /** The instant of the run, for the preflight. Absent = the clock. */
+  now?: () => Date
   openWriter: WmsArchiveOpenWriter
   /** Opens the IMS target from its env file, with that file's environment and the run's lock. Throws with a short message (never a credential) when it cannot. */
   openTarget: (envFile: string) => Promise<ArchiveTarget>
@@ -207,6 +212,7 @@ export async function runWmsArchiveCli(argv: string[], io: CliIo, reader: WmsCen
     let proof: Awaited<ReturnType<typeof readArchiveTarget>> | null = null
     let writer: WmsArchiveWriter | null = null
     let stepEvidence = ''
+    let retirementEvidence = ''
     if (args.execute !== null) {
       const ex = args.execute
       const deps = executeDeps!
@@ -215,7 +221,7 @@ export async function runWmsArchiveCli(argv: string[], io: CliIo, reader: WmsCen
         target = await deps.openTarget(ex.envFile)
         locked = await target.tryLock()
         if (!locked) return refuse(['another run of this command holds the target\'s lock: one run at a time'])
-        proof = await readArchiveTarget(target.port, deps.switchKey, archived)
+        proof = await readArchiveTarget(target.port, deps.switchKey, archived, deps.retirementEvidenceKind)
       } catch (error) {
         return refuse([`the IMS target could not be read (${error instanceof Error ? error.message : 'error'})`])
       }
@@ -229,9 +235,10 @@ export async function runWmsArchiveCli(argv: string[], io: CliIo, reader: WmsCen
         if (error instanceof WmsCensusRefused || error instanceof WmsCensusFailed) return refuse([`${reader.label}: ${error.message}`])
         throw error
       }
-      const preflight = writer.preflight()
+      const preflight = writer.preflight({ retirement: proof.retirement, now: (deps.now ?? (() => new Date()))() })
       if (!preflight.ok) return refuse([`the write may not leave under the target installation's rules: ${preflight.problem}`])
       stepEvidence = preflight.evidence
+      retirementEvidence = preflight.retirementEvidence
     }
 
     // ---- what the WMS holds now (GET only, through the injected reader) ----
@@ -272,6 +279,7 @@ export async function runWmsArchiveCli(argv: string[], io: CliIo, reader: WmsCen
       imsProductIdOf: (sku) => proof!.products.get(sku)!.id,
       operator: ex.operator,
       stepEvidence,
+      retirementEvidence,
       switchStillOn: () => archiveSwitchStillOn(port, executeDeps!.switchKey),
       progress: (line) => io.stdout(`${line}\n`),
     })
