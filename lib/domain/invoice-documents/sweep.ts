@@ -18,6 +18,8 @@ import { createHash } from 'node:crypto'
 import { db } from '@/lib/db'
 import { loadInvoiceDocumentFile } from '@/lib/invoice-pdf'
 import { getSettingValue } from '@/lib/settings-store'
+import { logActivity } from '@/lib/activity-log'
+import { DOCUMENT_MISSING_ESCALATION_MS } from './backoff'
 import { ensureInvoiceDocument, type InvoiceDocumentDeps, type EnsureInvoiceDocumentOutcome } from './fetch-service'
 import { INVOICE_DOCUMENTS_CREDIT_NOTES_SETTING, INVOICE_DOCUMENTS_LAZY_FETCH_SETTING, LAZY_REQUESTS_PER_RUN } from './on-demand'
 
@@ -39,8 +41,52 @@ export type InvoiceDocumentSweepResult = {
   needsAttention: number
   failed: number
   stoppedEarly: string | null
-  /** Customer-queued requests were left for a later run because the shared ledger budget is low. */
-  lazyDeferred?: 'ledger-budget-low'
+  /** Customer-queued requests were left for a later run because the shared ledger budget is low, or because no worker has seen it recently (unknown counts as low). */
+  lazyDeferred?: 'ledger-budget-low' | 'ledger-budget-unknown'
+  /** Customer requests that waited DOCUMENT_MISSING_ESCALATION_MS without being fetched, handed to a person this run (they no longer count against the waiting cap). */
+  lazyAgedOut?: number
+}
+
+/** At most this many waiting customer requests are aged out per run. */
+export const LAZY_AGE_OUT_BATCH = 50
+
+/**
+ * o3d-hvzdx (finding 2): A CUSTOMER REQUEST THAT HAS WAITED TOO LONG IS HANDED TO A PERSON, whether or not a fetch was ever attempted. The fetch's own
+ * 14-day escalation runs only after an attempt, and while the shared budget stays low no attempt is made, so without this the requests would stay
+ * PENDING for ever, fill the waiting cap and keep every new customer on "preparing". A request queued DOCUMENT_MISSING_ESCALATION_MS ago that is
+ * still PENDING and not leased by a running fetch is set NEEDS_ATTENTION (it leaves the waiting cap; a customer's click on it is answered "not
+ * available"), with the same activity row the fetch writes. Nothing is fetched; the ledger is not asked.
+ */
+export async function ageOutWaitingCustomerRequests(now: Date, batch: number = LAZY_AGE_OUT_BATCH): Promise<number> {
+  const cutoff = new Date(now.getTime() - DOCUMENT_MISSING_ESCALATION_MS)
+  const waiting = await db.invoiceDocumentFetchState.findMany({
+    where: { customerRequestedAt: { not: null, lte: cutoff }, status: 'PENDING', OR: [{ leaseUntil: null }, { leaseUntil: { lt: now } }] },
+    orderBy: { customerRequestedAt: 'asc' },
+    take: batch,
+    select: { id: true, orderId: true, refundId: true, kind: true, customerRequestedAt: true },
+  })
+  let aged = 0
+  for (const row of waiting) {
+    const reason = `a customer asked for it on ${row.customerRequestedAt!.toISOString().slice(0, 10)} and it has not been fetched in ${Math.round(DOCUMENT_MISSING_ESCALATION_MS / 86_400_000)} days`
+    // The same predicate again as a compare-and-set: a fetch that took the lease or finished meanwhile is left alone.
+    const updated = await db.invoiceDocumentFetchState.updateMany({
+      where: { id: row.id, status: 'PENDING', OR: [{ leaseUntil: null }, { leaseUntil: { lt: now } }] },
+      data: { status: 'NEEDS_ATTENTION', lastError: reason, nextAttemptAt: null },
+    })
+    if (updated.count === 0) continue
+    aged++
+    await logActivity({
+      entityType: 'SALES_ORDER',
+      entityId: row.orderId,
+      action: 'invoice_document_needs_attention',
+      tag: 'accounting',
+      level: 'WARNING',
+      description: `The ${row.kind === 'INVOICE' ? 'invoice' : 'credit note'} PDF for this order was not fetched and needs a person: ${reason}`,
+      metadata: { kind: row.kind, refundId: row.refundId ?? null, reason, agedOut: true },
+      resolveUser: false,
+    }).catch(() => { /* logging must never change the outcome */ })
+  }
+  return aged
 }
 
 function parseFloor(raw: string | null): Date | 'bad' | null {
@@ -214,9 +260,14 @@ export async function runInvoiceDocumentSweep(
 
   // A customer is waiting on these: they go first, capped per run.
   // A queued request spends up to three ledger reads from the SHARED rolling day: while less than LAZY_MIN_DAY_CALLS_REMAINING is left they wait (they stay queued; nothing is lost).
-  const remaining = deps.dayCallsRemaining?.() ?? null
-  const budgetLow = remaining !== null && remaining < LAZY_MIN_DAY_CALLS_REMAINING
-  if (lazyOn && budgetLow) result.lazyDeferred = 'ledger-budget-low'
+  // o3d-hvzdx: UNKNOWN COUNTS AS LOW. A fresh worker that has not called the ledger yet does not know what the others spent, so it waits rather than spend.
+  if (lazyOn) {
+    const aged = await ageOutWaitingCustomerRequests(now)
+    if (aged > 0) result.lazyAgedOut = aged
+  }
+  const remaining = lazyOn ? ((await deps.dayCallsRemaining?.()) ?? null) : null
+  const budgetLow = remaining === null || remaining < LAZY_MIN_DAY_CALLS_REMAINING
+  if (lazyOn && budgetLow) result.lazyDeferred = remaining === null ? 'ledger-budget-unknown' : 'ledger-budget-low'
   const requested = lazyOn && !budgetLow ? await selectCustomerRequested(now, Math.min(limit, LAZY_REQUESTS_PER_RUN), includeCreditNotes) : []
   let candidates: Candidate[] = requested
   if (floor instanceof Date) {

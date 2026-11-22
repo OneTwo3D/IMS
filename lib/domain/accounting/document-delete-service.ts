@@ -313,7 +313,12 @@ export async function requestAccountingDocumentDelete(
 
   return db.$transaction(async (tx): Promise<DocumentDeleteRequestResult> => {
     if (params.kind === 'SALES_INVOICE') await lockSalesOrder(tx, document.referenceId)
-    else await tx.$queryRaw(Prisma.sql`SELECT id FROM purchase_invoices WHERE id = ${document.referenceId} FOR UPDATE`)
+    else {
+      // The purchase order FIRST, then the bill (o3d-668a2): the supplier return and the supplier credit note take the order and then reach the
+      // bill, and they read the pending-delete fence under the order's lock; taking it here too serialises the request against them.
+      if (document.purchaseOrderId) await tx.$queryRaw(Prisma.sql`SELECT id FROM purchase_orders WHERE id = ${document.purchaseOrderId} FOR UPDATE`)
+      await tx.$queryRaw(Prisma.sql`SELECT id FROM purchase_invoices WHERE id = ${document.referenceId} FOR UPDATE`)
+    }
     // Re-decided under the lock: a payment, a refund or another delete that committed since the read refuses this one.
     const locked = await loadDocumentDeleteCandidate(tx, params.kind, params.documentId, settings)
     if (!locked) return { ok: false, code: 'NOT_FOUND', error: 'That document was not found.' }
@@ -408,17 +413,19 @@ export type DocumentDeleteCompletion = 'completed' | 'already-complete' | 'no-re
  */
 export async function completeAccountingDocumentDeletion(externalDocumentId: string): Promise<DocumentDeleteCompletion> {
   return db.$transaction(async (tx): Promise<DocumentDeleteCompletion> => {
-    // LOCK ORDER IS THE ORDER-FIRST CONVENTION every refund, payment, credit-note and bill-edit path follows: the sales order (or the bill, then its
-    // purchase order) FIRST, the deletion row second. The late-activity count below is taken only once that lock is held, so an action that holds the
+    // LOCK ORDER IS THE ORDER-FIRST CONVENTION every refund, payment, credit-note and bill-edit path follows: the sales order (or the purchase
+    // order, then its bill) FIRST, the deletion row second. o3d-668a2: the purchase order BEFORE the bill, as the supplier return takes them (it
+    // locks the order, then inserts a credit note whose foreign key share-locks the bill); bill-then-order here deadlocked against it. The late-activity count below is taken only once that lock is held, so an action that holds the
     // lock when completion arrives commits before the count (and is seen), and one that arrives later waits behind the unwind.
     const found = await tx.accountingDocumentDeletion.findUnique({ where: { externalDocumentId }, select: { id: true, kind: true, documentId: true, snapshot: true } })
     if (!found) return 'no-record'
     if (found.kind === 'SALES_INVOICE') {
       await lockSalesOrder(tx, found.documentId)
     } else {
-      await tx.$queryRaw(Prisma.sql`SELECT id FROM purchase_invoices WHERE id = ${found.documentId} FOR UPDATE`)
       const poId = (found.snapshot as { purchaseOrderId?: string } | null)?.purchaseOrderId
+        ?? (await tx.purchaseInvoice.findUnique({ where: { id: found.documentId }, select: { poId: true } }))?.poId
       if (poId) await tx.$queryRaw(Prisma.sql`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`)
+      await tx.$queryRaw(Prisma.sql`SELECT id FROM purchase_invoices WHERE id = ${found.documentId} FOR UPDATE`)
     }
     const rows = await tx.$queryRaw<Array<{ id: string }>>(Prisma.sql`SELECT id FROM accounting_document_deletions WHERE id = ${found.id} FOR UPDATE`)
     if (rows.length === 0) return 'no-record'

@@ -4830,6 +4830,8 @@ enum WmsOperatorTaskReason {
   WITHDRAWAL_REJECT_NOT_WRITTEN
   /// Merge hold (setting wms_merge_hold_enabled): IMS held every order of a same-customer group in the warehouse so a person can merge them there. Carries the EU and FedEx warnings.
   MERGE_HOLD
+  /// o3d-0syfq: Xero has voided a deleted refund's credit note but IMS could not unwind the refund (phase 2 refused after the void): a person resolves it in IMS. Not a warehouse query: raised with connector 'xero'.
+  REFUND_DELETE_VOIDED_NOT_UNWOUND
   /// A merge hold has stood longer than MERGE_HOLD_REMIND_HOURS: a person has to merge and confirm the orders in the warehouse (IMS never releases a merge hold).
   MERGE_HOLD_OVERDUE
   /// A withdrawal (or an IMS cancel) reached an order that is on merge hold: IMS did not cancel or release it, a person decides in the warehouse.
@@ -6531,4 +6533,14 @@ model XeroSettlementCallBudget {
   used Int      @default(0)
 
   @@map("xero_settlement_call_budget")
+}
+
+/// o3d-hvzdx: Xero's own X-DayLimit-Remaining for a tenant as last seen by any worker (lib/connectors/xero/day-limit-observation.ts), so a worker
+/// that has made no Xero call yet still sees the organisation's shared allowance. One row per tenant, overwritten; a stale row reads as unknown.
+model XeroDayLimitObservation {
+  tenantId     String   @id @map("tenant_id")
+  dayRemaining Int      @map("day_remaining")
+  observedAt   DateTime @map("observed_at")
+
+  @@map("xero_day_limit_observations")
 }

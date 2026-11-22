@@ -545,10 +545,12 @@ test('A REFUND THAT HOLDS THE ORDER LOCK WHEN COMPLETION ARRIVES: completion par
 
     let billCompletion: Promise<string> | null = null
     await db.$transaction(async (tx) => {
+      // o3d-668a2: a bill writer takes the purchase order first, then the bill (the supplier credit note and the return do), and so does completion.
+      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${b.poId} FOR UPDATE`
       await tx.$queryRaw`SELECT id FROM purchase_invoices WHERE id = ${b.billId} FOR UPDATE`
       const pid = await backendPid(tx)
       billCompletion = completeAccountingDocumentDeletion(b.xeroId)
-      await waitUntilParkedBehind(db, { holderPid: pid, waitingOn: /purchase_invoices/i, describe: 'bill completion behind the credit note' })
+      await waitUntilParkedBehind(db, { holderPid: pid, waitingOn: /purchase_orders/i, describe: 'bill completion behind the credit note' })
       await tx.supplierCreditNote.create({ data: { poId: b.poId, purchaseInvoiceId: b.billId, supplierId, amountForeign: 5, amountBase: 5, currency: 'GBP', fxRateToBase: 1 } })
     }, { timeout: 20_000, maxWait: 10_000 })
     assert.equal(await billCompletion, 'needs-review')

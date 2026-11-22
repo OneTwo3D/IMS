@@ -113,6 +113,8 @@ function ledger(orders: Array<{ orderNumber: string | null; invoiceNumber: strin
     },
     downloadPdf: async () => { calls.downloads++; return { ok: true, buffer: over.bytes ?? pdf('ledger') } },
     now: over.now ?? (() => new Date()),
+    // o3d-hvzdx: an unknown budget now counts as low, so the double states a known, ample one (the budget tests override it).
+    dayCallsRemaining: () => 950,
   }
   return { deps, calls }
 }
@@ -292,6 +294,102 @@ test('THE SWEEP DEFERS QUEUED REQUESTS WHILE THE SHARED LEDGER BUDGET IS LOW, an
       assert.equal(ran.lazyDeferred, undefined)
     })
   } finally { await cleanup(ctx, order.id) }
+})
+
+test('o3d-hvzdx UNKNOWN IS LOW: a fresh worker that knows nothing of the budget (null) defers the queued requests; the ledger is not asked', { skip }, async () => {
+  const ctx = await setup()
+  const order = await seedOrder(ctx)
+  try {
+    await withSettings(ctx, { invoice_documents_lazy_fetch_enabled: 'true' }, async () => {
+      assert.equal((await ctx.onDemand.requestInvoiceDocumentOnDemand({ orderId: order.id, kind: 'INVOICE' })).status, 'preparing')
+      const fresh = ledger([order])
+      fresh.deps.dayCallsRemaining = () => null
+      const deferred = await ctx.sweep.runInvoiceDocumentSweep(fresh.deps)
+      assert.equal(deferred.lazyDeferred, 'ledger-budget-unknown')
+      assert.equal(deferred.considered, 0)
+      assert.equal(fresh.calls.lookups.length, 0, 'the ledger was not asked')
+      const none = ledger([order])
+      delete none.deps.dayCallsRemaining
+      assert.equal((await ctx.sweep.runInvoiceDocumentSweep(none.deps)).lazyDeferred, 'ledger-budget-unknown', 'no budget reader at all is unknown too')
+      assert.equal(none.calls.lookups.length, 0)
+    })
+  } finally { await cleanup(ctx, order.id) }
+})
+
+test('o3d-hvzdx THE RACE BETWEEN WORKERS: worker A observes a low allowance and shares it; worker B, fresh (no Xero call of its own), starts only once A has written (barrier) and defers', { skip }, async () => {
+  const ctx = await setup()
+  const order = await seedOrder(ctx)
+  const tenant = `tenant-${randomUUID()}`
+  const observation = await import('../../lib/connectors/xero/day-limit-observation')
+  try {
+    await withSettings(ctx, { invoice_documents_lazy_fetch_enabled: 'true' }, async () => {
+      await ctx.onDemand.requestInvoiceDocumentOnDemand({ orderId: order.id, kind: 'INVOICE' })
+      observation.resetDayLimitPersistThrottleForTests()
+      let written!: () => void
+      const barrier = new Promise<void>((resolve) => { written = resolve })
+      const b = ledger([order])
+      // B's own process has made no Xero call: its local figure is null, exactly a fresh cron worker.
+      b.deps.dayCallsRemaining = () => observation.organisationDayCallsRemaining(null)
+      const workerA = (async () => {
+        const wrote = await observation.persistDayLimitObservation(tenant, ctx.sweep.LAZY_MIN_DAY_CALLS_REMAINING - 50)
+        written()
+        return wrote
+      })()
+      const workerB = (async () => {
+        await barrier
+        return ctx.sweep.runInvoiceDocumentSweep(b.deps)
+      })()
+      const [wrote, swept] = await Promise.all([workerA, workerB])
+      assert.equal(wrote, true, 'A reached the barrier having written its observation')
+      assert.equal(swept.lazyDeferred, 'ledger-budget-low', 'B sees the organisation\'s allowance A saw, not its own empty view')
+      assert.equal(b.calls.lookups.length, 0)
+
+      // Two workers writing at once, the older observation arriving last: the newer one stands.
+      observation.resetDayLimitPersistThrottleForTests()
+      const now = Date.now()
+      await Promise.all([
+        observation.persistDayLimitObservation(tenant, 900, now),
+        (async () => { observation.resetDayLimitPersistThrottleForTests(); return observation.persistDayLimitObservation(tenant, 10, now - 60_000) })(),
+      ])
+      const row = await ctx.db.xeroDayLimitObservation.findUniqueOrThrow({ where: { tenantId: tenant } })
+      assert.equal(row.dayRemaining, 900, 'an older observation never overwrites a newer one')
+    })
+  } finally {
+    await ctx.db.xeroDayLimitObservation.deleteMany({ where: { tenantId: tenant } })
+    await cleanup(ctx, order.id)
+  }
+})
+
+test('o3d-hvzdx AGE-OUT: a request that has waited 14 days without a fetch is handed to a person even while the budget stays low, leaving the waiting cap; one a fetch holds is left alone', { skip }, async () => {
+  const ctx = await setup()
+  const [old, leased, young, next] = await Promise.all([seedOrder(ctx), seedOrder(ctx), seedOrder(ctx), seedOrder(ctx)])
+  try {
+    await withSettings(ctx, { invoice_documents_lazy_fetch_enabled: 'true', invoice_documents_lazy_outstanding_cap: '3' }, async () => {
+      for (const o of [old, leased, young]) assert.equal((await ctx.onDemand.requestInvoiceDocumentOnDemand({ orderId: o.id, kind: 'INVOICE' })).status, 'preparing')
+      const fifteenDaysAgo = new Date(Date.now() - 15 * DAY)
+      await ctx.db.invoiceDocumentFetchState.updateMany({ where: { orderId: { in: [old.id, leased.id] } }, data: { customerRequestedAt: fifteenDaysAgo } })
+      await ctx.db.invoiceDocumentFetchState.updateMany({ where: { orderId: leased.id }, data: { leaseUntil: new Date(Date.now() + 5 * 60_000), leaseHolder: 'a-running-fetch' } })
+      const full = await ctx.onDemand.requestInvoiceDocumentOnDemand({ orderId: next.id, kind: 'INVOICE' })
+      assert.equal(full.status, 'throttled', 'the waiting cap is full')
+
+      const low = ledger([old, leased, young, next])
+      low.deps.dayCallsRemaining = () => ctx.sweep.LAZY_MIN_DAY_CALLS_REMAINING - 1
+      const swept = await ctx.sweep.runInvoiceDocumentSweep(low.deps)
+      assert.equal(swept.lazyDeferred, 'ledger-budget-low')
+      assert.equal(swept.lazyAgedOut, 1)
+      assert.equal(low.calls.lookups.length, 0, 'aging out asks the ledger nothing')
+      const states = await ctx.db.invoiceDocumentFetchState.findMany({ where: { orderId: { in: [old.id, leased.id, young.id] } }, select: { orderId: true, status: true } })
+      const by = new Map(states.map((st) => [st.orderId, st.status]))
+      assert.equal(by.get(old.id), 'NEEDS_ATTENTION')
+      assert.equal(by.get(leased.id), 'PENDING', 'a fetch holding the lease is not aged out from under it')
+      assert.equal(by.get(young.id), 'PENDING')
+      assert.equal(await ctx.db.activityLog.count({ where: { entityId: old.id, action: 'invoice_document_needs_attention' } }), 1)
+      const click = await ctx.onDemand.requestInvoiceDocumentOnDemand({ orderId: old.id, kind: 'INVOICE' })
+      assert.equal(click.status, 'unavailable', 'the aged-out document is answered "not available", not queued again')
+      const queued = await ctx.onDemand.requestInvoiceDocumentOnDemand({ orderId: next.id, kind: 'INVOICE' })
+      assert.ok(queued.status === 'preparing' && queued.queued, 'the waiting cap has room again')
+    })
+  } finally { await cleanup(ctx, old.id, leased.id, young.id, next.id) }
 })
 
 test('nothing is queued for a document that cannot be found, is already stored, or needs a person', { skip }, async () => {
