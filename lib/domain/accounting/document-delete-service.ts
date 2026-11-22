@@ -18,6 +18,7 @@
  * An activity-log entry is written in the same transaction.
  */
 
+import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivityInTransaction } from '@/lib/activity-log'
@@ -523,7 +524,8 @@ export async function completeAccountingDocumentDeletion(externalDocumentId: str
 async function lateActivityOn(tx: Client, deletion: { kind: string; documentId: string; externalDocumentId: string; requestedAt: Date; snapshot?: unknown }): Promise<string[]> {
   const late: string[] = []
   // #1132 MED-4: an invoice or bill UPDATE queued after the request (the request itself refuses while one is open) is activity on the document
-  // too: it was built for a document Xero has now removed. Any row but a cancelled one counts (a failed one may have reached the ledger).
+  // too: it was built for a document Xero has now removed. Every row that may have reached the ledger counts (MAY_HAVE_REACHED_LEDGER_WHERE:
+  // all but a cancellation proven never sent).
   if (deletion.kind === 'SALES_INVOICE') {
     const [payments, refunds, order, updates] = await Promise.all([
       tx.payment.count({ where: { orderId: deletion.documentId } }),
@@ -531,7 +533,7 @@ async function lateActivityOn(tx: Client, deletion: { kind: string; documentId: 
       // soft-delete exception (ledger cascade): includes soft-deleted refunds on purpose, their credit-note and reversal rows are still in the ledger and must be netted.
       tx.salesOrderRefund.count({ where: { orderId: deletion.documentId } }),
       tx.salesOrder.findUnique({ where: { id: deletion.documentId }, select: { paidAt: true } }),
-      tx.accountingSyncLog.count({ where: { type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: deletion.documentId, status: { not: 'CANCELLED' }, createdAt: { gte: deletion.requestedAt } } }),
+      tx.accountingSyncLog.count({ where: { type: 'SALES_INVOICE_UPDATE', referenceType: 'SalesOrder', referenceId: deletion.documentId, createdAt: { gte: deletion.requestedAt }, ...MAY_HAVE_REACHED_LEDGER_WHERE } }),
     ])
     if (payments > 0) late.push(`${payments} payment(s)`)
     if (order?.paidAt && payments === 0) late.push('a paid flag')
@@ -545,8 +547,8 @@ async function lateActivityOn(tx: Client, deletion: { kind: string; documentId: 
       tx.accountingSyncLog.count({ where: { type: 'BILL_PAYMENT', status: { in: ['PENDING', 'PROCESSING', 'SYNCED'] }, referenceId: { in: [deletion.documentId] } } }),
       tx.accountingSyncLog.count({
         where: {
-          type: 'PURCHASE_INVOICE_UPDATE', status: { not: 'CANCELLED' }, createdAt: { gte: deletion.requestedAt },
-          OR: [{ referenceType: 'PurchaseInvoice', referenceId: deletion.documentId }, ...(poId ? [{ referenceType: 'PurchaseOrder', referenceId: poId, payload: { path: ['accountingInvoiceId'], equals: deletion.externalDocumentId } }] : [])],
+          type: 'PURCHASE_INVOICE_UPDATE', createdAt: { gte: deletion.requestedAt },
+          AND: [MAY_HAVE_REACHED_LEDGER_WHERE, { OR: [{ referenceType: 'PurchaseInvoice', referenceId: deletion.documentId }, ...(poId ? [{ referenceType: 'PurchaseOrder', referenceId: poId, payload: { path: ['accountingInvoiceId'], equals: deletion.externalDocumentId } }] : [])] }],
         },
       }),
     ])
