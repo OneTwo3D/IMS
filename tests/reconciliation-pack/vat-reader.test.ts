@@ -5,7 +5,7 @@ import { readImsSnapshot, statementAllowed, type ImsQueryClient } from '../../li
 
 /** The `vat` section of the IMS read (R12's IMS side) over a scripted connection. The SQL itself runs against a real database in the concurrency test. */
 
-type Answers = { orgs?: Array<Record<string, unknown>>; sales?: Array<Record<string, unknown>>; tokens?: Array<Record<string, unknown>>; types?: Array<Record<string, unknown>>; settings?: Array<Record<string, unknown>>; chart?: Array<Record<string, unknown>>; fx?: Array<Record<string, unknown>> }
+type Answers = { orgs?: Array<Record<string, unknown>>; sales?: Array<Record<string, unknown>>; splits?: Array<Record<string, unknown>>; tokens?: Array<Record<string, unknown>>; types?: Array<Record<string, unknown>>; settings?: Array<Record<string, unknown>>; chart?: Array<Record<string, unknown>>; fx?: Array<Record<string, unknown>> }
 function fake(answers: Answers): ImsQueryClient & { sent: Array<{ sql: string; values?: unknown[] }> } {
   const sent: Array<{ sql: string; values?: unknown[] }> = []
   return {
@@ -16,6 +16,7 @@ function fake(answers: Answers): ImsQueryClient & { sent: Array<{ sql: string; v
       if (/pg_current_snapshot/.test(sql)) return { rows: [{ snapshot: '1:2:', read_only: 'on', isolation: 'repeatable read' }] }
       if (/FROM organisations/.test(sql)) return { rows: answers.orgs ?? [{ base: 'GBP' }] }
       if (/FROM sales_order_lines/.test(sql)) return { rows: answers.sales ?? [] }
+      if (/discount_tax_split IS NOT NULL/.test(sql)) return { rows: answers.splits ?? [] }
       if (/FROM accounting_tokens/.test(sql)) return { rows: answers.tokens ?? [{ tenant: 'tenant-1' }] }
       if (/FROM xero_tax_rates/.test(sql)) return { rows: answers.types ?? [] }
       if (/FROM settings/.test(sql)) return { rows: answers.settings ?? [] }
@@ -41,10 +42,12 @@ test('the section carries the base currency, the monthly sales tax per rate, the
     settings: [{ key: 'xero_shipping_account', value: ' 260 ' }, { key: 'xero_sales_account', value: '200' }, { key: 'xero_discount_account', value: '' }],
     chart: [{ n: '1' }],
     fx: [{ external_id: '9001', currency: 'EUR', fx: '1.15000000' }],
+    splits: [{ period: '2026-09', id: 'so-1', discount: '26.0000', split: '[{"taxRateId":"rGB","taxBase":4}]' }],
   })
   assert.deepEqual(section, { ok: true, value: {
     baseCurrency: 'GBP', window: WINDOW,
     sales: [{ period: '2026-08', taxRateId: 'rGB', taxBase: '50.0000', lines: 2, nonZeroLines: 2 }, { period: '2026-09', taxRateId: 'rGB', taxBase: '100.0000', lines: 3, nonZeroLines: 3 }, { period: '2026-09', taxRateId: null, taxBase: '0.0000', lines: 1, nonZeroLines: 0 }],
+    discountSplits: [{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: '[{"taxRateId":"rGB","taxBase":4}]' }],
     xeroTenantId: 'tenant-1', xeroReportTypes: [{ taxType: 'OUTPUT2', reportTaxType: 'OUTPUT' }, { taxType: 'NONE', reportTaxType: null }], shippingAccount: '260', shippingAccountInChart: true, salesAccount: '200', discountAccount: '', wooFx: [{ externalOrderId: '9001', currency: 'EUR', fxRateToBase: '1.15000000' }],
   } })
   // The window is a parameter of the sales statement, and the statement leaves out cancelled and archived orders (the IMS VAT report's own population).
@@ -57,6 +60,10 @@ test('the section carries the base currency, the monthly sales tax per rate, the
   assert.match(sales.sql, /so\.archived = false/)
   assert.match(sales.sql, /SUM\(l\."taxBase"\)/)
   assert.doesNotMatch(sales.sql, /shipping|taxBase.*tax_foreign/i)
+  // The per-rate discount split is read over the SAME population and window (an order booked under the split; header-rate orders have none).
+  const splits = client.sent.find((s) => /discount_tax_split IS NOT NULL/.test(s.sql))!
+  assert.deepEqual(splits.values, [WINDOW.from, WINDOW.toExclusive])
+  for (const clause of [/to_char\(\(so\."invoicedAt" AT TIME ZONE 'UTC'\) AT TIME ZONE 'Europe\/London', 'YYYY-MM'\)/, /so\."invoicedAt" >= \(\$1::date::timestamp AT TIME ZONE 'Europe\/London'\) AT TIME ZONE 'UTC' AND so\."invoicedAt" < \(\$2::date::timestamp AT TIME ZONE 'Europe\/London'\) AT TIME ZONE 'UTC'/, /so\.status::text <> 'CANCELLED'/, /so\.archived = false/]) assert.match(splits.sql, clause)
   for (const { sql } of client.sent) assert.ok(statementAllowed(sql) || /^(BEGIN|ROLLBACK)/.test(sql), sql)
 })
 
@@ -97,6 +104,10 @@ test('a row that cannot be read exactly makes the whole section unreadable: a ba
     ['two settings', { settings: [{ key: 'xero_shipping_account', value: '1' }, { key: 'xero_shipping_account', value: '2' }] }, 'DUPLICATE_KEY'],
     ['fx rate', { fx: [{ external_id: '9', currency: 'EUR', fx: 'x' }] }, 'BAD_VALUE'],
     ['fx duplicate', { fx: [{ external_id: '9', currency: 'EUR', fx: '1.1' }, { external_id: '9', currency: 'EUR', fx: '1.1' }] }, 'DUPLICATE_KEY'],
+    ['split period', { splits: [{ period: '2026-13', id: 'so', discount: '1.0000', split: '[]' }] }, 'SOURCE_UNREADABLE'],
+    ['split discount', { splits: [{ period: '2026-09', id: 'so', discount: '1e3', split: '[]' }] }, 'BAD_VALUE'],
+    ['split not text', { splits: [{ period: '2026-09', id: 'so', discount: '1.0000', split: [] }] }, 'SOURCE_UNREADABLE'],
+    ['split duplicate', { splits: [{ period: '2026-09', id: 'so', discount: '1.0000', split: '[]' }, { period: '2026-09', id: 'so', discount: '1.0000', split: '[]' }] }, 'DUPLICATE_KEY'],
   ]
   for (const [name, answers, reason] of cases) assert.deepEqual((await read(answers)).section, { ok: false, reason }, name)
 })
