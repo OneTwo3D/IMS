@@ -1,0 +1,7 @@
+### Per-event FX rates for purchasing, step 2 of 3: goods received at the Xero prepayment rate (o3d-hqvrp.51)
+- Behind `purchase_event_fx_rates_enabled` (still off by default; keep it off until step 3). Off, or for a base-currency order, nothing changes.
+- On, a foreign order's goods are received at the rate of its supplier prepayment in Xero (Spend Money > Prepayment, Reference = the PO number), read read-only from the Prepayments endpoint once per order (on demand from the new **Xero prepayment exchange rate** panel on the order page, or before the first receipt) within the shared Xero call budget; with no prepayment, at the fx_rates rate in force at the receipt, refused when there is none. Ambiguous prepayments (several, another currency, another contact, an unlinked supplier) and failed reads are refused, never guessed.
+- One helper values all three receipt paths (manual receipt, WMS book-in, WMS align-up): the goods unit cost and rate go on the cost layer, the receipt (`fx_rate_source` XERO_PREPAYMENT or FX_TABLE), the GR/IR RECEIPT row and the STOCK_RECEIPT journal (narration names the rate).
+- Landed-cost recalculation is per layer: a rate-locked layer keeps its goods cost and takes only the freight share; a legacy layer is recalculated exactly as before.
+- While on with Xero sync on, receipts refuse if the Realised FX or Purchase Price Variance account is blank.
+- Migration `20261122190000_purchase_order_fx_locks` (additive, no backfill): table `purchase_order_fx_locks` and `purchase_receipts.fx_rate_source`.

@@ -141,7 +141,8 @@ import {
 } from '@/lib/domain/purchasing/landed-cost-service'
 import { headerDiscountFactorForPo, unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
 import {
-  isPurchaseFxRefusalError, preparePurchaseReceiptFx, purchaseFxLayerFields, resolveReceiptFxValuation, type PrepaymentChecks,
+  isPurchaseFxRefusalError, preparePurchaseReceiptFx, purchaseFxLayerFields, readPurchaseOrderPrepaymentOnDemand, resolveReceiptFxValuation,
+  type OnDemandPrepaymentResult, type PrepaymentChecks,
 } from '@/lib/domain/purchasing/purchase-receipt-fx'
 import {
   assertFreightTotalNotNegative,
@@ -3470,6 +3471,40 @@ export async function receivePurchaseOrder(
     })
     // Per-event FX refusals carry an operator remedy: return the message itself, not the error's class name.
     if (isPurchaseFxRefusalError(e) || isMissingFxRateError(e)) return { success: false, error: e.message }
+    return { success: false, error: String(e) }
+  }
+}
+
+/**
+ * Per-event FX rates for purchasing (o3d-hqvrp.51 step 2): read this order's supplier prepayment from Xero NOW (Purchase order > Xero prepayment >
+ * Read from Xero), READ-ONLY, and lock the order's goods at its rate. The rules (one prepayment, the supplier's contact, the order's currency; a lock
+ * a receipt has used is never replaced) are lib/domain/purchasing/purchase-receipt-fx.ts `readPurchaseOrderPrepaymentOnDemand`. Refused while the
+ * switch is off. Finance permission: it fixes what the order's stock will cost.
+ */
+export async function readPurchaseOrderXeroPrepayment(poId: string): Promise<{ success: boolean; error?: string; result?: OnDemandPrepaymentResult }> {
+  try {
+    const session = await requirePermission('purchasing.invoice')
+    const parsed = z.string().trim().min(1).max(64).safeParse(poId)
+    if (!parsed.success) return { success: false, error: 'Invalid purchase order id' }
+    const result = await readPurchaseOrderPrepaymentOnDemand(parsed.data, session.user.id)
+    if (result.status === 'refused') return { success: false, error: result.reason, result }
+    const changed = result.status === 'locked' ? result.changed : result.removedUnusedLock
+    if (changed) {
+      await logActivity({
+        entityType: 'PURCHASE_ORDER',
+        entityId: parsed.data,
+        action: result.status === 'locked' ? 'xero_prepayment_rate_locked' : 'xero_prepayment_rate_lock_removed',
+        tag: 'purchase',
+        level: 'INFO',
+        description: result.status === 'locked'
+          ? `Locked the goods exchange rate at ${result.rateToBase} from Xero prepayment ${result.xeroPrepaymentId} (${result.prepaymentDate})`
+          : 'Removed an unused exchange-rate lock: Xero no longer holds a live prepayment for this order',
+        metadata: { ...result },
+      })
+      revalidatePath(`/purchase-orders/${parsed.data}`)
+    }
+    return { success: true, result }
+  } catch (e) {
     return { success: false, error: String(e) }
   }
 }

@@ -15,7 +15,9 @@ import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib
  *
  * SIGN: CREDIT-POSITIVE. `baseDelta` > 0 raises the GR/IR liability, < 0 lowers it.
  *
- *   RECEIPT               +  received qty x PO goods unit cost, 6dp.      Written with the stock, the layer and the receipt journal.
+ *   RECEIPT               +  received qty x PO goods unit cost, 6dp.      Written with the stock, the layer and the receipt journal. With per-event
+ *                            FX on (`purchase_event_fx_rates_enabled`), a foreign order's receipt is credited at the rate-locked goods unit cost its
+ *                            layers carry instead (`goodsUnitCostByLine`); bills, returns and credit notes stay at the PO valuation until step 3.
  *   BILL                  -  billed qty x PO goods unit cost.             Written with the bill. Only goods lines (a freight cost line is not here).
  *   BILL_UPDATE           -  the signed delta of an edited bill's goods quantity, valued the same way.
  *   SUPPLIER_RETURN       -  returned qty x PO goods unit cost: reverses the receipt portion. Written with the return.
