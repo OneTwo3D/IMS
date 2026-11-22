@@ -52,6 +52,8 @@ export const ACCOUNT_FIELDS: AccountFieldDef[] = [
   { suffix: 'accounts_payable_account', label: 'Accounts Payable', description: 'Your Accounts Payable control account — used as the control side of realised and unrealised FX journals on foreign-currency supplier balances' },
   { suffix: 'realised_fx_gain_loss_account', label: 'Realised FX Gain/Loss', description: 'P&L account for settlement-rate variances' },
   { suffix: 'unrealised_fx_gain_loss_account', label: 'Unrealised FX Gain/Loss', description: 'Account for open AR/AP revaluation journals' },
+  // Xero-only: the per-event FX purchase journals are the Xero connector's (no quickbooks_* key).
+  { suffix: 'purchase_price_variance_account', label: 'Purchase Price Variance', description: 'P&L (cost of sales) account for a small difference between a supplier bill and the order price. Used only while per-event FX rates for purchasing are switched on; leave blank otherwise. Must differ from Stock in Transit, GR/IR and Inventory Asset.', connectors: ['xero'] },
 ]
 
 export const SYNC_TYPE_TOGGLES: AccountFieldDef[] = [
@@ -93,6 +95,23 @@ export function settingKeyFor(connectorId: AccountingConnectorId, suffix: string
  * if they do. Pure data so the rule is reviewable next to the fields it governs.
  */
 const MUST_BE_DISTINCT: Array<{ a: string; b: string; why: string }> = [
+  {
+    a: 'transit_account',
+    b: 'purchase_price_variance_account',
+    why:
+      'the purchase price variance journal moves value from Stock in Transit to the variance account, so on one code it would post a journal that nets to ' +
+      'nothing and the price difference would stay in Stock in Transit',
+  },
+  {
+    a: 'grir_account',
+    b: 'purchase_price_variance_account',
+    why: 'GR/IR holds goods received and not billed; a price difference written to it would read as an open accrual that no bill ever clears',
+  },
+  {
+    a: 'inventory_account',
+    b: 'purchase_price_variance_account',
+    why: 'a price difference at or below the capitalise threshold is an expense, never stock cost; on the inventory code it would revalue stock the layers do not hold',
+  },
   {
     a: 'transit_account',
     b: 'grir_account',

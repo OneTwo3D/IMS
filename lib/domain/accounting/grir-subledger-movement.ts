@@ -28,15 +28,11 @@ import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib
  *                         variance or landed-cost path exists for a bill whose price differs from the order, so it is kept as its own movement,
  *                         OUTSIDE the GR/IR balance and outside the Xero reclass: the difference stays on Stock in Transit as it always has (the bill
  *                         debits transit at the billed price, the receipt credits it at the PO valuation), now visible per order instead of buried.
- *   BILL_FX_VARIANCE      per-event FX (switch `purchase_event_fx_rates_enabled`): the base-currency difference between valuing the billed goods
- *                         at the bill date's rate and at the receipt date's rate (positive = the bill costs more in base currency). THE FX
- *                         DIFFERENCE, the realised FX gain or loss between receipt and bill. A variance like the price difference: OUTSIDE the
- *                         balance and outside the reclass. RESERVED: no writer yet (the bill-date valuation is a later step); every reader
- *                         already treats it as a variance, so the first row cannot be misread as an accrual.
- *
- * PER-EVENT FX, RECEIPT SIDE. With `purchase_event_fx_rates_enabled` on, a RECEIPT is valued at the goods unit cost of its own business date's rate
- * (the receipt passes it as `goodsUnitCostByLine`, the same 6dp figure its cost layer stores as `goodsUnitCostBase`). Off, nothing is passed and every
- * row is the PO valuation, exactly as before.
+ *   BILL_FX_VARIANCE      per-event FX (switch `purchase_event_fx_rates_enabled`): the base-currency difference between the rate the received
+ *                         goods were valued at and the rate the bill is valued at (positive = the bill costs more in base currency). THE FX
+ *                         DIFFERENCE. A variance like the price difference: OUTSIDE the balance and outside the reclass. RESERVED: no writer
+ *                         yet (the valuation is a later step); every reader already treats it as a variance, so the first row cannot be
+ *                         misread as an accrual.
  *
  * `baseDelta` is written at 6dp; the balance is the sum of the BALANCE source types. Idempotent on `idempotencyKey` (first write wins), so a
  * replayed source event records exactly once. Every writer calls this INSIDE the transaction of its source event, and records whether or not the
@@ -136,25 +132,9 @@ function sumByLine(lines: ReadonlyArray<{ poLineId: string; qty: DecimalInput }>
  */
 export async function recordGrirReceipt(
   client: GrirClient,
-  input: {
-    poId: string
-    sourceRef: string
-    keyBase: string
-    at: Date
-    journalDate?: Date | string
-    lines: ReadonlyArray<{ poLineId: string; qty: DecimalInput }>
-    /**
-     * Per-event FX: the goods unit cost of THIS receipt per order line (its business date's rate), the figure its cost layer stores. A line it
-     * names is valued at it; a line it does not name (or no map at all, the switch off) is valued at the PO goods unit cost as before.
-     */
-    goodsUnitCostByLine?: ReadonlyMap<string, Decimal>
-  },
+  input: { poId: string; sourceRef: string; keyBase: string; at: Date; journalDate?: Date | string; lines: ReadonlyArray<{ poLineId: string; qty: DecimalInput }> },
 ): Promise<void> {
-  const poValuation = await loadGrirPoValuation(client, input.poId)
-  const override = input.goodsUnitCostByLine
-  const valuation: GrirPoValuation = override && override.size > 0
-    ? { supplierId: poValuation.supplierId, goodsUnitCostByLine: new Map([...poValuation.goodsUnitCostByLine].map(([id, unit]) => [id, override.get(id) ?? unit])) }
-    : poValuation
+  const valuation = await loadGrirPoValuation(client, input.poId)
   for (const [poLineId, qty] of sumByLine(input.lines)) {
     if (qty.lte(0)) continue
     await writeGrirMovement(client, {

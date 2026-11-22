@@ -1246,9 +1246,14 @@ type GrirGroupRow = {
  * days from the oldest source event of any line or credit that still has a balance to the as-of date. `dateFrom` plays no part: a balance is cumulative.
  * Orders whose every figure is zero are not listed.
  */
-/** The balance source types the GR/IR report sums (a literal, held equal to GRIR_BALANCE_SOURCE_TYPES by tests/accounting/purchase-event-fx-census.test.ts). */
-const GRIR_REPORT_BALANCE_SOURCE_TYPES: ReadonlySet<string> = new Set(['RECEIPT', 'BILL', 'BILL_UPDATE', 'SUPPLIER_RETURN', 'SUPPLIER_CREDIT_NOTE', 'OPENING_BALANCE'])
-export const GRIR_REPORT_KNOWN_SOURCE_TYPES: readonly string[] = [...GRIR_REPORT_BALANCE_SOURCE_TYPES, 'BILL_PRICE_VARIANCE', 'BILL_FX_VARIANCE']
+/**
+ * The GR/IR sub-ledger source types this report knows: the ones it sums into the balance, and the two variances it shows beside it. Literals (this module
+ * does not import the sub-ledger writer); tests/accounting/purchase-event-fx-census.test.ts holds them equal to GRIR_BALANCE_SOURCE_TYPES and
+ * GRIR_VARIANCE_SOURCE_TYPES in lib/domain/accounting/grir-subledger-movement.ts, so a new source type cannot be added without this report learning it.
+ */
+export const GRIR_REPORT_BALANCE_SOURCE_TYPES: readonly string[] = ['RECEIPT', 'BILL', 'BILL_UPDATE', 'SUPPLIER_RETURN', 'SUPPLIER_CREDIT_NOTE', 'OPENING_BALANCE']
+export const GRIR_REPORT_VARIANCE_SOURCE_TYPES: readonly string[] = ['BILL_PRICE_VARIANCE', 'BILL_FX_VARIANCE']
+const GRIR_REPORT_BALANCE_SET: ReadonlySet<string> = new Set(GRIR_REPORT_BALANCE_SOURCE_TYPES)
 
 export async function getGrirReport(
   filters: FinanceAnalyticsFilters = {},
@@ -1290,7 +1295,7 @@ export async function getGrirReport(
       byPo.set(group.poId, po)
     }
     const base = toDecimal(group._sum.baseDelta)
-    // EXHAUSTIVE over the sub-ledger's source types (GRIR_SOURCE_TYPES in lib/domain/accounting/grir-subledger-movement.ts): the two variances are
+    // EXHAUSTIVE over the sub-ledger's source types (GRIR_REPORT_*_SOURCE_TYPES above): the two variances are
     // outside the balance, every other known type is a balance movement, and a type this report does not know is refused rather than summed.
     if (group.sourceType === 'BILL_PRICE_VARIANCE') {
       po.variance = po.variance.add(base)
@@ -1300,7 +1305,7 @@ export async function getGrirReport(
       po.fxVariance = po.fxVariance.add(base)
       continue
     }
-    if (!GRIR_REPORT_BALANCE_SOURCE_TYPES.has(group.sourceType)) {
+    if (!GRIR_REPORT_BALANCE_SET.has(group.sourceType)) {
       throw new Error(`GR/IR report: the sub-ledger holds a movement of source type ${JSON.stringify(group.sourceType)}, which this report does not know; nothing is reported rather than a wrong balance`)
     }
     if (group.sourceType === 'SUPPLIER_CREDIT_NOTE') po.creditsShown = po.creditsShown.add(base)

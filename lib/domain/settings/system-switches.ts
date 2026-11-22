@@ -43,6 +43,11 @@ export type SwitchDefinition = {
   readonly stampOnKey?: string
   /** Turning ON is refused by this interlock (run by the command, which may read the store; the registry stays free of the database client). */
   readonly turnOnInterlock?: 'storefront-customer-email'
+  /**
+   * Turning ON is refused while `whenKey` is `whenValue` and any of `settings` is blank (unset or only spaces). Settings rows only, so it is checked here,
+   * in the dry run and again inside the write transaction.
+   */
+  readonly requiresMappedSettings?: { whenKey: string; whenValue: string; settings: ReadonlyArray<{ key: string; label: string }>; why: string }
 }
 
 const BOOLEAN_VALUES = ['true', 'false'] as const
@@ -76,6 +81,13 @@ export const SALES_DISCOUNT_APPORTION_KEY = 'sales_order_discount_tax_apportion_
 // Literals for the same reason; tests/settings-cli.test.ts holds them equal to lib/domain/storefront-customer-email/constants.ts.
 export const STOREFRONT_EMAIL_SWITCH_KEY = 'storefront_customer_email_enabled'
 export const STOREFRONT_EMAIL_ENABLED_AT_KEY = 'storefront_customer_email_enabled_at'
+
+// PER-EVENT FX RATES FOR PURCHASING (o3d-hqvrp.51). The master switch, off by default; while it is off no purchase posting or valuation changes. Turning it on is
+// refused while Xero sync is on and either account the variances post to is unmapped (literals, not imports of lib/connectors/xero/settings.ts: that module
+// reads the store; tests/settings-cli.test.ts holds them equal to its keys).
+export const PURCHASE_EVENT_FX_SWITCH_KEY = 'purchase_event_fx_rates_enabled'
+export const PURCHASE_PRICE_VARIANCE_ACCOUNT_KEY = 'xero_purchase_price_variance_account'
+export const REALISED_FX_ACCOUNT_KEY = 'xero_realised_fx_gain_loss_account'
 
 // The first-load archive command's write switch (scripts/first-load-<wms>-archive.ts reads it from the target with the import proof, `=== 'true'`).
 // Off by default; turned on only at the owner's go for the one run at the cut-over, and back off afterwards. ADMIN: it lets a command write to the LIVE warehouse.
@@ -114,6 +126,19 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   booleanSwitch(ASN_SUPPLIER_REQUIRED_KEY, [ASN_REQUIRED_NEEDS_SEND], true),
   { ...booleanSwitch(STOREFRONT_EMAIL_SWITCH_KEY), stampOnKey: STOREFRONT_EMAIL_ENABLED_AT_KEY, turnOnInterlock: 'storefront-customer-email' },
   booleanSwitch(FIRST_LOAD_WMS_ARCHIVE_SWITCH_KEY, undefined, true),
+  // ADMIN: it changes how purchase receipts and bills are valued in the LIVE ledger.
+  {
+    ...booleanSwitch(PURCHASE_EVENT_FX_SWITCH_KEY, undefined, true),
+    requiresMappedSettings: {
+      whenKey: 'xero_sync_enabled',
+      whenValue: 'true',
+      settings: [
+        { key: REALISED_FX_ACCOUNT_KEY, label: 'Realised FX Gain/Loss' },
+        { key: PURCHASE_PRICE_VARIANCE_ACCOUNT_KEY, label: 'Purchase Price Variance' },
+      ],
+      why: 'the per-event FX journals post the FX difference to the realised FX account and the bill-vs-order price difference to the purchase price variance account',
+    },
+  },
 ]
 
 export const SYSTEM_SWITCH_KEYS: readonly string[] = SYSTEM_SWITCHES.map((s) => s.key)
@@ -168,6 +193,20 @@ type ReadClient = { setting: { findUnique(args: { where: { key: string } }): Pro
  */
 export async function crossKeyRefusal(client: ReadClient, def: SwitchDefinition, proposed: string): Promise<string | null> {
   if (isOn(def, proposed)) {
+    const mapped = def.requiresMappedSettings
+    if (mapped) {
+      const when = await client.setting.findUnique({ where: { key: mapped.whenKey } })
+      if (when?.value === mapped.whenValue) {
+        const missing: string[] = []
+        for (const setting of mapped.settings) {
+          const row = await client.setting.findUnique({ where: { key: setting.key } })
+          if (!row?.value?.trim()) missing.push(`${setting.label} (${setting.key})`)
+        }
+        if (missing.length > 0) {
+          return `${def.key} cannot be turned on while ${mapped.whenKey} is ${mapped.whenValue} and ${missing.join(' and ')} ${missing.length === 1 ? 'is' : 'are'} not mapped: ${mapped.why}. Map ${missing.length === 1 ? 'it' : 'them'} first (Sync > Accounting settings).`
+        }
+      }
+    }
     for (const req of def.requires ?? []) {
       const reqDef = findSwitch(req.key)!
       const row = await client.setting.findUnique({ where: { key: req.key } })

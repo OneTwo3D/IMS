@@ -51,7 +51,7 @@ const SET = ['--by', 'jan', '--reason', 'switchover step M']
 test('allowlist contains exactly the switches that exist on development, and none is a credential', () => {
   assert.deepEqual([...SYSTEM_SWITCH_KEYS].sort(), [
     'first_load_mintsoft_archive_enabled', 'mintsoft_asn_send_supplier_enabled', 'mintsoft_asn_supplier_required', 'mintsoft_parent_sku_delete_enabled',
-    'mintsoft_product_parity_enabled', 'mintsoft_supplier_create_enabled', 'sales_order_discount_tax_apportion_enabled', 'storefront_customer_email_enabled', 'trackship_refire_enabled', 'wc_invoice_document_enabled',
+    'mintsoft_product_parity_enabled', 'mintsoft_supplier_create_enabled', 'purchase_event_fx_rates_enabled', 'sales_order_discount_tax_apportion_enabled', 'storefront_customer_email_enabled', 'trackship_refire_enabled', 'wc_invoice_document_enabled',
     'wc_invoice_note_enabled', 'wc_order_amendment_unpaid_rewrite_enabled', 'wc_order_amendment_write_enabled', 'wc_refund_credit_note_parity_enabled', 'wc_withdrawal_outcome_enabled', 'wms_despatch_date_enabled', 'wms_despatch_quantity_check_enabled', 'wms_merge_candidate_mode',
     'wms_merge_hold_enabled', 'wms_mixed_warehouse_push_enabled', 'wms_refund_remainder_task_enabled', 'wms_sku_rename_remap_enabled', 'xero_credit_note_allocation_enabled', 'xero_credit_note_duplicate_check_enabled',
   ])
@@ -266,4 +266,61 @@ test('the storefront e-mail registry keys equal the constants the readers use', 
   const sw = await import('../lib/domain/settings/system-switches')
   assert.equal(sw.STOREFRONT_EMAIL_SWITCH_KEY, c.STOREFRONT_CUSTOMER_EMAIL_SETTING_KEY)
   assert.equal(sw.STOREFRONT_EMAIL_ENABLED_AT_KEY, c.STOREFRONT_CUSTOMER_EMAIL_ENABLED_AT_KEY)
+})
+
+// o3d-hqvrp.51: per-event FX rates for purchasing. Off by default, ADMIN, and refused on while Xero sync is on and an account the variances post to is unmapped.
+test('purchase_event_fx_rates_enabled: off by default and ADMIN; its account keys are the Xero connector\'s', async () => {
+  const def = findSwitch('purchase_event_fx_rates_enabled')!
+  assert.equal(def.defaultValue, 'false')
+  assert.equal(def.adminOnly, true)
+  const { XERO_SETTING_KEYS } = await import('../lib/connectors/xero/settings')
+  const { PURCHASE_PRICE_VARIANCE_ACCOUNT_KEY, REALISED_FX_ACCOUNT_KEY } = await import('../lib/domain/settings/system-switches')
+  assert.ok(XERO_SETTING_KEYS.includes(PURCHASE_PRICE_VARIANCE_ACCOUNT_KEY))
+  assert.ok(XERO_SETTING_KEYS.includes(REALISED_FX_ACCOUNT_KEY))
+  assert.deepEqual(def.requiresMappedSettings!.settings.map((s) => s.key), [REALISED_FX_ACCOUNT_KEY, PURCHASE_PRICE_VARIANCE_ACCOUNT_KEY])
+  const { isPurchaseEventFxEnabled } = await import('../lib/domain/purchasing/purchase-event-fx-settings')
+  const reader = (value: string | null) => ({ setting: { findUnique: async () => (value === null ? null : { value }) } })
+  assert.equal(await isPurchaseEventFxEnabled(reader(null)), false)
+  for (const off of ['false', 'TRUE', '1', ' true']) assert.equal(await isPurchaseEventFxEnabled(reader(off)), false, off)
+  assert.equal(await isPurchaseEventFxEnabled(reader('true')), true)
+})
+
+const FX_ON = ['--key', 'purchase_event_fx_rates_enabled', '--value', 'true', ...SET, '--yes', '--confirm-admin']
+
+test('purchase_event_fx_rates_enabled: refused on while Xero sync is on and the realised FX or PPV account is unmapped, in the dry run and with --yes; nothing is written (MUTATION: drop the check => red)', async () => {
+  for (const [name, rows, missing] of [
+    ['both unmapped', { xero_sync_enabled: 'true' }, /Realised FX Gain\/Loss.*and Purchase Price Variance/],
+    ['PPV unmapped', { xero_sync_enabled: 'true', xero_realised_fx_gain_loss_account: '499' }, /Purchase Price Variance \(xero_purchase_price_variance_account\) is not mapped/],
+    ['realised FX blank', { xero_sync_enabled: 'true', xero_realised_fx_gain_loss_account: '  ', xero_purchase_price_variance_account: '510' }, /Realised FX Gain\/Loss \(xero_realised_fx_gain_loss_account\) is not mapped/],
+  ] as const) {
+    for (const argv of [FX_ON.slice(0, -2), FX_ON]) {
+      const f = fakeDb({ ...rows })
+      const r = await run('set', argv, f)
+      assert.equal(r.code, 3, `${name}: ${r.out}`)
+      assert.match(r.err, missing, name)
+      assert.equal(f.settings.get('purchase_event_fx_rates_enabled'), undefined, name)
+      assert.equal(f.audits.length, 0, name)
+    }
+  }
+})
+
+test('purchase_event_fx_rates_enabled: turns on when both accounts are mapped, or when Xero sync is off; turning it off is never refused', async () => {
+  const mapped = fakeDb({ xero_sync_enabled: 'true', xero_realised_fx_gain_loss_account: '499', xero_purchase_price_variance_account: '510' })
+  const on = await run('set', FX_ON, mapped)
+  assert.equal(on.code, 0, on.err)
+  assert.equal(mapped.settings.get('purchase_event_fx_rates_enabled')!.value, 'true')
+  const syncOff = fakeDb({ xero_sync_enabled: 'false' })
+  assert.equal((await run('set', FX_ON, syncOff)).code, 0)
+  const unmappedButOn = fakeDb({ xero_sync_enabled: 'true', purchase_event_fx_rates_enabled: 'true' })
+  const off = await run('set', ['--key', 'purchase_event_fx_rates_enabled', '--value', 'false', ...SET, '--yes', '--confirm-admin'], unmappedButOn)
+  assert.equal(off.code, 0, off.err)
+  assert.equal(unmappedButOn.settings.get('purchase_event_fx_rates_enabled')!.value, 'false')
+})
+
+test('purchase_event_fx_rates_enabled: the write transaction re-checks the accounts (an unmapping committed after the dry run still refuses)', async () => {
+  const { writeSwitch } = await import('../lib/domain/settings/system-switches')
+  const f = fakeDb({ xero_sync_enabled: 'true', xero_realised_fx_gain_loss_account: '499' })
+  const result = await writeSwitch(f.db as never, { def: findSwitch('purchase_event_fx_rates_enabled')!, value: 'true', by: 'jan', reason: 'test', adminConfirmed: true })
+  assert.equal(result.ok, false)
+  assert.equal(f.settings.get('purchase_event_fx_rates_enabled'), undefined)
 })

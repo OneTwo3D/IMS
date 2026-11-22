@@ -37,6 +37,10 @@ import { roundQuantity, type DecimalInput } from '@/lib/domain/math/decimal'
  *                                  DR transit / CR COGS; + the dispatch-cost value of the units.
  *   - GRIR_RECLASS              — the daily-batch GR/IR reclass (behind `grir_xero_posting_enabled`): DR transit / CR GR/IR when goods received
  *                                  not billed rose, the reverse when it fell; signed. The sourceRef is the batch reference, no order.
+ *   - PURCHASE_FX_VARIANCE      — per-event FX (switch `purchase_event_fx_rates_enabled`): the GBP manual journal between Stock in Transit and the
+ *                                  realised FX or purchase price variance account that clears the difference a bill leaves in transit when it
+ *                                  is valued at another rate or price than the goods; signed. The sourceRef is the purchase order id. RESERVED:
+ *                                  no writer yet; every reader already knows it.
  *
  * `baseDelta` is the signed base-currency transit movement at the highest precision
  * the source carries. Idempotent on `idempotencyKey` (the transit-affecting
@@ -44,17 +48,21 @@ import { roundQuantity, type DecimalInput } from '@/lib/domain/math/decimal'
  * write wins. A single journal that also moves COGS (LANDED_COST_CONSUMED_OFFSET)
  * writes to BOTH subledger tables under the same key without collision.
  */
-export type TransitSubledgerMovementSource =
-  | 'PURCHASE_BILL'
-  | 'PURCHASE_BILL_UPDATE'
-  | 'SUPPLIER_CREDIT_NOTE'
-  | 'STOCK_RECEIPT'
-  | 'LANDED_COST_RECLASS'
-  | 'LANDED_COST_CONSUMED_OFFSET'
-  | 'PURCHASE_ORDER_CANCEL'
-  | 'SUPPLIER_RETURN'
-  | 'CUSTOMER_RETURN_IN_TRANSIT'
-  | 'GRIR_RECLASS'
+/** Every source type the sub-ledger records. The reconciliation pack keeps its own literal list (TRANSIT_SOURCE_TYPES); a test holds the two equal. */
+export const TRANSIT_SUBLEDGER_SOURCE_TYPES = [
+  'PURCHASE_BILL',
+  'PURCHASE_BILL_UPDATE',
+  'SUPPLIER_CREDIT_NOTE',
+  'STOCK_RECEIPT',
+  'LANDED_COST_RECLASS',
+  'LANDED_COST_CONSUMED_OFFSET',
+  'PURCHASE_ORDER_CANCEL',
+  'SUPPLIER_RETURN',
+  'CUSTOMER_RETURN_IN_TRANSIT',
+  'GRIR_RECLASS',
+  'PURCHASE_FX_VARIANCE',
+] as const
+export type TransitSubledgerMovementSource = (typeof TRANSIT_SUBLEDGER_SOURCE_TYPES)[number]
 
 type TransitSubledgerMovementClient = Pick<Prisma.TransactionClient, 'transitSubledgerMovement'>
 

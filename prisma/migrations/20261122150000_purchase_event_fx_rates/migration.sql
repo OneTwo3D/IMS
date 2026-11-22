@@ -1,7 +1,7 @@
--- Per-event FX rates for purchasing, step 1-2 (behind the system switch `purchase_event_fx_rates_enabled`, default off).
--- A goods receipt is valued at the exchange rate of its own business date (fx_rates), not the PO rate, and the layer it lays
--- remembers its goods unit cost and that rate so the landed-cost recalculation revalues it per layer.
--- Additive only: three nullable columns, no default, no backfill (production is reinstalled; a NULL row is valued as before).
+-- Per-event FX rates for purchasing, step 1 (behind the system switch `purchase_event_fx_rates_enabled`, default off).
+-- Reserved columns for the rate that values a receipt's goods and the goods unit cost it gave each cost layer, so a later landed-cost
+-- recalculation can revalue per layer. Nothing writes them yet; a NULL row is valued exactly as before.
+-- Additive only: three nullable columns, no default, no backfill (production is reinstalled).
 -- The new GR/IR source type BILL_FX_VARIANCE and transit source type PURCHASE_FX_VARIANCE are TEXT values (no enum, no CHECK).
 
 ALTER TABLE "cost_layers" ADD COLUMN "goods_unit_cost_base" DECIMAL(18,6);
