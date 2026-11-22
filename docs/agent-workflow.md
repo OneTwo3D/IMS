@@ -109,7 +109,7 @@ that touches it. See docs/development.md, "Database-backed tiers".
 
 ## Documentation Updates
 
-Documentation is part of the change, not a later cleanup, and it is mandatory: the `docs-required` CI check fails a PR that changes behaviour-bearing code without changing `docs/` or `help-docs/` (or carrying a reasoned `Docs: none — <reason>` line in its changelog.d fragment). Code is the source of truth: where a doc disagrees with the code, fix the doc; if the code looks wrong, file a bead. The rule, the exact paths and the opt-out are in docs/development.md, "Documentation Updates". For every PR, check whether the change affects:
+Documentation is part of the change, not a later cleanup, and it is mandatory: the `docs-required` CI check fails a PR that changes behaviour-bearing code without a docs change, unless its changelog.d fragment carries a reasoned `Docs: none — <reason>` line. Code is the source of truth: where a doc disagrees with the code, fix the doc; if the code looks wrong, file a bead. The single list of paths, exclusions and opt-out rules is docs/development.md, "Documentation Updates". For every PR, check whether the change affects:
 
 - `README.md` for high-level user or setup entry points
 - `docs/development.md` for agent/developer workflow, validation, and guardrails

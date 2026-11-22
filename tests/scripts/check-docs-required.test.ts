@@ -7,11 +7,12 @@
  */
 import assert from 'node:assert/strict'
 import { execFileSync, spawnSync } from 'node:child_process'
-import { mkdirSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 
 import {
+  CI_ONLY_GUARDS,
   evaluateDocsRequired,
   findOptOuts,
   isBehaviourPath,
@@ -43,6 +44,11 @@ test('behaviour-bearing paths', () => {
     'proxy.ts',
     'next.config.ts',
     'instrumentation.ts',
+    'sentry.server.config.ts',
+    'sentry.edge.config.ts',
+    'prisma.config.ts',
+    'prisma/seed.ts',
+    'Dockerfile',
   ]) assert.equal(isBehaviourPath(p), true, p)
 })
 
@@ -60,6 +66,7 @@ test('narrow exclusions and non-behaviour paths', () => {
     'lib/releases.ts',
     'scripts/check-docs-required.mjs',
     'scripts/check-producer-census.ts',
+    'scripts/check-migration-conventions.mjs',
     'scripts/producer-census-declarations.ts',
     'scripts/ledger-standing-reader-declarations.mjs',
     'scripts/decimal-boundary-targets.json',
@@ -74,17 +81,17 @@ test('narrow exclusions and non-behaviour paths', () => {
     'CHANGELOG.md',
     'changelog.d/x.md',
     'types/next-auth.d.ts',
-    'prisma/seed.ts',
     'public/logo.png',
   ]) assert.equal(isBehaviourPath(p), false, p)
-  // Exclusions are anchored: a file merely NAMED like a tool elsewhere is still behaviour.
+  // Exclusions are anchored and explicit: a file merely NAMED like a tool elsewhere is still behaviour.
+  assert.equal(isBehaviourPath('scripts/check-new-guard.mjs'), true, 'a new check-* script is behaviour until listed as CI-only')
   assert.equal(isBehaviourPath('lib/check-stock.ts'), true)
   assert.equal(isBehaviourPath('lib/releases-view.ts'), true)
   assert.equal(isBehaviourPath('scripts/sub/check-x.ts'), true)
 })
 
 test('documentation paths', () => {
-  for (const p of ['docs/sales.md', 'docs/agent/env-vars.md', 'help-docs/sales.md', 'README.md', 'deploy/README.md'])
+  for (const p of ['docs/sales.md', 'docs/agent/env-vars.md', 'help-docs/sales.md', 'README.md', 'deploy/README.md', '.env.example'])
     assert.equal(isDocPath(p), true, p)
   for (const p of ['docs/scratch/x.md', 'docs/todo/plan.md', 'docs/completed/p.md', 'docs/archive/a.md', 'CHANGELOG.md',
     'changelog.d/x.md', 'CLAUDE.md', 'AGENTS.md', 'lib/README.md', 'app/docs/page.tsx'])
@@ -311,4 +318,65 @@ test('e2e: PUSH path takes the before SHA from the env or the event payload; bas
   const bad = run(dir, { CI: 'true', DOCS_REQUIRED_BASE_REF: 'deadbeef'.repeat(5) })
   assert.equal(bad.status, 1, bad.out)
   assert.match(bad.out, /Cannot resolve the comparison range/)
+})
+
+// ---- the CI-only guard list cannot drift from what actually ships ---------------------------------------
+const REPO = process.cwd()
+
+function walk(dir: string): string[] {
+  return readdirSync(join(REPO, dir), { withFileTypes: true }).flatMap((e) =>
+    e.isDirectory() ? walk(`${dir}/${e.name}`) : [`${dir}/${e.name}`])
+}
+
+/** The shell scripts and host files that ship and run on installation/production hosts. */
+const SHIPPED_SHELL = [
+  'scripts/deploy.sh',
+  'scripts/update.sh',
+  'scripts/install.sh',
+  ...walk('deploy').filter((f) => !f.startsWith('deploy/tests/') && !f.endsWith('.md')),
+].map((f) => ({ file: f, body: readFileSync(join(REPO, f), 'utf8') }))
+
+function shippedReferences(basename: string): string[] {
+  const stem = basename.replace(/\.[^.]+$/, '').replace(/[.]/g, '\\.')
+  const ext = basename.slice(basename.lastIndexOf('.')).replace(/[.]/g, '\\.')
+  const re = new RegExp(`(^|[^A-Za-z0-9_-])${stem}(${ext})?([^A-Za-z0-9_-]|$)`, 'm')
+  return SHIPPED_SHELL.filter(({ body }) => re.test(body)).map(({ file }) => file)
+}
+
+test('the shipped-shell census is not vacuous (it finds the known production-host gates)', () => {
+  assert.ok(SHIPPED_SHELL.length > 5)
+  for (const f of ['check-db-writers.mjs', 'check-app-db-object-access.mjs', 'check-prisma-drift.mjs', 'check-wms-push-state-enum.mjs'])
+    assert.notDeepEqual(shippedReferences(f), [], `${f} must be found in a shipped shell script`)
+})
+
+test('CI_ONLY_GUARDS is exactly the check:* scripts a workflow runs and no shipped shell script references', () => {
+  const pkg = JSON.parse(readFileSync(join(REPO, 'package.json'), 'utf8')) as { scripts: Record<string, string> }
+  const workflows = readdirSync(join(REPO, '.github/workflows')).map((f) => readFileSync(join(REPO, '.github/workflows', f), 'utf8')).join('\n')
+  const derived = new Set<string>()
+  for (const [name, cmd] of Object.entries(pkg.scripts)) {
+    if (!name.startsWith('check:')) continue
+    const m = /scripts\/(check-[^\s"'/]+)/.exec(cmd)
+    if (!m) continue
+    const runByWorkflow = new RegExp(`npm run ${name}(\\s|$)`, 'm').test(workflows)
+    if (runByWorkflow && shippedReferences(m[1]).length === 0) derived.add(m[1])
+  }
+  assert.deepEqual([...CI_ONLY_GUARDS].sort(), [...derived].sort())
+})
+
+test('every shipped or operator check-* script counts as behaviour', () => {
+  for (const f of walk('scripts').filter((p) => /^scripts\/check-[^/]+$/.test(p))) {
+    const base = f.slice('scripts/'.length)
+    if (!(CI_ONLY_GUARDS as string[]).includes(base)) assert.equal(isBehaviourPath(f), true, f)
+  }
+  for (const f of ['check-db-writers.mjs', 'check-app-db-object-access.mjs', 'check-prisma-drift.mjs', 'check-wms-push-state-enum.mjs', 'check-so.ts', 'check-bom-recipe-consistency.ts'])
+    assert.equal(isBehaviourPath(`scripts/${f}`), true, f)
+})
+
+test('no excluded scripts/ file is referenced by a shipped shell script', () => {
+  const excluded = walk('scripts').filter((f) => !isBehaviourPath(f) && !f.endsWith('.md'))
+  assert.ok(excluded.length > 10, 'the census must see the excluded tooling')
+  for (const f of excluded) {
+    const base = f.slice(f.lastIndexOf('/') + 1)
+    assert.deepEqual(shippedReferences(base), [], `${f} is excluded as tooling but ships`)
+  }
 })

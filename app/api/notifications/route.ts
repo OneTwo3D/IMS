@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { requireApiAuth } from '@/lib/auth/server'
 import { db } from '@/lib/db'
-import { ensureCurrentReleaseNotification } from '@/lib/releases'
+import { ensureCurrentReleaseNotification } from '@/lib/release-notifications'
 import { hasPermission } from '@/lib/permissions'
 import { announceNeedsAttentionThrottled } from '@/lib/domain/needs-attention/loader'
 

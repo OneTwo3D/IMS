@@ -33,7 +33,39 @@ export const BEHAVIOUR_PATHS = [
   { re: /^scripts\//, why: 'operator CLIs, install/update/deploy and one-off scripts that ship (tooling excluded below)' },
   { re: /^deploy\//, why: 'host deploy scripts, systemd units, nginx and env templates' },
   { re: /^(proxy|next\.config|instrumentation|instrumentation-client)\.ts$/, why: 'request proxy, Next config and startup hooks' },
+  { re: /^sentry\.[^/]+\.config\.ts$/, why: 'error-reporting configuration that runs in the app' },
+  { re: /^prisma\.config\.ts$/, why: 'Prisma CLI configuration used by migrate deploy' },
+  { re: /^prisma\/seed\.ts$/, why: 'database seed data' },
+  { re: /^Dockerfile$/, why: 'the container image that ships' },
 ]
+
+/**
+ * The guard scripts that run ONLY as repo tooling: each backs a `check:*` package script that a workflow runs,
+ * and no shipped shell script (scripts/deploy.sh, update.sh, install.sh, deploy/**) references it. Other
+ * `scripts/check-*` files ship and stay behaviour: check-db-writers, check-app-db-object-access,
+ * check-prisma-drift and check-wms-push-state-enum run on production hosts during install/update/deploy;
+ * check-so and check-bom-recipe-consistency are operator CLIs; check-prisma-schema-scope and
+ * check-stock-quantity-constraints back no `check:*` script. tests/scripts/check-docs-required.test.ts derives
+ * this list from package.json, the workflows and the shipped shell scripts and fails when it drifts.
+ */
+export const CI_ONLY_GUARDS = [
+  'check-archive-sealed.mjs',
+  'check-changelog-fragments.mjs',
+  'check-connector-fetch-boundaries.mjs',
+  'check-docs-required.mjs',
+  'check-documented-env-vars.mjs',
+  'check-domain-decimal-boundaries.mjs',
+  'check-fulfillment-requirement-seam.mjs',
+  'check-ledger-standing-readers.mjs',
+  'check-migration-conventions.mjs',
+  'check-producer-census.ts',
+  'check-server-action-auth-bypass.mjs',
+  'check-shadow-readers.ts',
+  'check-system-import-capability.mjs',
+  'check-wc-sync-row-predicates.mjs',
+  'check-wms-connector-boundary.mjs',
+]
+const CI_ONLY_GUARD_RE = new RegExp(`^scripts/(${CI_ONLY_GUARDS.map((f) => f.replace(/[.]/g, '\\.')).join('|')})$`)
 
 /** Narrow exclusions from BEHAVIOUR_PATHS. Nothing else is excluded. */
 export const BEHAVIOUR_EXCLUSIONS = [
@@ -43,7 +75,7 @@ export const BEHAVIOUR_EXCLUSIONS = [
   { re: /\.d\.[cm]?ts$/, why: 'type-only declarations' },
   { re: /\.md$/, why: 'Markdown next to code is documentation, not behaviour' },
   { re: /^lib\/releases\.ts$/, why: 'release notes data, written by the release cut' },
-  { re: /^scripts\/check-[^/]+$/, why: 'CI guard scripts (repo tooling)' },
+  { re: CI_ONLY_GUARD_RE, why: 'CI-only guard scripts (repo tooling; see CI_ONLY_GUARDS)' },
   { re: /^scripts\/[^/]+-declarations\.(ts|mjs)$/, why: 'guard declaration tables (repo tooling)' },
   { re: /^scripts\/(decimal-boundary-targets\.json|documented-env-var-allowlist\.json|archive-sealed-manifest\.tsv)$/, why: 'guard data files (repo tooling)' },
   { re: /^scripts\/[^/]+-e2e-fixture\.ts$/, why: 'e2e test fixtures' },
@@ -56,6 +88,7 @@ export const DOC_PATHS = [
   { re: /^help-docs\//, why: 'user help pages' },
   { re: /^README\.md$/, why: 'top-level setup and feature overview' },
   { re: /^deploy\/README\.md$/, why: 'deploy runbook' },
+  { re: /^\.env\.example$/, why: 'the configuration template' },
 ]
 
 /** Under docs/ but not documentation of current behaviour: plans, notes and archives. */
@@ -151,7 +184,7 @@ export function evaluateDocsRequired({ changedFiles, addedLines }) {
     return { ok: true, behaviour, docs, accepted, lines }
   }
   lines.push(
-    `Docs-required check FAILED: ${behaviour.length} behaviour-bearing file(s) changed, but no file under docs/ or help-docs/ (or README.md, deploy/README.md):`,
+    `Docs-required check FAILED: ${behaviour.length} behaviour-bearing file(s) changed, but no file under docs/ or help-docs/ (or README.md, deploy/README.md, .env.example):`,
     ...behaviour.slice(0, 40).map((b) => `  ${b}`),
     ...(behaviour.length > 40 ? [`  ... and ${behaviour.length - 40} more`] : []),
     'Update every doc this change makes stale (docs/development.md, "Documentation Updates", lists them).',

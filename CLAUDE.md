@@ -28,10 +28,10 @@ npm run lint | type-check | db:seed | db:studio
 ## Rules for every change
 
 ### Documentation (mandatory, CI-enforced)
-- Update the docs in the SAME PR as the code: `docs/**` for developer/operator/architecture behaviour, `help-docs/**` for user-facing screens, labels, actions and support workflows (a flagged, switched-off feature is documented as built and off, not live). Surfaces to check: docs/development.md, "Documentation Updates".
+- Update the docs in the SAME PR as the code: `docs/**` for developer, operator and architecture behaviour, and `help-docs/**` for user-facing screens, labels, actions and support workflows. A flagged feature that is switched off is documented as built and switched off, not as live.
 - Code is the source of truth. Where a doc and the code disagree, fix the doc. If the code looks wrong, file a bead rather than documenting the bug as intended.
-- `npm run check:docs-required` (ungated job `docs-required` in `.github/workflows/static-guards.yml`) fails a PR that changes `app/`, `lib/`, `components/`, `prisma/schema.prisma`, `prisma/migrations/`, shipped `scripts/` or `deploy/` without changing `docs/` or `help-docs/`. Tests, `*.d.ts` and repo tooling are excluded; the exact list is in docs/development.md.
-- Opt-out only when nothing needs documenting: a line `Docs: none — <reason, 20+ characters>` added to the PR's `changelog.d` fragment. A bare `Docs: none` fails; the check prints the accepted reason.
+- `npm run check:docs-required` (ungated job `docs-required` in `.github/workflows/static-guards.yml`) fails a PR that changes behaviour-bearing code without a docs change. If nothing needs documenting, add `Docs: none — <reason>` to the PR's `changelog.d` fragment.
+- The single list of behaviour-bearing paths, exclusions, documentation paths, surfaces to check and opt-out rules is docs/development.md, "Documentation Updates".
 
 ### Naming and imports
 - Files: `kebab-case` (components, actions, routes, utilities, config); UI primitives lowercase; hooks `useX.ts`.
