@@ -19,3 +19,20 @@ export async function pendingDeletionError(documentId: string, client: Client = 
   return `${pending.originalNumber ? `The ${what} ${pending.originalNumber}` : `This ${what}`} is being deleted in IMS and Xero, so payments, credit notes, refunds and edits are refused until the delete finishes. Nothing was changed. Follow the delete in Sync.`
 }
 
+
+/** The fence's refusal, thrown from inside a writer's transaction (after its lock) so the transaction rolls back; the action answers with `message`. */
+export class PendingDocumentDeletionError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'PendingDocumentDeletionError'
+  }
+}
+
+/**
+ * The fence as a writer takes it INSIDE its transaction, after the lock the delete request also takes (the sales order for an invoice; the
+ * purchase order, then the bill, for a bill). Throws PendingDocumentDeletionError when a delete is pending or awaiting review.
+ */
+export async function assertNoPendingDeletion(documentId: string, client: Client): Promise<void> {
+  const refusal = await pendingDeletionError(documentId, client)
+  if (refusal) throw new PendingDocumentDeletionError(refusal)
+}

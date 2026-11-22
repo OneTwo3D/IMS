@@ -16,8 +16,12 @@ type Captured = { created: Array<Record<string, unknown>> }
 const captured: Captured = { created: [] }
 
 let poFixture: Record<string, unknown> = {}
-const fakeDb = {
+const fakeDb: Record<string, unknown> = {
   purchaseOrder: { findUnique: async () => poFixture },
+  // o3d-668a2: the credit note is recorded in a transaction, under the purchase order's lock and the pending-delete fence.
+  $transaction: async <T,>(fn: (tx: unknown) => Promise<T>): Promise<T> => fn(dbProxy),
+  $queryRaw: async () => [],
+  accountingDocumentDeletion: { findFirst: async () => null },
   supplierCreditNote: {
     aggregate: async () => ({ _sum: { amountForeign: null } }),
     create: async (args: { data: Record<string, unknown> }) => { captured.created.push(args.data); return { id: 'cn-1' } },

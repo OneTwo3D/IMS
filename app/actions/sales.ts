@@ -1338,9 +1338,11 @@ async function prepareSalesOrderWrite(input: CreateSoInput, options?: { pinnedFx
   if (!taxValidation.success) return { ok: false as const, error: taxValidation.error }
 
   const apportionDiscountTax = (await getSettingValue('sales_order_discount_tax_apportion_enabled')) === 'true'
-  // The discount's per-rate split is keyed by the rate id: a line that names none cannot be placed on a rate, so such an order is refused rather than split ambiguously.
-  if (apportionDiscountTax && (input.orderDiscountForeign ?? 0) > 0 && lineResolved.some((r) => !r.taxRateId)) {
-    return { ok: false as const, error: 'The order discount is taxed per line rate, but a line has no tax rate to place its share of the discount on. Give every line a tax rate and try again.' }
+  // A line with no tax rate id is NOT refused: such a line only exists when the resolver found no rate and the order has no default rate that resolves, so every such line takes the
+  // same fallback rate (orderDefaultCtx.rate) and the split's `rate:<fraction>` key (discountSplitKey) groups them into ONE entry of their own (a manual "No VAT" or export order, its edits and its CSV import).
+  // Only the collision the key cannot tell apart is refused: no-rate lines at two different rates (unreachable from this writer today; the refund reversal keys every no-rate group alike).
+  if (apportionDiscountTax && (input.orderDiscountForeign ?? 0) > 0 && new Set(lineResolved.filter((r) => !r.taxRateId).map((r) => r.taxRateValue)).size > 1) {
+    return { ok: false as const, error: 'The order discount is taxed per line rate, but lines with no tax rate carry different rates, so their share of the discount cannot be placed. Choose an order default VAT rate, or give those lines a tax rate, and try again.' }
   }
   const model = buildSalesOrderWriteModel({
     fxRate,
@@ -3672,7 +3674,8 @@ export async function createRefund(
     // A PUBLIC caller is always capped per target (never above a line's stored net) and has its itemised lines re-cut from what each order line has left.
     const { enforcePerTargetBalances, deriveSaleLineNetsFromStoredBalance } = refundSafeguards({ isInternal, requestedPerTargetCap: options?.enforcePerTargetBalances })
 
-    // o3d-ngmt.21: no refund or credit note against an invoice whose delete is pending.
+    // o3d-ngmt.21: no refund or credit note against an invoice whose delete is pending. An early answer only: the binding check is the one
+    // createSalesOrderRefund makes under the order lock (a delete requested between this read and that lock is refused there).
     const deletePendingForRefund = await pendingDeletionError(orderId)
     if (deletePendingForRefund) return { success: false, error: deletePendingForRefund }
     let returnReasonId: string | null = null
@@ -4846,9 +4849,6 @@ export async function deleteSalesOrder(id: string): Promise<{ success: boolean; 
 export async function markSalesOrderPaid(id: string): Promise<{ success: boolean; error?: string }> {
   try {
     await requirePermission('sales.refund')
-    // o3d-ngmt.21: marking paid is a payment as far as a pending delete is concerned.
-    const deletePendingForPaid = await pendingDeletionError(id)
-    if (deletePendingForPaid) return { success: false, error: deletePendingForPaid }
     // audit-mmvp: lock the order row (same FOR UPDATE pattern as addPayment) so a
     // concurrent addPayment/markSalesOrderPaid can't both observe paidAt=null,
     // both flip it, and both run the warn/generate block — double-warning the
@@ -4859,6 +4859,10 @@ export async function markSalesOrderPaid(id: string): Promise<{ success: boolean
       await assertNotQuoteUnderLock(tx, id, 'it cannot be marked paid')
       const row = await tx.salesOrder.findUnique({ where: { id }, select: { orderNumber: true, externalOrderNumber: true, paidAt: true, invoiceNumber: true, status: true, unregisteredPaidAt: true } })
       if (!row) return null
+      // o3d-ngmt.21: marking paid is a payment as far as a pending delete is concerned. Read UNDER the order lock the delete request also
+      // takes, so a request committed first is seen and a later one waits for this and then refuses on the paid flag.
+      const deletePendingForPaid = await pendingDeletionError(id, tx)
+      if (deletePendingForPaid) return { refusal: deletePendingForPaid }
       const markingAsPaid = !row.paidAt // transitioning from unpaid to paid
       const paymentCount = await tx.payment.count({ where: { orderId: id, refundId: null } })
       const refusal = markPaidRefusal({ status: row.status, markingAsPaid, hasUnregisteredPaidMarker: row.unregisteredPaidAt != null, paymentCount })

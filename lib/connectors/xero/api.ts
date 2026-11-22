@@ -10,6 +10,7 @@ import { accountingEgressRefusal } from '@/lib/connectors/accounting-egress-auth
 import { outboundWriteRefusal, OutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { recordOutboundWriteRefusal } from '@/lib/security/outbound-write-refusal-log'
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
+import { persistDayLimitObservation } from './day-limit-observation'
 
 const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
 const XERO_CONNECTOR = 'xero'
@@ -414,6 +415,8 @@ function noteLimitHeaders(tenantId: string, res: { headers?: { get(name: string)
   }
   if (snapshot.dayRemaining == null && snapshot.minuteRemaining == null) return // not a Xero API response
   limitSnapshots.set(tenantId, snapshot)
+  // o3d-hvzdx: shared with every other worker (throttled, best effort, never awaited by the call that observed it).
+  if (snapshot.dayRemaining != null) void persistDayLimitObservation(tenantId, snapshot.dayRemaining, snapshot.at)
 
   // Loud once it is genuinely tight. Silence here is what let a day's budget vanish unnoticed
   // twice in one week.
@@ -450,7 +453,14 @@ function parseRetryAfterMs(value: string | null): number {
   return Number.isFinite(absolute) ? Math.max(0, absolute - Date.now()) : 0
 }
 
-async function performRequest(auth: { accessToken: string; tenantId: string }, init: RequestInit, url: string) {
+/**
+ * o3d-0syfq: A BOUNDED CALL. No in-request sleep (neither the minute-limit wait nor a Retry-After), no in-request retry, and a hard wall-clock
+ * timeout on the one attempt. For a caller that makes the call while holding database locks inside a transaction with a deadline: the call
+ * must take at most `timeoutMs`, and a rate limit is handed straight back (it waits in the queue, not on the locks).
+ */
+export type XeroBoundedCall = { timeoutMs: number }
+
+async function performRequest(auth: { accessToken: string; tenantId: string }, init: RequestInit, url: string, bounded?: XeroBoundedCall) {
   let lastRateLimitMs = 0
   /**
    * When Xero started this request's Idempotency-Key clock. Null until the first attempt actually
@@ -563,8 +573,9 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
     }) as Response
   }
 
-  for (let attempt = 0; attempt <= XERO_MAX_RETRIES; attempt++) {
-    const remainingBeforeCall = budgetRemainingMs()
+  for (let attempt = 0; attempt <= (bounded ? 0 : XERO_MAX_RETRIES); attempt++) {
+    // A bounded call never sleeps for minute budget: a zero budget refuses (not sent) instead of waiting.
+    const remainingBeforeCall = bounded ? 0 : budgetRemainingMs()
     // Wrapped for the same reason the two authorisations are: it is a statement that can leave by
     // throwing as well as by answering, and every exit above the socket has to be enumerated. It
     // cannot throw at today's body (in-memory buckets and a `setTimeout`), and that is precisely the
@@ -669,6 +680,8 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
     const res = await connectorFetch(url, init, { connectorName: 'Xero' })
     noteLimitHeaders(auth.tenantId, res)
     if (res.status !== 429) return res
+    // A bounded call hands Xero's 429 straight back: no Retry-After sleep, no second attempt.
+    if (bounded) return res
 
     lastRateLimitMs = Math.max(parseRetryAfterMs(res.headers.get('Retry-After')), 1000 * 2 ** attempt)
 
@@ -779,7 +792,7 @@ async function xeroFetch<T = unknown>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
   body?: unknown,
-  opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string; requireConnection?: RequiredXeroConnection },
+  opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string; requireConnection?: RequiredXeroConnection; bounded?: XeroBoundedCall },
 ): Promise<XeroResponse<T>> {
   let auth: Awaited<ReturnType<typeof getAccessToken>>
   try {
@@ -831,7 +844,7 @@ async function xeroFetchWithAuth<T = unknown>(
   method: 'GET' | 'POST' | 'PUT',
   path: string,
   body?: unknown,
-  opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string },
+  opts?: { idempotencyKey?: string; ifModifiedSince?: Date | string; bounded?: XeroBoundedCall },
 ): Promise<XeroResponse<T>> {
   // EVERY STATEMENT THAT ASSEMBLES THE REQUEST, IN ONE BLOCK THAT CANNOT THROW PAST ITSELF
   // (o3d-2w2j r2). Two of them can throw today — `formatIfModifiedSince` on an unparseable date and
@@ -863,7 +876,8 @@ async function xeroFetchWithAuth<T = unknown>(
       headers['If-Modified-Since'] = formatIfModifiedSince(opts.ifModifiedSince)
     }
 
-    init = { method, headers }
+    // A bounded call (o3d-0syfq) carries its own hard timeout: the one attempt it makes is aborted past it.
+    init = { method, headers, ...(opts?.bounded ? { signal: AbortSignal.timeout(opts.bounded.timeoutMs) } : {}) }
 
     if (body) {
       headers['Content-Type'] = 'application/json'
@@ -873,7 +887,7 @@ async function xeroFetchWithAuth<T = unknown>(
     return requestUnbuildableResponse<T>(auth.tenantId, error)
   }
 
-  const res = await performRequest(auth, init, url)
+  const res = await performRequest(auth, init, url, opts?.bounded)
   // Refused before sending. Reported verbatim rather than falling through to the `!res.ok` branch,
   // which would prefix it with "HTTP 0:" and so describe a reply Xero never made.
   if (res.status === XERO_NOT_SENT_STATUS) {
@@ -1019,7 +1033,7 @@ export async function xeroGetCached<T = unknown>(
 
 export async function xeroGet<T = unknown>(
   path: string,
-  opts?: { ifModifiedSince?: Date | string },
+  opts?: { ifModifiedSince?: Date | string; bounded?: XeroBoundedCall },
 ): Promise<XeroResponse<T>> {
   return xeroFetch<T>('GET', path, undefined, opts)
 }
@@ -1027,7 +1041,7 @@ export async function xeroGet<T = unknown>(
 export async function xeroPost<T = unknown>(
   path: string,
   body: unknown,
-  opts?: { idempotencyKey?: string; requireConnection?: RequiredXeroConnection },
+  opts?: { idempotencyKey?: string; requireConnection?: RequiredXeroConnection; bounded?: XeroBoundedCall },
 ): Promise<XeroResponse<T>> {
   return xeroFetch<T>('POST', path, body, opts)
 }

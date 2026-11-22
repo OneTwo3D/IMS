@@ -29,3 +29,5 @@ bb4e9ee6f7a56110612dc1402384317f821f3495:tests/ops/reconciliation-pack-schedule-
 6d060c0fa0a9eacf0a002919ec7dc805404b5631:tests/concurrency/erasure-raw-payloads.concurrent.test.ts:generic-api-key:161
 # Reviewed false positive: the NAME of a settings row ("eu_vat_refund182_held_count") in the EU VAT declaration, not a credential.
 655f95b69cdd6306e356546fbe08674ac6a7b4be:lib/tax/eu-vat-seed.json:generic-api-key:52
+# Synthetic --plan-token test value (MSA- + zeros) in a superseded PR commit; the head builds it at runtime.
+a3a72f4a3cb753944091c95146496dfd82abcc55:tests/first-load/mintsoft-archive.test.ts:generic-api-key:114

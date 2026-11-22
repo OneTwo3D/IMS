@@ -135,6 +135,15 @@ function attestationReader(kind: string): StepEvidenceReader {
  */
 const bridgeAttestationReader: StepEvidenceReader = async ({ db }) => {
   const row = await db.writerAttestation.findFirst({ where: { kind: BRIDGE_ATTESTATION_KIND }, orderBy: { attestedAt: 'desc' }, select: { attestedAt: true, payload: true } })
+  return bridgeAttestationReading(row)
+}
+
+/**
+ * The BRIDGE_ATTESTATION reading of one stored row (the newest `bridge-units-masked` attestation, or null when none is recorded). Exported so a reader
+ * that holds the row by another route (the first-load Mintsoft archive reads it inside its own READ ONLY transaction on the target) reads it exactly as
+ * writers:check does.
+ */
+export function bridgeAttestationReading(row: { attestedAt: Date; payload?: unknown } | null): StepEvidenceReading {
   if (!row) return { state: 'absent' }
   const report = readBridgePayload(row.payload)
   if (report === null) return { state: 'unreadable' }

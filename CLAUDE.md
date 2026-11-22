@@ -27,6 +27,12 @@ npm run lint | type-check | db:seed | db:studio
 
 ## Rules for every change
 
+### Documentation (mandatory, CI-enforced)
+- Update the docs in the SAME PR as the code: `docs/**` for developer, operator and architecture behaviour, and `help-docs/**` for user-facing screens, labels, actions and support workflows. A flagged feature that is switched off is documented as built and switched off, not as live.
+- Code is the source of truth. Where a doc and the code disagree, fix the doc. If the code looks wrong, file a bead rather than documenting the bug as intended.
+- `npm run check:docs-required` (ungated job `docs-required` in `.github/workflows/static-guards.yml`) fails a PR that changes behaviour-bearing code without a docs change. If nothing needs documenting, add `Docs: none — <reason>` to the PR's `changelog.d` fragment.
+- The single list of behaviour-bearing paths, exclusions, documentation paths, surfaces to check and opt-out rules is docs/development.md, "Documentation Updates".
+
 ### Naming and imports
 - Files: `kebab-case` (components, actions, routes, utilities, config); UI primitives lowercase; hooks `useX.ts`.
 - Identifiers: PascalCase components/classes/types; camelCase functions (verb prefix) and variables; `SCREAMING_SNAKE_CASE` constants; hooks `useX`; booleans `is`/`has`/`should`; state hooks `[x, setX]`.

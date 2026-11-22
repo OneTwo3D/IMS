@@ -39,12 +39,14 @@ import {
 import { logActivity, logActivityInTransaction, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
-import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote, readCreditNoteSettlementBalances, refundSalesCreditNote, resolveCreditNoteAllocationAmount, voidCreditNote } from './credit-notes'
+import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote, readCreditNoteSettlementBalances, refundSalesCreditNote, resolveCreditNoteAllocationAmount, voidCreditNote, readCreditNoteStatus } from './credit-notes'
 import {
   CREDIT_NOTE_ALLOCATION_CONNECTOR,
   decideXeroCreditNoteWitness,
   isCreditNoteAllocationEnabled,
+  isRefundCashOutDateEnabled,
   OPERATOR_ATTENTION_REASONS,
+  refundCashOutDate,
   planCreditNoteSettlement,
   readCreditNoteSettlementFacts,
   refundPaymentCap,
@@ -53,7 +55,7 @@ import {
   withXeroCashOut,
   type CreditNoteSettlementOperation,
 } from '@/lib/domain/accounting/credit-note-allocation'
-import { computeRealisedFx, describeFxRefusal, resolveSettlementFxRateToBase, settlementAsOfFromInput } from '@/lib/accounting-fx'
+import { computeRealisedFx, describeFxRefusal, resolveSettlementFxRateToBase, settlementAsOfFromInput, settlementAsOfFromStored } from '@/lib/accounting-fx'
 import { isMissingFxRateError } from '@/lib/currencies/fx-select'
 import { prepareManualJournal, postPreparedManualJournal } from './journals'
 import { getGrantedScopes } from './auth'
@@ -67,7 +69,7 @@ import {
   type AccountingOriginRecord,
 } from '@/lib/connectors/accounting-connection-provenance'
 import { withAccountingPostingIntent } from '@/lib/connectors/accounting-posting-intent'
-import { xeroUploadAttachment, xeroPost } from './api'
+import { xeroUploadAttachment, xeroPost, type XeroBoundedCall } from './api'
 import { CREDIT_NOTE_DUPLICATE_CHECK_SETTING_KEY, creditNoteCreateDuplicates, creditNotePayloadGrossCents, describeCreditNote, duplicateVerdict, readOrderCreditNoteKeys, readOrderCreditNotesFromXero, type DuplicateContext } from './order-credit-notes'
 import { accountingBankAccountBelongsTo, accountingPostingKey, lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { parsePaymentAccountMap } from '@/lib/accounting/payment-account-map'
@@ -6604,7 +6606,8 @@ async function processCreditNoteAllocation(args: {
 
   const posting = moneyPostDateToSend(type, payload, new Date())
   if (!posting.ok) return { success: false, error: `Cannot date this settlement: ${posting.reason}` }
-  const settlementDate = posting.date
+  // `let`: a RECORDED refund payment is re-dated to the day its cash went out below (o3d-l9gej), before anything is pinned or sent.
+  let settlementDate = posting.date
 
   // What Xero says is left on the documents sizes the settlement. READS ONLY, before the fence; FIRST of the Xero reads (#1127 R1 H1), so a row that only waits for
   // its receipt never pays for the credit-note search.
@@ -6728,12 +6731,28 @@ async function processCreditNoteAllocation(args: {
     pin.paymentMethod = method
     pin.cashEvidence = refundPlan?.cashEvidence
     pin.rateDecided = true
+    // o3d-l9gej (switch xero_refund_payment_cash_out_date_enabled, default off): a RECORDED refund payment is dated, and rated, on the day its cash went out
+    // (the refund Payment's paidAt), not the credit note's day. The credit note's date is kept on the row (`creditNoteDate`, written once) so that with the switch
+    // turned off again an UNSENT row goes back to it; a row that may have left is replayed above and never re-dated. Off, nothing here changes the payload.
+    const creditNoteDate = typeof payload.creditNoteDate === 'string' ? payload.creditNoteDate : settlementDate
+    const cashOut = (await isRefundCashOutDateEnabled(db)) ? refundCashOutDate(facts, refundPlan, creditNoteDate) : null
+    let rateAsOf = settlementAsOfFromInput(settlementDate, new Date())
+    if (cashOut) {
+      pin.creditNoteDate = creditNoteDate
+      pin.date = cashOut.date
+      settlementDate = cashOut.date
+      rateAsOf = settlementAsOfFromStored(cashOut.paidAt, cashOut.explicitInstant)
+    } else if (typeof payload.creditNoteDate === 'string' && payload.creditNoteDate !== settlementDate) {
+      pin.date = payload.creditNoteDate
+      settlementDate = payload.creditNoteDate
+      rateAsOf = settlementAsOfFromInput(settlementDate, new Date())
+    }
     // IMS's settlement rate for the cash-out, resolved ONCE here and carried on the row: the realised FX is booked by Xero at this rate (as for a receipt).
     const baseCurrency = await getBaseCurrencyCode()
     if (facts.order.currency !== baseCurrency) {
       try {
         const rate = await db.$transaction((tx) => resolveSettlementFxRateToBase(tx, {
-          currency: facts.order.currency, baseCurrency, asOf: settlementAsOfFromInput(settlementDate, new Date()),
+          currency: facts.order.currency, baseCurrency, asOf: rateAsOf,
         }))
         pin.settlementRateToBase = Math.round(rate * 1e8) / 1e8
       } catch (error) {
@@ -7543,28 +7562,45 @@ export async function processClaimedEntry(
     }
 
     case 'CREDIT_NOTE_VOID': {
-      // o3d-ngmt.22: the refund this credit note was raised for was deleted in IMS (recorded in error). The row carries the ledger id the
-      // credit note was posted under; nothing here consults the refund, which no longer exists. The void READS the document first and decides
-      // from what is there (voidCreditNote), so a retry after a lost response or a partial failure converges instead of erroring.
+      // o3d-ngmt.22: the refund this credit note was raised for is being deleted in IMS (recorded in error). The row carries the ledger id the
+      // credit note was posted under. The void READS the document first and decides from what is there (voidCreditNote), so a retry after a lost
+      // response or a partial failure converges instead of erroring.
       const voidCreditNoteId = typeof payload.creditNoteId === 'string' ? payload.creditNoteId : ''
       if (!voidCreditNoteId) return { success: false, error: 'Missing creditNoteId for CREDIT_NOTE_VOID' }
-      const fence = await lease.fenceBeforeRemoteWrite('credit-note-void')
-      if (!fence.ok) return fence.result
-      const voided = await voidCreditNote(
-        { creditNoteId: voidCreditNoteId, creditNoteNumber: typeof payload.creditNoteNumber === 'string' ? payload.creditNoteNumber : null },
-        { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note-void') },
+      // The claim fence and the void, as the last thing before the socket. `bounded`: called from inside the refund delete's locked transaction,
+      // so no in-request sleep or retry and a hard timeout (o3d-0syfq); unbounded for any other reference type, as before.
+      const voidInLedger = async (bounded?: XeroBoundedCall): Promise<EntryResult> => {
+        const fence = await lease.fenceBeforeRemoteWrite('credit-note-void')
+        if (!fence.ok) return fence.result
+        const voided = await voidCreditNote(
+          { creditNoteId: voidCreditNoteId, creditNoteNumber: typeof payload.creditNoteNumber === 'string' ? payload.creditNoteNumber : null },
+          { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note-void'), ...(bounded ? { bounded } : {}) },
+        )
+        return voided.success ? { success: true } : { success: false, error: voided.error ?? 'the void failed' }
+      }
+      if (referenceType !== 'SalesOrderRefund') {
+        const voided = await voidInLedger()
+        if (!voided.success) return voided
+        // The id returned is the credit note's own: the void acts on a document that already stood (UPDATE_DOCUMENT).
+        return { success: true, externalId: voidCreditNoteId }
+      }
+      // A refund delete (o3d-0syfq): the refund's stock is fenced, the delete re-decided and the whole IMS unwind run under the locks, and the
+      // (bounded) void is the last statement before the commit, so the returned stock cannot move between the void and the unwind. Refused under
+      // the locks, the ledger is not asked to void at all (idempotent: an already deleted refund is a success).
+      const meta = (payload as { _refundDelete?: { actorUserId?: string | null; reason?: string | null } })._refundDelete
+      const { voidCreditNoteThenCompleteRefundDeletion } = await import('@/lib/domain/sales/refund-delete-service')
+      const finished = await voidCreditNoteThenCompleteRefundDeletion(
+        db,
+        { refundId: referenceId, voidSyncLogId: entryId, actorUserId: meta?.actorUserId ?? null, reason: meta?.reason ?? null },
+        { voidInLedger: (bounded) => voidInLedger(bounded), readCreditNoteStatus: (bounded) => readCreditNoteStatus(voidCreditNoteId, bounded) },
       )
-      // The id returned is the credit note's own: the void acts on a document that already stood (UPDATE_DOCUMENT).
-      if (!voided.success) return { success: false, error: voided.error }
-      // Phase 2 of a refund delete: the ledger has confirmed the void, so IMS now unwinds the refund (idempotent: an already deleted refund is a success).
-      if (referenceType === 'SalesOrderRefund') {
-        const meta = (payload as { _refundDelete?: { actorUserId?: string | null; reason?: string | null } })._refundDelete
-        const { completeRefundDeletionAfterVoid } = await import('@/lib/domain/sales/refund-delete-service')
-        const finished = await completeRefundDeletionAfterVoid(db, { refundId: referenceId, voidSyncLogId: entryId, actorUserId: meta?.actorUserId ?? null, reason: meta?.reason ?? null })
-        if (!finished.ok) return { success: false, error: finished.error }
-        if (finished.stockSyncFailed) {
-          await logActivity({ entityType: 'SALES_ORDER', entityId: referenceId, action: 'refund_delete_stock_sync_failed', tag: 'sales', level: 'WARNING', description: 'The refund was deleted, but its stock change could not be queued for the storefront. It will go with the next stock sync; push the stock from the product page if it is urgent.', metadata: { refundId: referenceId } }).catch(() => { /* the delete is done; the warning is advisory */ })
-        }
+      if (!finished.ok) return finished.passthrough !== undefined ? finished.passthrough as EntryResult : { success: false, error: finished.error }
+      if (finished.stockSyncFailed) {
+        await logActivity({ entityType: 'SALES_ORDER', entityId: finished.orderId ?? referenceId, action: 'refund_delete_stock_sync_failed', tag: 'sales', level: 'WARNING', description: 'The refund was deleted, but its stock change could not be queued for the storefront. It will go with the next stock sync; push the stock from the product page if it is urgent.', metadata: { refundId: referenceId } }).catch(() => { /* the delete is done; the warning is advisory */ })
+      }
+      if (!finished.alreadyDeleted) {
+        // The same follow-up row the server action writes, so an order the worker could not re-reserve is visible to a person.
+        await logActivity({ entityType: 'SALES_ORDER', entityId: finished.orderId, action: 'refund_delete_follow_up', tag: 'sales', level: finished.reallocationWarning ? 'WARNING' : 'INFO', description: finished.reallocationWarning ? `The refund was deleted. ${finished.reallocationWarning}` : 'Refund deleted; the order was re-reserved and the stock change queued.', metadata: { refundId: referenceId } }).catch(() => { /* the delete is done; the row is advisory */ })
       }
       return { success: true, externalId: voidCreditNoteId }
     }

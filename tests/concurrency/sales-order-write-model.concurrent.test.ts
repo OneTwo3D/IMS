@@ -200,6 +200,78 @@ test('sales_order_discount_tax_apportion_enabled ON: the capped discount on the 
   assert.ok(Number(after.taxForeign) < 0)
 })
 
+test('sales_order_discount_tax_apportion_enabled ON: a discounted order mixing a line with NO tax rate (no default rate, no configured rate for its category) and a rated line is created, edited and CSV-imported; the no-rate line is its own 0% group of the split', SKIP, async (t) => {
+  const w = await seedWorld()
+  const { db } = await import('@/lib/db')
+  const KEY = 'sales_order_discount_tax_apportion_enabled'
+  // EXEMPT has no configured rate in this world, and the order names no default rate, so this line resolves to the fallback with no tax rate id at the fallback rate (0).
+  const exempt = await db.product.create({ data: { sku: `WM-EXM-${w.tag}`, name: 'Write model exempt', type: 'SIMPLE', taxCategory: 'EXEMPT' }, select: { id: true, sku: true } })
+  t.after(async () => {
+    await db.setting.deleteMany({ where: { key: KEY } })
+    const imported = await db.salesOrder.findMany({ where: { externalOrderNumber: { startsWith: `WMX${w.tag}` } }, select: { id: true } })
+    w.orderIds.push(...imported.map((o) => o.id))
+    await db.salesOrderLine.deleteMany({ where: { orderId: { in: w.orderIds } } })
+    await db.salesOrder.deleteMany({ where: { id: { in: w.orderIds } } })
+    await db.product.deleteMany({ where: { id: exempt.id } })
+    await w.teardown()
+  })
+  const { createSalesOrder, updateSalesOrder } = await import('@/app/actions/sales')
+  const { importSalesOrdersCsv } = await import('@/app/actions/import')
+  await db.setting.upsert({ where: { key: KEY }, create: { key: KEY, value: 'true' }, update: { value: 'true' } })
+  const input = (discount: number) => ({
+    customerName: 'No VAT export', customerEmail: 'nv@example.test',
+    billingAddress: { line1: '1 Export Rd', country: 'GB' }, shippingAddress: { line1: '1 Export Rd', country: 'GB' },
+    currency: 'GBP', pricesIncludeVat: false, shippingForeign: 0, orderDiscountForeign: discount, isDraft: true,
+    lines: [
+      { productId: exempt.id, sku: exempt.sku, description: 'Exempt', qty: 1, unitPriceForeign: 100 },
+      { productId: w.products.RED.id, sku: w.products.RED.sku, description: 'Reduced', qty: 1, unitPriceForeign: 100 },
+    ],
+  })
+  type Entry = { taxRateId: string | null; rate: number; netForeign: number; taxForeign: number }
+  const checkSplit = async (orderId: string, discount: number) => {
+    const row = await db.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { discountAmount: true, taxForeign: true, discountTaxSplit: true, lines: { select: { sku: true, taxRateId: true } } } })
+    assert.equal(row.lines.find((l) => l.sku === exempt.sku)!.taxRateId, null, 'the exempt line carries no tax rate')
+    assert.equal(row.lines.find((l) => l.sku === w.products.RED.sku)!.taxRateId, w.rateIds.red)
+    const split = row.discountTaxSplit as Entry[]
+    assert.ok(Array.isArray(split) && split.length === 2, `one group per rate: ${JSON.stringify(split)}`)
+    const noRate = split.find((e) => e.taxRateId === null)!
+    const red = split.find((e) => e.taxRateId === w.rateIds.red)!
+    assert.deepEqual([noRate.rate, noRate.taxForeign], [0, 0], 'the no-rate group is 0% and carries no VAT')
+    assert.equal(red.rate, 0.05)
+    assert.equal(Math.round((noRate.netForeign + red.netForeign) * 10000) / 10000, discount, 'the groups sum to the discount')
+    assert.equal(Number(row.discountAmount), discount)
+    // Equal nets, so each group takes half the discount; the header tax is the reduced line's 5.00 less 5% of its half (discount 10: 4.75; discount 20: 4.50). The no-rate half takes no VAT off.
+    assert.equal(red.netForeign, discount / 2)
+    assert.equal(Number(row.taxForeign), 5 - (discount / 2) * 0.05)
+  }
+
+  const created = await createSalesOrder(input(10) as never)
+  assert.equal(created.success, true, created.error)
+  w.orderIds.push(created.order!.id)
+  await checkSplit(created.order!.id, 10)
+
+  // An edit of the same order (a different discount) goes through and writes exactly what creating it fresh writes.
+  const edited = await updateSalesOrder(created.order!.id, input(20) as never, await versionOf(created.order!.id))
+  assert.equal(edited.success, true, edited.error)
+  await checkSplit(created.order!.id, 20)
+  const fresh = await createSalesOrder(input(20) as never)
+  assert.equal(fresh.success, true, fresh.error)
+  w.orderIds.push(fresh.order!.id)
+  assert.deepEqual(await writtenRows(w, created.order!.id), await writtenRows(w, fresh.order!.id), 'edit = create, the stored split included')
+
+  // The CSV import of the same order (two rows of one group): created, not reported as an error.
+  const form = (csv: string) => { const f = new FormData(); f.set('file', new File([csv], 'x.csv')); return f }
+  const key = `WMX${w.tag}`
+  const csv = `orderKey,customerName,currency,sku,qty,unitPriceForeign,orderDiscountForeign\r\n${key},No VAT export,GBP,${exempt.sku},1,100,10\r\n${key},No VAT export,GBP,${w.products.RED.sku},1,100,10\r\n`
+  const result = (await importSalesOrdersCsv(form(csv))) as { created?: number; skipped?: number; errors?: string[] }
+  assert.equal(result.created, 2, `both rows of the one group are counted created: ${JSON.stringify(result.errors)}`)
+  assert.equal(await db.salesOrder.count({ where: { externalOrderNumber: key } }), 1, 'one order')
+  assert.equal(result.skipped, 0)
+  assert.ok(!(result.errors ?? []).some((e) => /tax rate/i.test(e)), JSON.stringify(result.errors))
+  const imported = await db.salesOrder.findFirstOrThrow({ where: { externalOrderNumber: key }, select: { id: true } })
+  await checkSplit(imported.id, 10)
+})
+
 test('an edited draft writes exactly the rows creating the edited order fresh writes; identity is kept, lines are replaced, totals recomputed', SKIP, async (t) => {
   const w = await seedWorld()
   t.after(() => w.teardown())

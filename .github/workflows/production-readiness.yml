@@ -79,6 +79,8 @@ jobs:
     # on a push to development, an empty comparison that fails loudly (o3d-ok6hk), so give it the real range.
     env:
       MIGRATION_CONVENTION_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
+      # check:docs-required (also inside validate) takes the same range.
+      DOCS_REQUIRED_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
       # tsc --noEmit (inside validate) outgrew Node's default ~4 GB heap on the runner; same cap as the job below.
       NODE_OPTIONS: --max-old-space-size=5632
     steps:

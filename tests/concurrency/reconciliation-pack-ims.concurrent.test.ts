@@ -222,6 +222,9 @@ test('[reconciliation pack] the vat section reads the sales tax per month and ra
     await order('10', 'PROCESSING', '2026-09-17 10:00:00', '0')
     await order('8', 'PROCESSING', '2026-09-15 10:00:00', '1.00', { currency: 'EUR', fx: '1.2500' })
     await sql(`INSERT INTO shopping_order_links (id, "orderId", connector, "externalOrderId", "updatedAt") VALUES ($1, $2, 'woocommerce', $3, now())`, `${VP}-k8`, `${VP}-o8`, `${VP}-ext8`)
+    // The per-rate discount split: order 1 (in) and order 6 (archived, out) carry one; order 2 (in) carries none and gives no row.
+    const SPLIT = '[{"taxRateId":"t","accountingTaxType":null,"reverseCharge":false,"rate":0.2,"netForeign":20,"taxForeign":4,"netBase":20,"taxBase":4}]'
+    await sql(`UPDATE sales_orders SET "discountAmount" = 26, discount_tax_split = $2::jsonb WHERE id = ANY($1::text[])`, [`${VP}-o1`, `${VP}-o6`], SPLIT)
     await sql(`INSERT INTO settings (key, value, "updatedAt") VALUES ('xero_shipping_account', ' 260 ', now()) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value`)
     await sql(`INSERT INTO accounting_accounts (id, connector, "externalAccountId", code, name, type, active) VALUES ($1, 'xero', $2, '260', 'Shipping', 'REVENUE', true)`, `${VP}-acc`, `${VP}-acc-ext`)
     const read = await withClient((client) => readers.readImsSnapshot(client, { sections: ['vat'], vatWindow: { from: '2026-09-01', toExclusive: '2026-10-01' } }))
@@ -231,6 +234,9 @@ test('[reconciliation pack] the vat section reads the sales tax per month and ra
     const mine = section.value.sales.filter((row) => row.taxRateId === `${VP}-t`)
     // September, this rate: orders 1, 2, 8, 9 and 10 (10.50 + 4.25 + 1.00 - 2.00 + 0; the negative line is one of 4 non-zero lines, the zero line is not counted as one); the instant bounds are inclusive below and exclusive above, a cancelled, an archived and an un-invoiced order are not in it.
     assert.deepEqual(mine, [{ period: '2026-09', taxRateId: `${VP}-t`, taxBase: '13.7500', lines: 5, nonZeroLines: 4 }])
+    // The split is read over the same population (invoice-instant bounds, cancelled and archived left out), as the stored JSON text.
+    const splits = section.value.discountSplits.filter((row) => row.orderId.startsWith(VP))
+    assert.deepEqual(splits.map((row) => ({ ...row, split: JSON.parse(row.split) })), [{ period: '2026-09', orderId: `${VP}-o1`, discount: '26.0000', split: JSON.parse(SPLIT) }])
     assert.equal(section.value.shippingAccount, '260')
     assert.equal(section.value.shippingAccountInChart, true)
     assert.equal(section.value.baseCurrency, 'GBP')

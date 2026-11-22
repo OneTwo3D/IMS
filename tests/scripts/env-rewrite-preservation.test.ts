@@ -962,7 +962,7 @@ const NOT_CARRIED: Record<string, string> = {
   COMMIT_SHA: 'build identity, set at build/deploy', GIT_COMMIT_SHA: 'build identity', SOURCE_VERSION: 'build identity', VERCEL_GIT_COMMIT_SHA: 'build identity',
   // development and repository tooling, not read by an installed instance
   ARCHIVE_SEAL_BASE_REF: 'repo tooling', ARCHIVE_SEAL_MANIFEST: 'repo tooling', ARCHIVE_SEAL_REF: 'repo tooling', ARCHIVE_SEAL_REWRITE: 'repo tooling',
-  MIGRATION_CONVENTION_BASE_REF: 'repo tooling', MIGRATION_CONVENTION_HEAD_REF: 'repo tooling', SCHEMA_CHECK_BASE_REF: 'repo tooling', SCHEMA_CHECK_HEAD_REF: 'repo tooling',
+  MIGRATION_CONVENTION_BASE_REF: 'repo tooling', MIGRATION_CONVENTION_HEAD_REF: 'repo tooling', DOCS_REQUIRED_BASE_REF: 'repo tooling', DOCS_REQUIRED_HEAD_REF: 'repo tooling', SCHEMA_CHECK_BASE_REF: 'repo tooling', SCHEMA_CHECK_HEAD_REF: 'repo tooling',
   SCHEMA_SCOPE_BASE_REF: 'repo tooling', SCHEMA_SCOPE_HEAD_REF: 'repo tooling', PRISMA_DRIFT_ALLOWLIST: 'repo tooling', PRISMA_MIGRATIONS_DIR: 'repo tooling', PRISMA_SCHEMA_PATH: 'repo tooling',
   IMS_VERIFY_COVERAGE_STRICT: 'CI strictness flag of the verification runner', IMS_CHOWN_TREE_ROOT: 'test seam of the installer helper',
   RUN_DB_CONCURRENCY_TESTS: 'test switch', E2E_BASE_URL: 'test', E2E_CRON_RATE_LIMIT_MAX: 'test', E2E_ROUTE_SECRET: 'test', E2E_TEST_MODE: 'test (must never be on in production)',

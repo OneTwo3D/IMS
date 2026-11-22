@@ -5,7 +5,7 @@
 import { withSalesInvoiceAuthorization, type BeforeRemoteWrite, type ContactGate } from './invoices'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { createHash } from 'node:crypto'
-import { xeroGet, xeroPost, xeroPut, type RequiredXeroConnection } from './api'
+import { xeroGet, xeroPost, xeroPut, type RequiredXeroConnection, type XeroBoundedCall } from './api'
 import { assertXeroLineQuantitiesKept, planXeroRoundingLine, xeroUnitDpFields, type XeroTaxRateOf } from './write-path'
 import { resolveUnitDpRoundingAccount } from './unit-dp-rounding'
 import { findOrCreateContact } from './contacts'
@@ -183,8 +183,8 @@ export type CreditNoteVoidReadback = {
 }
 
 type CreditNoteVoidDeps = {
-  get: <T>(path: string) => Promise<{ ok: boolean; status: number; data?: T; error?: string }>
-  post: <T>(path: string, body: unknown, opts?: { idempotencyKey?: string }) => Promise<{ ok: boolean; status: number; data?: T; error?: string }>
+  get: <T>(path: string, opts?: { bounded?: XeroBoundedCall }) => Promise<{ ok: boolean; status: number; data?: T; error?: string }>
+  post: <T>(path: string, body: unknown, opts?: { idempotencyKey?: string; bounded?: XeroBoundedCall }) => Promise<{ ok: boolean; status: number; data?: T; error?: string }>
 }
 
 /** The decision half of the void, pure so it is tested without a ledger. */
@@ -219,15 +219,16 @@ export function decideCreditNoteVoid(note: CreditNoteVoidReadback | undefined, e
 
 export async function voidCreditNote(
   data: { creditNoteId: string; creditNoteNumber?: string | null },
-  opts?: { idempotencyKey?: string },
-  deps: CreditNoteVoidDeps = { get: (path) => xeroGet(path), post: (path, body, o) => xeroPost(path, body, o) },
+  /** `bounded` (o3d-0syfq): both calls without in-request sleeps or retries and with a hard timeout each (see XeroBoundedCall). */
+  opts?: { idempotencyKey?: string; bounded?: XeroBoundedCall },
+  deps: CreditNoteVoidDeps = { get: (path, o) => xeroGet(path, o), post: (path, body, o) => xeroPost(path, body, o) },
 ): Promise<{ success: boolean; alreadyDone?: boolean; error?: string; permanent?: boolean }> {
   if (!data.creditNoteId || /[^A-Za-z0-9-]/.test(data.creditNoteId)) {
     return { success: false, permanent: true, error: 'the credit note carries no usable ledger id to void' }
   }
   let read: { ok: boolean; status: number; data?: { CreditNotes?: CreditNoteVoidReadback[] }; error?: string }
   try {
-    read = await deps.get<{ CreditNotes?: CreditNoteVoidReadback[] }>(`CreditNotes/${data.creditNoteId}`)
+    read = await deps.get<{ CreditNotes?: CreditNoteVoidReadback[] }>(`CreditNotes/${data.creditNoteId}`, opts?.bounded ? { bounded: opts.bounded } : undefined)
   } catch (error) {
     return { success: false, error: `the credit note could not be read before voiding: ${String(error)}` }
   }
@@ -235,13 +236,39 @@ export async function voidCreditNote(
   const decision = decideCreditNoteVoid(read.data?.CreditNotes?.[0], data.creditNoteId, data.creditNoteNumber)
   if (decision.action === 'already-done') return { success: true, alreadyDone: true }
   if (decision.action === 'refuse') return { success: false, permanent: decision.permanent, error: decision.error }
-  const res = await deps.post<XeroCreditNoteResponse>(
-    `CreditNotes/${data.creditNoteId}`,
-    { CreditNotes: [{ CreditNoteID: data.creditNoteId, Status: decision.status }] },
-    opts,
-  )
+  let res: { ok: boolean; status: number; error?: string }
+  try {
+    res = await deps.post<XeroCreditNoteResponse>(
+      `CreditNotes/${data.creditNoteId}`,
+      { CreditNotes: [{ CreditNoteID: data.creditNoteId, Status: decision.status }] },
+      opts,
+    )
+  } catch (error) {
+    // A timeout or a reset after the request may have left: the outcome is unknown. Reported as a failure; the next attempt reads the document first.
+    return { success: false, error: `voiding the credit note did not complete (the outcome in Xero is not known until it is read again): ${String(error)}` }
+  }
   if (!res.ok) return { success: false, error: res.error ?? `voiding the credit note failed with HTTP ${res.status}` }
   return { success: true }
+}
+
+/**
+ * o3d-0syfq: READ ONLY. The credit note's status in Xero (`VOIDED`, `AUTHORISED`, ...), or null when it cannot be read. Used to tell whether an
+ * earlier attempt's void reached Xero before IMS reports that it did not.
+ */
+export async function readCreditNoteStatus(
+  creditNoteId: string,
+  bounded?: XeroBoundedCall,
+  get: CreditNoteVoidDeps['get'] = (path, o) => xeroGet(path, o),
+): Promise<string | null> {
+  if (!creditNoteId || /[^A-Za-z0-9-]/.test(creditNoteId)) return null
+  try {
+    const read = await get<{ CreditNotes?: CreditNoteVoidReadback[] }>(`CreditNotes/${creditNoteId}`, bounded ? { bounded } : undefined)
+    if (!read.ok) return null
+    const status = (read.data?.CreditNotes?.[0] as { Status?: unknown } | undefined)?.Status
+    return typeof status === 'string' ? status.toUpperCase() : null
+  } catch {
+    return null
+  }
 }
 
 export const XERO_PURCHASE_CREDIT_NOTE_TYPE = 'ACCPAYCREDIT'

@@ -27,6 +27,7 @@ export type ImsFixture = {
   rates?: TaxRateRow[]
   mappings?: TaxMappingRow[]
   sales?: VatSalesRow[]
+  discountSplits?: ImsVat['discountSplits']
   boundaries?: PopulationBoundaries
   baseCurrency?: string
   store?: XeroTaxRateStore
@@ -55,6 +56,7 @@ export function imsPort(fixture: ImsFixture = {}): { calls: ImsReadOptions[]; im
         baseCurrency: fixture.baseCurrency ?? 'GBP',
         window: options.vatWindow ?? { from: '2000-01-01', toExclusive: '2000-02-01' },
         sales: fixture.sales ?? [],
+        discountSplits: fixture.discountSplits ?? [],
         xeroTenantId: fixture.xeroTenantId === undefined ? TENANT : fixture.xeroTenantId,
         xeroReportTypes: fixture.reportTypes ?? REPORT_TYPES,
         shippingAccount: fixture.shippingAccount ?? '260',

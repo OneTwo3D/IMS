@@ -209,3 +209,27 @@ test('document payload validation rejects malformed commercial documents', () =>
     },
   }), /at least one line/)
 })
+
+// [mutation: the parts dropped from the mirror / the header code kept beside them / a header-rate document given parts]
+test('an order booked under the per-rate discount split: the mirrored discount records the per-code parts it posted and no header code; a header-rate document is unchanged', () => {
+  const base = {
+    invoiceNumber: 'INV-2001',
+    contactName: 'Split Order',
+    date: '2026-11-20',
+    currency: 'GBP',
+    lines: [{ description: 'Std', quantity: 1, unitAmount: 100, accountCode: '200', taxType: 'OUTPUT2' }, { description: 'Red', quantity: 1, unitAmount: 100, accountCode: '200', taxType: 'ADRED5' }],
+    discountAmount: 40,
+    discountAccountCode: '490',
+    discountTaxType: 'OUTPUT2',
+    lineAmountsIncludeTax: false,
+  }
+  const doc = (payload: Record<string, unknown>) => buildAccountingDocumentPayload({ type: 'SALES_INVOICE', sourceEntityType: 'SalesOrder', sourceEntityId: 'order-2', fallbackCurrency: 'GBP', payload })
+  const split = doc({ ...base, discountParts: [{ amount: 20, taxType: 'OUTPUT2', taxRateId: 'r20' }, { amount: 20, taxType: 'ADRED5', taxRateId: 'r5' }] })
+  assert.deepEqual(split.discount, { amount: 40, accountCode: '490', parts: [{ amount: 20, taxType: 'OUTPUT2' }, { amount: 20, taxType: 'ADRED5' }] })
+  // No parts (switch off, every header-rate order): exactly the shape it always had, no `parts` key.
+  assert.deepEqual(doc(base).discount, { amount: 40, accountCode: '490', taxType: 'OUTPUT2' })
+  assert.deepEqual(doc({ ...base, discountParts: [] }).discount, { amount: 40, accountCode: '490', taxType: 'OUTPUT2' })
+  // A malformed part is refused, as a malformed line is.
+  assert.throws(() => doc({ ...base, discountParts: [{ amount: 0, taxType: 'OUTPUT2' }] }), /discountParts\[0\]\.amount must be positive/)
+  assert.throws(() => doc({ ...base, discountParts: ['x'] }), /discountParts\[0\] must be an object/)
+})

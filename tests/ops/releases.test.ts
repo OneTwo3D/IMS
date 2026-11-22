@@ -4,8 +4,8 @@ import test from 'node:test'
 import {
   ensureCurrentReleaseNotificationInStore,
   getReleaseNotificationId,
-  CURRENT_RELEASE,
-} from '../../lib/releases.ts'
+} from '../../lib/release-notifications.ts'
+import { CURRENT_RELEASE } from '../../lib/releases.ts'
 
 type ReleaseRow = {
   id: string

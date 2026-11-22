@@ -97,6 +97,7 @@ import { SHOP_REFUND_CONNECTOR, raiseShopRefundTask } from '@/lib/domain/sales/s
 import { returnExchangeRefusals } from '@/lib/domain/sales/return-exchange'
 import { storeCreditCreditNoteNumber, type RefundParityFactsInput } from '@/lib/domain/sales/refund-cn-parity'
 import { findRestockedInboxesToAdopt, raiseAdoptionReclassTask, type InboxAdoption } from '@/lib/domain/sales/return-restock-cost'
+import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 
 /**
  * Deliberate call-site boundary for this number-shaped refund service contract.
@@ -4302,6 +4303,11 @@ export async function createSalesOrderRefund(
       },
     })
     if (!so) return { error: 'Order not found' } as const
+    // o3d-ngmt.21 fence, read UNDER the order lock the invoice delete request also takes: a request that committed first is seen here, and one
+    // that arrives later waits for this refund and then refuses on it. Read before the lock, a request could commit in between and the refund
+    // would land on an invoice Xero is about to remove.
+    const deletePending = await pendingDeletionError(input.orderId, tx)
+    if (deletePending) return { error: deletePending } as const
 
     // Every refund line that names an order line must name one of THIS order's lines: a foreign id would be stored as-is and pollute per-line refunded quantities. Pure tightening for every caller.
     const foreignLine = refundLinesNotOnOrder(refundLines, so.lines)

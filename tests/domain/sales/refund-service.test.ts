@@ -836,6 +836,10 @@ function createClient(state: State): RefundServiceClient {
         state.activityLogs.push(data)
       },
     },
+    // o3d-668a2: the invoice-delete fence the refund reads under the order lock. No delete is pending in these fixtures.
+    accountingDocumentDeletion: {
+      findFirst: async () => null,
+    },
     returnExpectation: {
       findUnique: async ({ where }: { where: { refundId: string } }) => (
         (state.returnExpectations ?? []).find((row) => row.refundId === where.refundId) ?? null

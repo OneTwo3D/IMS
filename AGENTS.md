@@ -4,6 +4,12 @@
 This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` before writing any code. Heed deprecation notices.
 <!-- END:nextjs-agent-rules -->
 
+## Documentation is mandatory with code changes
+
+- Update `docs/**` and/or `help-docs/**` in the same PR as the code change. Code is the source of truth: where a doc disagrees with the code, fix the doc; if the code looks wrong, file a bead instead of documenting it.
+- CI enforces this with `npm run check:docs-required`. If nothing needs documenting, add `Docs: none — <reason>` to the PR's `changelog.d` fragment.
+- The single list of paths, exclusions and opt-out rules is docs/development.md, "Documentation Updates".
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 

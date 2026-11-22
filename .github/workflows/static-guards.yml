@@ -107,6 +107,24 @@ jobs:
         with:
           node-version: 26
       - run: npm run check:changelog-fragments
+  docs-required:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    # A pull request that changes behaviour-bearing code (app/, lib/, components/, prisma schema and migrations,
+    # shipped scripts/ and deploy/) must change docs/ or help-docs/, or add a changelog.d fragment line
+    # `Docs: none — <reason>` (docs/development.md, "Documentation Updates"). Same base rule as
+    # migration-conventions: a pull request compares merge-base(origin/<base>, HEAD); a push compares the
+    # event's before..after. fetch-depth 0 is needed for the merge-base. Node built-ins only, no install.
+    env:
+      DOCS_REQUIRED_BASE_REF: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || github.event.before }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 26
+      - run: npm run check:docs-required
   migration-conventions:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
