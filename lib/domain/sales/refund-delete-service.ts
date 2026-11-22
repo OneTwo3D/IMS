@@ -904,6 +904,7 @@ export async function retireRefusedRefundDeleteVoid(
       data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null, abandonedBeforeRemoteCall: true, attemptRevision: { increment: 1 } },
     })
     if (retired.count === 0) return false
+    // (A CREDIT_NOTE_VOID row has no mirrored accounting event: mirrored-sync-types.ts does not list the type, so there is none to retire.)
     if (refund) {
       await tx.activityLog.create({
         data: {
