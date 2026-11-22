@@ -91,6 +91,20 @@ function normalizeDocumentLine(line: unknown, index: number): AccountingDocument
   }
 }
 
+/**
+ * The per-rate parts of a split order discount (`payload.discountParts`, built by queueSalesInvoiceForOrder from SalesOrder.discountTaxSplit), or undefined when the payload carries none
+ * (every header-rate document: its mirror is unchanged). A part that is not an object with a positive amount is refused, as a malformed line is.
+ */
+function normalizeDiscountParts(value: unknown, field: string): Array<{ amount: number; taxType?: string | null }> | undefined {
+  if (!Array.isArray(value) || value.length === 0) return undefined
+  return value.map((part, index) => {
+    if (!isRecord(part)) throw new Error(`${field}[${index}] must be an object`)
+    const amount = numberValue(part.amount, `${field}[${index}].amount`)
+    if (amount == null || amount <= 0) throw new Error(`${field}[${index}].amount must be positive`)
+    return { amount, ...(typeof part.taxType === 'string' || part.taxType === null ? { taxType: part.taxType } : {}) }
+  })
+}
+
 function normalizeAdjustment(input: {
   amount: unknown
   description: unknown
@@ -151,13 +165,16 @@ export function buildAccountingDocumentPayload(params: {
     taxType: payload.shippingTaxType,
     field: 'payload.shipping',
   })
-  const discount = normalizeAdjustment({
+  // An order booked under the per-rate discount split posts its discount as one line per tax code: the mirror records those parts, not the header code the document did not post.
+  const discountParts = normalizeDiscountParts(payload.discountParts, 'payload.discountParts')
+  const discountBase = normalizeAdjustment({
     amount: payload.discountAmount,
     description: payload.discountDescription,
     accountCode: payload.discountAccountCode,
-    taxType: payload.discountTaxType,
+    taxType: discountParts ? undefined : payload.discountTaxType,
     field: 'payload.discount',
   })
+  const discount = discountBase && discountParts ? { ...discountBase, parts: discountParts } : discountBase
 
   return {
     kind: 'accounting-document',

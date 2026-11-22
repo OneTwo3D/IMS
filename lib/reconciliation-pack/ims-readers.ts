@@ -129,12 +129,19 @@ export type WmsProductLinkRow = { connector: string; productId: string; external
  */
 /** `taxBase` is the SUM; `nonZeroLines` counts the lines whose own tax is not zero (lines of opposite sign cancel in the sum, not in the count). */
 export type VatSalesRow = { period: string; taxRateId: string | null; taxBase: string; lines: number; nonZeroLines: number }
+/**
+ * An order of the same population whose order discount was taxed at its lines' rates (SalesOrder.discountTaxSplit, written only with `sales_order_discount_tax_apportion_enabled` on): its
+ * invoice posts the discount as one negative line per tax code, so R12 takes each rate's share of the discount VAT off that rate (vat-item.ts). `discount` is the stored discountAmount (the
+ * invoice posts the parts only when it rounds to a positive penny) and `split` the stored JSON as text, read by the one parser every consumer uses. No row for an order without a split.
+ */
+export type VatDiscountSplitRow = { period: string; orderId: string; discount: string; split: string }
 export type VatXeroReportTypeRow = { taxType: string; reportTaxType: string | null }
 export type VatOrderFxRow = { externalOrderId: string; currency: string; fxRateToBase: string }
 export type ImsVat = {
   baseCurrency: string
   window: { from: string; toExclusive: string }
   sales: VatSalesRow[]
+  discountSplits: VatDiscountSplitRow[]
   xeroTenantId: string | null
   xeroReportTypes: VatXeroReportTypeRow[]
   /** The configured Xero shipping, sales and discount account codes ('' = not configured) and whether the shipping code is exactly ONE active account of the stored chart. */
@@ -619,6 +626,15 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
       return { period, taxRateId: textOrNull(row.rate_id), taxBase: decimal(row.tax), lines: count(row.n), nonZeroLines: count(row.nz) }
     })
     unique(sales, (row) => `${row.period}\u0001${row.taxRateId ?? ''}`)
+    // The orders of the same population (bounds, CANCELLED and archived as above) whose discount tax was split by line rate. Header-rate orders carry no split and are not read here.
+    const splitRows = await readCapped(tx, `SELECT to_char((so."invoicedAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Europe/London', 'YYYY-MM') AS period, so.id, COALESCE(so."discountAmount", 0)::text AS discount, so.discount_tax_split::text AS split FROM sales_orders so WHERE so."invoicedAt" >= ($1::date::timestamp AT TIME ZONE 'Europe/London') AT TIME ZONE 'UTC' AND so."invoicedAt" < ($2::date::timestamp AT TIME ZONE 'Europe/London') AT TIME ZONE 'UTC' AND so.status::text <> 'CANCELLED' AND so.archived = false AND so.discount_tax_split IS NOT NULL ORDER BY so.id`, [window.from, window.toExclusive])
+    const discountSplits = splitRows.map((row): VatDiscountSplitRow => {
+      const period = text(row.period, 'SOURCE_UNREADABLE')
+      if (!/^[0-9]{4}-(?:0[1-9]|1[0-2])$/.test(period)) throw new Unreadable('SOURCE_UNREADABLE')
+      if (typeof row.split !== 'string') throw new Unreadable('SOURCE_UNREADABLE')
+      return { period, orderId: text(row.id), discount: decimal(row.discount), split: row.split }
+    })
+    unique(discountSplits, (row) => row.orderId)
     const tokens = await tx.query(`SELECT "tenantId" AS tenant FROM accounting_tokens WHERE connector = 'xero'`)
     if (tokens.length > 1) throw new Unreadable('DUPLICATE_KEY')
     const xeroTenantId = tokens.length === 1 && typeof tokens[0]!.tenant === 'string' && tokens[0]!.tenant.trim() !== '' ? tokens[0]!.tenant : null
@@ -648,7 +664,7 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     }
     const fx = (await readCapped(tx, `SELECT l."externalOrderId" AS external_id, so.currency, so."fxRateToBase"::text AS fx FROM shopping_order_links l JOIN sales_orders so ON so.id = l."orderId" WHERE l.connector = 'woocommerce' AND so.currency <> 'GBP' ORDER BY l.id`)).map((row): VatOrderFxRow => ({ externalOrderId: text(row.external_id), currency: text(row.currency, 'CURRENCY_UNKNOWN'), fxRateToBase: decimal(row.fx) }))
     unique(fx, (row) => row.externalOrderId)
-    return { baseCurrency, window, sales, xeroTenantId, xeroReportTypes, shippingAccount, shippingAccountInChart, salesAccount, discountAccount, wooFx: fx }
+    return { baseCurrency, window, sales, discountSplits, xeroTenantId, xeroReportTypes, shippingAccount, shippingAccountInChart, salesAccount, discountAccount, wooFx: fx }
   },
 
   async wmsBindings(tx) {

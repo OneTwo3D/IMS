@@ -732,7 +732,7 @@ These rules change what IMS records, not who posts it. Credit notes go through t
 
 ### Order discount posted per VAT rate (switch off by default)
 
-For a manual order priced with `sales_order_discount_tax_apportion_enabled` on, the invoice posts the order-level discount as several negative "Order discount" lines, one for each VAT rate among the order's lines, all to the Discount account, so Xero's VAT per rate equals the order's. The invoice is refused (nothing sent) if those lines do not add up to the discount. A credit note for a refund of such an order reverses each rate's share on that rate's tax code. An automatic chargeback on such an order is not raised; it is logged as `chargeback_requires_manual_handling` and the credit note is raised by hand.
+For a manual order priced with `sales_order_discount_tax_apportion_enabled` on, the invoice posts the order-level discount as several negative "Order discount" lines, one for each VAT rate among the order's lines, all to the Discount account, so Xero's VAT per rate equals the order's. The invoice is refused (nothing sent) if those lines do not add up to the discount. A credit note for a refund of such an order reverses each rate's share on that rate's tax code. An automatic chargeback on such an order is not raised; it is logged as `chargeback_requires_manual_handling` and the credit note is raised by hand. IMS's own record of the invoice (the accounting event) lists the same per-rate discount parts, and the reconciliation pack's VAT check (R12) takes each rate's share of the discount VAT off that rate, so it compares like for like with Xero. Orders priced without the switch are unchanged in both.
 
 ### Chargebacks and the order-level discount
 

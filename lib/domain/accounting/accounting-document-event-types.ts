@@ -32,6 +32,11 @@ export type AccountingDocumentAdjustment = {
   description?: string
   accountCode?: string
   taxType?: string | null
+  /**
+   * The order discount of an order booked under the per-rate split (the payload's `discountParts`): one part per tax code, as the document posts it (one negative line per code). Present only then;
+   * the adjustment then carries no single `taxType`, because no header-coded discount line was posted. `amount` stays the whole discount (the parts sum to it).
+   */
+  parts?: Array<{ amount: number; taxType?: string | null }>
 }
 
 export type AccountingDocumentEventPayload = {
