@@ -22,6 +22,7 @@ import { randomUUID } from 'node:crypto'
 import process from 'node:process'
 import { runWmsArchiveCli, type ArchiveTarget } from '../lib/first-load/wms-discontinue/cli'
 import { openArchiveTargetConnection } from '../lib/db/first-load-archive-target'
+import { SESSION_LOCK_DATABASE_URL_ENV } from '../lib/db/database-url-schema.mjs'
 import { buildExportEnv } from '../lib/first-load/export-fx-rates'
 import { createMintsoftArchiveWiring } from '../lib/connectors/mintsoft/first-load-archive-write'
 import { readEnvFile } from './lib/first-load-apply-files'
@@ -40,7 +41,7 @@ async function openTarget(envFile: string): Promise<ArchiveTarget> {
   const built = buildExportEnv(file.env, process.env, process.env.HOME ?? '/tmp')
   if (built.problems.length > 0) throw new Error(built.problems.join('; '))
   // The direct-session override would move the session (and the run's lock) off the file's DATABASE_URL: this command connects directly or not at all.
-  if (built.env.DATABASE_SESSION_LOCK_URL !== undefined) throw new Error('the env file sets DATABASE_SESSION_LOCK_URL; this command uses the file\'s DATABASE_URL as a direct session only: run it with a direct (non-pooled) DATABASE_URL in a copy of the file without that variable')
+  if (Object.prototype.hasOwnProperty.call(built.env, SESSION_LOCK_DATABASE_URL_ENV)) throw new Error(`the env file sets ${SESSION_LOCK_DATABASE_URL_ENV}; this command uses the file's DATABASE_URL as a direct session only: run it with a direct (non-pooled) DATABASE_URL in a copy of the file without that variable`)
   let connection
   try {
     connection = await openArchiveTargetConnection({ databaseUrl: built.env.DATABASE_URL! }, APPLICATION_NAME)
