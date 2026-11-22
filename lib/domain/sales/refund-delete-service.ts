@@ -996,7 +996,12 @@ export async function voidCreditNoteThenCompleteRefundDeletion(
       let lockRefusal: string | null = null
       const beforePost = async (): Promise<string | null> => {
         lockRefusal = await voidLockDateRefusal(tx, input.voidSyncLogId, creditNoteOwnDay(verdict.plan?.creditNote.row?.payload))
-        return lockRefusal
+        if (lockRefusal) return lockRefusal
+        // #1132 MED-3: THE ATTEMPT STAMP, immediately before the void request, written on the app client (its own connection, outside this
+        // transaction) so it survives a rollback: a row without it has provably never sent a void (voidRowProvenNeverSent). A stamp that
+        // cannot be written throws here, and the void is then not sent.
+        await client.accountingSyncLog.updateMany({ where: { id: input.voidSyncLogId, remoteAttemptedAt: null }, data: { remoteAttemptedAt: new Date() } })
+        return null
       }
       const voided = await ledger.voidInLedger({ timeoutMs: REFUND_DELETE_VOID_CALL_TIMEOUT_MS, deadlineAt: deadline - REFUND_DELETE_COMMIT_MARGIN_MS, beforePost })
       if (lockRefusal) throw new RollbackWith({ kind: 'refused', error: lockRefusal })

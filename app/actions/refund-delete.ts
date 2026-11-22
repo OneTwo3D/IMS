@@ -6,7 +6,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
 import { INTERNAL_ACTION_BYPASS } from '@/lib/internal-action-bypass'
 import { enqueueStockSync } from '@/lib/shopping'
-import { evaluateRefundDeletion, deleteSalesOrderRefund } from '@/lib/domain/sales/refund-delete-service'
+import { evaluateRefundDeletion, deleteSalesOrderRefund, markRefundDeleteFollowUpsDone } from '@/lib/domain/sales/refund-delete-service'
 import { REFUND_DELETE_SETTING, refundDeleteEnabledFromSetting, type RefundDeleteRefusal } from '@/lib/domain/sales/refund-delete-policy'
 
 /**
@@ -90,6 +90,8 @@ export async function deleteRefund(
     description: warning ?? 'Refund deleted; the order was re-reserved and the stock change queued.',
     metadata: { refundId },
   })
+  // #1132 MED-2: the tombstone records that the follow-ups ran (the void worker's retry of a two-phase delete reads it; a one-step delete's is a record).
+  await markRefundDeleteFollowUpsDone(db, refundId).catch(() => { /* advisory: the follow-ups themselves ran and are logged above */ })
   if (orderId) {
     revalidatePath('/sales')
     revalidatePath(`/sales/${orderId}`)

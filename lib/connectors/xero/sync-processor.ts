@@ -6369,7 +6369,7 @@ export const REFUND_DELETE_MAX_DEFERRALS = 96
  *   anything else                    a failure that spends a retry; the one that makes the row FAILED raises the operator task
  *                                    REFUND_DELETE_VOID_STUCK (unless Xero is known to hold the credit note voided: that task is already raised).
  */
-async function refundDeleteVoidFailure(args: {
+export async function refundDeleteVoidFailure(args: {
   entryId: string
   referenceId: string
   attempt: AttemptRef
@@ -7671,14 +7671,8 @@ export async function processClaimedEntry(
           },
           voidInLedger: (bounded) => voidInLedger(
             { timeoutMs: bounded.timeoutMs, ...(bounded.deadlineAt !== undefined ? { deadlineAt: bounded.deadlineAt } : {}), ...(boundedAuth ? { auth: boundedAuth } : {}) },
-            async () => {
-              const refusal = bounded.beforePost ? await bounded.beforePost() : null
-              if (refusal) return refusal
-              // #1132 MED-3: THE ATTEMPT STAMP, on its own connection so it outlives a rollback, immediately before the void request: a row
-              // without it has provably never sent one (voidRowProvenNeverSent). A stamp that cannot be written sends nothing.
-              await db.accountingSyncLog.updateMany({ where: { id: entryId, remoteAttemptedAt: null }, data: { remoteAttemptedAt: new Date() } })
-              return null
-            },
+            // The service's own check and attempt stamp, asked by the void immediately before its POST (see voidCreditNote's beforePost).
+            bounded.beforePost,
           ),
           readCreditNoteStatus: (bounded) => readCreditNoteStatus(voidCreditNoteId, { timeoutMs: bounded.timeoutMs, ...(boundedAuth ? { auth: boundedAuth } : {}) }),
         },

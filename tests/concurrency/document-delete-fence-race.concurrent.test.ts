@@ -377,3 +377,61 @@ test('LOCK ORDER: bill completion takes the purchase order BEFORE the bill (as t
     await cleanBill(db, f)
   }
 })
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// #1132 MED-4 follow-ups
+// ---------------------------------------------------------------------------------------------------------------------------
+
+test('#1132 MED-4 POSTING A SUPPLIER CREDIT NOTE vs THE DELETE REQUEST: the check is under the purchase order lock; parked, it refuses on the committed request and stays DRAFT', SKIP, async () => {
+  const { db } = await import('@/lib/db')
+  await applySettings()
+  const f = await seedBill(db, 'bcnpost')
+  try {
+    const { recordSupplierFreightCreditNote, postSupplierCreditNote } = await import('@/app/actions/purchase-orders')
+    // Recorded (DRAFT) before any delete was asked for.
+    const recorded = await recordSupplierFreightCreditNote({ poId: f.poId, purchaseInvoiceId: f.billId, amountForeign: 5, reason: 'before' })
+    assert.equal(recorded.success, true, String((recorded as { error?: string }).error))
+    const cn = await db.supplierCreditNote.findFirstOrThrow({ where: { purchaseInvoiceId: f.billId }, select: { id: true, status: true } })
+    assert.equal(cn.status, 'DRAFT')
+    const { answer, parkedOn } = await raceAgainstRequest(db, {
+      lock: lockPoThenBill(f),
+      deletion: billDeletion(f),
+      writer: () => postSupplierCreditNote(cn.id),
+      waitingOn: /purchase_orders/i,
+      describe: 'supplier credit note post behind the delete request',
+    })
+    assert.match(parkedOn, /purchase_orders/i, 'parked on the purchase order lock (before the fix the check ran before the transaction and never waited)')
+    assert.equal(answer.success, false, 'the post must refuse once the request has committed')
+    assert.match(String(answer.error), /is being deleted in IMS and Xero/)
+    assert.equal((await db.supplierCreditNote.findUniqueOrThrow({ where: { id: cn.id }, select: { status: true } })).status, 'DRAFT')
+    assert.equal(await db.accountingSyncLog.count({ where: { type: 'PURCHASE_CREDIT_NOTE', referenceId: cn.id } }), 0, 'nothing queued for Xero')
+  } finally {
+    await cleanBill(db, f)
+  }
+})
+
+test('#1132 MED-4 LATE ACTIVITY COUNTS UPDATES: an invoice or bill UPDATE queued after the request stops the unwind (NEEDS_REVIEW), robust to other rows', SKIP, async () => {
+  const { db } = await import('@/lib/db')
+  await applySettings()
+  const sales = await seedSalesInvoice(db, 'lateupd')
+  const bill = await seedBill(db, 'lateupdb')
+  try {
+    const { completeAccountingDocumentDeletion } = await import('@/lib/domain/accounting/document-delete-service')
+    // An UPDATE row from BEFORE the request (already posted) is not late.
+    await db.accountingSyncLog.create({ data: { type: 'SALES_INVOICE_UPDATE', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: sales.orderId, payload: { accountingInvoiceId: sales.xeroId }, createdAt: new Date(Date.now() - 3_600_000) } })
+    await db.accountingDocumentDeletion.create({ data: { ...salesDeletion(sales), releasedNumber: `${sales.number}-DEL-LATE01`, snapshot: {} } })
+    await db.accountingDocumentDeletion.create({ data: { ...billDeletion(bill), releasedNumber: `${bill.number}-DEL-LATE01`, snapshot: { purchaseOrderId: bill.poId } } })
+    // Slipped in after the request.
+    await db.accountingSyncLog.create({ data: { type: 'SALES_INVOICE_UPDATE', status: 'PENDING', referenceType: 'SalesOrder', referenceId: sales.orderId, payload: { accountingInvoiceId: sales.xeroId } } })
+    await db.accountingSyncLog.create({ data: { type: 'PURCHASE_INVOICE_UPDATE', status: 'PENDING', referenceType: 'PurchaseOrder', referenceId: bill.poId, payload: { accountingInvoiceId: bill.xeroId } } })
+    assert.equal(await completeAccountingDocumentDeletion(sales.xeroId), 'needs-review', 'THE FIX: the late invoice update is counted')
+    assert.equal(await completeAccountingDocumentDeletion(bill.xeroId), 'needs-review', 'THE FIX: the late bill update is counted')
+    const salesRow = await db.accountingDocumentDeletion.findUniqueOrThrow({ where: { externalDocumentId: sales.xeroId } })
+    assert.deepEqual((salesRow.snapshot as { lateActivity?: string[] }).lateActivity, ['1 invoice update(s)'])
+    const billRow = await db.accountingDocumentDeletion.findUniqueOrThrow({ where: { externalDocumentId: bill.xeroId } })
+    assert.deepEqual((billRow.snapshot as { lateActivity?: string[] }).lateActivity, ['1 bill update(s)'])
+  } finally {
+    await cleanSales(db, sales)
+    await cleanBill(db, bill)
+  }
+})
