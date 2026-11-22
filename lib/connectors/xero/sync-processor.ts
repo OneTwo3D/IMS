@@ -39,7 +39,7 @@ import {
 import { logActivity, logActivityInTransaction, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
 import { pushSalesInvoice, updateSalesInvoice, type BeforeRemoteWrite } from './invoices'
 import { pushPurchaseBill, updatePurchaseBill } from './bills'
-import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote, readCreditNoteSettlementBalances, refundSalesCreditNote, resolveCreditNoteAllocationAmount, voidCreditNote } from './credit-notes'
+import { allocatePurchaseCreditNote, pushCreditNote, pushPurchaseCreditNote, readCreditNoteSettlementBalances, refundSalesCreditNote, resolveCreditNoteAllocationAmount, voidCreditNote, readCreditNoteStatus } from './credit-notes'
 import {
   CREDIT_NOTE_ALLOCATION_CONNECTOR,
   decideXeroCreditNoteWitness,
@@ -67,7 +67,7 @@ import {
   type AccountingOriginRecord,
 } from '@/lib/connectors/accounting-connection-provenance'
 import { withAccountingPostingIntent } from '@/lib/connectors/accounting-posting-intent'
-import { xeroUploadAttachment, xeroPost } from './api'
+import { xeroUploadAttachment, xeroPost, type XeroBoundedCall } from './api'
 import { CREDIT_NOTE_DUPLICATE_CHECK_SETTING_KEY, creditNoteCreateDuplicates, creditNotePayloadGrossCents, describeCreditNote, duplicateVerdict, readOrderCreditNoteKeys, readOrderCreditNotesFromXero, type DuplicateContext } from './order-credit-notes'
 import { accountingBankAccountBelongsTo, accountingPostingKey, lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
 import { parsePaymentAccountMap } from '@/lib/accounting/payment-account-map'
@@ -7548,13 +7548,14 @@ export async function processClaimedEntry(
       // response or a partial failure converges instead of erroring.
       const voidCreditNoteId = typeof payload.creditNoteId === 'string' ? payload.creditNoteId : ''
       if (!voidCreditNoteId) return { success: false, error: 'Missing creditNoteId for CREDIT_NOTE_VOID' }
-      // The claim fence and the void, as the last thing before the socket.
-      const voidInLedger = async (): Promise<EntryResult> => {
+      // The claim fence and the void, as the last thing before the socket. `bounded`: called from inside the refund delete's locked transaction,
+      // so no in-request sleep or retry and a hard timeout (o3d-0syfq); unbounded for any other reference type, as before.
+      const voidInLedger = async (bounded?: XeroBoundedCall): Promise<EntryResult> => {
         const fence = await lease.fenceBeforeRemoteWrite('credit-note-void')
         if (!fence.ok) return fence.result
         const voided = await voidCreditNote(
           { creditNoteId: voidCreditNoteId, creditNoteNumber: typeof payload.creditNoteNumber === 'string' ? payload.creditNoteNumber : null },
-          { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note-void') },
+          { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note-void'), ...(bounded ? { bounded } : {}) },
         )
         return voided.success ? { success: true } : { success: false, error: voided.error ?? 'the void failed' }
       }
@@ -7564,12 +7565,16 @@ export async function processClaimedEntry(
         // The id returned is the credit note's own: the void acts on a document that already stood (UPDATE_DOCUMENT).
         return { success: true, externalId: voidCreditNoteId }
       }
-      // A refund delete (o3d-0syfq): the refund's stock is fenced and the delete re-decided under the locks BEFORE the void reaches the ledger, and
-      // phase 2 (the IMS unwind) commits under the same locks, so the returned stock cannot move between the void and the unwind. Refused under the
-      // locks, the ledger is not asked at all (idempotent: an already deleted refund is a success).
+      // A refund delete (o3d-0syfq): the refund's stock is fenced, the delete re-decided and the whole IMS unwind run under the locks, and the
+      // (bounded) void is the last statement before the commit, so the returned stock cannot move between the void and the unwind. Refused under
+      // the locks, the ledger is not asked to void at all (idempotent: an already deleted refund is a success).
       const meta = (payload as { _refundDelete?: { actorUserId?: string | null; reason?: string | null } })._refundDelete
       const { voidCreditNoteThenCompleteRefundDeletion } = await import('@/lib/domain/sales/refund-delete-service')
-      const finished = await voidCreditNoteThenCompleteRefundDeletion(db, { refundId: referenceId, voidSyncLogId: entryId, actorUserId: meta?.actorUserId ?? null, reason: meta?.reason ?? null }, voidInLedger)
+      const finished = await voidCreditNoteThenCompleteRefundDeletion(
+        db,
+        { refundId: referenceId, voidSyncLogId: entryId, actorUserId: meta?.actorUserId ?? null, reason: meta?.reason ?? null },
+        { voidInLedger: (bounded) => voidInLedger(bounded), readCreditNoteStatus: (bounded) => readCreditNoteStatus(voidCreditNoteId, bounded) },
+      )
       if (!finished.ok) return finished.passthrough !== undefined ? finished.passthrough as EntryResult : { success: false, error: finished.error }
       if (finished.stockSyncFailed) {
         await logActivity({ entityType: 'SALES_ORDER', entityId: finished.orderId ?? referenceId, action: 'refund_delete_stock_sync_failed', tag: 'sales', level: 'WARNING', description: 'The refund was deleted, but its stock change could not be queued for the storefront. It will go with the next stock sync; push the stock from the product page if it is urgent.', metadata: { refundId: referenceId } }).catch(() => { /* the delete is done; the warning is advisory */ })
