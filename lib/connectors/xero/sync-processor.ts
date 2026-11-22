@@ -6338,20 +6338,6 @@ async function refuseNonPositivePayment(params: {
   return { success: true, skipped: true }
 }
 
-/**
- * o3d-19gy / o3d-s36z / o3d-gfh: every remote call this entry makes is attributed to this entry's row.
- *
- * WHERE THE PERMISSION IS ACTUALLY GRANTED. Not here. This establishes the INTENT — which row is being
- * posted — and the verdict is reached inside `performRequest`, against the tenant id that will be
- * written into the outgoing `Xero-Tenant-Id` header, immediately before the request leaves. The earlier
- * revision decided it here, from its own read of the `AccountingToken` row, and the request then made a
- * second, independent selection of the tenant when it built its headers; a permission taken at T1 and
- * spent at T2 is not a permission, and that gap is what Codex r1 finding 3 names.
- *
- * The wrap covers the whole entry rather than just its write, because a handler's contact and item
- * lookups CACHE ids from the responses they get: reading organisation C's chart of accounts on behalf of
- * a row raised against B is the same error one step earlier.
- */
 /** #1132 R2-MED-2: how long a refund delete's void waits after an attempt that sent nothing, and how many such waits it takes before it fails. */
 export const REFUND_DELETE_DEFER_DELAY_MS = 15 * 60_000
 /** 96 waits of 15 minutes: a day. Past that a not-sent attempt fails like any other (it spends retries, and the last raises an operator task). */
@@ -6401,6 +6387,20 @@ export async function refundDeleteVoidFailure(args: {
   return passed ?? { success: false, error }
 }
 
+/**
+ * o3d-19gy / o3d-s36z / o3d-gfh: every remote call this entry makes is attributed to this entry's row.
+ *
+ * WHERE THE PERMISSION IS ACTUALLY GRANTED. Not here. This establishes the INTENT — which row is being
+ * posted — and the verdict is reached inside `performRequest`, against the tenant id that will be
+ * written into the outgoing `Xero-Tenant-Id` header, immediately before the request leaves. The earlier
+ * revision decided it here, from its own read of the `AccountingToken` row, and the request then made a
+ * second, independent selection of the tenant when it built its headers; a permission taken at T1 and
+ * spent at T2 is not a permission, and that gap is what Codex r1 finding 3 names.
+ *
+ * The wrap covers the whole entry rather than just its write, because a handler's contact and item
+ * lookups CACHE ids from the responses they get: reading organisation C's chart of accounts on behalf of
+ * a row raised against B is the same error one step earlier.
+ */
 async function processEntry(
   entryId: string,
   type: AccountingSyncType,
