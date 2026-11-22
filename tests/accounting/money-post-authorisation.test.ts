@@ -386,7 +386,16 @@ test('CREDIT_NOTE_ALLOCATION posts inside the fence, dated and fenced like the o
     assert.ok(at > 0, `${needle} is called`)
     assert.ok(lines.slice(Math.max(0, at - 2), at).some((line) => line.includes('if (!fence.ok) return fence.result') || line.includes('if (!refundFence.ok) return refundFence.result')), `${needle} is fenced immediately before it`)
   }
-  assert.ok(/const settlementDate = posting\.date/.test(body), 'the date comes from moneyPostDateToSend')
+  assert.ok(/(?:const|let) settlementDate = posting\.date/.test(body), 'the date comes from moneyPostDateToSend')
+  // o3d-l9gej: a RECORDED refund payment may be re-dated to its cash-out day (`let`), but only BEFORE the decision is pinned and the fence is asked: no
+  // assignment to settlementDate follows the pinned write, so the fence and the request still carry one value, and it is the pinned one.
+  const pinnedAt = body.indexOf('const pinnedWrite = await db.accountingSyncLog.updateMany(')
+  assert.notEqual(pinnedAt, -1, 'the decision is pinned before the fence')
+  assert.ok(pinnedAt < guardAt, 'the pin precedes the fence')
+  assert.equal(/\bsettlementDate = (?!posting\.date)/.test(body.slice(pinnedAt)), false, 'settlementDate is never reassigned after the decision is pinned')
+  for (const m of body.matchAll(/\bsettlementDate = (?!posting\.date)([^\n]+)/g)) {
+    assert.ok(/^(cashOut\.date|payload\.creditNoteDate)$/.test(m[1]!.trim()), `settlementDate is only ever re-dated to a value pinned as the row's date: ${m[1]}`)
+  }
   assert.ok(body.slice(guardAt, callbackAt).includes('postingDate: settlementDate,'), 'the fence is handed the very date the request carries')
 })
 
