@@ -68,7 +68,7 @@ export async function readClaimedSyncLogPayload(
  *
  * Not a second query and not a second moment: one `findUnique` selects both, so a caller can never
  * hold a payload from one read and a column from another. {@link readClaimedSyncLogPayload} is the
- * narrow face of this for callers that do not make the connection check (QuickBooks today).
+ * narrow face of this for callers that do not make the connection check.
  *
  * A client whose `findUnique` predates this column answers `undefined`, which reads as "no durable
  * record" — the same as a pre-migration row, and refuses nothing that is not already refused.

@@ -155,17 +155,16 @@ export const RETURNS_EXCHANGE_NOTICE =
 // ---------------------------------------------------------------------------------------------
 
 /**
- * o3d-remove-parked-connectors — FIVE ENTRIES WERE REMOVED WITH THE QUICKBOOKS CONNECTOR.
+ * o3d-remove-parked-connectors — FIVE ENTRIES WERE REMOVED WITH A RETIRED CONNECTOR.
  *
- * `app/actions/quickbooks-{sync,daily-batch}.ts` and `lib/connectors/quickbooks/{daily-sync,
- * payment-poller,settings}.ts`, all classified `not-refund-sensitive` ("ledger posting / out of scope
- * by owner instruction"). `tests/analytics/refund-figure-surface-coverage.test.ts` refuses a STALE
- * entry — one naming a file the tree no longer has — so they had to go in the same commit as the
- * archive.
+ * Five files of a retired connector, all classified `not-refund-sensitive` ("ledger posting / out of
+ * scope by owner instruction"), left the tree. `tests/analytics/refund-figure-surface-coverage.test.ts`
+ * refuses a STALE entry — one naming a file the tree no longer has — so they had to go in the same
+ * commit as the removal.
  *
  * THIS CENSUS IS NOT LEFT VACUOUS BY THAT: its population is every file in the tree that mentions a
  * refund-sensitive figure name, the sweep is re-run from the tree on every test run, and 80-odd
- * entries remain. What changed is only that the five QuickBooks files are no longer in the tree to
+ * entries remain. What changed is only that the five retired-connector files are no longer in the tree to
  * classify.
  */
 export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [

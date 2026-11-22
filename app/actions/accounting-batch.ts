@@ -10,7 +10,7 @@ import type {
 /**
  * Generic daily-batch preview. `groupBPreviewed` is `false` when the active
  * connector does not yet compute a group-B (shipment revenue + COGS) preview
- * (e.g. QuickBooks — 2t0q deferred B): the UI must then NOT treat a zero
+ * (a connector whose group B preview is deferred — 2t0q): the UI must then NOT treat a zero
  * group B as "nothing pending", since the batch still posts B at run time.
  * Omitted/undefined means group B is previewed normally (Xero).
  */
@@ -77,8 +77,8 @@ function mapHistoryDay(day: DailyBatchHistoryDay): AccountingBatchHistoryDay {
 }
 
 // Daily-batch preview/history are connector-owned read surfaces: each queries
-// its own connector's DAILY_BATCH_* sync logs and settings. Xero and QuickBooks
-// each provide one; connectors without a surface get an honest empty result
+// its own connector's DAILY_BATCH_* sync logs and settings. Xero
+// provides one; connectors without a surface get an honest empty result
 // rather than bleeding another connector's batch data into the UI. The
 // daily-batch *poster* still runs per active connector via
 // /api/cron/accounting-daily-batch.
@@ -106,8 +106,8 @@ function emptyAccountingBatchPreview(): AccountingBatchPreview {
 // (a database-backed plugin-state read) has already run on behalf of a principal
 // that may not read anything here.
 //
-// Both branches' delegates agree on requirePermission('sync')
-// (xero-daily-batch.ts and quickbooks-daily-batch.ts alike), so this is an exact
+// Every branch's delegate agrees on requirePermission('sync')
+// (xero-daily-batch.ts today), so this is an exact
 // match rather than a choice: ADMIN and MANAGER keep every path they had, and
 // WAREHOUSE / FINANCE / READONLY / SUPPLIER lose a fall-through answer and a
 // plugin-state read they could never have used.

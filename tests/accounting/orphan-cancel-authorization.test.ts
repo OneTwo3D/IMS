@@ -44,7 +44,6 @@ const accountingSyncLog = {
 function pluginRows() {
   return [
     { key: 'plugin_mintsoft_enabled', value: 'false' },
-    { key: 'plugin_quickbooks_enabled', value: String(state.activeConnector === 'quickbooks') },
     { key: 'plugin_shopify_enabled', value: 'false' },
     { key: 'plugin_woocommerce_enabled', value: 'false' },
     { key: 'plugin_xero_enabled', value: String(state.activeConnector === 'xero') },
@@ -105,7 +104,7 @@ test('the mismatch this file is about: MANAGER holds `sync` and not `settings`',
 })
 
 test('ADMIN passes the REAL gate and the cancel runs', async () => {
-  const result = await cancel('quickbooks')
+  const result = await cancel('retired-ledger')
 
   assert.equal(result.success, true)
   assert.equal(result.cancelled, 2)
@@ -116,7 +115,7 @@ test('MANAGER is REFUSED by the real gate, and refused by THROWING — which is 
   state.role = 'MANAGER'
 
   await assert.rejects(
-    () => cancel('quickbooks'),
+    () => cancel('retired-ledger'),
     (error: unknown) => {
       assert.ok(isAuthorizationDenial(error), 'a typed denial')
       assert.equal((error as PermissionDeniedError).permission, 'settings')
@@ -130,7 +129,7 @@ test('every role without `settings` is refused; the only role with it is ADMIN',
   for (const role of ['MANAGER', 'WAREHOUSE', 'FINANCE', 'READONLY', 'SUPPLIER']) {
     state.role = role
     state.updates = []
-    await assert.rejects(() => cancel('quickbooks'), (e: unknown) => isAuthorizationDenial(e), `${role} must be refused`)
+    await assert.rejects(() => cancel('retired-ledger'), (e: unknown) => isAuthorizationDenial(e), `${role} must be refused`)
     assert.deepEqual(state.updates, [], `${role} must write nothing`)
   }
 })

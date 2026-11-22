@@ -26,8 +26,5 @@ export async function GET(request: Request) {
     return cronResultResponse(result, { outcomeClass: cronOutcome('accounting-payment-poll', result) })
   }
 
-  // The QuickBooks branch was here and is archived (o3d-remove-parked-connectors): plugin +
-  // `quickbooks_payment_polling_enabled` + `quickbooks_sync_enabled`, then `pollQuickBooksPayments()`.
-
   return cronSkippedResponse('No accounting plugin enabled')
 }

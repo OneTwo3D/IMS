@@ -4,10 +4,10 @@
  * THE HOLE THIS FILLS. Re-posting a FAILED money row under the token its attempt used is only
  * protective while the remote system still remembers that token. Xero retains an Idempotency-Key
  * for a documented window of MINUTES; a manual retry is by nature minutes to days later, so the
- * key it re-sends is processed as a brand-new request. QuickBooks' `requestid` replay is better
- * behaved, but "better behaved" is a claim about someone else's undocumented retention, and this
- * guard exists precisely because a lost response is indistinguishable from a failed call. So
- * neither connector's deduplication may be treated as a reason to skip the question.
+ * key it re-sends is processed as a brand-new request. Another ledger's replay window may be
+ * better behaved, but "better behaved" is a claim about someone else's undocumented retention, and
+ * this guard exists precisely because a lost response is indistinguishable from a failed call. So
+ * no connector's deduplication may be treated as a reason to skip the question.
  *
  * The question that CAN be answered is not "did the remote deduplicate?" but "is this attempt in
  * the ledger?". A committed payment is a durable, readable record. So before a previously-attempted
@@ -81,8 +81,7 @@ export type LedgerSettlementRecord = {
   /** The remote id, carried only so a refusal can name it. */
   id?: string | null
   /**
-   * The reference/note field IMS writes its mark into (Xero `Payment.Reference`, QuickBooks
-   * `PrivateNote`). Null when the ledger does not expose one for this kind of settlement.
+   * The reference/note field IMS writes its mark into (Xero `Payment.Reference`). Null when the ledger does not expose one for this kind of settlement.
    */
   reference?: string | null
 }
@@ -108,13 +107,11 @@ export type LedgerSettlementProbe =
        * of a non-match: a truncated response that omits the document's own settled figure, returns
        * one UNRELATED settlement and omits the attempted one satisfied that predicate, answered
        * `ok: true`, matched nothing, and reached `clear` — which authorises a second payment. Codex
-       * executed the shape against all three probe arms (Xero invoice, Xero credit note, QuickBooks
-       * bill) and got `clear` from each.
+       * executed the shape against every probe arm and got `clear` from each.
        *
        * SO WHAT PROVES COMPLETENESS. Not the records: the DOCUMENT'S OWN settled figure, which every
        * arm already computes for its shortfall cross-check — `Total - AmountDue` on a Xero invoice,
-       * `Total - RemainingCredit` on a Xero credit note, `TotalAmt - Balance` on a QuickBooks
-       * document. When that figure is stated, the cross-check has run: either the ledger says nothing
+       * `Total - RemainingCredit` on a Xero credit note. When that figure is stated, the cross-check has run: either the ledger says nothing
        * has settled the document (so an empty or non-matching list is the ledger's own answer), or it
        * names an amount that the records this probe read must account for and do. Either way the
        * collection is measured against a figure OUTSIDE it. When the figure is absent, nothing
@@ -148,8 +145,7 @@ export type LedgerSettlementProbe =
        * answer, and leaving an unsound provenance on a probe result is an invitation to reuse it.
        *
        * A sound replacement is request-bound, not snapshot-bound: `XeroResponse` already carries the
-       * `tenantId` its request went out under, and QuickBooks resolves a `realmId` per request that
-       * `QboResponse` currently discards. bd o3d-llyw carries that design.
+       * `tenantId` its request went out under. bd o3d-llyw carries that design.
        */
       /**
        * WHICH CONNECTION SERVED EVERY FETCH THIS ANSWER WAS BUILT FROM — or absent/null when that
@@ -294,8 +290,8 @@ function asRecord(payload: unknown): Record<string, unknown> {
  * Which payload field a money post takes its date from — and it is NOT the same field for every
  * type, which is the entire reason this table exists (Codex round 6, finding 1).
  *
- *   INVOICE_PAYMENT / BILL_PAYMENT           `paymentDate`   (both connectors)
- *   PURCHASE_CREDIT_NOTE_ALLOCATION          `date`          (Xero only; QuickBooks has no branch)
+ *   INVOICE_PAYMENT / BILL_PAYMENT           `paymentDate`
+ *   PURCHASE_CREDIT_NOTE_ALLOCATION          `date`          (Xero only)
  *
  * Round 5 wrote a "mirror" that read `paymentDate ?? date` for every type. That is not either
  * processor: it AVERAGES two conventions, and an average is wrong for both wherever they differ.
@@ -504,18 +500,16 @@ const money = formatLedgerMoney
  *   r3  the option is introduced: only an IMMUTABLE id may exclude, never a mutable amount or date.
  *   r4  an `OPERATOR_ASSERTION` row's id is a human typing into a form with no call made, so the
  *       caller must filter on `isOperatorAssertedSettlement`.
- *   r5  `connector` scopes a query to a ledger TYPE, not a NAMESPACE: after a QuickBooks reconnect,
- *       realm A's `123` and realm B's `123` are two payments spelt the same. The caller must
- *       compare the row's recorded origin against the organisation the probe answered from.
+ *   r5  `connector` scopes a query to a ledger TYPE, not a NAMESPACE: after a reconnect to a
+ *       different organisation, organisation A's `123` and organisation B's `123` are two payments
+ *       spelt the same. The caller must compare the row's recorded origin against the organisation
+ *       the probe answered from.
  *   r6  BOTH REMAINING GAPS ARE MISSING EVIDENCE, NOT LOOSE REASONING, and neither can be recorded
  *       from inside this branch:
  *
- *       • THE ORIGIN IS STAMPED AT ENQUEUE AND THE ID IS MINTED AT POST. A row queued against realm
- *         A can post after a reconnect to B, take B's id, and keep its A origin. QuickBooks has no
- *         post-time realm enforcement at all (o3d-8prh, OPEN — see the block at
- *         lib/connectors/quickbooks/sync-processor.ts, which says in terms that nothing downstream
- *         of it is safe first), and `QboResponse` does not even carry the `realmId` it resolved, so
- *         there is no issuer to record on that path today.
+ *       • THE ORIGIN IS STAMPED AT ENQUEUE AND THE ID IS MINTED AT POST. A row queued against
+ *         organisation A can post after a reconnect to B, take B's id, and keep its A origin, and
+ *         no issuer is recorded on that path today.
  *       • TWO TOKEN SNAPSHOTS EITHER SIDE OF A REMOTE CALL CANNOT DEFEAT ABA. An A→B→A reconnect
  *         across the fetch makes both reads say A while B served it. Reading one value twice says
  *         nothing about the interval between.
@@ -539,10 +533,9 @@ const money = formatLedgerMoney
  * WHAT A SOUND VERSION WOULD REQUIRE, if anyone comes back to it: bd o3d-llyw carries the whole
  * estimate. It is a new write-once-on-post column plus its own trigger (the existing
  * `connection_provenance` trigger CLEARS on UPDATE, and an issuer is written by the post-time
- * UPDATE, so that shape cannot be reused), issuer capture at every id-writing path in both
- * connectors, a `QboResponse` that carries its realm, o3d-8prh landed first, and a per-connector
- * reconnect epoch — `AccountingToken.connectionGeneration` exists but is minted by Xero's OAuth
- * callback only and is NULL for every QuickBooks row.
+ * UPDATE, so that shape cannot be reused), issuer capture at every id-writing path, and a
+ * per-connector reconnect epoch — `AccountingToken.connectionGeneration` exists but is minted by
+ * Xero's OAuth callback only and is NULL for any other connector's row.
  */
 
 /**
@@ -609,19 +602,12 @@ export function classifyLedgerSettlement(
   //                              deleted but not renumbered.
   //       `Payment.Reference`  — MUTABLE. It is the operator-visible reference field, editable in
   //                              the Xero UI, and it is where IMS writes its own mark.
-  //   QuickBooks INVOICE_PAYMENT / BILL_PAYMENT
-  //       `Payment.Id` / `BillPayment.Id` — IMMUTABLE, and read here off the DOCUMENT's own
-  //                              `LinkedTxn.TxnId`, so it is QuickBooks' statement about what settles
-  //                              this document rather than ours.
-  //       `PrivateNote`        — MUTABLE. Editable on the transaction; IMS's mark lives in it.
   //   Xero PURCHASE_CREDIT_NOTE_ALLOCATION
   //       NOTHING. The allocation carries no id this probe reads and no reference field exists on it
   //       at all. This type has no identity, so it can never be ruled out — see below.
-  //   QuickBooks PURCHASE_CREDIT_NOTE_ALLOCATION
-  //       Never reaches here: `probeQuickBooksSettlement` refuses the type outright.
   //
-  // NEITHER CONNECTOR ECHOES OUR REQUEST ID. Xero's `Idempotency-Key` and QuickBooks' `requestid` are
-  // request headers/params; neither is stored on, or returned with, the settlement entity. So the
+  // XERO DOES NOT ECHO OUR REQUEST ID. Its `Idempotency-Key` is a request header; it is not stored
+  // on, or returned with, the settlement entity. So the
   // only thing IMS can recognise on a record it did not just create is the MARK it wrote into the
   // mutable reference — which is why the mark pass above returns `present` and nothing here uses a
   // reference to return `clear`. The asymmetry is deliberate and it is the whole rule: a mutable
@@ -629,8 +615,7 @@ export function classifyLedgerSettlement(
   //
   // SO THE ONE EXCLUSION IS: this record's immutable id is one IMS has ALREADY RECORDED as a
   // DIFFERENT attempt's settlement. `AccountingSyncLog.externalTransactionId` holds exactly that for
-  // these types — the Xero money branch stores `Payments[0].PaymentID` and the QuickBooks ones store
-  // `Payment.Id` / `BillPayment.Id` — so a caller holding the other rows for this document can hand
+  // these types — the Xero money branch stores `Payments[0].PaymentID` — so a caller holding the other rows for this document can hand
   // their recorded ids over. A record whose id is in that set was created by an attempt that is not
   // this one, and no edit to its amount, its date or its reference can make it this one.
   //

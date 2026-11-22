@@ -12,7 +12,7 @@ import {
 /**
  * o3d-d0pd — WHAT AN ALREADY-PRESENT CHECK HAS TO PROVE BEFORE IT RAISES A SECOND ROW.
  *
- * THE DEFECT. Three enqueues (lib/connectors/xero/queue.ts, lib/connectors/quickbooks/queue.ts,
+ * THE DEFECT. Two enqueues (lib/connectors/xero/queue.ts,
  * `queueAccountingSyncTx` in lib/accounting.ts) answered "does a posting for this idempotency key
  * already exist?" with
  *

@@ -70,9 +70,8 @@ export async function maybeQueueTaxRateSync(taxRate: TaxRateForSync): Promise<vo
     idempotencyKey,
     // o3d-j625: this payload carries no account codes, but the SAME second resolution was here: the
     // Xero-only refusal above is about the connector resolved at the top of this function, and the
-    // enqueue resolved it again. A switch in between wrote a QUICKBOOKS `TAX_RATE_SYNC` row — a type
-    // QUICKBOOKS_SYNC_TYPE_SETTING does not name, so it falls through to the default posting mode and is
-    // queued — which is exactly the posting the refusal above exists to prevent.
+    // enqueue resolved it again. A connector switch in between wrote a `TAX_RATE_SYNC` row for the other
+    // connector, which that connector would queue — which is exactly the posting the refusal above exists to prevent.
     chartConnector: connector.id,
   })
   // o3d-j625 r3 (Codex HIGH 1 family) — THE ANSWER IS READ.

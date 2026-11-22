@@ -8,10 +8,9 @@ import { summarizeCrossConnectorOrphans } from '@/lib/domain/accounting/connecto
  * o3d-remove-parked-connectors — WHAT THIS FILE IS STILL PROVING, AND WHAT IT CANNOT.
  *
  * Every case here used to pit two REGISTERED connectors against each other, because a connector
- * SWITCH is what strands rows. With QuickBooks archived there is one registered accounting connector,
- * so no switch is possible and the summariser's population can only be rows naming a connector this
- * build no longer ships — which is exactly what a development database holds after that removal
- * (`AccountingSyncLog.connector = 'quickbooks'`).
+ * SWITCH is what strands rows. With one registered accounting connector, no switch is possible and the
+ * summariser's population can only be rows naming a connector this build no longer ships (a retired
+ * connector id on `AccountingSyncLog.connector`).
  *
  * So the subject changes from "the other live ledger" to "a ledger this build cannot service", and
  * the assertions below are rewritten to say that, because it is the case that now matters: those rows
@@ -21,9 +20,9 @@ import { summarizeCrossConnectorOrphans } from '@/lib/domain/accounting/connecto
  * working, and why the test can still exercise it honestly.
  *
  * WHAT IS LOST: nothing here shows the summariser handles a switch BETWEEN two live ledgers any more,
- * because there is only one. Recorded in docs/archive/quickbooks-connector-removal.md.
+ * because there is only one.
  */
-const RETIRED_CONNECTOR = 'quickbooks'
+const RETIRED_CONNECTOR = 'retired-ledger'
 
 test('rows for the active connector are not orphans', () => {
   const summary = summarizeCrossConnectorOrphans(

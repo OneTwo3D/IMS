@@ -155,12 +155,12 @@ test('a per-row retry that names no attempt at all is refused rather than run un
 })
 
 test('a per-row retry naming another connector’s row is refused before the fence is consulted', async () => {
-  reset([syncLogRow({ ...FAILED_ROW, connector: 'quickbooks', attemptRevision: 4 })])
+  reset([syncLogRow({ ...FAILED_ROW, connector: 'retired-ledger', attemptRevision: 4 })])
 
   const result = await (await loadRetry())('log-1', 4)
 
   assert.equal(result.success, false)
-  assert.match(result.error ?? '', /belongs to the quickbooks connector/)
+  assert.match(result.error ?? '', /belongs to the retired-ledger connector/)
   assert.equal(store.get('log-1')?.status, 'FAILED')
 })
 
@@ -178,7 +178,7 @@ test('the bulk "Retry All" stays unfenced: it is not a judgement about any one a
     syncLogRow({ ...FAILED_ROW, id: 'log-1', attemptRevision: 4 }),
     syncLogRow({ ...FAILED_ROW, id: 'log-2', attemptRevision: 7 }),
     syncLogRow({ ...FAILED_ROW, id: 'log-3', status: 'SYNCED', attemptRevision: 2 }),
-    syncLogRow({ ...FAILED_ROW, id: 'qbo-1', connector: 'quickbooks', attemptRevision: 0 }),
+    syncLogRow({ ...FAILED_ROW, id: 'retired-1', connector: 'retired-ledger', attemptRevision: 0 }),
   ])
 
   const result = await (await loadRetry())()
@@ -187,7 +187,7 @@ test('the bulk "Retry All" stays unfenced: it is not a judgement about any one a
   assert.equal(store.get('log-1')?.status, 'PENDING')
   assert.equal(store.get('log-2')?.status, 'PENDING')
   assert.equal(store.get('log-3')?.status, 'SYNCED', 'only FAILED rows are re-queued')
-  assert.equal(store.get('qbo-1')?.status, 'FAILED', 'only this connector’s rows are re-queued')
+  assert.equal(store.get('retired-1')?.status, 'FAILED', 'only this connector’s rows are re-queued')
   // FAILED -> PENDING is itself a status change, which a later fenced decision detects as STATUS_MOVED,
   // and getting back to FAILED needs a claim, which mints a new revision. So the bulk form needs no bump.
   assert.equal(store.get('log-1')?.attemptRevision, 4)

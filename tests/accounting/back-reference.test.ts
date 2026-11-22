@@ -26,6 +26,7 @@ import {
   UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE,
   buildBackReferenceCandidateQuery,
 } from '@/lib/domain/accounting/back-reference-sweep'
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import { BACK_REFERENCE_PO_ATTRIBUTION_LOCK_NAMESPACE } from '@/lib/db/advisory-locks'
 import { NAMES_A_DOCUMENT_WHERE, ledgerStanding, type LedgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import { adapterUniqueViolation, legacyUniqueViolation } from '../helpers/prisma-unique-error'
@@ -181,7 +182,7 @@ function makeDeps(overrides: {
     const externalId = data.accountingInvoiceId
     if (typeof externalId !== 'string' || externalId === '') return
     // On the VALUE ALONE, exactly as the database index is. A double that namespaced it per
-    // connection would let the realm-collision write through and hide the fact that production
+    // connection would let the tenant-collision write through and hide the fact that production
     // refuses it — which is the behaviour the global index was deliberately kept for.
     const holder = bills.find((bill) => bill.accountingInvoiceId === externalId && !writtenBillIds.includes(bill.id))
     if (!holder) return
@@ -374,9 +375,8 @@ test('PURCHASE_CREDIT_NOTE/SupplierCreditNote writes accountingCreditNoteId back
 })
 
 // ---------------------------------------------------------------------------
-// o3d-9kek — PurchaseOrder → bill attribution. Shared by BOTH connectors' writers
-// (Xero's updateBackReference and QuickBooks', which used to keep its own copy of the
-// "newest unlinked bill" guess) and by the repair sweep.
+// o3d-9kek — PurchaseOrder → bill attribution. Shared by every connector's writer
+// (Xero's updateBackReference) and by the repair sweep.
 // ---------------------------------------------------------------------------
 
 test('resolvePurchaseOrderBackReference counts the whole population for the PO, not a page', async () => {
@@ -788,11 +788,11 @@ test('[o3d-9kek f1] backReferenceIsMissing stops reporting a PO row whose id is 
 })
 
 // ---------------------------------------------------------------------------
-// o3d-9kek — THE REALM-COLLISION TRADE, made explicit.
+// o3d-9kek — THE TENANT-COLLISION TRADE, made explicit.
 //
-// The unique index is GLOBAL, on the value alone. QuickBooks realm ids are integers that repeat
+// The unique index is GLOBAL, on the value alone. Ids that are small per-tenant integers repeat
 // across companies, and disconnect keeps historical bill ids, so after a reconnect to a different
-// company a new bill can post remotely and then collide locally with a retired realm's bill.
+// company a new bill can post remotely and then collide locally with a retired tenant's bill.
 //
 // That is a REFUSED WRITE WITH A LOUD ERROR, deliberately, and it is what these two tests pin. The
 // alternative — namespacing the id per connection so both bills can hold the same integer — was
@@ -801,14 +801,14 @@ test('[o3d-9kek f1] backReferenceIsMissing stops reporting a PO row whose id is 
 // acceptable; repairing onto the wrong bill is not. See o3d-gt8r.
 // ---------------------------------------------------------------------------
 
-test('[o3d-9kek] a bill id a retired realm still holds BLOCKS the new link, loudly', async () => {
-  // 1042 was issued by the company we used to be connected to and is still on bill-old. QuickBooks
+test('[o3d-9kek] a bill id a retired tenant still holds BLOCKS the new link, loudly', async () => {
+  // 1042 was issued by the company we used to be connected to and is still on bill-old. The ledger
   // has since reissued 1042 in the company we are connected to now.
   const { deps, calls } = makeDeps({
     bills: [{ id: 'bill-old', poId: 'po-9', accountingInvoiceId: '1042', createdAt: 1 }],
   })
   await assert.rejects(
-    () => applyBackReference(deps, { connector: 'quickbooks', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseInvoice', referenceId: 'bill-new', externalId: '1042' }),
+    () => applyBackReference(deps, { connector: 'retired-ledger', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseInvoice', referenceId: 'bill-new', externalId: '1042' }),
     (error: Error) => {
       // The operator has to be able to act on this without reading the source: what is wrong (the
       // id is already held locally) and the likeliest cause (a reconnect to a different company).
@@ -828,13 +828,13 @@ test('[o3d-9kek] the PO-keyed repair path reports the same collision instead of 
       { id: 'bill-old', poId: 'po-9', accountingInvoiceId: '1042', createdAt: 1 },
       { id: 'bill-new', poId: 'po-1', accountingInvoiceId: null, createdAt: 9 },
     ],
-    poSyncRows: [{ id: 'log-self', connector: 'quickbooks', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', status: 'SYNCED', externalTransactionId: '1042' }],
+    poSyncRows: [{ id: 'log-self', connector: 'retired-ledger', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', status: 'SYNCED', externalTransactionId: '1042' }],
   })
-  const resolved = await resolvePurchaseOrderBackReference(deps, { connector: 'quickbooks', purchaseOrderId: 'po-1', externalId: '1042' })
+  const resolved = await resolvePurchaseOrderBackReference(deps, { connector: 'retired-ledger', purchaseOrderId: 'po-1', externalId: '1042' })
   assert.equal(resolved.outcome === 'ambiguous' && resolved.reason, 'EXTERNAL_ID_LINKED_ELSEWHERE')
   assert.equal(resolved.outcome === 'ambiguous' && resolved.linkedPurchaseInvoiceId, 'bill-old')
 
-  const applied = await applyBackReference(deps, { connector: 'quickbooks', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: '1042' })
+  const applied = await applyBackReference(deps, { connector: 'retired-ledger', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: '1042' })
   assert.equal(applied.outcome, 'ambiguous')
   assert.equal(calls.purchaseInvoiceUpdateIds.length, 0, 'the new bill must NOT receive a second copy of 1042')
 })
@@ -893,7 +893,7 @@ for (const testCase of CONFLICT_CASES) {
         assert.match(error.message, testCase.expectRemote)
         assert.match(error.message, /ALREADY HELD LOCALLY/)
         assert.match(error.message, /resolve it by hand/)
-        // The realm-switch cause named, as the bill writer does: this is the single likeliest
+        // The tenant-switch cause named, as the bill writer does: this is the single likeliest
         // explanation and the one an operator would otherwise never think of.
         assert.match(error.message, /reconnected to a different company/)
         // The original P2002 is preserved as the cause — the sweep classifies on it, and a message
@@ -940,7 +940,7 @@ test('[o3d-9kek r6 f3] a NON-uniqueness write failure is still propagated untouc
 // `meta.target` is `undefined` under `@prisma/adapter-pg`, which is what lib/db/index.ts builds the
 // client with — so LIVE, every unique-constraint violation of any kind on any of these models was
 // reported to the operator as an accounting external-id collision, complete with a message about
-// realm switches and a remedy for a constraint that had not failed.
+// tenant switches and a remedy for a constraint that had not failed.
 //
 // Every test below is paired with the OTHER column's classifier returning false, because that pairing
 // is what the old code could not satisfy: it answered true to both for anything it could not read.
@@ -959,7 +959,7 @@ test('[o3d-9kek r7 f2] the LIVE adapter shape is classified by the right column 
 test('[o3d-9kek r7 f2] an UNRELATED unique constraint is NOT reported as an external-id conflict', () => {
   // The concrete regression: SalesOrderRefund carries its own unique externalRefundId. Under the
   // live adapter this violation has no meta.target at all, so the old classifier claimed it — and
-  // the operator was told an accounting id was duplicated and pointed at a realm switch.
+  // the operator was told an accounting id was duplicated and pointed at a tenant switch.
   const violation = adapterUniqueViolation(['externalRefundId'], {
     modelName: 'SalesOrderRefund',
     constraintName: 'sales_order_refunds_connector_externalRefundId_key',
@@ -1080,13 +1080,13 @@ function makeClaimDeps(options: {
   const salesOrders = options.salesOrders ?? []
   const source: ReleaseSourceRow | null = options.source === null ? null : {
     id: 'log-1',
-    connector: 'quickbooks',
+    connector: 'retired-ledger',
     type: 'PURCHASE_INVOICE',
     referenceType: 'PurchaseInvoice',
     referenceId: 'bill-target',
     externalTransactionId: '145',
     status: 'SYNCED',
-    errorMessage: 'QuickBooks PURCHASE_INVOICE for PurchaseInvoice bill-target POSTED SUCCESSFULLY as external id 145, but …',
+    errorMessage: 'Retired Ledger PURCHASE_INVOICE for PurchaseInvoice bill-target POSTED SUCCESSFULLY as external id 145, but …',
     backReferenceAmbiguousLoggedAt: null,
     backReferenceEvidenceCompactedAt: null,
     settlementBasis: null,
@@ -1309,7 +1309,7 @@ const recordRelease: ExternalDocumentIdReleaseRecorder = async (tx, release) => 
 }
 
 const RELEASE_PARAMS = {
-  connector: 'quickbooks' as const,
+  connector: 'retired-ledger' as const,
   type: 'PURCHASE_INVOICE' as const,
   referenceType: 'PurchaseInvoice',
   referenceId: 'bill-target',
@@ -1322,12 +1322,12 @@ const PO_RELEASE_PARAMS = { ...RELEASE_PARAMS, referenceType: 'PurchaseOrder', r
 const PO_SOURCE = { referenceType: 'PurchaseOrder', referenceId: 'po-1' }
 /** The one live row the PO attribution requires as evidence — the row under repair itself. */
 const PO_SYNC_ROWS = [{
-  id: 'log-1', connector: 'quickbooks', type: 'PURCHASE_INVOICE',
+  id: 'log-1', connector: 'retired-ledger', type: 'PURCHASE_INVOICE',
   referenceType: 'PurchaseOrder', referenceId: 'po-1', status: 'SYNCED', externalTransactionId: '145',
 }]
 
 test('[o3d-9kek r7 f1] releasing the confirmed holder links the id to the document that posted it', async () => {
-  // The realm switch, end to end: company A's retired bill holds 145, company B has just issued 145
+  // The tenant switch, end to end: company A's retired bill holds 145, company B has just issued 145
   // to bill-target, and the index refused the write. One confirmed operator action resolves both.
   const { claimDeps, bills, source, claimCalls } = makeClaimDeps({
     bills: [
@@ -1472,11 +1472,11 @@ test('[o3d-0bfh r4] a claim whose statement fails owns nothing, and the row stil
 })
 
 // ---------------------------------------------------------------------------
-// o3d-0bfh r5 (Codex HIGH) — THE RELEASE HELPER PROMISED A SWEEP THAT ONE CONNECTOR DOES NOT HAVE.
+// o3d-0bfh r5 (Codex HIGH) — THE RELEASE HELPER PROMISED A SWEEP THAT A CONNECTOR MAY NOT HAVE.
 //
 // All three of its non-clearing outcomes used to end with some form of "a later sweep will
 // re-enqueue them". That is true on Xero, which binds `repairXeroBackReferences` and has cron invoke
-// it. It is FALSE on QuickBooks, which has no binding and no invocation, so a retained marker there
+// it. It is FALSE on a connector with no binding and no invocation, so a retained marker there
 // is read by nothing and the outstanding payment, PDF, email or attachment never runs.
 //
 // The distinction is not cosmetic. The whole protocol prefers RETAINING a marker to clearing one on
@@ -1487,13 +1487,13 @@ test('[o3d-0bfh r4] a claim whose statement fails owns nothing, and the row stil
 //
 // So the caller states it and the helper reports what the caller stated. `SWEEP` below is the
 // control: without it these tests would pass just as well if the recovery wording were deleted
-// outright, which would lose Xero's true and useful promise to fix QuickBooks' false one.
+// outright, which would lose Xero's true and useful promise to fix a no-consumer connector's false one.
 // ---------------------------------------------------------------------------
 
 const SWEEP = { consumer: 'sweep' } as const
 const NO_CONSUMER = {
   consumer: 'none',
-  blockedBy: 'no QuickBooks sweep is bound (o3d-8prh)',
+  blockedBy: 'no sweep is bound for this connector',
   operatorRemedy: 'find the row by its marker and re-drive the payment by hand',
 } as const
 
@@ -1520,11 +1520,11 @@ test('[o3d-0bfh r5] EVERY refusal on a connector with no consumer says nothing r
   const newer = new Date('2026-08-17T09:00:00.001Z')
 
   const owningNothing = await releaseSaying(obligationClient(newer).client,
-    { syncLogId: 'log-1', connector: 'quickbooks', generation: null, recovery: NO_CONSUMER })
+    { syncLogId: 'log-1', connector: 'retired-ledger', generation: null, recovery: NO_CONSUMER })
   const superseded = await releaseSaying(obligationClient(newer).client,
-    { syncLogId: 'log-1', connector: 'quickbooks', generation: mine, recovery: NO_CONSUMER })
+    { syncLogId: 'log-1', connector: 'retired-ledger', generation: mine, recovery: NO_CONSUMER })
   const unwritable = await releaseSaying(obligationClient(mine, { failUpdateMany: true }).client,
-    { syncLogId: 'log-1', connector: 'quickbooks', generation: mine, recovery: NO_CONSUMER })
+    { syncLogId: 'log-1', connector: 'retired-ledger', generation: mine, recovery: NO_CONSUMER })
 
   // THE PRECONDITION, asserted so this cannot pass by reaching none of the paths (a helper that
   // threw, or an outcome that cleared, would otherwise leave three empty strings satisfying every
@@ -1539,7 +1539,7 @@ test('[o3d-0bfh r5] EVERY refusal on a connector with no consumer says nothing r
     assert.ok(said.length > 0, `${path} said nothing at all — a refusal counted nowhere is a settlement`)
     assert.match(said, /NOTHING re-enqueues them on this connector/,
       `${path} must tell an operator the work is stalled, not scheduled`)
-    assert.match(said, /o3d-8prh/, `${path} must name why nothing re-enqueues it`)
+    assert.match(said, /no sweep is bound/, `${path} must name why nothing re-enqueues it`)
     assert.match(said, /re-drive the payment by hand/, `${path} must say what a human has to do instead`)
     assert.doesNotMatch(said, /later sweep/,
       `${path} must not promise a sweep this connector does not have — that promise is the finding`)
@@ -1606,7 +1606,7 @@ test('[o3d-9kek r10 f1] the release writes a link but does NOT discharge the fol
   // The release is the THIRD path that writes a back-reference, after the two connectors and the
   // sweep — and unlike them it enqueues no follow-ups at all. Its precondition guarantees the source
   // row owes some: the write it is repairing was REFUSED by the unique index, so on Xero the refusal
-  // propagated and the follow-ups never ran, and on QuickBooks the row was quarantined mid-way.
+  // propagated and the follow-ups never ran, and on a connector that quarantines, the row was left quarantined mid-way.
   //
   // So the correct behaviour here is to touch neither the obligation marker nor the sweep's verdict
   // marker, leaving the row a repair candidate that still says what it owes. Asserted on the WRITES,
@@ -1692,7 +1692,7 @@ test('[o3d-9kek r9 f3] a release whose audit record cannot be written is ROLLED 
 })
 
 test('[o3d-9kek r8 f2] running the same command a SECOND time is already-correct, not a refusal', async () => {
-  // Success clears the quarantine text, which is the only conflict evidence a QuickBooks row has —
+  // Success clears the quarantine text, which is the only conflict evidence a quarantined row has —
   // so a re-run has to be answered by "the id is already where you were putting it", not by the
   // no-conflict-evidence refusal, which reads as "you named the wrong row". The distinction matters
   // because the wrong reading sends an operator looking for another row to release.
@@ -1713,7 +1713,7 @@ test('[o3d-9kek r8 f2] running the same command a SECOND time is already-correct
 })
 
 test('[o3d-9kek r7 f1] a holder the operator did NOT confirm is refused, not released', async () => {
-  // The confirmation is the ONLY thing separating a retired realm's stale id from a live, correct
+  // The confirmation is the ONLY thing separating a retired tenant's stale id from a live, correct
   // link — nothing in the database distinguishes them. A confirmation about a different document
   // confirms nothing, so this must write nothing at all.
   const { claimDeps, bills } = makeClaimDeps({
@@ -1731,8 +1731,8 @@ test('[o3d-9kek r7 f1] a holder the operator did NOT confirm is refused, not rel
 })
 
 test('[o3d-9kek r7 f1] a SAME-VALUE id in another table is not a claim on this one', async () => {
-  // The four unique indexes are PER TABLE. QuickBooks issues Invoice ids and Bill ids from separate
-  // sequences, so Invoice 145 and Bill 145 routinely coexist and are unrelated. A lookup across all
+  // The four unique indexes are PER TABLE. A ledger can issue Invoice ids and Bill ids from separate
+  // sequences, so Invoice 145 and Bill 145 can coexist and are unrelated. A lookup across all
   // four tables would name an innocent sales order as the blocker — and this path then invites an
   // operator to detach it.
   const { claimDeps, salesOrders } = makeClaimDeps({
@@ -1791,7 +1791,7 @@ test('[o3d-9kek r7 f1] the id already being where it belongs is a no-op, not a r
 test('[o3d-9kek r8 f1] a re-link that dies mid-operation rolls the RELEASE back', async () => {
   // The connection drops after the claim has been cleared and before the id has been written. The
   // pre-atomic version left bill-retired with no id and bill-target with no id: one ledger document
-  // attached to nothing at all, permanently for QuickBooks.
+  // attached to nothing at all, permanently where no sweep is bound.
   const { claimDeps, bills, source, claimCalls } = makeClaimDeps({
     bills: [
       { id: 'bill-target', poId: 'po-1', accountingInvoiceId: null, createdAt: 2 },
@@ -2177,7 +2177,7 @@ test('[o3d-anu8] an OPERATOR-SETTLED source is refused, and the posted bill KEEP
 
 test('[o3d-anu8] a connector-written SYNCED row with the same shape is still repairable', async () => {
   // The other side of the fence: without this, "refuse everything SYNCED with an errorMessage" would
-  // pass the test above while destroying the QuickBooks quarantine route this command exists for.
+  // pass the test above while destroying the quarantine route this command exists for.
   // Same row, same note-shaped errorMessage, settlementBasis NULL — it must still release.
   const { claimDeps, bills } = makeClaimDeps({
     bills: [
@@ -2197,7 +2197,7 @@ test('[o3d-anu8] a connector-written SYNCED row with the same shape is still rep
 test('[o3d-9kek r8 f2] a FAILED sync row is repairable — it is what a XERO conflict looks like', async () => {
   // The question the previous attempt at r8 left open, and getting it wrong would have made this
   // whole command useless for Xero. Xero does NOT quarantine a refused back-reference the way
-  // QuickBooks does: updateBackReference lets the refusal propagate, markSyncLogForFollowUpRetry
+  // a quarantining connector does: updateBackReference lets the refusal propagate, markSyncLogForFollowUpRetry
   // retries it, and the last retry lands the row on FAILED — still carrying the external id, which
   // is persisted before the back-reference is ever attempted. So SYNCED-only would have refused
   // every Xero conflict there is: sound, and useless. The sweep and retention already treat FAILED
@@ -2287,8 +2287,8 @@ test('[o3d-9kek r8 f2] the repair sweep\'s deferred-refusal stamp counts as evid
 test('[o3d-9kek r8 f2] a RETENTION TOMBSTONE is still evidence — the route out must survive compaction', async () => {
   // The guard undoing the thing it guards, one more time. Data retention compacts an unresolved row
   // to an attribution-only tombstone and NULLS errorMessage (it is free text quoting the payload).
-  // For a QuickBooks conflict that erases the only marker there is — QuickBooks has no repair sweep,
-  // so there is no deferred-refusal stamp either — and a release that accepted only the other
+  // For a quarantined conflict that erases the only marker there is — a connector with no repair sweep
+  // leaves no deferred-refusal stamp either — and a release that accepted only the other
   // markers would let RETENTION permanently retire the operator's ability to fix it. Compaction is
   // scheduled by AGE and says nothing about repairability; the stamp is written exclusively to rows
   // matching UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE, so it is the strongest marker of the four.
@@ -2457,7 +2457,7 @@ test('[o3d-wf86] an operator relink records MANUAL, and the loser keeps no recor
 // active connector — and the enqueue refuses a payload whose provenance is missing or disagrees.
 // ---------------------------------------------------------------------------
 
-for (const connector of ['xero', 'quickbooks'] as const) {
+for (const connector of ACCOUNTING_CONNECTORS.map((def) => def.id)) {
   test(`[o3d-j625 r3] every back-reference write records ${connector} as the document's connector, in the SAME data as the id`, async () => {
     const cases = [
       { type: 'SALES_INVOICE', referenceType: 'SalesOrder', idField: 'accountingInvoiceId', connectorField: 'accountingInvoiceConnector' },
@@ -2481,12 +2481,12 @@ for (const connector of ['xero', 'quickbooks'] as const) {
 test('[o3d-j625 r3] the PO-keyed repair records the connector too, in the compare-and-swap that writes the id', async () => {
   const { deps, calls } = makeDeps({
     bills: [{ id: 'bill-1', poId: 'po-1', accountingInvoiceId: null, createdAt: 1 }],
-    poSyncRows: [{ id: 'log-1', connector: 'quickbooks', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', status: 'SYNCED', externalTransactionId: 'QBILL-1' }],
+    poSyncRows: [{ id: 'log-1', connector: 'retired-ledger', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', status: 'SYNCED', externalTransactionId: 'BILL-1' }],
   })
-  const applied = await applyBackReference(deps, { connector: 'quickbooks', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'QBILL-1' })
+  const applied = await applyBackReference(deps, { connector: 'retired-ledger', type: 'PURCHASE_INVOICE', referenceType: 'PurchaseOrder', referenceId: 'po-1', externalId: 'BILL-1' })
   assert.equal(applied.outcome, 'applied')
-  assert.equal(calls.lastUpdateData?.accountingInvoiceId, 'QBILL-1')
-  assert.equal(calls.lastUpdateData?.accountingInvoiceConnector, 'quickbooks')
+  assert.equal(calls.lastUpdateData?.accountingInvoiceId, 'BILL-1')
+  assert.equal(calls.lastUpdateData?.accountingInvoiceConnector, 'retired-ledger')
 })
 
 test('[o3d-j625 r3] a released claim does not keep the connector of a link it no longer holds', async () => {

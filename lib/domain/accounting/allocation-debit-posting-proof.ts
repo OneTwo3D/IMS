@@ -295,7 +295,7 @@ export type AllocationDebitCreditTarget<C extends string = string> = {
   /**
    * The connector the credit would be raised on, or null when that cannot be established.
    *
-   * o3d-i0o6: parameterised so a caller whose connector is a UNION (`'xero' | 'quickbooks'`) gets
+   * o3d-i0o6: parameterised so a caller whose connector is a UNION (a union of connector ids) gets
    * that union back out of a `posted` verdict, and can hand it straight to an enqueue that demands
    * one. Widening it to `string` here would force a cast at the pin site, and a cast is exactly the
    * place a re-resolution creeps back in.

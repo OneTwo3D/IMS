@@ -51,7 +51,7 @@ test('daily batch sync log payload mirrors to an accounting event', () => {
 
 test('refund reversal sync log payload mirrors using the existing idempotency key', () => {
   const event = buildMirroredAccountingEventDraft({
-    connector: 'quickbooks',
+    connector: 'xero',
     type: 'COGS_REVERSAL',
     referenceType: 'SalesOrderRefund',
     referenceId: 'refund-1',
@@ -70,9 +70,9 @@ test('refund reversal sync log payload mirrors using the existing idempotency ke
 
   assert.ok(event)
   assert.equal(event.status, 'POSTED')
-  assert.equal(event.externalSystem, 'quickbooks')
+  assert.equal(event.externalSystem, 'xero')
   assert.equal(event.externalId, 'journal-1')
-  assert.equal(event.idempotencyKey, 'accounting-sync:quickbooks:cogs_reversal:sales-order-refund:refund-1:cogs-reversal')
+  assert.equal(event.idempotencyKey, 'accounting-sync:xero:cogs_reversal:sales-order-refund:refund-1:cogs-reversal')
   assert.deepEqual(event.linesJson, [
     { accountCode: '120', description: 'COGS reversal', debit: 10.01 },
     { accountCode: '500', description: 'COGS reversal', credit: 10.01 },
@@ -126,7 +126,7 @@ test('credit note sync logs mirror as document-shaped accounting events', () => 
 
 test('sales and purchase document sync logs mirror with stable document keys', () => {
   const sales = buildMirroredAccountingEventDraft({
-    connector: 'quickbooks',
+    connector: 'xero',
     type: 'SALES_INVOICE',
     referenceType: 'SalesOrder',
     referenceId: 'order-1',
@@ -161,7 +161,7 @@ test('sales and purchase document sync logs mirror with stable document keys', (
   })
 
   assert.ok(sales)
-  assert.equal(sales.idempotencyKey, 'accounting-sync:quickbooks:sales_invoice:sales-order:order-1:invoice')
+  assert.equal(sales.idempotencyKey, 'accounting-sync:xero:sales_invoice:sales-order:order-1:invoice')
   assert.equal(sales.currency, 'USD')
   assert.equal((sales.linesJson as Record<string, unknown>).lineAmountMode, 'INCLUSIVE')
   assert.ok(purchase)
@@ -356,7 +356,7 @@ test('terminal sync failure updates mirrored refund reversal event to failed', a
   })
 
   await updateMirroredAccountingEventStatus(client as never, {
-    connector: 'quickbooks',
+    connector: 'xero',
     type: 'COGS_REVERSAL',
     referenceType: 'SalesOrderRefund',
     referenceId: 'refund-1',
@@ -379,7 +379,7 @@ test('terminal sync failure updates mirrored refund reversal event to failed', a
   // The column is a permission a later enqueue reads, so a row that is not retired must not carry
   // one — the clearing is part of the write rather than a separate tidy-up that could be skipped.
   assert.deepEqual(updates, [{
-    where: { idempotencyKey: 'accounting-sync:quickbooks:cogs_reversal:sales-order-refund:refund-1:cogs-reversal' },
+    where: { idempotencyKey: 'accounting-sync:xero:cogs_reversal:sales-order-refund:refund-1:cogs-reversal' },
     // o3d-f709: `postBasis: null` travels with every non-POSTED write, exactly like `voidBasis`.
     data: { status: 'FAILED', voidBasis: null, postBasis: null },
     select: { id: true },
@@ -390,7 +390,7 @@ test('terminal sync failure updates mirrored refund reversal event to failed', a
       action: 'failed_from_sync_log',
       message: 'connector failed',
       metadata: {
-        connector: 'quickbooks',
+        connector: 'xero',
         syncType: 'COGS_REVERSAL',
         referenceType: 'SalesOrderRefund',
         referenceId: 'refund-1',

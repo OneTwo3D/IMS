@@ -2,10 +2,9 @@
  * o3d-h2wx — a follow-up's remote idempotency token must survive REGENERATION of its
  * AccountingSyncLog row.
  *
- * THE HAZARD. Both accounting connectors derive the token they send to the remote system
+ * THE HAZARD. An accounting connector derives the token it sends to the remote system
  * from the sync entry's own row id:
  *
- *   QuickBooks  buildQboRequestId(getIdempotencySource(entryId, ...))  -> Request-Id
  *   Xero        buildXeroIdempotencyKey(entryId, operation)            -> Idempotency-Key
  *
  * `hasExistingSyncLog` only counts PENDING / PROCESSING / SYNCED rows, so a FAILED
@@ -224,9 +223,8 @@ export type FailedFollowUpRow = {
   payload: unknown
   /**
    * The token this row's attempt ACTUALLY posted under, as its own connector would have
-   * derived it. Supplied by the connector because the two derive it differently: Xero falls
-   * back to the row id, while QuickBooks consults the generic queue's `_idempotencyKey`
-   * first. Capturing it here is what lets a pinned token outlive the row it came from —
+   * derived it. Supplied by the connector because each derives it its own way (Xero falls
+   * back to the row id). Capturing it here is what lets a pinned token outlive the row it came from —
    * stamping this value onto the payload reproduces the identical remote key even after the
    * original row is gone, which is why losing the row no longer has to refuse (Codex r4).
    */
@@ -321,8 +319,8 @@ const REQUIRED_BODY_FIELDS: Record<string, readonly { field: string; kind: 'id' 
     { field: 'bankAccountId', kind: 'id' },
     { field: 'amount', kind: 'amount' },
   ],
-  // The SUPPLIER side of the same guard, verified against both connectors rather than assumed from
-  // the sales one: xero/sync-processor.ts and quickbooks/sync-processor.ts each open their
+  // The SUPPLIER side of the same guard, verified against the connector rather than assumed from
+  // the sales one: xero/sync-processor.ts opens its
   // BILL_PAYMENT case with the identical
   //   if (!accountingInvoiceId || !bankAccountId || amount == null)
   // and return before building any request. Without this entry a FAILED BILL_PAYMENT row would be
@@ -545,8 +543,8 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   //
   // An earlier revision ALSO excluded rows whose errorMessage looked like a pre-call
   // validation failure, on the grounds that such an attempt provably never posted. That was
-  // REMOVED: errorMessage carries no provenance. Both connectors overwrite `HTTP nnn` with
-  // the remote system's own message (quickbooks/api.ts, xero/api.ts), so a remote reply
+  // REMOVED: errorMessage carries no provenance. The connector overwrites `HTTP nnn` with
+  // the remote system's own message (xero/api.ts), so a remote reply
   // reading "Missing account for PAYMENT" was indistinguishable from our own validation and
   // would have rotated the token of a request that may well have committed (Codex r3
   // blocker A). Inferring "no call was made" from free text is not sound, and the safe
@@ -565,7 +563,7 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
   // dangerous is not the row COUNT but the number of DISTINCT tokens they posted under: if
   // several rows share one token, whichever committed committed under that same token, and
   // pinning it is unambiguous. Refusing on count alone stranded exactly that case -- reruns
-  // of one QuickBooks receipt all carry `invoice-payment:payment:<id>` (Codex r5 #3).
+  // of one receipt all carry `invoice-payment:payment:<id>` (Codex r5 #3).
   //
   // ...and only among attempts that could have SENT anything (o3d-qsbs). A stored body missing a
   // field its connector validates before building a request never reached the ledger, so its token
@@ -805,11 +803,9 @@ export function planFollowUpEnqueue(input: FollowUpEnqueueInput): FollowUpEnqueu
  * rows into their own slot — and deliberately so: the application guard may be stricter than the
  * constraint that backs it, never laxer.
  *
- * SHARED BY BOTH CONNECTORS since the o3d-hbgo QuickBooks port. The o3d-anu8 branch left the
- * QuickBooks lookup counting rows, on the reasoning that narrowing it "changes which rows a lookup
- * returns"; it does, and the rows it was returning were the ones that stranded a re-invoiced order's
- * payment. One predicate, imported by both, so the two connectors cannot drift into two readings of
- * "already handled".
+ * SHARED BY EVERY CONNECTOR'S LOOKUP (o3d-hbgo). A lookup that counted rows, rather than asking this
+ * predicate, returned the rows that stranded a re-invoiced order's payment. One predicate, imported
+ * by each, so connectors cannot drift into two readings of "already handled".
  *
  * AND IT STAYS ON THIS MODULE'S TOKEN-SCOPED `anchorsOf`, NOT ON `couldBeTheSameDocument` — which is
  * worth stating, because the canonical comparison looks like the obvious upgrade and is the right

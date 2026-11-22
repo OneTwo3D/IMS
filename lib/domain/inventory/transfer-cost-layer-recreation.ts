@@ -93,10 +93,9 @@
  *        `buildStockMovementValueFieldsFromConsumed`, which now refuses too. Before
  *        that, the movement value was positive while the `cogs_entries` rows written
  *        for the same consumption kept the negative sign.
- *      · STILL OPEN, and the reason a negative basis must not exist yet: both
- *        connector journal paths emit the COGS pair only when the batch total is
- *        greater than zero (lib/connectors/xero/daily-sync.ts:2104 and :2144,
- *        lib/connectors/quickbooks/daily-sync.ts:1324 and :1354), so a credit-derived
+ *      · STILL OPEN, and the reason a negative basis must not exist yet: the
+ *        connector journal path emits the COGS pair only when the batch total is
+ *        greater than zero (lib/connectors/xero/daily-sync.ts:2104 and :2144), so a credit-derived
  *        COGS is dropped entirely rather than posted, and no sync-log row records the
  *        skip. A landed-cost recalc can drive an ALREADY-SHIPPED line's
  *        `costLayerSnapshot` negative (`updateSnapshotsForCostLayerChange` patches

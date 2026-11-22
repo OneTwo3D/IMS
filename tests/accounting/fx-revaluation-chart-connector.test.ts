@@ -17,9 +17,9 @@ import { fakeFxClient } from '../helpers/fx-fake-client'
  *   the REVERSAL enqueue builds its lines from `reverseJournalLines(prior.lines, …)`, and `prior.lines`
  *   was read back out of a previous `AccountingSyncLog.payload`. Those account codes belong to whichever
  *   connector that row was written under, which `getPriorRevaluations` did not even SELECT. r1 attributed
- *   them to `settings.connector` too, so a revaluation posted under QuickBooks and reversed after a
- *   switch to Xero had its reversal routed to XERO carrying QuickBooks's AR/AP control and unrealised-FX
- *   codes — an existing cross-connector row routed into the wrong books, which is the o3d-j625 defect
+ *   them to `settings.connector` too, so a revaluation posted under a connector other than the active one
+ *   (e.g. a retired connector id) had its reversal routed to the ACTIVE connector carrying the other
+ *   connector's AR/AP control and unrealised-FX codes — an existing cross-connector row routed into the wrong books, which is the o3d-j625 defect
  *   reached through the one site whose codes are not the adjacent settings read's.
  *
  * WHAT THIS FILE PINS:
@@ -168,7 +168,7 @@ function reset(rows: Array<{ id: string; connector: string; payload: unknown }>)
 /**
  * o3d-j625 r12 (merging o3d-remove-parked-connectors) — WHAT THIS CASE CAN AND CANNOT STILL SEE.
  *
- * It used to post the prior revaluation under QUICKBOOKS while XERO was active, so the source row's
+ * With two live connectors this case would post the prior revaluation under the other one while XERO was active, so the source row's
  * connector and the active chart DISAGREED and the routing could be told apart from the defect. With one
  * registered connector that disagreement cannot exist: a prior row naming an unregistered connector is now
  * REFUSED rather than routed anywhere, which is the case the sibling test below ('a source row naming a

@@ -103,7 +103,7 @@ export type HeldSalesInvoicePayload = {
    * `discountAccountCode` are FROZEN as the connector's whose chart the import read, and the release
    * happens whenever WooCommerce gets round to numbering the order, which can be days later. The
    * release used to enqueue with no connector at all, which resolved the active one afresh: a hold
-   * taken while Xero was active and released after a move to QuickBooks posted a QuickBooks invoice
+   * taken while Xero was active and released after a move to a different connector posted that connector's invoice
    * carrying Xero account codes. This is the widest window of any site o3d-j625's sweep found, and it
    * is the one that is not a race at all — the two reads are days apart by design.
    *

@@ -24,10 +24,9 @@ export async function GET(request: Request) {
       // let them silence pounds this route had stopped scheduling.
       const schedule = await resolveScheduledDailyBatchSweep()
       if (schedule.connector === null) return { skipped: true, reason: schedule.reason }
-      // ONE SWEEP TODAY (o3d-remove-parked-connectors). The QuickBooks arm was archived; this is an
+      // ONE SWEEP TODAY. This is an
       // exhaustive `switch` rather than an `if` with a fall-through so that a connector added to
-      // `DailyBatchSweepConnector` is a `tsc` error here until its own sweep is wired — the previous
-      // shape would have silently run Xero's sweep for it.
+      // `DailyBatchSweepConnector` is a `tsc` error here until its own sweep is wired, rather than silently running Xero's sweep for it.
       switch (schedule.connector) {
         case 'xero': {
           const { runDailyBatchSync } = await import('@/lib/connectors/xero/daily-sync')

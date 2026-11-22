@@ -69,20 +69,20 @@ import { CONFIRMED_POST_BASES, OPERATOR_ASSERTION_POST_BASIS } from '@/lib/domai
  *
  * WHAT IS STILL REFUSED, and none of it is arbitrary: see SETTLEABLE_ACCOUNTING_SYNC_STATUSES
  * (PENDING, SYNCED, CANCELLED), settleableSettlementOutcomes (DAILY_BATCH_*), and the fence's own
- * UNFENCED_ATTEMPT — which is what refuses a QuickBooks row WHILE QUICKBOOKS IS THE ACTIVE
- * CONNECTOR, because that processor stamps no attempt revision and its rows therefore stay at 0.
+ * UNFENCED_ATTEMPT — which is what refuses a row of a connector whose processor stamps no attempt
+ * revision, because its rows therefore stay at 0.
  *
- * THAT IS A QUALIFIED STATEMENT AND IT MUST STAY ONE (round 4, Codex HIGH). It is NOT true that a
- * QuickBooks row can never be settled: `unclaimable` (below) is a fact about the INSTALLATION, and
- * a QuickBooks row that is neither on the active connector nor reachable by any claim path becomes
+ * THAT IS A QUALIFIED STATEMENT AND IT MUST STAY ONE (round 4, Codex HIGH). It is NOT true that
+ * such a row can never be settled: `unclaimable` (below) is a fact about the INSTALLATION, and
+ * a row that is neither on the active connector nor reachable by any claim path becomes
  * settleable BY ADOPTION, with the stranded-rows banner rendering the control for it. Writing the
  * refusal as an absolute anywhere it is read by an operator (see
  * lib/domain/accounting/unrecorded-posted-document.ts) hides the only per-row remedy that exists.
  *
  * AND THE QUALIFICATION IS NOT "NOT THE ACTIVE CONNECTOR" (round 5, Codex HIGH #1). Round 4 wrote
  * that `describeStrandedSyncRow` passes `unclaimable` unconditionally for every row on a non-active
- * connector, and it did — which made adoption available while the QuickBooks manual Sync button
- * could still reclaim the row, because that action gates on `quickbooks_sync_enabled` alone and
+ * connector, and it did — which made adoption available while that connector's manual Sync button
+ * could still reclaim the row, because that action gates on `<connector>_sync_enabled` alone and
  * never resolves the active connector. The precondition now lives in one place,
  * `isStrandedRowUnclaimable` (sync-row-claimability.ts): NOT the active connector AND that
  * connector's sync toggle off. Loosening it back to half of that re-opens a settled row to the very
@@ -463,7 +463,7 @@ export function describeSettlementCaveat(status: string): string | null {
  *  3. ATTEMPT. A row at revision 0 carries no attempt an assertion could be fenced to, so
  *     applyFencedAttemptDecision would refuse it as UNFENCED_ATTEMPT. Offering a control whose only
  *     possible answer is a refusal is worse than not offering one, so it is disabled WITH the reason
- *     — permanent for a QuickBooks row, and "not claimed yet" for a Xero one.
+ *     — permanent for a row of a connector whose processor stamps no revision, and "not claimed yet" for a Xero one.
  *
  * The type gate is a CAVEAT rather than a gate now: a DAILY_BATCH row is settleable exactly as far as
  * its status and attempt allow, for the POSTED assertion only, and the caveat says which half is

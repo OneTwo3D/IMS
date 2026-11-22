@@ -340,7 +340,7 @@ test('o3d-bnp6: the population is the page\'s, and an event of another connector
     await insertUnmirroredRow(tx, id('not-mirrored'), { status: 'PENDING', ageDays: 2, type: 'INVOICE_PDF' })
     // Events that do NOT count as this row's mirror: another connector, no connector, another type.
     await insertUnmirroredRow(tx, id('other-connector'), { status: 'PENDING', ageDays: 2, referenceId: id('oc-ref') })
-    await insertEvent(tx, id('oc-e'), { referenceId: id('oc-ref'), externalSystem: 'quickbooks' })
+    await insertEvent(tx, id('oc-e'), { referenceId: id('oc-ref'), externalSystem: 'retired-ledger' })
     await insertUnmirroredRow(tx, id('null-connector'), { status: 'PENDING', ageDays: 2, referenceId: id('nc-ref') })
     await insertEvent(tx, id('nc-e'), { referenceId: id('nc-ref'), externalSystem: null })
     await insertUnmirroredRow(tx, id('other-type'), { status: 'PENDING', ageDays: 2, referenceId: id('ot-ref') })

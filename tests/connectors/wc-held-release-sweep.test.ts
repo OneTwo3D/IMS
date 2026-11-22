@@ -202,8 +202,8 @@ async function queueAccountingSyncDouble(params: { referenceId: string; idempote
         const posting = { type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: params.referenceId, scope: '' }
         const existing = state.refusals.find((r) => r.referenceId === params.referenceId && r.resolvedAt === null)
         if (existing) existing.refusedCount = Number(existing.refusedCount) + 1
-        else state.refusals.push({ ...posting, chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'chart_retired', refusedCount: 1, resolvedAt: null })
-        return { queued: false, reason: 'refused', connector: 'xero', activeConnector: 'quickbooks', refusalRecorded: true, posting }
+        else state.refusals.push({ ...posting, chartConnector: 'xero', activeConnector: 'retired-ledger', reason: 'chart_retired', refusedCount: 1, resolvedAt: null })
+        return { queued: false, reason: 'refused', connector: 'xero', activeConnector: 'retired-ledger', refusalRecorded: true, posting }
       }
       state.queued.push({ referenceId: params.referenceId, idempotencyKey: params.idempotencyKey, payload: params.payload })
   }
@@ -481,7 +481,7 @@ test('[o3d-j625 r5 M-4/M-5] a refusal the FACADE already recorded is merged by t
   assert.equal(rows.length, 1)
   assert.equal(rows[0].refusedCount, 1, 'one refusal is one attempt, however many writers describe it')
   assert.equal(rows[0].reason, 'chart_retired', 'the facade\'s SPECIFIC reason survives the release\'s generic one')
-  assert.equal(rows[0].activeConnector, 'quickbooks', 'and the ACTIVE connector is not overwritten with the chart\'s')
+  assert.equal(rows[0].activeConnector, 'retired-ledger', 'and the ACTIVE connector is not overwritten with the chart\'s')
   assert.ok(String(rows[0].committed).includes('imported'), 'while what only the release knows is added')
 })
 

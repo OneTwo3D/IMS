@@ -104,7 +104,7 @@
  * is stated rather than assumed. `isWithinXeroIdempotencyWindow` is here for the rare genuinely-fresh
  * row, and to keep the comparison the issue asked for a real one rather than a rhetorical one.
  *
- * QUICKBOOKS' `RequestId` window is deliberately NOT recorded here. It is unestablished, and this
+ * No other connector's idempotency window is recorded here: this
  * helper says nothing about connectors whose window nobody has verified rather than guessing one —
  * a caution quoting a made-up number is worse than no caution, because it would be believed.
  */

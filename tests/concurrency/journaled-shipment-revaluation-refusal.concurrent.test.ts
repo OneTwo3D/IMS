@@ -34,7 +34,7 @@ import { INTEGRATION_PLUGIN_SETTING_KEYS } from '../../lib/integration-plugin-ke
  * POSITIVE CONTROL runs the real recalculation with a credit that leaves the basis positive, so a fixture
  * that never reaches the revaluation cannot pass for a refusal.
  *
- * No network: fetch and the connector transport throw, and nothing here reaches Xero, QuickBooks,
+ * No network: fetch and the connector transport throw, and nothing here reaches Xero,
  * Mintsoft or WooCommerce. No email is sent.
  */
 

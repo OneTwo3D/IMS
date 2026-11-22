@@ -71,28 +71,23 @@ test('END-TO-END: a malformed configured app URL also degrades to a safe relativ
   assert.doesNotMatch(location(res), /attacker/)
 })
 
-// --- connector selection + gating (valid Xero/QBO shapes) -----------------
+// --- connector selection + gating (valid Xero shapes) ---------------------
 
-// o3d-remove-parked-connectors — REPLACED, and the replacement asserts the STRONGER property.
-//
-// This used to be two cases: "a callback carrying `realmId` selects quickbooks" and "a callback
-// without one selects xero". That discrimination existed because QuickBooks sent a `realmId` and Xero
-// never does — and it decided the connector from a query parameter the CALLER controls. With
-// QuickBooks archived the route no longer looks at `realmId` at all, and the case worth locking is
-// that it CANNOT be steered by one: a caller-supplied `realmId` must not change which connector the
-// callback is handled as. That is a security property, not a parity one, so it is asserted directly
-// rather than deleted with the connector.
-test('END-TO-END: a caller-supplied realmId cannot steer which connector handles the callback', async () => {
+// The route decides the connector from the registry, never from a query parameter the CALLER controls.
+// The case worth locking is that it CANNOT be steered by one: a caller-supplied `connector` (or any
+// other) parameter must not change which connector the callback is handled as. That is a security
+// property, so it is asserted directly.
+test('END-TO-END: a caller-supplied query parameter cannot steer which connector handles the callback', async () => {
   const res = await handleAccountingCallback(
-    hostileRequest('error=cancelled&realmId=123'),
+    hostileRequest('error=cancelled&connector=retired-ledger&tenantId=123'),
     deps({ appUrl: CONFIGURED, enabled: (p) => p === 'xero' }),
   )
   assert.equal(new URL(location(res)).origin, CONFIGURED)
   assert.match(location(res), /connector=xero/, 'the registered connector handles it, not one named by the query string')
-  assert.doesNotMatch(location(res), /connector=quickbooks/)
+  assert.doesNotMatch(location(res), /connector=retired-ledger/)
 })
 
-test('END-TO-END: an ordinary callback (no realmId) selects the registered connector', async () => {
+test('END-TO-END: an ordinary callback selects the registered connector', async () => {
   const res = await handleAccountingCallback(
     hostileRequest('error=cancelled'),
     deps({ appUrl: CONFIGURED, enabled: (p) => p === 'xero' }),
@@ -138,7 +133,7 @@ test('resolveAppOrigin returns the NORMALIZED origin for WHATWG-parseable junk (
 })
 
 test('buildAccountingCallbackUri normalizes every settings-accepted config to the same redirect_uri (Codex r5/r6: exact-match on BOTH sides)', () => {
-  // Authorize (xero-sync/quickbooks-sync) and the callback token exchange both
+  // Authorize (xero-sync) and the callback token exchange both
   // call this ONE builder, so the redirect_uri is identical for every valid
   // config — including user-info, which the origin form strips consistently
   // (Codex r6: the previous mismatch was user-info preserved on one side only).

@@ -39,19 +39,19 @@ async function resolve() {
   return resolveScheduledDailyBatchSweep()
 }
 
-const ON = { xero_daily_batch_enabled: 'true', xero_sync_enabled: 'true', quickbooks_daily_batch_enabled: 'true', quickbooks_sync_enabled: 'true' }
+const ON = { xero_daily_batch_enabled: 'true', xero_sync_enabled: 'true' }
 
-test('o3d-i0o6 r6: with both plugins enabled it is XERO\'s sweep that runs, and only Xero\'s', async () => {
-  state.enabled = ['xero', 'quickbooks']
+test('o3d-i0o6 r6: with another plugin id also enabled it is XERO\'s sweep that runs, and only Xero\'s', async () => {
+  state.enabled = ['xero', 'retired-ledger']
   state.settings = { ...ON }
   assert.deepEqual(await resolve(), { connector: 'xero' })
 })
 
-test('o3d-i0o6 r6: an enabled-but-switched-off Xero does NOT hand the tick to QuickBooks', async () => {
-  // The load-bearing half. A fall-through here would make the QuickBooks sweep look scheduled — and
+test('o3d-i0o6 r6: an enabled-but-switched-off Xero does NOT hand the tick to another plugin', async () => {
+  // The load-bearing half. A fall-through here would make another plugin's sweep look scheduled — and
   // every Xero A2 batch it declines to rebuild would go unreported on the strength of a sweep that
   // is not running. The route returns its skip reason at this point, so this does too, verbatim.
-  state.enabled = ['xero', 'quickbooks']
+  state.enabled = ['xero', 'retired-ledger']
   state.settings = { ...ON, xero_daily_batch_enabled: 'false' }
   assert.deepEqual(await resolve(), { connector: null, reason: 'Xero daily batch disabled' })
 
@@ -59,12 +59,8 @@ test('o3d-i0o6 r6: an enabled-but-switched-off Xero does NOT hand the tick to Qu
   assert.deepEqual(await resolve(), { connector: null, reason: 'Xero sync disabled' })
 })
 
-// DELETED WITH ITS SUBJECT (o3d-remove-parked-connectors): 'o3d-i0o6 r6: QuickBooks is the scheduled
-// sweep only when the Xero PLUGIN is off'. It was the second arm of `DAILY_BATCH_SWEEPS`, and it is
-// the case that made "route order is load-bearing — the FIRST enabled plugin decides, whether or not
-// its own switches then turn the run into a skip" observable at all. With one entry in the list, the
-// order is unobservable and a resolver that ignored the list entirely would pass every case left.
-// Recorded in docs/archive/quickbooks-connector-removal.md.
+// With one entry in `DAILY_BATCH_SWEEPS`, the list's ORDER is unobservable, and a resolver that ignored the
+// list entirely would pass every case here.
 
 test('o3d-i0o6 r6: no accounting plugin at all means no sweep is coming for anything', async () => {
   state.enabled = []

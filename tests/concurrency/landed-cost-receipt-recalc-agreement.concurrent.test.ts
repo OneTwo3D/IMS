@@ -10,7 +10,7 @@ import { enableStockReceiptPosting, loadEnv, uid } from './po-landed-fixtures'
  * unchanged cost lines posts NOTHING", "the stored layer is exactly zero", and "the activity entry is written
  * after the commit".
  *
- * Every arm prints its precondition. No network: nothing here reaches Xero, QuickBooks, Mintsoft or
+ * Every arm prints its precondition. No network: nothing here reaches Xero, Mintsoft or
  * WooCommerce, and no email is sent.
  */
 

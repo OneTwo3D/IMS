@@ -4,8 +4,8 @@ import test, { mock } from 'node:test'
 // o3d-hrak: accounting enqueue must join the sales-order delete protocol.
 //
 // o3d-5r8 made the hard delete lock the order, check for live accounting/WMS work, then delete.
-// The side that WRITES never took part: queueXeroSync / queueQuickBooksSync create their
-// AccountingSyncLog row in their own transaction with no order lock and no existence check, and
+// The side that WRITES never took part: queueXeroSync creates its
+// AccountingSyncLog row in its own transaction with no order lock and no existence check, and
 // AccountingSyncLog has no FK to SalesOrder. A poster holding a pre-delete payload snapshot could
 // therefore insert its PENDING row after the guard looked and commit after the order was gone —
 // and the worker would post a real document for an order that no longer exists.

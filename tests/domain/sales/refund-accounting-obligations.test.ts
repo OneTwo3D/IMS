@@ -11,18 +11,15 @@ import {
 } from '@/lib/domain/sales/refund-accounting-obligations'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 /**
- * A LEDGER THIS BUILD NO LONGER SERVICES (o3d-remove-parked-connectors).
+ * A LEDGER THIS BUILD NO LONGER SERVICES.
  *
  * Three cases below are about a refund raised while the books are on one ledger against a debit that
- * stands in ANOTHER — the cross-ledger refusals of o3d-o97 r3/r4 and the pin-never-crosses rule. They
- * named 'quickbooks', the second REGISTERED connector; it is archived, so the id is no longer in the
- * union. They are kept rather than deleted, driving the retired id, because that is not a hypothetical
- * state: `AccountingSyncLog.connector` is a plain String column and development databases hold
- * `quickbooks` rows right now, so "a debit standing in a ledger this build cannot post to" is exactly
- * what an operator will meet. Weaker subject than two live ledgers, and recorded as such in
- * docs/archive/quickbooks-connector-removal.md.
+ * stands in ANOTHER — the cross-ledger refusals of o3d-o97 r3/r4 and the pin-never-crosses rule. With
+ * one registered connector they drive a retired id, because that is not a hypothetical state:
+ * `AccountingSyncLog.connector` is a plain String column, so "a debit standing in a ledger this build
+ * cannot post to" is exactly what an operator can meet. Weaker subject than two live ledgers.
  */
-const OTHER_LEDGER = 'quickbooks' as unknown as AccountingConnectorId
+const OTHER_LEDGER = 'retired-ledger' as unknown as AccountingConnectorId
 
 
 /**
@@ -138,7 +135,7 @@ test('o3d-2sm1 r7: the connector is PINNED for the whole hand-off — a flip is 
 
   assert.throws(
     () => ledger.settle(),
-    /COGS_REVERSAL for SalesOrderRefund refund-1 \(the active accounting connector changed from xero to quickbooks/,
+    /COGS_REVERSAL for SalesOrderRefund refund-1 \(the active accounting connector changed from xero to retired-ledger/,
   )
 })
 
@@ -183,7 +180,7 @@ test('o3d-2sm1 r8: a connector flip between the pin and the IN-TRANSACTION enque
   const ledger = await openRefundAccountingObligationLedger([COGS_REVERSAL], postingEnabled())
 
   // THE FLIP. The row was written — `queueAccountingSyncTx` returned true and the COGS subledger row
-  // was recorded beside it — but it was written for QuickBooks, and the credit note that preceded it
+  // was recorded beside it — but it was written for another connector, and the credit note that preceded it
   // went to Xero. Under r7 this bare `true` settled the obligation and the recovery flag came down
   // over a refund whose postings are split across two ledgers.
   ledger.accountInTransaction(COGS_REVERSAL, { queued: true, connector: OTHER_LEDGER })
@@ -194,7 +191,7 @@ test('o3d-2sm1 r8: a connector flip between the pin and the IN-TRANSACTION enque
       assert.ok(error instanceof RefundAccountingObligationsUnmet)
       assert.equal(error.unmet.length, 1)
       assert.match(error.message, /COGS_REVERSAL for SalesOrderRefund refund-1/)
-      assert.match(error.message, /the active accounting connector changed from xero to quickbooks/)
+      assert.match(error.message, /the active accounting connector changed from xero to retired-ledger/)
       assert.match(error.message, /queued against a connector it was not reckoned against/)
       return true
     },
@@ -353,7 +350,6 @@ test('o3d-2sm1 r7: no enqueue path returns without saying what it did', () => {
       'export async function queueXeroSync(',
       /notConfiguredUnderPinnedLedgerFence\(params\.pinnedLedger\)/,
     ],
-    // o3d-remove-parked-connectors: the archived QuickBooks file was the second entry here, so this rule was checked against TWO independently-written implementations. One now.
     [
       'lib/accounting.ts',
       'export async function queueAccountingSync(',
@@ -484,7 +480,7 @@ test('o3d-2sm1 r8: the transactional enqueue names the connector it resolved, on
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The connector flips to QuickBooks the instant after the pin is taken, and back to Xero the instant
+ * The connector flips to another connector the instant after the pin is taken, and back to Xero the instant
  * after the verdict is read — so nothing downstream can see that it ever moved.
  *
  * `isTypeEnabledFor` answers about the connector it is HANDED. The reverted shape resolves `live`
@@ -499,7 +495,7 @@ function abaFlip(enabledOn: Record<string, boolean>) {
     deps: {
       activeConnector: async () => {
         const pinned = live
-        live = 'quickbooks'
+        live = 'retired-ledger'
         return pinned
       },
       isTypeEnabledFor: async (connector: string, _type: AccountingSyncType) => {
@@ -512,8 +508,8 @@ function abaFlip(enabledOn: Record<string, boolean>) {
 }
 
 test('o3d-2sm1 r9: an ABA flip between the pin and a type verdict cannot poison the verdict', async () => {
-  // CREDIT_NOTE posts on Xero and is switched off on QuickBooks. The hand-off pins Xero.
-  const flip = abaFlip({ xero: true, quickbooks: false })
+  // CREDIT_NOTE posts on Xero and is switched off on the other connector. The hand-off pins Xero.
+  const flip = abaFlip({ xero: true, 'retired-ledger': false })
   const ledger = await openRefundAccountingObligationLedger([CREDIT_NOTE], flip.deps)
 
   assert.equal(ledger.pinnedConnector, 'xero')
@@ -521,7 +517,7 @@ test('o3d-2sm1 r9: an ABA flip between the pin and a type verdict cannot poison 
   assert.equal(flip.liveNow(), 'xero', 'and the flip has been and gone, so nothing later can see it')
 
   // THE CONSEQUENCE. A helper that resolved the active connector for itself would have read
-  // QuickBooks here, recorded "this posting will never exist", and let the enqueue's no-op settle an
+  // the other connector here, recorded "this posting will never exist", and let the enqueue's no-op settle an
   // obligation the pinned connector was in fact going to post.
   ledger.account(CREDIT_NOTE, { queued: false, reason: 'not-configured', connector: 'xero' })
   assert.throws(
@@ -535,7 +531,7 @@ test('o3d-2sm1 r9: an ABA flip between the pin and a type verdict cannot poison 
   )
 
   // The in-transaction arm reads the same pinned verdict, so it reaches the same answer.
-  const flipTx = abaFlip({ xero: true, quickbooks: false })
+  const flipTx = abaFlip({ xero: true, 'retired-ledger': false })
   const inTx = await openRefundAccountingObligationLedger([CREDIT_NOTE], flipTx.deps)
   inTx.accountInTransaction(CREDIT_NOTE, { queued: false, reason: 'not-configured', connector: 'xero' })
   assert.throws(() => inTx.settle(), /switched off, though it was enabled when the hand-off began/)
@@ -544,7 +540,7 @@ test('o3d-2sm1 r9: an ABA flip between the pin and a type verdict cannot poison 
 test('o3d-2sm1 r9: with nothing pinned, no verdict is asked of any connector at all', async () => {
   // "No connector" is a decision the pin already made; asking a per-type helper would only give some
   // other connector's answer a way in.
-  const flip = abaFlip({ xero: true, quickbooks: true })
+  const flip = abaFlip({ xero: true, 'retired-ledger': true })
   const ledger = await openRefundAccountingObligationLedger([CREDIT_NOTE, COGS_REVERSAL], {
     ...flip.deps,
     activeConnector: async () => null,

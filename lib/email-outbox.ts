@@ -215,7 +215,7 @@ type QueueEmailInput = {
  * is that a delivery is QUEUED: a PROCESSING row may already be on the wire, and any undelivered
  * row may still end FAILED — the recipient is suppressed, the send fails permanently, or
  * `EMAIL_MAX_ATTEMPTS` is exhausted. Same overclaim this branch removed from the operator-facing
- * incident records (see `tests/accounting/qbo-invoice-email-queued-not-sent.test.ts`), so it is
+ * incident records, so it is
  * removed from the enqueue contract too rather than left as the one place it still reads as a
  * guarantee.
  */

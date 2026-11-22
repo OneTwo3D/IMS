@@ -46,7 +46,7 @@ test('a connector that is not Xero is skipped without even asking', async () => 
   const { treatImportedSalesInvoice } = await import('../../lib/connectors/woocommerce/sync/eu-vat-invoice-treatment')
   enabled = true
   asked.length = 0
-  for (const connector of [null, 'quickbooks']) {
+  for (const connector of [null, 'retired-ledger']) {
     assert.deepEqual(await treatImportedSalesInvoice(params({ connector })), { kind: 'skipped', why: 'switch_off' })
   }
   assert.deepEqual(asked, [])
@@ -73,6 +73,6 @@ test('the shadow preview assumes the switch ON in memory: it never asks the sett
   assert.deepEqual(await previewTreatedSalesInvoice(client, params({ storeCreditForeign: { gt: () => true } }), { assumeSwitchOn: true, provisionalStamp: true }), { kind: 'skipped', why: 'store_credit' })
   assert.deepEqual(asked, [])
   // Still Xero only.
-  assert.deepEqual(await previewTreatedSalesInvoice(client, params({ connector: 'quickbooks' }), { assumeSwitchOn: true }), { kind: 'skipped', why: 'switch_off' })
+  assert.deepEqual(await previewTreatedSalesInvoice(client, params({ connector: 'retired-ledger' }), { assumeSwitchOn: true }), { kind: 'skipped', why: 'switch_off' })
   assert.deepEqual(touched, [])
 })

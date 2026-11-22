@@ -20,14 +20,14 @@ export type SalesInvoiceUpdateQueueParams = {
    *
    * This module resolves the active connector itself and then hands the payload to `queueXeroSync`.
    * The payload was built by the caller from ONE read of `getAccountingSettings()`, which resolves the
-   * active connector internally, so without this the two resolutions are independent: with QuickBooks
-   * active the caller composes an update carrying QuickBooks `salesAccount` / `shippingAccount` /
+   * active connector internally, so without this the two resolutions are independent: with another connector
+   * active the caller composes an update carrying that connector's `salesAccount` / `shippingAccount` /
    * `discountAccount`, a switch to Xero commits, and this queues that document as a XERO invoice
    * update. Xero then either rejects it or posts the order's revenue to whatever those codes happen to
    * name in its own chart.
    *
    * Checked before anything else below, so a mismatch is reported as a mismatch rather than as
-   * "QuickBooks updates are not supported yet", which would be a true sentence about the wrong fact.
+   * "this connector does not support updates yet", which would be a true sentence about the wrong fact.
    */
   chartConnector: StoredAccountingConnector | null
   /**
@@ -176,7 +176,7 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
   // o3d-j625 r3 (Codex HIGH 2) — AND THE DOCUMENT ID MUST BE THIS CONNECTOR'S TOO.
   //
   // Asked immediately after the chart check and before the Xero-only gate, for the same reason the chart
-  // check is asked first: reporting this as "QuickBooks updates are not supported yet" would be a true
+  // check is asked first: reporting this as "this connector does not support updates yet" would be a true
   // sentence about the wrong fact.
   if (params.documentConnector !== (connector?.id ?? null)) {
     await deps.logActivity({

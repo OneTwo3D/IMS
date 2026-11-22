@@ -62,19 +62,19 @@ export type { XeroSettings } from '@/lib/connectors/xero/settings'
  * dispatcher on the LOOSEST of its two branches' gates by saying "the stricter branch keeps enforcing
  * its own on top", and names that stricter branch as the Xero one: "The Xero delegates use
  * requireRole('ADMIN')". They did not. This module's local helper was `requirePermission('sync')`
- * verbatim — identical to the dispatcher's own gate and to QuickBooks' — so a MANAGER passed the
+ * verbatim — identical to the dispatcher's own gate — so a MANAGER passed the
  * dispatcher and then passed the delegate too, and the "reach change per principal" table's claim
  * that MANAGER "is still refused by the Xero delegate" was false for every export in this file. Round
  * 3 fixed that by making the code true rather than the sentence smaller.
  *
  * WHAT THE MERGE FOUND, AND WHY THE FIX IS NOW SCOPED (o3d-m3gy). Round 3 applied the ADMIN role to
  * EVERY export here, and stated the consequence as "MANAGER loses this tenant's Xero connection,
- * settings, sync logs and readiness — it keeps the whole QuickBooks branch". On current
+ * settings, sync logs and readiness — it keeps the whole other-connector branch". On current
  * `development` that second half is FALSE, and it is false for a reason that landed after round 3:
  * app/(dashboard)/sync/page.tsx now treats a denial from ANY of its reads as FATAL (o3d-osl8), on the
  * deliberate principle that a partial page is a dishonest answer to a denial. Seven of the page's
  * reads route through this module, so an ADMIN-only read surface does not narrow MANAGER's reach —
- * it replaces the whole /sync page with the generic error boundary, QuickBooks half included, and
+ * it replaces the whole /sync page with the generic error boundary, and
  * gives an operator "Go to Login" / "Try Again" for a refusal no retry can clear. That is
  * tests/accounting/dashboard-read-gates.test.ts, and it is measuring a real user-visible outcome
  * rather than restating a policy.

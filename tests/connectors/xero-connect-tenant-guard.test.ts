@@ -671,7 +671,7 @@ mock.module('@/lib/destructive-action-confirm', {
 })
 mock.module('@/lib/integration-plugin-selection-lock', {
   namedExports: {
-    lockIntegrationPluginSelection: async () => ({ xero: false, quickbooks: false, woocommerce: false }),
+    lockIntegrationPluginSelection: async () => ({ xero: false, woocommerce: false }),
     // o3d-6thk1: the binding takes the mapping lock before reading who the mapping belongs to. Inert here
     // (the lock has its own tests); what this file measures is what the binding then does with the rows.
     lockAccountingMappingSelection: async () => {},

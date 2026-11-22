@@ -99,22 +99,22 @@ let lockedSelectionMovedTo: string[] | null = null
  * twice — and it is the only way to see the difference.
  */
 let selectionReads = 0
-let flipToQuickBooksAfterReads: number | null = null
+let switchOffAfterReads: number | null = null
 
 mock.module('@/lib/integration-plugins', {
   namedExports: {
     isIntegrationPluginEnabled: async (id: string) => {
       const answer = enabledPlugins.includes(id)
       selectionReads++
-      if (flipToQuickBooksAfterReads !== null && selectionReads >= flipToQuickBooksAfterReads) {
-        enabledPlugins = ['quickbooks']
+      if (switchOffAfterReads !== null && selectionReads >= switchOffAfterReads) {
+        enabledPlugins = []
       }
       return answer
     },
   },
 })
 
-/** Xero's chart. Every code is distinguishable from QuickBooks's, which is the whole point. */
+/** Xero's chart. Every code is distinguishable from any other chart's, which is the whole point. */
 mock.module('@/lib/connectors/xero/settings', {
   namedExports: {
     getXeroSettings: async () => ({
@@ -153,9 +153,9 @@ mock.module('@/lib/connectors/xero/settings', {
 // --------------------------------------------------------------------------------------------
 
 /** Rows the facade routed, with the queue they went to and the codes they carried. */
-const routed: Array<{ queue: 'xero' | 'quickbooks'; type: string; salesAccount: unknown }> = []
+const routed: Array<{ queue: 'xero'; type: string; salesAccount: unknown }> = []
 
-function recordRouted(queue: 'xero' | 'quickbooks') {
+function recordRouted(queue: 'xero') {
   return async (params: { type: string; payload: Record<string, unknown> }) => {
     const lines = params.payload.lines as Array<{ accountCode?: unknown }> | undefined
     routed.push({ queue, type: params.type, salesAccount: lines?.[0]?.accountCode })
@@ -408,7 +408,7 @@ function reset(selection: string[]): void {
   txModel.priorAttempts = []
   enabledPlugins = selection
   selectionReads = 0
-  flipToQuickBooksAfterReads = null
+  switchOffAfterReads = null
   // o3d-j625 r13: cleared here, so the one test that sets it cannot leak a divergent locked selection into
   // every test after it — which is how a fixture seam becomes a silent global.
   lockedSelectionMovedTo = null
@@ -431,9 +431,8 @@ function salesInvoiceRequest(salesAccount: string) {
 /**
  * THE REGISTERED ROSTER, from the registry (o3d-j625 r12, merging o3d-remove-parked-connectors).
  *
- * It was the literal pair `['xero', 'quickbooks']`, which after the archiving would have driven this sweep
- * with an id no plugin flag can make active — the sweep would fail for a reason that is not the rule under
- * test. Derived, with a floor below, so an empty registry fails loudly instead of passing by iterating
+ * A hand-written roster could name an id no plugin flag can make active, and the sweep would then fail for
+ * a reason that is not the rule under test. Derived, with a floor below, so an empty registry fails loudly instead of passing by iterating
  * nothing.
  */
 const CHART_CONNECTORS = ACCOUNTING_CONNECTORS.map((connector) => connector.id)
@@ -487,10 +486,10 @@ for (const [label, documentConnector] of [
   // `params.documentConnector !== params.chartConnector` on the values the CALLER declared — no registry
   // lookup, no database read (lib/accounting.ts, `connectorNativePayloadIdKeys` branch). So a document id
   // attributed to a connector this build never had is refused for exactly the same reason as one attributed
-  // to a connector it used to have: the claim disagrees with the chart. If provenance were judged by what is
-  // REGISTERED, the archiving would have turned this refusal into a write — which is this branch's original
+  // to a connector it once had: the claim disagrees with the chart. If provenance were judged by what is
+  // REGISTERED, retiring a connector would have turned this refusal into a write — which is this branch's original
   // money defect — and the third row would fail.
-  ['the ARCHIVED connector (the id survived the removal)', 'quickbooks'],
+  ['a RETIRED connector (an id this build no longer registers)', 'retired-ledger'],
   ['a connector this build NEVER had (provenance is judged by the claim, not by the registry)', 'a-ledger-ims-never-shipped'],
 ] as const) {
   test(`[o3d-j625 r3] facade: a payload carrying a document id attributed to ${label} is REFUSED, and says so`, async () => {
@@ -500,10 +499,9 @@ for (const [label, documentConnector] of [
     // The chart check passes on its own: the active connector's chart, that connector active. That is
     // exactly the state after a switch in which r2 approved the payment.
     //
-    // o3d-j625 r12: the two sides are SWAPPED relative to the original (chart was the second connector,
-    // document was Xero). The mismatch is what is under test and it is unchanged — and the document now
-    // names an ARCHIVED connector, which is the realistic form of this defect after
-    // o3d-remove-parked-connectors: `SalesOrder.accountingInvoiceConnector` still holds `quickbooks` rows.
+    // The mismatch is what is under test: the document names a retired connector, which is the realistic
+    // form of this defect — `SalesOrder.accountingInvoiceConnector` is a plain string that can hold an id
+    // this build no longer registers.
     const outcome = await queueAccountingSync({
       ...paymentRequest('INVOICE_PAYMENT'),
       chartConnector: 'xero',
@@ -526,7 +524,7 @@ for (const [label, documentConnector] of [
     const answered: { outcome?: { queued: boolean; reason?: string; connector: string | null } } = {}
     const queued = await queueAccountingSyncTx(transactionDouble() as never, {
       ...paymentRequest('BILL_PAYMENT'),
-      // o3d-j625 r12: chart and document swapped, as above — the document is the archived id now.
+      // o3d-j625 r12: chart and document swapped, as above — the document is the retired id.
       chartConnector: 'xero',
       ...(documentConnector === undefined ? {} : { documentConnector }),
       reportOutcome: (outcome) => { answered.outcome = outcome },
@@ -601,13 +599,11 @@ test('[o3d-j625 r3] an EMPTY id is not an id — a payload with `accountingInvoi
 test('[o3d-j625 r3] a recorded value this build cannot route is `null`, never narrowed to a supported one', async () => {
   const { asRoutableAccountingConnector } = await import('@/lib/accounting')
   assert.equal(asRoutableAccountingConnector('xero'), 'xero')
-  // o3d-j625 r12 (merging o3d-remove-parked-connectors) — AND `quickbooks` IS NOW SUCH A VALUE. This line
-  // read `'quickbooks'` before, because the build routed it; the connector is archived, the normaliser asks
-  // the REGISTRY rather than a literal pair, and a stored `quickbooks` therefore answers `null`. That is not
-  // a weakening of this test, it is the case it exists for — `AccountingSyncLog`/`accountingRetrySyncs` hold
-  // those rows right now, and the alternative (a literal pair) would have gone on routing a connector whose
-  // queue is gone.
-  assert.equal(asRoutableAccountingConnector('quickbooks'), null)
+  // A retired connector id is such a value: the normaliser asks the REGISTRY rather than a literal pair,
+  // so a stored id this build does not register answers `null`. `AccountingSyncLog`/`accountingRetrySyncs`
+  // columns are plain strings that can hold one, and a literal pair would have gone on routing a connector
+  // whose queue is gone.
+  assert.equal(asRoutableAccountingConnector('retired-ledger'), null)
   assert.equal(asRoutableAccountingConnector('shiphero'), null)
   assert.equal(asRoutableAccountingConnector(''), null)
   assert.equal(asRoutableAccountingConnector(null), null)
@@ -625,15 +621,14 @@ test('[o3d-j625 r4] accountingPostingVerdictForChart keeps "chart retired" apart
   assert.deepEqual(await accountingPostingVerdictForChart('xero', 'SALES_INVOICE'), { verdict: 'post', connector: 'xero' })
   // Posting mode for this type is not in the Xero settings double, i.e. switched off, while Xero is active.
   assert.deepEqual(await accountingPostingVerdictForChart('xero', 'COGS_REVERSAL'), { verdict: 'not-configured', connector: 'xero' })
-  // o3d-j625 r12: this enabled the SECOND connector and asserted the verdict named it as active. An
-  // unregistered plugin flag resolves to NO active connector now, so that state is the `reset([])` case
-  // below and the two have merged. What this case keeps is the distinction the test is named for — a
-  // retired chart is `chart-retired` and NOT `not-configured` — which the `reset([])` line proves.
+  // With one registered connector, "the active connector moved" is the `reset([])` case below (nothing
+  // active). What this case keeps is the distinction the test is named for — a retired chart is
+  // `chart-retired` and NOT `not-configured` — which the `reset([])` line proves.
   //
-  // AND THE NEW ARM: a chart naming a connector this build does not register is retired too, which is the
-  // realistic form of it after the archiving and is checked here rather than left to inference.
+  // AND A chart naming a connector this build does not register is retired too, checked here rather than
+  // left to inference.
   reset(['xero'])
-  assert.deepEqual(await accountingPostingVerdictForChart('quickbooks', 'SALES_INVOICE'), { verdict: 'chart-retired', chartConnector: 'quickbooks', activeConnector: 'xero' })
+  assert.deepEqual(await accountingPostingVerdictForChart('retired-ledger', 'SALES_INVOICE'), { verdict: 'chart-retired', chartConnector: 'retired-ledger', activeConnector: 'xero' })
   reset([])
   assert.deepEqual(await accountingPostingVerdictForChart('xero', 'SALES_INVOICE'), { verdict: 'chart-retired', chartConnector: 'xero', activeConnector: null })
   assert.deepEqual(await accountingPostingVerdictForChart(null, 'SALES_INVOICE'), { verdict: 'no-chart' })
@@ -648,7 +643,7 @@ test('[o3d-j625 r4] a refused posting becomes an OUTSTANDING inbox row naming BO
   reset(['xero'])
   const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
   const settings = await getAccountingSettings()
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
 
   const outcome = await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
 
@@ -659,12 +654,10 @@ test('[o3d-j625 r4] a refused posting becomes an OUTSTANDING inbox row naming BO
   assert.equal(rows[0].referenceType, 'SalesOrder')
   assert.equal(rows[0].referenceId, 'order-1')
   assert.equal(rows[0].chartConnector, 'xero', 'the chart the codes came from')
-  // o3d-j625 r12 (merging o3d-remove-parked-connectors): `null`, not 'quickbooks'. These cases model "the
-  // active connector moved away from the chart" by enabling the second connector's plugin flag; that flag
-  // now names no REGISTERED connector, so the resolution answers "nothing is active" — the same retired
-  // chart, reported with the successor it can honestly name. The named-successor half of r2's MEDIUM 2 is
-  // only observable with a second registered connector (o3d-5ktph); that the field is PRESENT and states
-  // something rather than being omitted is what this line still holds.
+  // `null`: these cases model "the active connector moved away from the chart" by switching the
+  // accounting plugin off, so the resolution answers "nothing is active" — the same retired chart. That
+  // the field is PRESENT and states something rather than being omitted is what this line holds; naming a
+  // successor connector is only observable with a second registered connector (o3d-5ktph).
   assert.equal(rows[0].activeConnector, null, 'AND what is active now — the half round 2 omitted')
   assert.equal(rows[0].reason, 'retired_chart')
   assert.match(String(rows[0].remedy), /back to xero/)
@@ -674,7 +667,7 @@ test('[o3d-j625 r4] the SAME posting refused again updates one row rather than f
   reset(['xero'])
   const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
   const settings = await getAccountingSettings()
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
 
   await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
   await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
@@ -689,7 +682,7 @@ test('[o3d-j625 r4] the posting being QUEUED clears the outstanding row — noth
   const settings = await getAccountingSettings()
 
   // Refused while the chart's connector is retired…
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
   await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
   assert.equal(outstandingRefusals().length, 1, 'PRECONDITION: the debt was recorded')
 
@@ -716,7 +709,7 @@ test('[o3d-j625 r5 HIGH 4] the IN-TRANSACTION enqueue records its refusal when t
   reset(['xero'])
   const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
   const settings = await getAccountingSettings()
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
 
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
@@ -734,12 +727,10 @@ test('[o3d-j625 r5 HIGH 4] the IN-TRANSACTION enqueue records its refusal when t
   assert.equal(rows[0].type, TX_REQUEST.type)
   assert.equal(rows[0].referenceId, TX_REQUEST.referenceId)
   assert.equal(rows[0].chartConnector, 'xero')
-  // o3d-j625 r12 (merging o3d-remove-parked-connectors): `null`, not 'quickbooks'. These cases model "the
-  // active connector moved away from the chart" by enabling the second connector's plugin flag; that flag
-  // now names no REGISTERED connector, so the resolution answers "nothing is active" — the same retired
-  // chart, reported with the successor it can honestly name. The named-successor half of r2's MEDIUM 2 is
-  // only observable with a second registered connector (o3d-5ktph); that the field is PRESENT and states
-  // something rather than being omitted is what this line still holds.
+  // `null`: these cases model "the active connector moved away from the chart" by switching the
+  // accounting plugin off, so the resolution answers "nothing is active" — the same retired chart. That
+  // the field is PRESENT and states something rather than being omitted is what this line holds; naming a
+  // successor connector is only observable with a second registered connector (o3d-5ktph).
   assert.equal(rows[0].activeConnector, null, 'both connectors, as the refusal saw them')
   assert.equal(txModel.txRefusalWrites, 1, 'written through the CALLER\'S TRANSACTION, so it commits with the state that made the debt real')
   assert.equal(txModel.pooledRefusalWrites, 0, 'and not through the pool, where it would survive the caller rolling back')
@@ -749,7 +740,7 @@ test('[o3d-j625 r5] the in-transaction enqueue records NOTHING when the caller d
   reset(['xero'])
   const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
   const settings = await getAccountingSettings()
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
 
   await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,
@@ -767,7 +758,7 @@ test('[o3d-j625 r5 M-13] a posting refused, made, then refused again reports the
   const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
   const settings = await getAccountingSettings()
 
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
   await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
   await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
   const firstEpisode = refusals[0]!
@@ -781,7 +772,7 @@ test('[o3d-j625 r5 M-13] a posting refused, made, then refused again reports the
 
   // And a LATER switch opens a NEW gap. r4 carried the first episode's timestamp and count forward, so the
   // inbox aged a fresh debt from a gap that had already been closed — falsifying the column's own contract.
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
   await queueAccountingSync({ ...salesInvoiceRequest(settings.salesAccount), chartConnector: settings.connector })
 
   const reopened = outstandingRefusals()
@@ -794,7 +785,7 @@ test('[o3d-j625 r5 M-14] a refusal row that cannot be WRITTEN does not abort the
   reset(['xero'])
   const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
   const settings = await getAccountingSettings()
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
   txModel.failRefusalWrites = true
 
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
@@ -851,14 +842,13 @@ test('[o3d-j625 r5 HIGH 5] the payment-account confirmation admits what the POST
 test('[o3d-j625 r5 HIGH 5] CONTROL: the confirmation still refuses a value that is not in THIS connector\'s chart', async () => {
   const { accountingBankAccountBelongsTo } = await import('@/lib/accounting')
   storedAccounts.length = 0
-  // o3d-j625 r12 (merging o3d-remove-parked-connectors): the OTHER connector moved from the argument to
-  // the stored row, because that is where an archived id actually occurs — `AccountingAccount.connector`
-  // is a plain string and archiving deleted no rows. The property is identical and still observable: a
-  // code or id that exists ONLY under a different connector does not belong to the one being asked about.
-  storedAccounts.push({ connector: 'quickbooks', code: '090', externalAccountId: 'qbo-uuid-bank', active: true, type: 'BANK' })
+  // The OTHER connector is a stored row: `AccountingAccount.connector` is a plain string that can hold a
+  // retired id. A code or id that exists ONLY under a different connector does not belong to the one being
+  // asked about.
+  storedAccounts.push({ connector: 'retired-ledger', code: '090', externalAccountId: 'retired-uuid-bank', active: true, type: 'BANK' })
 
   assert.equal(await accountingBankAccountBelongsTo('xero', '090'), false, 'another connector\'s code')
-  assert.equal(await accountingBankAccountBelongsTo('xero', 'qbo-uuid-bank'), false, 'another connector\'s id')
+  assert.equal(await accountingBankAccountBelongsTo('xero', 'retired-uuid-bank'), false, 'another connector\'s id')
   assert.equal(await accountingBankAccountBelongsTo('xero', 'nope'), false, 'a value in no chart at all')
   assert.equal(await accountingBankAccountBelongsTo('xero', ''), false, 'nothing mapped')
 })
@@ -876,7 +866,7 @@ test('[o3d-j625 r6 H2] a second allocation-reversal TRIM queued does not clear t
     recordRefusalAsOutstanding: true,
   })
 
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
   assert.equal(await queueAccountingSyncTx(transactionDouble() as never, trim('trim-1')), false, 'PRECONDITION: trim 1 refused')
   assert.equal(outstandingRefusals().length, 1, 'PRECONDITION: and recorded as outstanding')
 
@@ -1012,7 +1002,7 @@ test('[o3d-j625 r6 L1] the in-transaction answer carries the active connector an
   reset(['xero'])
   const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
   const settings = await getAccountingSettings()
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
   const reported: { outcome?: Record<string, unknown> } = {}
 
   await queueAccountingSyncTx(transactionDouble() as never, {
@@ -1024,12 +1014,10 @@ test('[o3d-j625 r6 L1] the in-transaction answer carries the active connector an
   })
 
   assert.equal(reported.outcome?.reason, 'refused', 'PRECONDITION')
-  // o3d-j625 r12 (merging o3d-remove-parked-connectors): `null`, not 'quickbooks'. These cases model "the
-  // active connector moved away from the chart" by enabling the second connector's plugin flag; that flag
-  // now names no REGISTERED connector, so the resolution answers "nothing is active" — the same retired
-  // chart, reported with the successor it can honestly name. The named-successor half of r2's MEDIUM 2 is
-  // only observable with a second registered connector (o3d-5ktph); that the field is PRESENT and states
-  // something rather than being omitted is what this line still holds.
+  // `null`: these cases model "the active connector moved away from the chart" by switching the
+  // accounting plugin off, so the resolution answers "nothing is active" — the same retired chart. That
+  // the field is PRESENT and states something rather than being omitted is what this line holds; naming a
+  // successor connector is only observable with a second registered connector (o3d-5ktph).
   assert.equal(reported.outcome?.activeConnector, null)
   assert.equal(reported.outcome?.refusalRecorded, true)
 })
@@ -1062,11 +1050,11 @@ test('[o3d-j625 r7 H-B] refused → marked handled → the outbox drains → NOT
   })
 
   // 1. Refused: the connector moved under the recalculation. The reporting site records the row.
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
   insertedInTx.length = 0
   assert.equal(await queueAccountingSyncTx(transactionDouble() as never, journal()), false, 'PRECONDITION: refused')
   await recordAccountingPostingRefusal({ accountingPostingRefusal: postingRefusalTable } as never, accountingPostingKey(journal()), {
-    kind: 'landed_cost_cogs_journal', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: 'r',
+    kind: 'landed_cost_cogs_journal', chartConnector: 'xero', activeConnector: null, reason: 'retired_chart', committed: 'c', remedy: 'r',
   })
   const row = outstandingRefusals()[0]!
   assert.equal(row.kind, 'landed_cost_cogs_journal', 'PRECONDITION: recorded as outstanding')

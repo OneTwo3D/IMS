@@ -38,8 +38,7 @@ import * as realSettingsStore from '../lib/settings-store.ts'
 /** The setting key the derived map must mint for a registered connector, spelled independently. */
 const ACME_SETTING_KEY = `plugin_${ACME_WMS_ID}_enabled`
 
-// o3d-remove-parked-connectors: `plugin_quickbooks_enabled` was here (and `plugin_shopify_enabled`
-// before it). Both connectors are archived. Spelled independently of the shipped derivation on
+// Spelled independently of the shipped derivation on
 // purpose, so this has to be edited when the id set does.
 const SHIPPED_KEYS = [
   'plugin_woocommerce_enabled',
@@ -181,8 +180,7 @@ test('seam/plugin-state: a registered WMS connector gets an id, a setting key an
     keys.INTEGRATION_PLUGIN_KEYS_IN_LOCK_ORDER.includes(ACME_SETTING_KEY),
     'and its row is inside the selection lock — a row outside it is a row a concurrent writer can move',
   )
-  // o3d-remove-parked-connectors: 6 while Shopify and QuickBooks were registered; 4 now
-  // (woocommerce, xero, mintsoft, acme-wms). Spelled independently of the derivation, so it has to
+  // 4 (woocommerce, xero, mintsoft, acme-wms). Spelled independently of the derivation, so it has to
   // be edited when the id set does — which is the point of writing it out at all.
   assert.equal(keys.INTEGRATION_PLUGIN_IDS.length, SHIPPED_KEYS.length + 1)
 })

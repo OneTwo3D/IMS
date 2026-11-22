@@ -35,9 +35,8 @@ import { WMS_CONNECTOR_IDS, type WmsConnectorId } from './connectors/wms/types'
  * These are enumerated because there is no registry to derive them from — unlike the WMS
  * connectors, which have one.
  *
- * o3d-remove-parked-connectors: `shopify` and `quickbooks` were here and are archived (see
- * docs/archive/shopify-connector-removal.md and docs/archive/quickbooks-connector-removal.md).
- * Both exclusivity groups went with them — see below.
+ * The `shopping` and `accounting` exclusivity groups do not exist while each has one member —
+ * see below.
  */
 export const NON_WMS_INTEGRATION_PLUGIN_IDS = ['woocommerce', 'xero'] as const
 
@@ -55,7 +54,7 @@ export const INTEGRATION_PLUGIN_IDS: readonly IntegrationPluginId[] = [
  * (o3d-remove-shiphero round 10, Codex HIGH 1).
  *
  * WHAT WENT WRONG. Exclusivity used to be two hand-written `if` pairs inside each of the two
- * writers: `xero && quickbooks`, `woocommerce && shopify`. Round 8 made the settings toggles
+ * writers (one per pair of mutually exclusive connectors). Round 8 made the settings toggles
  * registry-derived, which is what made a SECOND WMS switch exist — and nothing added a rule that
  * only one WMS may be on. Neither writer rejected it, so an operator could enable a second WMS
  * connector beside Mintsoft, be told it saved (it did), and then watch every push and every sweep
@@ -63,10 +62,9 @@ export const INTEGRATION_PLUGIN_IDS: readonly IntegrationPluginId[] = [
  * `WMS_CONNECTOR_IDS.find(...)` — first enabled wins. The operator is told the thing they asked for
  * happened. It did not.
  *
- * WHY THE `shopping` AND `accounting` GROUPS ARE GONE RATHER THAN LEFT WITH ONE MEMBER EACH
- * (o3d-remove-parked-connectors). Shopify was WooCommerce's only partner, and QuickBooks was Xero's.
- * A one-member group can never conflict, so it reads as an enforced rule and enforces nothing — the
- * same failure mode as a guard nobody has watched fail. Both are deleted; a second storefront or a
+ * WHY THERE ARE NO `shopping` OR `accounting` GROUPS RATHER THAN ONES WITH ONE MEMBER EACH.
+ * WooCommerce and Xero have no partner connector registered. A one-member group can never conflict, so it reads as an enforced rule and enforces nothing — the
+ * same failure mode as a guard nobody has watched fail. Both are omitted; a second storefront or a
  * second ledger restores its entry in the same commit that registers itself.
  * `findIntegrationPluginExclusivityConflict` is unchanged and total over whatever groups exist, so
  * restoring an entry is the whole edit.

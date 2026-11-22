@@ -226,8 +226,7 @@ mock.module('@/lib/domain/accounting/cogs-subledger-movement', {
 // with the reloaded NEGATIVE basis differs, so that is asserted per connector below rather than
 // parameterised here.
 //
-// o3d-remove-parked-connectors: QuickBooks was the second entry and is archived out of the built tree
-// (archive/connectors/quickbooks/, tag archive/quickbooks-connector), so there is one entry today. The
+// There is one registered connector, so one entry. The
 // roster is ASSERTED against the registry below rather than trusted — a one-element matrix that quietly
 // became a zero-element one would make every `for (const connector of CONNECTORS)` test below vanish
 // without a single failure, and a connector added back without an entry here would be untested.
@@ -335,23 +334,6 @@ test('xero Group B REFUSES the order on the reloaded negative basis: nothing sta
   assert.equal(logged.length, 1, 'one ERROR activity entry for the refusal')
   assert.equal(logged[0].level, 'ERROR')
 })
-
-// THE QUICKBOOKS RESIDUAL TEST WAS HERE, AND IS DELETED RATHER THAN PORTED (o3d-c08y r3).
-//
-// It pinned what QuickBooks Group B did with a reloaded NEGATIVE basis: no refusal, the negative COGS
-// pair dropped by its `> 0` gate and the shipment stamped anyway (decision-doc items (e)/(f)), which was
-// the Codex HIGH on ff613aa3. o3d-remove-parked-connectors (#698) archived that processor out of the
-// built tree, so there is no longer a live path by which a negative cost basis can reach QuickBooks
-// Group B: `app/api/cron/accounting-sync/route.ts` has one executable arm (`xero`) and
-// `app/api/cron/accounting-daily-batch/route.ts` switches exhaustively over `DailyBatchSweepConnector`
-// = `AccountingConnectorId` = `'xero'`. Keeping the test would have meant importing
-// `archive/connectors/quickbooks/...`, i.e. re-attaching an archived connector to the live test matrix
-// to pin a defect that can no longer be reached.
-//
-// The defect itself is NOT fixed — it travels with the archive. o3d-tedw stays open and the archive tag
-// message names it. If a QuickBooks (or any second) connector is ever un-archived, the registry-derived
-// matrix assertion above fails until it is driven through these tests, and the negative-basis refusal
-// o3d-tedw describes has to be written before it can pass them.
 
 for (const connector of CONNECTORS) {
   test(`${connector.name} Group B refuses the window when the reloaded data references a cost layer it did not lock`, async () => {

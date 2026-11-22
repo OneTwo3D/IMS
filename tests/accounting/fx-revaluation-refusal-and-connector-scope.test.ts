@@ -6,10 +6,11 @@ import { fakeFxClient } from '../helpers/fx-fake-client'
 /**
  * o3d-j625 r3 — THE AR/AP FX REVALUATION RUN: TWO FINDINGS IN ONE FUNCTION.
  *
- * Codex HIGH 4 — `hasRevaluationForDate` searched EVERY connector's live revaluation rows. Xero
- * revalues the 2nd; the operator switches to QuickBooks that day; the QuickBooks run reads Xero's row,
- * decides "already revalued", and skips — so QuickBooks' journal, whose lines come from QuickBooks' own
- * accounts and which no Xero row can stand in for, is silently never written. r2 declared this out of
+ * Codex HIGH 4 — `hasRevaluationForDate` searched EVERY connector's live revaluation rows. A
+ * connector other than the active one (e.g. a retired connector id) revalued that date; the run for the
+ * active connector reads that row, decides "already revalued", and skips — so the active connector's
+ * journal, whose lines come from its own accounts and which no other connector's row can stand in for,
+ * is silently never written. r2 declared this out of
  * scope because it "only decides whether to skip work". The work it skips is the journal.
  *
  * Codex MEDIUM — `reversed += 1` (and `revalued += 1`) after an enqueue whose result was discarded, so a
@@ -25,7 +26,7 @@ import { fakeFxClient } from '../helpers/fx-fake-client'
 type Row = { id: string; type: string; status: string; connector: string; payload: Record<string, unknown> }
 
 const state = {
-  connector: 'quickbooks' as 'xero' | 'quickbooks',
+  connector: 'xero' as string,
   rows: [] as Row[],
   receivables: [] as unknown[],
   /** Which enqueue kinds answer `refused`. */
@@ -119,7 +120,7 @@ const OPEN_USD_RECEIVABLE = {
   currency: 'USD', totalForeign: 100, totalBase: 80, fxRateToBase: 0.8, payments: [], refunds: [],
 }
 
-function reset(connector: 'xero' | 'quickbooks', rows: Row[]): void {
+function reset(connector: string, rows: Row[]): void {
   state.connector = connector
   state.rows = rows
   state.receivables = [OPEN_USD_RECEIVABLE]
@@ -134,26 +135,26 @@ function reset(connector: 'xero' | 'quickbooks', rows: Row[]): void {
 // ---------------------------------------------------------------------------------------------------
 
 test('[o3d-j625 r3 HIGH 4] PRECONDITION: a SAME-connector revaluation for the date does skip the fresh run — the rig can see a skip', async () => {
-  reset('quickbooks', [revaluationRow('qbo-today', 'quickbooks', VALUATION_DATE)])
+  reset('xero', [revaluationRow('xero-today', 'xero', VALUATION_DATE)])
   const { runArApFxRevaluation } = await import('@/lib/accounting-fx-revaluation')
 
   const result = await runArApFxRevaluation({ valuationDate: VALUATION_DATE })
 
-  assert.equal(result.revalued, 0, 'QuickBooks already revalued this date, so the fresh half is skipped')
+  assert.equal(result.revalued, 0, 'this connector already revalued this date, so the fresh half is skipped')
   assert.equal(state.enqueued.filter((e) => e.kind === 'revaluation').length, 0)
   assert.equal(result.skipped, true)
 })
 
 test('[o3d-j625 r3 HIGH 4] ANOTHER connector’s revaluation for the same date does NOT skip this connector’s journal', async () => {
-  // Xero revalued the 2nd; the operator switched to QuickBooks the same day.
-  reset('quickbooks', [revaluationRow('xero-today', 'xero', VALUATION_DATE)])
+  // A retired connector revalued the 2nd; the active connector is Xero.
+  reset('xero', [revaluationRow('retired-today', 'retired-ledger', VALUATION_DATE)])
   const { runArApFxRevaluation } = await import('@/lib/accounting-fx-revaluation')
 
   const result = await runArApFxRevaluation({ valuationDate: VALUATION_DATE })
 
   const revaluations = state.enqueued.filter((e) => e.kind === 'revaluation')
-  assert.equal(revaluations.length, 1, `QuickBooks' own revaluation must be written. Enqueued: ${JSON.stringify(state.enqueued)}`)
-  assert.equal(revaluations[0].chartConnector, 'quickbooks')
+  assert.equal(revaluations.length, 1, `the active connector's own revaluation must be written. Enqueued: ${JSON.stringify(state.enqueued)}`)
+  assert.equal(revaluations[0].chartConnector, 'xero')
   assert.equal(result.revalued, 1)
   assert.notEqual(result.skipped, true, 'and the run must not call itself a no-op')
 })
@@ -215,7 +216,7 @@ test('[o3d-j625 r3 MEDIUM] PRECONDITION: the same reversal, NOT refused, IS coun
 })
 
 test('[o3d-j625 r3 MEDIUM] a REFUSED revaluation is not counted as revalued either', async () => {
-  reset('quickbooks', [])
+  reset('xero', [])
   state.refuseKinds.add('revaluation')
   const { runArApFxRevaluation } = await import('@/lib/accounting-fx-revaluation')
 
@@ -230,7 +231,7 @@ test('[o3d-j625 r3 MEDIUM] a REFUSED revaluation is not counted as revalued eith
 // row that run creates clears the refusal (createAccountingSyncLogRow). Driven through the real run twice.
 test('[o3d-j625 r6 H4] a refused revaluation is raised again, under the SAME posting key, by re-running the date', async () => {
   const { accountingPostingKey } = await import('@/lib/accounting/posting-key')
-  reset('quickbooks', [])
+  reset('xero', [])
   state.refuseKinds.add('revaluation')
   const { runArApFxRevaluation } = await import('@/lib/accounting-fx-revaluation')
   await runArApFxRevaluation({ valuationDate: VALUATION_DATE })

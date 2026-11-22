@@ -156,9 +156,8 @@ test('a scheduler failure is shown as SAVED with a warning, never as a failed sa
 
 test('a REFUSAL rolls the switches back and states the reason', async () => {
   // The one outcome that committed nothing, and therefore the only one a rollback describes.
-  // o3d-remove-parked-connectors: the refusal reason was the accounting pair's, whose group went with
-  // QuickBooks. The action's result is stubbed here, so this asserts the SCREEN's handling of a
-  // refusal, not which rule produced it; the reason is now the one surviving group's.
+  // The action's result is stubbed here, so this asserts the SCREEN's handling of a refusal, not which
+  // rule produced it; the reason is the surviving (WMS) group's.
   state.result = { status: 'refused', error: 'Enable one WMS connector at a time — order push, dispatch and every WMS sweep route to a single warehouse.' }
   const screen = await mountSettings()
   // A switch moved before Save — what makes the rollback observable: requested and previous must

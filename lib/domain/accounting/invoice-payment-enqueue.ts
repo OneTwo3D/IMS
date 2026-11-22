@@ -183,8 +183,7 @@ export async function loadInvoicePaymentSyncRows(
       // ...and the mark it would have written, which identifies the attempt even if its amount or
       // date has since been corrected in the ledger.
       // REGISTRY-CHECKED, not a literal pair (o3d-remove-parked-connectors). `connector` here comes
-      // from a stored row, so it can name a connector this build no longer ships (rows stamped
-      // `quickbooks` still exist in development databases). Such a row gets a null marker, which the
+      // from a stored row, so it can name a connector this build no longer ships. Such a row gets a null marker, which the
       // caller reads as "no identifying mark" rather than inventing one.
       settlementMarker: isRegisteredAccountingConnector(connector)
         ? settlementMarkerFor(effectiveTokenFor(connector, { id: r.id, payload: r.payload }))
@@ -683,7 +682,7 @@ export type InvoicePaymentRedrive =
  * On the deferred path the recovery half is `followUpObligationRecoveryNote` over the REGISTRY's
  * declaration for the pinned connector, exactly as `releaseFollowUpObligation`, the Xero processor
  * and the sweep already do. Nothing about what re-drives a retained obligation is written as prose
- * here, on any connector: Xero's bound sweep and QuickBooks' "nothing does, READ AND ESCALATE" are
+ * here, on any connector: Xero's bound sweep and a retired connector's "nothing does, READ AND ESCALATE" are
  * both the registry's answers, not this module's guesses.
  */
 export function invoicePaymentRemedyNote(redrive: InvoicePaymentRedrive): string {
@@ -1517,7 +1516,7 @@ export async function registerInvoicePaymentWithLedger(params: {
     // Conditional on purpose: this is a network read, and the ordinary receipt has no history to check.
     const probeConnector = connectorId
     // o3d-r948 r6: the records, and nothing beside them. r5 carried the probe's organisation here
-    // too, so the decision's exclusion set could be scoped to the realm that answered; that
+    // too, so the decision's exclusion set could be scoped to the tenant that answered; that
     // exclusion is gone (see invoice-payment-registration.ts), and the provenance it needed was
     // itself unsound — two token snapshots either side of the fetch cannot see a reconnect across
     // it.
@@ -2092,7 +2091,7 @@ export async function registerDeferredOrderReceipts(
     // where nothing has been decided about them, so nothing may be discharged on their behalf.
     if (paymentsPost === null) return { settled: false, reason: 'posting-context-unknown', release: 'retained' }
 
-    // THE LINK NEVER LANDED (o3d-ekn8 r5, Codex HIGH). QuickBooks' `updateBackReference` catches its
+    // THE LINK NEVER LANDED (o3d-ekn8 r5, Codex HIGH). A connector's `updateBackReference` can swallow its
     // own failure, so the invoice can post while the order is left with no accountingInvoiceId at
     // all — and this function's old first line treated that exactly like "no receipts to register"
     // and returned in silence. Every receipt on this order then stayed unregistered, nothing said

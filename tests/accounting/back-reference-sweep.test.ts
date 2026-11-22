@@ -1421,7 +1421,7 @@ test('[o3d-9kek r2 f3] a warning that was NOT persisted does not buy 24 hours of
 
 test('the sweep stays inside its own connector', async () => {
   const harness = makeHarness({
-    syncRows: [salesInvoiceRow(1), salesInvoiceRow(2, { connector: 'quickbooks' })],
+    syncRows: [salesInvoiceRow(1), salesInvoiceRow(2, { connector: 'retired-ledger' })],
     bills: [],
     orders: [
       { id: 'so-1', accountingInvoiceId: null },
@@ -1436,7 +1436,7 @@ test('the sweep stays inside its own connector', async () => {
 })
 
 // ---------------------------------------------------------------------------
-// o3d-9kek ROUND 3 — the uniqueness namespace, the missing QuickBooks-side sweep's shape, the
+// o3d-9kek ROUND 3 — the uniqueness namespace, the
 // retention tombstone, and the third incarnation of the starvation bug.
 // ---------------------------------------------------------------------------
 
@@ -1660,8 +1660,8 @@ test('[o3d-9kek r3 f4] the Setting-backed cursor store round-trips, and treats j
   assert.equal(await store.load(), null)
   await store.save({ createdAt: at(7), id: 'log-0007' })
   assert.deepEqual(await store.load(), { createdAt: at(7), id: 'log-0007' })
-  // Per connector: a QuickBooks sweep must not resume from Xero's bookmark.
-  assert.equal(await createBackReferenceSweepCursorStore(settingDb, 'quickbooks').load(), null)
+  // Per connector: another connector's sweep must not resume from Xero's bookmark.
+  assert.equal(await createBackReferenceSweepCursorStore(settingDb, 'retired-ledger').load(), null)
 
   rows.set('xero_backreference_sweep_cursor', 'not json')
   assert.equal(await store.load(), null)

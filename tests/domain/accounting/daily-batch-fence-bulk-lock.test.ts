@@ -14,9 +14,8 @@ import {
  * `assertRevenueDeferralsUnchanged` protects Group A1 from staging a deferral derived from a
  * discount the backfill has since corrected. Its first revision expanded the member ids with
  * `Prisma.join`, which spends ONE BIND PARAMETER PER ORDER, and PostgreSQL's wire protocol caps a
- * statement at 65535 of them. Group A1 selects every eligible order with no `take`, and QuickBooks —
- * unlike Xero — has no bounded window through which a backlog can drain, so a large enough backlog
- * made the fence itself throw and the whole daily batch fail before staging anything. A fence that
+ * statement at 65535 of them. Group A1 selects every eligible order with no `take`, so a large enough
+ * backlog made the fence itself throw and the whole daily batch fail before staging anything. A fence that
  * turns a backlog into an outage is not a safety property.
  *
  * These tests assert the SHAPE OF THE QUERIES rather than allocating a real 65k-row fixture, which

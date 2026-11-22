@@ -34,11 +34,11 @@ import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/l
 //
 // AND FOR A CONNECTOR THIS BUILD DOES NOT SERVICE, THE TOGGLE IS NOT AN ANSWER TO THAT QUESTION AT
 // ALL — it is a stale row in the `settings` table (o3d-remove-parked-connectors round 2, Codex
-// MEDIUM). Archiving QuickBooks removed its processor, its cron branch, its manual Sync action and
-// its Sync-settings control, and deleted NO `quickbooks_sync_enabled` row: membership of that table
-// is not a data-retention decision this branch took. Reading the survivor as proof of a claim path
+// MEDIUM). Retiring a connector removes its processor, its cron branch, its manual Sync action and
+// its Sync-settings control, and deletes NO `<connector>_sync_enabled` row: membership of that table
+// is not a data-retention decision a code removal takes. Reading the survivor as proof of a claim path
 // got the answer wrong IN THE UNSAFE DIRECTION — it reported a row claimable when nothing in the
-// deployment can claim it, which refused adoption for every stranded QuickBooks row and told the
+// deployment can claim it, which refused adoption for every stranded row on a retired connector and told the
 // operator to go and turn off a checkbox the Sync page no longer renders. A financial row with no
 // claim path, no exit and instructions that cannot be followed.
 //
@@ -89,9 +89,7 @@ import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/l
  * TOTAL OVER `AccountingConnectorId`, so registering a connector without naming the toggle its claim
  * paths gate on is a `tsc` error here rather than a silent "cannot be shown to be quiesced" at
  * runtime. And it holds NOTHING ELSE: a key for a connector this build does not service would be a
- * claim path that does not exist, which is the round-2 defect. `quickbooks_sync_enabled` was here and
- * is gone with the connector (o3d-remove-parked-connectors); the archived spelling is recoverable at
- * `git show archive/quickbooks-connector`.
+ * claim path that does not exist, which is the round-2 defect.
  */
 export const ACCOUNTING_SYNC_ENABLED_SETTING_KEYS: Readonly<Record<AccountingConnectorId, string>> = Object.freeze({
   xero: 'xero_sync_enabled',

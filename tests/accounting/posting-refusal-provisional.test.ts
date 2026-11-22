@@ -33,7 +33,7 @@ const KEY = accountingPostingKey({ type: 'MANUFACTURING_JOURNAL', referenceType:
 const RECORD = {
   kind: 'manufacturing_journal' as const,
   chartConnector: 'xero',
-  activeConnector: 'quickbooks',
+  activeConnector: 'retired-ledger',
   reason: 'retired_chart',
   committed: 'the production order is completed in IMS and its stock movements are posted',
   remedy: 'Post the manufacturing journal by hand in the ledger it belongs to and mark this row handled.',

@@ -88,8 +88,8 @@ import { AsyncLocalStorage } from 'node:async_hooks'
  * talking to compares against this and nothing else — never against a tenant it read earlier, which
  * is the stale read this parameter exists to retire.
  *
- * The field is named for the ledger's own identity, so QuickBooks' realmId lands here too when its
- * egress is threaded through this seam.
+ * The field is named for the ledger's own identity, so another connector's tenant/company id would land
+ * here too if its egress were threaded through this seam.
  */
 export type AccountingEgressRequest = {
   /** The ledger the request is addressed to, exactly as the outgoing header spells it. */

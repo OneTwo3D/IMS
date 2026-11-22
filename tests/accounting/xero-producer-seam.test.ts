@@ -18,7 +18,7 @@ import { ACCOUNTING_SYNC_TYPE_EXCLUSIONS, WRITER_OWNERSHIP_MAP, type OwnershipRo
  * Named mutations (shown red in the PR, restored from a copy, md5-verified):
  *  a  type-unmapped-live   an unmapped type answers legacy while enforced: the unmapped arm goes red
  *  b  date-first           the document date is read before the payment date: the obligation-date arm goes red
- *  c  quickbooks-asked     the seam asks for a non-Xero connector: the connector arm goes red
+ *  c  other-connector-asked the seam asks for a non-Xero connector: the connector arm goes red
  */
 
 const TENANT = '4f7f0c6e-1111-4222-8333-944455556666'
@@ -118,7 +118,7 @@ test('an enforced type the ownership map does not name is SHADOW (a posting nobo
 })
 
 test('only connector xero is asked', () => {
-  assert.deepEqual(xeroProducerSeamVerdict({ connector: 'quickbooks', type: 'PURCHASE_INVOICE', payload: { date: '2026-06-01' }, env: ENFORCED, now: NOW }), { kind: 'legacy' })
+  assert.deepEqual(xeroProducerSeamVerdict({ connector: 'retired-ledger', type: 'PURCHASE_INVOICE', payload: { date: '2026-06-01' }, env: ENFORCED, now: NOW }), { kind: 'legacy' })
 })
 
 test('the business-event date is the ONE declared field: a date without a time is the start of that UTC day; absent or unreadable is undefined whatever other dates the payload carries', () => {

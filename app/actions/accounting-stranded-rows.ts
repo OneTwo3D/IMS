@@ -52,7 +52,7 @@ async function resolveActiveAccountingConnector(): Promise<string | null> {
  *
  * o3d-osl8 is explicit that an aggregate count is not a remedy; that was the specific
  * criticism. Every existing accounting log view is scoped to the active connector
- * (getAccountingSyncLogs resolves it; getXeroSyncLogs / getQuickBooksSyncLogs hard-filter), so
+ * (getAccountingSyncLogs resolves it; getXeroSyncLogs hard-filters), so
  * a row left behind on a retired connector is visible ONLY as the integer in the orphan
  * banner. This loader is deliberately NOT connector-scoped, which is the whole point of it.
  *
@@ -116,7 +116,7 @@ export async function getStrandedAccountingSyncRows(limit = 50): Promise<Strande
   const unclaimable = (connector: string) => isStrandedRowUnclaimable({
     connector,
     activeConnector,
-    // A toggle with no row is OFF, which is exactly how triggerXeroSync / triggerQuickBooksSync read
+    // A toggle with no row is OFF, which is exactly how triggerXeroSync reads
     // it — `enabled?.value !== 'true'`. `null` and "absent" are the same answer to both.
     syncEnabledValue: syncEnabled.get(accountingSyncEnabledSettingKey(connector) ?? '') ?? null,
   })

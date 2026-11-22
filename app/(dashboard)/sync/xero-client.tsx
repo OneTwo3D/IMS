@@ -206,18 +206,15 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
   const [releasingId, setReleasingId] = useState<string | null>(null)
   const [retryMsg, setRetryMsg] = useState<string | null>(null)
   const searchParams = useSearchParams()
-  // o3d-remove-parked-connectors: this read `?connector=quickbooks ? 'quickbooks' : 'xero'`, i.e. the
-  // panel's connector came from a hand-written pair and every unrecognised value silently became
-  // Xero. It now resolves through the registry, so an unknown `?connector=` falls back to the first
-  // registered connector explicitly and the LABEL comes from that connector's definition rather than
-  // from a second ternary.
+  // The panel's connector resolves through the registry, so an unknown `?connector=` falls back to
+  // the first registered connector explicitly and the LABEL comes from that connector's definition.
   const requestedConnector = searchParams.get('connector')
   const connectorId: AccountingConnectorId =
     ACCOUNTING_CONNECTORS.find((connector) => connector.id === requestedConnector)?.id
     ?? ACCOUNTING_CONNECTORS[0].id
   const connectorLabel = getAccountingConnectorDefinition(connectorId).label
   // iwrm: resolve a connector-agnostic setting suffix to the active connector's
-  // prefixed key (xero_* vs quickbooks_*). `settings`/`s` are already keyed for
+  // prefixed key (`<connector>_*`). `settings`/`s` are already keyed for
   // the active connector by the registry, so the form must read/write the same.
   const settingKey = (suffix: string) => settingKeyFor(connectorId, suffix)
   const accountFields = ACCOUNT_FIELDS.filter(f => isFieldAvailableForConnector(f, connectorId))
@@ -265,9 +262,8 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
 
   function handleSave() {
     setMsg(null)
-    // iwrm: build the payload with the active connector's prefix so QuickBooks
-    // account mappings actually save (previously hardcoded xero_* keys were
-    // filtered out by saveQuickBooksSettings' allowlist). secretMasked is never a
+    // iwrm: build the payload with the active connector's prefix so account
+    // mappings save under that connector's own keys. secretMasked is never a
     // suffix/account key, so the cast to a plain string map is safe.
     const payload = buildAccountingSettingsPayload(connectorId, s as unknown as Record<string, string>)
     startTransition(async () => {

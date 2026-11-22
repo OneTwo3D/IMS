@@ -33,17 +33,13 @@ import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 // ---------------------------------------------------------------------------
 // THE EVIDENCE EVERY CONNECTOR'S REVERSAL READER MUST CONSULT (o3d-psrx r3, Codex HIGH)
 //
-// r2 gave `SalesOrder.paidAt` a provenance column and taught the XERO poller to read it. Codex found
-// the SAME rule wide open one connector over: the QuickBooks reversal candidate query selected
-// neither `unregisteredPaidAt` nor any registration/receipt evidence, so every recently modified
-// balance-due invoice walked straight into reversal handling — and a sale an operator marked paid by
-// hand, which by design has no ledger receipt at all, satisfied that query exactly. The branch that
-// exists to close "one rule, several writers, one fixed" would have shipped "one rule, two readers,
-// one fixed".
-//
-// So the reader is written ONCE, here, and both pollers call it. What differs between Xero and
-// QuickBooks is only how each ledger states its payments, and that difference is a single argument
-// (`ledgerListedPaymentIds`) rather than a second implementation of the decision.
+// r2 gave `SalesOrder.paidAt` a provenance column and taught the XERO poller to read it. The rule
+// is written ONCE, here, so that a reversal candidate query which selected no registration/receipt
+// evidence cannot walk every recently modified balance-due invoice into reversal handling — and a
+// sale an operator marked paid by hand, which by design has no ledger receipt at all, satisfy that
+// query exactly. The reader is shared by every poller. What differs between ledgers is only how each
+// states its payments, and that difference is a single argument (`ledgerListedPaymentIds`) rather
+// than a second implementation of the decision.
 // ---------------------------------------------------------------------------
 
 /**

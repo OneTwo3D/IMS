@@ -13,8 +13,7 @@ import {
 // makes the save-payload mapping unit-testable — this is a save-path bug that previously hardcoded
 // xero_* keys, silently dropping the other connector's mappings.
 //
-// o3d-remove-parked-connectors: `ACCOUNTING_CONNECTOR_IDS` was a SIXTH hand-written spelling of the
-// accounting id union (`['xero', 'quickbooks']`). It is derived from the registry now, so a field
+// `ACCOUNTING_CONNECTOR_IDS` is derived from the registry, so a field
 // restricted with `connectors: [...]` cannot name an id the app does not register, and registering one
 // widens this list without an edit here.
 
@@ -34,16 +33,16 @@ export const ACCOUNT_FIELDS: AccountFieldDef[] = [
   { suffix: 'shipping_account', label: 'Shipping Income', description: 'Shipping charges on sales' },
   { suffix: 'discount_account', label: 'Discounts Given', description: 'Order-level discounts' },
   { suffix: 'transit_account', label: 'Stock in Transit', description: 'Purchase bills and goods ordered but not yet received' },
-  // Xero-only: the GR/IR reclass journal is the Xero daily batch's (no quickbooks_* key).
+  // Xero-only: the GR/IR reclass journal is the Xero daily batch's.
   { suffix: 'grir_account', label: 'GR/IR (goods received, not invoiced)', description: 'Clearing account the daily batch moves goods received but not yet billed into, out of Stock in Transit. Used only while GR/IR posting is switched on (Sub-Ledger section); leave blank otherwise. Must differ from Stock in Transit.', connectors: ['xero'] },
   { suffix: 'inventory_account', label: 'Inventory Asset', description: 'Stock on hand value' },
   { suffix: 'allocated_inventory_account', label: 'Allocated Inventory', description: 'Stock allocated to paid orders awaiting dispatch' },
   { suffix: 'cogs_account', label: 'Cost of Goods Sold', description: 'COGS booked on dispatch' },
   { suffix: 'manufacturing_overhead_account', label: 'Manufacturing Overhead', description: 'Overhead absorbed into manufactured stock cost on production completion. Leave blank to capitalise components at material cost only.' },
-  // Xero-only: the retrospective COGS revaluation path is Xero-specific (no quickbooks_* key).
+  // Xero-only: the retrospective COGS revaluation path is Xero-specific.
   { suffix: 'inventory_revaluation_account', label: 'Inventory Revaluation', description: 'P&L offset for retrospective COGS corrections on goods already sold (e.g. freight cancelled after dispatch). Leave blank to use Stock in Transit.', connectors: ['xero'] },
   { suffix: 'rounding_difference_account', label: 'Rounding Difference', description: 'Optional. Absorbs the sub-penny residue when 6dp inventory values post to the 2dp ledger, so the inventory subledger ties to the GL exactly. Leave blank to keep accepting residue within tolerance (no rounding line posted).' },
-  // Xero-only: the EU IOSS / VOEC / DDP treatment is the Xero connector's (no quickbooks_* key). Configuration only until the invoice treatment reads these.
+  // Xero-only: the EU IOSS / VOEC / DDP treatment is the Xero connector's. Configuration only until the invoice treatment reads these.
   { suffix: 'eu_vat_ioss_account', label: 'EU IOSS/VOEC VAT collected', description: 'Liability account for the VAT collected on IOSS and VOEC sales, which is remitted outside the UK VAT return (Xero "Non-UK VAT"). Leave blank until the EU VAT treatment is switched on.', connectors: ['xero'] },
   { suffix: 'eu_vat_ddp_account', label: 'EU DDP charges collected', description: 'Account for the VAT and duty collected on over-threshold (DDP) EU sales. Leave blank until the EU VAT treatment is switched on.', connectors: ['xero'] },
   { suffix: 'eu_fee_account', label: 'EU landed-cost fees', description: 'Account for marked landed-cost fee lines (customs, handling) on EU sales, posted without VAT. Leave blank until the EU VAT treatment is switched on.', connectors: ['xero'] },
@@ -58,7 +57,7 @@ export const SYNC_TYPE_TOGGLES: AccountFieldDef[] = [
   { suffix: 'sync_sales_invoice', label: 'Sales Invoices', description: 'Push invoices when generated' },
   { suffix: 'sync_credit_note', label: 'Credit Notes', description: 'Push credit notes on refund' },
   { suffix: 'sync_purchase_invoice', label: 'Purchase Bills', description: 'Push supplier bills when PO is invoiced' },
-  // Xero-only: supplier credit notes (ACCPAYCREDIT) have no quickbooks_* sync key.
+  // Xero-only: supplier credit notes (ACCPAYCREDIT) are Xero-specific.
   { suffix: 'sync_purchase_credit_note', label: 'Supplier Credit Notes', description: 'Push supplier credit notes (e.g. a credited duplicate freight bill) as ACCPAYCREDIT', connectors: ['xero'] },
   { suffix: 'sync_stock_receipt', label: 'Stock Receipts', description: 'Journal: DR Inventory / CR Stock in Transit on goods received' },
   { suffix: 'sync_cogs_reversal', label: 'COGS Reversals', description: 'Reverse COGS on stock returns' },
@@ -153,7 +152,7 @@ export function validateAccountingAccountMapping(
   //
   // The first cut took the connector from saveAccountingSettings' getActiveAccountingConnector(),
   // which is xero-first and independent of the ?connector= URL param the client builds its
-  // payload from (xero-client.tsx:157). So a QuickBooks save would be checked against
+  // payload from (xero-client.tsx:157). So a save for another connector would be checked against
   // xero_* keys, find nothing, and the guard would silently never fire — a guard that
   // reports success is worse than no guard. Keys absent from the payload are skipped
   // anyway, so checking both prefixes costs nothing and cannot mis-fire.
@@ -192,8 +191,7 @@ export function validateAccountingAccountMapping(
 /**
  * Build the connector-prefixed settings payload from the in-form state. Uses the
  * active connector's prefix for every sync/flag suffix plus every account field
- * available on that connector, so QuickBooks account mappings actually persist
- * (the old hardcoded xero_* payload was filtered out by saveQuickBooksSettings).
+ * available on that connector, so account mappings persist under that connector's own keys.
  */
 export function buildAccountingSettingsPayload(
   connectorId: AccountingConnectorId,

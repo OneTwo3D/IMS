@@ -5,11 +5,10 @@
  * accounting connector is connected. The per-invoice lookups short-circuit on the stored id so they never
  * re-verify it — which is the whole point, but it means a stale id (from a connector switch that bypassed
  * disconnect, or a re-authorisation to a different Xero org) would be read by a connection that never
- * issued it. QuickBooks ids are numeric strings and Xero ids are UUIDs, so today the failure is a loud
- * broken sync rather than corrupted books — but it is still a failure, and the guard below removes it.
+ * issued it. A foreign id is a failure at best and
+ * corrupted books at worst, and the guard below removes it.
  *
- * Provenance is `"<connector>:<tenantId>"`, taken from the connection's `AccountingToken` row (QuickBooks
- * stores its realmId in the same `tenantId` column). Storing it beside the id lets a reader ignore an id
+ * Provenance is `"<connector>:<tenantId>"`, taken from the connection's `AccountingToken` row. Storing it beside the id lets a reader ignore an id
  * whose provenance does not match the active connection, so correctness no longer depends on every exit
  * path remembering to clear the column.
  */
@@ -33,7 +32,7 @@ export function accountingIdProvenanceFor(connector: string, tenantId: string | 
 }
 
 /**
- * The provenance string for a connector's currently-connected tenant/realm, or `null` when that connector
+ * The provenance string for a connector's currently-connected tenant, or `null` when that connector
  * has no token (so nothing can legitimately match — a stored id is treated as stale).
  */
 export async function activeAccountingIdProvenance(connector: string): Promise<string | null> {

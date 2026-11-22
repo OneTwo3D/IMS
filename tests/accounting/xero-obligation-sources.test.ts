@@ -328,8 +328,8 @@ test('A HOP MUST BE THE SAME DOCUMENT: a parent of the right type from another r
     ['last hop, other reference', chain({ invoice: { referenceId: 'order-2' } })],
     ['first hop, other reference type', chain({ pdf: { referenceType: 'PurchaseOrder' } })],
     ['last hop, other reference type', chain({ invoice: { referenceType: 'PurchaseOrder' } })],
-    ['first hop, other connector', chain({ pdf: { connector: 'quickbooks' } })],
-    ['last hop, other connector', chain({ invoice: { connector: 'quickbooks' } })],
+    ['first hop, other connector', chain({ pdf: { connector: 'retired-ledger' } })],
+    ['last hop, other connector', chain({ invoice: { connector: 'retired-ledger' } })],
   ] as const) {
     const verdict = await verdictFor(rows)
     assert.ok(verdict.kind === 'shadow' && verdict.decision.reason === 'obligation_time_required', label)

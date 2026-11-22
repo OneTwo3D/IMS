@@ -602,7 +602,7 @@ test('[eu vat credit note] the treatment asks first: only Xero with the Sales In
   const refund = await directRefund(deps, fx, { lines: [{ net: '100' }], stated: '119' })
   // A refund with no persisted scheme snapshot is skipped; one recorded under the scheme treatment is never skipped (a persisted decision outranks the switch and the connector).
   const bareRefund = await directRefund(deps, fx, { lines: [{ net: '100', type: null, rate: null }], stated: null })
-  for (const connector of ['quickbooks', null]) {
+  for (const connector of ['retired-ledger', null]) {
     assert.deepEqual(await treat(deps, fx, bareRefund, { connector }), { kind: 'skipped', why: 'switch_off' })
     assert.equal(refusal(await treat(deps, fx, refund, { connector }))?.code, 'hand_post')
   }

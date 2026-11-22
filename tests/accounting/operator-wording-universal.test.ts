@@ -558,7 +558,6 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/domain/accounting/sync-row-settlement.ts', prefix: 'Without it the row records a post that nothing can be reconciled against.', verdict: 'DESCRIPTION', why: 'states a consequence' },
   { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: 'REMEDY: {lookup} and either keep it', verdict: 'CHECKS_FIRST', why: 'the sentence opens with the lookup of the document in the ledger; nothing is posted, the options are keep, void or reverse', count: 2 },
   { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: '{Lookup} and either keep it', verdict: 'CHECKS_FIRST', why: 'opens with the lookup in the ledger' },
-  { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: 'THIS OPERATION RETURNS NO IDENTIFIER', verdict: 'DESCRIPTION', why: 'states why the document cannot be recorded' },
   { file: 'lib/domain/sales/allocation-service.ts', prefix: 'Group A2 will not re-post this order', verdict: 'DESCRIPTION', why: 'states IMS behaviour' },
   { file: 'lib/domain/sales/refund-posted-tax-identity.ts', prefix: '{} carries no VAT rate of its own', verdict: 'DESCRIPTION', why: 'states why no identity exists (credit note "posts under")' },
   { file: 'lib/domain/sales/refund-posted-tax-identity.ts', prefix: '{} has no accounting tax code', verdict: 'DESCRIPTION', why: 'states why no identity exists' },
@@ -657,7 +656,7 @@ test('[o3d-1e7sl Codex r17] every instruction site in the tree is guarded by con
   // Codex r19: the verdicts are VERIFIED against each declared sentence, never taken on trust.
   const ACT = /\b(post|re-?post|repost|re-?send|resend|retry|re-?save|raise|enter|register|record|book|apply|allocate|settle|reconcile|void|reverse|correct|link)\b/i
   const CHECK = /\b(check|confirm|open|look ?up|locate|inspect|compare)\b|{lookup}/i
-  const LEDGERISH = /ledger|accounting|Xero|QuickBooks|journal|credit note/i
+  const LEDGERISH = /ledger|accounting|Xero|journal|credit note/i
   const violations: string[] = []
   for (const site of unguarded) {
     const e = UNGUARDED_SITES.find((x) => x.file === site.file && site.sentence.startsWith(x.prefix))!
@@ -722,7 +721,7 @@ test('[o3d-1e7sl Codex r19] the xero allocation refusal directs the operator to 
 })
 
 test('[o3d-1e7sl Codex r19] the classifier: a descriptive phrase never exempts an imperative in the same sentence; DESCRIPTION entries have no imperative form', () => {
-  assert.equal(isInstructionSentence('IMS records the connector as quickbooks, which are recorded separately. Re-post the invoice from this order.'.split('. ')[0] + '; re-post the invoice from this order'), true, 'control: "are recorded" does not exempt a later re-post')
+  assert.equal(isInstructionSentence('IMS records the connector as retired-ledger, which are recorded separately. Re-post the invoice from this order.'.split('. ')[0] + '; re-post the invoice from this order'), true, 'control: "are recorded" does not exempt a later re-post')
   assert.equal(isInstructionSentence('The invoices are recorded in the ledger; re-post the invoice from this order to fix it.'), true)
   assert.equal(isInstructionSentence('Do not re-post it by hand.'), false, 'a prohibition clause is not an instruction')
   assert.equal(isInstructionSentence('This was posted by hand and the invoices are recorded in the ledger.'), false)

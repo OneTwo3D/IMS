@@ -2156,8 +2156,8 @@ function buildWcInvoiceCore(p: {
     // Bound (plain: shipping is never reverse-charge swapped) only to the rate whose own code is the one sent.
     ...(((shippingRateNow ?? defaultRateNow)?.accountingTaxType ?? undefined) === shippingTypeNow ? rateBinding((shippingRateNow ?? defaultRateNow)?.id, 'plain', 'shipping') : {}),
     // Only the residual — the coupon itself is already on the lines above as a per-line
-    // discountAmount, which the connector sends as a Xero DiscountRate / QuickBooks
-    // discount line. Sending both deducted it twice (o3d-y14).
+    // discountAmount, which the connector sends as a Xero DiscountRate.
+    // Sending both deducted it twice (o3d-y14).
     discountAmount: orderLevelDiscountAmount,
     discountAccountCode: settings.discountAccount || undefined,
     discountTaxType: invoiceTaxTypes.discount.type ?? undefined,
@@ -3529,7 +3529,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     // `subtotal` minus that line's share), and mapWcLineItems turns that difference into a per-line
     // discountAmount. IMS's ORDER-LEVEL discountAmount slot means the opposite — a discount that is
     // NOT in the lines — so it must carry only the residual, normally zero. Storing the coupon in
-    // both places made every consumer deduct it twice (o3d-y14): the Xero/QuickBooks builders send
+    // both places made every consumer deduct it twice (o3d-y14): the Xero builder sends
     // the per-line figure as a DiscountRate AND append the order-level figure as a negative line.
     //
     // STORE CREDIT IS A PAYMENT, NOT A DISCOUNT. Smart Coupons store credit reaches `coupon_lines[]`

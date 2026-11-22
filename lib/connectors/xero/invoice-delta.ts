@@ -908,9 +908,8 @@ const LEDGER_AMOUNT_GRAMMAR = /^[+-]?\d+(?:\.\d+)?$/
 /**
  * An ISO-4217 code out of a payload field, or NULL when the field does not carry one.
  *
- * Shared by both connectors so "what currency is this document in" has ONE answer: Xero states it as
- * `CurrencyCode: "GBP"`, QuickBooks as `CurrencyRef: { value: "GBP" }`, and the two unwrappings differ
- * while the validation must not. Anything that is not three letters is NULL rather than a guess — the
+ * One home for "what currency is this document in", so every reader has ONE answer: Xero states it
+ * as `CurrencyCode: "GBP"`, and the validation lives here rather than at each unwrapping. Anything that is not three letters is NULL rather than a guess — the
  * rules built on the result are all written about that null, and all of them take it as "be stricter".
  */
 export function ledgerCurrencyCode(value: unknown): string | null {
@@ -1065,8 +1064,8 @@ export function ledgerAmountMagnitudeBound(currency: string | null): number {
  * this number be spent in place of the figure it came from?
  *
  * WHY IT IS A FUNCTION AND NOT A LINE INSIDE `parseLedgerAmount`. r12 guarded the INPUTS and not the
- * ARITHMETIC BETWEEN THEM: QuickBooks' settled figure is `TotalAmt - Balance`, a Decimal subtraction
- * whose result was converted bare. Both operands can round-trip perfectly and their exact difference
+ * ARITHMETIC BETWEEN THEM: a settled figure derived as a total less a balance is a Decimal
+ * subtraction whose result was converted bare. Both operands can round-trip perfectly and their exact difference
  * still not — total `0.005055810576648219` less balance `0.00005581057664821855` is exactly
  * `0.00500000000000000045`, which is ABOVE the GBP epsilon, and whose `toNumber()` is exactly
  * `0.005`, which is NOT. That turns a positive payment into `HOLDS_NOTHING`, the one verdict that
@@ -1074,7 +1073,7 @@ export function ledgerAmountMagnitudeBound(currency: string | null): number {
  * not get; this one belongs to the conversion itself.
  *
  * NULL IS A REFUSAL AND NEVER A ZERO, wherever it is returned — see `parseLedgerAmount` below and
- * `QboLedgerAmount.paid`, both of which withhold on it.
+ * the amount readers that call it, all of which withhold on it.
  *
  * o3d-psrx r14 (Codex HIGH) added the magnitude bound HERE, and r15 (Codex MEDIUM 1) TOOK IT BACK
  * OUT — because this function is only ever handed a value whose own evidence still exists.
@@ -1214,7 +1213,7 @@ export function readLedgerDifferenceAsNumber(
  * WHAT IT COSTS. A ledger figure carrying MORE decimals than its own currency has is refused rather
  * than read — `1234567.8901` in GBP, `123456789.99` in JPY. That is the fail-closed direction the
  * finding asked for ("fail closed for numeric-token evidence that cannot be proven quantized"), and it
- * costs nothing that exists: Xero and QuickBooks both state document totals and paid amounts rounded
+ * costs nothing that exists: Xero states document totals and paid amounts rounded
  * to the document's own currency, and an amount that arrives finer than its currency is precisely the
  * shape this reader cannot read safely. NULL IS A REFUSAL AND NEVER A ZERO, and every caller must
  * withhold on it — in `classifyLedgerSettlement` that is `record-unmeasurable`, which reads as
@@ -1262,11 +1261,11 @@ export function readLedgerStatedAmount(value: unknown, currency: string | null):
  * reason: it now has a SECOND caller, and the last time a reader of these fields had two spellings
  * the two diverged and the divergence moved money.
  *
- * THE DIVERGENCE THIS EXISTS TO PREVENT, twice over. o3d-psrx r10 found `typeof row.Balance ===
- * 'number'` failing on a QuickBooks `Balance` of `"50.00"` and moved the QuickBooks payment POLLER
- * onto `parseLedgerAmount`, which is this reader plus a conversion. o3d-obyd then found the
- * settlement PROBE still holding the r10 shape — `typeof value === 'number'` — over the same fields
- * of the same documents from the same connector. One rule, two readers, one of them fixed. So the
+ * THE DIVERGENCE THIS EXISTS TO PREVENT, twice over. o3d-psrx r10 found a payment reader's `typeof row.Balance ===
+ * 'number'` failing on a ledger balance of `"50.00"` and moved it onto `parseLedgerAmount`, which is
+ * this reader plus a conversion. o3d-obyd then found the settlement PROBE still holding the r10
+ * shape — `typeof value === 'number'` — over the same fields of the same documents from the same
+ * connector. One rule, two readers, one of them fixed. So the
  * probe does not get a third spelling of "is this text a money figure": it calls THIS, which is the
  * function the poller's own reading is built out of, and a change to what a ledger amount may look
  * like now lands on both by construction.
@@ -1309,8 +1308,8 @@ export function parseLedgerAmount(value: unknown, currency: string | null): numb
   //
   // The alternative — carrying Decimal through every classification instead of converting at all — is
   // the stronger shape and is NOT small here: this reader's result is a `number` in the Xero
-  // partition, in `QboLedgerAmount`, in `QboLedgerEvidence` and in the activity metadata those
-  // verdicts are written into. That is a change to two connectors' public readings, and o3d-78rq
+  // partition and in the activity metadata those verdicts are written into. That is a change to
+  // public readings, and o3d-78rq
   // needed only the settlement classifier's operands, so it took the Decimal reader above instead.
   return readDecimalAsNumber(stated)
 }
@@ -1328,10 +1327,10 @@ export function parseLedgerAmount(value: unknown, currency: string | null): numb
 //
 // The constant is DELETED rather than corrected in place. A fixed number that is right for one
 // currency is a standing invitation to reach for it from a second call site, and that is how this
-// defect was built: r10 moved QuickBooks onto a per-currency threshold and left this one behind,
+// defect was built: r10 moved one reader onto a per-currency threshold and left this one behind,
 // because it sat in a module the shared rule could not be imported into. "How small is nothing" is
-// now answered in ONE place for both connectors — `ledgerAmountEpsilon`, in lib/domain/math/decimal.ts,
-// beside the minor-unit table it derives from and upstream of both.
+// now answered in ONE place — `ledgerAmountEpsilon`, in lib/domain/math/decimal.ts, beside the
+// minor-unit table it derives from and upstream of every reader.
 
 export type PaymentReversalReading = {
   /**
@@ -1888,12 +1887,12 @@ export type RegisteredPaymentVerdict =
    * which reads registrations, receipts and provenance, and never an amount the ledger states.
    *
    * Xero establishes it upstream: `partitionPaymentReversals` splits `zeroPaid` from `partPaid` and
-   * `unverifiable` on `AmountPaid`, and only the first is asked this question at all. THE QUICKBOOKS
-   * POLLER DID NOT. Its candidates were invoices with `Balance > 0` — a PART payment and a removed
-   * one look identical in that predicate — and with no listing to enumerate, a document carrying a
-   * posted registration landed on `LEDGER_DID_NOT_LIST_PAYMENTS`, which admits. Two registrations
-   * covering the total, one payment removed: a positive balance, the other payment still held by
-   * QuickBooks, and the whole sale reversed with a chargeback credit note over it.
+   * `unverifiable` on `AmountPaid`, and only the first is asked this question at all. A READER THAT
+   * SELECTS CANDIDATES ON `Balance > 0` DOES NOT: a PART payment and a removed one look identical in
+   * that predicate, and with no listing to enumerate, a document carrying a posted registration
+   * lands on `LEDGER_DID_NOT_LIST_PAYMENTS`, which admits. Two registrations covering the total, one
+   * payment removed: a positive balance, the other payment still held by the ledger, and the whole
+   * sale reversed with a chargeback credit note over it.
    *
    * So the precondition is now a VERDICT rather than an assumption, and a connector that cannot show
    * it says so here instead of falling into an admitting arm by default. `paidAmount` is what the
@@ -1905,21 +1904,6 @@ export type RegisteredPaymentVerdict =
       verdict: 'LEDGER_NOT_PROVEN_ZERO_PAID'
       paidAmount: number | null
       documentTotal: number | null
-      /**
-       * o3d-psrx r15 (Codex MEDIUM 2) — THE ONE CAUSE OF THIS VERDICT THAT IS A BINDING DEFECT
-       * RATHER THAN A LEDGER READING, SAID OUT LOUD.
-       *
-       * The amounts a ledger states are only readable against a MINOR UNIT, and the minor unit comes
-       * from the document's currency. When neither the payload nor the IMS document it is linked to
-       * can supply one, the reader falls back to the finest precision this repository supports — the
-       * strictest bound — and the figures are refused for a reason that has nothing to do with what
-       * the ledger said. An operator told only "IMS could not read the amount" would go and look at a
-       * document whose amounts are perfectly ordinary.
-       *
-       * Optional, and ABSENT MEANS NO: every other producer of this verdict read a currency from
-       * somewhere, so only the QuickBooks reader that can reach the unbound state sets it.
-       */
-      currencyUnbound?: boolean
     }
   /**
    * o3d-psrx r10 (Codex HIGH 1) — THE LEDGER STATES THIS DOCUMENT IS ONLY PARTLY PAID. THAT IS THE
@@ -2022,15 +2006,15 @@ export function classifyRegisteredPayment(
  * `classifyRegisteredPayment` above is this function plus ONE line: how a XERO invoice states which
  * payments it carries. Everything the verdict actually turns on -- the registrations, the fence, the
  * unregistered receipts, the recorded provenance -- is connector-neutral, and splitting it here is
- * what lets the QuickBooks poller reach the SAME decision instead of a second one worded like it.
+ * what lets any other reader reach the SAME decision instead of a second one worded like it.
  * Two independently-worded implementations of one money rule is precisely the defect Codex found:
- * the rule enforced for Xero and silently absent for QuickBooks.
+ * the rule enforced in one reader and silently absent in the other.
  *
  * `ledgerListedPaymentIds` is the set of payment ids the ledger states on this document, LOWERCASED,
  * or NULL when this read did not enumerate them. Null is not "no payments": it is "absence cannot be
- * established from this payload", which is what `LEDGER_DID_NOT_LIST_PAYMENTS` says. The QuickBooks
- * reversal read asks only which invoice ids regressed, so it always passes null, and GONE/STILL_HELD
- * are unreachable from that connector -- see the QuickBooks poller's own note.
+ * established from this payload", which is what `LEDGER_DID_NOT_LIST_PAYMENTS` says. A reversal read
+ * that asks only which invoice ids regressed always passes null, and GONE/STILL_HELD are then
+ * unreachable for it.
  */
 export function classifyRegisteredPaymentAgainstListing(
   ledgerListedPaymentIds: ReadonlySet<string> | null,

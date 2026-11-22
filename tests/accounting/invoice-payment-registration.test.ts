@@ -327,7 +327,7 @@ test('an attempt that PROVABLY never posted does not block the receipt (o3d-0m56
  *   [o3d-r948 r3] an attempt s OWN recorded settlement is never excluded from its own match
  *   [o3d-r948 r4] a RETIRED operator-asserted row s typed id does not exclude the attempt s own settlement
  *   [o3d-r948 r4] an OPERATOR_RELEASE row s id is the connector s own and still excludes
- *   [o3d-r948 r5] an id minted in a FORMER realm does not exclude the current ledger s own evidence
+ *   [o3d-r948 r5] an id minted in a FORMER tenant does not exclude the current ledger s own evidence
  *   [o3d-r948 r5] a row whose origin is UNKNOWN grants no exclusion — in any of its three flavours
  *   [o3d-r948 r5] the PROBE side is scoped too — a connection the probe cannot name excludes nothing
  *
@@ -373,7 +373,7 @@ test('[o3d-r948 r6] an unmeasurable settlement withholds — whatever id any oth
 
 test('[o3d-r948 r6] the id being OURS, the ledger s, or nobody s makes no difference at all', () => {
   // The withhold is not conditional on anything about the id. It was, through five revisions of a
-  // predicate — asserted or not, this realm or a former one, stamped or unknown — and each of those
+  // predicate — asserted or not, this tenant or a former one, stamped or unknown — and each of those
   // conditions was a route to `clear`. Now the id is not consulted, so a test that varies it and
   // gets one answer is the strongest statement of the rule available.
   //
@@ -466,7 +466,7 @@ test('o3d-hbgo: ANOTHER receipt s payment against a RETIRED invoice leaves the r
 //
 // The safety argument — "the old document has been deleted" — is an assumption about a ledger this
 // code never reads, and it inverts the module's own rule that for money unknown must read as
-// "possibly this one". On QuickBooks a deleted invoice leaves its payment as an UNAPPLIED CREDIT:
+// "possibly this one". On some ledgers a deleted invoice leaves its payment as an UNAPPLIED CREDIT:
 // the customer is credited twice.
 // ---------------------------------------------------------------------------
 

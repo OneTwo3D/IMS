@@ -1,5 +1,5 @@
 import type { Prisma } from '@/app/generated/prisma/client'
-import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from '@/lib/domain/accounting/money-attempt-provenance'
+import { ATTEMPT_PROVEN_NEVER_MADE_WHERE, REVISION_BUMPING_CONNECTOR_WHERE } from '@/lib/domain/accounting/money-attempt-provenance'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
 import { invoicingOrderIdsForRows, lockOrdersFirst, recomputeInvoicingStateForOrders } from '@/lib/domain/sales/invoicing-state-sites'
 
@@ -12,7 +12,7 @@ import { invoicingOrderIdsForRows, lockOrdersFirst, recomputeInvoicingStateForOr
  * posted row put back to PENDING keeps the id the ledger issued. So `abandonedBeforeRemoteCall: true` is
  * written ONLY over a PENDING row at `attemptRevision` 0 with no external id that also carries the
  * canonical never-attempted record (`ATTEMPT_PROVEN_NEVER_MADE_WHERE`: no `remoteAttemptedAt`, custody
- * present; revision 0 alone does not prove it) - the row's own claim evidence, in the SAME predicate as
+ * present; revision 0 alone does not prove it) from a REGISTERED connector (a retired connector's processor may have claimed without bumping the revision) - the row's own claim evidence, in the SAME predicate as
  * the cancelling UPDATE (a claim mints revision >= 1, so a claim that
  * lands between the two statements moves the row out of the first and into the second). Every other
  * PENDING row is still retired - it is an orphan either way - but UNSTAMPED, i.e. UNKNOWN to
@@ -43,6 +43,9 @@ export async function cancelOrphanedPendingRows(
         // Revision 0 alone is not proof (a legacy row attempted before the column existed, or a revival that did not advance
         // it): the row must also carry the canonical never-attempted record. A row without it is retired below, unstamped.
         ATTEMPT_PROVEN_NEVER_MADE_WHERE,
+        // Only a registered connector's processor is known to bump the revision on a claim (o3d-g5t0y); a
+        // retired connector's revision-0 row is retired below, unstamped.
+        REVISION_BUMPING_CONNECTOR_WHERE,
       ],
     },
     data: { status: 'CANCELLED', errorMessage: reason, processingStartedAt: null, abandonedBeforeRemoteCall: true },

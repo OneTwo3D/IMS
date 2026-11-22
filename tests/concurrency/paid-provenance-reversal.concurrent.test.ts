@@ -100,7 +100,7 @@ async function createPaidOrder(
 /**
  * o3d-77sj — THE FENCE INSTANT, WITH THE ORDERING IT RESTS ON PROVED INSTEAD OF ASSUMED.
  *
- * Cross-ported from the QuickBooks sibling, where the same shape was CI's only red test. The finding
+ * Cross-ported from a sibling poller, where the same shape was CI's only red test. The finding
  * there applies here verbatim, and here it appears five times.
  *
  * `classifyRegisteredPaymentAgainstListing` counts a registration as spoken for only while it

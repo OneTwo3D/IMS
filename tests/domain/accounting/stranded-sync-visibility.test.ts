@@ -108,7 +108,7 @@ test('a FAILED stranded read does not redirect — failure is not "there are non
 function summary(totalOrphans: number): ConnectorOrphanSummary {
   return {
     activeConnector: 'xero',
-    orphanGroups: totalOrphans > 0 ? [{ connector: 'quickbooks', count: totalOrphans }] : [],
+    orphanGroups: totalOrphans > 0 ? [{ connector: 'retired-ledger', count: totalOrphans }] : [],
     totalOrphans,
   }
 }

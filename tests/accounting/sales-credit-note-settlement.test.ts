@@ -107,7 +107,7 @@ test('nothing is settled until BOTH documents are posted, and only for Xero docu
   assert.equal((planCreditNoteSettlement(facts({ refund: { creditNoteId: null } })) as { reason: string }).reason, 'CREDIT_NOTE_NOT_POSTED')
   assert.equal((planCreditNoteSettlement(facts({ order: { invoiceId: null } })) as { reason: string }).reason, 'INVOICE_NOT_POSTED')
   assert.equal((planCreditNoteSettlement(facts({ refund: { creditNoteConnector: null } })) as { reason: string }).reason, 'DOCUMENT_NOT_XEROS')
-  assert.equal((planCreditNoteSettlement(facts({ order: { invoiceConnector: 'quickbooks' } })) as { reason: string }).reason, 'DOCUMENT_NOT_XEROS')
+  assert.equal((planCreditNoteSettlement(facts({ order: { invoiceConnector: 'retired-ledger' } })) as { reason: string }).reason, 'DOCUMENT_NOT_XEROS')
 })
 
 test('a deleted refund, or one another row already settled, is not settled again', () => {

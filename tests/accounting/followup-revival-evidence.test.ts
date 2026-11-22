@@ -90,7 +90,6 @@ test('a ROTATED token and a non-money type are never probed (o3d-0m56)', async (
   assert.deepEqual(xeroCalls, [], 'neither may cost an API call')
 })
 
-// o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
 for (const connector of ['xero']) {
   test(`${connector}: the processor asks before it revives, and stops when the answer is no (o3d-0m56)`, async () => {
     // Both enqueue helpers are module-private, so this pins the WIRING: the evidence call sits
@@ -117,7 +116,6 @@ for (const connector of ['xero']) {
   })
 }
 
-// o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
 for (const connector of ['xero']) {
   test(`${connector}: the revival's candidate rows carry remoteAttemptedAt (o3d-0m56 r8)`, async () => {
     // The revival WRITES OVER the payload of the row it recycles, and that payload is where an
@@ -141,7 +139,6 @@ for (const connector of ['xero']) {
   })
 }
 
-// o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
 for (const connector of ['xero']) {
   test(`${connector}: the revival reads the CUSTODY the row carries, not a global epoch (o3d-0m56 r10)`, async () => {
     // A NULL `remoteAttemptedAt` is only proof for a row nothing but a stamping binary has handled.
@@ -172,9 +169,7 @@ for (const connector of ['xero']) {
     // after a deploy or a rollback would otherwise post against a blind fence, and because this
     // binary's own claim RESTORES custody, so the forfeit has to be made permanent first.
     const source = await readFile(path.join(process.cwd(), `lib/connectors/${connector}/sync-processor.ts`), 'utf8')
-    const entry = source.indexOf(connector === 'xero'
-      ? 'export async function processPendingXeroSync('
-      : 'export async function processPendingQuickBooksSync(')
+    const entry = source.indexOf('export async function processPendingXeroSync(')
     assert.notEqual(entry, -1)
 
     const ensure = source.indexOf('await repairMoneyAttemptsOutsideStampingCustody()', entry)

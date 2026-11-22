@@ -144,7 +144,7 @@ export function dailyBatchDateKey(value: Date | string | null | undefined): stri
  *    batch date ONCE at run start and write the stage stamps with later new Date() calls, so
  *    a batch keyed A2-2026-07-20-<digest> can leave a stamp of 2026-07-21T00:0x:xxZ behind.
  *  - the derived shapes, in both forms that exist in the wild: the bare `<group>-<date>`
- *    QuickBooks writes and the digest-suffixed `<group>-<date>-<8 hex>` Xero's
+ *    (no digest) and the digest-suffixed `<group>-<date>-<8 hex>` Xero's
  *    buildDailyBatchReferenceId writes. Pre-migration rows have no persisted ref, so this is
  *    all they have.
  *
@@ -262,12 +262,6 @@ export async function findSalesOrderDeleteBlocker(
   // An old order can therefore hold a real invoice in the external ledger, have no retained sync
   // row, and pass every other check — hard-deleted, stranding the document with no IMS order
   // behind it. accountingInvoiceId lives on the order itself and is never purged.
-  //
-  // CAVEAT (o3d-0g2n): this marker is only as reliable as the writeback that sets it. On
-  // QuickBooks, updateBackReference runs after the sync row is SYNCED, swallows its failure, and
-  // has no repair sweep — so a transient failure leaves a real invoice with no accountingInvoiceId.
-  // Until that is fixed, the sync-log checks below are what covers that case, and only until
-  // retention purges them.
   //
   // accountingInvoiceId ONLY — deliberately NOT invoicedAt. generateInvoiceNumber sets invoicedAt
   // when it merely assigns a LOCAL invoice number (app/actions/sales.ts ~2680), and that action is

@@ -93,8 +93,9 @@ export const SETTING_ENV_FALLBACKS: Partial<Record<string, string>> = {
  * MEASURED, not reasoned about: on the head this list was added to, a WAREHOUSE session calling
  * getSetting() against a seeded row got all six values back in clear -- the three shopify_* keys
  * because this branch removed them, the three shiphero_* keys because PR #680 removed them and
- * nobody noticed. `quickbooks_client_secret` was refused, because the QuickBooks removal left it
- * in the set; that asymmetry is what showed the other two removals were the mistake.
+ * nobody noticed. The one retired accounting credential key was refused, because that removal had
+ * left it in the set; that asymmetry is what showed the other two removals were the mistake. (That
+ * key has since been dropped from this list in the same change as the migration that deletes its rows.)
  *
  * THE RULE: a credential key stays here for as long as a row for it may exist, i.e. until a
  * migration deletes the rows. Removing a key from this list is a data-retention decision, not a
@@ -108,7 +109,6 @@ export const SETTING_ENV_FALLBACKS: Partial<Record<string, string>> = {
  * the code.
  */
 export const RETIRED_CREDENTIAL_SETTING_KEYS: readonly string[] = [
-  'quickbooks_client_secret',
   'shiphero_access_token',
   'shiphero_refresh_token',
   'shiphero_webhook_secret',

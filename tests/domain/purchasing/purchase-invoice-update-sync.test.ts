@@ -191,7 +191,7 @@ test('maybeQueuePurchaseInvoiceUpdate logs unsupported connector without queuein
     },
   }
 
-  const result = await maybeQueuePurchaseInvoiceUpdate(baseParams(tx, deps, 'quickbooks'))
+  const result = await maybeQueuePurchaseInvoiceUpdate(baseParams(tx, deps, 'retired-ledger'))
 
   assert.equal(result, 'skipped-unsupported-connector')
   assert.equal(queueCalls.length, 0)
@@ -201,7 +201,7 @@ test('maybeQueuePurchaseInvoiceUpdate logs unsupported connector without queuein
   assert.deepEqual(activityLogCalls[0]?.data.metadata, {
     invoiceId: 'bill-1',
     accountingInvoiceId: 'xero-bill-1',
-    connector: 'quickbooks',
+    connector: 'retired-ledger',
     idempotencyKey: 'purchase-invoice-update:hash',
   })
 })
@@ -307,7 +307,7 @@ test('maybeQueuePurchaseInvoiceUpdate does not record a transit row when the upd
   }
 
   const result = await maybeQueuePurchaseInvoiceUpdate({
-    ...baseParams(tx, deps, 'quickbooks'),
+    ...baseParams(tx, deps, 'retired-ledger'),
     previousSubtotalBase: 100,
     newSubtotalBase: 130.5,
   })
@@ -347,7 +347,7 @@ test('[o3d-j625 r4] maybeQueuePurchaseInvoiceUpdate REFUSES when the chart’s c
   let enqueues = 0
   const asked: Array<[unknown, unknown]> = []
   // The race in the finding: the chart is Xero's, and by the time the gate asks, the active connector is a
-  // QuickBooks that does not post bill updates. `isAccountingSyncTypeEnabled` — the dependency this seam
+  // different one that does not post bill updates. `isAccountingSyncTypeEnabled` — the dependency this seam
   // used to take — answers `false` in that state, and it is supplied here too (by cast: it is no longer in
   // the type) so that the old code, run against this test, takes its `skipped-disabled` exit instead of
   // failing on a missing function.
@@ -355,7 +355,6 @@ test('[o3d-j625 r4] maybeQueuePurchaseInvoiceUpdate REFUSES when the chart’s c
     isAccountingSyncTypeEnabled: async () => false,
     postingVerdictForChart: async (chart: StoredAccountingConnector | null, type: 'PURCHASE_INVOICE_UPDATE') => {
       asked.push([chart, type])
-      // o3d-j625 r12 (merging o3d-remove-parked-connectors): this said `activeConnector: 'quickbooks'`.
       // With one registered connector "a DIFFERENT connector is active" cannot be expressed; `null` —
       // nothing switched on — is the retired-chart state that remains observable, and it is the one this
       // case is actually about (a retired chart is a REFUSAL, not `skipped-disabled`).

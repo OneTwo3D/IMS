@@ -14,10 +14,10 @@
 
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
-// o3d-78rq: the SAME reader both connectors' amount readings already go through, answering with the
+// o3d-78rq: the SAME reader the payment poller's amount readings already go through, answering with the
 // Decimal rather than the double. It lives beside `parseLedgerAmount` in the Xero module because that
-// is where `ledgerAmountMagnitudeBound` is, and this is the import direction QuickBooks' own payment
-// poller already takes for exactly the same rule.
+// is where `ledgerAmountMagnitudeBound` is, and this is the import direction the payment poller
+// already takes for exactly the same rule.
 // o3d-obyd: and `decodeLedgerAmountText` is the string arm of that same reader, which is how the
 // completeness arithmetic below reads a numeric STRING without also inheriting the currency and
 // magnitude judgements that belong to a decision which withholds. One decode, two callers.
@@ -65,10 +65,8 @@ function str(value: unknown): string {
   return typeof value === 'string' ? value.trim() : ''
 }
 
-// o3d-remove-parked-connectors: `num()` was here and lost its only callers with the QuickBooks arm —
-// it read the wire doubles on `QboPaymentLine.Amount`. Xero's arm reads through
-// `readLedgerStatedAmount`, which accepts `number | string` and is the reading that survived o3d-obyd.
-// Recoverable at `git show archive/quickbooks-connector:lib/connectors/accounting-settlement-probe.ts`.
+// Xero's arm reads amounts through `readLedgerStatedAmount`, which accepts `number | string` and is
+// the reading that survived o3d-obyd.
 
 /* ------------------------------------------------------------------------------------------- *
  * o3d-r948 — THE COMPLETENESS CROSS-CHECKS, IN DECIMAL, AT THIS DOCUMENT'S OWN MINOR UNIT.
@@ -103,8 +101,8 @@ function str(value: unknown): string {
  *
  * So the narrower of the two available answers is taken, and `ledgerAmountEpsilon` — "how small an
  * amount counts as NOTHING", which is the same question this asks of a shortfall — is that answer,
- * already written down for both connectors. It is 0.005 exactly in every two-decimal currency, so
- * nothing about the ordinary Xero or QuickBooks document moves; it is 0.0005 in a Gulf dinar, where
+ * already written down once for every reader. It is 0.005 exactly in every two-decimal currency, so
+ * nothing about the ordinary Xero document moves; it is 0.0005 in a Gulf dinar, where
  * the fil that was being swallowed now refuses.
  *
  * AN UNSTATED CURRENCY TAKES THE STRICTEST BAND, which is `ledgerAmountEpsilon`'s documented
@@ -132,9 +130,9 @@ function completenessBand(currency: string | null): Decimal {
  *                                            actionable rather than mysterious.
  *
  * WHAT COUNTS AS STATED. A finite JSON number, or TEXT that `decodeLedgerAmountText` — the very
- * function the QuickBooks poller's own `parseLedgerAmount` reading is built out of — admits.
- * QuickBooks serialises `TotalAmt` and `Balance` as strings (o3d-psrx r10, which moved the poller and
- * left this module behind), so a string here is the ordinary case and not an exotic one.
+ * function the poller's own `parseLedgerAmount` reading is built out of — admits. A ledger that
+ * serialises money as strings (o3d-psrx r10, which moved the poller and left this module behind)
+ * makes a string here the ordinary case and not an exotic one.
  *
  * DELIBERATELY NOT `readLedgerStatedAmount` ITSELF. That reader additionally refuses a figure finer
  * than its currency or above the magnitude bound, and those refusals belong to a decision that
@@ -177,13 +175,13 @@ function completenessBand(currency: string | null): Decimal {
  * is above the band, and they are one double. So the halved bound is REUSED here rather than
  * re-derived, and it applies to every figure this reader answers, because there is no figure here
  * that is read alone: `Total - RemainingCredit`, `AmountPaid` against its collection, `Total -
- * AmountDue`, `TotalAmt - Balance`, and every `shortBy` and `statesAnything` besides, are all decided
+ * AmountDue`, and every `shortBy` and `statesAnything` besides, are all decided
  * at one half of a minor unit.
  *
  * THE STRING ARM TAKES NO BOUND, which is o3d-psrx r15 and is deliberately unchanged. A string still
  * carries its own digits, so nothing was destroyed and there is nothing for a size rule to stand in
- * for. That is also why this does not undo o3d-obyd: QuickBooks states `TotalAmt` and `Balance` as
- * TEXT, and text is read exactly as it was.
+ * for. That is also why this does not undo o3d-obyd: a ledger that states its totals and balances as
+ * TEXT has them read exactly as they were.
  *
  * A REFUSED NUMBER IS UNREADABLE, NOT ABSENT. It is a figure the ledger STATED, so it takes the
  * direction the triple exists for -- `completenessCannotRun` refuses the probe rather than excusing
@@ -232,12 +230,12 @@ function wireDecimal(value: unknown, currency: string | null): Decimal | null {
  * o3d-obyd — A COMPLETENESS CHECK THAT CANNOT BE RUN MUST NOT READ AS ONE THAT PASSED.
  *
  * THE DEFECT. Every completeness cross-check in this file is guarded by `figure !== null`, and every
- * figure came from a reader that answered `null` to a numeric STRING. QuickBooks sends `TotalAmt` and
- * `Balance` as strings. So on the ordinary QuickBooks bill the guard was false, the check did not
+ * figure came from a reader that answered `null` to a numeric STRING. A ledger that sends its totals
+ * and balances as strings made the guard false on an ordinary bill, so the check did not
  * run, control fell through to `return { ok: true, records }` — and with nothing uncovered linked,
  * `records` is EMPTY. `classifyLedgerSettlement` reads an ok probe with an empty record list as
  * `clear`, `clear` is what authorises a money post, and the money post is a SECOND payment against a
- * bill QuickBooks is reporting as fully settled. The refusal was being spent as permission.
+ * bill the ledger is reporting as fully settled. The refusal was being spent as permission.
  *
  * Reading the string (above) removes the reachable cause. This removes the SHAPE, which is the part
  * that can come back: a figure the ledger stated and this code cannot read now REFUSES the probe
@@ -305,12 +303,11 @@ function exceeds(accounted: Decimal, stated: Decimal, currency: string | null): 
  *   ASSUMED EMPTY    the document states none of them. `settled` is null, no check ran, and the empty
  *                    record list is a conclusion drawn from having nothing to read. It refuses.
  *
- * This is the QuickBooks arm's rule, not a second spelling of it: `probeQuickBooksSettlement` has
- * required exactly this since o3d-mm51 — emptiness PROVED by two stated figures rather than assumed
- * from two missing ones — and the function is shared so the two can never drift. What each arm passes
- * as `settled` is its own ledger's account of how much has come off the document by ANY means:
+ * The rule is emptiness PROVED by two stated figures rather than assumed
+ * from two missing ones (o3d-mm51), and the function is shared so that no two arms can drift. What
+ * each arm passes as `settled` is its own ledger's account of how much has come off the document by ANY means:
  * `Total - AmountDue` (or the `AmountPaid + AmountCredited` fallback) on a Xero invoice,
- * `Total - RemainingCredit` on a Xero credit note, `TotalAmt - Balance` on a QuickBooks document. In
+ * `Total - RemainingCredit` on a Xero credit note. In
  * every case it is null exactly when the ledger stated too little for the figure to be computed.
  *
  * A NON-EMPTY RECORD LIST STILL ANSWERS — AND o3d-obyd r31 IS WHAT "ANSWERS" MEANS. This paragraph
@@ -553,7 +550,6 @@ type XeroAppliedCollection = Array<{ AppliedAmount?: number }>
  *     invoice      CISDeduction      document figure; cross-checked TWO-SIDED against
  *                                    `AmountPaid + AmountCredited`, which catches an over-subtraction
  *                                    whenever that fallback pair is stated (it is, on every real GET).
- *     QuickBooks   Balance           document figure, no per-member flag. Believed as stated.
  *
  *   ADDED or COMPARED — an over-count makes the collection EXCEED the figure certifying it, which
  *   withholds proof: `unknown`, never `clear`. No member filter is needed on any of them, and adding
@@ -561,7 +557,6 @@ type XeroAppliedCollection = Array<{ AppliedAmount?: number }>
  *     credit note  Total, SUM(Allocations)
  *     invoice      Total, AmountPaid, AmountCredited, SUM(Payments), and the three applied
  *                  collections (`CreditNotes` / `Prepayments` / `Overpayments`)
- *     QuickBooks   TotalAmt, SUM(applied linked settlements)
  *
  * So: exactly one term in either identity carries a member-level flag that decides whether the member
  * is netted at all, and a rule about excluding members belongs only to it. Every other term is a
@@ -1266,9 +1261,9 @@ export async function probeXeroSettlement(
      * NON-OPTIONAL off this endpoint, so requiring the echo is established rather than hoped for,
      * which is the test `resolveCreditNoteRefunds` applies to every field it binds on.
      *
-     * The two arms beside this one (`Invoices/{id}` here, `bill/{id}` in the QuickBooks probe) read
-     * their documents the same unbound way. That is one change about all three rather than a rider on
-     * this one, and it is filed rather than smuggled in — see the round's bd issue.
+     * The other by-id reads in this file (`Invoices/{id}`) read
+     * their documents the same unbound way. That is one change about all of them rather than a rider
+     * on this one, and it is filed rather than smuggled in — see the round's bd issue.
      */
     // o3d-h9pb: the three checks above are `readSingleXeroDocument` now, shared with every other by-id
     // read; every `unreadable` outcome is UNKNOWN here (refusal), never an empty record list.
@@ -1963,8 +1958,8 @@ export async function probeXeroSettlement(
   const paymentsExceedTotal = amountPaid !== null && seen !== null && exceeds(seen, amountPaid, invoiceCurrency)
 
   // THE SHAPE-INDEPENDENT SETTLEMENT ACCOUNTING (Codex round 6, finding 3) — the same arithmetic
-  // the QuickBooks probe already does, for the same reason, because `AmountPaid` is not the whole
-  // of what settles a Xero document.
+  // the other completeness checks already do, for the same reason, because `AmountPaid` is not the
+  // whole of what settles a Xero document.
   //
   // WHAT XERO CAN AND CANNOT SEE FROM HERE. A credit note allocated to this invoice reduces
   // `AmountCredited`, NOT `AmountPaid`, and does not appear in `Payments` at all. So an invoice a
@@ -2111,7 +2106,7 @@ export async function probeXeroSettlement(
   // and no `AmountPaid`/`AmountCredited` fallback pair — runs NEITHER check above and fell through to
   // `ok: true` over whatever `records` holds. With an absent or empty `Payments` collection that is
   // an EMPTY list, which `classifyLedgerSettlement` reads as `clear`: the same positive claim on no
-  // evidence the QuickBooks arm was refused for. The exclusion the paragraphs above justify is about
+  // evidence. The exclusion the paragraphs above justify is about
   // two shapes — a response that omits `Total`/`AmountDue` (the `settled` fallback exists for it) and
   // an unsettled invoice that states no `AmountCredited` — and in BOTH of those the fallback's OTHER
   // operand is stated, so `settled` is computable and the check runs. Stating too little for EITHER
@@ -2129,8 +2124,8 @@ export async function probeXeroSettlement(
   // WHAT THE ORDINARY FIRST PAYMENT DOES NOW. An unpaid invoice states `Total` and `AmountDue` EQUAL,
   // so `settled` is exactly zero, `statesAnything` is false, the check above PASSES, and the probe
   // answers `ok: true` with an empty record list — `clear`, and the payment posts. Emptiness proved
-  // by two stated figures rather than assumed from four missing ones, which is the same sentence the
-  // QuickBooks arm has carried since o3d-mm51 and now the same FUNCTION.
+  // by two stated figures rather than assumed from four missing ones (o3d-mm51), through the shared
+  // completeness FUNCTION.
   //
   // o3d-obyd r31: and the SECOND thing `settled` decides here is whether the `Payments` list is
   // proved whole. It is the identical fact — a stated figure the collection was measured against —
@@ -2162,37 +2157,26 @@ export async function probeXeroSettlement(
     + 'that nothing has settled the document rather than report what does')
 }
 
-// o3d-r948 — `XERO_AMOUNT_EPSILON` AND `QBO_AMOUNT_EPSILON` WERE HERE, BOTH `0.005`, AND BOTH ARE
-// GONE. They were the ninth site of o3d-78rq's enumeration: two flat half-pennies measuring wire
+// o3d-r948 — `XERO_AMOUNT_EPSILON` WAS HERE (AND A PER-LEDGER TWIN), `0.005`, AND THEY ARE
+// GONE. They were the ninth site of o3d-78rq's enumeration: flat half-pennies measuring wire
 // doubles, in a file whose classifier operand had already become exact and whose band had already
 // become a fraction of the document's own minor unit. The direction they failed in was TOO WIDE,
 // which is the direction that lets a `clear` be built from an incomplete list — see
-// `completenessBand`, which is now the single answer for all four checks and both connectors.
-// THE QUICKBOOKS ARM WAS HERE, AND IS ARCHIVED (o3d-remove-parked-connectors).
+// `completenessBand`, which is now the single answer for all four checks.
 //
-// About 410 lines: `QboLinkedTxn` / `QboPaymentLine` / `QboDocumentBody`, the three link-type sets
-// (`QBO_PAYMENT_LINK_TYPES`, `QBO_UNCOVERED_SETTLEMENT_LINK_TYPES`, `QBO_NON_SETTLING_LINK_TYPES`),
-// `qboAmountAppliedTo` and `probeQuickBooksSettlement`. Recoverable at
-// `git show archive/quickbooks-connector:lib/connectors/accounting-settlement-probe.ts`.
+// SOME OF THIS FILE'S HARDEST-WON RULES EXIST BECAUSE A LEDGER CAN BEHAVE DIFFERENTLY FROM XERO, and
+// they are kept for the next ledger as much as for this one:
 //
-// WHAT THAT ARM WAS EVIDENCE FOR, and why its loss is worth naming rather than just deleting. Four
-// of this file's hardest-won rules exist because QuickBooks behaves differently from Xero, and the
-// QuickBooks arm is what demonstrated each of them:
-//
-//   * STRING-TYPED MONEY. QuickBooks serialises `TotalAmt` and `Balance` as strings (o3d-obyd), and
-//     a guard that read them as numbers answered `null` to a numeric STRING — spending a refusal as
-//     permission on an ordinary bill. `readLedgerStatedAmount` still accepts `number | string` for
-//     exactly that reason, and `tests/accounting/settlement-probe-string-amounts.test.ts` still
-//     pins it. That test now exercises the rule through the XERO arm only, so the rule survives and
-//     its original motivating connector does not.
-//   * A MISSING CURRENCY ON A SETTLEMENT LINE (o3d-78rq). QuickBooks omits `CurrencyRef` on payment
-//     lines in the home currency; the completeness band and the currency-agnostic comparison exist
-//     because of that.
-//   * `LinkedTxn.TxnType` NAMING SOMETHING OTHER THAN WHAT YOU POSTED. You POST a `BillPayment` and
-//     QuickBooks records the link as something else; the three link-type sets were the classified
-//     answer, and the "unclassified link type refuses rather than guesses" rule came from it.
-//   * THE `OPERATOR_ASSERTION` SETTLEMENT SURFACE exists largely because QuickBooks has no
-//     reconcile sweep. It is KEPT — see docs/archive/quickbooks-connector-removal.md.
+//   * STRING-TYPED MONEY (o3d-obyd). A ledger that serialises totals and balances as strings and a
+//     guard that read them as numbers answered `null` to a numeric STRING — spending a refusal as
+//     permission on an ordinary bill. `readLedgerStatedAmount` accepts `number | string` for exactly
+//     that reason, and `tests/accounting/settlement-probe-string-amounts.test.ts` pins it through the
+//     Xero arm.
+//   * A MISSING CURRENCY ON A SETTLEMENT LINE (o3d-78rq). A ledger may omit the currency on a
+//     settlement line in the home currency; the completeness band and the currency-agnostic
+//     comparison exist because of that.
+//   * THE `OPERATOR_ASSERTION` SETTLEMENT SURFACE exists largely because a ledger may have no
+//     reconcile sweep.
 //
 // `probeLedgerSettlement` below is still connector-keyed, and is still the seam a second ledger's
 // probe registers at.
@@ -2217,7 +2201,7 @@ export async function probeLedgerSettlement(
   // Nothing consumes the answer now — `classifyLedgerSettlement` excludes no record on any identity
   // — so the unsound reading is removed rather than left standing beside a caller that might trust
   // it. A sound version is REQUEST-BOUND, not snapshot-bound: propagate the `tenantId` `XeroResponse`
-  // already carries and the `realmId` `qboFetch` resolves and drops, and refuse a multi-fetch probe
+  // already carries, and refuse a multi-fetch probe
   // whose responses disagree. bd o3d-llyw has the estimate.
   // ONE ARM TODAY (o3d-remove-parked-connectors). Kept as an exhaustive `switch` over
   // `AccountingConnectorId` rather than collapsed to a direct `probeXeroSettlement` call: a ledger
@@ -3080,7 +3064,7 @@ export async function postMoneyUnderLedgerFence(
     // made DETECTABLE — asked once the call has returned, when the answer is finally knowable —
     // and RECOVERABLE, which it already is by construction:
     //
-    //   - the payment carries IMS's mark (Xero `Reference`, QuickBooks `PrivateNote`), so a later
+    //   - the payment carries IMS's mark (Xero `Reference`), so a later
     //     probe finds it whoever posted it and whatever has since been done to its amount or date;
     //   - `remoteAttemptedAt` was stamped before the call, so no later row treats this scope as
     //     virgin, and every subsequent post re-probes under a FRESH lock — there is no path from

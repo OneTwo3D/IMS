@@ -489,7 +489,7 @@ async function createPendingSyncLog(
       payload: payload as never,
       // o3d-dzip: the DURABLE half of the same origin record, minted from the stamp in the payload
       // this statement is writing. Retention compacts the payload to `{}` and keeps the external id,
-      // so a stamp that lives only in the payload is missing from exactly the rows whose realm is
+      // so a stamp that lives only in the payload is missing from exactly the rows whose tenant is
       // least knowable. Minted here and nowhere else — see mintAccountingConnectionProvenanceColumn
       // for why this is not a back-fill.
       connectionProvenance: mintAccountingConnectionProvenanceColumn(payload),
@@ -1099,9 +1099,9 @@ export async function recreateMissingDailyBatchLogs(
   }
 
   // o3d-i0o6 r5 (Codex round 4, HIGH 1) — THE LEDGER THIS SWEEP WOULD POST INTO, NAMED ONCE.
-  // The live-log probe below already filters by `connector`, so a batch that posted on QuickBooks
-  // is invisible to this sweep and reads as missing; without the same filter on the EVIDENCE, the
-  // rebuild carried QuickBooks-attributed pounds into Xero accounts.
+  // The live-log probe below already filters by `connector`, so a batch that posted on another
+  // connector is invisible to this sweep and reads as missing; without the same filter on the
+  // EVIDENCE, the rebuild would carry another ledger's pounds into Xero accounts.
   const a2Ledger: AllocationDebitBatchLedger = {
     connector: XERO_CONNECTOR,
     accountCode: settings.xero_allocated_inventory_account,
@@ -1121,8 +1121,8 @@ export async function recreateMissingDailyBatchLogs(
       )
       if (!summary) continue
       // o3d-i0o6 r4 (Codex round 3, HIGH 1) — THIS BATCH'S SHARE, NEVER THE RUNNING TOTAL, and
-      // (r5) never another ledger's share of it either. One shared fold, so the Xero and QuickBooks
-      // sweeps cannot answer the same question two ways.
+      // (r5) never another ledger's share of it either. One shared fold, so no two sweeps
+      // can answer the same question two ways.
       foldA2RecreateOrder(summary, order, a2Ledger, target.batchRef)
     }
   }

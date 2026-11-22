@@ -34,70 +34,6 @@ import type { FollowUpObligationRecovery } from '@/lib/domain/accounting/back-re
  */
 const XERO_RECOVERY: FollowUpObligationRecovery = { consumer: 'sweep' }
 
-// ---------------------------------------------------------------------------
-// WHY THE REMEDY BELOW REFUSES TO AUTHORISE A CREATION AT ALL (o3d-0bfh r8, Codex HIGH).
-//
-// r7 replaced "the follow-ups were never enqueued, re-drive them" with "read QuickBooks first, then
-// create only what is verifiably absent". That is safer, and it is still not safe: REMOTE ABSENCE IS
-// NOT PROOF THAT CREATION IS SAFE.
-//
-// `enqueueFollowUps` on the QuickBooks connector writes each follow-up as its OWN local sync-log row,
-// and it enqueues INVOICE_PAYMENT BEFORE INVOICE_PDF, in separate transactions. So the ordinary way
-// this marker is retained — the PDF enqueue failing — leaves a payment row already PENDING in the
-// local queue, not yet executed. An operator following r7's remedy reads QuickBooks in that window,
-// finds no payment, creates one, and the queued row posts its own minutes later. The connector's
-// idempotency is a request id it generated; it cannot deduplicate a payment a human created in the
-// QuickBooks UI. The result is a double payment against one invoice, which is not undoable.
-//
-// The honest remedy is therefore READ AND ESCALATE. A remedy that permits creation would have to
-// serialize against the local queue first — inspect every follow-up row for the document, hold or
-// cancel it under one lock, and only then reconcile the remote document — and IMS has no such
-// workflow (o3d-8prh gates building one: this connector does not enforce the connection/realm verdict
-// at post time and its follow-up rows record no origin). Until it exists, this surface must not tell
-// an operator to do by hand what it cannot make safe. Filed as follow-up work, not shipped as prose.
-// ---------------------------------------------------------------------------
-
-/**
- * QUICKBOOKS HAD THE CLAIM SIDE OF THE PROTOCOL AND NOT THE CONSUMER SIDE, and `blockedBy` names the
- * blocker as it stood when the connector was archived — not the one this codebase named for three
- * rounds. o3d-s36z (realm isolation) CLOSED on 2026-08-21 and unblocked nothing here.
- *
- * o3d-remove-parked-connectors — WHY THIS ENTRY SURVIVES THE CONNECTOR.
- *
- * The connector is archived, so no row will ever CLAIM a new obligation on it. The entry is kept
- * because the registry has a second job: `CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER` is what
- * `buildFollowUpObligationBacklogWhere` selects on, and that backlog is the /sync/exceptions section
- * "Accounting follow-ups owed, with nothing to re-drive them". Development databases hold SYNCED and
- * FAILED `quickbooks` rows with a non-null `backReferenceFollowUpsPendingAt` right now. Deleting this
- * entry would empty that query of its only population and take those rows off the one screen that
- * lists them — turning a visible stranded obligation into an invisible one, which is precisely the
- * failure this registry was written to prevent.
- *
- * It declares `consumer: 'none'`, which was true while it shipped and is more true now: there is no
- * cron branch for it at all. The remedy is unchanged and still correct — READ AND ESCALATE, create
- * nothing — with one addition: the connector is gone, so "nothing will come back for it" is now
- * structural rather than a wiring gap.
- */
-const QUICKBOOKS_RECOVERY: FollowUpObligationRecovery = {
-  consumer: 'none',
-  blockedBy: 'the QuickBooks connector was ARCHIVED (o3d-remove-parked-connectors), so there is no '
-    + 'processor, no repair sweep and no cron branch for it at all; before that, the sweep was already '
-    + 'unbound (o3d-8prh: the connector did not enforce the connection/realm verdict at post time, and '
-    + 'its follow-up rows record no origin, so a re-enqueued payment could post to a different company)',
-  operatorRemedy: 'READ AND ESCALATE — DO NOT CREATE ANYTHING FOR THIS ROW, and in particular do not register a '
-    + 'payment. This row was written by a connector this build no longer ships (see docs/archive/), so NOTHING '
-    + 'will come back for it — but that does NOT establish that its follow-ups never ran (see '
-    + 'FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN), and reading the accounting package first does NOT make creation '
-    + 'safe: the follow-ups are separate LOCAL queue rows and INVOICE_PAYMENT is enqueued BEFORE INVOICE_PDF, so '
-    + 'this marker survives a pass in which a payment is already sitting PENDING locally and has simply not '
-    + 'executed yet. You would read the ledger, see no payment, create one, and the queued row would post its own '
-    + 'afterwards — its request id cannot deduplicate a payment a human created, and a second payment against an '
-    + 'invoice is not undoable. The row is listed in the exception inbox under "Accounting follow-ups owed, with '
-    + 'nothing to re-drive them" (/sync/exceptions): open the document in the accounting package, record what is '
-    + 'actually there — payment, PDF, email, attachment — and hand that reading to accounting. Reading the '
-    + 'document is safe to repeat as often as you like',
-}
-
 /**
  * Every accounting connector that CLAIMS a follow-up obligation, and what re-reads it afterwards.
  *
@@ -106,7 +42,6 @@ const QUICKBOOKS_RECOVERY: FollowUpObligationRecovery = {
  */
 export const ACCOUNTING_FOLLOW_UP_RECOVERY: Readonly<Record<string, FollowUpObligationRecovery>> = {
   xero: XERO_RECOVERY,
-  quickbooks: QUICKBOOKS_RECOVERY,
 }
 
 /**
@@ -125,19 +60,32 @@ export function followUpObligationRecoveryFor(connector: string): FollowUpObliga
     consumer: 'none',
     blockedBy: `no entry for connector "${connector}" in ACCOUNTING_FOLLOW_UP_RECOVERY, so nothing is known to `
       + 'read its retained markers back',
-    operatorRemedy: 'if this connector is one this build no longer ships, the row is historical — see docs/archive/ '
-      + 'for what was removed and when, and treat it exactly as below. Otherwise declare the connector in '
-      + 'lib/domain/accounting/follow-up-obligation-registry.ts. Until then '
-      + 'treat any listed row as an UNKNOWN outcome, not an undone one: READ the document in the accounting '
-      + 'package, record what is already present, and ESCALATE that reading. Do not create a payment, PDF or email '
-      + 'from this surface — an absent document is not proof that nothing is queued to produce one, and on the '
-      + 'payment path the mistake is not undoable',
+    operatorRemedy: 'READ AND ESCALATE — DO NOT CREATE ANYTHING FOR THIS ROW, and in particular do not register a '
+      + 'payment. If this connector is one this build no longer ships, the row is historical — see docs/archive/ '
+      + 'for what was removed and when — and NOTHING will come back for it; otherwise declare the connector in '
+      + 'lib/domain/accounting/follow-up-obligation-registry.ts. Either way that does NOT establish that its '
+      + 'follow-ups never ran (see FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN), and reading the accounting package '
+      + 'first does NOT make creation safe: the follow-ups are separate LOCAL queue rows and INVOICE_PAYMENT is '
+      + 'enqueued BEFORE INVOICE_PDF, so this marker survives a pass in which a payment is already sitting PENDING '
+      + 'locally and has simply not executed yet. You would read the ledger, see no payment, create one, and the '
+      + 'queued row would post its own afterwards — its request id cannot deduplicate a payment a human created, '
+      + 'and a second payment against an invoice is not undoable. The row is listed in the exception inbox under '
+      + '"Accounting follow-ups owed, with nothing to re-drive them" (/sync/exceptions): open the document in the '
+      + 'accounting package, record what is actually there — payment, PDF, email, attachment — and hand that '
+      + 'reading to accounting. Reading the document is safe to repeat as often as you like',
   }
 }
 
-/** Connectors whose retained obligation markers are read by NOTHING — the backlog population. */
-export const CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER: readonly string[] = Object.entries(ACCOUNTING_FOLLOW_UP_RECOVERY)
-  .filter(([, recovery]) => recovery.consumer === 'none')
+/**
+ * Connectors whose retained obligation markers ARE re-read by a bound sweep.
+ *
+ * The backlog population is the complement of this list, not an enumeration of connectors known to
+ * lack a consumer: a row written by a connector this build no longer registers (a retired
+ * connector's history) has no consumer either, and must stay on the one screen that lists stranded
+ * obligations. Those rows get `followUpObligationRecoveryFor`'s fail-safe remedy.
+ */
+export const CONNECTORS_WITH_FOLLOW_UP_SWEEP: readonly string[] = Object.entries(ACCOUNTING_FOLLOW_UP_RECOVERY)
+  .filter(([, recovery]) => recovery.consumer === 'sweep')
   .map(([connector]) => connector)
 
 /**
@@ -249,7 +197,7 @@ export async function readFollowUpObligationDatabaseNow(
 /**
  * THE OPERATIONAL BACKLOG (o3d-0bfh r6 Codex HIGH; the grace corrected in r7).
  *
- * Rows carrying a follow-up obligation on a connector that has no consumer for it. This is the whole
+ * Rows carrying a follow-up obligation on a connector that has no sweep consumer for it. This is the whole
  * point of the finding: the previous design made an ACTIVITY-LOG LINE the only notice an operator
  * would ever get, and `logActivity` swallows its own persistence failure, so a transient failure of
  * that one insert left a payment, PDF, email or attachment permanently stalled with nothing anywhere
@@ -276,9 +224,10 @@ export function buildFollowUpObligationBacklogWhere(options: {
   connectors?: readonly string[]
 }): Prisma.AccountingSyncLogWhereInput {
   const grace = options.settlingGraceMs ?? FOLLOW_UP_OBLIGATION_SETTLING_GRACE_MS
-  const connectors = options.connectors ?? CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER
+  // Default population: every connector that is NOT declared with a sweep consumer, including ids
+  // this build no longer registers. An explicit `connectors` list narrows it to exactly those.
   const where: Prisma.AccountingSyncLogWhereInput = {
-    connector: { in: [...connectors] },
+    connector: options.connectors ? { in: [...options.connectors] } : { notIn: [...CONNECTORS_WITH_FOLLOW_UP_SWEEP] },
     status: { in: [...STRANDED_FOLLOW_UP_OBLIGATION_STATUSES] },
     // Existence, and nothing else. A range comparison here is the r7 defect.
     backReferenceFollowUpsPendingAt: { not: null },

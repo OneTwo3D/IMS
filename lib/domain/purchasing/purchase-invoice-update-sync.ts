@@ -1,5 +1,9 @@
 import type { StoredAccountingConnector } from '@/lib/accounting/connector-provenance'
-import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
+import {
+  getAccountingConnectorDefinition,
+  isRegisteredAccountingConnector,
+  type AccountingConnectorId,
+} from '@/lib/connectors/accounting-registry'
 import { accountingPostingKey, type AccountingPostingKey } from '@/lib/accounting/posting-key'
 import type { PurchaseInvoiceAccountingPayload } from '@/lib/domain/purchasing/purchase-invoice-edit'
 
@@ -111,7 +115,7 @@ export type PurchaseInvoiceUpdateSyncDeps<Tx extends PurchaseInvoiceUpdateSyncTx
  *   refused-chart-retired      the chart's connector is no longer active — detected before enqueueing.
  *   skipped-disabled           the chart's connector is active and does not post bill updates.
  *   skipped-no-external-id     the bill never reached a ledger.
- *   skipped-unsupported-connector  the chart's connector has no bill-update poster (QuickBooks).
+ *   skipped-unsupported-connector  the chart's connector has no bill-update poster.
  */
 export type PurchaseInvoiceUpdateOutcome =
   | 'queued'
@@ -194,7 +198,7 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
   // o3d-j625 r2: the CALLER's chart connector, not a fresh resolution. The name is derived from the id
   // rather than read off a second lookup for the same reason.
   const connector: AccountingConnectorInfo = params.chartConnector
-    ? { id: params.chartConnector, name: params.chartConnector === 'xero' ? 'Xero' : 'QuickBooks' }
+    ? { id: params.chartConnector, name: isRegisteredAccountingConnector(params.chartConnector) ? getAccountingConnectorDefinition(params.chartConnector).label : params.chartConnector }
     : null
   // o3d-j625 r12 (merging o3d-remove-parked-connectors): the gate reads the PARAM rather than
   // `connector.id`. Same value by construction (the line above derives one from the other), but a literal

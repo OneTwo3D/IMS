@@ -32,7 +32,7 @@ const refusalRows = [
     // fixture with no kind could not tell an affordance that is still offered from one that was removed.
     kind: 'sales_invoice_held_release',
     chartConnector: 'xero',
-    activeConnector: 'quickbooks',
+    activeConnector: 'retired-ledger',
     reason: 'retired_chart',
     committed: 'the order SO-1001 is invoiced in IMS',
     remedy: 'Re-queue the invoice from the order once the accounting connector selection has settled.',
@@ -280,7 +280,7 @@ test('[o3d-j625 r4] the exception inbox LISTS refused postings, counts them in i
   assert.equal(row.referenceType, 'SalesOrder')
   assert.equal(row.referenceId, 'so-1')
   assert.equal(row.chartConnector, 'xero', 'the chart the payload was built from')
-  assert.equal(row.activeConnector, 'quickbooks', 'AND what is active now — round 2 omitted this half')
+  assert.equal(row.activeConnector, 'retired-ledger', 'AND what is active now — round 2 omitted this half')
   assert.equal(row.reason, 'retired_chart')
   assert.equal(row.committed, refusalRows[0].committed)
   assert.equal(row.remedy, refusalRows[0].remedy)
@@ -331,7 +331,7 @@ test('[o3d-j625 r10] an unreconciled provisional claim is LISTED and counted, ma
       record: {
         kind: 'manufacturing_journal',
         chartConnector: 'xero',
-        activeConnector: 'quickbooks',
+        activeConnector: 'retired-ledger',
         reason: 'retired_chart',
         committed: 'the production order is completed in IMS',
         remedy: 'Post the manufacturing journal by hand and mark this row handled.',
@@ -604,7 +604,7 @@ const invoiceUpdateRefusal = {
   scope: '',
   kind: 'sales_invoice_update',
   chartConnector: 'xero',
-  activeConnector: 'quickbooks',
+  activeConnector: 'retired-ledger',
   reason: 'retired_chart',
   committed: 'the order SO-1002 holds edit 2 in IMS and the ledger holds edit 1',
   remedy: 'Re-save the order once the accounting connector selection has settled.',

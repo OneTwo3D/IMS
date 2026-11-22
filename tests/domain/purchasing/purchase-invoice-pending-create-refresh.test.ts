@@ -88,7 +88,7 @@ test('a row that may have left IMS refuses the edit and is not written', async (
   }
   const noChart = fake([unsent])
   await assert.rejects(refreshPendingPurchaseInvoiceCreate({ tx: noChart.tx, invoiceId: 'inv1', poId: 'po1', currentInvoiceNumber: 'SUP-1', chartConnector: null, accountingPayload: edited }), PurchaseBillFirstPostingInFlightError, 'no chart connector')
-  const { tx } = fake([{ ...unsent, connector: 'quickbooks' }])
+  const { tx } = fake([{ ...unsent, connector: 'retired-ledger' }])
   await assert.rejects(run(tx), PurchaseBillFirstPostingInFlightError, 'a row of another connector than the chart')
 })
 

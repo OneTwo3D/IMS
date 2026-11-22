@@ -28,7 +28,7 @@ import { INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/integration-plugin-keys'
  * ledger now being serviced would have taken the posting.
  *
  * WHY THE R8 FILE COULD NOT CATCH THIS, which is the finding to carry forward. Its fixture stubs
- * `getXeroSettings` and `getQuickBooksSettings` to `*_sync_enabled: 'true'` — deliberately, so that a
+ * `getXeroSettings` to `xero_sync_enabled: 'true'` — deliberately, so that a
  * refusal there can only have come from the fence — and the defect needs the toggle OFF. The setup
  * excluded the state under test. So this file's toggles are MUTABLE per test, and the tests that
  * matter run with them off.
@@ -56,8 +56,6 @@ const settingsTable = new Map<string, string>()
  * The r8 file froze both master toggles on, which excluded the entire state this file is about. Here
  * each test says what the configuration is, and the tests that reproduce the defect say "off".
  */
-// o3d-remove-parked-connectors: there was a second map here, `quickBooksSettings`, plus a module mock
-// for `@/lib/connectors/quickbooks/settings`. Both went with the connector.
 const xeroSettings = new Map<string, string>()
 
 /**
@@ -174,13 +172,9 @@ const REVERSAL = {
  * @param selection what the LOCKED read sees — the committed plugin rows.
  * @param xero the connector's own sync settings, which a plugin switch does not touch.
  *
- * o3d-remove-parked-connectors: `selection` carried a `quickbooks` member, and the tests below set it
- * `true` to model "the selection has moved to the OTHER ledger". QuickBooks is archived, so the state
- * those tests need is now expressed as `xero: false` — no registered accounting connector is enabled,
- * so the locked read resolves to `null` and a pin naming Xero is a pin on a ledger nothing is
- * servicing. The FENCE behaves identically (`resolveActiveAccountingConnector(locked) !== pinned`),
- * and the scenario is the one a development database is actually in. What is no longer modelled is a
- * switch to a second LIVE ledger.
+ * "The selection has moved off the pin" is expressed as `xero: false` — no registered accounting
+ * connector is enabled, so the locked read resolves to `null` and a pin naming Xero is a pin on a
+ * ledger nothing is servicing. The FENCE compares `resolveActiveAccountingConnector(locked) !== pinned`.
  */
 function reset(options: {
   selection: { xero: boolean }
@@ -201,7 +195,7 @@ function reset(options: {
 // ---------------------------------------------------------------------------------------------
 
 test('[o3d-i0o6 r9] a pinned enqueue whose ledger was switched away REFUSES, even though its sync toggle is off', async () => {
-  // THE STATE THE R8 FIXTURE EXCLUDED. The switch to QuickBooks has committed, and Xero's own master
+  // THE STATE THE R8 FIXTURE EXCLUDED. The selection has moved off Xero and it has committed, and Xero's own master
   // toggle is off — the two facts together, which is what makes the old code answer from the toggle
   // read and never reach the fence.
   reset({
@@ -279,20 +273,8 @@ test('[o3d-i0o6 r9] and a per-type `off` on the STILL-ACTIVE ledger remains `not
   assert.deepEqual(created, [])
 })
 
-// ---------------------------------------------------------------------------------------------
-// THE CROSS-PORT — DELETED WITH ITS SUBJECT (o3d-remove-parked-connectors)
-// ---------------------------------------------------------------------------------------------
-//
-// Two cases were here: 'the QuickBooks queue gate is fenced too' and 'the QuickBooks narrowing holds
-// as well'. They drove `queueQuickBooksSync`, which is archived with the connector, so there is no way
-// to keep them — and they were the evidence that the fence is a property of the QUEUE PATTERN rather
-// than of Xero's file. Their original point is stated in their own comment and is worth keeping in
-// view: "a fence with a gate in one side of it is not a fence."
-//
-// What survives that role, partly: the structural case at the bottom of this file, which forbids any
-// connector queue from constructing a `not-configured` outcome itself — but it now walks one file. A
-// second connector's queue MUST be added to its list and to this section, or its gate is unfenced
-// with nothing to say so. Recorded in docs/archive/quickbooks-connector-removal.md.
+// A connector queue added later MUST be added to the structural case at the bottom of this file, or its
+// gate is unfenced with nothing to say so.
 
 // ---------------------------------------------------------------------------------------------
 // THE UNPINNED PATH PAYS NOTHING
@@ -323,7 +305,7 @@ test('[o3d-i0o6 r9] an UNPINNED toggled-off enqueue takes no lock and opens no t
 test('[o3d-i0o6 r9] the facade\'s native-posting suppression is fenced for a pinned enqueue', async () => {
   // Xero posts FX gain/loss itself, so an IMS journal for it is suppressed — a `not-configured` taken
   // on the facade, before the connector queue and therefore before the fence. "Never" there is a
-  // statement about XERO; with the pin retired, QuickBooks is what is being serviced and it DOES post
+  // statement about XERO; with the pin retired, whatever ledger is being serviced may post
   // them, so the suppression may not settle the obligation on the retired ledger's behalf.
   //
   // The facade's own pooled check has to PASS for this line to be reached, which is what
@@ -374,9 +356,8 @@ test('[o3d-i0o6 r9] neither connector queue phrases a `not-configured` outcome i
    * "unless a fence call appears within N lines", which would pass forever the moment the two drifted
    * apart. The files may discuss `not-configured` in prose all they like; they may not construct one.
    */
-  // ONE FILE TODAY (o3d-remove-parked-connectors): lib/connectors/quickbooks/queue.ts was the second
-  // and is archived. Add a second connector's queue here in the same commit that writes it, or its
-  // gate is unfenced and nothing says so — see THE CROSS-PORT section above.
+  // Add a further connector's queue here in the same commit that writes it, or its gate is unfenced
+  // and nothing says so.
   const files = ['lib/connectors/xero/queue.ts']
   for (const file of files) {
     const source = readFileSync(new URL(`../../${file}`, import.meta.url), 'utf8')

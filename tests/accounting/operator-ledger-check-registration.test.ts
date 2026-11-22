@@ -179,7 +179,7 @@ test('[o3d-llyw] a check is for ONE attempt, ONE receipt, ONE document and ONE c
     ['another receipt', { ...CHECK, paymentId: 'pay-other' }],
     ['another attempt', { ...CHECK, syncLogId: 'log-other' }],
     ['another document', { ...CHECK, ledgerDocumentId: 'INV-OLD' }],
-    ['another connector', { ...CHECK, connector: 'quickbooks' }],
+    ['another connector', { ...CHECK, connector: 'retired-ledger' }],
   ] as const) {
     const d = decide({ operatorLedgerChecks: [check] })
     precondition(label, d)

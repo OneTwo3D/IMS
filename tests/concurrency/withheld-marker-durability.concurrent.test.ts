@@ -316,9 +316,9 @@ test(
         // Settled: the closure must outlive the marker it settles, then go.
         await marker({ id: `al-rs-open-${run}`, entityId: settled, action: 'payment_reversal_withheld', level: 'WARNING', connector: 'xero', createdAt: daysAgo(AGED_DAYS) })
         await marker({ id: `al-rs-close-${run}`, entityId: settled, action: 'payment_reversal_withheld_cleared', level: 'INFO', connector: 'xero', createdAt: daysAgo(AGED_DAYS - 1) })
-        // One document, two connectors. The newer XERO marker must not license deleting the QuickBooks
-        // one — a marker scoped to a poller that is not running is not a marker that has been answered.
-        await marker({ id: `al-rb-qbo-${run}`, entityId: twoConnectors, action: 'payment_reversal_withheld', level: 'WARNING', connector: 'quickbooks', createdAt: daysAgo(AGED_DAYS) })
+        // One document, two connectors. The newer XERO marker must not license deleting the other
+        // connector's one — a marker scoped to a poller that is not running is not a marker that has been answered.
+        await marker({ id: `al-rb-other-${run}`, entityId: twoConnectors, action: 'payment_reversal_withheld', level: 'WARNING', connector: 'retired-ledger', createdAt: daysAgo(AGED_DAYS) })
         await marker({ id: `al-rb-xero-${run}`, entityId: twoConnectors, action: 'payment_reversal_withheld', level: 'WARNING', connector: 'xero', createdAt: daysAgo(AGED_DAYS - 100) })
         // THE CONTROL THAT PROVES THE SWEEP REACHED THESE ROWS AT ALL. An ordinary aged `sync` WARNING,
         // same table, same age, no exemption: if this survives, the test has proved nothing.
@@ -344,7 +344,7 @@ test(
         assert.ok(!alive.has(`al-ctl-${run}`), 'the sweep must actually have deleted an unexempt aged row')
         assert.ok(alive.has(`al-ro-new-${run}`), 'the open document keeps its CURRENT marker')
         assert.ok(!alive.has(`al-ro-old-${run}`), 'and lets its superseded history expire — the exemption is one row, not a log')
-        assert.ok(alive.has(`al-rb-qbo-${run}`), "the other connector's open marker is not answered by this one's")
+        assert.ok(alive.has(`al-rb-other-${run}`), "the other connector's open marker is not answered by this one's")
         assert.ok(alive.has(`al-rb-xero-${run}`))
         assert.ok(!alive.has(`al-rs-open-${run}`), 'a settled document releases its marker')
         assert.ok(alive.has(`al-rs-close-${run}`),
@@ -355,7 +355,7 @@ test(
         alive = await survivingIds(db, ids)
         assert.ok(!alive.has(`al-rs-close-${run}`), 'the settled document leaves nothing behind at all')
         assert.ok(alive.has(`al-ro-new-${run}`), 'and the open one is still open')
-        assert.ok(alive.has(`al-rb-qbo-${run}`))
+        assert.ok(alive.has(`al-rb-other-${run}`))
 
         await db.activityLog.deleteMany({ where: { id: { in: ids } } })
       })

@@ -43,7 +43,7 @@ test('o3d-2w2j: the order comes from the helper, not from how the caller spelt i
 })
 
 test('o3d-2w2j: a writer that touches only some of the rows gets back only those, still ordered', () => {
-  // QuickBooks has no release witness, so it supplies two of the three. Omitting a row must not
+  // A connector with no release witness supplies two of the three. Omitting a row must not
   // insert a hole or reorder what is left.
   assert.deepEqual(orderedAccountingBindingWrites({ token: 'T', pin: 'P' }), ['P', 'T'])
   assert.deepEqual(orderedAccountingBindingWrites({ witness: 'W' }), ['W'])
@@ -90,7 +90,6 @@ test('o3d-2w2j: a step that throws stops the sequence, so nothing after it is ac
 
 test('o3d-2w2j: every writer of more than one binding row acquires them through the helper', () => {
   const xeroAuth = readFileSync('lib/connectors/xero/auth.ts', 'utf8')
-  // o3d-remove-parked-connectors: the archived QuickBooks file was the second entry here, so this rule was checked against TWO independently-written implementations. One now.
   const guard = readFileSync('lib/connectors/xero/tenant-guard.ts', 'utf8')
 
   const body = (source: string, from: string, to: string) => {
@@ -120,16 +119,8 @@ test('o3d-2w2j: every writer of more than one binding row acquires them through 
   assert.ok(!/\$transaction\(\[\s*\n\s*db\.(setting|accountingToken)\./.test(disconnect),
     'the binding rows must not be spelt straight into the transaction array')
 
-  // 3. THE THIRD ACQUIRER IS GONE WITH ITS CONNECTOR (o3d-remove-parked-connectors).
-  //
-  //    It was the QuickBooks disconnect, and finding it is why this test exists in this shape: it had
-  //    the SAME inversion Xero's had — `accountingToken.deleteMany` and then the realm pin, in one
-  //    transaction — and it was found by asking "who else acquires more than one binding row?" rather
-  //    than by looking where the bug had already been. The connector is archived.
-  //
-  //    WHAT THAT COSTS: this test now inspects ONE disconnect, so it can no longer show that the
-  //    helper is used by an independently-written second acquirer. The census question it embodies is
-  //    the valuable part and it still has to be asked of any new connector.
+  // 3. Any further connector that acquires more than one binding row must be added here: the census
+  //    question ("who else acquires more than one binding row?") is the valuable part of this test.
 
   // 4. The raw-SQL writer the provisioner and the recovery script share.
   assert.match(guard, /return orderedAccountingBindingWrites<XeroPinSqlStatement>\(\{/)

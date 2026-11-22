@@ -5,7 +5,7 @@ import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync
 import { heldClaimWhere, type HeldClaim } from '@/lib/domain/accounting/sync-claim-fence'
 import { lockOrderFirst, recomputeSalesOrderInvoicingState, type InvoicingStateClient } from '@/lib/domain/sales/invoicing-state-sites'
 import { voidMirroredAccountingEventsForOrder } from './accounting-event-mirror'
-import { ATTEMPT_PROVEN_NEVER_MADE_WHERE } from './money-attempt-provenance'
+import { ATTEMPT_PROVEN_NEVER_MADE_WHERE, REVISION_BUMPING_CONNECTOR_WHERE } from './money-attempt-provenance'
 import { UNCLAIMED_ATTEMPT_REVISION, nextAttemptRevision, type AttemptRef } from './sync-log-attempt'
 
 /** SALES_INVOICE sync types that recognise revenue for a sales order. */
@@ -287,6 +287,9 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
       // Revision 0 alone is not proof (legacy rows, revivals): the canonical never-attempted record as well. A row without it
       // falls through to the general statement below and is retired unstamped, i.e. UNKNOWN to `ledgerStanding`.
       ...ATTEMPT_PROVEN_NEVER_MADE_WHERE,
+      // Only a registered connector's processor is known to bump the revision on a claim (o3d-g5t0y); a
+      // retired connector's revision-0 row falls through to the general statement, unstamped.
+      ...REVISION_BUMPING_CONNECTOR_WHERE,
     },
     data: { ...retirement, abandonedBeforeRemoteCall: true },
   })
@@ -340,7 +343,7 @@ export async function cancelPendingSalesInvoiceSyncForOrder(
  * (retiring a posted row would hide a real receivable). If the CAS matches nothing — the attempt moved,
  * the row already posted, or it is no longer claimed — leave the row and the mirror untouched.
  *
- * A caller at UNCLAIMED_ATTEMPT_REVISION is a connector whose processor stamps no attempt (QuickBooks).
+ * A caller at UNCLAIMED_ATTEMPT_REVISION is a connector whose processor stamps no attempt (none registered today).
  * It is retired on those remaining guards alone and STAYS at revision 0: no forged attempt, and no later
  * decision can believe such a row was ever fenced.
  */
@@ -362,7 +365,7 @@ export async function retireSalesInvoiceForCancelledOrder(
   // THE OWNERSHIP HALF IS COMPOSED FROM heldClaimWhere, NOT SPELT OUT AGAIN (o3d-550x, Codex r1
   // medium 1): a change to what "I still hold this claim" means must apply to this RETRACTION as
   // well as to the connector's releases. It is also the only fence a connector that stamps no
-  // attempt revision has — QuickBooks retires at revision 0 — so removing it would weaken the very
+  // attempt revision has — such a caller retires at revision 0 — so removing it would weaken the very
   // caller this branch leaves unfenced.
   //
   // THE ATTEMPT HALF IS WHAT CLOSES THE HOLE o3d-e2mz FOUND (Codex r1). `processingStartedAt` says

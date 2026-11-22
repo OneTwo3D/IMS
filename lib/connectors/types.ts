@@ -2,7 +2,7 @@
  * Shared interfaces for platform connectors.
  *
  * Shopping connectors: WooCommerce
- * Accounting connectors: Xero (current), QuickBooks (future)
+ * Accounting connectors: Xero
  */
 
 import type { SalesNoTaxLineKind } from '@/lib/domain/accounting/sales-document-tax-types'
@@ -132,7 +132,7 @@ export interface ShoppingConnector {
 }
 
 // ---------------------------------------------------------------------------
-// Accounting Connector (Xero, QuickBooks future)
+// Accounting Connector (Xero)
 // ---------------------------------------------------------------------------
 
 export type JournalEntry = {
@@ -183,7 +183,6 @@ export type InvoiceLine = {
    *     into a `DiscountRate` percentage, which Xero stores to 2dp — so a small absolute discount
    *     rounded to 0.00 and vanished (o3d-y14).
    *   - Xero bills (ACCPAY) → applied by reducing `UnitAmount` (ACCPAY takes no line discount)
-   *   - QuickBooks → maps to `DiscountRate` / `DiscountAmt`
    */
   discountAmount?: number
 }
@@ -199,7 +198,6 @@ export type InvoiceLine = {
  *
  * Each adapter inverts/translates as needed:
  *   - Xero `CurrencyRate` is `1 doc-ccy = X base` → `1 / currencyRateToBase`.
- *   - QuickBooks `ExchangeRate` is `1 doc-ccy = X base` → same as Xero.
  */
 export type InvoiceData = {
   invoiceNumber: string

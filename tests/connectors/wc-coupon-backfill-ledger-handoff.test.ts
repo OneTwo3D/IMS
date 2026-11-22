@@ -377,20 +377,23 @@ test('a document that discounts LESS than the corrected order is credited, and o
   assert.match(text, /Add Credit Note/, 'named as an operation Xero actually has')
 })
 
-test('QuickBooks always posts its discount line, and its remedy names QuickBooks steps', async () => {
-  // The QBO adapter pushes DiscountLineDetail on a positive amount alone — the account ref is
-  // optional — so the recorded figure IS the posted one even with no account code. A handoff that
-  // replayed Xero's rule for every connector would tell the operator to do nothing here.
-  const handoff = await handoffFor(
-    [invoiceWithNoDiscountAccount({ externalSystem: 'quickbooks', externalId: 'QBO-42' })],
-    0,
-  )
+test('a remedy for a system this build does not know gets neutral wording, never Xero steps', async () => {
+  // Take real Xero remedies — one that edits/raises a further invoice, one that raises a credit note —
+  // and name a different system on them. Xero's UI paths are Xero's alone.
+  const { wcCouponRemedySteps } = await import('@/lib/connectors/woocommerce/sync/coupon-discount-ledger-handoff')
+  const tooLittle = await handoffFor([postedInvoice()], 4)
+  const tooMuch = await handoffFor([invoiceWithNoDiscountAccount()], 4)
+  assert.ok(tooLittle.remedy && tooMuch.remedy, 'PRECONDITION: both Xero cases carry a remedy')
 
-  assert.equal(handoff.invoice.case, 'DOCUMENT_DISCOUNTS_MORE')
-  const text = handoff.lines.join('\n')
-  assert.match(text, /QuickBooks Online/)
-  assert.match(text, /Receive Payment screen/)
-  assert.doesNotMatch(text, /Xero|Remove & Redo/, 'no Xero-only step is offered for a QuickBooks document')
+  const xeroText = [...wcCouponRemedySteps(tooLittle.remedy as never), ...wcCouponRemedySteps(tooMuch.remedy as never)].join('\n')
+  assert.match(xeroText, /Remove & Redo/, 'PRECONDITION: the Xero wording carries its UI path')
+  assert.match(xeroText, /Add Credit Note/, 'PRECONDITION: and so does the credit-note step')
+
+  for (const remedy of [tooLittle.remedy, tooMuch.remedy]) {
+    const text = wcCouponRemedySteps({ ...(remedy as object), externalSystem: 'retired-ledger' } as never).join('\n')
+    assert.doesNotMatch(text, /Remove & Redo|Add Credit Note|Invoice ▸ Options|re-approve/, 'no Xero-only UI wording for another system')
+    assert.match(text, /the accounting system/)
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -1306,17 +1309,17 @@ test('a parked refund is named in the operator text where a recorded one would b
  * is asserted to render different text and a different `needsAccountingAction`. A pair that rendered
  * the same answer would prove nothing, which is the trap every earlier round in this file guards.
  */
-const CREDIT_NOTE_IN_QUICKBOOKS: CreditNoteEventRow[] = [
-  { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'POSTED', externalId: 'CN-501', externalSystem: 'quickbooks', postBasis: 'CONNECTOR' },
+const CREDIT_NOTE_IN_RETIRED_LEDGER: CreditNoteEventRow[] = [
+  { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'POSTED', externalId: 'CN-501', externalSystem: 'retired-ledger', postBasis: 'CONNECTOR' },
 ]
 
-test('a Xero invoice is NOT netted against a QuickBooks credit note (o3d-y14 r9 F1)', async () => {
+test('a Xero invoice is NOT netted against a retired-ledger credit note (o3d-y14 r9 F1)', async () => {
   // The connector-switch shape. `connector-orphans.ts` exists because the active accounting
-  // connector can be switched (Xero → QuickBooks) and IMS keeps every historical document under the
+  // connector can be switched (Xero → another connector) and IMS keeps every historical document under the
   // connector that posted it. The Xero invoice here is outstanding at its full posted value and the
-  // QuickBooks credit memo reduces nothing in Xero — so "10 - 10 = 0, this customer is square" is a
+  // retired-ledger credit note reduces nothing in Xero — so "10 - 10 = 0, this customer is square" is a
   // statement about a balance that exists in neither ledger.
-  const split = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], CREDIT_NOTE_IN_QUICKBOOKS)
+  const split = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], CREDIT_NOTE_IN_RETIRED_LEDGER)
   const oneLedger = await NETTED_TO_ZERO()
 
   assert.equal(split.reversal.ok, true, 'the credit-note side is still perfectly derivable')
@@ -1325,7 +1328,7 @@ test('a Xero invoice is NOT netted against a QuickBooks credit note (o3d-y14 r9 
   const text = split.lines.join('\n')
   assert.doesNotMatch(text, /THE POSITION NETS/)
   assert.doesNotMatch(text, /THE TWO ERRORS CANCEL/)
-  assert.match(text, /posted to Xero and this order's credit note\(s\) to QuickBooks Online — TWO SEPARATE LEDGERS/)
+  assert.match(text, /posted to Xero and this order's credit note\(s\) to the accounting system — TWO SEPARATE LEDGERS/)
   assert.match(text, /IMS CANNOT NET THE TWO FOR YOU here/)
   // The invoice finding itself is still reported — it is a fact about the invoice either way.
   assert.match(text, /carries an order-level discount of 10 GBP/)
@@ -1336,10 +1339,10 @@ test('a Xero invoice is NOT netted against a QuickBooks credit note (o3d-y14 r9 
 
 test('a cross-ledger position would otherwise have PRESCRIBED a fabricated instrument (r9 F1)', async () => {
   // The dangerous shape, not merely the mislabelled one. A Xero invoice carrying 10 against a
-  // QuickBooks credit memo that reversed only 6 reads as "the customer still owes 4" and prescribes
+  // credit note in another ledger that reversed only 6 reads as "the customer still owes 4" and prescribes
   // a further Xero invoice for it — while the Xero invoice they actually owe against is untouched
-  // and the QuickBooks document was never a reversal of it at all.
-  const handoff = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(6)], CREDIT_NOTE_IN_QUICKBOOKS)
+  // and the other ledger's document was never a reversal of it at all.
+  const handoff = await handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(6)], CREDIT_NOTE_IN_RETIRED_LEDGER)
 
   assert.equal(handoff.remedy, null)
   const text = handoff.lines.join('\n')
@@ -1375,7 +1378,7 @@ test('the ledger membership check is PURE and reachable from plain values (r9 F1
   const derived = { ok: true as const, amount: 10, externalSystem: 'xero', legs: [], detail: '' }
 
   assert.deepEqual(wcCouponLedgerMembership('xero', derived), { ok: true })
-  assert.equal(wcCouponLedgerMembership('quickbooks', derived).ok, false)
+  assert.equal(wcCouponLedgerMembership('retired-ledger', derived).ok, false)
   assert.equal(wcCouponLedgerMembership(null, derived).ok, false)
   assert.equal(wcCouponLedgerMembership('xero', { ok: false, legs: [], detail: 'nope' }).ok, false)
 })
@@ -1386,7 +1389,7 @@ test('the ledger membership check is PURE and reachable from plain values (r9 F1
 
 test('a netted-to-ZERO order carries the credit-note precondition too (o3d-y14 r9 F2)', async () => {
   // THE DEFECT. r8 gave the netted REMEDY a precondition naming the credit notes it rests on,
-  // because IMS cannot see one voided or edited by hand in Xero or QuickBooks. The ZERO outcome
+  // because IMS cannot see one voided or edited by hand in Xero. The ZERO outcome
   // rests on the same documents, carried no precondition at all — the block that prints one only ran
   // for a remedy — and is the one outcome that tells the operator there is nothing to look at.
   const handoff = await NETTED_TO_ZERO()
@@ -1547,7 +1550,7 @@ const MATRIX: Array<
   [
     'netting withdrawn / cross-ledger',
     () =>
-      handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], CREDIT_NOTE_IN_QUICKBOOKS),
+      handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], CREDIT_NOTE_IN_RETIRED_LEDGER),
   ],
   // r10 finding 1. THE OTHER THREE WAYS THE NETTING IS SUPPRESSED. Each renders the refusal prose
   // that used to assert the netting's own conclusion, and each is reached with a perfectly
@@ -1738,14 +1741,14 @@ test('a netting SUPPRESSED cross-ledger no longer says the invoice was already c
   // The same defect in the other direction, on the other side of the classification: the
   // DOCUMENT_DISCOUNTS_LESS refusal stated "an invoice that has already been credited away" as a
   // fact — which is precisely the half of the position the withdrawn subtraction could not read.
-  // Here the credit note is in QuickBooks and the invoice in Xero, so nothing IMS holds says the
+  // Here the credit note is in another ledger and the invoice in Xero, so nothing IMS holds says the
   // invoice was credited at all.
   const suppressed = await handoffFor(
     [invoiceWithNoDiscountAccount()],
     4,
     FULLY_REVERSED_INVOICE,
     [chargebackReversing(10)],
-    CREDIT_NOTE_IN_QUICKBOOKS,
+    CREDIT_NOTE_IN_RETIRED_LEDGER,
   )
 
   assert.equal(suppressed.invoice.case, 'DOCUMENT_DISCOUNTS_LESS')
@@ -1769,7 +1772,7 @@ test('a suppressed netting does not assert what the credit notes were RAISED FRO
     0,
     FULLY_REVERSED_INVOICE,
     [chargebackReversing(10)],
-    CREDIT_NOTE_IN_QUICKBOOKS,
+    CREDIT_NOTE_IN_RETIRED_LEDGER,
   )
 
   assert.equal(handoff.invoice.case, 'DOCUMENT_AGREES')
@@ -1852,7 +1855,7 @@ test('"netted to nothing" is only ever true of an order that was NETTED (o3d-y14
     ['two documents', () => handoffFor(twoAgreeingInvoices(), 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)])],
     [
       'cross-ledger',
-      () => handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], CREDIT_NOTE_IN_QUICKBOOKS),
+      () => handoffFor([postedInvoice()], 0, FULLY_REVERSED_INVOICE, [chargebackReversing(10)], CREDIT_NOTE_IN_RETIRED_LEDGER),
     ],
   ]
   for (const [name, build] of suppressions) {
@@ -2389,21 +2392,6 @@ test('TIED posted documents do not manufacture a withdrawal (o3d-y14 r13 F2)', a
     'the same rows read twice are the same position, whichever way round they come back',
   )
   assert.deepEqual(oneWay.lines, otherWay.lines)
-
-  // A SUCCESS, whose named document decides which ACCOUNTING SYSTEM the whole position claims to be
-  // in: an order invoiced in Xero and re-raised in QuickBooks is a shape `connector-orphans.ts`
-  // exists for, and the tie swapped the answer.
-  const inXero = () => postedInvoice({ ...tied, externalId: 'INV-A' })
-  const inQuickBooks = () => postedInvoice({ ...tied, externalId: 'INV-B', externalSystem: 'quickbooks' })
-  const xeroFirst = await handoffFor([inXero(), inQuickBooks()], 0)
-  const quickBooksFirst = await handoffFor([inQuickBooks(), inXero()], 0)
-
-  assert.equal(xeroFirst.invoice.case, 'DOCUMENT_DISCOUNTS_MORE')
-  assert.ok(
-    sameWcCouponDocumentPosition(xeroFirst.documents, quickBooksFirst.documents),
-    'nor may a tie decide which ledger the position names',
-  )
-  assert.deepEqual(xeroFirst.lines, quickBooksFirst.lines)
 })
 
 /**

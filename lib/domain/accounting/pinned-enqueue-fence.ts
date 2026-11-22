@@ -5,11 +5,11 @@
  * WHAT ROUND 8 CLOSED, AND WHERE IT LEFT A GATE IN THE FENCE. r8 put the pinned-ledger verdict under
  * the plugin-selection lock ON THE INSERTING TRANSACTION, so no connector switch can commit between
  * the verdict and the write. That holds. What it did not do is stop anything else answering FIRST:
- * both connector queues read their own settings before opening that transaction, and both returned
+ * a connector queue reads its own settings before opening that transaction, and returned
  * `not-configured` from there. So:
  *
  *   1. the facade's unlocked pooled check accepts the pin — Xero is the active ledger when it looks;
- *   2. a connector switch commits (`plugin_xero_enabled` false, `plugin_quickbooks_enabled` true);
+ *   2. a connector switch commits (`plugin_xero_enabled` false, another accounting plugin's flag true);
  *   3. the queue's own `xero_sync_enabled` read finds the toggle off and returns `not-configured`
  *      BEFORE the transaction — so `pinnedLedgerIsServicedUnderLock` never runs at all.
  *
@@ -62,8 +62,8 @@
  * pooled `getActiveAccountingConnectorId()` cannot supply:
  *
  *   * IT IS NOT TORN. A connector switch writes TWO rows, and the pooled resolver asks two separate
- *     questions (`isIntegrationPluginEnabled('xero')`, then `('quickbooks')`). Interleaved with a
- *     committing switch it can see neither flag set, or both. The locked read takes all six plugin
+ *     questions (one `isIntegrationPluginEnabled(...)` per accounting plugin). Interleaved with a
+ *     committing switch it can see neither flag set, or both. The locked read takes all the plugin
  *     rows in one `FOR UPDATE` statement, so it observes only whole, committed selections.
  *   * IT WAITS FOR AN IN-FLIGHT SWITCH instead of racing it. That is what makes a `not-configured`
  *     answer defensible: it names the committed configuration, with no switch part-applied behind it.
@@ -86,8 +86,8 @@ export type PinnableLedger = NonNullable<AccountingConnectorSelection>
 /**
  * A CONNECTOR'S OWN SYNC VERDICT, IN A TYPE THAT IS NOT AN ENQUEUE OUTCOME.
  *
- * This is the whole structural point: `{ posts: false }` cannot be returned from `queueXeroSync` or
- * `queueQuickBooksSync`, so the gate that computes it cannot answer for a pinned enqueue even by
+ * This is the whole structural point: `{ posts: false }` cannot be returned from `queueXeroSync` or any
+ * other connector's queue, so the gate that computes it cannot answer for a pinned enqueue even by
  * accident. The only way to turn it into an answer is
  * {@link notConfiguredUnderPinnedLedgerFence}, which consults the fence first.
  *

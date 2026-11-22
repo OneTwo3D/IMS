@@ -8,7 +8,13 @@ import { RetryAllFailedDialog } from './retry-all-failed-dialog'
 import { accountingRetryDuplicateCaution } from '@/lib/domain/accounting/idempotency-retention'
 import type { FailedAccountingSyncSummary } from '@/app/actions/accounting-sync'
 
-const CONNECTOR_LABELS: Record<string, string> = { xero: 'Xero', quickbooks: 'QuickBooks' }
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
+
+// Labels come from the registry; a historical row may name a connector this build no longer
+// registers, which falls back to the raw id.
+function registeredConnectorLabel(connector: string): string {
+  return ACCOUNTING_CONNECTORS.find((def) => def.id === connector)?.label ?? connector
+}
 
 /**
  * audit-6vq0: a prominent admin alert when accounting sync rows have exhausted
@@ -25,7 +31,7 @@ export function FailedSyncBanner({ summary }: { summary: FailedAccountingSyncSum
   // The server summary is the source of truth: router.refresh() re-fetches it
   // after a retry, so the banner hides (or shows the remainder) on its own.
   if (summary.failedCount === 0) return null
-  const connectorLabel = summary.connector ? (CONNECTOR_LABELS[summary.connector] ?? summary.connector) : 'the accounting connector'
+  const connectorLabel = summary.connector ? registeredConnectorLabel(summary.connector) : 'the accounting connector'
   // o3d-wahn: the connector's idempotency key does NOT protect this button. Xero keeps one for six
   // minutes and a row is only FAILED after its automatic retries are exhausted, so by the time this
   // control exists the key has expired and a re-post is a new request. Stated here rather than

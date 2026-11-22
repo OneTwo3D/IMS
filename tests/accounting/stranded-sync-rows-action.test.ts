@@ -80,13 +80,13 @@ async function loadLoader() {
 function dbRow(over: Record<string, unknown> = {}) {
   return {
     id: 'log-1',
-    connector: 'quickbooks',
+    connector: 'retired-ledger',
     type: 'SALES_INVOICE',
     status: 'PROCESSING',
     referenceType: 'SalesOrder',
     referenceId: 'order-7',
     externalTransactionId: null,
-    errorMessage: 'HTTP 500 from QuickBooks',
+    errorMessage: 'HTTP 500 from the ledger',
     createdAt: new Date(Date.now() - 3 * 86_400_000),
     attemptRevision: 0,
     ...over,
@@ -235,12 +235,12 @@ test('the rows come back described, with age and identifying detail', async () =
   state.rows = [dbRow({ externalTransactionId: 'INV-42' })]
 
   const [row] = (await getStrandedAccountingSyncRows()).rows
-  assert.equal(row.connector, 'quickbooks')
+  assert.equal(row.connector, 'retired-ledger')
   assert.equal(row.status, 'PROCESSING')
   assert.equal(row.referenceType, 'SalesOrder')
   assert.equal(row.referenceId, 'order-7')
   assert.equal(row.externalTransactionId, 'INV-42')
-  assert.equal(row.errorMessage, 'HTTP 500 from QuickBooks')
+  assert.equal(row.errorMessage, 'HTTP 500 from the ledger')
   assert.equal(row.ageDays, 3)
   assert.equal(typeof row.createdAt, 'string')
 })
@@ -249,7 +249,7 @@ test('the rows come back described, with age and identifying detail', async () =
 // ROUND 5 (Codex HIGH #1) — THE LOADER ASKS WHETHER ANYTHING CAN STILL CLAIM THESE ROWS.
 //
 // It used to report every row on a non-active connector as adoptable, which offered the Settle
-// control for QuickBooks rows the QuickBooks Sync button can still reclaim. These drive the real
+// control for rows a manual Sync button can still reclaim. These drive the real
 // loader and assert what it PUT ON THE ROW, not what it read.
 // ---------------------------------------------------------------------------
 
@@ -269,12 +269,12 @@ test('[round 5] the loader reads the sync toggle for the connectors on the page,
 })
 
 test('[archived] a page of ARCHIVED-connector rows reads no toggle at all — there is no gate behind one', async () => {
-  // o3d-remove-parked-connectors round 2 (Codex MEDIUM). The toggle read is what made the surviving
-  // `quickbooks_sync_enabled` row load-bearing. With the connector unregistered there is nothing to
+  // Round 2 (Codex MEDIUM). The toggle read is what made the surviving
+  // `retired-ledger_sync_enabled` row load-bearing. With the connector unregistered there is nothing to
   // look up, so the query is not even issued.
   const getStrandedAccountingSyncRows = await loadLoader()
   state.activeConnector = 'xero'
-  state.rows = [dbRow({ connector: 'quickbooks' })]
+  state.rows = [dbRow({ connector: 'retired-ledger' })]
 
   await getStrandedAccountingSyncRows()
 
@@ -311,15 +311,15 @@ test('[round 5] the toggle decides whether the row is offered the settle control
 })
 
 test('[archived] the UI OFFERS the control on an archived-connector row whose stored toggle is still on', async () => {
-  // o3d-remove-parked-connectors round 2 (Codex MEDIUM): the half of the finding that is about what
+  // Round 2 (Codex MEDIUM): the half of the finding that is about what
   // the operator SEES. Driven through the real loader and the real rule, so it asserts what was put
   // on the row rather than what the rule was asked.
   const getStrandedAccountingSyncRows = await loadLoader()
   state.activeConnector = 'xero'
-  state.rows = [dbRow({ connector: 'quickbooks', status: 'PROCESSING', attemptRevision: 0 })]
-  // The row archiving left behind. The loader does not even read it now, but seed it so this test
+  state.rows = [dbRow({ connector: 'retired-ledger', status: 'PROCESSING', attemptRevision: 0 })]
+  // The stale row retirement left behind. The loader does not even read it now, but seed it so this test
   // would still see it if the read came back.
-  state.settings = new Map([['quickbooks_sync_enabled', 'true']])
+  state.settings = new Map([['retired-ledger_sync_enabled', 'true']])
 
   const row = (await getStrandedAccountingSyncRows()).rows[0]
   assert.equal(row.settleable, true, 'nothing in this build can claim it, so the remedy is offered')
@@ -337,9 +337,9 @@ test('[round 5] two connectors on one page get two different answers', async () 
   state.activeConnector = null
   state.rows = [
     dbRow({ id: 'log-x', connector: 'xero', status: 'PROCESSING', attemptRevision: 0 }),
-    dbRow({ id: 'log-q', connector: 'quickbooks', status: 'PROCESSING', attemptRevision: 0 }),
+    dbRow({ id: 'log-q', connector: 'retired-ledger', status: 'PROCESSING', attemptRevision: 0 }),
   ]
-  state.settings = new Map([['xero_sync_enabled', 'true'], ['quickbooks_sync_enabled', 'true']])
+  state.settings = new Map([['xero_sync_enabled', 'true'], ['retired-ledger_sync_enabled', 'true']])
 
   const byId = new Map((await getStrandedAccountingSyncRows()).rows.map((row) => [row.id, row]))
   assert.equal(byId.get('log-q')?.settleable, true, 'archived: no worker left to claim it')

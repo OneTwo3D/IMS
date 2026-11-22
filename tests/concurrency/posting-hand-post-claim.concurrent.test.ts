@@ -78,7 +78,7 @@ async function seedRefusal(db: Db, posting: { type: string; referenceType: strin
       ...keyFor(posting, referenceId),
       kind: posting.kind,
       chartConnector: 'xero',
-      activeConnector: 'quickbooks',
+      activeConnector: 'retired-ledger',
       reason: 'retired_chart',
       committed: 'the document stands in IMS and the ledger does not have this posting',
       remedy: SITE_REMEDY,

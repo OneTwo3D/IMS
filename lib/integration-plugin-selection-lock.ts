@@ -20,7 +20,7 @@
  * `FOR UPDATE` closes that window for EVERY writer, because it is Postgres, not a convention:
  * while this transaction is open, no other transaction can commit an UPDATE or DELETE of these
  * rows. Step 2 exists because `FOR UPDATE` locks only rows that EXIST — a missing
- * `plugin_quickbooks_enabled` could otherwise be INSERTed by a bypassing writer mid-transaction,
+ * plugin row could otherwise be INSERTed by a bypassing writer mid-transaction,
  * which is precisely the "both connectors enabled" and "connector switched under the sweep"
  * transitions this is guarding. Materialising first makes the rows lockable, and is idempotent and
  * semantically inert.
@@ -210,11 +210,9 @@ export async function readLockedPluginSelection(
 }
 
 /**
- * o3d-remove-parked-connectors: this was a THIRD hand-written spelling of the accounting id union
- * (`accounting-registry.ts` has the canonical one, `app/actions/accounting-sync.ts` and
- * `app/(dashboard)/sync/accounting-settings-fields.ts` had two more). Archiving QuickBooks was the
- * moment to stop copying it: it is now `AccountingConnectorId | null`, so registering a connector
- * widens this by construction instead of by somebody remembering this file.
+ * Derived from the registry (`accounting-registry.ts` has the canonical id union) rather than a
+ * hand-written copy: `AccountingConnectorId | null`, so registering a connector widens this by
+ * construction instead of by somebody remembering this file.
  */
 export type AccountingConnectorSelection = AccountingConnectorId | null
 
@@ -226,9 +224,7 @@ export type AccountingConnectorSelection = AccountingConnectorId | null
 export function resolveActiveAccountingConnector(
   state: Pick<IntegrationPluginState, AccountingConnectorId>,
 ): AccountingConnectorSelection {
-  // REGISTRY ORDER, not a hand-written chain (o3d-remove-parked-connectors). This was
-  // `if (state.xero) … if (state.quickbooks) …`, i.e. Xero-first by virtue of being written first.
-  // It now walks ACCOUNTING_CONNECTORS in its declared order, so "the first enabled registered
+  // REGISTRY ORDER, not a hand-written chain. It walks ACCOUNTING_CONNECTORS in its declared order, so "the first enabled registered
   // connector wins" is the rule and the registry's order is where the precedence lives — the same
   // shape `resolveEnabledWmsConnector` uses. With one connector registered the two are
   // indistinguishable; with two they are not, which is why it is worth writing down now.

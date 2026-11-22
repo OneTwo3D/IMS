@@ -6,7 +6,6 @@ import path from 'node:path'
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import {
   describePreservedUnrecordedIncidents,
-  describeUnpersistedQboPost,
   describeUnrecordablePostedDocument,
   incidentKindForOperation,
   type PostedOperationOutcome,
@@ -52,12 +51,6 @@ function xero(type: AccountingSyncType, opts: {
     reason: opts.reason ?? 'ROW_MISSING',
     outcome: opts.outcome,
   })
-}
-function qbo(type: AccountingSyncType, opts: { posted?: string | null; outcome?: PostedOperationOutcome } = {}): string {
-  return describeUnpersistedQboPost(
-    { entry: ENTRY(type), postedExternalId: opts.posted === undefined ? 'EXT-1' : opts.posted, outcome: opts.outcome },
-    new Error('write conflict'),
-  )
 }
 
 /**
@@ -210,10 +203,10 @@ test('ROUND 10: an attempt whose posting mode was not recorded says so, and pres
 // MUTATION THAT KILLS THIS (run): make `nonDocumentWordingFor` ignore its outcome and always return
 // the MADE variant — the disabled case claims an upload and "THERE IS NOTHING TO UNDO" disappears;
 // return the UNRECORDED variant unconditionally and the enabled case stops saying the upload
-// happened. Deleting `externalEffect: 'NONE'` from either connector's disabled branch kills it
+// happened. Deleting `externalEffect: 'NONE'` from the disabled branch kills it
 // through the source assertions at the bottom of this file.
 //
-// ROUTE: the exported formatters, both connectors, with the handler's own recorded answer.
+// ROUTE: the exported formatter, with the handler's own recorded answer.
 test('ROUND 10 (Codex MEDIUM): the attachment record states the handler outcome, including the disabled no-op', () => {
   // ROUND 12: an upload that happened is now told apart from an upload whose BILL the record can
   // name — see tests/accounting/record-reads-settings-as-history.test.ts. The round-10 property is
@@ -241,25 +234,6 @@ test('ROUND 10 (Codex MEDIUM): the attachment record states the handler outcome,
   assert.match(unknown, /IMS DID NOT RECORD WHETHER THE UPLOAD HAPPENED/)
   assert.match(unknown, /DO NOT REMOVE AN ATTACHMENT ON THE STRENGTH OF THIS RECORD/)
   assert.match(unknown, /escalate this record/i)
-
-  // The QuickBooks door is the o3d-qn21 replay wording, and it splits the same three ways.
-  const qboUploaded = qbo('BILL_ATTACHMENT', {
-    posted: null, outcome: { externalEffect: 'MADE', ledgerTargetId: 'QBO-BILL-7' },
-  })
-  assert.match(qboUploaded, /uploaded to QuickBooks bill QBO-BILL-7 AGAIN, once per sweep/)
-  assert.match(qboUploaded, /remove any duplicate attachment/)
-  assert.doesNotMatch(qboUploaded, /unless/i)
-
-  const qboDisabled = qbo('BILL_ATTACHMENT', { posted: null, outcome: { externalEffect: 'NONE' } })
-  // ROUND 12 (Codex HIGH): the no-op claim is CONDITIONAL now — `externalEffect: NONE` says what the
-  // setting read when the attempt ran, and this record outlives the setting.
-  assert.match(qboDisabled, /NOTHING — PROVIDED ATTACHMENT UPLOAD IS STILL OFF WHEN THE SWEEP RUNS/)
-  assert.match(qboDisabled, /it created no attachment/)
-  assert.doesNotMatch(qboDisabled, /remove any duplicate attachment/)
-
-  const qboUnknown = qbo('BILL_ATTACHMENT', { posted: null })
-  assert.match(qboUnknown, /IMS DID NOT RECORD WHETHER THIS ATTEMPT UPLOADED ANYTHING/)
-  assert.match(qboUnknown, /quickbooks_sync_attach_pdf/)
 })
 
 // ---------------------------------------------------------------------------------------------
@@ -284,27 +258,13 @@ test('ROUND 10: the recorded posting mode is the same predicate the request stat
     'the record would otherwise call a draft live, or a live posting a draft')
 })
 
-// DELETED WITH ITS SUBJECT (o3d-remove-parked-connectors): 'ROUND 10: QuickBooks records LIVE because
-// it has no draft form, and the day it gets one this fails'. It scanned every file under
-// `lib/connectors/quickbooks` for a `_postingMode` READ (writing the key into an outgoing payload is
-// the queue recording an operator setting; reading it back would mean the connector acts on it), and
-// pinned that the escalation therefore records `postingMode: 'LIVE'` unconditionally. The directory
-// does not exist, so the scan cannot run — and the claim it guarded is moot: there is no connector to
-// gain a draft form.
+// MUTATION THAT KILLS THIS (run): delete `externalEffect: 'NONE'` from the disabled
+// branch (or `'MADE'` from the upload branch) — the block scan finds a success return that says
+// nothing about what left the process, and fails naming the file.
 //
-// THE SHAPE IS WORTH COPYING for the next connector that records LIVE unconditionally: scan its whole
-// directory for a READ of the key, tell a write apart from a read, and assert the scan saw the key at
-// all so it cannot pass over an empty directory.
-
-// MUTATION THAT KILLS THIS (run): delete `externalEffect: 'NONE'` from either connector's disabled
-// branch (or `'MADE'` from either upload branch) — the block scan finds a success return that says
-// nothing about what left the process, and fails naming the connector.
-//
-// ROUTE: the BILL_ATTACHMENT case block is extracted from each shipped processor and every
+// ROUTE: the BILL_ATTACHMENT case block is extracted from the shipped processor and every
 // success-return inside it is inspected.
 test('ROUND 10: the BILL_ATTACHMENT handler records which of the two things it did', async () => {
-  // o3d-remove-parked-connectors: the archived QuickBooks processor was the second file, so "BOTH
-  // handlers" was a real cross-port claim. One handler now.
   for (const file of ['lib/connectors/xero/sync-processor.ts']) {
     const source = await readFile(path.join(process.cwd(), file), 'utf8')
     const at = source.indexOf("case 'BILL_ATTACHMENT': {")

@@ -336,7 +336,7 @@ test('the control is offered only where an assertion could actually land', () =>
 })
 
 test('a row with no attempt is disabled WITH the reason, not silently omitted', () => {
-  // Every QuickBooks row is permanently here: that processor stamps no attempt revision, so its
+  // Every row of a connector whose processor stamps no attempt revision is permanently here: its
   // rows stay at 0 and applyFencedAttemptDecision would refuse them as UNFENCED_ATTEMPT. Offering a
   // button whose only possible answer is a refusal is worse than offering none.
   const unfenced = describeSyncRowSettleability({ status: 'FAILED', type: 'SALES_INVOICE', attemptRevision: 0 })
@@ -505,7 +505,7 @@ test('a revision-0 row that NOTHING can ever claim is settleable by adoption, wi
   // the population it was built for.
   const s = describeSyncRowSettleability({
     status: 'FAILED', type: 'SALES_INVOICE', attemptRevision: UNCLAIMED_ATTEMPT_REVISION,
-    unclaimable: true, connector: 'quickbooks',
+    unclaimable: true, connector: 'retired-ledger',
   })
   assert.equal(s.settleable, true)
   assert.equal(s.requiresAttemptAdoption, true)
@@ -531,7 +531,7 @@ test('a revision-0 row on the ACTIVE connector is still refused — and told the
 
 test('adoption carries the TYPE narrowing with it — an adopted DAILY_BATCH row is still POSTED-only', () => {
   const s = describeSyncRowSettleability({
-    status: 'FAILED', type: 'DAILY_BATCH_GROUP_B', attemptRevision: 0, unclaimable: true, connector: 'quickbooks',
+    status: 'FAILED', type: 'DAILY_BATCH_GROUP_B', attemptRevision: 0, unclaimable: true, connector: 'retired-ledger',
   })
   assert.equal(s.settleable, true)
   assert.equal(s.requiresAttemptAdoption, true)
@@ -542,7 +542,7 @@ test('adoption carries the TYPE narrowing with it — an adopted DAILY_BATCH row
 
 test('adoption never overrides the STATUS gate — a PENDING stranded row is still the sweeps\' work', () => {
   const s = describeSyncRowSettleability({
-    status: 'PENDING', type: 'SALES_INVOICE', attemptRevision: 0, unclaimable: true, connector: 'quickbooks',
+    status: 'PENDING', type: 'SALES_INVOICE', attemptRevision: 0, unclaimable: true, connector: 'retired-ledger',
   })
   assert.equal(s.settleable, false)
   assert.match(s.notSettleableReason ?? '', /nothing has been sent/)

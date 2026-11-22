@@ -21,9 +21,8 @@ import type { IntegrationPluginState } from '@/lib/integration-plugin-keys'
  * `configured` the REAL facade produced.
  *
  * WMS ENABLEMENT IS DERIVED, never a named member: any registered connector being on means a WMS
- * is in play, which is the same rule `isIntegrationModuleVisible` applies. o3d-remove-parked-connectors
- * made ACCOUNTING enablement derived the same way, from ACCOUNTING_CONNECTORS, rather than
- * `plugins.xero || plugins.quickbooks`.
+ * is in play, which is the same rule `isIntegrationModuleVisible` applies. ACCOUNTING enablement is derived
+ * the same way, from ACCOUNTING_CONNECTORS, rather than a hand-written `plugins.xero || ...`.
  */
 export type IntegrationsStepConnections = {
   /** The WooCommerce store's credentials are saved. */

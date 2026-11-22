@@ -26,15 +26,15 @@ import { ledgerAmountEpsilon, toDecimal } from '@/lib/domain/math/decimal'
  * linked, control then fell through to `return { ok: true, records }` over an EMPTY record list,
  * `classifyLedgerSettlement` reads that as `clear`, and `clear` is what authorises a money post.
  *
- * WHY IT IS REACHABLE RATHER THAN THEORETICAL. QuickBooks serialises `TotalAmt` and `Balance` as
- * JSON STRINGS. That is o3d-psrx r10's HIGH, recorded in this same connector's payment poller, where
- * `typeof row.Balance === 'number'` failed on a real `Balance` of `"50.00"` and the poller was moved
+ * WHY IT IS REACHABLE RATHER THAN THEORETICAL. A ledger can serialise a total and a
+ * balance as JSON STRINGS. That is o3d-psrx r10's HIGH, recorded in the payment poller, where
+ * `typeof row.Balance === 'number'` failed on a real balance of `"50.00"` and the poller was moved
  * onto `parseLedgerAmount` — a reader that admits numeric text. The PROBE was not moved with it. One
  * rule, two readers, one of them fixed; the unfixed one is the one that authorises money.
  *
  * So the same bill read two ways:
- *   `TotalAmt: 1200, Balance: 0`       -> applied 1200, explained 0, shortfall -> ok:false. Correct.
- *   `TotalAmt: "1200.00", "0.00"`      -> applied null -> check skipped -> ok:true, records []
+ *   `total: 1200, balance: 0`          -> applied 1200, explained 0, shortfall -> ok:false. Correct.
+ *   `total: "1200.00", "0.00"`         -> applied null -> check skipped -> ok:true, records []
  *                                      -> clear -> a SECOND payment against a fully settled bill.
  *
  * WHAT THE FIX IS, IN TWO PARTS, AND BOTH ARE TESTED HERE.
@@ -46,8 +46,8 @@ import { ledgerAmountEpsilon, toDecimal } from '@/lib/domain/math/decimal'
  *      "Xero omitted `Total`" is a response shape this module has a documented fallback for and
  *      turning it into a refusal would fail the ordinary unsettled document.
  *
- * All three arms are covered — the Xero credit-note check, both of the Xero invoice checks, and the
- * QuickBooks one — because the finding cites one and the file holds three of the same shape.
+ * Every arm is covered — the Xero credit-note check and both of the Xero invoice checks — because the
+ * finding cites one and the file holds several of the same shape.
  *
  * Every test states the PRECONDITION it turns on, so none can pass by the property under test
  * quietly ceasing to hold.
@@ -73,16 +73,10 @@ const reasonOf = (probe: LedgerSettlementProbe) => (probe.ok === false ? probe.r
 const attemptFor = (amount: string): AttemptDescription =>
   ({ amount: toDecimal(amount), currency: 'GBP', date: DATE, marker: null })
 
-/* --- the three arms, each driven by its own document body. --- */
+/* --- the arms, each driven by its own document body. --- */
 
-// o3d-remove-parked-connectors: the QuickBooks arm of this file is DELETED with the connector.
-// `probeQuickBooksSettlement` and its fixtures are archived; the cases that drove them were the
-// twin of every Xero case here, and several of them ("all THREE arms read a string figure", "the rule
-// is ONE function, and all three arms reach it") were the ONLY assertions that the rule was reached
-// by more than one arm. That evidence is gone. What the rules themselves protect — string-typed money
-// (o3d-obyd), the difference magnitude bound (o3d-mm51), the completeness band (o3d-r948) — is still
-// asserted through the Xero arms. Recoverable with the connector:
-// `git show archive/quickbooks-connector:<this path>`.
+// What the rules protect — string-typed money (o3d-obyd), the difference magnitude bound (o3d-mm51),
+// the completeness band (o3d-r948) — is asserted through the Xero arms.
 
 /** ARM 2: the Xero invoice's `AmountPaid` and `Total - AmountDue` checks. */
 const probeInvoice = (body: Record<string, unknown>) => probeXeroSettlement(
@@ -316,10 +310,10 @@ test('[o3d-mm51] the AmountPaid gate no longer excludes itself over a record the
  * 6. o3d-nk5n (Codex HIGH, round 29) — THE SAME RULE ON THE XERO SIDE: AN EMPTY RECORD LIST IS A
  *    POSITIVE CLAIM ABOUT MONEY, AND IT NEEDS A FIGURE BEHIND IT.
  *
- * o3d-mm51 closed this on the QuickBooks arm (section 5) and FILED it on both Xero arms, because 25
+ * o3d-mm51 closed this on another arm and FILED it on both Xero arms, because 25
  * fixtures modelled an ordinary first payment as a figureless stub Xero does not send. The fixtures
- * now state what Xero states, so the rule is one function — `settlementAnswer` — reached by all
- * three arms rather than one connector's own sentence.
+ * now state what Xero states, so the rule is one function — `settlementAnswer` — reached by every
+ * arm rather than one arm's own sentence.
  *
  * Every test below states the PRECONDITION it turns on, so none can pass by the shape under test
  * quietly ceasing to be reached.
@@ -375,7 +369,7 @@ test('[o3d-nk5n] an INCOMPLETE Xero invoice cannot classify as clear', async () 
     assert.equal(verdict.outcome === 'unknown' && verdict.cause, 'probe-unreadable')
   }
 
-  // AND ABSENCE STILL ONLY SKIPS WHERE THERE IS OTHER EVIDENCE, exactly as on the QuickBooks arm. A
+  // AND ABSENCE STILL ONLY SKIPS WHERE THERE IS OTHER EVIDENCE, as elsewhere. A
   // figureless invoice whose payment this probe actually READ is not refused: the record is evidence
   // in its own right and the verdict is decided by comparing it, not by the absence.
   const withEvidence = await probeInvoice({
@@ -445,8 +439,7 @@ test('[o3d-nk5n] a Xero document stating EQUAL readable totals proves zero settl
   // THE OTHER SIDE OF THE RULE, AND THE ONE THAT MUST NOT BE BROKEN BY IT. Closing the fall-through
   // is only correct if the ordinary FIRST payment still proceeds — and it does, because Xero states
   // these figures on every document that exists and an UNPAID one states them EQUAL. That is
-  // emptiness PROVED by two stated figures rather than assumed from four missing ones, which is the
-  // same sentence the QuickBooks arm has carried since o3d-mm51.
+  // emptiness PROVED by two stated figures rather than assumed from four missing ones (o3d-mm51).
   //
   // ROUTE: probeXeroSettlement -> wireAmount reads both -> `settled` is exactly 0 -> statesAnything
   //        false -> the check PASSES -> `settlementAnswer` is false because `settled` is a
@@ -523,10 +516,6 @@ const TRUNCATED = {
     CurrencyCode: 'GBP',
     Allocations: [{ Amount: 99, Date: '/Date(1780272000000+0000)/', Invoice: { InvoiceID: 'inv-1' } }],
   }),
-  // ARM 3 WAS THE QUICKBOOKS BILL (o3d-remove-parked-connectors), and it is gone with the connector.
-  // Two arms are left. Note what that costs this particular case: the r31 finding is about a
-  // TRUNCATED collection, and its whole argument is that the rule must hold on EVERY arm because each
-  // arm reads a different document shape. Two of three is not the same claim.
 }
 
 test('[o3d-obyd r31] a truncated response holding ONE UNRELATED record does not authorise a post', async () => {
@@ -619,8 +608,8 @@ test('[o3d-obyd r31] a MATCHING record still yields present with no document tot
 })
 
 test('[o3d-obyd r31] the ordinary first payment still posts, and the ordinary part-payment still clears', async () => {
-  // WHAT THE RULE COSTS THE ORDINARY DOCUMENT: nothing. Xero and QuickBooks state these figures on
-  // every document they return, so `provedComplete` is true for every real response and the
+  // WHAT THE RULE COSTS THE ORDINARY DOCUMENT: nothing. Xero states these figures on
+  // every document it returns, so `provedComplete` is true for every real response and the
   // non-match still clears. The refusals above are reachable only by a response that omits them.
   //
   // ROUTE: `settled`/`applied` computable -> the shortfall check passes -> `settlementAnswer`
@@ -961,11 +950,10 @@ test('[o3d-acctmoney] the contradiction check still catches a real contradiction
  * NON-match: a match is still `present`, a shortfall still escalates to `ok: false`, and the ordinary
  * first payment still posts.
  *
- * FOUR PAIRS TAKE IT, and each test below names which:
+ * THREE PAIRS TAKE IT, and each test below names which:
  *   1  Xero credit note   `Total - RemainingCredit`  vs  SUM(Allocations)          identity
  *   2  Xero invoice       `AmountPaid`               vs  SUM(Payments)             identity
  *   3  Xero invoice       `Total - AmountDue`        vs  SUM(Payments + applied)   composed identity
- *   4  QuickBooks         `TotalAmt - Balance`       vs  SUM(payment lines)        one-sided bound
  * ------------------------------------------------------------------------------------------- */
 
 /** The band both directions are measured on — `completenessBand` is `ledgerAmountEpsilon`. */
@@ -1182,7 +1170,7 @@ test('[o3d-zo4j] PAIR 3: an itemised credit that exceeds what the invoice says h
  *
  * IT ONLY BITES WHERE THE UNMEASURABLE TERM LEAVES NO RECORD BEHIND. A payment IMS cannot read is
  * itself a record with a null amount, and `classifyLedgerSettlement` withholds on that record before
- * the completeness gate is reached — so the invoice's payment pair and the whole QuickBooks arm are
+ * the completeness gate is reached — so the invoice's payment pair is
  * already covered, and a null arm on either would be a guard no input can reach. An ALLOCATION to
  * another invoice and an APPLIED CREDIT NOTE are not records here, and those two are the holes.
  * ------------------------------------------------------------------------------------------- */

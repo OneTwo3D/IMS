@@ -90,8 +90,8 @@
  *     REVERSED, re-posted or never posted is not a document whose persisted lines describe what
  *     stands; and the invoice and the credit notes must have been posted to THE SAME LEDGER — the
  *     active accounting connector can be switched, IMS keeps every historical document under the
- *     connector that posted it, and an order invoiced in Xero and credited in QuickBooks has an
- *     invoice standing at full value that the credit memo reduces by nothing. Each names the
+ *     connector that posted it, and an order invoiced in one ledger and credited in another has an
+ *     invoice standing at full value that the credit note reduces by nothing. Each names the
  *     condition that failed and prescribes nothing.
  *
  *     AND A SUPPRESSED NETTING STATES NO NETTING CONCLUSION EITHER (o3d-y14 r10 finding 1). Two of
@@ -126,7 +126,7 @@
  *     EVERY netted outcome names THE CREDIT NOTES ITS FIGURE WAS DERIVED AGAINST (o3d-y14 r8
  *     finding 3, r9 finding 2) — including the one that nets to ZERO. IMS can see a credit note it
  *     never posted, one it re-posted and one it retired — all of those suppress the netting — but
- *     NOT one voided or edited by hand in Xero or QuickBooks, because nothing writes that back, and
+ *     NOT one voided or edited by hand in the ledger, because nothing writes that back, and
  *     it records which CONNECTOR posted a document but never which ORGANISATION inside it. Confirming
  *     those documents still stand, and are in the same organisation as the invoice, is part of the
  *     output rather than an optional extra. A zero net needs it MOST: a hand-voided credit note

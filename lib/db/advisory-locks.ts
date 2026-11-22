@@ -1,18 +1,17 @@
 /**
- * Every PostgreSQL advisory lock key in one place — because two pairs of them
+ * Every PostgreSQL advisory lock key in one place — because pairs of them
  * were the SAME number by accident, and nothing said so (o3d-4ajo).
  *
  * `pg_advisory_xact_lock(k)` and `pg_try_advisory_lock(k)` contend on the value
  * of `k` alone; nothing namespaces them by module. So two features that pick the
  * same constant serialize against each other, and the symptom is never an error
  * — it is a job that waits, or a `try` lock that reports "someone else holds it"
- * and SKIPS its run. What was wired, in two unrelated commits eleven days apart:
+ * and SKIPS its run. What was wired, in unrelated commits:
  *
  *   4_112_208_031  refund creation              +  the Xero daily batch
- *   4_112_208_032  the Xero payment-write lock  +  the QuickBooks daily batch
  *
  * The values are deliberately UNCHANGED. Splitting them would be a silent
- * behaviour change in the dangerous direction: each pair writes overlapping
+ * behaviour change in the dangerous direction: the pair writes overlapping
  * accounting state, so today's accidental serialization is doing real work (see
  * each domain below). What changes is that the sharing is now DELIBERATE —
  * named, documented and asserted. A future reader cannot mistake it for a
@@ -51,9 +50,7 @@ export const ACCOUNTING_WRITE_LOCK_KEY = 4_112_208_031
  * PAYMENT WRITE domain.
  *
  * Held by the two Xero jobs that write `paidAt` — the 15-minute payment poll and
- * the daily backlog reconcile (o3d-2s8) — and by the QuickBooks daily batch,
- * which selects on `paidAt IS NOT NULL` and would otherwise read a payment state
- * another job is midway through rewriting.
+ * the daily backlog reconcile (o3d-2s8) — and nothing else.
  */
 export const PAYMENT_WRITE_LOCK_KEY = 4_112_208_032
 
@@ -224,7 +221,6 @@ export const SINGLE_KEY_ADVISORY_LOCKS = {
  */
 export const REFUND_ACCOUNTING_LOCK_KEY = ACCOUNTING_WRITE_LOCK_KEY
 export const XERO_DAILY_BATCH_LOCK_KEY = ACCOUNTING_WRITE_LOCK_KEY
-export const QBO_DAILY_BATCH_LOCK_KEY = PAYMENT_WRITE_LOCK_KEY
 
 /**
  * TWO-INT namespaces — pg_advisory_xact_lock(namespace, id).
@@ -317,7 +313,7 @@ export const ACCOUNTING_FOLLOWUP_SCOPE_LOCK_NAMESPACE = 411_220_871
  *
  * A SEPARATE domain from the scope lock above, and the separation is the point. That one is
  * transaction-scoped and held by short database writes; this one is SESSION-scoped and held
- * across two HTTP calls to Xero or QuickBooks — the ledger read that authorises the post and the
+ * across two HTTP calls to the accounting system — the ledger read that authorises the post and the
  * post. Folding them together would put every enqueue transaction for a document behind a remote
  * round trip, which is longer than Prisma's transaction timeout: the enqueue would not merely
  * wait, it would abort.

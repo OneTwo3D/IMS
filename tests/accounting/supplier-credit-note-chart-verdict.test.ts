@@ -23,7 +23,6 @@ import { Prisma } from '@/app/generated/prisma/client'
 let enabledPlugins: string[] = ['xero']
 let pluginReads = 0
 let flipAfterReads: { reads: number; to: string[] } | null = null
-let qboSyncEnabled = 'true'
 
 mock.module('@/lib/integration-plugins', {
   namedExports: {
@@ -45,10 +44,6 @@ mock.module('@/lib/connectors/xero/settings', {
     }),
   },
 })
-// o3d-j625 r12 (merging o3d-remove-parked-connectors): the SECOND CONNECTOR'S SETTINGS MOCK WAS HERE, and
-// removing it is not cosmetic — `mock.module` RESOLVES its specifier, so a mock of an archived module makes
-// the whole file fail to load with ERR_MODULE_NOT_FOUND. Every case that needed the second connector's
-// chart is adapted or removed above/below, each saying which.
 mock.module('@/lib/auth', {
   namedExports: {
     auth: async () => ({ user: { id: 'u1', email: 'u@example.test', name: 'U', role: 'ADMIN', supplierId: null, sessionInvalidReason: null, totpEnabled: false, totpVerified: false } }),
@@ -146,11 +141,10 @@ mock.module('@/lib/db', {
   },
 })
 
-function reset(flip: { reads: number; to: string[] } | null, qboSync = 'true') {
+function reset(flip: { reads: number; to: string[] } | null) {
   enabledPlugins = ['xero']
   pluginReads = 0
   flipAfterReads = flip
-  qboSyncEnabled = qboSync
   committed.posted = 0
   committed.syncRows = []
   activity.length = 0
@@ -169,16 +163,11 @@ test('[o3d-j625 r4 HIGH 2] PRECONDITION: with no switch the credit note is POSTE
   assert.deepEqual(committed.syncRows, [{ connector: 'xero', type: 'PURCHASE_CREDIT_NOTE' }])
 })
 
-// o3d-j625 r12 (merging o3d-remove-parked-connectors): the matrix had a second row — "the active
-// connector SWITCHES to a QuickBooks with sync off after the chart read". An unregistered plugin flag
-// resolves to NO active connector now, so that row became a duplicate of the first rather than a second
-// state, and a duplicate row dressed as a matrix is how a test comes to look broader than it is. One row,
-// and the state it drives is the one that remains: the chart is retired because nothing is active.
-for (const [label, flip, qboSync] of [
-  ['the active connector is DISABLED after the chart read', { reads: 1, to: [] as string[] }, 'true'],
+for (const [label, flip] of [
+  ['the active connector is DISABLED after the chart read', { reads: 1, to: [] as string[] }],
 ] as const) {
   test(`[o3d-j625 r4 HIGH 2] ${label}: the credit note is NOT posted with no ledger entry — it is refused and stays DRAFT`, async () => {
-    reset({ reads: flip.reads, to: [...flip.to] }, qboSync)
+    reset({ reads: flip.reads, to: [...flip.to] })
     const result = await post()
     assert.ok(pluginReads >= 2, `PRECONDITION: the selection was read again after the chart (reads: ${pluginReads})`)
     assert.equal(committed.syncRows.length, 0, 'no ledger row exists for this credit note')
@@ -188,12 +177,3 @@ for (const [label, flip, qboSync] of [
     assert.equal(record?.metadata?.declineReason, 'chart-retired', 'reported as a refusal, not as posting switched off')
   })
 }
-
-// o3d-j625 r12 (merging o3d-remove-parked-connectors) — REMOVED, no subject.
-//
-// '[o3d-j625 r4 HIGH 2] CONTROL: an AGREEING QuickBooks chart still posts LOCALLY — the no-poster escape
-// valve is untouched' needed a connector that has NO ACCPAYCREDIT poster, so that an agreeing chart posts
-// in IMS and queues nothing. The one registered connector HAS that poster, so the escape valve cannot be
-// exercised at all. It was a control for the refusals above — it showed they were refusals and not the
-// escape valve firing — and losing it is a real weakening, recorded in o3d-5ktph. Verbatim at
-// `git show da093f85:tests/accounting/supplier-credit-note-chart-verdict.test.ts`.
