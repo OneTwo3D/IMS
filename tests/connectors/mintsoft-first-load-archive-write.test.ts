@@ -8,9 +8,9 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import path from 'node:path'
 import test, { after, afterEach, before } from 'node:test'
-import { ARCHIVE_RETIREMENT_ATTESTATION_KIND, ARCHIVE_RETIREMENT_MAX_AGE_MS, archiveHopRefusal, archivePreflight, archiveRetirementEvidence, changedMintsoftProductFields, createMintsoftArchiveWiring, createMintsoftArchiveWriter, discontinueMintsoftProduct, mintsoftMessage, targetHoldRefusal, ARCHIVE_USER_AGENT } from '../../lib/connectors/mintsoft/first-load-archive-write.ts'
+import { ARCHIVE_RETIREMENT_ATTESTATION_KIND, ARCHIVE_RETIREMENT_MAX_AGE_MS, ARCHIVE_SWITCHOVER_CHECK_MAX_AGE_MS, archiveHopRefusal, archivePreflight, archiveRetirementEvidence, archiveSwitchoverCheckEvidence, changedMintsoftProductFields, createMintsoftArchiveWiring, createMintsoftArchiveWriter, discontinueMintsoftProduct, mintsoftMessage, targetHoldRefusal, ARCHIVE_USER_AGENT } from '../../lib/connectors/mintsoft/first-load-archive-write.ts'
 import { WmsCensusRefused } from '../../lib/first-load/wms-discontinue/cli.ts'
-import { KEY, LIVE_FROM, configOf, fakeMintsoft as fakeTenant, grantedEnv, liveEnv, reportInstant, retirementRow, stockRow, syntheticProduct, type FakeTenant, type Rig } from './mintsoft-archive-fake.ts'
+import { KEY, LIVE_FROM, configOf, fakeMintsoft as fakeTenant, grantedEnv, liveEnv, reportInstant, retirementRow, stockRow, switchoverCheckRow, syntheticProduct, type FakeTenant, type Rig } from './mintsoft-archive-fake.ts'
 import { setOutboundRefusalSink } from '../../lib/security/outbound-write-refusal-log.ts'
 
 // A held write is recorded through the refusal sink; here it is counted, never written to a database.
@@ -181,15 +181,19 @@ test('the stock re-read reads EVERY listed warehouse: stock in a warehouse nobod
 test('the preflight, on the TARGET environment: step M live (grant + live-from reached), a grant for exactly this tenant and the target\'s retirement evidence; evidence names the instant', async () => {
   const rig = await fakeMintsoft(tenantOf())
   const config = configOf(rig)
-  const facts = { retirement: retirementRow(), now: new Date() }
+  const facts = { retirement: retirementRow(), switchoverCheck: switchoverCheckRow(), now: new Date() }
   const ok = archivePreflight(config, liveEnv(rig), facts)
   assert.ok(ok.ok)
   assert.match(ok.evidence, new RegExp(`since ${LIVE_FROM.replace('Z', '')}`))
   assert.match(ok.retirementEvidence, /^bridge-units-masked attestation recorded .* judged as writers:check judges it against MINTSOFT_WRITES_LIVE_FROM 2026-01-01T00:00:00.000Z$/)
   assert.ok(archivePreflight(config, { ...liveEnv(rig), PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'all' }, facts).ok, 'a LIVE disposition is the hold\'s live phase: the hold check cannot refuse on its own')
-  const none = archivePreflight(config, liveEnv(rig), { retirement: null, now: new Date() })
+  assert.match(ok.switchoverEvidence, /^writers:check record of the target: verdict ok, phase P2-M, generated .*, step M live since 2026-01-01T00:00:00.000Z$/)
+  const none = archivePreflight(config, liveEnv(rig), { ...facts, retirement: null })
   assert.equal(none.ok, false)
   assert.match((none as { problem: string }).problem, /holds no bridge-units-masked attestation/)
+  const noCheck = archivePreflight(config, liveEnv(rig), { ...facts, switchoverCheck: null })
+  assert.equal(noCheck.ok, false)
+  assert.match((noCheck as { problem: string }).problem, /holds no writers:check record/)
   const cases: Array<[Record<string, string>, RegExp]> = [
     [grantedEnv(rig), /Mintsoft step \(M\) is not live in the target installation \(producer decision SHADOW: no_cutoff\)/],
     [{ ...liveEnv(rig), MINTSOFT_WRITES_LIVE_FROM: '2999-01-01T00:00:00Z' }, /not live .*before_cutoff/],
@@ -229,12 +233,15 @@ test('the wiring parses the credentials file once for both the census and the wr
   const writer = wiring.openWriter('/synthetic/ms.env', liveEnv(rig))
   assert.deepEqual(parsed, ['/synthetic/ms.env'])
   assert.equal(censusConfigs.length, 1)
-  assert.ok(writer.preflight({ retirement: retirementRow(), now: new Date() }).ok, 'the writer runs under the target environment it was given')
+  assert.ok(writer.preflight({ retirement: retirementRow(), switchoverCheck: switchoverCheckRow(), now: new Date() }).ok, 'the writer runs under the target environment it was given')
+  assert.ok(writer.judgeSwitchoverCheck(switchoverCheckRow(), new Date()).ok)
   assert.throws(() => wiring.openWriter('/synthetic/other.env', liveEnv(rig)), WmsCensusRefused)
 })
 
 // [mutation: the retirement evidence is not required, not judged against the step-M instant, or an old report is believed] (#1128 R2 MED-A)
-test('the retirement evidence: the target\'s newest bridge-units-masked attestation, judged as writers:check judges it; stage and an M rollback refuse', () => {
+// It covers what the HOST report can show of a rollback; a rollback that resumes the bridge or the plugin BEFORE the live-from is unset leaves a passing
+// attestation behind, and is the switchover check's to catch (the tests below) (#1129 R1 LOW-2).
+test('the retirement evidence: the target\'s newest bridge-units-masked attestation, judged as writers:check judges it; stage refuses, and so does a host report that shows the bridge back, a re-dated M or a stale report', () => {
   assert.equal(ARCHIVE_RETIREMENT_ATTESTATION_KIND, 'bridge-units-masked')
   const now = new Date()
   const env = { MINTSOFT_WRITE_ALLOWED: 'https://ms.example.test|89', MINTSOFT_WRITES_LIVE_FROM: LIVE_FROM }
@@ -318,4 +325,79 @@ test('the warehouse list must not hold a warehouse twice; a stock row only in an
   const r2 = await fakeMintsoft(elsewhere)
   const w2 = createMintsoftArchiveWriter(configOf(r2), { env: grantedEnv(r2), sleep: noSleep })
   assert.deepEqual(await w2.readStock('501', 'SYN-A'), { ok: true, value: { stockRow: false, onHand: 4 } })
+})
+
+// [mutation: the switchover-check record is not required, a failing or non-INFO one passes, a stale one is believed, or a phase before M passes] (#1129 R1 MED-1)
+test('the switchover check: the target\'s newest writers:check record must pass (INFO, verdict ok), be of phase P2-M or later with the same step-M instant, and be under 6 hours old', () => {
+  const now = new Date()
+  const env = { MINTSOFT_WRITE_ALLOWED: 'https://ms.example.test|89', MINTSOFT_WRITES_LIVE_FROM: LIVE_FROM }
+  assert.equal(ARCHIVE_SWITCHOVER_CHECK_MAX_AGE_MS, 6 * 3_600_000)
+  const ok = archiveSwitchoverCheckEvidence(switchoverCheckRow({ now: now.getTime() }), env, now)
+  assert.ok(ok.ok, JSON.stringify(ok))
+  for (const phase of ['P2-W', 'P2-X']) assert.ok(archiveSwitchoverCheckEvidence(switchoverCheckRow({ report: { phase } }), env, now).ok, phase)
+  assert.ok(archiveSwitchoverCheckEvidence(switchoverCheckRow({ generatedAt: new Date(now.getTime() - ARCHIVE_SWITCHOVER_CHECK_MAX_AGE_MS + 60_000).toISOString() }), env, now).ok, 'just inside the age limit')
+  const refused = (row: Parameters<typeof archiveSwitchoverCheckEvidence>[0], why: RegExp, e: Record<string, string> = env) => {
+    const r = archiveSwitchoverCheckEvidence(row, e, now)
+    assert.equal(r.ok, false, String(why))
+    assert.match((r as { problem: string }).problem, why)
+  }
+  refused(null, /holds no writers:check record/)
+  refused(switchoverCheckRow({ level: 'ERROR' }), /did not pass \(level ERROR, verdict ok\)/)
+  refused(switchoverCheckRow({ level: 'WARNING' }), /did not pass \(level WARNING/)
+  refused(switchoverCheckRow({ report: { verdict: 'double-claim' } }), /did not pass \(level INFO, verdict double-claim\)/)
+  refused({ level: 'INFO', createdAt: now.toISOString(), metadata: {} }, /did not pass/)
+  refused(switchoverCheckRow({ generatedAt: new Date(now.getTime() - ARCHIVE_SWITCHOVER_CHECK_MAX_AGE_MS - 60_000).toISOString() }), /more than 6 hours before this run/)
+  refused(switchoverCheckRow({ generatedAt: new Date(now.getTime() + 3_600_000).toISOString() }), /cannot be read, or one in the future/)
+  refused(switchoverCheckRow({ report: { generatedAt: 'yesterday' } }), /cannot be read, or one in the future/)
+  refused(switchoverCheckRow({ report: { phase: 'P1' } }), /is of phase P1, not P2-M or later/)
+  refused(switchoverCheckRow({ report: { phase: 'P3' } }), /not P2-M or later/)
+  refused(switchoverCheckRow({ report: { steps: [{ step: 'mintsoft', liveFrom: new Date(LIVE_FROM).toISOString(), state: 'scheduled' }] } }), /does not show step M live at the instant the target env file names/)
+  refused(switchoverCheckRow(), /does not show step M live/, { ...env, MINTSOFT_WRITES_LIVE_FROM: '2026-02-01T00:00:00Z' })
+  refused(switchoverCheckRow(), /does not show step M live/, { MINTSOFT_WRITE_ALLOWED: env.MINTSOFT_WRITE_ALLOWED })
+})
+
+// [mutation: a rollback that resumed the bridge and plugin before the live-from was unset is not refused] (#1129 R1 MED-1)
+// The rollback ordering the review names: the bridge's plugin reactivated and its sweep running again (a fresh foreign Mintsoft order) while
+// MINTSOFT_WRITES_LIVE_FROM is still set, with the host attestation from step M still clean and fresh. writers:check, as the scheduled job records it,
+// fails on the companion-plugin probe and the foreign order, and the archive refuses that record. Driven through the real evaluator and recorder.
+test('an M rollback that resumed the bridge before the live-from was unset: the retirement attestation still passes, the recorded writers:check fails, and the archive refuses', async () => {
+  const { evaluateWritersCheck } = await import('../../lib/ops/writers-check.ts')
+  const { runWritersCheckRecord } = await import('../../lib/ops/writers-check-record.ts')
+  const { STEP_EVIDENCE_KINDS } = await import('../../lib/security/writers-check-constants.ts')
+  const now = new Date()
+  const env = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'all', MINTSOFT_WRITE_ALLOWED: 'https://ms.example.test|89', WC_WRITEBACK_ALLOWED_ORIGIN: 'https://shop.example.test', MINTSOFT_WRITES_LIVE_FROM: LIVE_FROM }
+  const evidence = (rolledBack: boolean) => {
+    const out: Record<string, unknown> = {}
+    for (const kind of STEP_EVIDENCE_KINDS) {
+      out[kind] = kind === 'BRIDGE_ATTESTATION' ? { state: 'present', at: new Date(now.getTime() - 3_000_000).toISOString(), violations: [], lastTriggerAt: '2025-12-31T23:55:01.000Z', generatedAt: new Date(now.getTime() - 3_300_000).toISOString() }
+        : kind === 'BRIDGE_PROBE' ? { state: 'probed', violations: rolledBack ? ['bridge-route-registered:wc-mintsoft/v1', 'order-sync-enabled'] : [] }
+        : kind === 'MINTSOFT_FOREIGN_ORDER' ? { state: 'counted', counted: rolledBack ? 1 : 0, floor: LIVE_FROM }
+        : kind.startsWith('QOBLEX') ? { state: 'present', at: '2025-11-01T00:00:00.000Z' }
+        : kind === 'NATIVE_EMAIL_EXCLUSIVE' || kind === 'XEROOM_NOTE' ? { state: 'probed', violations: [] }
+        : { state: 'counted', counted: 0, floor: LIVE_FROM }
+    }
+    return out
+  }
+  const recorded = async (rolledBack: boolean) => {
+    let row: { level: string; createdAt: string; metadata: unknown } | null = null
+    const report = evaluateWritersCheck({
+      env, now, windowDays: 14, settings: new Map([['trackship_refire_enabled', 'true'], ['mintsoft_parent_sku_delete_enabled', 'true'], ['wc_withdrawal_outcome_enabled', 'true']]), cronEnabled: { 'wms-order-push': true },
+      pluginEnabled: { woocommerce: true, mintsoft: true, xero: true },
+      evidence: Object.fromEntries(['MINTSOFT_ORDER_ID', 'MINTSOFT_OTHER_META', 'XEROOM_MARKER', 'XERO_FOREIGN_NUMBER'].map((k) => [k, { counted: 0, total: 0, unpaid: 0, floor: LIVE_FROM }])) as never,
+      stepEvidence: evidence(rolledBack) as never, evidenceUnrecorded: 0, unknownEvidenceKinds: 0,
+    })
+    await runWritersCheckRecord({ build: async () => report, log: (async (entry: { level: string; metadata: unknown }) => { row = { level: entry.level, createdAt: now.toISOString(), metadata: entry.metadata }; return true }) as never })
+    return { report, row: row! }
+  }
+  const before = await recorded(false)
+  assert.equal(before.report.verdict, 'ok', JSON.stringify(before.report.findings.filter((f) => f.severity === 'fail')))
+  assert.ok(archiveSwitchoverCheckEvidence(before.row, env, now).ok, 'the check before the rollback passes')
+  // The host attestation of step M is still clean and fresh: alone it would let the write leave.
+  assert.ok(archiveRetirementEvidence(retirementRow({ now: now.getTime() }), env, now).ok)
+  const after = await recorded(true)
+  assert.notEqual(after.report.verdict, 'ok')
+  assert.equal(after.row.level, 'ERROR')
+  const r = archiveSwitchoverCheckEvidence(after.row, env, now)
+  assert.equal(r.ok, false)
+  assert.match((r as { problem: string }).problem, /did not pass \(level ERROR, verdict [a-z-]+\)/)
 })

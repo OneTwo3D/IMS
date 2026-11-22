@@ -13,7 +13,8 @@
  * --execute WRITES, and only when every one of these holds (else nothing is sent to the WMS):
  *   - the IMS target is confirmed (env file, --expect-db, --expect-system-id), its advisory lock is free, the writer's preflight passes under the TARGET's
  *     environment (the WMS step live there, no hold, its grant for exactly this tenant) and on the target's own evidence that the incumbent's product
- *     sync is retired (the newest retirement attestation, read in the same READ ONLY transaction), and its system switch (the one the script names, registered in lib/domain/settings/system-switches.ts, default OFF)
+ *     sync is retired (the newest retirement attestation, read in the same READ ONLY transaction) and on a recent passing switchover check recorded by the
+ *     target itself (read there too, and again before each write), and its system switch (the one the script names, registered in lib/domain/settings/system-switches.ts, default OFF)
  *     reads exactly `true`;
  *   - the decisions would import and a real prepare of the manifest is not blocked;
  *   - the plan recomputed now from a fresh WMS read has exactly the token the operator reviewed (--plan-token), and refuses no SKU;
@@ -26,14 +27,14 @@ import { EXIT_CODES } from '../spec'
 import { ConfigError, prepare } from '../transform'
 import { executeArchivePlan, type ArchiveExecuteResult, type WmsArchiveWriter } from './execute'
 import { buildArchivePlan, isRefused, type ArchivePlan, type WmsCensus } from './plan'
-import { archiveSwitchStillOn, readArchiveTarget, recordArchiveWrite, unprovenImports, type ArchiveTargetPort } from './target'
+import { archiveSwitchStillOn, readArchiveTarget, readSwitchoverCheck, recordArchiveWrite, unprovenImports, type ArchiveTargetPort } from './target'
 
 export const WMS_ARCHIVE_EXIT_CODE_TABLE: ReadonlyArray<{ code: number; name: string; meaning: string }> = [
   { code: EXIT_CODES.OK, name: 'OK', meaning: 'Dry run: the plan was printed, no SKU is refused and a real prepare of the manifest is not blocked (the plan may be empty). --execute: every WOULD_ARCHIVE SKU was written and verified.' },
   { code: EXIT_CODES.BLOCKING_FINDINGS, name: 'BLOCKING_FINDINGS', meaning: 'The plan was printed and at least one Archived SKU is refused (not found, a bundle, no discontinued flag, no stock row, or physical stock other than zero), or a real prepare of the manifest is blocked by other findings: resolve each before any write. With --execute nothing was written.' },
   { code: EXIT_CODES.USAGE, name: 'USAGE', meaning: 'Bad command line or an invalid run manifest. Nothing was read or requested.' },
-  { code: EXIT_CODES.INPUT_UNUSABLE, name: 'INPUT_UNUSABLE', meaning: 'An input cannot be used: a manifest file, the decisions not bound to a verified review sheet, a refused or missing decision, a review set that changed or cannot be checked, or the WMS credentials file refused or its census unreadable. With --execute also: the IMS target not confirmed or unreadable, another run holding its lock, the switch not on, the WMS step not live in the target (or its hold or grant refusing the write), no target-resident evidence that the incumbent product sync is retired, a plan token that does not match the plan made now, or an import that is not proven. Nothing was written.' },
-  { code: EXIT_CODES.OUTPUT_FAILED, name: 'WRITE_STOPPED', meaning: '--execute stopped at the first answer that was not exactly the expected one (a re-read that differs, stock that appeared, the switch turned off, a write the WMS refused or that got no usable answer, a read-back that does not verify, or a record that could not be written). The SKUs written and verified before it are listed and recorded; nothing after it was attempted.' },
+  { code: EXIT_CODES.INPUT_UNUSABLE, name: 'INPUT_UNUSABLE', meaning: 'An input cannot be used: a manifest file, the decisions not bound to a verified review sheet, a refused or missing decision, a review set that changed or cannot be checked, or the WMS credentials file refused or its census unreadable. With --execute also: the IMS target not confirmed or unreadable, another run holding its lock, the switch not on, the WMS step not live in the target (or its hold or grant refusing the write), no target-resident evidence that the incumbent product sync is retired, no recent passing switchover check recorded in the target, a plan token that does not match the plan made now, or an import that is not proven. Nothing was written.' },
+  { code: EXIT_CODES.OUTPUT_FAILED, name: 'WRITE_STOPPED', meaning: '--execute stopped at the first answer that was not exactly the expected one (a re-read that differs, stock that appeared, the switch turned off, the target switchover check no longer passing, a write the WMS refused or that got no usable answer, a read-back that does not verify, or a record that could not be written). The SKUs written and verified before it are listed and recorded; nothing after it was attempted.' },
 ]
 
 /** The WMS reader the script injects (lib/first-load never names a connector). */
@@ -213,6 +214,7 @@ export async function runWmsArchiveCli(argv: string[], io: CliIo, reader: WmsCen
     let writer: WmsArchiveWriter | null = null
     let stepEvidence = ''
     let retirementEvidence = ''
+    let switchoverEvidence = ''
     if (args.execute !== null) {
       const ex = args.execute
       const deps = executeDeps!
@@ -235,10 +237,11 @@ export async function runWmsArchiveCli(argv: string[], io: CliIo, reader: WmsCen
         if (error instanceof WmsCensusRefused || error instanceof WmsCensusFailed) return refuse([`${reader.label}: ${error.message}`])
         throw error
       }
-      const preflight = writer.preflight({ retirement: proof.retirement, now: (deps.now ?? (() => new Date()))() })
+      const preflight = writer.preflight({ retirement: proof.retirement, switchoverCheck: proof.switchoverCheck, now: (deps.now ?? (() => new Date()))() })
       if (!preflight.ok) return refuse([`the write may not leave under the target installation's rules: ${preflight.problem}`])
       stepEvidence = preflight.evidence
       retirementEvidence = preflight.retirementEvidence
+      switchoverEvidence = preflight.switchoverEvidence
     }
 
     // ---- what the WMS holds now (GET only, through the injected reader) ----
@@ -280,6 +283,8 @@ export async function runWmsArchiveCli(argv: string[], io: CliIo, reader: WmsCen
       operator: ex.operator,
       stepEvidence,
       retirementEvidence,
+      switchoverEvidence,
+      switchoverCheckStillPasses: async () => writer!.judgeSwitchoverCheck(await readSwitchoverCheck(port), (executeDeps!.now ?? (() => new Date()))()),
       switchStillOn: () => archiveSwitchStillOn(port, executeDeps!.switchKey),
       progress: (line) => io.stdout(`${line}\n`),
     })

@@ -6,8 +6,9 @@
  * PER SKU, in this order, and the run STOPS at the first answer that is not exactly the expected one (nothing after it is attempted):
  *   1. re-read the product by its id: it must be the plan's product (same id, EXACTLY the same SKU, our client), not a bundle, and not discontinued;
  *   2. re-read its physical stock across the configured warehouses: a stock row must exist and the total must be exactly 0;
- *   3. read the system switch again (it must still read on) and record the attempt in the IMS activity log (a failed record stops the run before anything
- *      is sent);
+ *   3. read the system switch again (it must still read on), read the target's newest switchover-check record again (it must still pass, judged by the
+ *      writer: an M rollback that resumed the incumbent is caught here once a failing check is recorded, even in a run started before it) and record the
+ *      attempt in the IMS activity log (a failed record stops the run before anything is sent);
  *   4. send the discontinue request, and require the WMS to say it succeeded (a 200 alone proves nothing). A failure says whether the request may have
  *      left: refused before it left (nothing was sent) or dispatched without a usable answer (it may have reached the WMS);
  *   5. re-read the product: the flag must now read discontinued and NO other field may differ from the read of step 1 (the writer names the fields that
@@ -45,9 +46,23 @@ export interface ArchiveRetirementRow {
   payload: unknown
 }
 
-/** What the preflight judges besides the target's environment: the target-resident retirement evidence and the instant of the run. */
+/**
+ * The newest switchover-check record of the TARGET (the `writers_check_recorded` activity-log row the installation's own scheduled `writers:check`
+ * writes), read in the same READ ONLY transaction as the import proof and again before each write; null when none is recorded there. `level` is the
+ * activity-log level (INFO only for a passing check), `createdAt` an ISO instant (UTC), `metadata` the stored record (`{ report }`).
+ */
+export interface ArchiveSwitchoverCheckRow {
+  level: string
+  createdAt: string
+  metadata: unknown
+}
+
+export type ArchiveEvidence = { ok: true; evidence: string } | { ok: false; problem: string }
+
+/** What the preflight judges besides the target's environment: the target-resident evidence and the instant of the run. */
 export interface ArchivePreflightFacts {
   retirement: ArchiveRetirementRow | null
+  switchoverCheck: ArchiveSwitchoverCheckRow | null
   now: Date
 }
 
@@ -66,7 +81,9 @@ export interface WmsArchiveWriter {
    * the grant) and its own evidence that the incumbent's product sync is retired (`facts.retirement`, read from the target). Both evidences are
    * recorded with every write.
    */
-  preflight(facts: ArchivePreflightFacts): { ok: true; evidence: string; retirementEvidence: string } | { ok: false; problem: string }
+  preflight(facts: ArchivePreflightFacts): { ok: true; evidence: string; retirementEvidence: string; switchoverEvidence: string } | { ok: false; problem: string }
+  /** The writer's judgement of one switchover-check record at an instant (the preflight uses it, and the run again before each write). */
+  judgeSwitchoverCheck(row: ArchiveSwitchoverCheckRow | null, now: Date): ArchiveEvidence
 }
 
 export type ArchiveWriteOutcome = 'ATTEMPT' | 'VERIFIED' | 'FAILED'
@@ -89,6 +106,8 @@ export interface ArchiveWriteRecord {
   stepEvidence: string
   /** The target-resident evidence that the incumbent's product sync is retired, as the writer's preflight found it. */
   retirementEvidence: string
+  /** The target's passing switchover-check record, as judged right before this row's write (the preflight's for a row that did not get that far). */
+  switchoverEvidence: string
   problem: string | null
 }
 
@@ -103,6 +122,10 @@ export interface ArchiveExecuteDeps {
   stepEvidence: string
   /** The writer's preflight retirement evidence, recorded with every write. */
   retirementEvidence: string
+  /** The writer's preflight switchover-check evidence; each row records the evidence of its own re-check. */
+  switchoverEvidence: string
+  /** Reads the target's newest switchover-check record again and judges it (the writer's judgement). Called before each request that writes. */
+  switchoverCheckStillPasses: () => Promise<ArchiveEvidence>
   /** Reads the system switch again; true only when it still reads on. Called before each request that writes. */
   switchStillOn: () => Promise<boolean>
   /** Called once per line of progress. */
@@ -131,7 +154,7 @@ export async function executeArchivePlan(plan: ArchivePlan, deps: ArchiveExecute
   for (let index = 0; index < targets.length; index++) {
     const row = targets[index]!
     const productId = row.productId!
-    const base = { sku: row.sku, imsProductId: deps.imsProductIdOf(row.sku), wmsProductId: productId, wms: label, discontinuedBefore: false, operator: deps.operator, planToken: plan.token, sheetId: plan.sheetId, stepEvidence: deps.stepEvidence, retirementEvidence: deps.retirementEvidence }
+    const base = { sku: row.sku, imsProductId: deps.imsProductIdOf(row.sku), wmsProductId: productId, wms: label, discontinuedBefore: false, operator: deps.operator, planToken: plan.token, sheetId: plan.sheetId, stepEvidence: deps.stepEvidence, retirementEvidence: deps.retirementEvidence, switchoverEvidence: deps.switchoverEvidence }
     let attempted = false
     try {
       // 1. the product, read again right before the write
@@ -156,6 +179,14 @@ export async function executeArchivePlan(plan: ArchivePlan, deps: ArchiveExecute
         throw new Stop('the system switch could not be read again, so nothing was sent', false)
       }
       if (!on) throw new Stop('the system switch no longer reads on in the target, so nothing was sent', false)
+      let check: ArchiveEvidence
+      try {
+        check = await deps.switchoverCheckStillPasses()
+      } catch {
+        throw new Stop('the target\'s switchover-check record could not be read again, so nothing was sent', false)
+      }
+      if (!check.ok) throw new Stop(`the target's switchover check no longer passes, so nothing was sent: ${check.problem}`, false)
+      base.switchoverEvidence = check.evidence
       try {
         await deps.record({ ...base, outcome: 'ATTEMPT', discontinuedAfter: null, problem: null })
       } catch {

@@ -27,8 +27,16 @@
  * sync), and an M rollback hands back to the bridge. So the preflight also requires evidence that lives in the TARGET installation: the newest
  * `bridge-units-masked` writer attestation there (read in the command's READ ONLY transaction), judged exactly as `writers:check` judges it from step M
  * (lib/ops/writers-check.ts stepEvidenceFindings: units masked and inactive, report generated and recorded at or after the step-M instant, last trigger
- * before it), and generated no more than ARCHIVE_RETIREMENT_MAX_AGE_MS before the run (a rollback resumes the bridge, and an old report says nothing
- * about the host after it).
+ * before it), and generated no more than ARCHIVE_RETIREMENT_MAX_AGE_MS before the run (an old report says nothing about the host now).
+ *
+ * THE SWITCHOVER CHECK (#1129 R1 MED-1). A fresh attestation still passes when an M rollback resumes the bridge or the plugin BEFORE the live-from is
+ * unset, and a run started before a rollback would go on. So the run also requires the TARGET's own newest scheduled `writers:check` record (the
+ * `writers_check_recorded` activity-log row, lib/ops/writers-check-record.ts) to pass: level INFO and verdict ok, phase P2-M or later with step M live
+ * at the same instant as the target env file's, generated no more than ARCHIVE_SWITCHOVER_CHECK_MAX_AGE_MS before. That check reads what this command
+ * cannot (it never calls WooCommerce): the companion-plugin probe of the plugin and the bridge, and foreign Mintsoft orders. It is judged in the
+ * preflight and AGAIN before every POST (`judgeSwitchoverCheck`), so a failing check recorded during the run stops it before the next write. LIMIT: the
+ * check runs hourly, so a rollback is caught within the hour after it starts plus one run, not at once; rollback step 1 also turns the archive switch off
+ * (docs/woocommerce-live-runbook.md), which stops a run at its next write.
  *
  * Requests are sequential and paced (`MIN_INTERVAL_MS` between any two). Every failure is a short reason without the key, a URL or a response body;
  * Mintsoft's own `Message` is passed on, cut to 200 printable characters.
@@ -46,7 +54,8 @@ import { mintsoftEgressHold, mintsoftEgressRefusalText } from './producer-egress
 import { BRIDGE_ATTESTATION_KIND } from '@/lib/domain/writer-attestation/bridge-status'
 import { stepEvidenceFindings } from '@/lib/ops/writers-check'
 import { bridgeAttestationReading, stepLiveFrom } from '@/lib/ops/writers-check-step-evidence'
-import type { ArchivePreflightFacts, ArchiveRetirementRow } from '@/lib/first-load/wms-discontinue/execute'
+import { WRITERS_CHECK_PHASES } from '@/lib/security/writers-check-constants'
+import type { ArchiveEvidence, ArchivePreflightFacts, ArchiveRetirementRow, ArchiveSwitchoverCheckRow } from '@/lib/first-load/wms-discontinue/execute'
 
 export const ARCHIVE_USER_AGENT = 'onetwo3d-ims-first-load-archive/1'
 export const MIN_INTERVAL_MS = 1000
@@ -125,22 +134,50 @@ export function archiveRetirementEvidence(row: ArchiveRetirementRow | null, env:
   const reading = bridgeAttestationReading({ attestedAt: new Date(attestedMs), payload: row.payload })
   const findings = stepEvidenceFindings('BRIDGE_ATTESTATION', reading, flat, now).filter((f) => f.severity === 'fail')
   if (findings.length > 0) return { ok: false, problem: `the target's newest ${ARCHIVE_RETIREMENT_ATTESTATION_KIND} attestation does not show the bridge retired, as writers:check judges it: ${findings.map((f) => f.message).join(' ')}` }
+  // Defence in depth (#1129 R1 LOW-4): with step M live the check requires this kind, so any reading but a clean `present` one already gave a finding above.
   if (reading.state !== 'present' || reading.generatedAt === undefined) return { ok: false, problem: `the target's newest ${ARCHIVE_RETIREMENT_ATTESTATION_KIND} attestation cannot be read` }
   const generatedMs = Date.parse(reading.generatedAt)
   if (!(now.getTime() - generatedMs <= ARCHIVE_RETIREMENT_MAX_AGE_MS)) return { ok: false, problem: `the target's newest ${ARCHIVE_RETIREMENT_ATTESTATION_KIND} report was generated at ${reading.generatedAt}, more than 24 hours before this run, so it says nothing about the bridge now (an M rollback resumes it): ${remedy}` }
   return { ok: true, evidence: `${ARCHIVE_RETIREMENT_ATTESTATION_KIND} attestation recorded ${reading.at} in the target (report generated ${reading.generatedAt}, last trigger ${reading.lastTriggerAt ?? 'never'}; units masked and inactive), judged as writers:check judges it against MINTSOFT_WRITES_LIVE_FROM ${liveFrom.toISOString()}` }
 }
 
+/** The target's scheduled writers:check record must have been generated at most this long before the run and before each write (the check runs hourly). */
+export const ARCHIVE_SWITCHOVER_CHECK_MAX_AGE_MS = 6 * 3_600_000
+/** A record stamped later than this after the instant of the run is refused (clock skew allowance). */
+const SWITCHOVER_CHECK_MAX_FUTURE_MS = 5 * 60_000
+
+/**
+ * The target's newest scheduled writers:check record (#1129 R1 MED-1), judged at `now` under the target's environment: it must be a PASSING check (level
+ * INFO and verdict ok), of phase P2-M or later with step M live at the same instant as the target env file's, generated within
+ * ARCHIVE_SWITCHOVER_CHECK_MAX_AGE_MS. Sends nothing.
+ */
+export function archiveSwitchoverCheckEvidence(row: ArchiveSwitchoverCheckRow | null, env: OutboundEnv, now: Date): ArchiveEvidence {
+  const remedy = 'let the target\'s scheduled Writers Coexistence Check (cron writers-check) run and pass, and run again'
+  if (row === null) return { ok: false, problem: `the target installation holds no writers:check record, so nothing there shows the switchover check passing: ${remedy}` }
+  const report = record(record(row.metadata)?.report)
+  if (row.level !== 'INFO' || report === null || report.verdict !== 'ok') return { ok: false, problem: `the target's newest writers:check record did not pass (level ${mintsoftMessage(row.level)}, verdict ${mintsoftMessage(report?.verdict)}): the incumbents are not shown stopped, as after an M rollback that resumed the bridge or the plugin. Resolve its findings first` }
+  const generatedMs = typeof report.generatedAt === 'string' ? Date.parse(report.generatedAt) : Number.NaN
+  if (!Number.isFinite(generatedMs) || generatedMs > now.getTime() + SWITCHOVER_CHECK_MAX_FUTURE_MS) return { ok: false, problem: 'the target\'s newest writers:check record carries a generation time that cannot be read, or one in the future' }
+  if (now.getTime() - generatedMs > ARCHIVE_SWITCHOVER_CHECK_MAX_AGE_MS) return { ok: false, problem: `the target's newest writers:check record was generated at ${new Date(generatedMs).toISOString()}, more than 6 hours before this run: ${remedy}` }
+  const phaseRank = WRITERS_CHECK_PHASES.indexOf(report.phase as (typeof WRITERS_CHECK_PHASES)[number])
+  if (phaseRank < WRITERS_CHECK_PHASES.indexOf('P2-M')) return { ok: false, problem: `the target's newest writers:check record is of phase ${mintsoftMessage(report.phase)}, not P2-M or later: step M was not live when it ran` }
+  const liveFrom = stepLiveFrom(env as Record<string, string | undefined>, 'mintsoft')
+  const step = Array.isArray(report.steps) ? report.steps.map(record).find((entry) => entry?.step === 'mintsoft') : undefined
+  if (!(liveFrom instanceof Date) || step?.state !== 'live' || step.liveFrom !== liveFrom.toISOString()) return { ok: false, problem: 'the target\'s newest writers:check record does not show step M live at the instant the target env file names (MINTSOFT_WRITES_LIVE_FROM changed since, or the check ran under another environment)' }
+  return { ok: true, evidence: `writers:check record of the target: verdict ok, phase ${String(report.phase)}, generated ${new Date(generatedMs).toISOString()}, step M live since ${liveFrom.toISOString()}` }
+}
+
 /**
  * Before anything is read for the write (#1128 R1 LOW-2, MED-3; R2 MED-A): on the TARGET's environment, the ownership row `product.discontinue` is LIVE
  * (the Mintsoft step is live: the grant is set and its live-from instant reached), the outbound-write grant admits `POST /api/Product` to exactly this
- * tenant, and the target holds the evidence that the bridge and the plugin's product sync are retired (`archiveRetirementEvidence`). A string refuses
+ * tenant, the target holds the evidence that the bridge and the plugin's product sync are retired (`archiveRetirementEvidence`), and its own scheduled
+ * writers:check passed recently (`archiveSwitchoverCheckEvidence`). A string refuses
  * (nothing sent); both evidences are recorded with every write.
  *
  * The producer-hold check here is defence in depth and cannot refuse on its own (#1128 R2 LOW-H): a LIVE disposition is exactly the live phase the
  * hold releases, so with the disposition LIVE the hold never holds Mintsoft. It is kept so a change to either rule fails closed.
  */
-export function archivePreflight(config: MintsoftReviewConfig, env: OutboundEnv, facts: ArchivePreflightFacts): { ok: true; evidence: string; retirementEvidence: string } | { ok: false; problem: string } {
+export function archivePreflight(config: MintsoftReviewConfig, env: OutboundEnv, facts: ArchivePreflightFacts): { ok: true; evidence: string; retirementEvidence: string; switchoverEvidence: string } | { ok: false; problem: string } {
   const decision = explainProducerDisposition('mintsoft', 'product.discontinue', undefined, { env })
   if (decision.disposition !== 'LIVE') return { ok: false, problem: `the Mintsoft step (M) is not live in the target installation (producer decision ${decision.disposition}: ${decision.reason}): the woo-mintsoft plugin's product sync, which may reset DisCont, is not retired there. Set MINTSOFT_WRITE_ALLOWED and MINTSOFT_WRITES_LIVE_FROM in the target's env file at the cut-over first` }
   if (mintsoftEgressHold({ env }).held) return { ok: false, problem: 'the producer hold holds Mintsoft in the target installation' }
@@ -149,7 +186,9 @@ export function archivePreflight(config: MintsoftReviewConfig, env: OutboundEnv,
   if (refusal !== null) return { ok: false, problem: `the target's outbound-write grant does not admit POST /api/Product to the credentials file's tenant (${refusal.code}): MINTSOFT_WRITE_ALLOWED in the target env file must name exactly this base URL and client id` }
   const retired = archiveRetirementEvidence(facts.retirement, env, facts.now)
   if (!retired.ok) return retired
-  return { ok: true, evidence: `Mintsoft step live in the target since ${decision.cutoff === null ? 'unknown' : decision.cutoff.toISOString()} (producer decision LIVE, ${decision.phase}, owner ${decision.owner})`, retirementEvidence: retired.evidence }
+  const checked = archiveSwitchoverCheckEvidence(facts.switchoverCheck, env, facts.now)
+  if (!checked.ok) return checked
+  return { ok: true, evidence: `Mintsoft step live in the target since ${decision.cutoff === null ? 'unknown' : decision.cutoff.toISOString()} (producer decision LIVE, ${decision.phase}, owner ${decision.owner})`, retirementEvidence: retired.evidence, switchoverEvidence: checked.evidence }
 }
 
 /**
@@ -347,6 +386,7 @@ export function createMintsoftArchiveWriter(config: MintsoftReviewConfig, deps: 
     },
     changedFields: changedMintsoftProductFields,
     preflight: (facts) => archivePreflight(config, deps.env, facts),
+    judgeSwitchoverCheck: (row, now) => archiveSwitchoverCheckEvidence(row, deps.env, now),
   }
 }
 

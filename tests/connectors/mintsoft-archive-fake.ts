@@ -8,7 +8,7 @@ import http from 'node:http'
 import type { AddressInfo } from 'node:net'
 import type { MintsoftReviewConfig } from '../../lib/connectors/mintsoft/lifecycle-review-read.ts'
 import { bridgePayloadFromReport, parseBridgeStatusOutput } from '../../lib/domain/writer-attestation/bridge-status.ts'
-import type { ArchiveRetirementRow } from '../../lib/first-load/wms-discontinue/execute.ts'
+import type { ArchiveRetirementRow, ArchiveSwitchoverCheckRow } from '../../lib/first-load/wms-discontinue/execute.ts'
 import { sampleReport } from '../ops/bridge-status-fixtures.ts'
 
 export const KEY = 'ms_fixed_key_archive_0123456789_test_only'
@@ -113,4 +113,18 @@ export function retirementRow(options: { now?: number; generatedAt?: string; att
   const parsed = parseBridgeStatusOutput(raw)
   if (!parsed.ok) throw new Error(`the synthetic bridge report does not parse: ${parsed.error}`)
   return { attestedAt: options.attestedAt ?? new Date(Date.parse(generatedAt) + 5 * 60_000).toISOString(), payload: bridgePayloadFromReport(parsed.report, raw) }
+}
+
+/**
+ * The target's newest scheduled writers:check record as the command reads it (#1129 R1 MED-1): by default a PASSING check (level INFO, verdict ok,
+ * phase P2-M, step M live since LIVE_FROM) generated ten minutes before `now`. `report` overrides fields of the stored report.
+ */
+export function switchoverCheckRow(options: { now?: number; level?: string; generatedAt?: string; report?: Record<string, unknown> } = {}): ArchiveSwitchoverCheckRow {
+  const now = options.now ?? Date.now()
+  const generatedAt = options.generatedAt ?? new Date(now - 10 * 60_000).toISOString()
+  return {
+    level: options.level ?? 'INFO',
+    createdAt: generatedAt,
+    metadata: { report: { schemaVersion: 1, generatedAt, phase: 'P2-M', verdict: 'ok', steps: [{ step: 'mintsoft', env: 'MINTSOFT_WRITES_LIVE_FROM', liveFrom: new Date(LIVE_FROM).toISOString(), state: 'live' }, { step: 'woocommerce', env: 'WC_WRITES_LIVE_FROM', liveFrom: null, state: 'unset' }, { step: 'xero', env: 'XERO_WRITES_LIVE_FROM', liveFrom: null, state: 'unset' }], findings: [], ...options.report } },
+  }
 }
