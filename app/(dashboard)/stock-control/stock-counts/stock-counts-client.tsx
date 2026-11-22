@@ -59,6 +59,7 @@ export function StockCountsClient({
   initialVarianceTab,
   initialVarianceSort,
   initialOpenCountId,
+  reasonCostRequired = false,
 }: {
   initialCounts: StockCountRow[]
   warehouses: Warehouse[]
@@ -67,6 +68,8 @@ export function StockCountsClient({
   initialVarianceTab: VarianceTab
   initialVarianceSort: VarianceSort
   initialOpenCountId: string | null
+  /** o3d-0ypv9: switch `stock_adjustment_reason_cost_required` (off by default). */
+  reasonCostRequired?: boolean
 }) {
   const router = useRouter()
   const pathname = usePathname()
@@ -150,6 +153,7 @@ export function StockCountsClient({
                   key={count.id}
                   count={count}
                   reasons={reasons}
+                  reasonCostRequired={reasonCostRequired}
                   expanded={expandedId === count.id}
                   onToggle={() => { const next = expandedId === count.id ? null : count.id; setExpandedId(next); writeUrl({ count: next }) }}
                   threshold={smallVarianceThreshold}
@@ -246,10 +250,11 @@ function NewCountDialog({ warehouses, onClose, onCreated }: { warehouses: Wareho
 }
 
 function StockCountRowView({
-  count, reasons, expanded, onToggle, onChanged, threshold, varianceTab, varianceSort, onVarianceTab, onVarianceSort,
+  count, reasons, expanded, onToggle, onChanged, threshold, varianceTab, varianceSort, onVarianceTab, onVarianceSort, reasonCostRequired,
 }: {
   count: StockCountRow
   reasons: AdjustmentReasonOption[]
+  reasonCostRequired: boolean
   expanded: boolean
   onToggle: () => void
   onChanged: (message?: string) => void
@@ -519,7 +524,7 @@ function StockCountRowView({
                   {count.reconciledAt ? 'Refresh reconciliation' : 'Reconcile'}
                 </Button>
                 <Select value={reasonId} onChange={(e) => setReasonId(e.target.value)} className="h-8 text-xs w-48">
-                  <option value="">Variance reason (optional)</option>
+                  <option value="">{reasonCostRequired ? 'Variance reason (default: Stock count)' : 'Variance reason (optional)'}</option>
                   {reasons.map((r) => <option key={r.id} value={r.id}>{r.name}</option>)}
                 </Select>
                 <Button

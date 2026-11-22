@@ -1,5 +1,5 @@
 import type { Metadata } from 'next'
-import { getWarehouses, getActiveAdjustmentReasons } from '@/app/actions/stock'
+import { getWarehouses, getActiveAdjustmentReasons, getStockAdjustmentReasonCostRequired } from '@/app/actions/stock'
 import { getStockCounts, getStockCountSmallVarianceThreshold } from '@/app/actions/stock-counts'
 import { parseVarianceSort, parseVarianceTab } from '@/lib/domain/inventory/stock-count-triage'
 import { StockCountsClient } from './stock-counts-client'
@@ -11,11 +11,12 @@ const first = (v: string | string[] | undefined) => (Array.isArray(v) ? v[0] : v
 
 export default async function StockCountsPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
   const params = await searchParams
-  const [counts, warehouses, reasons, threshold] = await Promise.all([
+  const [counts, warehouses, reasons, threshold, reasonCostRequired] = await Promise.all([
     getStockCounts(),
     getWarehouses(),
     getActiveAdjustmentReasons(),
     getStockCountSmallVarianceThreshold(),
+    getStockAdjustmentReasonCostRequired(),
   ])
   return (
     <StockCountsClient
@@ -26,6 +27,7 @@ export default async function StockCountsPage({ searchParams }: { searchParams: 
       initialVarianceTab={parseVarianceTab(first(params.vtab))}
       initialVarianceSort={parseVarianceSort(first(params.vsort))}
       initialOpenCountId={first(params.count) ?? null}
+      reasonCostRequired={reasonCostRequired}
     />
   )
 }

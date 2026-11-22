@@ -2,6 +2,7 @@ import { db } from '@/lib/db'
 import { buildTemplateCsv, toCsv, csvResponse } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
+import { readStockAdjustmentReasonCostRequired } from '@/lib/domain/inventory/stock-adjustment-policy'
 
 // unitCost (base currency) is optional but REQUIRED for a positive adjustment of a
 // product with no existing cost basis (cogs-audit scjz.2); blank uses the derived
@@ -19,6 +20,14 @@ export async function GET(req: Request) {
   const templateOnly = url.searchParams.get('template') === '1'
 
   if (templateOnly) {
+    // o3d-0ypv9: with `stock_adjustment_reason_cost_required` on, the import needs a reason on every row, so the template
+    // carries a required `reason` column (an adjustment reason's name). Off: the template is unchanged.
+    if (await readStockAdjustmentReasonCostRequired(db)) {
+      return csvResponse(
+        buildTemplateCsv([...TEMPLATE_HEADERS, 'reason'], [...REQUIRED_HEADERS, 'reason']),
+        'adjustments-import-template.csv',
+      )
+    }
     return csvResponse(buildTemplateCsv(TEMPLATE_HEADERS, REQUIRED_HEADERS), 'adjustments-import-template.csv')
   }
 

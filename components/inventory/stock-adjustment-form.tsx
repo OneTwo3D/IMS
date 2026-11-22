@@ -1,12 +1,13 @@
 'use client'
 
-import { useActionState, useEffect, useState } from 'react'
+import { type ChangeEvent, useActionState, useEffect, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Select } from '@/components/ui/select'
-import { adjustStock, type AdjustmentReasonOption } from '@/app/actions/stock'
+import { adjustStock, getAdjustmentDefaultUnitCosts, type AdjustmentDefaultUnitCost, type AdjustmentReasonOption } from '@/app/actions/stock'
+import { describeDefaultUnitCost } from '@/components/inventory/adjustment-default-cost'
 
 type Warehouse = { id: string; code: string; name: string; type: string }
 
@@ -14,9 +15,11 @@ type Props = {
   productId: string
   warehouses: Warehouse[]
   reasons: AdjustmentReasonOption[]
+  /** o3d-0ypv9: switch `stock_adjustment_reason_cost_required`. Off (the default) renders the form exactly as before. */
+  reasonCostRequired?: boolean
 }
 
-export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
+export function StockAdjustmentForm({ productId, warehouses, reasons, reasonCostRequired = false }: Props) {
   const router = useRouter()
   // formKey resets the form by remounting it after a successful save
   const [formKey, setFormKey] = useState(0)
@@ -52,13 +55,27 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
       // token stays attached until now, but the submit button is disabled while the
       // success message shows, so it can't be reused).
       setIdempotencyToken(crypto.randomUUID())
+      setWarehouseId(warehouses[0]?.id ?? '')
       setFormKey((k) => k + 1)
       setSuccessMsg('')
     }, 1500)
     return () => clearTimeout(t)
-  }, [state.success, router])
+  }, [state.success, router, warehouses])
 
   const hasReasons = reasons.length > 0
+  // o3d-0ypv9 (switch on): show the unit cost a blank addition defaults to (the latest cost layer, never an average).
+  const [warehouseId, setWarehouseId] = useState(warehouses[0]?.id ?? '')
+  const [costDefault, setCostDefault] = useState<{ key: string; value: AdjustmentDefaultUnitCost | null } | null>(null)
+  const costKey = `${productId}:${warehouseId}`
+  useEffect(() => {
+    if (!reasonCostRequired || !warehouseId) return
+    let cancelled = false
+    getAdjustmentDefaultUnitCosts([{ productId, warehouseId }])
+      .then((rows) => { if (!cancelled) setCostDefault({ key: costKey, value: rows[0] ?? null }) })
+      .catch(() => { if (!cancelled) setCostDefault({ key: costKey, value: null }) })
+    return () => { cancelled = true }
+  }, [reasonCostRequired, productId, warehouseId, costKey, formKey])
+  const currentDefault = costDefault?.key === costKey ? costDefault.value : undefined
 
   return (
     <div className="space-y-3">
@@ -76,7 +93,12 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
         <div className="grid grid-cols-2 gap-3">
           <div className="space-y-1">
             <Label htmlFor="adj-warehouse" className="text-xs">Warehouse</Label>
-            <Select id="adj-warehouse" name="warehouseId" className="h-8 text-xs">
+            <Select
+              id="adj-warehouse"
+              name="warehouseId"
+              className="h-8 text-xs"
+              {...(reasonCostRequired ? { onChange: (e: ChangeEvent<HTMLSelectElement>) => setWarehouseId(e.target.value) } : {})}
+            >
               {warehouses.map((w) => (
                 <option key={w.id} value={w.id}>
                   {w.code} — {w.name}
@@ -107,7 +129,11 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
         <div className="space-y-1">
           <Label htmlFor="adj-unit-cost" className="text-xs">
             Unit cost{' '}
-            <span className="text-muted-foreground">(base currency — required for additions of a product with no existing cost; 0 for samples)</span>
+            {reasonCostRequired ? (
+              <span className="text-muted-foreground">(base currency — for additions; leave blank to use the latest cost layer&apos;s unit cost; 0 only for genuinely free stock)</span>
+            ) : (
+              <span className="text-muted-foreground">(base currency — required for additions of a product with no existing cost; 0 for samples)</span>
+            )}
           </Label>
           <Input
             id="adj-unit-cost"
@@ -115,10 +141,13 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
             type="number"
             step="any"
             min="0"
-            placeholder="leave blank to use average cost"
+            placeholder={reasonCostRequired ? describeDefaultUnitCost(currentDefault).placeholder : 'leave blank to use average cost'}
             className="h-8 text-xs"
             aria-invalid={!!state.errors?.unitCostBase}
           />
+          {reasonCostRequired && currentDefault !== undefined && (
+            <p className="text-xs text-muted-foreground" data-testid="adj-unit-cost-default">{describeDefaultUnitCost(currentDefault).hint}</p>
+          )}
           {state.errors?.unitCostBase && (
             <p className="text-xs text-destructive">{state.errors.unitCostBase[0]}</p>
           )}
@@ -143,6 +172,11 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
               className="h-8 text-xs mt-1"
             />
           </div>
+        ) : reasonCostRequired ? (
+          <p className="text-xs text-destructive">
+            Every stock adjustment needs a reason. Add an adjustment reason (with its account) in{' '}
+            <a href="/settings" className="underline hover:no-underline">Settings</a> first.
+          </p>
         ) : (
           <div className="space-y-1">
             <Label htmlFor="adj-note" className="text-xs">
@@ -164,7 +198,7 @@ export function StockAdjustmentForm({ productId, warehouses, reasons }: Props) {
         {/* 0tr0: stay disabled through the post-success window (until the form
             remounts and mints a new token). Otherwise an edit-and-resubmit in that
             window reuses the same token and the new adjustment is silently deduped. */}
-        <Button type="submit" size="sm" disabled={isPending || !!successMsg}>
+        <Button type="submit" size="sm" disabled={isPending || !!successMsg || (reasonCostRequired && !hasReasons)}>
           {isPending ? 'Saving…' : 'Apply Adjustment'}
         </Button>
       </form>

@@ -1312,6 +1312,13 @@ async function importAdjustmentsCsvInner(formData: FormData): Promise<CsvImportA
   const warehouses = await db.warehouse.findMany({ select: { id: true, code: true } })
   const codeToWarehouseId = new Map(warehouses.map((w) => [w.code.toUpperCase(), w.id]))
   const { applyStockAdjustment } = await import('@/lib/domain/inventory/stock-adjustment-apply')
+  // o3d-0ypv9 (switch `stock_adjustment_reason_cost_required`, off by default): every row needs a `reason` column naming an active
+  // adjustment reason (by name, or its id). Off: the column is not read, exactly as before.
+  const { matchAdjustmentReason, readStockAdjustmentReasonCostRequired } = await import('@/lib/domain/inventory/stock-adjustment-policy')
+  const reasonRequired = await readStockAdjustmentReasonCostRequired(db)
+  const activeReasons = reasonRequired
+    ? await db.adjustmentReason.findMany({ where: { active: true }, select: { id: true, name: true } })
+    : []
 
   for (let i = 0; i < rows.length; i++) {
     const row = rows[i]
@@ -1348,6 +1355,13 @@ async function importAdjustmentsCsvInner(formData: FormData): Promise<CsvImportA
     }
     const unitCostBase = unitCostStr != null && unitCostStr !== '' ? Number(unitCostStr) : undefined
 
+    let reasonId: string | undefined
+    if (reasonRequired) {
+      const match = matchAdjustmentReason(row['reason'], activeReasons)
+      if (!match.ok) { result.errors.push(`Row ${lineNum}: ${match.message}`); result.skipped++; continue }
+      reasonId = match.reasonId
+    }
+
     try {
       if (!preview) {
         await db.$transaction(async (tx) => {
@@ -1358,6 +1372,7 @@ async function importAdjustmentsCsvInner(formData: FormData): Promise<CsvImportA
             qty,
             note,
             unitCostBase,
+            ...(reasonId ? { reasonId } : {}),
           })
         })
       }

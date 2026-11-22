@@ -31,6 +31,7 @@ import {
   buildStockMovementValueFieldsFromConsumed,
 } from '@/lib/domain/inventory/stock-movement-value'
 import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
+import { getLatestLayerUnitCost, readStockAdjustmentReasonCostRequired } from '@/lib/domain/inventory/stock-adjustment-policy'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -633,9 +634,20 @@ export async function updateAdjustmentMovement(
         // Only a removal→addition edit (no original addition layer to inherit a
         // cost from) falls back to the derived warehouse/historical average.
         const originalUnitCost = oldIsAddition ? Number(movement.adjustmentLayers[0]?.unitCostBase) : NaN
-        let unitCostBase: number
+        let unitCostBase: number | Prisma.Decimal
         if (Number.isFinite(originalUnitCost) && originalUnitCost >= 0) {
           unitCostBase = originalUnitCost
+        } else if (await readStockAdjustmentReasonCostRequired(tx)) {
+          // o3d-0ypv9 (switch on): a removal edited into an addition is valued at the latest cost layer's unit cost, never an
+          // average. With no costed layer to default to, the edit is refused: there is no unit cost box on an edit.
+          const latest = await getLatestLayerUnitCost(tx, movement.productId, newWarehouseId)
+          if (!latest) {
+            throw new Error(
+              'This edit would turn a removal into an addition, and the product has no cost layer with a cost to value it at. '
+              + 'Create a new adjustment with a unit cost instead of editing this one.',
+            )
+          }
+          unitCostBase = latest.unitCostBase
         } else {
           const warehouseAvgCost = await getAverageUnitCost(tx, movement.productId, newWarehouseId)
           unitCostBase = warehouseAvgCost > 0 ? warehouseAvgCost : await getHistoricalAverageUnitCost(tx, movement.productId)
@@ -876,6 +888,52 @@ export async function getActiveAdjustmentReasons(): Promise<AdjustmentReasonOpti
     orderBy: [{ sortOrder: 'asc' }, { name: 'asc' }],
     select: { id: true, name: true, accountCode: true },
   })
+}
+
+// ---------------------------------------------------------------------------
+// o3d-0ypv9: reason and unit cost required (switch `stock_adjustment_reason_cost_required`, off by default)
+// ---------------------------------------------------------------------------
+
+/** Whether the adjustment forms must offer no "No reason" choice and show the latest-layer cost default. */
+export async function getStockAdjustmentReasonCostRequired(): Promise<boolean> {
+  await requireInternalUser()
+  return readStockAdjustmentReasonCostRequired(db)
+}
+
+export type AdjustmentDefaultUnitCost = {
+  productId: string
+  warehouseId: string
+  /** The latest cost layer's unit cost (6dp, base currency), or null when there is none or the user may not see costs. */
+  unitCostBase: string | null
+  /** True when a default exists, even if its figure is withheld from this user. */
+  hasDefault: boolean
+  source: 'warehouse' | 'any_warehouse' | null
+}
+
+/**
+ * The unit cost a blank addition would be booked at with the switch on: the latest cost layer's unit cost in that warehouse,
+ * else in any warehouse. Read-only. The figure is withheld from roles that may not read cost figures; they still learn
+ * whether a default exists, so the form can say a unit cost must be entered.
+ */
+export async function getAdjustmentDefaultUnitCosts(
+  pairs: Array<{ productId: string; warehouseId: string }>,
+): Promise<AdjustmentDefaultUnitCost[]> {
+  const session = await requirePermission('stock_control.adjust')
+  const parsed = z.array(z.object({ productId: z.string().min(1), warehouseId: z.string().min(1) })).max(200).safeParse(pairs)
+  if (!parsed.success) return []
+  const showCost = canViewDashboardCostFigures(session.user.role)
+  const out: AdjustmentDefaultUnitCost[] = []
+  for (const pair of parsed.data) {
+    const latest = await getLatestLayerUnitCost(db, pair.productId, pair.warehouseId)
+    out.push({
+      productId: pair.productId,
+      warehouseId: pair.warehouseId,
+      unitCostBase: latest && showCost ? latest.unitCostBase.toFixed(6) : null,
+      hasDefault: latest != null,
+      source: latest?.source ?? null,
+    })
+  }
+  return out
 }
 
 // ---------------------------------------------------------------------------

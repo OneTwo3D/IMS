@@ -19,6 +19,7 @@ import {
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { enabledWmsConnectorIds } from '@/lib/connectors/wms/enabled-connector'
 import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
+import { matchAdjustmentReason, readStockAdjustmentReasonCostRequired, STOCK_COUNT_REASON_NAME } from '@/lib/domain/inventory/stock-adjustment-policy'
 import {
   STOCK_COUNTABLE_PRODUCT_TYPES,
   checkLineAddition,
@@ -718,6 +719,21 @@ export async function postStockCount(input: unknown): Promise<StockCountResult> 
       }
 
       const postings = computeStockCountPostings(countedLines, liveBook)
+      // o3d-0ypv9 (switch `stock_adjustment_reason_cost_required`, off by default): every variance is an adjustment and needs a
+      // reason. With none chosen, the count posts under the active reason called "Stock count"; with no such reason it is
+      // refused before anything is booked. Off: the chosen reason or none, exactly as before.
+      let postingReasonId = reasonId
+      if (!postingReasonId && postings.some((p) => p.adjustmentQty !== 0) && await readStockAdjustmentReasonCostRequired(tx)) {
+        const candidates = await tx.adjustmentReason.findMany({ where: { active: true }, select: { id: true, name: true } })
+        const match = matchAdjustmentReason(STOCK_COUNT_REASON_NAME, candidates)
+        if (!match.ok) {
+          throw new Error(
+            `Choose a variance reason, or add an active adjustment reason called "${STOCK_COUNT_REASON_NAME}" (with its account) in Settings: `
+            + `every stock count variance is a stock adjustment and needs a reason (${match.message}). Nothing was posted.`,
+          )
+        }
+        postingReasonId = match.reasonId
+      }
       for (const posting of postings) {
         if (posting.adjustmentQty !== 0) {
           try {
@@ -726,7 +742,7 @@ export async function postStockCount(input: unknown): Promise<StockCountResult> 
               productId: posting.productId,
               warehouseId: count.warehouseId,
               qty: posting.adjustmentQty,
-              reasonId,
+              reasonId: postingReasonId,
               note: `Stock count ${countId}`,
               referenceType: 'StockCount',
               referenceId: countId,

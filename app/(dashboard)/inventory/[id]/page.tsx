@@ -3,7 +3,7 @@ import { notFound } from 'next/navigation'
 import { ChevronRight, Package, Layers, SlidersHorizontal } from 'lucide-react'
 import { db } from '@/lib/db'
 import { getProduct, getVariableProducts, listProductCategories, listProductSupplierOptions, updateProduct, getProductOptions, getProductSuppliers, getProductComponents, getKitStock } from '@/app/actions/products'
-import { getWarehouses, getActiveAdjustmentReasons } from '@/app/actions/stock'
+import { getWarehouses, getActiveAdjustmentReasons, getStockAdjustmentReasonCostRequired } from '@/app/actions/stock'
 import { getStockUnitOptions } from '@/app/actions/settings'
 import { getPendingHsProposalForProduct } from '@/app/actions/hs-proposals'
 import { ProductForm } from '@/components/inventory/product-form'
@@ -91,6 +91,7 @@ export default async function ProductDetailPage({
   const locationBuffers = holdsOwnStock ? await getLocationBuffers(id) : null
   const reorderThresholds = holdsOwnStock ? await getWarehouseReorderThresholds(id) : null
   const customFields = await getCustomFieldCardData('PRODUCT', id)
+  const reasonCostRequired = await getStockAdjustmentReasonCostRequired()
 
   const [productOptions, suppliers, productComponents, kitStock, hsProposal] = await Promise.all([
     product.type === 'VARIABLE' ? getProductOptions(id) : Promise.resolve([]),
@@ -301,6 +302,7 @@ export default async function ProductDetailPage({
                 productId={product.id}
                 warehouses={warehouses}
                 reasons={reasons}
+                reasonCostRequired={reasonCostRequired}
               />
             </Card>
           )}

@@ -1,6 +1,6 @@
 'use client'
 
-import { type KeyboardEvent as ReactKeyboardEvent, useRef, useState } from 'react'
+import { type KeyboardEvent as ReactKeyboardEvent, useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import { X, PackageSearch, Loader2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
@@ -17,6 +17,8 @@ import {
 import { bulkAdjustStock, type BulkAdjustLine } from '@/app/actions/stock'
 import type { ProductRow } from '@/app/actions/products'
 import type { AdjustmentReasonOption } from '@/app/actions/stock'
+import { getAdjustmentDefaultUnitCosts, type AdjustmentDefaultUnitCost } from '@/app/actions/stock'
+import { describeDefaultUnitCost } from '@/components/inventory/adjustment-default-cost'
 import { ProductLink } from '@/components/inventory/product-link'
 
 type Warehouse = { id: string; code: string; name: string }
@@ -26,6 +28,8 @@ type Props = {
   products: ProductRow[]
   reasons: AdjustmentReasonOption[]
   onClose: () => void
+  /** o3d-0ypv9: switch `stock_adjustment_reason_cost_required`. Off (the default) renders the dialog exactly as before. */
+  reasonCostRequired?: boolean
 }
 
 // The dialog tracks lines by their own stable `key`; the wire-level lineId is
@@ -41,7 +45,7 @@ type AdjLine = Omit<BulkAdjustLine, 'lineId' | 'qty' | 'note'> & {
   note: string
 }
 
-export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }: Props) {
+export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose, reasonCostRequired = false }: Props) {
   const router = useRouter()
   const [lines, setLines] = useState<AdjLine[]>([])
   const [nextKey, setNextKey] = useState(0)
@@ -57,6 +61,39 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }:
   const idempotencyTokenRef = useRef<string | null>(null)
 
   const defaultWarehouseId = warehouses[0]?.id ?? ''
+
+  // o3d-0ypv9 (switch on): the unit cost each line's blank addition defaults to (latest cost layer, never an average).
+  const [costDefaults, setCostDefaults] = useState<Record<string, AdjustmentDefaultUnitCost | null>>({})
+  const pairKey = (productId: string, warehouseId: string) => `${productId}:${warehouseId}`
+  const missingPairs = reasonCostRequired
+    ? [...new Map(lines
+        .filter((l) => !(pairKey(l.productId, l.warehouseId) in costDefaults))
+        .map((l) => [pairKey(l.productId, l.warehouseId), { productId: l.productId, warehouseId: l.warehouseId }])).values()]
+    : []
+  const missingKey = missingPairs.map((p) => pairKey(p.productId, p.warehouseId)).join('|')
+  useEffect(() => {
+    if (!missingKey) return
+    let cancelled = false
+    const pairs = missingKey.split('|').map((k) => { const [productId, warehouseId] = k.split(':'); return { productId: productId!, warehouseId: warehouseId! } })
+    getAdjustmentDefaultUnitCosts(pairs)
+      .then((rows) => {
+        if (cancelled) return
+        setCostDefaults((prev) => {
+          const next = { ...prev }
+          for (const p of pairs) next[pairKey(p.productId, p.warehouseId)] = rows.find((r) => r.productId === p.productId && r.warehouseId === p.warehouseId) ?? null
+          return next
+        })
+      })
+      .catch(() => {
+        if (cancelled) return
+        setCostDefaults((prev) => {
+          const next = { ...prev }
+          for (const p of pairs) next[pairKey(p.productId, p.warehouseId)] = null
+          return next
+        })
+      })
+    return () => { cancelled = true }
+  }, [missingKey])
 
   const searchResults = search.trim().length >= 1
     ? products
@@ -218,7 +255,7 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }:
                   </Select>
                   {reasons.length > 0 ? (
                     <Select value={line.reasonId} onChange={(e) => updateLine(line.key, 'reasonId', e.target.value)} aria-label="Reason" className="h-8 text-xs">
-                      <option value="">— No reason —</option>
+                      {!reasonCostRequired && <option value="">— No reason —</option>}
                       {reasons.map((r) => (<option key={r.id} value={r.id}>{r.name}</option>))}
                     </Select>
                   ) : (
@@ -243,9 +280,11 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }:
                     type="number" step="any" min="0"
                     value={line.unitCostBase == null ? '' : line.unitCostBase}
                     onChange={(e) => updateLine(line.key, 'unitCostBase', e.target.value === '' ? null : (Number(e.target.value) || 0))}
-                    placeholder="avg"
+                    placeholder={reasonCostRequired ? describeDefaultUnitCost(costDefaults[pairKey(line.productId, line.warehouseId)]).placeholder : 'avg'}
                     aria-label="Unit cost (base currency)"
-                    title="Unit cost (base currency). Required for a positive line when the product has no existing cost; 0 for samples."
+                    title={reasonCostRequired
+                      ? (describeDefaultUnitCost(costDefaults[pairKey(line.productId, line.warehouseId)]).hint || 'Unit cost (base currency). Blank uses the latest cost layer\'s unit cost; 0 only for genuinely free stock.')
+                      : 'Unit cost (base currency). Required for a positive line when the product has no existing cost; 0 for samples.'}
                     className="h-8 w-24 text-right text-sm font-mono"
                   />
                   <Button type="button" variant="ghost" size="icon" onClick={() => setLines((p) => p.filter((l) => l.key !== line.key))} aria-label={`Remove ${line.productSku}`} className="h-8 w-8 text-muted-foreground hover:text-destructive">
@@ -258,6 +297,11 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose }:
             </div>
           )}
 
+          {reasonCostRequired && lines.length > 0 && (
+            <p className="text-xs text-muted-foreground">
+              Every line needs a reason. A blank unit cost on an addition uses the latest cost layer&apos;s unit cost shown in the box; with none, enter one.
+            </p>
+          )}
           {result?.success && <p className="text-sm text-green-600 font-medium">{result.count} adjustment{result.count !== 1 ? 's' : ''} saved.</p>}
           {result?.message && <p className="text-sm text-destructive">{result.message}</p>}
         </div>

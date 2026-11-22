@@ -27,6 +27,8 @@ type Props = {
   products: ProductRow[]
   reasons: AdjustmentReasonOption[]
   history: AdjustmentMovementRow[]
+  /** o3d-0ypv9: switch `stock_adjustment_reason_cost_required` (off by default). */
+  reasonCostRequired?: boolean
 }
 
 function buildStockLevelsExportUrl(selectedWarehouseIds: string[], includeBundles: boolean) {
@@ -115,7 +117,7 @@ function StockLevelsExportMenu({ warehouses }: { warehouses: Warehouse[] }) {
   )
 }
 
-export function StockAdjustmentsClient({ warehouses, products, reasons, history }: Props) {
+export function StockAdjustmentsClient({ warehouses, products, reasons, history, reasonCostRequired = false }: Props) {
   const [showCreate, setShowCreate] = useState(false)
 
   return (
@@ -144,6 +146,7 @@ export function StockAdjustmentsClient({ warehouses, products, reasons, history 
           warehouses={warehouses}
           products={products}
           reasons={reasons}
+          reasonCostRequired={reasonCostRequired}
           onClose={() => setShowCreate(false)}
         />
       )}
