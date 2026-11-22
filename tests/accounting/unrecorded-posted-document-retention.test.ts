@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
-import { UNRECORDED_POSTED_DOCUMENT_ACTION } from '@/lib/domain/accounting/unrecorded-posted-document'
+import {
+  RETIRED_UNRECORDED_POSTED_DOCUMENT_ACTIONS,
+  UNRECORDED_POSTED_DOCUMENT_ACTION,
+} from '@/lib/domain/accounting/unrecorded-posted-document'
 import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-reallocation'
 
 // ---------------------------------------------------------------------------
@@ -90,4 +93,19 @@ test('Codex r2 medium 1: a shortened ERROR retention still cannot reach it', asy
   const exempt = errorDelete!.values.find((value): value is string[] => Array.isArray(value))
   assert.ok(exempt!.includes(UNRECORDED_POSTED_DOCUMENT_ACTION))
   settings.delete('activity_log_retention_error')
+})
+
+test('a retired connector\'s incident record is exempt from age-based deletion too', async () => {
+  // No remedy is rendered for these any more, but each is the only local trace of an effect that
+  // connector's ledger accepted. Mutation that kills this: spread the live list instead of the KEPT one.
+  settings.clear()
+  await purge()
+
+  const errorDelete = captured.find((query) => query.values[0] === 'ERROR')
+  const exempt = errorDelete!.values.find((value): value is string[] => Array.isArray(value))
+  assert.ok(exempt)
+  assert.equal(RETIRED_UNRECORDED_POSTED_DOCUMENT_ACTIONS.includes('quickbooks_posted_document_unrecorded'), true)
+  for (const action of RETIRED_UNRECORDED_POSTED_DOCUMENT_ACTIONS) {
+    assert.ok(exempt.includes(action), `${action} must be in the ERROR-level exemption`)
+  }
 })

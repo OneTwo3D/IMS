@@ -2075,6 +2075,13 @@ test('[o3d-0bfh r9] the operator documentation for these rows authorises no hand
   const scoped = paragraphs.filter((p) => /nothing to re-drive them|settle one of these rows by hand/i.test(p))
 
   assert.equal(scoped.length > 0, true, 'the documentation must still describe the stranded follow-up backlog')
+  // NOT VACUOUS: the doc must name the inbox section an operator is sent to, by its exact title, so
+  // deleting that paragraph (and leaving only an unrelated "by hand" sentence elsewhere) fails here
+  // rather than passing on whatever else matched the scope above.
+  assert.ok(
+    paragraphs.some((p) => p.includes('Accounting follow-ups owed, with nothing to re-drive them')),
+    'the documentation must name the "Accounting follow-ups owed, with nothing to re-drive them" section',
+  )
   for (const paragraph of scoped) {
     assertNoBannedInstruction(`help-docs/xero-sync.md (${paragraph.slice(0, 80).replace(/\s+/g, ' ')}…)`, paragraph)
   }

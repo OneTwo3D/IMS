@@ -2,6 +2,8 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 import {
+  KEPT_UNRECORDED_POSTED_DOCUMENT_ACTIONS,
+  RETIRED_UNRECORDED_POSTED_DOCUMENT_ACTIONS,
   UNRECORDED_POSTED_DOCUMENT_ACTION,
   UNRECORDED_POSTED_DOCUMENT_ACTIONS,
 } from '@/lib/domain/accounting/unrecorded-posted-document'
@@ -214,7 +216,7 @@ test('Codex HIGH: every preserved record survives the same reset, and is counted
   assert.match(breadcrumb.description, new RegExp(UNRECORDED_POSTED_DOCUMENT_ACTION), 'and names the Xero action')
   assert.deepEqual(
     (breadcrumb as unknown as { metadata?: { actions?: string[] } }).metadata?.actions,
-    [...UNRECORDED_POSTED_DOCUMENT_ACTIONS],
+    [...KEPT_UNRECORDED_POSTED_DOCUMENT_ACTIONS],
     'the metadata carries the whole list, so the breadcrumb is searchable for every one',
   )
 })
@@ -272,7 +274,7 @@ test('Codex r3 medium + HIGH: the exemption is in the DELETE, and it names the w
 
   assert.deepEqual(
     state.activityDeleteArgs,
-    { where: { action: { notIn: [...UNRECORDED_POSTED_DOCUMENT_ACTIONS] } } },
+    { where: { action: { notIn: [...KEPT_UNRECORDED_POSTED_DOCUMENT_ACTIONS] } } },
     'the reset must never issue an unrestricted activityLog.deleteMany({}), and never name one action alone',
   )
   const exempted = (state.activityDeleteArgs as { where: { action: { notIn: string[] } } }).where.action.notIn
@@ -754,4 +756,53 @@ test('ROUND 8: the per-incident record stops promising an id it does not carry',
   })
   assert.doesNotMatch(xeroOneId, /open both ids in Xero/)
   assert.match(xeroOneId, /ONE OF THE TWO IDS IS NOT RECORDED HERE/)
+})
+
+// ---------------------------------------------------------------------------
+// A RETIRED CONNECTOR'S INCIDENT RECORDS ARE KEPT AND COUNTED, THOUGH NO REMEDY IS SHOWN FOR THEM.
+//
+// The retired accounting connector wrote the same kind of record under its own action. Nothing
+// renders a remedy for it any more, but a stored row is still the only local trace of an effect that
+// ledger accepted, so a reset must not delete it — and the breadcrumb must say it is there.
+// Mutation that kills this: spread UNRECORDED_POSTED_DOCUMENT_ACTIONS (the live list) back into the
+// reset's delete, or drop the retired count from the breadcrumb.
+// ---------------------------------------------------------------------------
+
+const RETIRED_INCIDENT: ActivityRow = {
+  action: RETIRED_UNRECORDED_POSTED_DOCUMENT_ACTIONS[0]!,
+  level: 'ERROR',
+  metadata: { type: 'SALES_INVOICE', syncLogId: 'log-old', postedExternalId: '145' },
+  description: 'historical record written by a connector this build no longer ships',
+}
+
+test('a reset keeps a retired connector\'s incident record and counts it in the breadcrumb', async () => {
+  reset([RETIRED_INCIDENT, ORDINARY])
+
+  await runReset('full')
+
+  const kept = state.activity.filter((row) => row.action === RETIRED_INCIDENT.action)
+  assert.equal(kept.length, 1, 'the retired connector\'s record survives the reset')
+  assert.ok(!state.activity.some((row) => row.action === 'order_created'), 'ordinary history still goes')
+  const breadcrumb = state.activity.find((row) => row.action === 'database_reset_preserved_unrecorded_documents')
+  assert.ok(breadcrumb, 'a retired record alone is enough to leave the breadcrumb')
+  assert.match(breadcrumb.description, /1 further record\(s\)/)
+  assert.match(breadcrumb.description, new RegExp(RETIRED_INCIDENT.action), 'and it says what to search for')
+  assert.equal(
+    (breadcrumb as unknown as { metadata?: { retiredConnectorRecords?: number } }).metadata?.retiredConnectorRecords,
+    1,
+  )
+})
+
+test('a reset with both kinds keeps both, and counts the retired one separately', async () => {
+  reset([INCIDENT, RETIRED_INCIDENT, ORDINARY])
+
+  await runReset('transactions')
+
+  assert.equal(state.activity.filter((row) => row.action === UNRECORDED_POSTED_DOCUMENT_ACTION).length, 1)
+  assert.equal(state.activity.filter((row) => row.action === RETIRED_INCIDENT.action).length, 1)
+  const breadcrumb = state.activity.find((row) => row.action === 'database_reset_preserved_unrecorded_documents')
+  assert.ok(breadcrumb)
+  const metadata = (breadcrumb as unknown as { metadata: { preserved: number; retiredConnectorRecords: number } }).metadata
+  assert.equal(metadata.preserved, 1, 'the live count is still the live incidents only')
+  assert.equal(metadata.retiredConnectorRecords, 1)
 })

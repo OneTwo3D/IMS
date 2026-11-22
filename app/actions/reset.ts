@@ -23,6 +23,8 @@ import { drainOrderAttachmentFileDeletions, queueOrderAttachmentFilesInTx } from
 import {
   countUnrecordedIncidents,
   describePreservedUnrecordedIncidents,
+  KEPT_UNRECORDED_POSTED_DOCUMENT_ACTIONS,
+  RETIRED_UNRECORDED_POSTED_DOCUMENT_ACTIONS,
   UNRECORDED_POSTED_DOCUMENT_ACTIONS,
 } from '@/lib/domain/accounting/unrecorded-posted-document'
 
@@ -227,7 +229,10 @@ async function clearTransactionScope(guards: ResetGuards) {
   // either action name or any of the ledger ids; the description is the full incident and its remedy.
   // The breadcrumb below puts the count in the same list so nobody has to know to look, and it names
   // BOTH actions because a breadcrumb that names one is the same defect as an exemption that does.
-  await db.activityLog.deleteMany({ where: { action: { notIn: [...UNRECORDED_POSTED_DOCUMENT_ACTIONS] } } })
+  // KEPT, not just the live actions: a retired connector's incident records are kept and counted too —
+  // no remedy is rendered for them any more, but each is still the only trace of an effect its ledger
+  // accepted.
+  await db.activityLog.deleteMany({ where: { action: { notIn: [...KEPT_UNRECORDED_POSTED_DOCUMENT_ACTIONS] } } })
   // findMany, not count: the breadcrumb can no longer be written from an integer, because which
   // sentence each row earns is decided by its own metadata. The population is bounded by what
   // survived the delete above — incidents this rare are units, not pages.
@@ -235,14 +240,28 @@ async function clearTransactionScope(guards: ResetGuards) {
     where: { action: { in: [...UNRECORDED_POSTED_DOCUMENT_ACTIONS] } },
     select: { metadata: true },
   })
-  if (preservedRows.length > 0) {
+  // Counted, not classified: their metadata was written by code this build no longer has, so the
+  // breadcrumb names how many there are and where to find them rather than what each one is.
+  const retiredPreserved = await db.activityLog.count({
+    where: { action: { in: [...RETIRED_UNRECORDED_POSTED_DOCUMENT_ACTIONS] } },
+  })
+  if (preservedRows.length > 0 || retiredPreserved > 0) {
     const counts = countUnrecordedIncidents(preservedRows)
+    const retiredSentence = retiredPreserved > 0
+      ? `${retiredPreserved} further record(s) of the same kind, written by an accounting connector this `
+        + 'build no longer ships, were also kept. IMS shows no remedy for them; each is the only local trace '
+        + 'of an effect that ledger accepted. Search this log for '
+        + `${RETIRED_UNRECORDED_POSTED_DOCUMENT_ACTIONS.map((action) => `"${action}"`).join(' or ')}.`
+      : ''
     await logActivity({
       entityType: 'SYSTEM',
       tag: 'sync',
       action: 'database_reset_preserved_unrecorded_documents',
       level: 'WARNING',
-      description: describePreservedUnrecordedIncidents(counts),
+      description: [
+        preservedRows.length > 0 ? describePreservedUnrecordedIncidents(counts) : '',
+        retiredSentence,
+      ].filter(Boolean).join(' '),
       metadata: {
         preserved: preservedRows.length,
         ledgerDocuments: counts.LEDGER_DOCUMENT,
@@ -255,7 +274,8 @@ async function clearTransactionScope(guards: ResetGuards) {
         ledgerNonDocuments: counts.LEDGER_NON_DOCUMENT,
         noIdentifierSideEffects: counts.NO_IDENTIFIER_SIDE_EFFECT,
         unclassified: counts.UNCLASSIFIED,
-        actions: [...UNRECORDED_POSTED_DOCUMENT_ACTIONS],
+        retiredConnectorRecords: retiredPreserved,
+        actions: [...KEPT_UNRECORDED_POSTED_DOCUMENT_ACTIONS],
       },
     })
   }

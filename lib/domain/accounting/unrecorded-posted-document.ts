@@ -287,6 +287,25 @@ export const UNRECORDED_POSTED_DOCUMENT_ACTIONS: readonly string[] = [
 ]
 
 /**
+ * THE SAME KIND OF RECORD, WRITTEN BY A CONNECTOR THIS BUILD NO LONGER SHIPS.
+ *
+ * The QuickBooks connector wrote its own unrecorded-document incident under this action before it was
+ * retired. Nothing renders a remedy for it any more (the controls its remedy named are gone), but a
+ * stored row is still the only trace IMS holds of an effect that connector's ledger accepted, so it
+ * must never be deleted by age or by a factory reset. Literal strings, deliberately: there is no code
+ * left to import them from, and the list only ever grows.
+ */
+export const RETIRED_UNRECORDED_POSTED_DOCUMENT_ACTIONS: readonly string[] = [
+  'quickbooks_posted_document_unrecorded',
+]
+
+/** Every incident action an eraser must spare: the live ones and the retired ones. */
+export const KEPT_UNRECORDED_POSTED_DOCUMENT_ACTIONS: readonly string[] = [
+  ...UNRECORDED_POSTED_DOCUMENT_ACTIONS,
+  ...RETIRED_UNRECORDED_POSTED_DOCUMENT_ACTIONS,
+]
+
+/**
  * WHAT ONE PRESERVED INCIDENT ACTUALLY IS.
  *
  * `LEDGER_DOCUMENT` — a LIVE effect stands in Xero, with an id that opens it: a

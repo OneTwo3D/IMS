@@ -1,7 +1,7 @@
 import { db } from '@/lib/db'
 import { expectedDisposableDatabaseMarker } from '@/lib/disposable-database-marker'
 import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-reallocation'
-import { UNRECORDED_POSTED_DOCUMENT_ACTIONS } from '@/lib/domain/accounting/unrecorded-posted-document'
+import { KEPT_UNRECORDED_POSTED_DOCUMENT_ACTIONS } from '@/lib/domain/accounting/unrecorded-posted-document'
 import { WC_REFUND_PARK_RECOVERED_ACTION } from '@/lib/domain/sales/refund-park-recovery'
 import { ERASURE_RETAINED_ACTIONS } from '@/lib/domain/erasure/erasure-record'
 import {
@@ -41,7 +41,7 @@ const DEFAULTS: Record<string, number> = {
  * for one reference was the accident. Ageing it out does not expire a log line, it converts a recorded
  * duplicate into an invisible one — the exact outcome the branch that writes it exists to prevent.
  *
- * These are named by one value, `UNRECORDED_POSTED_DOCUMENT_ACTIONS`, and this list SPREADS it
+ * These are named by one value, `KEPT_UNRECORDED_POSTED_DOCUMENT_ACTIONS`, and this list SPREADS it
  * rather than listing its members: an exemption written as a single constant name looks complete,
  * compiles, passes its own test, and is wrong only for the member the author was not thinking about.
  *
@@ -88,7 +88,8 @@ const RETAINED_ACTIONS = [
   // o3d-peh1 r5 — the unrecorded-document records, spread from the one place they are named. Spreading
   // rather than listing members is the point: the factory reset, writing the same exemption from
   // memory, once named a single action and so deleted every incident record under another (Codex HIGH).
-  ...UNRECORDED_POSTED_DOCUMENT_ACTIONS,
+  // The KEPT list includes the retired connector's action, so its stored records are never aged out.
+  ...KEPT_UNRECORDED_POSTED_DOCUMENT_ACTIONS,
   // o3d-xnwu r14 — the kind-(3) entry. Independent of the two above: it is written by
   // `recoverParkedWcRefund` about a `shopping_sync_logs` row, never by an accounting post, so it
   // cannot collide with either unrecorded-document name.
