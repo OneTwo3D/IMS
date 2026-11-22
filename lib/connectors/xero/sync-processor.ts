@@ -6924,8 +6924,6 @@ export function fxReversalOfPostedRevaluationNotice(params: { sourceEntryId: str
     + 'counts the same movement twice until someone reverses it. Reverse that journal by hand in Xero, then mark the exception-inbox row handled.')
 }
 
-type FxRetirementSource = { status: string; externalTransactionId: string | null; connector: string } | null
-
 /**
  * THE ONE RETIREMENT OF A RETIRED FX JOURNAL ROW (REALISED_FX_JOURNAL / UNREALISED_FX_JOURNAL). Sends nothing in any branch.
  *
@@ -6990,7 +6988,7 @@ async function retireFxJournalRow(args: {
 
   // A reversal names the revaluation it undoes. Read BEFORE the retirement, so the report below states what the reversal was for.
   const sourceEntryId = !realised && kind === 'reversal' && typeof payload.sourceEntryId === 'string' ? payload.sourceEntryId : null
-  const source: FxRetirementSource = sourceEntryId
+  const source = sourceEntryId
     ? await db.accountingSyncLog.findUnique({ where: { id: sourceEntryId }, select: { status: true, externalTransactionId: true, connector: true } })
     : null
   const sourcePosted = source !== null && source.connector === XERO_CONNECTOR && (source.status === 'SYNCED' || source.externalTransactionId != null)
