@@ -1,0 +1,7 @@
+### Fixed: FX journal retirement follow-ups (Xero)
+- A queued realised or unrealised FX journal row whose record shows an earlier attempt may have reached Xero (a create-dispatch marker, a remote-attempt stamp or a document id) is now parked **Failed** with "may have posted: check Xero Manual Journals (reference FXREV-<date> for a revaluation) and reverse by hand", instead of being marked Cancelled "Retired, not sent". Nothing is sent in either case.
+- Retiring the reversal of an unrealised FX revaluation that had already **posted** to Xero now logs an Error naming the Xero manual journal and records a standing exception-inbox row (`unrealised_fx_journal`, reason `retired_reversal_source_posted`) until it is reversed by hand and marked handled. The activity text no longer says the reversal "would count the movement twice".
+- A retirement that the processing attempt did not make (its claim moved on) is now logged at Info as "not retired by this attempt", not as a retirement.
+- Xero sync can now be enabled without mapping the Unrealised FX Gain/Loss account (no longer checked) or the Accounts Receivable, Accounts Payable and Realised FX Gain/Loss accounts (now listed as "report only", never blocking).
+- The two retired FX journal types no longer need the `accounting.manualjournals` scope to be retired, and their sync-type switches are no longer shown on the Sync settings tab.
+- Operator text for the retired FX posting-refusal kinds, and the related help pages, updated.

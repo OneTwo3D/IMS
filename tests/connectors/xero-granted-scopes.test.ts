@@ -84,11 +84,21 @@ test('each scope-dependent sync type names the right scope, and the rest name no
   assert.equal(requiredScopeForSyncType('INVOICE_PAYMENT'), 'accounting.payments')
   assert.equal(requiredScopeForSyncType('BILL_PAYMENT'), 'accounting.payments')
   assert.equal(requiredScopeForSyncType('BILL_ATTACHMENT'), 'accounting.attachments')
-  assert.equal(requiredScopeForSyncType('REALISED_FX_JOURNAL'), 'accounting.manualjournals')
+  assert.equal(requiredScopeForSyncType('COGS_JOURNAL'), 'accounting.manualjournals')
   assert.equal(requiredScopeForSyncType('DAILY_BATCH_GROUP_B'), 'accounting.manualjournals')
   assert.equal(requiredScopeForSyncType('SALES_INVOICE'), null)
   assert.equal(requiredScopeForSyncType('PURCHASE_INVOICE'), null)
   assert.equal(requiredScopeForSyncType('TAX_RATE_SYNC'), null)
+})
+
+// o3d-n2ci4 (#1135 review LOW-2): the two retired FX journal types send nothing, so a missing journals scope must not block their retirement.
+// [mutation: put either type back on JOURNALS]
+test('the retired FX journal types need no scope: their retirement sends nothing and is never scope-blocked', () => {
+  for (const type of ['REALISED_FX_JOURNAL', 'UNREALISED_FX_JOURNAL']) {
+    assert.equal(requiredScopeForSyncType(type), null, type)
+    assert.equal(blockingScopeFor(type, ['accounting.invoices']), null, `${type} is not blocked by a grant without accounting.manualjournals`)
+  }
+  assert.equal(blockingScopeFor('COGS_JOURNAL', ['accounting.invoices']), 'accounting.manualjournals', 'control: a live journal type still is')
 })
 
 test('the blocked-row error says what to DO, and is recognisable', () => {
