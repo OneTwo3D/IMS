@@ -175,7 +175,7 @@ export const MINT_SEAM_FUNCTIONS: readonly MintSeamFunction[] = [
  */
 export const MINT_OPERATIONS_GOVERNED_ELSEWHERE: Readonly<Record<string, string>> = {
   'auth.login': 'Key minting is not a business write (map owner nobody) and has no seam: requestMintsoftAuthSession refuses it itself (assertMintsoftKeyMintingAllowed) while the producer hold is enforced and the installation is not live; the outbound-write hold\'s login grant governs it as well.',
-  'product.discontinue': 'The first-load archive command (an operator runs it once at the cut-over, never the application): it asks the producer hold itself (mintsoftEgressHold before the POST, mintsoftHopGate on every hop) and the transport\'s outbound-write grant governs the POST; its transport site is declared in MINT_OPERATOR_TRANSPORT.',
+  'product.discontinue': 'The first-load archive command (an operator runs it once at the cut-over, never the application): it refuses unless the producer disposition of product.discontinue is LIVE on the TARGET installation\'s environment (step M live), asks the producer hold itself on that environment (mintsoftEgressHold before the POST, targetHoldRefusal on every hop), and the transport\'s outbound-write grant, read from the same environment, governs the POST; its transport site is declared in MINT_OPERATOR_TRANSPORT.',
   'order.comment': 'IMS writes no order comment any more (the warehouse does not read them: owner ruling 2026-11-15; IMS raises an operator task instead). Nothing calls the connector\'s addOrderComment, and tests/wms-no-order-comment-writes.test.ts is red if a call is reintroduced; were one added, MINT-5 still requires it to pass a clearance.',
 }
 
@@ -186,11 +186,11 @@ export const MINT_LOGIN_TRANSPORT: Readonly<Record<string, string>> = {
 }
 /**
  * Operator-run transports outside the barrier: a one-off operator command whose credentials come from an operator file, not the IMS settings that
- * mintsoftRequest reads. MINT-3 requires a hop gate on the call and a stale entry is red; that the gate composes the producer hold (mintsoftHopGate) with
+ * mintsoftRequest reads. MINT-3 requires a hop gate on the call and a stale entry is red; that the gate composes the producer hold (targetHoldRefusal, on the target's environment) with
  * its own exact-path gate is pinned by the entry's own test (tests/connectors/mintsoft-first-load-archive-write.test.ts).
  */
 export const MINT_OPERATOR_TRANSPORT: Readonly<Record<string, string>> = {
-  'lib/connectors/mintsoft/first-load-archive-write.ts::sendMintsoftArchiveRequest': 'The first-load archive command (scripts/first-load-mintsoft-archive.ts): the fixed key of the operator\'s credentials file, exactly GET /api/Product/{id}, GET /api/Product/StockLevels and POST /api/Product {ID, SKU, DisCont} (archiveHopRefusal), the producer hold per hop (mintsoftHopGate), no redirect, and the outbound-write grant on the POST (ownership-map row product.discontinue).',
+  'lib/connectors/mintsoft/first-load-archive-write.ts::sendMintsoftArchiveRequest': 'The first-load archive command (scripts/first-load-mintsoft-archive.ts): the fixed key of the operator\'s credentials file, exactly GET /api/Product/{id}, GET /api/Warehouse, GET /api/Product/StockLevels and POST /api/Product {ID, SKU, DisCont} (archiveHopRefusal), the producer hold per hop on the target installation\'s environment (targetHoldRefusal), no redirect, and the outbound-write grant of that environment on the POST (ownership-map row product.discontinue).',
 }
 export const MINT_BARRIER_FILE = 'lib/connectors/mintsoft/api/client.ts'
 export const MINT_BARRIER_ENTRY = 'mintsoftRequest'

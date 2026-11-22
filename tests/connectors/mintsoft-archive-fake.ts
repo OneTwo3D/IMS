@@ -15,8 +15,12 @@ export type Seen = { method: string; url: string; apikey: string | undefined; ua
 export type FakeTenant = {
   products: Map<string, Record<string, unknown>>
   stock: Record<string, Array<Record<string, unknown>>>
-  /** Called on a partial POST before it is applied; return a body to answer instead (the write is then NOT applied). */
-  onPost?: (body: Record<string, unknown>) => { status?: number; body: unknown } | undefined
+  /** The warehouse list (`GET /api/Warehouse`); default: warehouse 5 only. */
+  warehouses?: Array<Record<string, unknown>>
+  /** Called on a partial POST before it is applied; return a body to answer instead (the write is then NOT applied), or 'drop' to destroy the connection without an answer. */
+  onPost?: (body: Record<string, unknown>) => { status?: number; body: unknown } | 'drop' | undefined
+  /** Called after an accepted write instead of setting DisCont (a write Mintsoft reports as done that did not take). */
+  ignoreDisCont?: boolean
   /** Called after an accepted write, to change the stored product further (a write that touched other fields). */
   afterWrite?: (product: Record<string, unknown>) => void
   /** Called on each stock read. */
@@ -44,6 +48,7 @@ export async function fakeMintsoft(tenant: FakeTenant, track: Rig[]): Promise<Ri
       const url = new URL(req.url ?? '/', 'http://x')
       if (!req.headers['user-agent']) return json({ Message: 'Forbidden' }, 403)
       if (/\/api\/Auth/i.test(url.pathname)) return json({}, 500)
+      if (req.method === 'GET' && url.pathname === '/api/Warehouse') return json(tenant.warehouses ?? [{ ID: 5, Name: 'synthetic main' }])
       const one = /^\/api\/Product\/(\d+)$/.exec(url.pathname)
       if (req.method === 'GET' && one) {
         const p = tenant.products.get(one[1]!)
@@ -59,10 +64,11 @@ export async function fakeMintsoft(tenant: FakeTenant, track: Rig[]): Promise<Ri
         // Mintsoft's own validation: a full product body (it carries PalletSizes from GET) is refused with a 200.
         if ('PalletSizes' in sent) return json({ Success: false, Message: 'One or more pallet sizes are not valid!', ID: sent.ID })
         const override = tenant.onPost?.(sent)
+        if (override === 'drop') { req.socket.destroy(); return }
         if (override) return json(override.body, override.status ?? 200)
         const p = tenant.products.get(String(sent.ID))
         if (!p || p.SKU !== sent.SKU) return json({ Success: false, Message: 'Product not found' })
-        p.DisCont = sent.DisCont
+        if (!tenant.ignoreDisCont) p.DisCont = sent.DisCont
         p.LastUpdated = '2026-11-21T23:59:59.000'
         p.LastUpdatedByUser = 'synthetic-api'
         tenant.afterWrite?.(p)
@@ -80,5 +86,8 @@ export async function fakeMintsoft(tenant: FakeTenant, track: Rig[]): Promise<Ri
 export const configOf = (rig: Rig, warehouseIds = ['5']): MintsoftReviewConfig => ({ baseUrl: rig.base, apiKey: KEY, clientId: String(CLIENT), warehouseIds })
 /** The transport's environment: the e2e loopback allowance and the outbound-write grant for exactly this fake tenant. */
 export const grantedEnv = (rig: Rig) => ({ E2E_TEST_MODE: '1', NODE_ENV: 'test', MINTSOFT_WRITE_ALLOWED: `${rig.base}|${CLIENT}` })
+/** The TARGET installation at the cut-over: the grant for exactly this tenant and the Mintsoft step's live-from instant reached. */
+export const LIVE_FROM = '2026-01-01T00:00:00Z'
+export const liveEnv = (rig: Rig) => ({ ...grantedEnv(rig), MINTSOFT_WRITES_LIVE_FROM: LIVE_FROM })
 export const stockRow = (id: number, sku: string, level: number, warehouse = 5) => ({ SKU: sku, ProductId: id, WarehouseId: warehouse, ClientId: CLIENT, Bundle: false, TotalStockLevel: level, Level: level })
 

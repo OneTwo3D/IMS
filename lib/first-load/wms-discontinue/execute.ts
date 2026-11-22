@@ -6,11 +6,14 @@
  * PER SKU, in this order, and the run STOPS at the first answer that is not exactly the expected one (nothing after it is attempted):
  *   1. re-read the product by its id: it must be the plan's product (same id, EXACTLY the same SKU, our client), not a bundle, and not discontinued;
  *   2. re-read its physical stock across the configured warehouses: a stock row must exist and the total must be exactly 0;
- *   3. record the attempt in the IMS activity log (a failed record stops the run before anything is sent);
- *   4. send the discontinue request, and require the WMS to say it succeeded (a 200 alone proves nothing);
+ *   3. read the system switch again (it must still read on) and record the attempt in the IMS activity log (a failed record stops the run before anything
+ *      is sent);
+ *   4. send the discontinue request, and require the WMS to say it succeeded (a 200 alone proves nothing). A failure says whether the request may have
+ *      left: refused before it left (nothing was sent) or dispatched without a usable answer (it may have reached the WMS);
  *   5. re-read the product: the flag must now read discontinued and NO other field may differ from the read of step 1 (the writer names the fields that
  *      are allowed to move with any update, such as a last-updated stamp);
- *   6. record the verified write (or the failure) in the activity log, with the SKU, the WMS product id, the flag before and after, and the operator.
+ *   6. record the verified write (or the failure) in the activity log, with the SKU, the WMS product id, the flag before and after, the operator and the
+ *      evidence that the WMS step is live in the target. Every attempt that was recorded gets its outcome recorded, sent or not.
  */
 import type { ArchivePlan, ArchivePlanRow } from './plan'
 
@@ -29,6 +32,9 @@ export interface WmsProductRead {
   snapshot: unknown
 }
 
+/** The answer to the discontinue request. A failure says whether the request may have reached the WMS: `false` refused before it left, `'unknown'` dispatched. */
+export type WmsDiscontinueAnswer = { ok: true; value: { accepted: boolean; message: string } } | { ok: false; problem: string; sent: false | 'unknown' }
+
 /** The WMS side of the write, supplied by the connector module (the only place the WMS is named). */
 export interface WmsArchiveWriter {
   label: string
@@ -36,9 +42,14 @@ export interface WmsArchiveWriter {
   /** The physical stock of the product summed over the configured warehouses, and whether any of them has a stock row for it. */
   readStock(productId: string, sku: string): Promise<WmsStep<{ stockRow: boolean; onHand: number }>>
   /** Sends the discontinue request. `accepted` is the WMS's own verdict on the answer body (never the HTTP status alone); `message` is short and carries no credential. */
-  setDiscontinued(productId: string, sku: string): Promise<WmsStep<{ accepted: boolean; message: string }>>
+  setDiscontinued(productId: string, sku: string): Promise<WmsDiscontinueAnswer>
   /** The fields of the two product answers that differ, except the discontinued flag and the fields any update moves (named by the connector). */
   changedFields(before: unknown, after: unknown): string[]
+  /**
+   * Once, before anything is read for the write: whether the write may leave at all under the TARGET installation's rules (the WMS step live, the hold,
+   * the grant). The evidence is recorded with every write.
+   */
+  preflight(): { ok: true; evidence: string } | { ok: false; problem: string }
 }
 
 export type ArchiveWriteOutcome = 'ATTEMPT' | 'VERIFIED' | 'FAILED'
@@ -57,6 +68,8 @@ export interface ArchiveWriteRecord {
   operator: string
   planToken: string
   sheetId: string
+  /** Why the write was allowed to leave: the WMS step live in the target, as the writer's preflight found it. */
+  stepEvidence: string
   problem: string | null
 }
 
@@ -67,6 +80,10 @@ export interface ArchiveExecuteDeps {
   /** The IMS product id of each SKU written (from the import proof). */
   imsProductIdOf: (sku: string) => string
   operator: string
+  /** The writer's preflight evidence, recorded with every write. */
+  stepEvidence: string
+  /** Reads the system switch again; true only when it still reads on. Called before each request that writes. */
+  switchStillOn: () => Promise<boolean>
   /** Called once per line of progress. */
   progress: (line: string) => void
 }
@@ -93,7 +110,8 @@ export async function executeArchivePlan(plan: ArchivePlan, deps: ArchiveExecute
   for (let index = 0; index < targets.length; index++) {
     const row = targets[index]!
     const productId = row.productId!
-    const base = { sku: row.sku, imsProductId: deps.imsProductIdOf(row.sku), wmsProductId: productId, wms: label, discontinuedBefore: false, operator: deps.operator, planToken: plan.token, sheetId: plan.sheetId }
+    const base = { sku: row.sku, imsProductId: deps.imsProductIdOf(row.sku), wmsProductId: productId, wms: label, discontinuedBefore: false, operator: deps.operator, planToken: plan.token, sheetId: plan.sheetId, stepEvidence: deps.stepEvidence }
+    let attempted = false
     try {
       // 1. the product, read again right before the write
       const before = await writer.readProduct(productId)
@@ -109,15 +127,23 @@ export async function executeArchivePlan(plan: ArchivePlan, deps: ArchiveExecute
       if (!stock.ok) throw new Stop(`the ${label} stock of product ${productId} could not be read again: ${stock.problem}`, false)
       if (!stock.value.stockRow) throw new Stop(`no configured ${label} warehouse has a stock row for product ${productId} now: its stock is unknown`, false)
       if (stock.value.onHand !== 0) throw new Stop(`the ${label} product ${productId} now shows physical stock ${stock.value.onHand}: never archived unless it is exactly 0`, false)
-      // 3. the attempt, recorded before anything is sent
+      // 3. the switch, read again, and the attempt, recorded before anything is sent
+      let on = false
+      try {
+        on = await deps.switchStillOn()
+      } catch {
+        throw new Stop('the system switch could not be read again, so nothing was sent', false)
+      }
+      if (!on) throw new Stop('the system switch no longer reads on in the target, so nothing was sent', false)
       try {
         await deps.record({ ...base, outcome: 'ATTEMPT', discontinuedAfter: null, problem: null })
       } catch {
         throw new Stop('the attempt could not be recorded in the IMS activity log, so nothing was sent', false)
       }
+      attempted = true
       // 4. the write
       const answer = await writer.setDiscontinued(productId, row.sku)
-      if (!answer.ok) throw new Stop(`the ${label} discontinue request for product ${productId} failed: ${answer.problem}`, true)
+      if (!answer.ok) throw new Stop(`the ${label} discontinue request for product ${productId} failed: ${answer.problem}`, answer.sent !== false)
       if (!answer.value.accepted) throw new Stop(`${label} did not accept the discontinue request for product ${productId}: ${answer.value.message}`, true)
       // 5. the read-back
       const after = await writer.readProduct(productId)
@@ -135,11 +161,14 @@ export async function executeArchivePlan(plan: ArchivePlan, deps: ArchiveExecute
       deps.progress(`  ${row.sku}: ${label} product ${productId} set discontinued and verified (${index + 1} of ${targets.length})`)
     } catch (error) {
       if (!(error instanceof Stop)) throw error
-      if (error.sent) {
-        // Best effort: the failure is printed in any case.
-        const after = await writer.readProduct(productId).catch(() => null)
-        const flag = after !== null && after.ok ? after.value.discontinued : null
-        await deps.record({ ...base, outcome: 'FAILED', discontinuedAfter: flag, problem: error.problem }).catch(() => undefined)
+      if (attempted) {
+        // Best effort: the failure is printed in any case. The flag is read back only when the request may have left.
+        let flag: boolean | null = null
+        if (error.sent) {
+          const after = await writer.readProduct(productId).catch(() => null)
+          flag = after !== null && after.ok ? after.value.discontinued : null
+        }
+        await deps.record({ ...base, outcome: 'FAILED', discontinuedAfter: flag, problem: `${error.problem}${error.sent ? ' (the request was sent)' : ' (nothing was sent)'}` }).catch(() => undefined)
       }
       return { verified, stopped: { row, problem: error.problem, sent: error.sent }, notAttempted: targets.slice(index + 1) }
     }

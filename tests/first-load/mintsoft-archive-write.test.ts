@@ -14,9 +14,10 @@ import { LIFECYCLE_REVIEW_FILE_NAMES } from '../../lib/first-load/lifecycle-revi
 import { runWmsArchiveCli, type WmsArchiveExecuteDeps, type WmsCensusReader } from '../../lib/first-load/wms-discontinue/cli.ts'
 import type { WmsCensus } from '../../lib/first-load/wms-discontinue/plan.ts'
 import { ARCHIVE_ACTIVITY_ACTIONS, ARCHIVE_TARGET_STATEMENTS, type ArchiveTargetPort } from '../../lib/first-load/wms-discontinue/target.ts'
+import { FIRST_LOAD_WMS_ARCHIVE_LOCK_KEY } from '../../lib/db/advisory-locks.ts'
 import { FIRST_LOAD_WMS_ARCHIVE_SWITCH_KEY, findSwitch } from '../../lib/domain/settings/system-switches.ts'
 import { createMintsoftArchiveWriter } from '../../lib/connectors/mintsoft/first-load-archive-write.ts'
-import { configOf, fakeMintsoft, grantedEnv, stockRow, syntheticProduct, type FakeTenant, type Rig } from '../connectors/mintsoft-archive-fake.ts'
+import { LIVE_FROM, configOf, fakeMintsoft, grantedEnv, liveEnv, stockRow, syntheticProduct, type FakeTenant, type Rig } from '../connectors/mintsoft-archive-fake.ts'
 import { buildFixture, fakeWms, type Fixture } from './lifecycle-review-fixture.ts'
 
 let fx: Fixture
@@ -64,14 +65,21 @@ function census(rig: Rig): WmsCensus {
   }
 }
 
-type Target = { queries: Array<{ sql: string; values?: unknown[] }>; records: Array<{ action: string; level: string; entityId: string; metadata: Record<string, unknown>; description: string }>; opened: number }
-function fakeTarget(opts: { switchValue?: string | null; lifecycle?: Record<string, string | null>; db?: string; sid?: string; failRecord?: boolean } = {}): { deps: Pick<WmsArchiveExecuteDeps, 'openTarget'>; target: Target } {
-  const target: Target = { queries: [], records: [], opened: 0 }
+type Target = { queries: Array<{ sql: string; values?: unknown[] }>; records: Array<{ action: string; level: string; entityId: string; metadata: Record<string, unknown>; description: string }>; opened: number; unlocked: number }
+type TargetOpts = { switchValue?: string | null; lifecycle?: Record<string, string | null>; db?: string; sid?: string; failRecord?: boolean; env?: Record<string, string>; envOf?: (rig: Rig) => Record<string, string>; lockHeld?: boolean; switchAgain?: string[] }
+function fakeTarget(opts: TargetOpts = {}): { deps: Pick<WmsArchiveExecuteDeps, 'openTarget'>; target: Target } {
+  const target: Target = { queries: [], records: [], opened: 0, unlocked: 0 }
+  const again = [...(opts.switchAgain ?? [])]
   const lifecycle = opts.lifecycle ?? { 'SIM-DRAFT': 'ARCHIVED', 'SIM-PRIV': 'ARCHIVED' }
   const port: ArchiveTargetPort = {
     query: async <T,>(sql: string, values?: unknown[]) => {
       target.queries.push({ sql, values })
       const rows = (r: unknown[]) => ({ rows: r as T[] })
+      if (sql === ARCHIVE_TARGET_STATEMENTS.lock) { assert.deepEqual(values, [FIRST_LOAD_WMS_ARCHIVE_LOCK_KEY]); return rows([{ locked: opts.lockHeld !== true }]) }
+      if (sql === ARCHIVE_TARGET_STATEMENTS.unlock) { target.unlocked++; return rows([{ unlocked: true }]) }
+      if (sql === ARCHIVE_TARGET_STATEMENTS.switchAgain) {
+        return rows([{ value: again.length > 0 ? again.shift()! : 'true' }])
+      }
       if (sql === ARCHIVE_TARGET_STATEMENTS.identity) return rows([{ db: opts.db ?? 'ims_test', sid: opts.sid ?? '7000000000000000001' }])
       if (sql === ARCHIVE_TARGET_STATEMENTS.switch) {
         assert.deepEqual(values, [FIRST_LOAD_WMS_ARCHIVE_SWITCH_KEY])
@@ -89,28 +97,29 @@ function fakeTarget(opts: { switchValue?: string | null; lifecycle?: Record<stri
       return rows([])
     },
   }
-  return { target, deps: { openTarget: async () => { target.opened++; return { port, close: async () => {} } } } }
+  return { target, deps: { openTarget: async () => { target.opened++; return { port, env: opts.env ?? {}, close: async () => {} } } } }
 }
 
 const ENV = ['--mintsoft-env-file', '/only/for/the/fake']
 const EXEC = (token: string, extra: string[] = []) => ['--execute', '--plan-token', token, '--env-file', '/only/for/the/fake.env', '--expect-db', 'ims_test', '--expect-system-id', '7000000000000000001', '--operator', 'Synthetic Operator', ...extra]
 
-async function setup(t: FakeTenant = tenant(), targetOpts: Parameters<typeof fakeTarget>[0] = {}, censusChange?: (c: WmsCensus) => void) {
+async function setup(t: FakeTenant = tenant(), targetOpts: TargetOpts = {}, censusChange?: (c: WmsCensus) => void, censusAtDryRun?: (c: WmsCensus) => void, dryExit: number = EXIT_CODES.OK) {
   const rig = await fakeMintsoft(t, rigs)
   const reads: string[] = []
   const c = census(rig)
+  censusAtDryRun?.(c)
   const reader: WmsCensusReader = { flag: '--mintsoft-env-file', label: 'Mintsoft', read: async (file) => { reads.push(file); return c } }
   const m = manifest()
   const io = () => { const o = { out: '', err: '' }; return { o, io: { stdout: (s: string) => (o.out += s), stderr: (s: string) => (o.err += s) } } }
   const dry = io()
   const dryCode = await runWmsArchiveCli(['--manifest', m, ...ENV], dry.io, reader, 'first-load-mintsoft-archive')
-  assert.equal(dryCode, EXIT_CODES.OK, dry.o.err)
+  assert.equal(dryCode, dryExit, dry.o.err)
   const token = /plan token: (MSA-[0-9a-f]{16})/.exec(dry.o.out)![1]!
   censusChange?.(c)
-  const { deps, target } = fakeTarget(targetOpts)
+  const { deps, target } = fakeTarget({ env: targetOpts.envOf ? targetOpts.envOf(rig) : liveEnv(rig), ...targetOpts })
   const execDeps: WmsArchiveExecuteDeps = {
     switchKey: FIRST_LOAD_WMS_ARCHIVE_SWITCH_KEY,
-    openWriter: () => createMintsoftArchiveWriter(configOf(rig), { env: grantedEnv(rig), sleep: async () => {} }),
+    openWriter: (_file, env) => createMintsoftArchiveWriter(configOf(rig), { env, sleep: async () => {} }),
     newId: (() => { let n = 0; return () => `log-${++n}` })(),
     ...deps,
   }
@@ -130,8 +139,8 @@ test('--execute writes each WOULD_ARCHIVE SKU once with the verified partial bod
   assert.deepEqual(posts(s.rig).map((p) => JSON.parse(p.body)), [{ ID: 12, SKU: 'SIM-DRAFT', DisCont: true }, { ID: 13, SKU: 'SIM-PRIV', DisCont: true }])
   // per SKU: GET product, GET stock, POST, GET product (one at a time, in plan order)
   assert.deepEqual(s.rig.seen.map((x) => `${x.method} ${x.url}`), [
-    'GET /api/Product/12', 'GET /api/Product/StockLevels?WarehouseId=5', 'POST /api/Product', 'GET /api/Product/12',
-    'GET /api/Product/13', 'GET /api/Product/StockLevels?WarehouseId=5', 'POST /api/Product', 'GET /api/Product/13',
+    'GET /api/Product/12', 'GET /api/Warehouse', 'GET /api/Product/StockLevels?WarehouseId=5', 'POST /api/Product', 'GET /api/Product/12',
+    'GET /api/Product/13', 'GET /api/Warehouse', 'GET /api/Product/StockLevels?WarehouseId=5', 'POST /api/Product', 'GET /api/Product/13',
   ])
   assert.equal(s.rig.tenant.products.get('12')!.DisCont, true)
   assert.equal(s.rig.tenant.products.get('13')!.DisCont, true)
@@ -141,8 +150,15 @@ test('--execute writes each WOULD_ARCHIVE SKU once with the verified partial bod
   ])
   assert.deepEqual(s.target.records[1]!.metadata, {
     sku: 'SIM-DRAFT', wms: 'Mintsoft', wmsProductId: '12', discontinuedBefore: false, discontinuedAfter: true, operator: 'Synthetic Operator', planToken: s.token, sheetId: sheetId(), outcome: 'VERIFIED', problem: null,
+    stepEvidence: (s.target.records[1]!.metadata.stepEvidence as string),
   })
-  assert.equal(s.target.queries[0]!.sql, ARCHIVE_TARGET_STATEMENTS.begin, 'the target is read in a READ ONLY transaction first')
+  assert.match(s.target.records[1]!.metadata.stepEvidence as string, new RegExp(`^Mintsoft step live in the target since ${LIVE_FROM.replace('Z', '')}`))
+  // The lock first, then the read in ONE READ ONLY REPEATABLE READ transaction (the exact text pinned), and the lock released at the end.
+  assert.deepEqual(s.target.queries.slice(0, 2).map((q) => q.sql), [ARCHIVE_TARGET_STATEMENTS.lock, 'BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ'])
+  assert.equal(ARCHIVE_TARGET_STATEMENTS.begin, 'BEGIN READ ONLY ISOLATION LEVEL REPEATABLE READ')
+  assert.equal(s.target.unlocked, 1)
+  // The switch is read again before each POST (#1128 R1 LOW-4).
+  assert.equal(s.target.queries.filter((q) => q.sql === ARCHIVE_TARGET_STATEMENTS.switchAgain).length >= 2, true)
   assert.match(r.out, /written and verified: 2/)
   assert.match(r.out, /SIM-PRIV \(Mintsoft product 13\): discontinued false -> true/)
 })
@@ -323,4 +339,94 @@ test('a real prepare blocked by another finding: the dry run exits 1 and says so
   assert.equal(target.opened, 0)
   assert.equal(reads.length, readsBefore)
   assert.deepEqual(rig.seen, [])
+})
+
+// [mutation: the "no refused SKU" gate is removed] (#1128 R1 MED-1)
+test('a plan that refuses a SKU (stock > 0, or no stock row) is never written, even with its own token: exit 1, no POST, no record', async () => {
+  const changes: Array<[string, (c: WmsCensus) => void]> = [
+    ['stock', (c) => { (c.physical as Map<string, number>).set('SIM-PRIV', 2) }],
+    ['no stock row', (c) => { (c.physical as Map<string, number>).delete('SIM-PRIV') }],
+  ]
+  for (const [label, change] of changes) {
+    const s = await setup(tenant(), {}, undefined, change, EXIT_CODES.BLOCKING_FINDINGS)
+    const r = await s.exec(EXEC(s.token))
+    assert.equal(r.code, EXIT_CODES.BLOCKING_FINDINGS, `${label}: ${r.err}`)
+    assert.match(r.err, /nothing was written: the plan refuses at least one SKU/)
+    assert.deepEqual(posts(s.rig), [], label)
+    assert.deepEqual(s.rig.seen, [], `${label}: not even a product read`)
+    assert.deepEqual(s.target.records, [], label)
+  }
+})
+
+// [mutation: the read-back DisCont check is removed] (#1128 R1 MED-2)
+test('Success:true but the read-back still shows DisCont false stops the run (exit 4) with a FAILED record', async () => {
+  const s = await setup({ ...tenant(), ignoreDisCont: true })
+  const r = await s.exec(EXEC(s.token))
+  assert.equal(r.code, EXIT_CODES.OUTPUT_FAILED)
+  assert.match(r.err, /the Mintsoft product 12 does not read discontinued after a write Mintsoft accepted/)
+  assert.match(r.err, /the request WAS sent/)
+  assert.equal(posts(s.rig).length, 1)
+  assert.deepEqual(s.target.records.map((x) => x.action), [ARCHIVE_ACTIVITY_ACTIONS.ATTEMPT, ARCHIVE_ACTIVITY_ACTIONS.FAILED])
+  assert.equal(s.target.records[1]!.metadata.discontinuedAfter, false)
+})
+
+// [mutation: a failed answer after the POST left reads as "nothing was sent", or is retried] (#1128 R1 MED-5)
+test('a connection dropped after Mintsoft received the POST: exit 4, "WAS sent", a FAILED record, no retry, nothing after it attempted', async () => {
+  const s = await setup({ ...tenant(), onPost: () => 'drop' })
+  const r = await s.exec(EXEC(s.token))
+  assert.equal(r.code, EXIT_CODES.OUTPUT_FAILED)
+  assert.match(r.err, /may or may not have reached Mintsoft/)
+  assert.match(r.err, /the request WAS sent: check the Mintsoft product 12 by hand/)
+  assert.equal(posts(s.rig).length, 1, 'no retry')
+  assert.deepEqual(s.target.records.map((x) => [x.action, x.level]), [[ARCHIVE_ACTIVITY_ACTIONS.ATTEMPT, 'INFO'], [ARCHIVE_ACTIVITY_ACTIONS.FAILED, 'ERROR']])
+  assert.match(s.target.records[1]!.metadata.problem as string, /\(the request was sent\)$/)
+  assert.match(r.out, /not attempted: 1 \(SIM-PRIV\)/)
+})
+
+// [mutation: the hold or the step is judged on the operator's shell, or the preflight is skipped] (#1128 R1 MED-3, LOW-2)
+test('the target installation\'s rules decide: step M not live there, a hold there, or its grant for another tenant refuses (exit 3) before Mintsoft is read, whatever the shell holds', async () => {
+  const shell = process.env.MINTSOFT_WRITES_LIVE_FROM
+  process.env.MINTSOFT_WRITES_LIVE_FROM = LIVE_FROM // the operator's shell says live: it must not count
+  try {
+    const envs: Array<[string, (rig: Rig) => Record<string, string>, RegExp]> = [
+      ['no live-from in the target', (rig) => grantedEnv(rig), /Mintsoft step \(M\) is not live in the target installation/],
+      ['live-from in the future', (rig) => ({ ...liveEnv(rig), MINTSOFT_WRITES_LIVE_FROM: '2999-01-01T00:00:00Z' }), /not live .*before_cutoff/],
+      ['a grant for another tenant', (rig) => ({ ...liveEnv(rig), MINTSOFT_WRITE_ALLOWED: `${rig.base}|90` }), /does not admit POST \/api\/Product/],
+    ]
+    for (const [label, envOf, why] of envs) {
+      const s = await setup(tenant(), { envOf })
+      const readsBefore = s.reads.length
+      const r = await s.exec(EXEC(s.token))
+      assert.equal(r.code, EXIT_CODES.INPUT_UNUSABLE, label)
+      assert.match(r.err, why, label)
+      assert.equal(s.reads.length, readsBefore, `${label}: the census was not read`)
+      assert.deepEqual(s.rig.seen, [], label)
+    }
+  } finally {
+    if (shell === undefined) delete process.env.MINTSOFT_WRITES_LIVE_FROM
+    else process.env.MINTSOFT_WRITES_LIVE_FROM = shell
+  }
+})
+
+// [mutation: the advisory lock is not taken, or not checked] (#1128 R1 LOW-3)
+test('another run holding the target lock refuses (exit 3) before anything is read', async () => {
+  const s = await setup(tenant(), { lockHeld: true })
+  const readsBefore = s.reads.length
+  const r = await s.exec(EXEC(s.token))
+  assert.equal(r.code, EXIT_CODES.INPUT_UNUSABLE)
+  assert.match(r.err, /another run of this command holds the target's lock/)
+  assert.deepEqual(s.target.queries.map((q) => q.sql), [ARCHIVE_TARGET_STATEMENTS.lock])
+  assert.equal(s.target.unlocked, 0, 'a lock not taken is not released')
+  assert.equal(s.reads.length, readsBefore)
+  assert.deepEqual(s.rig.seen, [])
+})
+
+// [mutation: the switch is read once only] (#1128 R1 LOW-4)
+test('the switch turned off during the run stops it before the next POST: nothing more is sent', async () => {
+  const s = await setup(tenant(), { switchAgain: ['true', 'false'] })
+  const r = await s.exec(EXEC(s.token))
+  assert.equal(r.code, EXIT_CODES.OUTPUT_FAILED)
+  assert.match(r.err, /STOPPED at SIM-PRIV: the system switch no longer reads on in the target, so nothing was sent/)
+  assert.deepEqual(posts(s.rig).map((p) => JSON.parse(p.body).SKU), ['SIM-DRAFT'])
+  assert.deepEqual(s.target.records.map((x) => x.action), [ARCHIVE_ACTIVITY_ACTIONS.ATTEMPT, ARCHIVE_ACTIVITY_ACTIONS.VERIFIED])
 })
