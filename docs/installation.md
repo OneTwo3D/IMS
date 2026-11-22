@@ -1392,7 +1392,7 @@ Verify each scheduled job is registered with your cron daemon and has run succes
       transaction had to hold because another job held the same posting's lock. Leave it unscheduled and those
       sit in **Sync → Exceptions** marked *Unconfirmed* instead of being settled.
 - [ ] `/api/cron/accounting-payment-poll` — every 15 min (if accounting connected)
-- [ ] `/api/cron/accounting-fx-revaluation` — daily (if accounting connected)
+- [ ] `/api/cron/accounting-fx-revaluation` — **retired, do not schedule** (it answers a skip and does nothing; Xero revalues open foreign balances itself). Remove it from the crontab if an older install has it
 - [ ] `/api/cron/xero-chart-sync` — daily (if accounting connected)
 - [ ] `/api/cron/account-balance-snapshot` — daily (if accounting connected)
 - [ ] `/api/cron/delivery-status` — every 15 min (if delivery tracking enabled)

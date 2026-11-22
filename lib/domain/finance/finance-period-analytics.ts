@@ -1765,10 +1765,10 @@ export async function getFxGainLossReport(
     rowCount: String(rows.length),
     unconvertedCount: String(rows.filter((row) => row.outcome === 'not_computable').length),
   }, [
-    `FX gain/loss uses IMS FxRate semantics where rate means 1 ${baseCurrency} = foreign currency; base value is foreign amount divided by the rate, matching the Xero realised-FX posting helper.`,
+    `FX gain/loss uses IMS FxRate semantics where rate means 1 ${baseCurrency} = foreign currency; base value is foreign amount divided by the rate, the same arithmetic as computeRealisedFx. This report is information only: IMS posts no FX journal, and Xero books realised currency gains itself at the settlement rate IMS sends on each payment, and revalues open foreign balances in its own reports.`,
     'Receivable FX rows are one row per Payment.id so partial settlements keep their own paidAt settlement rate; purchase-invoice rows remain one row per paid invoice because supplier partial payments are not modelled.',
     'Base-currency settlements are excluded from FX rows because they have no FX exposure; rowCount is therefore foreign-currency settlement count, not total settlement count.',
     'Settlement rate is the latest FxRate row on or before the end of the paidAt day (an instant when paidAt carries a time). When no settlement rate exists the row is listed as NOT COMPUTABLE with the reason, shows no rate or gain/loss, and is excluded from the totals: it is never valued at the document booking rate or at 1. Add the rate in Settings -> Currencies to include it.',
-    `Rows surface the configured realised FX account (${settings.realisedFxGainLossAccount || 'not configured'}) plus the AR/AP control account used by the Xero journal path.`,
+    `Rows surface the configured realised FX account (${settings.realisedFxGainLossAccount || 'not configured'}) plus the AR/AP control account, for reference only (no journal is posted to either).`,
   ], options.paginate !== false)
 }
