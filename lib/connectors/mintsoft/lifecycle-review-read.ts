@@ -127,8 +127,12 @@ type ListedProduct = MintsoftCensusProduct
 
 export interface MintsoftProductCensus {
   products: MintsoftCensusProduct[]
+  /** Physical stock per SKU over the configured warehouses; a SKU with no stock row there is absent (never 0). */
   physical: Map<string, number>
   warehouses: string[]
+  /** The client id every row was checked against, and the origin of the connection read (both in the archive plan's token). */
+  clientId: string
+  origin: string
 }
 
 /** Reads the listing for the review sheet (the census without the bundle flag, so the sheet's listing digest is unchanged). */
@@ -265,5 +269,5 @@ export async function readMintsoftProductCensus(config: MintsoftReviewConfig, de
     const stocked = (await stockOf(warehouse)).filter((row) => row.onHand > 0).length
     if (stocked > 0) throw new MintsoftReviewFailed(`warehouse ${warehouse} holds stock of ${stocked} product(s) but is not in ${LIFECYCLE_REVIEW_MINTSOFT_KEYS.warehouseIds}: name it there, or the sheet would show that stock as absent`)
   }
-  return { products: first.map(({ sku, productId, bundle, status }) => ({ sku, productId, bundle, status })), physical, warehouses: [...config.warehouseIds] }
+  return { products: first.map(({ sku, productId, bundle, status }) => ({ sku, productId, bundle, status })), physical, warehouses: [...config.warehouseIds], clientId: config.clientId, origin: new URL(config.baseUrl).origin }
 }

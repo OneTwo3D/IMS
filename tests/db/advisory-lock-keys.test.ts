@@ -204,3 +204,13 @@ test('[o3d-0m56 r4] the two-int advisory call passes the NAMESPACE first', async
     'the single-bigint form the daily batches use is unchanged')
   assert.deepEqual(advisoryLockCall(7, 9), { label: '9/7', args: [9, 7], params: '$1, $2' })
 })
+
+// [mutation: the first-load archive run lock is taken on another key, or in a statement that names the key itself] (#1128 R1 LOW-3)
+test('the first-load archive run lock takes the registered key on the session-lock factory\'s connection', async () => {
+  const { FIRST_LOAD_WMS_ARCHIVE_LOCK_KEY, SINGLE_KEY_ADVISORY_LOCKS } = await import('../../lib/db/advisory-locks.ts')
+  assert.ok(Object.values(SINGLE_KEY_ADVISORY_LOCKS).includes(FIRST_LOAD_WMS_ARCHIVE_LOCK_KEY))
+  const source = readFileSync('lib/db/first-load-archive-target.ts', 'utf8')
+  assert.match(source, /createSessionAdvisoryLockClient\(/)
+  assert.match(source, /ARCHIVE_TARGET_LOCK_STATEMENTS\.lock, \[FIRST_LOAD_WMS_ARCHIVE_LOCK_KEY\]/)
+  assert.match(source, /'select pg_try_advisory_lock\(\$1::bigint\) as locked'/)
+})

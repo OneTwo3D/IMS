@@ -315,6 +315,8 @@ export const DECLARATIONS: readonly Declaration[] = [
     'The connector method delegates to the Mintsoft supplier creator (PUT /api/Product/Suppliers). Create-only: nothing here updates a supplier.'),
   d('lib/connectors/mintsoft/index.ts::MintsoftConnector.createBundle::createMintsoftBundle#1', 'mintsoft', 'product.bundle', 'facade', 'not-applicable',
     'The connector method delegates to the Mintsoft bundle writer.'),
+  d('lib/connectors/mintsoft/first-load-archive-write.ts::createMintsoftArchiveWriter::discontinueMintsoftProduct#1', 'mintsoft', 'product.discontinue', 'script', 'not-applicable',
+    'The first-load archive command (scripts/first-load-mintsoft-archive.ts --execute): an operator runs it once at the cut-over, behind the switch first_load_mintsoft_archive_enabled, the plan token and the import proof; the producer hold (per hop and before the POST) and the outbound-write grant govern its transport.'),
   d('lib/connectors/mintsoft/index.ts::MintsoftConnector.pushOrder::pushMintsoftOrder#1', 'mintsoft', 'order.create', 'facade', 'required',
     'The connector method delegates to the Mintsoft order creator.'),
   d('lib/connectors/mintsoft/index.ts::MintsoftConnector.updateOrder::updateMintsoftOrder#1', 'mintsoft', 'order.amend', 'facade', 'required',

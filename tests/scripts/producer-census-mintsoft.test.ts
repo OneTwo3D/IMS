@@ -83,7 +83,7 @@ test('PRECONDITION: the real tree is green, and the census reached every part of
   // 14: the comment writers are gone (the sweep's note and the refund note: IMS raises operator tasks instead), so the sweep has 9 and the rest are unchanged; the parent-SKU deleter (o3d-zvec.20) is the fourteenth; the merge hold (holdOrder, a GET MarkAwaitingConfirmation, behind its producer-seam clearance) is the fifteenth.
   assert.equal(report.counts.writeCalls, 16, 'the sweep (9), the merge hold, the product, bundle, content and parent-SKU delete writers, the supplier creator and the two ASN buttons')
   assert.equal(report.counts.writeCallsWithClearance, report.counts.writeCalls)
-  assert.equal(report.counts.transportSites, 3, 'sendMintsoftRequest and the two login helpers')
+  assert.equal(report.counts.transportSites, 4, 'sendMintsoftRequest, the two login helpers and the first-load archive command (MINT_OPERATOR_TRANSPORT)')
   assert.equal(report.counts.clearanceCasts, 1)
   assert.equal(report.counts.mintCalls, 2, 'one in the generic seam (an unregistered connector) and one in the destination seam')
   assert.equal(report.counts.mapOperationsGoverned, report.counts.mapOperations)
