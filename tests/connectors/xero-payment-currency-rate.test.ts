@@ -36,6 +36,9 @@ type SyncRow = {
   createdAt: Date
   backReferenceCheckedAt: Date | null
   backReferenceFollowUpsPendingAt: Date | null
+  /** o3d-n2ci4: the send evidence an earlier attempt leaves on the row. */
+  createDispatchedAt?: Date | null
+  remoteAttemptedAt?: Date | null
 }
 
 const state = {
@@ -44,11 +47,17 @@ const state = {
   activeTenantId: 'tenant-B' as string | null,
   /** Every Xero write attempted. The load-bearing assertion is that this stays EMPTY. */
   posts: [] as Array<{ path: string; body: unknown }>,
-  activities: [] as Array<{ action: string }>,
+  activities: [] as Array<{ action: string; level?: string; description?: string; metadata?: Record<string, unknown> }>,
   /** SALES_INVOICE re-reads its order right before posting; a missing one fails locally, not remotely. */
   liveSalesOrder: false,
   /** The currency the ledger's own copy of the invoice is in (the probe reads it). */
   ledgerCurrency: 'GBP',
+  /** o3d-n2ci4: exception-inbox rows recorded (recordAccountingPostingRefusal, captured below). */
+  refusals: [] as Array<{ key: Record<string, unknown>; record: Record<string, unknown> }>,
+  /** o3d-n2ci4: a terminal write (CANCELLED / FAILED) finds the claim moved on and matches nothing. */
+  loseClaimOnTerminalWrite: false,
+  /** o3d-n2ci4: answer the create-dispatch fence's clock read (the journal positive control). */
+  answerDatabaseClock: false,
 }
 
 function blankRow(payload: Record<string, unknown>): SyncRow {
@@ -85,6 +94,7 @@ const db = {
       return { ...(row ?? {}) }
     },
     async updateMany(args: { where: { id?: string }; data: Record<string, unknown> }) {
+      if (state.loseClaimOnTerminalWrite && (args.data.status === 'CANCELLED' || args.data.status === 'FAILED')) return { count: 0 }
       const matched = state.rows.filter((row) => !args.where.id || row.id === args.where.id)
       for (const row of matched) Object.assign(row, args.data)
       return { count: matched.length }
@@ -135,12 +145,28 @@ const db = {
   // nothing to do with connection provenance. Answering an empty row set is what the lock helper
   // does when it locks nothing of interest; the locking behaviour itself is pinned in the
   // allocation-service and cancel-invoice-posting-intent tests.
-  async $queryRaw() { return [] },
+  // o3d-n2ci4: the create-dispatch fence reads the database clock before a journal's create; answered only for the positive control.
+  async $queryRaw(strings?: TemplateStringsArray) {
+    if (state.answerDatabaseClock && strings?.join('').includes('clock_timestamp() AS "now"')) return [{ now: new Date() }]
+    return []
+  },
   async $queryRawUnsafe() { return [] },
   async $transaction(fn: (tx: unknown) => Promise<unknown>) { return fn(db) },
 }
 
 mock.module('@/lib/db', { namedExports: { db } })
+// o3d-n2ci4: the standing exception-inbox row is captured, the rest of the module is the real one.
+// eslint-disable-next-line @typescript-eslint/no-require-imports -- this file compiles to CJS (no top-level await); the real module, loaded before the mock replaces it
+const realPostingRefusalInbox = require('@/lib/domain/accounting/posting-refusal-inbox') as Record<string, unknown>
+mock.module('@/lib/domain/accounting/posting-refusal-inbox', {
+  namedExports: {
+    ...realPostingRefusalInbox,
+    recordAccountingPostingRefusal: async (_client: unknown, key: Record<string, unknown>, record: Record<string, unknown>) => {
+      state.refusals.push({ key, record })
+      return { recorded: true }
+    },
+  },
+})
 /**
  * o3d-0m56: every money post now runs inside `postMoneyUnderLedgerFence`, which takes a per-DOCUMENT
  * advisory lock on a PINNED connection — and that opens a real `pg` client from DATABASE_URL, which
@@ -236,6 +262,9 @@ mock.module('@/lib/security/connector-fetch', {
           text: async () => '',
         }
       }
+      if (/^ManualJournals/.test(path)) {
+        return { ok: true, status: 200, headers: { get: () => null }, json: async () => ({ ManualJournals: [{ ManualJournalID: 'MJ-1' }] }), text: async () => '' }
+      }
       return {
         ok: true,
         status: 200,
@@ -252,6 +281,9 @@ function reset(payload: Record<string, unknown>, activeTenantId: string | null =
   state.activeTenantId = activeTenantId
   state.posts = []
   state.activities = []
+  state.refusals = []
+  state.loseClaimOnTerminalWrite = false
+  state.answerDatabaseClock = false
 }
 
 async function runXeroSync() {
@@ -262,8 +294,9 @@ async function runXeroSync() {
 
 const BILL = { accountingInvoiceId: 'XBILL-ISSUED-BY-A', bankAccountId: 'BANK-1', amount: 250, paymentDate: '2026-01-02', _connectionProvenance: 'xero:tenant-B' }
 
-async function post(payload: Record<string, unknown>, type: 'BILL_PAYMENT' | 'INVOICE_PAYMENT' | 'REALISED_FX_JOURNAL' | 'UNREALISED_FX_JOURNAL' = 'BILL_PAYMENT', ledgerCurrency = 'GBP') {
+async function post(payload: Record<string, unknown>, type: 'BILL_PAYMENT' | 'INVOICE_PAYMENT' | 'REALISED_FX_JOURNAL' | 'UNREALISED_FX_JOURNAL' | 'COGS_JOURNAL' = 'BILL_PAYMENT', ledgerCurrency = 'GBP', before?: () => void) {
   reset(payload)
+  before?.()
   state.ledgerCurrency = ledgerCurrency
   state.liveSalesOrder = true
   state.rows[0]!.type = type
@@ -362,6 +395,126 @@ for (const kind of ['revaluation', 'reversal'] as const) {
     assert.ok(state.activities.some((a) => a.action === 'xero_unrealised_fx_journal_retired'))
   })
 }
+
+const FX_ROW = (kind: 'revaluation' | 'reversal') => ({
+  kind, valuationDate: '2026-01-02', side: 'receivable', date: '2026-01-02', reference: 'FXREV-2026-01-02',
+  narration: kind === 'reversal' ? 'Reverse unrealised FX revaluation from 2026-01-01' : 'Unrealised AR FX revaluation at 2026-01-02',
+  ...(kind === 'reversal' ? { sourceEntryId: 'log-0', sourceValuationDate: '2026-01-01' } : {}),
+  lines: [{ description: 'x', accountCode: '610', debit: 12.34 }, { description: 'y', accountCode: '498', credit: 12.34 }],
+  _idempotencyKey: `unrealised-fx:${kind}:2026-01-02:${kind === 'reversal' ? 'log-0' : 'receivable'}`,
+  _connectionProvenance: 'xero:tenant-B',
+})
+const REALISED_ROW = {
+  date: '2026-01-02', reference: 'SO-1', narration: 'Realised FX', side: 'receivable',
+  lines: [{ description: 'x', accountCode: '610', debit: 1 }, { description: 'y', accountCode: '810', credit: 1 }],
+  _connectionProvenance: 'xero:tenant-B',
+}
+
+// o3d-n2ci4 (#1135 review MED-1): a row whose record shows it MAY have reached Xero is never retired as "not sent". It is parked FAILED for
+// a person (retries spent, so nothing re-claims it), naming where to look. [mutation: ignore createDispatchedAt or remoteAttemptedAt;
+// write CANCELLED; leave retryCount unspent; drop the FXREV reference from the notice]
+for (const [label, evidence] of [
+  ['a create-dispatch marker', { createDispatchedAt: new Date('2026-01-02T10:00:00Z') }],
+  ['a remote-attempt stamp', { remoteAttemptedAt: new Date('2026-01-02T10:00:00Z') }],
+] as const) {
+  for (const kind of ['revaluation', 'reversal'] as const) {
+    test(`an UNREALISED_FX_JOURNAL ${kind} with ${label} is parked FAILED "may have posted", not CANCELLED "not sent", and sends NOTHING`, async () => {
+      const { fxJournalMayHavePostedNotice } = await import('@/lib/connectors/xero/sync-processor')
+      const { result, row } = await post(FX_ROW(kind), 'UNREALISED_FX_JOURNAL', 'GBP', () => { Object.assign(state.rows[0]!, evidence) })
+      assert.deepEqual(state.posts, [], 'no journal reached Xero')
+      assert.equal(result.succeeded, 0)
+      assert.equal(row.status, 'FAILED', 'an operator item, never CANCELLED "not sent"')
+      assert.equal(row.retryCount, 5, 'retries spent: nothing re-claims it')
+      assert.match(row.errorMessage ?? '', /may have posted on an earlier attempt/)
+      assert.match(row.errorMessage ?? '', /Xero Manual Journals with the reference FXREV-2026-01-02/)
+      assert.match(row.errorMessage ?? '', /reverse it by hand in Xero/)
+      assert.doesNotMatch(row.errorMessage ?? '', /Retired, not sent/)
+      assert.equal(typeof fxJournalMayHavePostedNotice, 'function')
+      const parked = state.activities.find((a) => a.action === 'xero_unrealised_fx_journal_parked_may_have_posted')
+      assert.ok(parked, 'the operator is told')
+      assert.equal(parked.level, 'ERROR')
+      assert.ok(!state.activities.some((a) => a.action === 'xero_unrealised_fx_journal_retired'), 'and it is not reported as retired')
+      assert.deepEqual(state.refusals, [], 'a maybe-posted reversal is not reported as an unreversed revaluation')
+    })
+  }
+  test(`a REALISED_FX_JOURNAL with ${label} is parked FAILED "may have posted", not CANCELLED "not sent", and sends NOTHING`, async () => {
+    const { result, row } = await post(REALISED_ROW, 'REALISED_FX_JOURNAL', 'GBP', () => { Object.assign(state.rows[0]!, evidence) })
+    assert.deepEqual(state.posts, [], 'no journal reached Xero')
+    assert.equal(result.succeeded, 0)
+    assert.equal(row.status, 'FAILED')
+    assert.equal(row.retryCount, 5)
+    assert.match(row.errorMessage ?? '', /may have posted on an earlier attempt/)
+    assert.match(row.errorMessage ?? '', /the reference SO-1/)
+    assert.ok(state.activities.some((a) => a.action === 'xero_realised_fx_journal_parked_may_have_posted' && a.level === 'ERROR'))
+  })
+}
+
+// o3d-n2ci4 (#1135 review MED-2): the reversal of a revaluation that POSTED is still retired unsent (Xero revalues itself), but that leaves
+// the IMS revaluation standing in Xero. It is an ERROR that names the Xero journal, with text that says so (not "would count it twice"),
+// and a standing exception-inbox row. [mutation: skip the source read; report at WARNING; keep the generic reason as the activity text;
+// drop the refusal record; name no journal id]
+test('a reversal whose source revaluation is SYNCED is retired with an ERROR and a standing finding naming the Xero journal', async () => {
+  const { UNREALISED_FX_JOURNAL_RETIRED_REASON } = await import('@/lib/connectors/xero/sync-processor')
+  const { result, row } = await post(FX_ROW('reversal'), 'UNREALISED_FX_JOURNAL', 'GBP', () => {
+    state.rows.push({ ...blankRow({ kind: 'revaluation' }), id: 'log-0', type: 'UNREALISED_FX_JOURNAL', referenceType: 'FxRevaluation', referenceId: '2026-01-01', status: 'SYNCED', externalTransactionId: 'MJ-XERO-123' })
+  })
+  assert.deepEqual(state.posts, [], 'no journal reached Xero')
+  assert.equal(result.succeeded, 0)
+  assert.equal(row.status, 'CANCELLED', 'the reversal itself was never sent, so CANCELLED is true of it')
+  assert.equal(row.errorMessage, UNREALISED_FX_JOURNAL_RETIRED_REASON)
+  const report = state.activities.find((a) => a.action === 'xero_unrealised_fx_reversal_retired_source_posted')
+  assert.ok(report, 'reported under its own action')
+  assert.equal(report.level, 'ERROR')
+  assert.match(report.description ?? '', /POSTED to Xero as Xero manual journal MJ-XERO-123/)
+  assert.match(report.description ?? '', /Reverse that journal by hand in Xero/)
+  assert.doesNotMatch(report.description ?? '', /would count the same movement twice/, 'the generic reason is wrong for this case')
+  assert.ok(!state.activities.some((a) => a.action === 'xero_unrealised_fx_journal_retired'), 'not also reported as an ordinary retirement')
+  assert.equal(state.refusals.length, 1, 'one standing exception-inbox row')
+  const [{ key, record }] = state.refusals
+  assert.deepEqual(key, { type: 'UNREALISED_FX_JOURNAL', referenceType: 'FxRevaluation', referenceId: '2026-01-02', scope: 'unrealised-fx:reversal:2026-01-02:log-0' })
+  assert.equal(record.kind, 'unrealised_fx_journal')
+  assert.equal(record.reason, 'retired_reversal_source_posted')
+  assert.match(String(record.remedy), /Reverse Xero manual journal MJ-XERO-123 \(reference FXREV-2026-01-02\) by hand in Xero/)
+  assert.equal((record.detail as Record<string, unknown>).sourceJournalId, 'MJ-XERO-123')
+})
+
+for (const status of ['CANCELLED', 'FAILED'] as const) {
+  test(`a reversal whose source revaluation is ${status} (never posted) is an ordinary retirement: no ERROR, no finding`, async () => {
+    const { row } = await post(FX_ROW('reversal'), 'UNREALISED_FX_JOURNAL', 'GBP', () => {
+      state.rows.push({ ...blankRow({ kind: 'revaluation' }), id: 'log-0', type: 'UNREALISED_FX_JOURNAL', referenceType: 'FxRevaluation', referenceId: '2026-01-01', status })
+    })
+    assert.deepEqual(state.posts, [])
+    assert.equal(row.status, 'CANCELLED')
+    assert.ok(state.activities.some((a) => a.action === 'xero_unrealised_fx_journal_retired' && a.level === 'WARNING'))
+    assert.ok(!state.activities.some((a) => a.level === 'ERROR'))
+    assert.deepEqual(state.refusals, [])
+  })
+}
+
+// o3d-n2ci4 (#1135 review LOW-1): a retirement this attempt did NOT make (its claim moved on) is not reported as one.
+// [mutation: report `retired` regardless; keep WARNING]
+for (const type of ['REALISED_FX_JOURNAL', 'UNREALISED_FX_JOURNAL'] as const) {
+  test(`a ${type} whose claim moved on before the retirement is reported as NOT retired, at INFO`, async () => {
+    const prefix = type === 'REALISED_FX_JOURNAL' ? 'xero_realised_fx_journal' : 'xero_unrealised_fx_journal'
+    await post(type === 'REALISED_FX_JOURNAL' ? REALISED_ROW : FX_ROW('revaluation'), type, 'GBP', () => { state.loseClaimOnTerminalWrite = true })
+    assert.deepEqual(state.posts, [])
+    assert.ok(!state.activities.some((a) => a.action === `${prefix}_retired`), 'no "retired" report for a retirement that did not happen')
+    const moved = state.activities.find((a) => a.action === `${prefix}_not_retired_claim_moved`)
+    assert.ok(moved)
+    assert.equal(moved.level, 'INFO')
+    assert.match(moved.description ?? '', /Not retired by this attempt/)
+  })
+}
+
+// o3d-n2ci4 (#1135 review LOW-7): THE POSITIVE CONTROL. "Sends NOTHING" above is only evidence if a live journal type DOES reach the wire in
+// this same harness; otherwise an arm that handed the row back before the wire would pass those tests too. [mutation: none — if this goes
+// red the retirement tests above are vacuous]
+test('control: a COGS_JOURNAL in the same harness DOES reach Xero (POST ManualJournals), so "sends NOTHING" above is not vacuous', async () => {
+  const { row } = await post({
+    date: '2026-01-02', reference: 'SO-1', narration: 'COGS', lines: REALISED_ROW.lines, _connectionProvenance: 'xero:tenant-B',
+  }, 'COGS_JOURNAL', 'GBP', () => { state.answerDatabaseClock = true })
+  assert.ok(state.posts.some((p) => /^ManualJournals/.test(p.path)), `a manual journal was sent (row ${row.status}: ${row.errorMessage ?? ''})`)
+})
 
 // A payment of zero or less is never sent. [mutation: remove the guard from one case; test `< 0` (zero passes); test the absolute value (negative passes); report failure instead of retiring (a retry loop); skip the notice]
 for (const type of ['BILL_PAYMENT', 'INVOICE_PAYMENT'] as const) {
