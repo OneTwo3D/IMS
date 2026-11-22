@@ -4,6 +4,12 @@
 This version has breaking changes — APIs, conventions, and file structure may all differ from your training data. Read the relevant guide in `node_modules/next/dist/docs/` before writing any code. Heed deprecation notices.
 <!-- END:nextjs-agent-rules -->
 
+## Documentation is mandatory with code changes
+
+- Update `docs/**` and/or `help-docs/**` in the same PR as the code change. Code is the source of truth: where a doc disagrees with the code, fix the doc; if the code looks wrong, file a bead instead of documenting it.
+- CI enforces this: `npm run check:docs-required` fails a PR that changes behaviour-bearing paths (`app/`, `lib/`, `components/`, `prisma/schema.prisma`, `prisma/migrations/`, shipped `scripts/`, `deploy/`) without a docs change.
+- If nothing needs documenting, add `Docs: none — <reason, 20+ characters>` to the PR's `changelog.d` fragment. Paths, exclusions and opt-out rules: docs/development.md, "Documentation Updates".
+
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:ca08a54f -->
 ## Beads Issue Tracker
 

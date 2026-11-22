@@ -325,12 +325,17 @@ test('detector: two guards in one job are flagged, two in separate jobs are not'
   assert.equal(jobsHidingFailures(twoSteps).length, 1)
 })
 
-for (const [file, jobId] of [['static-guards.yml', 'migration-conventions'], ['production-readiness.yml', 'validate']] as const) {
-test(`${file}: job ${jobId} (which runs check:migration-conventions) passes an explicit base for BOTH event shapes (a push must not default to origin/development == HEAD)`, () => {
+for (const [file, jobId, envName] of [
+  ['static-guards.yml', 'migration-conventions', 'MIGRATION_CONVENTION_BASE_REF'],
+  ['production-readiness.yml', 'validate', 'MIGRATION_CONVENTION_BASE_REF'],
+  ['static-guards.yml', 'docs-required', 'DOCS_REQUIRED_BASE_REF'],
+  ['production-readiness.yml', 'validate', 'DOCS_REQUIRED_BASE_REF'],
+] as const) {
+test(`${file}: job ${jobId} passes ${envName} explicitly for BOTH event shapes (a push must not default to origin/development == HEAD)`, () => {
   const doc = yaml.load(readFileSync(join(WF_DIR, file), 'utf8')) as Json
   const job = (doc.jobs as Record<string, Json>)[jobId]
   assert.ok(job, `${file} must have a ${jobId} job`)
-  const expr = String(((job.env ?? {}) as Json).MIGRATION_CONVENTION_BASE_REF ?? '')
+  const expr = String(((job.env ?? {}) as Json)[envName] ?? '')
   assert.match(expr, /github\.event\.before/, 'push events must compare the event before..after range')
   assert.match(expr, /github\.base_ref/, 'pull requests must compare against their base branch')
   assert.match(expr, /github\.event_name == 'pull_request'/, 'the expression must branch on the event name')

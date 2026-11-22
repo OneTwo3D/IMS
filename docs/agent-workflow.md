@@ -109,7 +109,7 @@ that touches it. See docs/development.md, "Database-backed tiers".
 
 ## Documentation Updates
 
-Documentation is part of the change, not a later cleanup. For every PR, check whether the change affects:
+Documentation is part of the change, not a later cleanup, and it is mandatory: the `docs-required` CI check fails a PR that changes behaviour-bearing code without changing `docs/` or `help-docs/` (or carrying a reasoned `Docs: none — <reason>` line in its changelog.d fragment). Code is the source of truth: where a doc disagrees with the code, fix the doc; if the code looks wrong, file a bead. The rule, the exact paths and the opt-out are in docs/development.md, "Documentation Updates". For every PR, check whether the change affects:
 
 - `README.md` for high-level user or setup entry points
 - `docs/development.md` for agent/developer workflow, validation, and guardrails
@@ -119,7 +119,7 @@ Documentation is part of the change, not a later cleanup. For every PR, check wh
 - `docs/workflows.md` and the workflow generator when status transitions change
 - `help-docs/` when user-facing screens, labels, available actions, or support workflows change
 
-If a behavior change intentionally has no documentation impact, say that explicitly in the PR summary or review response.
+If a behavior change intentionally has no documentation impact, add the `Docs: none — <reason>` line to the PR's changelog.d fragment; the check prints the reason it accepted.
 
 ## PR Process
 
