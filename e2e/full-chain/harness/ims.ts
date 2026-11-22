@@ -679,18 +679,9 @@ export async function runDailyBatch(page: Page): Promise<Record<string, unknown>
  * Drive the period-end AR/AP unrealised-FX revaluation cron (GET /api/cron/accounting-fx-revaluation,
  * CRON_SECRET bearer), optionally for an explicit valuation date.
  *
- * `valuationDate` (YYYY-MM-DD) is worth passing: it is the sweep's referenceId, so pinning it makes the
- * documents a test asserts on addressable, and it side-steps hasRevaluationForDate() skipping the fresh
- * revaluation when one was already queued for today.
- *
- * The returned body is the sweep's own report, and its counts are the assertion surface:
- *   - `documents` — open foreign AR/AP documents it revalued;
- *   - `revalued`  — journals it ENQUEUED, incremented after the queueAccountingSync call RETURNS, so it
- *     counts enqueue attempts rather than rows written — which is exactly what makes it the non-vacuous
- *     half of X-03's suppression assertion;
- *   - `reversed`  — prior-period revaluations it reversed.
- * `{ skipped: true }` means it never really ran (sync disarmed, or already revalued for the date); a
- * caller asserting on counts must treat that as a failure, not as a zero.
+ * RETIRED (owner decision 2026-11-22): Xero revalues open foreign balances itself, so the route no longer runs
+ * the sweep. It answers `{ success: true, skipped: true, reason: 'Retired: …' }` with every count zero, and X-03
+ * asserts exactly that answer plus the absence of any UNREALISED_FX_JOURNAL row for `valuationDate`.
  *
  * Rate-limited 1/hour/IP like every cron route; X-03 needs a single call, so it takes no override.
  */

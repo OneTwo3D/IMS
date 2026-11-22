@@ -27,7 +27,7 @@ export default async function FxGainLossAnalyticsPage({ searchParams }: Props) {
   return (
     <FinanceAnalyticsReportPage
       title="FX Gain/Loss"
-      description="Realised FX gain and loss by settled receivable and payable transaction."
+      description="Realised FX gain and loss by settled receivable and payable transaction, measured at IMS's rates. Information only: IMS posts no FX journal; Xero books realised and unrealised currency gains itself."
       reportKey="fx-gain-loss"
       filters={financeAnalyticsFiltersForUi(filters)}
       pageInfo={report.pageInfo}

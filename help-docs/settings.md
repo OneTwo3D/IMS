@@ -484,7 +484,7 @@ Defaults are what the Scheduler shows until you change them. "On" means switched
 | `/api/cron/xero-chart-sync` | Refresh the stored Xero chart of accounts (read only) before the balance snapshot | Daily at 00:30 | On |
 | `/api/cron/account-balance-snapshot` | Xero account balance snapshots (needs the trial-balance permission; see [Xero Accounting Sync](xero-sync.md)) | Daily at 01:00 | On |
 | `/api/cron/xero-tax-rate-drift` | Compare IMS tax rates with the live Xero rates and raise the drift alert | Hourly | On |
-| `/api/cron/accounting-fx-revaluation` | Unrealised FX on open AR/AP | Daily | Not in the Scheduler list; schedule it from the server's own cron if you use accounting |
+| `/api/cron/accounting-fx-revaluation` | **Retired.** Answers a successful skip and does nothing: Xero revalues open foreign balances itself | — | Not in the Scheduler list; do not schedule it, and remove it from the server's own cron if it is there |
 | `/api/cron/delivery-status` | Tracking provider polling | Every 15 min | On |
 | `/api/cron/refund-reservation-release` | Safety net that releases stock reservations for refunded units | Every 15 min | On |
 | `/api/cron/product-sync-marks` | Sends the shop and warehouse sync owed by products edited by CSV, 25 products per run | Every 5 min | On |

@@ -287,8 +287,13 @@ export async function isAccountingConnectorConnected(
  * Xero's own posting. So FX gain/loss journals are suppressed for the Xero
  * connector at the single queue chokepoint every enqueue site routes through
  * (realised: sales.ts / purchase-orders.ts on payment; unrealised:
- * accounting-fx-revaluation.ts at period end). QuickBooks is unaffected — its
- * AP/AR manual-journal rules differ; revisit per o3d-lgo.6.1 if QBO is verified.
+ * accounting-fx-revaluation.ts at period end, reversals included). Both are
+ * RETIRED for Xero: the realised journal because every foreign payment carries
+ * IMS's settlement rate and Xero books the gain/loss itself; the unrealised
+ * revaluation (owner decision 2026-11-22) because Xero revalues open foreign
+ * invoices, bills and bank balances in its own reports. Its cron no longer runs
+ * the sweep, and the Xero processor retires any row of either type already
+ * queued instead of sending it.
  */
 const FX_GAIN_LOSS_JOURNAL_TYPES: ReadonlySet<AccountingSyncType> = new Set([
   'REALISED_FX_JOURNAL',

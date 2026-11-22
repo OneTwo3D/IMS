@@ -14,7 +14,8 @@ import test, { mock } from 'node:test'
  *    XE.com day rate);
  *  - a payload naming no currency sends nothing (it cannot be told to be base);
  *  - a base-currency payment is unchanged: no CurrencyRate;
- *  - a REALISED_FX_JOURNAL row queued before this change is retired with a named reason and sends nothing.
+ *  - a REALISED_FX_JOURNAL row queued before this change is retired with a named reason and sends nothing;
+ *  - an UNREALISED_FX_JOURNAL row (a revaluation or the reversal of one) is retired the same way: Xero revalues open foreign balances itself.
  */
 
 mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP', resolveBaseCurrencyCode: async () => 'GBP' } })
@@ -261,12 +262,13 @@ async function runXeroSync() {
 
 const BILL = { accountingInvoiceId: 'XBILL-ISSUED-BY-A', bankAccountId: 'BANK-1', amount: 250, paymentDate: '2026-01-02', _connectionProvenance: 'xero:tenant-B' }
 
-async function post(payload: Record<string, unknown>, type: 'BILL_PAYMENT' | 'INVOICE_PAYMENT' | 'REALISED_FX_JOURNAL' = 'BILL_PAYMENT', ledgerCurrency = 'GBP') {
+async function post(payload: Record<string, unknown>, type: 'BILL_PAYMENT' | 'INVOICE_PAYMENT' | 'REALISED_FX_JOURNAL' | 'UNREALISED_FX_JOURNAL' = 'BILL_PAYMENT', ledgerCurrency = 'GBP') {
   reset(payload)
   state.ledgerCurrency = ledgerCurrency
   state.liveSalesOrder = true
   state.rows[0]!.type = type
   if (type === 'INVOICE_PAYMENT') { state.rows[0]!.referenceType = 'SalesOrder'; state.rows[0]!.referenceId = 'so-1' }
+  if (type === 'UNREALISED_FX_JOURNAL') { state.rows[0]!.referenceType = 'FxRevaluation'; state.rows[0]!.referenceId = '2026-01-02' }
   const result = await runXeroSync()
   const payments = state.posts.filter((p) => p.path === 'Payments')
   return { result, payments, row: state.rows[0]! }
@@ -337,6 +339,29 @@ test('a REALISED_FX_JOURNAL queued before this change is retired with a named re
   assert.match(REALISED_FX_JOURNAL_RETIRED_REASON, /Xero books the realised FX/)
   assert.ok(state.activities.some((a) => a.action === 'xero_realised_fx_journal_retired'))
 })
+
+// Retiring the unrealised revaluation (Xero revalues open foreign invoices, bills and bank balances itself). [mutation: put
+// UNREALISED_FX_JOURNAL back in the manual-journal group (a journal is posted); report failure instead of retiring (a retry loop); skip the notice]
+for (const kind of ['revaluation', 'reversal'] as const) {
+  test(`an UNREALISED_FX_JOURNAL ${kind} already queued is retired with a named reason and sends NOTHING`, async () => {
+    const { UNREALISED_FX_JOURNAL_RETIRED_REASON } = await import('@/lib/connectors/xero/sync-processor')
+    const { result, row } = await post({
+      kind, valuationDate: '2026-01-02', side: 'receivable', date: '2026-01-02', reference: 'FXREV-2026-01-02',
+      narration: kind === 'reversal' ? 'Reverse unrealised FX revaluation from 2026-01-01' : 'Unrealised AR FX revaluation at 2026-01-02',
+      ...(kind === 'reversal' ? { sourceEntryId: 'log-0', sourceValuationDate: '2026-01-01' } : {}),
+      // The real control leg: the AR system account, which Xero refuses on a manual journal.
+      lines: [{ description: 'x', accountCode: '610', debit: 12.34 }, { description: 'y', accountCode: '498', credit: 12.34 }],
+      _connectionProvenance: 'xero:tenant-B',
+    }, 'UNREALISED_FX_JOURNAL')
+    assert.deepEqual(state.posts, [], 'no journal reached Xero')
+    assert.equal(result.succeeded, 0)
+    assert.equal(row.status, 'CANCELLED')
+    assert.equal(row.errorMessage, UNREALISED_FX_JOURNAL_RETIRED_REASON)
+    assert.equal(row.externalTransactionId, null)
+    assert.match(UNREALISED_FX_JOURNAL_RETIRED_REASON, /Xero revalues open foreign-currency invoices, bills and bank balances itself/)
+    assert.ok(state.activities.some((a) => a.action === 'xero_unrealised_fx_journal_retired'))
+  })
+}
 
 // A payment of zero or less is never sent. [mutation: remove the guard from one case; test `< 0` (zero passes); test the absolute value (negative passes); report failure instead of retiring (a retry loop); skip the notice]
 for (const type of ['BILL_PAYMENT', 'INVOICE_PAYMENT'] as const) {

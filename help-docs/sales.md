@@ -659,11 +659,11 @@ Even if the daily rate changes tomorrow, the order's base-currency totals don't 
 
 ### Realised FX gain/loss on settlement
 
-When a multi-currency invoice is paid weeks or months later, the actual settlement exchange rate may differ from the rate booked at invoice creation. The system computes the **realised FX gain/loss** at payment time and books it to a configured FX P&L account in Xero.
+When a multi-currency invoice is paid weeks or months later, the actual settlement exchange rate may differ from the rate booked at invoice creation. **Xero books that realised FX gain or loss itself**: every foreign payment IMS sends carries the settlement rate IMS resolved for it as the payment's `CurrencyRate`, so Xero posts the gain or loss to its own system currency-gains account at IMS's rate. IMS also computes the realised FX gain/loss at payment time, for its own **FX Gain/Loss report** (Analytics → FX Gain/Loss) only.
 
 Example: a €100 invoice booked at €1 = £0.85 (so £85 in base) but paid two months later at €1 = £0.88 (so £88 received) realises an £3 FX gain.
 
-The realised FX entry is queued as a `REALISED_FX_JOURNAL` accounting sync row and posted to Xero via the standard daily batch.
+IMS posts **no** FX journal: it does not queue a `REALISED_FX_JOURNAL` (it would book the same gain or loss a second time, against an AR control account Xero refuses on a manual journal), and a row queued before that change is retired, not sent. Unpaid foreign invoices are not revalued by IMS either: Xero revalues open foreign invoices, bills and bank balances in its own reports. See [Xero Accounting Sync → Realised and Unrealised FX](xero-sync.md#realised-and-unrealised-fx).
 
 ### Tax inclusive vs exclusive
 
