@@ -395,7 +395,7 @@ This means an admin viewing the activity log can see who did what but not see se
 
 - **Plugins** — enable or disable shopping/accounting connector plugins. Disabled plugins are hidden from menus and shared UI.
   - Each plugin has a switch, and **Save & Apply** at the bottom saves the selection and updates the scheduler's crontab to match. If the selection saves but the crontab could not be updated, an amber message says so and tells you what to do; the selection itself is kept.
-  - Some plugins are **mutually exclusive**: one WMS connector at a time. Saving is refused with "Enable one WMS connector at a time" rather than partially applied, and the refusal writes nothing at all, including the plugins in the same save that were individually fine. (Shopify and QuickBooks were removed in 2026-09: WooCommerce is the only shopping connector and Xero the only accounting connector, so they have nothing to conflict with.)
+  - Some plugins are **mutually exclusive**: one WMS connector at a time. Saving is refused with "Enable one WMS connector at a time" rather than partially applied, and the refusal writes nothing at all, including the plugins in the same save that were individually fine. (WooCommerce is the only shopping connector and Xero the only accounting connector, so they have nothing to conflict with.)
   - The rule is checked against the state the save is about to *land on*, not the state the page was loaded with. If a second administrator enables the other connector of a pair while your form is open, your save is refused rather than silently producing a both-enabled system. Reload to see the current selection before choosing again.
   - Saves are applied as one all-or-nothing change and are serialised against anything that acts on which connector is active (notably cancelling stranded accounting sync rows), so no other part of the system can observe a half-switched selection.
 - **Scheduler** — the **Public URL** card and the list of scheduled jobs (see [Cron jobs](#cron-jobs) below).
@@ -429,10 +429,7 @@ This means an admin viewing the activity log can see who did what but not see se
   re-sending it — a WARNING is written to the activity log
   (`xero_backreference_followups_discarded`) naming the document, so you can check whether its PDF or
   payment is missing and re-drive it by hand. In both cases the row is settled only once that warning
-  has been written, so a retry can never turn one of these rows green without saying what it lost. On **QuickBooks** there is
-  deliberately no repair sweep at all — a QuickBooks document id is a per-company integer, so a sweep
-  could not tell a previously connected company's id from the current one's — and an unresolved row
-  is compacted on the same schedule but only ever links by hand. See *Back-Reference Repair* in the
+  has been written, so a retry can never turn one of these rows green without saying what it lost. See *Back-Reference Repair* in the
   accounting sync guide. A row can fall under both rules at once (a failed sync that already has an
   accounting document id): it is kept for the retry AND has its content cleared on schedule, which is
   safe because a document that already posted is never re-sent — only its follow-ups are re-driven.

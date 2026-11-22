@@ -1,13 +1,5 @@
 # Xero Accounting Sync
 
-> **QuickBooks Online was removed in 2026-09.** Xero is the only accounting connector One Two
-> Inventory ships. This page still mentions QuickBooks in places — every one of those mentions is
-> **historical**, and is kept for one reason: most of them explain why a rule on the Xero side is
-> shaped the way it is, by contrast with a connector that behaved differently. Nothing on this page
-> describes a QuickBooks control you can use, because there is no longer a QuickBooks connector to
-> control. If you have sync rows or documents recorded against QuickBooks from before the removal,
-> see **Sync → Exceptions**, which still lists them and tells you what to do about each one.
-
 One Two Inventory integrates with Xero to keep your accounting records in sync. The system acts as a **sub-ledger** — Xero handles invoicing, payments, and bank reconciliation, while the IMS creates daily correction journals to control when revenue is recognised and how inventory flows through your accounts.
 
 ## Connection Setup
@@ -401,15 +393,6 @@ purpose. Setting both to the *same* single organisation is fine, so you can migr
 `XERO_TENANT_ID` alongside `XERO_ALLOWED_TENANT_NAMES` is fine too: a name narrows what the id chose
 rather than competing with it.
 
-> **Historical note (2026-09):** the paragraph below described the QuickBooks connector, which has
-> since been removed (see the release notes). It is kept because the CONTRAST is the reason this
-> control exists on Xero, and the next accounting connector has to be asked the same question.
-
-**QuickBooks** did not have this control. It did not share the same defect — Intuit sends the company
-(`realmId`) in the callback itself, so there is no list to pick from and nothing is chosen silently —
-but it also has no environment allow-list, so a restored database with a QuickBooks token in it is not
-stopped the way a Xero one is.
-
 ### How to get your Xero Client ID and Secret
 
 The Client ID and Client Secret come from a **Xero app** you create in the Xero Developer portal:
@@ -456,15 +439,14 @@ permission:
 
 A connection made before IMS started recording grants has no record of its permissions. Those are
 treated as *unknown*, not as *missing* — nothing is blocked, and the record fills in on the next
-reconnect. QuickBooks connections do not record grants and never show this warning.
+reconnect.
 
 ### Disconnecting
 
 Disconnecting removes the stored token **and forgets every Xero ID the IMS had cached** — the Xero
 contact ID on each customer/supplier and the Xero item ID on each product. This is deliberate: those
 IDs only mean anything to the organisation that issued them, so keeping them would hand stale IDs to
-the next connection. After reconnecting (to the same org or a different one, or when switching to
-QuickBooks) the IDs are simply resolved again on first use. Nothing needs to be re-entered.
+the next connection. After reconnecting (to the same org or a different one) the IDs are simply resolved again on first use. Nothing needs to be re-entered.
 
 A cached ID also records **which organisation issued it**, taken from the request that produced it — so
 even an ID that survived some other route (a restored database, a connector switch that bypassed
@@ -934,7 +916,7 @@ CurrencyRate sent on Invoice / Bill / CreditNote API call
 
 **Refunds and credit notes use the booked rate, and refuse without one.** A refund, a chargeback's discount line, a supplier credit note and a hand-recorded WooCommerce refund are all converted at the exchange rate stored on the order or bill they reverse (never a fresh table rate). A document in the base currency is 1 because its currency is the base currency. A foreign document whose stored rate is missing, zero or negative is **refused by name before anything is written** (`<document> is in USD but has no usable stored FX rate to GBP`): the refund or credit note is not created and nothing is converted at 1. A WooCommerce refund that hits this is not lost: it is parked as a quarantined refund (the sync-exceptions inbox, with the message above and an `refund_sync_missing_order_fx_rate` activity entry). **Operator action: correct the document's exchange rate, then record or retry the refund from the inbox.**
 
-**Connector-agnostic design:** the optional `currencyRateToBase` field is on the generic `InvoiceData` / `BillData` / `CreditNoteData` types (`lib/connectors/types.ts`). Each accounting connector decides how to translate it. Xero sends the inverse form (`1 / x`) as `CurrencyRate`; QuickBooks also inverts the IMS rate before setting `ExchangeRate`, rounded to the connector's supported precision.
+**Connector-agnostic design:** the optional `currencyRateToBase` field is on the generic `InvoiceData` / `BillData` / `CreditNoteData` types (`lib/connectors/types.ts`). Each accounting connector decides how to translate it. Xero sends the inverse form (`1 / x`) as `CurrencyRate`.
 
 **Downstream push to WooCommerce (retired).** IMS no longer pushes exchange rates to the store: the onetwoInventory Helper plugin 1.3.0 refuses every rate push and no longer overrides Aelia's rate, so Aelia, the store's currency switcher, owns the storefront rates. A push attempt is recorded as a skipped row in the push log. IMS takes its rates from the daily ECB fetch; reading Aelia's rates into IMS (setting `fx_rate_source`, default ECB) is built but **not yet switched on**. See `docs/woocommerce.md` for the plugin.
 
@@ -982,7 +964,7 @@ When enabled, the nightly cron job runs three groups in sequence:
 
 **Refunds entered before the first run.** A refund recorded before an order's first batch run (a net refund, from this release's refund writer) is netted out of that order's revenue deferral, so a partial refund no longer leaves Unearned Revenue holding the refunded value. The deferral journal itself stays at the full amount on the day the order was paid, and each such refund is posted as its own adjustment (DR Unearned Revenue / CR Sales) dated the day of the refund (never before the payment), so a refund entered in a later period never changes an earlier period's journal. Each refund records the adjustment journal that netted it, so a lost adjustment is rebuilt exactly once by the missing-batch sweep and reported by the accounting checks (`refund_deferral_adjustment_without_sync_evidence`) until it is. Refunds recorded after the deferral keep using the refund reversal journals described above. A refund from before refunds were stored net is not netted (its tax-inclusive total cannot be subtracted from a tax-exclusive deferral) and is left for the lifecycle tie-out to report.
 
-Group A1 reads each order's subtotal, shipping and discount to work out how much revenue to defer, and it reads them before it opens the transaction that writes the journal. If any of those orders changes in that window — in practice only the one-off WooCommerce coupon backfill does this — the whole group is **refused rather than posted**, because the journal it had prepared would no longer match the orders it names. Nothing is staged and no order is marked as deferred, so the next night's run simply recalculates from the corrected figures. The refusal appears in the run's errors and as an `accounting_daily_batch_stale_order_discount` entry in the activity log, naming each affected order and both amounts. The same applies to the QuickBooks daily batch.
+Group A1 reads each order's subtotal, shipping and discount to work out how much revenue to defer, and it reads them before it opens the transaction that writes the journal. If any of those orders changes in that window — in practice only the one-off WooCommerce coupon backfill does this — the whole group is **refused rather than posted**, because the journal it had prepared would no longer match the orders it names. Nothing is staged and no order is marked as deferred, so the next night's run simply recalculates from the corrected figures. The refusal appears in the run's errors and as an `accounting_daily_batch_stale_order_discount` entry in the activity log, naming each affected order and both amounts.
 
 ### GR/IR accrual posting (goods received, not invoiced)
 
@@ -1121,56 +1103,12 @@ the part payment: the receipt is registered, the reversal decision waits for tha
 usual way, and an empty Xero invoice with nothing left to speak for it is still **withheld** rather
 than charged back.
 
-**QuickBooks reverses on the same evidence, decided by the same code.** The rule above is not Xero's;
-it is IMS's, and the QuickBooks payment poller reaches its verdict through the same functions. It
-selects each order's recorded origin, takes the same database-clock reading *before* asking Intuit,
-and puts every reversal candidate through the same decision. A sale marked paid by hand or by a
-channel, one whose receipt has not been registered yet, and one whose registration this read cannot
-speak for are all **withheld** — `paidAt` is left set, no chargeback credit note is raised, and a
-WARNING against the order says which of the three it is and what to do. A genuine chargeback still
-reverses the moment a payment registration has demonstrably reached QuickBooks. The bill side is
-covered too: a bill whose payment IMS has queued but not yet posted no longer has `paidAt` cleared on
-the strength of a balance QuickBooks reports while that payment is still on its way.
-
-One difference from Xero is worth knowing, because it is visible to whoever reads the warnings:
-
-- **QuickBooks is not asked which payments a document carries.** The reversal read asks only which
-  documents regressed, so IMS can never prove that one *particular* payment of its own has been
-  removed. Where Xero would name the vanished payment id, QuickBooks acts on the amounts alone: it
-  reads the document's total and its balance out of the same response, and reverses only when
-  QuickBooks states that **nothing at all** is still applied to it. A document showing merely a
-  balance due is never reversed on that alone — a part payment produces exactly the same balance as a
-  removed one, and clearing **Paid** over it would raise a credit note against money QuickBooks is
-  still holding.
-
-  "Nothing at all" is measured against the **document's own currency**: half of one minor unit, so a
-  penny in GBP, one yen in JPY, a thousandth of a dinar in KWD. An amount below that is dust; one
-  minor unit is a real payment and is never read as nothing.
-
-  The withheld verdict is put back to QuickBooks on the same hourly timer Xero's is (see below), so a
-  document does not need to change again for IMS to reconsider it.
-
-**A part-paid document is reported, not reconciled — and IMS will not put it right by itself.** When
-QuickBooks says a document is only partly settled while IMS holds it as fully paid — a £100 invoice
-with £50 against it — IMS says exactly that: the warning against the order names the amount
-QuickBooks has settled, the document's total, the amount still **outstanding** and the currency, and
-the activity entry carries them as fields so the open ones can be listed. **Paid** stays set, because
-reversing the whole document would credit the half QuickBooks is still accounting for, and the
-warning is rewritten every time the document is reconsidered.
-
-**The warning does not say a payment was removed, and that is deliberate.** A document that was only
-ever part paid — invoiced at £100, settled with a single £50 — states exactly the same total and
-balance as one that carried two £50 payments and lost one. The figures cannot tell them apart, so
-IMS reports the difference and leaves the cause to whoever opens the document. Being told money was
-taken back would send somebody hunting a chargeback that may never have happened.
-
-What IMS does *not* do is unwind the difference: there is no partial credit note and no partial
-reversal of recognised revenue. So the order goes on reading as fully paid until somebody acts.
-Either settle the outstanding amount in QuickBooks — pay or re-apply it, and IMS closes the item by
-itself on the next poll — or, if a payment really was taken back, raise the credit note for it by
-hand and correct the order. If the *rest* of the payment goes later, the document reaches a zero paid
-amount and IMS reverses it in full on its own. The same is true of a part-paid **Xero** invoice,
-which is warned about on every poll and reconciled by nobody.
+**A part-paid document is reported, not reconciled.** IMS does not unwind the difference: there is no
+partial credit note and no partial reversal of recognised revenue. A part-paid **Xero** invoice is
+warned about on every poll and reconciled by nobody, so the order goes on reading as fully paid until
+somebody acts. If a payment really was taken back, raise the credit note for it by hand and correct the
+order. If the *rest* of the payment goes later, the document reaches a zero paid amount and IMS
+reverses it in full on its own.
 
 **A withheld verdict is asked again on a timer.** It cannot be left to resolve itself: the delta
 returns an invoice only when it *changes*, and what usually settles a withheld verdict is not a change
@@ -1307,10 +1245,6 @@ queues a `SALES_INVOICE_UPDATE` entry instead of silently skipping the change. T
 the same document builder as the create path, so the update reflects exactly what a fresh push
 would have sent. An idempotency key derived from the payload prevents duplicate updates if the
 order is re-saved without changes.
-
-If the active accounting connector is QuickBooks (not Xero), IMS records a
-`sales_invoice_update_skipped_unsupported_connector` WARNING and does not queue the update. The
-behaviour is symmetric with the purchase bill path.
 
 ### Deleting a synced invoice or bill (off by default)
 
@@ -1527,9 +1461,6 @@ log) all state this. Before re-queueing an aged row, search Xero for the documen
 does not block the retry: it is the only remedy for a row whose cause has since been fixed, and
 refusing everything older than six minutes would refuse every retry there is.
 
-QuickBooks' `RequestId` dedupe window has not been established, so no equivalent claim is made for
-that connector and no caution is shown at its retry controls.
-
 #### The same is true of the AUTOMATIC retries
 
 The six minutes are not a fact about operators, and the automatic retry path does not clear them
@@ -1641,10 +1572,7 @@ rate queues an `AccountingSyncType.TAX_RATE_SYNC` entry. The sync processor call
 component-level breakdown on the Xero side. The push is idempotent: Xero matches the rate by
 `Name`, and unchanged re-saves dedupe at the IMS queue layer via a payload-derived idempotency key.
 
-A per-connector toggle (`xero_sync_tax_rate`, defaulting to `submitted`) gates the queueing. The
-QuickBooks side has no equivalent API for component breakdowns — for QBO operators the trigger
-logs a `tax_rate_sync_skipped_unsupported_connector` WARNING and the equivalent QBO tax codes must
-be configured manually.
+A per-connector toggle (`xero_sync_tax_rate`, defaulting to `submitted`) gates the queueing.
 
 Until the sync settles (or for connectors that don't support it), every IMS invoice or bill that
 uses a multi-component rate also emits a one-shot WARNING activity log
@@ -1731,7 +1659,7 @@ run that records tax-rate drift).
 
 ### Reverse Charge
 
-Lines whose `TaxRate.reverseCharge` is true post to Xero / QuickBooks with the connector-side tax
+Lines whose `TaxRate.reverseCharge` is true post to Xero with the connector-side tax
 type swapped to a configurable reverse-charge code:
 
 - `accounting_reverse_charge_sales_tax_type` (typical Xero: `ECOUTPUTSERVICES`)
@@ -2198,47 +2126,7 @@ is written at all** and a WARNING goes to the activity log
 document in Xero: until you do, that sale is in no reporting period. An invoice date the order
 already has is never overwritten.
 
-**The sweep runs for Xero only.** There is deliberately no QuickBooks equivalent, and that is not an
-oversight to be reported. A QuickBooks document id is a per-company integer, so a repair that ran
-against the wrong company would write a retired company's integer onto a live order or bill, and
-payment polling would then act on it as if it were current. Failing to repair is acceptable;
-repairing onto the wrong document is not.
-
-**The company boundary is no longer what is missing.** Every sync row now records which connected
-company it was raised against, so a QuickBooks sweep *could* select only the current company's rows.
-What is still missing is on the other side of the repair, and it is why the sweep stays unbound: IMS
-does not yet check **at post time** — as the last thing it does before sending — that the company
-connected at that moment is the company the row was raised against, and the follow-up rows a repair
-would create carry no record of their own origin for such a check to read. A correctly selected row
-could therefore still be posted against whatever company happens to be connected when the sync
-processor reaches it. Both of those — the **post time** check and the origin record — have to land before a QuickBooks sweep is safe to bind.
-
-On QuickBooks, a back-reference that fails to write is therefore **not retried by anything**: the
-warning in the activity log (`quickbooks_backreference_failed` or
-`quickbooks_backreference_ambiguous`) says so, and the link has to be made by hand. The external id
-is on the sync row, so nothing is lost — only automatic. See *Connecting a different company* below
-for what a company switch leaves behind.
-
-(QuickBooks *does* record outstanding follow-ups the same way Xero does — that costs nothing and
-crosses no company boundary — so the work is recoverable the day a QuickBooks sweep becomes safe to
-run. Until then it is a record, not a repair. **Every such row is listed on Sync → Exceptions, under
-"Accounting follow-ups owed, with nothing to re-drive them"** — that list, not the activity log, is
-the reliable place to find them, because it is read straight off the sync rows themselves rather than
-depending on a log entry having been written. `quickbooks_followup_error` in the activity log is the
-same news, when it could be recorded.
-
-**Do not settle one of these rows by hand.** The marker does not say the follow-up work never ran —
-it survives a pass whose follow-ups all succeeded and whose last write failed, and it survives a pass
-in which the payment was enqueued and the PDF was not, leaving a payment sitting `PENDING` in the
-local queue right now. Reading QuickBooks does not separate those cases: you can find no payment,
-create one, and have the queued row post its own minutes later, against the same invoice, with a
-request id that cannot deduplicate what a human made in the QuickBooks UI. Open the document, record
-what is actually there, and hand that reading to accounting. The page states the same rule at the top
-of the list, and each row carries the connector's own wording — both read from
-`lib/domain/accounting/follow-up-obligation-registry.ts`, which is the only place this instruction is
-written down.)
-
-**On Xero the same marker means something different — and still nothing to do.** Xero *does* have a
+**A row still marked as owing follow-ups needs nothing from you.** Xero has a
 back-reference repair sweep bound (`repairXeroBackReferences`, run by the accounting-sync cron and by
 a manual sync), so a Xero row whose deferred receipt is still unregistered is retained *work* rather
 than stranded work: the sweep re-reads the marker and re-enqueues the follow-ups idempotently, and
@@ -2250,10 +2138,9 @@ is still marked after the next accounting-sync run, read the invoice in Xero, re
 and escalate that reading.
 
 **When the id itself is the blocker.** One case cannot be resolved by linking the document by hand:
-the write was refused because *another local record already holds that id* — typically a bill from a
-QuickBooks company you are no longer connected to, whose integer the new company has since reissued.
+the write was refused because *another local record already holds that id*.
 A manual link is refused for exactly the same reason, so the stale claim has to come off first. IMS
-logs `quickbooks_backreference_id_conflict` at ERROR, writes the same text onto the sync row's error
+logs `xero_backreference_id_conflict` at ERROR, writes the same text onto the sync row's error
 message, and names both the blocking record and the command that resolves it. See *Releasing a stale
 external id* below.
 
@@ -2300,9 +2187,8 @@ releasing it is an explicit, confirmed operator action (see *Releasing a stale e
 The repair sweep reports a refusal it hits as `xero_backreference_id_conflict` and re-reports it once
 a day until it is resolved, rather than retrying silently.
 
-The likeliest cause is a connector reconnected to a different company that has reissued an id (see
-below). The other — the ledger merging two of our documents because they were posted under the same
-document number — used to have a live case in supplier credit notes: two credits raised against one
+One cause is the ledger merging two of our documents because they were posted under the same
+document number. That used to have a live case in supplier credit notes: two credits raised against one
 purchase order with the number left blank on both posted under the purchase order's own reference,
 and Xero treated the second as an edit of the first.
 
@@ -2349,14 +2235,12 @@ queued under its own minted number.
 A refused write leaves the ledger document with no local record of it, and "resolve it by hand" is
 not something you can actually do while the id is claimed — the unique index refuses a manual link
 for the same reason it refused the automatic one. The claim has to be released first, and IMS will
-not do that on its own: nothing in the database distinguishes a retired company's stale id from a
+not do that on its own: nothing in the database distinguishes a stale id from a
 live, correct link, so the decision is yours.
 
-1. Read the activity entry (`quickbooks_backreference_id_conflict`, or
-   `xero_backreference_id_conflict` from the sweep). It names the **blocking record** and the
+1. Read the activity entry (`xero_backreference_id_conflict`). It names the **blocking record** and the
    command, with the ids already filled in.
-2. Open that record in IMS and confirm it is stale — it belongs to a company this system is no longer
-   connected to, or to a ledger document that no longer exists. **If it is a live, correctly linked
+2. Open that record in IMS and confirm it is stale — for example it points at a ledger document that no longer exists. **If it is a live, correctly linked
    document, stop.** Releasing it detaches a good link, which is worse than the refusal.
 3. Dry-run (reads only, writes nothing):
    `tsx scripts/release-accounting-external-id-claim.ts --sync-log <id> --holder <id>`
@@ -2371,8 +2255,7 @@ live, correct link, so the decision is yours.
    either and you are told the command failed.
 
 The release and the re-link are one atomic operation on purpose: clearing the id and stopping would
-leave the ledger document attached to nothing at all, and on QuickBooks nothing would pick it up
-afterwards. Because they are one transaction, **any** failure — a refusal, an error, a lost
+leave the ledger document attached to nothing at all. Because they are one transaction, **any** failure — a refusal, an error, a lost
 connection part-way through — leaves everything exactly as it was, and the recovery is simply to run
 the command again.
 
@@ -2387,11 +2270,9 @@ anything unexpected is a refusal rather than a write:
 - the document being linked must still **have no external id of its own**. If it has been linked
   correctly in the meantime, the older id from your warning is refused, never written over the top.
 
-**Which sync rows this applies to.** The two connectors record the same conflict differently, and the
-command accepts both: QuickBooks keeps the row `SYNCED` and writes the conflict into its error text,
-while Xero lets the refusal fail the row, so it retries and ends up `FAILED` — still carrying the
-external id, because that is stored before the local write is ever attempted. A `FAILED` row is the
-normal shape of a Xero conflict, not a broken one. Running the command a second time after it has
+**Which sync rows this applies to.** Xero lets the refusal fail the row, so it retries and ends up
+`FAILED` — still carrying the external id, because that is stored before the local write is ever
+attempted. A `FAILED` row is the normal shape of a Xero conflict, not a broken one. Running the command a second time after it has
 succeeded is safe: it reports that the id is already on the document and does nothing.
 
 **Rows past their retention window.** Data retention clears the stored payload of an unresolved sync
@@ -2410,31 +2291,9 @@ escalate that reading to accounting. Do not settle one of these rows by hand.
 the external ids already stored against your orders, bills and credit notes stay behind, and they
 belong to the company that issued them.
 
-For **Xero** that is harmless in practice: organisation ids and document ids are GUIDs, so an id
+That is harmless in practice with Xero: organisation ids and document ids are GUIDs, so an id
 from a previous organisation can never be mistaken for one of the new organisation's documents — it
 simply resolves to nothing, and the failure is a loud "not found" rather than a wrong document.
-
-For **QuickBooks** it is not harmless, because document ids are per-company integers: company B
-routinely issues the same id company A did. IMS keeps the rule that one ledger document belongs to
-exactly one local record, enforced by the database, so if the new company issues an id an old order,
-bill or credit note still holds, **the new link is refused** with an error saying the id is already
-held locally and naming a company reconnect as the likely cause. The document really is in
-QuickBooks; only the local link is missing, and someone has to resolve it by hand.
-
-That is deliberate. Letting both records hold the same integer would be worse: the many places that
-read a stored external id — payment matching, reconciliation, document updates, attachments — cannot
-tell two companies' ids apart, and orders, refunds and credit notes do not record an issuing company
-at all. A refused link is visible and fixable; a payment settling the wrong document is neither.
-
-It is part of why there is no back-reference repair sweep on QuickBooks (see *Back-Reference Repair*
-above, which describes what a sweep is actually waiting on: a check, at post time, that the company
-connected now is the company the row was raised against). The refusal only fires when some local
-record still holds the id; after a company switch the usual case is that **nothing** holds it, and an
-automatic repair would then link a retired company's document with no constraint to stop it.
-
-**Practically:** if you need to move a QuickBooks connection to a different company, treat it as a
-migration, not a reconnect. Export the existing links first (they are financial records), then clear
-them deliberately before connecting the new company.
 
 ### Disconnecting and reconnecting
 
@@ -2657,7 +2516,6 @@ Before every payment, bill payment and credit-note allocation — automatic or r
 - **"already holds a settlement of £X dated …"** — the payment is in the ledger. Either IMS sent it and lost the reply, or it was entered by hand. Reconcile the row against the settlement it names rather than sending another.
 - **"could not establish what the accounting connector already holds"** — the read failed (the connector was down, or it returned something IMS cannot measure). Nothing was sent. The row retries on the next run and usually clears itself.
 - **"does not record the amount its attempt would send, and the accounting connector already holds N settlement(s)"** — the queued row is incomplete, so IMS cannot tell its payment apart from what is already on the document. It only appears when the document is not empty; a document with nothing on it still posts normally.
-- **"QuickBooks reports £X already applied … but only £Y of it is accounted for"** (QuickBooks only) — money has come off the bill or invoice by something IMS does not read: a vendor credit, a credit memo, a deposit, a journal entry, or a transaction IMS has never seen. IMS will not pay a document it cannot fully account for. Apply the remainder in QuickBooks, or resolve the row by hand.
 - **"... not sent: ... is in EUR but carries no usable IMS rate to GBP"** — a payment against a foreign invoice or bill whose queued work has no usable settlement rate (or whose payload names no currency). IMS sends its own rate on every foreign payment and never lets Xero fall back to its XE.com day rate, so this payment was not sent. A payment recorded in IMS always carries its rate, so this appears only for work queued by an older build or damaged at rest: re-record the payment after adding the rate in Settings → Currencies. Nothing reached Xero.
 - **"another entry for this document is posting … right now"** — two queued rows target the same document. Nothing is wrong; the second one retries once the first is readable.
 - **"the money-post lock for this document was lost while IMS was posting"** — rare. The database connection holding this document's exclusive claim died mid-call, so another entry could in principle have posted at the same instant. Check the document for a duplicate settlement before retrying. When this happens the server log also carries a line beginning `[money-post] EXCLUSION LOST` naming the connector, document and entry.
@@ -2983,9 +2841,9 @@ every one of them is refused rather than mis-routed.
 **Three postings behave slightly differently, and it is worth knowing why.**
 
 * **Reversing a previous FX revaluation.** The reversal's account numbers are copied from the journal it
-  reverses, which may have been posted under the *other* connector. So the reversal is routed by the
+  reverses, which may have been posted under a different connector. So the reversal is routed by the
   connector that journal was posted under — not by whichever is active now — and it is refused if that
-  connector is no longer the active one. You cannot reverse a QuickBooks journal by posting to Xero: if
+  connector is no longer the active one. You cannot reverse another connector's journal by posting to Xero: if
   the unrealised FX from an earlier period needs unwinding after a connector switch, it has to be
   unwound in the accounting system that holds it.
 * **A sales invoice held waiting for a WooCommerce invoice number.** These holds can sit for days, and
@@ -3040,8 +2898,7 @@ sync the chart of accounts and re-map each method against the new connector.
 
 The same check applies to payments registered for **imported (WooCommerce) orders**, whose bank account is
 chosen when the sales invoice posts rather than when the receipt is recorded. If the mapped account is not
-one of the posting connector's own bank accounts, the payment is not queued and `xero_payment_skipped` /
-`quickbooks_payment_skipped` names the mapped account; the retry picks it up once the mapping is fixed. The
+one of the posting connector's own bank accounts, the payment is not queued and `xero_payment_skipped` names the mapped account; the retry picks it up once the mapping is fixed. The
 account that passes the check is the one written into the payment, so a later edit to the mapping does not
 redirect a payment that is already queued.
 
@@ -3189,7 +3046,7 @@ Two consequences worth knowing:
 * **Unrealised FX revaluation.** The run's result now includes `refused` — journals it owed and could not
   queue — and those are no longer counted in `reversed` or `revalued`. A run with refusals is never
   reported as "already queued for this date". The "already revalued today" check is also per connector: a
-  revaluation posted to Xero earlier the same day no longer stops the QuickBooks revaluation after a switch.
+  revaluation posted under a different connector earlier the same day no longer stops the active connector's revaluation after a switch.
 
 ### Rows stranded on a connector you switched away from
 
@@ -3300,8 +3157,7 @@ batch (and then meets the already-journaled refusal above). Nothing needs config
 **What this does not cover.** Other places a negative cost can reach are catalogued in
 `docs/todo/negative-basis-cost-layers-decision.md`. Whether IMS should ever post a negative cost
 basis at all is an open decision (o3d-gd2f). The three checks above are Xero's, and Xero is the only
-accounting connector this build ships — the QuickBooks daily batch had none of them, and it was
-archived (see the note at the top of this page) rather than given them.
+accounting connector this build ships.
 
 ### Which batch a row belongs to
 

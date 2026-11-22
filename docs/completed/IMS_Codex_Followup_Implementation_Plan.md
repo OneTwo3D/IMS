@@ -640,7 +640,6 @@ Fail when `@/lib/decimal` is imported from:
 lib/domain/**
 lib/cost-layers.ts
 lib/connectors/xero/**
-lib/connectors/quickbooks/**
 app/actions/xero*
 app/actions/accounting*
 ```
@@ -1134,7 +1133,7 @@ Apply to:
 Mintsoft base URL
 WooCommerce store URL
 Shopify URL if present
-QuickBooks/Xero custom URLs if any
+Xero custom URLs if any
 SFTP host validation where applicable
 ```
 

@@ -11,7 +11,7 @@ COGS account and the transit/clearing account, so the sub-penny 6dp-subledger-vs
 - `loadInventoryGlReconciliation()` → subledger = inventory_snapshots as-of GL date;
   GL = inventory + allocated account-balance snapshots (same date).
 - `buildInventoryReconciliationSweepJournal()` → pure balanced DR/CR sweep journal.
-- Wired in xero/daily-sync.ts:1286-1315 (+ qbo) behind hasLiveDailyBatchLog idempotency,
+- Wired in xero/daily-sync.ts:1286-1315 behind hasLiveDailyBatchLog idempotency,
   type DAILY_BATCH_INVENTORY_RECONCILIATION. SAFETY: only sub-penny sweeps; material→flag.
 
 ## Plan: generic account reconciliation
@@ -23,7 +23,7 @@ roundingAccount, recon, label)`), then add two subledger providers.
 - ⚠️ ORIGINAL BASIS WAS UNSOUND. "Σ all cogs_entries.totalCostBase" does NOT tie to the
   GL COGS account. Verified by enumerating posting sites:
   - GL COGS account is posted ONLY by: (a) daily-batch Group B dispatch COGS
-    (xero/daily-sync.ts:471/1201, qbo:407/1097 — round2(summary.cogs) debit from
+    (xero/daily-sync.ts:471/1201 — round2(summary.cogs) debit from
     SALE_DISPATCH shipment movements); MINUS (b) refund COGS reversals
     (refund-service.ts:1319 — credit COGS at 2dp = roundQuantity(sumCostLayerSnapshot,2)).
   - cogs_entries is written from 7 sites (shipment-service:414 SALE_DISPATCH,

@@ -151,7 +151,6 @@ onetwo3d-ims/
 5. **Integrations** — Connector modules for data sync:
    - **WooCommerce** — Order sync via webhooks (or polling), product sync, tax rate mapping to Xero
    - **Xero** — Daily batch journal entry posting, sub-ledger sync, COGS calculation, payment reconciliation
-   - **QuickBooks** — Coming soon
 
 6. **Financial Module** — Multi-currency and reporting:
    - Daily FX rates auto-fetch from frankfurter.dev (ECB data)

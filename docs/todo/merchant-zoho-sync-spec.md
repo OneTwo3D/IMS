@@ -16,12 +16,12 @@ The objective is to mirror every merchant transaction from Revolut Merchant, Str
 This replaces the earlier open Option A / Option B decision:
 
 - **Selected approach:** IMS-native TypeScript implementation.
-- **Zoho scope:** first-class accounting connector alongside Xero and QuickBooks.
+- **Zoho scope:** first-class accounting connector alongside Xero.
 - **Merchant sync scope:** provider transaction ingestion, normalization, posting, reconciliation, retry, and dead-letter handling inside IMS.
 
 ## 2. Current IMS implications
 
-Latest development currently has accounting connector paths hardcoded around Xero and QuickBooks in several places: connector discovery, settings UI, sync dashboard, queueing, cron, sync type maps, token handling, and connection tests. Zoho cannot be added safely as a narrow merchant-only client without creating a second accounting abstraction.
+Latest development currently has accounting connector paths hardcoded around Xero in several places: connector discovery, settings UI, sync dashboard, queueing, cron, sync type maps, token handling, and connection tests. Zoho cannot be added safely as a narrow merchant-only client without creating a second accounting abstraction.
 
 The plan must therefore start with the Zoho accounting connector foundation, then layer merchant settlement sync on top of that connector.
 
@@ -73,12 +73,12 @@ Deliverables:
 - Add `zoho` to accounting connector discovery, settings UI, sync dashboard, token storage, connection testing, route-auth policy, and cron policy.
 - Add Zoho organization ID and EU data center configuration.
 - Implement OAuth/token refresh storage using existing IMS accounting-token patterns.
-- Keep Xero and QuickBooks behavior unchanged.
+- Keep Xero behavior unchanged.
 
 Exit criteria:
 
 - Admin can configure and connection-test Zoho.
-- Existing Xero/QuickBooks tests and settings flows still pass.
+- Existing Xero tests and settings flows still pass.
 - Zoho remains disabled for accounting sync until explicitly configured.
 
 ### Epic 2 - Zoho accounting API surface
@@ -89,7 +89,7 @@ Deliverables:
 
 - Add Zoho client methods for invoice read/lookup, customer payment creation, credit note or refund creation, bank transaction creation, chart-of-accounts lookup, and clearing-account balance reads where supported.
 - Extend the shared accounting connector interface only where cross-connector semantics are clear.
-- Keep Zoho-specific banking or clearing behavior behind Zoho-specific capability methods when Xero/QuickBooks do not share the same abstraction.
+- Keep Zoho-specific banking or clearing behavior behind Zoho-specific capability methods when Xero does not share the same abstraction.
 - Verify sandbox behavior for `bank_charges`; if unsupported or insufficient, implement the explicit clearing-account fee expense fallback.
 
 Exit criteria:
@@ -407,7 +407,7 @@ Integration tests:
 - Zoho fee posting fallback.
 - Merchant ingest -> normalize -> post -> reconcile lifecycle.
 - Retry and dead-letter behavior.
-- Existing Xero and QuickBooks paths remain unchanged.
+- Existing Xero paths remain unchanged.
 
 Security tests:
 

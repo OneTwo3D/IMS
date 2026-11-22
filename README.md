@@ -38,7 +38,7 @@ Inventory Management System — built with Next.js 16, TypeScript, Prisma 7, Pos
 - Allocation now distinguishes physical reservations from backorder demand; activity logs include the backorder breakdown
 - Stock reservation on allocation, release on ship/cancel/refund
 - Invoice generation (manual, auto on ship, or auto on paid — configurable)
-- Edits to invoices that have already pushed to Xero sync back as `SALES_INVOICE_UPDATE` (QuickBooks logs an explicit "not supported" warning)
+- Edits to invoices that have already pushed to Xero sync back as `SALES_INVOICE_UPDATE`
 - Payment tracking against invoices and credit notes
 - Automatic credit note numbers on refund
 - Order and invoice PDF generation, SMTP email, and packing slips
@@ -64,7 +64,7 @@ Inventory Management System — built with Next.js 16, TypeScript, Prisma 7, Pos
 
 ### Settings
 - VAT rate profiles in **Accounting**: ordered components, compound math, reverse-charge flag, reporting category. Connector-specific reverse-charge tax-type codes for the Xero swap
-- Multi-component VAT rates auto-sync to Xero TaxRates via the `TaxComponents` API on save (idempotent by `Name`); QBO logs a clear "not supported" warning
+- Multi-component VAT rates auto-sync to Xero TaxRates via the `TaxComponents` API on save (idempotent by `Name`)
 - Currencies and FX rates with daily auto-fetch cron
 - Landed cost distribution method default
 - Invoice generation trigger (manual/on shipped/on paid)
@@ -77,7 +77,6 @@ Inventory Management System — built with Next.js 16, TypeScript, Prisma 7, Pos
 - **Xero TaxRate sync** — multi-component IMS `TaxRate` rows auto-push to Xero with the matching `TaxComponents` so the VAT return picks up the breakdown
 - **WooCommerce** — webhook or polling order import with multi-currency support, tax-class mapping, refund reversal, product sync, and stock push-back. Pending-FX queue retries store the full WC order snapshot for deterministic replay
 - **WMS / 3PL (Mintsoft)** — a connector-agnostic WMS boundary (a generic connector contract behind dispatch facades, CI-guarded so no core flow hard-codes a vendor) with Mintsoft as the first connector. Outbound order-dispatch push (Phase 8): paid, ready-to-fulfil orders for WMS-bound warehouses are pushed to the WMS on a sweep, with courier mapping, idempotent create/update, hold/cancel propagation, and dead-letter retry; a live order-status chip on sales orders (cached sweep + on-demand refresh, deep-linked to the WMS admin). Plus outbound stock-sync + ASN booked-in webhooks with HMAC-bound freshness timestamp, durable-persistence ack before responding, configurable sweeper, and queryable retry state; bundle/product verification crons keep IMS in sync with 3PL inventory. See `docs/mintsoft.md` and `docs/wms-connector-boundary.md`
-- **QuickBooks** — invoice push, credit notes, daily batch sync; invoice update + TaxRate sync log "not supported" instead of silently failing
 - **SMTP** — outbound document delivery (orders, invoices, packing slips, notifications) with configurable from-name / from-email and per-department reply-to addresses
 
 ### CSV Import/Export

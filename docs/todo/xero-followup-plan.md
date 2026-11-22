@@ -5,7 +5,7 @@ Branch baseline: `development`
 
 ## Goal
 
-Close the remaining Xero follow-up work and finish the accounting connector boundary so Xero can be disabled or replaced by another accounting connector, such as QuickBooks, without changing non-connector code.
+Close the remaining Xero follow-up work and finish the accounting connector boundary so Xero can be disabled or replaced by another accounting connector without changing non-connector code.
 
 ## Outcome Target
 
@@ -17,8 +17,8 @@ That means:
 - cron and OAuth/webhook ingress go through generic accounting connector entrypoints
 - connector-specific settings keys, token models, route details, payload shaping, and API semantics stay inside the connector implementation
 
-Replacing Xero with QuickBooks should require:
-- adding a QuickBooks connector implementation
+Replacing Xero with another accounting connector should require:
+- adding that connector's implementation
 - selecting/configuring the active accounting connector
 - optionally migrating connector-owned persisted data
 
@@ -78,7 +78,7 @@ Examples:
 
 Impact:
 - the UI knows about Xero tabs, Xero client ID/secret, Xero tenant name, Xero account IDs, Xero tax codes, and Xero-specific toggle labels.
-- QuickBooks support would currently require editing shared dashboard code instead of plugging in a connector-owned UI surface or metadata contract.
+- Adding another accounting connector would currently require editing shared dashboard code instead of plugging in a connector-owned UI surface or metadata contract.
 
 ### 4. Cron and OAuth ingress are Xero-specific app routes
 
@@ -150,7 +150,7 @@ Required changes:
 
 Definition of done:
 - shared app actions no longer expose Xero-specific types, names, or settings keys.
-- adding QuickBooks does not require cloning and renaming app actions.
+- adding another accounting connector does not require cloning and renaming app actions.
 
 ### 3. Generalize the accounting integrations dashboard
 
@@ -209,7 +209,7 @@ Required changes:
 - where schema renames are too invasive for now, treat existing Xero tables/columns as adapter-owned persistence behind generic APIs
 
 Definition of done:
-- non-connector code can stay unchanged even if the backing accounting connector storage changes from Xero tables to QuickBooks tables.
+- non-connector code can stay unchanged even if the backing accounting connector storage changes from Xero tables to another connector's tables.
 
 ### 7. Preserve and extend accounting correctness work under the new boundary
 
@@ -244,7 +244,7 @@ Guidance:
 - shared UI does not use Xero-specific component names or types for generic accounting surfaces
 - cron and OAuth entrypoints are connector-agnostic
 - sales, purchasing, stock, and settings flows continue to work without assuming Xero-specific URLs, tax concepts, or route names
-- QuickBooks support can be added by implementing the connector contract rather than rewriting app code
+- Another accounting connector can be added by implementing the connector contract rather than rewriting app code
 
 ## Suggested next-session starting checklist
 

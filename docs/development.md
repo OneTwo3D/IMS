@@ -775,7 +775,7 @@ If `psql` and `prisma migrate deploy` work but `migrate status` or `db pull` rep
 
 ## Archive Seal
 
-`archive/` holds retired connectors (QuickBooks, Shopify, ShipHero) that #698 removed by *renaming*
+`archive/` holds retired connectors that #698 removed by *renaming*
 their files under `archive/`. It is deliberately outside every other gate: excluded from
 `tsconfig.json`, from `eslint.config.mjs`, from the `tests/**/*.test.ts` glob and from all four
 `check:*` SCAN_ROOTS. That is what archiving means here, and it is also why a change to an archived
