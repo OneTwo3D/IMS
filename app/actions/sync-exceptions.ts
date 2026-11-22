@@ -1,7 +1,8 @@
 'use server'
 
-import { feeRepaymentInstruction, isRefundParityHold, settledOutsideImsNote } from '@/lib/domain/sales/refund-cn-parity'
-import { lookupSalesCreditNoteByNumber, readNotDuplicateAcks } from '@/lib/connectors/xero/order-credit-notes'
+import { feeRepaymentInstruction, isRefundParityHold, isVatOnlyRefundHold, settledOutsideImsNote } from '@/lib/domain/sales/refund-cn-parity'
+import { creditNoteBelongsTo, lookupSalesCreditNoteByNumber, readNotDuplicateAcks } from '@/lib/connectors/xero/order-credit-notes'
+import { settleAccountingSyncRow } from '@/app/actions/accounting-settlement'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { Prisma } from '@/app/generated/prisma/client'
 import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
@@ -165,6 +166,24 @@ const OPEN_FEE_REPAYMENT_WHERE = { easFeeGapForeign: { gt: 0 }, feeRepaymentAppl
 /** #1127 R1 M6: refunds the credit-note duplicate check holds (see recordDuplicateHold in the Xero sync processor). */
 const CREDIT_NOTE_DUPLICATE_HOLD_WHERE = { creditNoteDuplicateHold: { not: Prisma.AnyNull }, deletedAt: null } as const
 
+/**
+ * #1127 R2 MED-5: a duplicate hold clears itself once what it held is decided: the held sync row is settled (SYNCED) or cancelled, or (a hold on the CREATE) the
+ * refund has since been given its credit note id. Run before the holds are counted or listed; it only ever removes held credit notes.
+ */
+async function pruneResolvedDuplicateHolds(): Promise<void> {
+  const held = await db.salesOrderRefund.findMany({ where: CREDIT_NOTE_DUPLICATE_HOLD_WHERE, select: { id: true, accountingCreditNoteId: true, creditNoteDuplicateHold: true }, take: 500 })
+  for (const refund of held) {
+    const entries = (Array.isArray(refund.creditNoteDuplicateHold) ? refund.creditNoteDuplicateHold as unknown[] : []).filter((cn): cn is { rowId?: unknown } & Record<string, unknown> => typeof cn === 'object' && cn !== null)
+    const rowIds = [...new Set(entries.map((cn) => cn.rowId).filter((id): id is string => typeof id === 'string'))]
+    const rows = rowIds.length === 0 ? [] : await db.accountingSyncLog.findMany({ where: { id: { in: rowIds } }, select: { id: true, type: true, status: true } })
+    const resolved = new Set(rows.filter((row) => row.status === 'SYNCED' || row.status === 'CANCELLED' || (row.type === 'CREDIT_NOTE' && refund.accountingCreditNoteId !== null)).map((row) => row.id))
+    const gone = new Set(rowIds.filter((id) => !rows.some((row) => row.id === id)))
+    const rest = entries.filter((cn) => !(typeof cn.rowId === 'string' && (resolved.has(cn.rowId) || gone.has(cn.rowId))))
+    if (rest.length === entries.length) continue
+    await db.salesOrderRefund.updateMany({ where: { id: refund.id }, data: { creditNoteDuplicateHold: rest.length > 0 ? rest as Prisma.InputJsonValue : Prisma.DbNull } })
+  }
+}
+
 async function loadCreditNoteDuplicateHolds(): Promise<CreditNoteDuplicateHoldRow[]> {
   const rows = await db.salesOrderRefund.findMany({
     where: CREDIT_NOTE_DUPLICATE_HOLD_WHERE,
@@ -180,7 +199,7 @@ async function loadCreditNoteDuplicateHolds(): Promise<CreditNoteDuplicateHoldRo
     creditNoteNumber: row.creditNoteNumber,
     candidates: (Array.isArray(row.creditNoteDuplicateHold) ? row.creditNoteDuplicateHold as unknown[] : [])
       .filter((cn): cn is Record<string, unknown> => typeof cn === 'object' && cn !== null && typeof (cn as { creditNoteId?: unknown }).creditNoteId === 'string')
-      .map((cn) => ({ creditNoteId: cn.creditNoteId as string, creditNoteNumber: typeof cn.creditNoteNumber === 'string' ? cn.creditNoteNumber : null, status: typeof cn.status === 'string' ? cn.status : 'UNKNOWN', total: typeof cn.total === 'number' ? cn.total : null, date: typeof cn.date === 'string' ? cn.date : null })),
+      .map((cn) => ({ creditNoteId: cn.creditNoteId as string, creditNoteNumber: typeof cn.creditNoteNumber === 'string' ? cn.creditNoteNumber : null, status: typeof cn.status === 'string' ? cn.status : 'UNKNOWN', total: typeof cn.total === 'number' ? cn.total : null, date: typeof cn.date === 'string' ? cn.date : null, rowId: typeof cn.rowId === 'string' ? cn.rowId : null })),
   }))
 }
 
@@ -521,6 +540,8 @@ export type RefundSyncParkRow = {
   manuallyRecordable: boolean
   /** o3d-pnc8p: a refund-parity hold, closable only by acknowledging it as settled outside IMS (creates nothing; operator and reason recorded). */
   settledOutsideAcknowledgeable: boolean
+  /** #1127 R2 MED-6: the VAT-only hold, which may be closed with no credit note. */
+  vatOnlyHold: boolean
   currency: string | null
   refundGrossForeign: string | null
   allocationTargets: RefundParkAllocationTarget[]
@@ -548,7 +569,7 @@ export type CreditNoteDuplicateHoldRow = {
   orderNumber: string | null
   externalRefundId: number | null
   creditNoteNumber: string | null
-  candidates: Array<{ creditNoteId: string; creditNoteNumber: string | null; status: string; total: number | null; date: string | null }>
+  candidates: Array<{ creditNoteId: string; creditNoteNumber: string | null; status: string; total: number | null; date: string | null; rowId: string | null }>
 }
 
 export type StuckDispatchRow = {
@@ -1386,6 +1407,7 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
 
   const giftCardLinesToResolve = await db.shoppingSyncLog.count({ where: giftCardUnsettledHoldWhere() })
   const openFeeRepayments = await db.salesOrderRefund.count({ where: OPEN_FEE_REPAYMENT_WHERE })
+  await pruneResolvedDuplicateHolds()
   const creditNoteDuplicateHolds = await db.salesOrderRefund.count({ where: CREDIT_NOTE_DUPLICATE_HOLD_WHERE })
   const wmsOperatorTasksOpen = await db.wmsOperatorTask.count({ where: { status: 'OPEN' } })
   // HIGH and MEDIUM only: LOW is noise by design (listed on the page, never counted).
@@ -1972,6 +1994,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
         // o3d-k26m.17: never for a refund-parity hold, whose manual credit note would be wrong (see recordRefundParkManually).
         manuallyRecordable: log.status === 'QUARANTINED' && Boolean(log.entityId) && Boolean(log.externalId) && !isRefundParityHold(log.errorMessage),
         settledOutsideAcknowledgeable: log.status === 'QUARANTINED' && Boolean(log.entityId) && Boolean(log.externalId) && isRefundParityHold(log.errorMessage),
+        vatOnlyHold: log.status === 'QUARANTINED' && isVatOnlyRefundHold(log.errorMessage),
         currency: order?.currency ?? null,
         refundGrossForeign: payloadAmount,
         allocationTargets: buildAllocationTargets(order),
@@ -5290,12 +5313,14 @@ const ACKNOWLEDGEMENT_REASON_MAX = 500
  *
  * Permissions as "Record manually": `sync`, and a fresh `sales.refund` (it closes a refund's only open record in IMS).
  */
-export async function acknowledgeRefundParkSettledOutsideIms(parkId: string, reason: string, creditNoteNumber: string): Promise<MutationResult> {
+export async function acknowledgeRefundParkSettledOutsideIms(parkId: string, reason: string, creditNoteNumber: string | null, options?: { noCreditNoteNeeded?: boolean }): Promise<MutationResult> {
   try {
     await requirePermission('sync')
     const session = await requireFreshPermission('sales.refund')
     const number = typeof creditNoteNumber === 'string' ? creditNoteNumber.trim() : ''
-    if (number === '') return { success: false, error: 'Name the Xero credit note the refund was settled with (its number, for example CN-11629).' }
+    // #1127 R2 MED-6: a VAT-only refund against an invoice Xero already holds ex-VAT needs NO credit note (159049); that is the one hold closed without naming one.
+    const noCreditNote = options?.noCreditNoteNeeded === true
+    if (number === '' && !noCreditNote) return { success: false, error: 'Name the Xero credit note the refund was settled with (its number, for example CN-11629).' }
     const why = typeof reason === 'string' ? reason.trim() : ''
     if (why === '') return { success: false, error: withLedgerCheck('A reason is required: say how the refund was settled outside IMS (for example "CN-11629 raised in Xero by the accountant"). It is the audit record.') }
     if (why.length > ACKNOWLEDGEMENT_REASON_MAX) return { success: false, error: `Keep the reason under ${ACKNOWLEDGEMENT_REASON_MAX} characters.` }
@@ -5307,12 +5332,24 @@ export async function acknowledgeRefundParkSettledOutsideIms(parkId: string, rea
     if (!isRefundParityHold(park.errorMessage)) {
       return { success: false, error: withLedgerCheck('Only a refund held by the storefront refund parity checks can be acknowledged as settled outside IMS. Use Retry, Record manually or Wrong order for this row.') }
     }
-    // #1127 R1 L10: the credit note named is verified, read only, to exist in Xero as a live sales credit note before the park is closed.
-    const found = await lookupSalesCreditNoteByNumber(number)
-    if (!found.ok) return { success: false, error: `IMS could not check credit note ${number} in Xero (${found.error}), so nothing was changed.` }
-    if (found.found.length === 0) return { success: false, error: `Xero holds no live sales credit note numbered ${number}, so nothing was changed. Check the number (a voided or deleted one does not count).` }
+    if (noCreditNote && !isVatOnlyRefundHold(park.errorMessage)) {
+      return { success: false, error: 'Only a VAT-only refund can be closed without naming a credit note; for this hold, name the Xero credit note it was settled with.' }
+    }
+    // #1127 R1 L10 / R2 L4: the credit note named is verified, read only, to exist in Xero as a live sales credit note OF THIS ORDER OR REFUND (its number or reference
+    // names the WooCommerce order id or this refund id) before the park is closed.
+    let verified: { creditNoteId: string } | null = null
+    if (number !== '') {
+      const found = await lookupSalesCreditNoteByNumber(number)
+      if (!found.ok) return { success: false, error: `IMS could not check credit note ${number} in Xero (${found.error}), so nothing was changed.` }
+      if (found.found.length === 0) return { success: false, error: `Xero holds no live sales credit note numbered ${number}, so nothing was changed. Check the number (a voided or deleted one does not count).` }
+      const links = await db.shoppingOrderLink.findMany({ where: { orderId: park.entityId, connector: 'woocommerce' }, select: { externalOrderId: true } })
+      const keys = { orderIds: links.map((link) => link.externalOrderId), refundIds: [park.externalId] }
+      const mine = found.found.find((cn) => creditNoteBelongsTo({ creditNoteId: cn.creditNoteId, creditNoteNumber: number, reference: cn.reference }, keys))
+      if (!mine) return { success: false, error: `Credit note ${number} in Xero names neither this order nor refund ${park.externalId} (by its number or reference), so nothing was changed. Check the number.` }
+      verified = mine
+    }
     const by = session.user.name?.trim() || session.user.email || session.user.id
-    const note = settledOutsideImsNote({ by, reason: why, hold: park.errorMessage, creditNoteNumber: number })
+    const note = settledOutsideImsNote({ by, reason: noCreditNote ? `no credit note needed: ${why}` : why, hold: park.errorMessage, creditNoteNumber: number || null })
     const closed = await db.$transaction(async (tx) => {
       // Compare-and-set on the hold still standing as it was read: a Retry or another acknowledgement in between wins, and this one changes nothing.
       const updated = await tx.shoppingSyncLog.updateMany({
@@ -5327,7 +5364,7 @@ export async function acknowledgeRefundParkSettledOutsideIms(parkId: string, rea
         action: 'refund_park_settled_outside_ims',
         level: 'WARNING',
         description: `WooCommerce refund ${park.externalId} acknowledged as settled outside IMS by ${by}: ${why}. Nothing was created in IMS or sent to Xero; the refund is no longer synced.`,
-        metadata: { parkId: park.id, externalRefundId: park.externalId, by, userId: session.user.id, reason: why, hold: park.errorMessage, creditNoteNumber: number, creditNoteId: found.found[0]!.creditNoteId },
+        metadata: { parkId: park.id, externalRefundId: park.externalId, by, userId: session.user.id, reason: why, hold: park.errorMessage, creditNoteNumber: number || null, creditNoteId: verified?.creditNoteId ?? null, noCreditNoteNeeded: noCreditNote },
         userId: session.user.id,
       })
       return true
@@ -5357,6 +5394,13 @@ export async function acknowledgeFeeRepaymentApplied(refundId: string, note: str
       const found = await lookupSalesCreditNoteByNumber(number)
       if (!found.ok) return { success: false, error: `IMS could not check credit note ${number} in Xero (${found.error}), so nothing was changed.` }
       if (found.found.length === 0) return { success: false, error: `Xero holds no live sales credit note numbered ${number}, so nothing was changed.` }
+      // #1127 R2 L4: and it must be this refund's or its order's.
+      const owner = await db.salesOrderRefund.findUnique({ where: { id: refundId }, select: { externalRefundId: true, creditNoteNumber: true, order: { select: { shoppingLinks: { where: { connector: 'woocommerce' }, select: { externalOrderId: true } } } } } })
+      const keys = { orderIds: (owner?.order.shoppingLinks ?? []).map((link) => link.externalOrderId), refundIds: owner?.externalRefundId != null ? [String(owner.externalRefundId)] : [] }
+      const ims = owner?.creditNoteNumber?.trim().toLowerCase() === number.toLowerCase()
+      if (!ims && !found.found.some((cn) => creditNoteBelongsTo({ creditNoteId: cn.creditNoteId, creditNoteNumber: number, reference: cn.reference }, keys))) {
+        return { success: false, error: `Credit note ${number} in Xero names neither this refund nor its order, so nothing was changed.` }
+      }
     }
     const why = typeof note === 'string' ? note.trim() : ''
     if (why === '') return { success: false, error: 'Say what was applied (for example "3.00 repayment applied to CN-00042 in Xero"). It is the audit record.' }
@@ -5430,6 +5474,41 @@ export async function acknowledgeCreditNoteNotDuplicate(refundId: string, credit
       return refund
     })
     if (!done) return { success: false, error: 'This credit note is no longer held for that refund (already acknowledged, or the refund was deleted). Reload the page.' }
+    revalidatePath('/sync/exceptions')
+    return { success: true }
+  } catch (error) {
+    const freshAuthFailure = freshAuthFailureResult(error)
+    if (freshAuthFailure) return freshAuthFailure
+    throw error
+  }
+}
+
+/**
+ * #1127 R2 MED-5: "IT IS THIS REFUND'S". The operator has established with the accountant that a credit note Xero holds (not raised by IMS) IS this refund's
+ * credit note. Recorded through the one settlement action (`settleAccountingSyncRow`, fresh `sync` permission, attempt-fenced, audited):
+ *   a hold on the CREATE (a CREDIT_NOTE row): the row is settled as POSTED with that credit note's id, so IMS creates no second one;
+ *   a hold on the SETTLEMENT (a CREDIT_NOTE_ALLOCATION row): the row is settled as NOT POSTED, so IMS neither allocates nor pays out its own credit note on top;
+ *   which credit note stands is then the accountant's to put right in Xero.
+ * The hold on that credit note is then cleared.
+ */
+export async function confirmCreditNoteIsThisRefunds(refundId: string, creditNoteId: string, reason: string): Promise<MutationResult> {
+  try {
+    await requirePermission('sync')
+    await requireFreshPermission('sales.refund')
+    const why = typeof reason === 'string' ? reason.trim() : ''
+    if (why === '') return { success: false, error: 'Say how this was established (for example "CN-11573 was raised by hand for refund 162752"). It is the audit record.' }
+    const refund = await db.salesOrderRefund.findFirst({ where: { id: refundId, deletedAt: null }, select: { id: true, creditNoteDuplicateHold: true } })
+    const hold = Array.isArray(refund?.creditNoteDuplicateHold) ? refund!.creditNoteDuplicateHold as Array<{ creditNoteId?: unknown; rowId?: unknown }> : []
+    const candidate = hold.find((cn) => typeof cn?.creditNoteId === 'string' && cn.creditNoteId.toLowerCase() === creditNoteId.trim().toLowerCase())
+    if (!candidate || typeof candidate.rowId !== 'string') return { success: false, error: 'This credit note is no longer held for that refund. Reload the page.' }
+    const row = await db.accountingSyncLog.findUnique({ where: { id: candidate.rowId }, select: { id: true, type: true, status: true, attemptRevision: true } })
+    if (!row) return { success: false, error: 'The sync row this hold named no longer exists. Reload the page.' }
+    const settled = row.type === 'CREDIT_NOTE'
+      ? await settleAccountingSyncRow(row.id, { outcome: 'POSTED', externalTransactionId: candidate.creditNoteId as string, observedStatus: row.status, observedAttemptRevision: row.attemptRevision })
+      : await settleAccountingSyncRow(row.id, { outcome: 'NOT_POSTED', reason: `Credit note ${candidate.creditNoteId as string} in Xero is this refund's credit note (${why}); IMS does not settle its own as well.`, observedStatus: row.status, observedAttemptRevision: row.attemptRevision })
+    if (!settled.success) return { success: false, error: settled.error ?? 'The sync row could not be settled.' }
+    const rest = hold.filter((cn) => cn !== candidate)
+    await db.salesOrderRefund.update({ where: { id: refundId }, data: { creditNoteDuplicateHold: rest.length > 0 ? rest as Prisma.InputJsonValue : Prisma.DbNull } })
     revalidatePath('/sync/exceptions')
     return { success: true }
   } catch (error) {

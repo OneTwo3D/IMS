@@ -205,11 +205,6 @@ test('the claim is RE-TAKEN at the instant the remote write begins, fenced on th
   assert.deepEqual(where.processingStartedAt, heldFrom,
     'fenced on the EXACT claim this worker wrote — anything looser would re-take a claim someone else holds')
   assert.deepEqual(data.processingStartedAt, renewed)
-  // o3d-0lpnb R1 M1: the renewal re-asserts stamping custody in the same statement (or the forfeit trigger takes it on every claim), and carries the claim's
-  // refusal for a money row that holds neither custody nor a stamp.
-  assert.deepEqual(data.attemptStampingCustodyAt, renewed)
-  const { CUSTODY_MAY_BE_RESTORED } = await import('@/lib/domain/accounting/money-attempt-provenance')
-  assert.deepEqual((where as { AND?: unknown[] }).AND, [CUSTODY_MAY_BE_RESTORED])
 })
 
 test('a claim taken by another worker returns null, and nothing else is written', async () => {
@@ -292,7 +287,7 @@ test('both sweep paths open the lease before posting and anchor the persist to t
   }
 
   // And the outbox path must pass its job in, or the queue-side lock is never renewed.
-  const outboxLease = lines.findIndex((line) => line.includes('openRemoteWriteLease(entry.id, claimedAt, job)'))
+  const outboxLease = lines.findIndex((line) => line.includes('openRemoteWriteLease(entry.id, claimedAt, job') /* #1127 R2: followed by the custody options for STAMPING_CUSTODY_KEPT_TYPES */)
   assert.ok(outboxLease > 0,
     'the outbox path must hand its job to the lease so every fence renews the OUTBOX lock as well as the row claim')
 })

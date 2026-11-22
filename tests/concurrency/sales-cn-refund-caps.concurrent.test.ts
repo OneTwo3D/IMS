@@ -137,6 +137,8 @@ test.after(() => { if (OUTBOX_BEFORE_THIS_FILE === undefined) delete process.env
 
 async function seedOrder(d: Deps, t: { after: (fn: () => Promise<void>) => void }, opts: { receipt: number; count: number; credit?: number }): Promise<Seeded> {
   process.env.XERO_ACCOUNTING_OUTBOX_ENABLED = 'true'
+  // #1127 R2 MED-1: the Xero call budget is per day and persistent; on this scratch database every test starts with today's budget unspent.
+  await d.db.$executeRaw`DELETE FROM "xero_settlement_call_budget"`
   t.after(async () => { if (OUTBOX_BEFORE_THIS_FILE === undefined) delete process.env.XERO_ACCOUNTING_OUTBOX_ENABLED; else process.env.XERO_ACCOUNTING_OUTBOX_ENABLED = OUTBOX_BEFORE_THIS_FILE })
   const tag = `cnc${randomUUID().slice(0, 8)}`
   const invoiceId = `inv-${tag}`
@@ -764,4 +766,93 @@ test('[#1127 R1 M6] a held possible duplicate is listed on the refund, and an op
   await due(d, [row.id])
   await d.processor.processPendingXeroSync()
   assert.deepEqual(refunds.map((r) => r.amount), [40])
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+// #1127 R2: custody kept ONLY for CREDIT_NOTE_ALLOCATION (H-A), through the real forfeit trigger; the persistent daily budget (MED-1); the episode ageing (L7)
+// ---------------------------------------------------------------------------------------------------------------------------------------------
+
+test('[#1127 R2 H-A] through the real forfeit trigger: a CREDIT_NOTE_ALLOCATION renewal keeps custody; INVOICE_PAYMENT and CREDIT_NOTE renewals lose it exactly as before; a money row with neither custody nor stamp is refused', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  const s = await seedOrder(d, t, { receipt: 50, count: 1 })
+  const claimed = new Date(Date.now() - 1000)
+  const make = (type: string, custody: Date | null) => d.db.accountingSyncLog.create({
+    data: { connector: 'xero', type, status: 'PROCESSING', referenceType: 'SalesOrderRefund', referenceId: s.refunds[0]!.id, payload: { creditNoteId: `x-${randomUUID()}`, accountingInvoiceId: `i-${randomUUID()}` }, processingStartedAt: claimed, attemptStampingCustodyAt: custody, createdAt: ancient() } as never,
+    select: { id: true },
+  })
+  const custodyOf = async (id: string) => (await d.db.accountingSyncLog.findUniqueOrThrow({ where: { id }, select: { attemptStampingCustodyAt: true, processingStartedAt: true } }))
+  const rows: string[] = []
+  t.after(async () => { await d.db.accountingSyncLog.deleteMany({ where: { id: { in: rows } } }) })
+
+  const cna = await make('CREDIT_NOTE_ALLOCATION', claimed); rows.push(cna.id)
+  const renewed = await d.processor.renewClaimForRemoteWrite(cna.id, d.processor.claimHeldFrom(claimed), undefined, d.processor.stampingCustodyOptionsFor('CREDIT_NOTE_ALLOCATION'))
+  assert.ok(renewed)
+  const kept = await custodyOf(cna.id)
+  assert.equal(kept.attemptStampingCustodyAt?.getTime(), renewed!.getTime(), 'custody re-asserted in the same statement: the trigger left it')
+
+  for (const type of ['INVOICE_PAYMENT', 'CREDIT_NOTE']) {
+    const row = await make(type, claimed); rows.push(row.id)
+    const again = await d.processor.renewClaimForRemoteWrite(row.id, d.processor.claimHeldFrom(claimed), undefined, d.processor.stampingCustodyOptionsFor(type))
+    assert.ok(again, type)
+    assert.equal((await custodyOf(row.id)).attemptStampingCustodyAt, null, `${type}: the trigger forfeited custody, as on development`)
+  }
+
+  const orphan = await make('CREDIT_NOTE_ALLOCATION', null); rows.push(orphan.id)
+  assert.equal(await d.processor.renewClaimForRemoteWrite(orphan.id, d.processor.claimHeldFrom(claimed), undefined, { keepStampingCustody: true }), null, 'a money row with neither custody nor a stamp is not renewed (and not given custody)')
+  assert.equal((await custodyOf(orphan.id)).attemptStampingCustodyAt, null)
+})
+
+test('[#1127 R2 MED-1] the daily budget is persistent and shared: once today\'s is spent a settlement waits (awaiting-budget) WITHOUT reading Xero, and its episode is kept (MED-7)', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  const s = await seedOrder(d, t, { receipt: 50, count: 1 })
+  await sweep(d, s)
+  const row = (await settlementRows(d, s.refunds[0]!.id))[0]!
+  const since = new Date(Date.now() - 3_600_000).toISOString()
+  const p = await d.db.accountingSyncLog.findUniqueOrThrow({ where: { id: row.id }, select: { payload: true } })
+  await d.db.accountingSyncLog.update({ where: { id: row.id }, data: { payload: { ...(p.payload as object), _settlementWait: { reason: 'awaiting-receipt', since, count: 3 } } } })
+  await d.db.$executeRaw`INSERT INTO "xero_settlement_call_budget" ("day", "used") VALUES ((now() AT TIME ZONE 'UTC')::date, ${d.processor.SETTLEMENT_XERO_CALL_BUDGET_PER_DAY})`
+  let reads = 0
+  onBalancesRead = async () => { reads++ }
+  await d.processor.processPendingXeroSync()
+  onBalancesRead = null
+  assert.equal(reads, 0, 'no Xero read past the budget')
+  assert.equal(refunds.length, 0)
+  assert.match(await whyNotSent(d, row.id), /today's Xero call budget for credit-note settlements is spent/)
+  await assertWaiting(d, row.id)
+  const after = await d.db.accountingSyncLog.findUniqueOrThrow({ where: { id: row.id }, select: { payload: true } })
+  assert.deepEqual((after.payload as { _settlementWait?: unknown })._settlementWait, { reason: 'awaiting-receipt', since, count: 3, budgetWaits: 1 }, 'the episode kept its age and count')
+})
+
+test('[#1127 R2 L7] an episode older than 3 days ends in FAILED on its next wait, budget waits included (a row starved by the budget still escalates)', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  const s = await seedOrder(d, t, { receipt: 50, count: 1 })
+  await sweep(d, s)
+  const row = (await settlementRows(d, s.refunds[0]!.id))[0]!
+  const p = await d.db.accountingSyncLog.findUniqueOrThrow({ where: { id: row.id }, select: { payload: true } })
+  await d.db.accountingSyncLog.update({ where: { id: row.id }, data: { payload: { ...(p.payload as object), _settlementWait: { reason: 'awaiting-receipt', since: new Date(Date.now() - 4 * 24 * 3_600_000).toISOString(), count: 0, budgetWaits: 40 } } } })
+  await d.db.$executeRaw`INSERT INTO "xero_settlement_call_budget" ("day", "used") VALUES ((now() AT TIME ZONE 'UTC')::date, ${d.processor.SETTLEMENT_XERO_CALL_BUDGET_PER_DAY})`
+  await d.processor.processPendingXeroSync()
+  const failed = await d.db.accountingSyncLog.findUniqueOrThrow({ where: { id: row.id }, select: { status: true, retryCount: true, errorMessage: true } })
+  assert.equal(failed.status, 'FAILED')
+  assert.equal(failed.retryCount, 5)
+  assert.match(failed.errorMessage ?? '', /and 41 more for the Xero call budget/)
+})
+
+test('[#1127 R2 L7] the wait hand-back is fenced on the ATTEMPT: an operator decision that moved the revision is never overwritten by the hand-back', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  invoiceAmountPaid = 0
+  const s = await seedOrder(d, t, { receipt: 50, count: 1 })
+  await sweep(d, s)
+  const row = (await settlementRows(d, s.refunds[0]!.id))[0]!
+  // While the worker reads the balances, an operator decides about the row (the decision bumps the attempt revision and leaves the claim as it is).
+  onBalancesRead = async () => { await d.db.accountingSyncLog.update({ where: { id: row.id }, data: { attemptRevision: { increment: 1 } } }) }
+  await d.processor.processPendingXeroSync()
+  onBalancesRead = null
+  const after = await d.db.accountingSyncLog.findUniqueOrThrow({ where: { id: row.id }, select: { status: true, errorMessage: true } })
+  assert.equal(after.status, 'PROCESSING', 'the hand-back matched nothing: the row is left exactly as the decision left it')
+  assert.equal(await d.db.activityLog.count({ where: { entityId: row.id, action: 'xero_sync_awaiting_receipt_before_post' } }), 0, 'and no evidence of a hand-back that did not happen')
 })

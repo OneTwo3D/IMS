@@ -28,6 +28,8 @@ mock.module('next/cache', { namedExports: { revalidatePath: () => {}, revalidate
 // #1127 R1 L10: the Xero credit-note lookup the acknowledgements verify against; the real module, with the one read-only call answered here.
 const liveCreditNotes = new Set(['CN-11629'])
 const lookups: string[] = []
+/** The Reference the found credit note carries (#1127 R2 L4: it must name the order or the refund). */
+let foundReference: string | null = null
 let lookupMocked = false
 /** Registered before the actions module is first imported (the first fixture call). Not at top level: this tier compiles to CommonJS. */
 async function mockLookup() {
@@ -39,7 +41,7 @@ async function mockLookup() {
       ...realCreditNotes,
       lookupSalesCreditNoteByNumber: async (number: string) => {
         lookups.push(number)
-        return { ok: true, found: liveCreditNotes.has(number) ? [{ creditNoteId: `id-${number}`, status: 'AUTHORISED', reference: null, total: 3 }] : [] }
+        return { ok: true, found: liveCreditNotes.has(number) ? [{ creditNoteId: `id-${number}`, status: 'AUTHORISED', reference: foundReference, total: 3 }] : [] }
       },
     },
   })
@@ -63,7 +65,8 @@ async function fixtures(t: { after: (fn: () => Promise<void>) => void }) {
     data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: order.id, recordKind: 'WC_REFUND_PARK', status: 'QUARANTINED', externalId, errorMessage: message, createdAt: LONG_AGO } as never,
     select: { id: true },
   })
-  const parityHold = await park(`${Date.now()}1`, `WooCommerce refund 166130 refunds no goods.${PARITY_NO_MANUAL_RECORD}`)
+  const parityExternalId = `${Date.now()}1`
+  const parityHold = await park(parityExternalId, `WooCommerce refund 166130 refunds no goods.${PARITY_NO_MANUAL_RECORD}`)
   const ordinary = await park(`${Date.now()}2`, 'This refund is monetary-only and the VAT basis could not be determined.')
   const refund = await db.salesOrderRefund.create({
     data: { orderId: order.id, totalForeign: 17.08, totalBase: 17.08, creditNoteNumber: `CN-${tag}`, externalRefundId: Math.floor(Math.random() * 1_000_000_000) + 1, easFeeGapForeign: 3, storefrontAmountForeign: 17.86, createdAt: LONG_AGO } as never,
@@ -76,7 +79,7 @@ async function fixtures(t: { after: (fn: () => Promise<void>) => void }) {
     await db.salesOrder.deleteMany({ where: { id: order.id } })
     await db.user.deleteMany({ where: { id: user.id } })
   })
-  return { db, order, parityHold, ordinary, refund }
+  return { db, order, parityHold, parityExternalId, ordinary, refund }
 }
 
 test('[pnc8p] "Settled outside IMS" closes a parity hold, creates nothing, records who and why; refused for any other park and without a reason; two at once close it once', SKIP, async (t) => {
@@ -96,6 +99,16 @@ test('[pnc8p] "Settled outside IMS" closes a parity hold, creates nothing, recor
   assert.match(String(other.error), /Only a refund held by the storefront refund parity checks/)
   assert.equal((await f.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: f.ordinary.id } })).status, 'QUARANTINED', 'the ordinary park is untouched')
 
+  // #1127 R2 L4: a live credit note that names neither the order nor this refund is refused.
+  foundReference = 'someone else 170000'
+  const foreign = await actions.acknowledgeRefundParkSettledOutsideIms(f.parityHold.id, 'done', 'CN-11629')
+  assert.equal(foreign.success, false)
+  assert.match(String(foreign.error), /names neither this order nor refund/)
+  foundReference = f.parityExternalId
+  // #1127 R2 MED-6: "no credit note needed" is only for the VAT-only hold.
+  const noCn = await actions.acknowledgeRefundParkSettledOutsideIms(f.parityHold.id, 'done', null, { noCreditNoteNeeded: true })
+  assert.equal(noCn.success, false)
+  assert.match(String(noCn.error), /Only a VAT-only refund can be closed without naming a credit note/)
   const refundsBefore = await f.db.salesOrderRefund.count({ where: { orderId: f.order.id } })
   const [a, b] = await Promise.all([
     actions.acknowledgeRefundParkSettledOutsideIms(f.parityHold.id, 'CN-11629 raised in Xero by the accountant', 'CN-11629'),
@@ -154,4 +167,21 @@ test('[#1127 R1 M6] "Not a duplicate" records the operator\'s acknowledgement on
   assert.equal(await f.db.activityLog.count({ where: { entityId: f.order.id, action: 'credit_note_not_duplicate_acknowledged' } }), 1)
   assert.equal((await actions.acknowledgeCreditNoteNotDuplicate(f.refund.id, 'cn-b', 'also not')).success, true)
   assert.equal((await f.db.salesOrderRefund.findUniqueOrThrow({ where: { id: f.refund.id }, select: { creditNoteDuplicateHold: true } })).creditNoteDuplicateHold, null, 'the hold is cleared with its last credit note')
+})
+
+test('[#1127 R2 MED-6] the VAT-only hold closes with "no credit note needed", its reason recorded, and no Xero lookup', SKIP, async (t) => {
+  const f = await fixtures(t)
+  const actions = await import('@/app/actions/sync-exceptions')
+  const { vatOnlyRefundHold } = await import('@/lib/domain/sales/refund-cn-parity')
+  const vat = await f.db.shoppingSyncLog.create({
+    data: { connector: 'woocommerce', direction: 'FROM_CONNECTOR', entityType: 'SalesOrder', entityId: f.order.id, recordKind: 'WC_REFUND_PARK', status: 'QUARANTINED', externalId: `${Date.now()}9`, errorMessage: vatOnlyRefundHold({ refundId: 159049, amount: '29.67', currency: 'EUR' }), createdAt: new Date(Date.UTC(2001, 0, 1)) } as never,
+    select: { id: true },
+  })
+  const before = lookups.length
+  const ok = await actions.acknowledgeRefundParkSettledOutsideIms(vat.id, 'invoice 141.30 is zero-rated in Xero', null, { noCreditNoteNeeded: true })
+  assert.equal(ok.success, true, JSON.stringify(ok))
+  assert.equal(lookups.length, before, 'no credit note to look up')
+  const closed = await f.db.shoppingSyncLog.findUniqueOrThrow({ where: { id: vat.id } })
+  assert.equal(closed.status, 'SYNCED')
+  assert.match(closed.errorMessage ?? '', /no credit note needed: invoice 141\.30 is zero-rated in Xero/)
 })

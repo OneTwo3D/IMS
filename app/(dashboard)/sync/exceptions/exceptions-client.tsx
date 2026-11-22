@@ -74,6 +74,7 @@ import {
   acknowledgeRefundParkSettledOutsideIms,
   acknowledgeFeeRepaymentApplied,
   acknowledgeCreditNoteNotDuplicate,
+  confirmCreditNoteIsThisRefunds,
   type ExceptionInboxData,
   type RefundParkAllocationInput,
   type RefundParkAllocationTarget,
@@ -113,6 +114,7 @@ export function ExceptionsClient({ data }: Props) {
   const [settlingOutsideParkId, setSettlingOutsideParkId] = useState<string | null>(null)
   const [settledOutsideReason, setSettledOutsideReason] = useState('')
   const [settledOutsideCreditNote, setSettledOutsideCreditNote] = useState('')
+  const [settledOutsideNoCreditNote, setSettledOutsideNoCreditNote] = useState(false)
   // #1127 R1 M6: the held credit note being acknowledged as not a duplicate ("refundId:creditNoteId"), and why.
   const [notDuplicateKey, setNotDuplicateKey] = useState<string | null>(null)
   const [notDuplicateReason, setNotDuplicateReason] = useState('')
@@ -710,7 +712,7 @@ export function ExceptionsClient({ data }: Props) {
                           size="sm"
                           disabled={isPending}
                           title={withLedgerCheck('For a refund whose credit note was settled in Xero with the accountant. Closes this row and records who and why; nothing is created in IMS or sent to Xero, and the refund is not synced again.')}
-                          onClick={() => { setSettledOutsideReason(''); setSettledOutsideCreditNote(''); setSettlingOutsideParkId(settlingOutsideParkId === row.id ? null : row.id) }}
+                          onClick={() => { setSettledOutsideReason(''); setSettledOutsideCreditNote(''); setSettledOutsideNoCreditNote(false); setSettlingOutsideParkId(settlingOutsideParkId === row.id ? null : row.id) }}
                         >
                           <CheckCircle2 className="h-3 w-3 mr-1" />Settled outside IMS
                         </Button>
@@ -735,20 +737,31 @@ export function ExceptionsClient({ data }: Props) {
                         <p className="text-xs text-muted-foreground">
                           Acknowledge that this refund was settled outside IMS (its credit note settled in Xero with the accountant). Nothing is created in IMS or sent to Xero, returned stock is not restocked, and the refund is not synced again. An open fee repayment on an earlier refund stays open until it is acknowledged as applied.
                         </p>
-                        <Label htmlFor={`settled-outside-cn-${row.id}`} className="text-xs">The Xero credit note it was settled with (its number; IMS checks it exists in Xero)</Label>
-                        <Input id={`settled-outside-cn-${row.id}`} value={settledOutsideCreditNote} maxLength={50} onChange={(event) => setSettledOutsideCreditNote(event.target.value)} />
+                        {row.vatOnlyHold ? (
+                          <label className="flex items-center gap-2 text-xs">
+                            <input type="checkbox" checked={settledOutsideNoCreditNote} onChange={(event) => setSettledOutsideNoCreditNote(event.target.checked)} />
+                            No credit note is needed (the invoice is already ex-VAT in Xero, so there is nothing to reverse)
+                          </label>
+                        ) : null}
+                        {!(row.vatOnlyHold && settledOutsideNoCreditNote) ? (
+                          <>
+                            <Label htmlFor={`settled-outside-cn-${row.id}`} className="text-xs">The Xero credit note it was settled with (its number; IMS checks it exists in Xero and names this order or refund)</Label>
+                            <Input id={`settled-outside-cn-${row.id}`} value={settledOutsideCreditNote} maxLength={50} onChange={(event) => setSettledOutsideCreditNote(event.target.value)} />
+                          </>
+                        ) : null}
                         <Label htmlFor={`settled-outside-${row.id}`} className="text-xs">How was it settled? (recorded with your name)</Label>
                         <Input id={`settled-outside-${row.id}`} value={settledOutsideReason} maxLength={500} onChange={(event) => setSettledOutsideReason(event.target.value)} />
                         <div className="space-x-2">
                           <Button
                             type="button"
                             size="sm"
-                            disabled={isPending || settledOutsideReason.trim() === '' || settledOutsideCreditNote.trim() === ''}
+                            disabled={isPending || settledOutsideReason.trim() === '' || (settledOutsideCreditNote.trim() === '' && !(row.vatOnlyHold && settledOutsideNoCreditNote))}
                             onClick={() => {
                               const reason = settledOutsideReason
-                              const creditNote = settledOutsideCreditNote
+                              const noCreditNote = row.vatOnlyHold && settledOutsideNoCreditNote
+                              const creditNote = noCreditNote ? null : settledOutsideCreditNote
                               setSettlingOutsideParkId(null)
-                              runAction(() => acknowledgeRefundParkSettledOutsideIms(row.id, reason, creditNote), 'Acknowledged as settled outside IMS. Nothing was created; the row is closed.')
+                              runAction(() => acknowledgeRefundParkSettledOutsideIms(row.id, reason, creditNote, { noCreditNoteNeeded: noCreditNote }), 'Acknowledged as settled outside IMS. Nothing was created; the row is closed.')
                             }}
                           >
                             Acknowledge
@@ -875,8 +888,24 @@ export function ExceptionsClient({ data }: Props) {
                         <Button type="button" variant="outline" size="sm" disabled={isPending} onClick={() => { setNotDuplicateReason(''); setNotDuplicateKey(notDuplicateKey === key ? null : key) }}>
                           <XCircle className="h-3 w-3 mr-1" />Not a duplicate
                         </Button>
+                        <Button type="button" variant="outline" size="sm" className="ml-1" disabled={isPending} onClick={() => { setNotDuplicateReason(''); setNotDuplicateKey(notDuplicateKey === `this:${key}` ? null : `this:${key}`) }}>
+                          <CheckCircle2 className="h-3 w-3 mr-1" />{"It is this refund's"}
+                        </Button>
                       </TableCell>
                     </TableRow>
+                    {notDuplicateKey === `this:${key}` ? (
+                      <TableRow>
+                        <TableCell colSpan={4} className="bg-muted/30 space-y-2">
+                          <p className="text-xs text-muted-foreground">{withLedgerCheck('Records that this credit note in Xero IS this refund\'s: a held create is settled as posted with it (IMS creates no second one); a held settlement is settled as not posted (IMS does not allocate or pay out its own on top). Which credit note stands is then the accountant\'s to put right in Xero.')}</p>
+                          <Label htmlFor={`is-this-${key}`} className="text-xs">How was it established? (recorded with your name)</Label>
+                          <Input id={`is-this-${key}`} value={notDuplicateReason} maxLength={500} onChange={(event) => setNotDuplicateReason(event.target.value)} />
+                          <div className="space-x-2">
+                            <Button type="button" size="sm" disabled={isPending || notDuplicateReason.trim() === ''} onClick={() => { const reason = notDuplicateReason; setNotDuplicateKey(null); runAction(() => confirmCreditNoteIsThisRefunds(row.refundId, cn.creditNoteId, reason), 'Recorded: the credit note in Xero is this refund\'s.') }}>Confirm</Button>
+                            <Button type="button" size="sm" variant="ghost" disabled={isPending} onClick={() => setNotDuplicateKey(null)}>Cancel</Button>
+                          </div>
+                        </TableCell>
+                      </TableRow>
+                    ) : null}
                     {notDuplicateKey === key ? (
                       <TableRow>
                         <TableCell colSpan={4} className="bg-muted/30 space-y-2">

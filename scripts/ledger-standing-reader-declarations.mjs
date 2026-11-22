@@ -15,6 +15,14 @@
 // slice-1c conversion entry remains); o3d-2by1 owns the re-settleability authority question.
 
 export const DECLARATIONS = [
+  { key: "app/actions/sync-exceptions.ts::pruneResolvedDuplicateHolds::cmp-synced#1", class: "DISPLAY",
+    reason: "#1127 R2 MED-5: clears a credit-note DUPLICATE HOLD (an inbox listing) once the held sync row is decided by anyone - settled (SYNCED, asserted or confirmed) or cancelled; it only shrinks the list of credit notes shown for a person, and the duplicate check itself runs again on the row's next attempt." },
+  { key: "app/actions/sync-exceptions.ts::pruneResolvedDuplicateHolds::cmp-cancelled#1", class: "DISPLAY",
+    reason: "#1127 R2 MED-5: the same clearing for a held row that was cancelled: nothing further will be sent from it, so the hold it raised is no longer an operator item." },
+  { key: "lib/connectors/xero/order-credit-notes.ts::readOrderCreditNoteKeys::where-excludes-cancelled#1", class: "GUARD",
+    reason: "#1127 R2 MED-4: which of the order's refunds IMS raises (or has raised) a credit note for: any CREDIT_NOTE row not CANCELLED, a shadow's CANCELLED row included in the excluded set; only a refund with none can own a credit note in Xero that IMS did not raise. A wrong 'raises' reading only makes the duplicate check hold more, never less." },
+  { key: "lib/connectors/xero/order-credit-notes.ts::readOrderCreditNoteKeys::where-admits-synced#1", class: "GUARD",
+    reason: "#1127 R2 MED-4: the same read: a SYNCED (posted or asserted) CREDIT_NOTE row means IMS raised the refund's credit note, so that refund is not a possible owner of a foreign one." },
   { key: "lib/domain/accounting/document-delete-service.ts::lateActivityOn::where-admits-synced#1", class: "GUARD",
     reason: "o3d-ngmt.21: the unwind's re-check under the document's lock: a bill payment queued, running or synced since the delete was requested stops the unwind (the bill is paid in the ledger sense); a cancelled row is not a payment." },
   { key: "lib/domain/accounting/document-delete-service.ts::loadDocumentDeleteCandidate::where-admits-synced#1", class: "GUARD",

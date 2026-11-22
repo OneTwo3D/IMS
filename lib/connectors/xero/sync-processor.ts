@@ -2398,6 +2398,12 @@ function accountingSyncLogClaimWhere(
  */
 // Exported for tests/accounting/xero-claim-before-remote-write.test.ts: "we did not post" is the
 // outcome under test, and it is only observable at this seam.
+/** #1127 R2 H-A: the ONE type whose remote-write lease keeps attempt-stamping custody (its settlement waits hand a claimed row back unsent). */
+export const STAMPING_CUSTODY_KEPT_TYPES: ReadonlySet<string> = new Set(['CREDIT_NOTE_ALLOCATION'])
+export function stampingCustodyOptionsFor(type: string): { keepStampingCustody: boolean } | undefined {
+  return STAMPING_CUSTODY_KEPT_TYPES.has(type) ? { keepStampingCustody: true } : undefined
+}
+
 export async function renewClaimForRemoteWrite(
   entryId: string,
   held: HeldClaim,
@@ -2414,22 +2420,30 @@ export async function renewClaimForRemoteWrite(
    * Absent for every other remote mutation, which mint nothing.
    */
   write?: CreateDispatchFenceWrite,
+  /**
+   * #1127 R2 H-A: keep attempt-stamping custody through this renewal. ONLY for the types in STAMPING_CUSTODY_KEPT_TYPES (CREDIT_NOTE_ALLOCATION), whose waits hand
+   * a claimed row back unsent; absent for every other type, whose renewal is the statement development has always written (custody forfeited by the trigger).
+   */
+  options?: { keepStampingCustody?: boolean },
 ): Promise<Date | null> {
   const renewedAt = new Date()
-  const renewed = await db.accountingSyncLog.updateMany({
+  // #1127 R2 H-A: A CREDIT_NOTE_ALLOCATION RENEWAL KEEPS STAMPING CUSTODY (`options.keepStampingCustody`, set only for STAMPING_CUSTODY_KEPT_TYPES), as the claim
+  // statement took it (`stampingCustodyOnClaim`): the renewal moves `processingStartedAt`, and the forfeit trigger (migration 20260819090000) nulls custody on any
+  // such move that does not write custody equal to it in the same statement, so a settlement that then WAITS would be stamped as possibly attempted by the next
+  // run's repair. Scoped to that one type on purpose: for every other type a lost response must keep reading as possibly attempted (a CREDIT_NOTE or COGS_REVERSAL
+  // whose answer was lost must never look retireable) and the money posts' Idempotency-Key derivation reads custody too, so their statement below is development's,
+  // unchanged. The claim's refusal is carried: a money row that already holds neither custody nor a stamp is not given custody back; it is not renewed at all.
+  const keepCustody: Prisma.AccountingSyncLogUpdateManyArgs = {
+    where: { ...heldClaimWhere(entryId, held), connector: XERO_CONNECTOR, ...xeroNotBeforeCutoffWhere(xeroCutoffFloor()), AND: [CUSTODY_MAY_BE_RESTORED] },
+    data: { processingStartedAt: renewedAt, attemptStampingCustodyAt: renewedAt, ...(write ?? {}) },
+  }
+  const renewed = await db.accountingSyncLog.updateMany(options?.keepStampingCustody ? keepCustody : {
     // The shared claim-identity fence (see heldClaimWhere), narrowed to this connector. `held` is
     // asked for its instant HERE, as the statement is built — so a renewal that has happened since
     // the caller obtained the claim is the instant this re-take fences on (o3d-xl63 r6).
     // THE WRITER-SIDE CUT-OFF, RE-DERIVED AT EVERY REMOTE WRITE: the floor of THIS moment is a clause of the statement that proves the claim
     // immediately before a request leaves, so a row that is (or has become) older than the live-from instant cannot take the fence and nothing is sent.
-    // o3d-0lpnb R1 M1: AND THE RENEWAL RE-ASSERTS STAMPING CUSTODY, as the claim statement does (`stampingCustodyOnClaim`). It moves `processingStartedAt`, and the
-    // forfeit trigger (migration 20260819090000) nulls custody on any such move that does not write custody equal to it in the same statement, so a renewal that
-    // left custody out forfeited it on EVERY claim this binary took: a money row that then stopped before its call was stamped as possibly attempted by the next
-    // run's repair, and replayed a stale pin, was counted as a sibling's cash and could no longer be retired. This binary is a stamping binary and holds the claim
-    // continuously, so its renewal keeps custody exactly as its claim took it. The refusal welded into the claim (CUSTODY_MAY_BE_RESTORED) is carried here too: a
-    // money row that already holds neither custody nor a stamp (a row that genuinely lost custody, which the repair stamps before any claim) is not given custody
-    // back; it is not renewed at all, and that is the closed direction (the claim reads as lost and nothing is sent).
-    where: { ...heldClaimWhere(entryId, held), connector: XERO_CONNECTOR, ...xeroNotBeforeCutoffWhere(xeroCutoffFloor()), AND: [CUSTODY_MAY_BE_RESTORED] },
+    where: { ...heldClaimWhere(entryId, held), connector: XERO_CONNECTOR, ...xeroNotBeforeCutoffWhere(xeroCutoffFloor()) },
     // `processingStartedAt` is this host's clock and `createDispatchedAt` is the DATABASE's, read by
     // `planCreateDispatch` one statement ago. They are deliberately not the same instant: the claim is
     // only ever compared against itself, while the dispatch instant is aged against `clock_timestamp()`
@@ -2438,7 +2452,7 @@ export async function renewClaimForRemoteWrite(
     // proceeding under a release. Both belong in this statement for the same reason — the fact and the
     // claim proof must land together, or not at all — and the union means the fence can never be
     // handed both at once.
-    data: write ? { processingStartedAt: renewedAt, attemptStampingCustodyAt: renewedAt, ...write } : { processingStartedAt: renewedAt, attemptStampingCustodyAt: renewedAt },
+    data: write ? { processingStartedAt: renewedAt, ...write } : { processingStartedAt: renewedAt },
   })
   return renewed.count === 1 ? renewedAt : null
 }
@@ -2546,10 +2560,12 @@ export async function openRemoteWriteLease(
   claimedAt: Date,
   outboxJob?: IntegrationOutboxRow,
   now: () => number = () => Date.now(),
+  /** #1127 R2 H-A: keep stamping custody through every renewal of this lease (STAMPING_CUSTODY_KEPT_TYPES only). */
+  options?: { keepStampingCustody?: boolean },
 ): Promise<RemoteWriteLease | null> {
   // `claimedAt` really is a fixed instant at this one point — it is the claim the sweep loop stamped,
   // and this is the statement that replaces it — so it is wrapped rather than carried further.
-  const renewed = await renewClaimForRemoteWrite(entryId, claimHeldFrom(claimedAt))
+  const renewed = await renewClaimForRemoteWrite(entryId, claimHeldFrom(claimedAt), undefined, options)
   if (!renewed) return null
 
   let heldFrom = renewed
@@ -2588,7 +2604,7 @@ export async function openRemoteWriteLease(
       // is committed, send" and "it does not, nothing was written, nothing is sent".
       let again: Date | null
       try {
-        again = await renewClaimForRemoteWrite(entryId, claim, createDispatchWrite)
+        again = await renewClaimForRemoteWrite(entryId, claim, createDispatchWrite, options)
       } catch (error) {
         // A create whose local record cannot be written is a create whose OUTCOME cannot be recorded
         // either (o3d-k26m.5), so it is refused rather than sent unrecorded. Only the minting fence
@@ -4206,8 +4222,6 @@ export async function processPendingXeroSync(): Promise<ProcessResult> {
   // costs a five-minute delay, whereas posting into a fence that cannot see its rivals costs a
   // duplicate payment. The cron treats a throw here as it treats any other sync failure.
   await reportMoneyAttemptCustodyRepair(await repairMoneyAttemptsOutsideStampingCustody(), XERO_CONNECTOR)
-  // o3d-0lpnb #1127 R1 H1: every run starts with a fresh Xero call budget for credit-note settlements and duplicate checks.
-  beginSettlementXeroCallBudget()
   if (!isXeroAccountingOutboxEnabled()) {
     return processPendingXeroSyncDirect()
   }
@@ -4385,7 +4399,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
       // o3d-xl63 r4 #1 / r5 #1: open the lease. Opening it re-takes the claim at the instant the work
       // begins and posts NOTHING if it is gone; from here on every remote mutation inside processEntry
       // fences on it again, and the absolute deadline it fixes covers the preparation calls too.
-      const lease = await openRemoteWriteLease(entry.id, claimedAt)
+      const lease = await openRemoteWriteLease(entry.id, claimedAt, undefined, undefined, stampingCustodyOptionsFor(entry.type))
       if (!lease) {
         await logActivity({
           entityType: 'SYSTEM',
@@ -5032,7 +5046,7 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
       // the queue side has its own fifteen-minute staleness and would otherwise hand this job to a
       // second worker while the first is still legitimately working. Handed back for retry rather than
       // failed, because nothing was sent.
-      const lease = await openRemoteWriteLease(entry.id, claimedAt, job)
+      const lease = await openRemoteWriteLease(entry.id, claimedAt, job, undefined, stampingCustodyOptionsFor(entry.type))
       if (!lease) {
         await markXeroOutboxRetry(job, lostClaimMessage(entry.id))
         await logActivity({
@@ -5418,11 +5432,11 @@ export const SETTLEMENT_WAIT_MAX_MS = 3 * 24 * 3_600_000
 export const SETTLEMENT_WAIT_MAX_COUNT = 10
 
 /** One episode of waits, kept on the row's payload as `_settlementWait`. */
-export type SettlementWait = { reason: 'awaiting-receipt' | 'awaiting-sibling'; since: string; count: number }
+export type SettlementWait = { reason: 'awaiting-receipt' | 'awaiting-sibling'; since: string; count: number; /** #1127 R2 MED-7: budget waits in a row (not counted in `count`). */ budgetWaits?: number }
 export function readSettlementWait(payload: unknown): SettlementWait | null {
   const raw = (payload as { _settlementWait?: unknown } | null)?._settlementWait as Partial<SettlementWait> | undefined
-  if (!raw || (raw.reason !== 'awaiting-receipt' && raw.reason !== 'awaiting-sibling') || typeof raw.since !== 'string' || !Number.isFinite(Date.parse(raw.since)) || typeof raw.count !== 'number' || raw.count < 1) return null
-  return { reason: raw.reason, since: raw.since, count: Math.floor(raw.count) }
+  if (!raw || (raw.reason !== 'awaiting-receipt' && raw.reason !== 'awaiting-sibling') || typeof raw.since !== 'string' || !Number.isFinite(Date.parse(raw.since)) || typeof raw.count !== 'number' || raw.count < 0) return null
+  return { reason: raw.reason, since: raw.since, count: Math.floor(raw.count), ...(typeof raw.budgetWaits === 'number' && raw.budgetWaits > 0 ? { budgetWaits: Math.floor(raw.budgetWaits) } : {}) }
 }
 /** The n-th wait's delay: the reason's base, doubled each time, capped at SETTLEMENT_WAIT_MAX_DELAY_MS. */
 export function settlementWaitDelayMs(reason: 'awaiting-receipt' | 'awaiting-sibling', count: number): number {
@@ -6352,22 +6366,24 @@ async function processEntry(
 }
 
 // ---------------------------------------------------------------------------------------------------------------------------------------------
-// o3d-0lpnb #1127 R1 H1: THE XERO CALL BUDGET FOR CREDIT-NOTE SETTLEMENTS AND DUPLICATE CHECKS, per run. The day allowance (1,000 calls) is the ORGANISATION's,
-// shared with Xeroom's live invoicing; a settlement costs 2 balance reads, one credit-note search and one read per matched credit note (and 2 more under the
-// order lock). Past the budget a row waits (`awaiting-budget`, 30 minutes, no retry spent, no wait counted) instead of reading.
+// #1127 R1 H1 / R2 MED-1: THE XERO CALL BUDGET FOR CREDIT-NOTE SETTLEMENTS AND DUPLICATE CHECKS, PER UTC DAY, PERSISTENT AND SHARED by every run (the cron, "Sync
+// now", every host): one row per day in xero_settlement_call_budget, spent with one atomic statement. The allowance it protects is the ORGANISATION's (1,000 Xero
+// calls per rolling 24 hours on this plan), shared with Xeroom's live invoicing; a settlement costs 2 balance reads, one credit-note search and one read per
+// matched credit note (and 2 more under the order lock). Past the day's budget a row waits (`awaiting-budget`, 30 minutes, no retry spent).
 // ---------------------------------------------------------------------------------------------------------------------------------------------
-export const SETTLEMENT_XERO_CALL_BUDGET = 60
+export const SETTLEMENT_XERO_CALL_BUDGET_PER_DAY = 200
 export const AWAITING_BUDGET_RETRY_DELAY_MS = 30 * 60_000
-let settlementXeroCallsLeft = SETTLEMENT_XERO_CALL_BUDGET
-/** Reset at the start of every processPendingXeroSync run. */
-export function beginSettlementXeroCallBudget(budget: number = SETTLEMENT_XERO_CALL_BUDGET): void {
-  settlementXeroCallsLeft = budget
-}
-/** Spend `n` calls from this run's budget; false (and nothing spent) when fewer are left. */
-export function spendSettlementXeroCalls(n: number = 1): boolean {
-  if (settlementXeroCallsLeft < n) return false
-  settlementXeroCallsLeft -= n
-  return true
+
+type BudgetClient = { $queryRaw: <T>(query: TemplateStringsArray, ...values: unknown[]) => Promise<T> }
+/** Spend `n` calls from today's budget: true when spent, false (nothing spent) when the day's budget would be exceeded. One atomic statement. */
+export async function spendSettlementXeroCalls(n: number = 1, client: BudgetClient = db as unknown as BudgetClient, perDay: number = SETTLEMENT_XERO_CALL_BUDGET_PER_DAY): Promise<boolean> {
+  if (n > perDay) return false
+  const rows = await client.$queryRaw<Array<{ used: number }>>`
+    INSERT INTO "xero_settlement_call_budget" ("day", "used") VALUES ((now() AT TIME ZONE 'UTC')::date, ${n})
+    ON CONFLICT ("day") DO UPDATE SET "used" = "xero_settlement_call_budget"."used" + ${n}
+      WHERE "xero_settlement_call_budget"."used" + ${n} <= ${perDay}
+    RETURNING "used"`
+  return rows.length === 1
 }
 
 /** The duplicate context for one refund: its own figures and the order's refunds (see duplicateVerdict). */
@@ -6384,8 +6400,9 @@ function duplicateContextFor(args: { refundId: string; keys: Awaited<ReturnType<
  * #1127 R1 M6: record (or clear) the credit notes a refund is held on as possible duplicates, so Sync exceptions can list them with a "Not a duplicate"
  * acknowledgement. Ids, numbers, status, total and date only (never the reference, which can carry a customer's name). Best effort: the refusal stands either way.
  */
-async function recordDuplicateHold(refundId: string, found: ReadonlyArray<{ creditNoteId: string; creditNoteNumber: string | null; status: string; total: number | null; date?: string | null }>): Promise<void> {
-  const hold = found.length === 0 ? Prisma.DbNull : found.map((cn) => ({ creditNoteId: cn.creditNoteId, creditNoteNumber: cn.creditNoteNumber, status: cn.status, total: cn.total, date: cn.date ?? null }))
+async function recordDuplicateHold(refundId: string, rowId: string, found: ReadonlyArray<{ creditNoteId: string; creditNoteNumber: string | null; status: string; total: number | null; date?: string | null }>): Promise<void> {
+  // #1127 R2 MED-5: each held credit note names the sync row it holds, so the hold clears itself once that row is settled or cancelled.
+  const hold = found.length === 0 ? Prisma.DbNull : found.map((cn) => ({ creditNoteId: cn.creditNoteId, creditNoteNumber: cn.creditNoteNumber, status: cn.status, total: cn.total, date: cn.date ?? null, rowId }))
   await db.salesOrderRefund.updateMany({ where: { id: refundId }, data: { creditNoteDuplicateHold: hold } }).catch(() => { /* advisory: the row's own refusal names the credit notes */ })
 }
 
@@ -6396,7 +6413,7 @@ const DUPLICATE_HOLD_REMEDY = 'Decide in Xero, with the accountant, which credit
  * o3d-pnc8p note 1: the duplicate check before a sales credit note is CREATED (see duplicateVerdict). Null when the switch is off, the row is not a refund's, or
  * Xero holds nothing for this refund; otherwise the refusal (nothing is sent).
  */
-async function salesCreditNoteDuplicateRefusal(referenceType: string, referenceId: string, payload: SyncPayload): Promise<EntryResult | null> {
+async function salesCreditNoteDuplicateRefusal(entryId: string, referenceType: string, referenceId: string, payload: SyncPayload): Promise<EntryResult | null> {
   if (referenceType !== 'SalesOrderRefund') return null
   const flag = await db.setting.findUnique({ where: { key: CREDIT_NOTE_DUPLICATE_CHECK_SETTING_KEY }, select: { value: true } })
   if (flag?.value !== 'true') return null
@@ -6407,13 +6424,21 @@ async function salesCreditNoteDuplicateRefusal(referenceType: string, referenceI
   const read = await readOrderCreditNotesFromXero(keys.keys, refund.order.currency, { spend: () => spendSettlementXeroCalls(1) })
   if (!read.ok) {
     const message = `Not sent yet: ${read.error}. IMS reads Xero for the order's credit notes before it creates one, so that a credit note raised by Xeroom or by hand is never duplicated; it tries again later.`
-    return read.budget ? { success: false, error: message, notPosted: { reason: 'awaiting-budget', operation: 'credit-note', message, retryDelayMs: AWAITING_BUDGET_RETRY_DELAY_MS } } : { success: false, error: message }
+    if (!read.budget) return { success: false, error: message }
+    // #1127 R2 L3: the evidence of a budget wait is written once a day per row, not every half hour.
+    const recent = await db.activityLog.count({ where: { entityType: 'SYSTEM', entityId: entryId, action: 'xero_sync_awaiting_budget_before_post', createdAt: { gte: new Date(Date.now() - 24 * 3_600_000) } } })
+    return { success: false, error: message, notPosted: { reason: 'awaiting-budget', operation: 'credit-note', message, retryDelayMs: AWAITING_BUDGET_RETRY_DELAY_MS, recordEvidence: recent === 0 } }
   }
+  const row = await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { attemptRevision: true, retryCount: true } })
   const gross = refund.statedGrossForeign == null ? null : Number(refund.statedGrossForeign.toString())
-  const found = creditNoteCreateDuplicates(read.creditNotes, duplicateContextFor({
+  const ctx = duplicateContextFor({
     refundId: referenceId, keys, totalCents: creditNotePayloadGrossCents(payload, gross), creditNoteNumber: typeof payload.creditNoteNumber === 'string' ? payload.creditNoteNumber : null,
-  }))
-  await recordDuplicateHold(referenceId, found)
+  })
+  // #1127 R2 MED-3: IMS's own number converges only on a row claimed before (this claim is revision 1 of a first attempt), or on a document with IMS's content.
+  ctx.self.earlierClaim = (row?.attemptRevision ?? 0) > 1 || (row?.retryCount ?? 0) > 0
+  ctx.self.reference = typeof payload.reference === 'string' ? payload.reference : null
+  const found = creditNoteCreateDuplicates(read.creditNotes, ctx)
+  await recordDuplicateHold(referenceId, entryId, found)
   if (found.length === 0) return null
   return {
     success: false,
@@ -6442,8 +6467,10 @@ async function processCreditNoteAllocation(args: {
   referenceId: string
   payload: SyncPayload
   lease: RemoteWriteLease
+  /** #1127 R2 L2: the attempt this claim minted; the FAILED write of an escalated wait fences on it. */
+  attempt: AttemptRef
 }): Promise<EntryResult> {
-  const { entryId, type, referenceType, referenceId, lease } = args
+  const { entryId, type, referenceType, referenceId, lease, attempt } = args
   let payload = args.payload
   if (referenceType !== 'SalesOrderRefund') return { success: false, error: `CREDIT_NOTE_ALLOCATION is raised for a SalesOrderRefund, not a ${referenceType}` }
   const creditNoteId = typeof payload.creditNoteId === 'string' ? payload.creditNoteId : ''
@@ -6529,25 +6556,39 @@ async function processCreditNoteAllocation(args: {
   }
   const waitFor = async (reason: 'awaiting-receipt' | 'awaiting-sibling' | 'awaiting-budget', message: string): Promise<EntryResult> => {
     const operationName = 'credit-note-settlement'
-    if (reason === 'awaiting-budget') {
-      if (!reading.attempted) await writeRowPayload({ ...waitBase, ...(priorWait ? { _settlementWait: priorWait } : {}) } as SyncPayload)
-      return { success: false, error: message, notPosted: { reason, operation: operationName, message, retryDelayMs: AWAITING_BUDGET_RETRY_DELAY_MS, recordEvidence: false } }
-    }
     const now = Date.now()
-    const episode = priorWait && priorWait.reason === reason ? { reason, since: priorWait.since, count: priorWait.count + 1 } : { reason, since: new Date(now).toISOString(), count: 1 }
+    // #1127 R2 L1: ONE episode for any run of settlement waits, whatever the reason of each (a receipt wait, then a sibling wait, then a receipt wait again is one
+    // episode, not three fresh ones). MED-7: a budget wait keeps (or starts) the episode, so it ages like any other and a row starved by the budget still escalates
+    // after SETTLEMENT_WAIT_MAX_MS; it is not counted among the waits.
+    const since = priorWait?.since ?? new Date(now).toISOString()
+    if (reason === 'awaiting-budget') {
+      const budgetWaits = (priorWait?.budgetWaits ?? 0) + 1
+      const episode: SettlementWait = { reason: priorWait?.reason ?? 'awaiting-receipt', since, count: priorWait?.count ?? 0, budgetWaits }
+      if (now - Date.parse(since) > SETTLEMENT_WAIT_MAX_MS) return escalateWait({ ...episode, reason: priorWait?.reason ?? 'awaiting-receipt' }, message)
+      await writeRowPayload({ ...waitBase, _settlementWait: episode } as SyncPayload)
+      return { success: false, error: message, notPosted: { reason, operation: operationName, message, retryDelayMs: AWAITING_BUDGET_RETRY_DELAY_MS, recordEvidence: budgetWaits === 1 } }
+    }
+    const episode: SettlementWait = { reason, since, count: (priorWait?.count ?? 0) + 1, budgetWaits: 0 }
     if (episode.count > SETTLEMENT_WAIT_MAX_COUNT || now - Date.parse(episode.since) > SETTLEMENT_WAIT_MAX_MS) return escalateWait(episode, message)
     await writeRowPayload({ ...waitBase, _settlementWait: episode } as SyncPayload)
     return { success: false, error: message, notPosted: { reason, operation: operationName, message, retryDelayMs: settlementWaitDelayMs(reason, episode.count), recordEvidence: episode.count === 1 } }
   }
   const escalateWait = async (episode: SettlementWait, message: string): Promise<EntryResult> => {
-    const why = withLedgerCheck(`Not sent: this settlement has waited ${episode.count - 1} times since ${episode.since} (${episode.reason === 'awaiting-receipt' ? 'Xero does not show the receipt it would return' : 'another refund of the order held the cash or the order lock'}), so IMS stopped waiting and failed it for a person. The last reason: ${message} `
+    const why = withLedgerCheck(`Not sent: this settlement has waited ${episode.count} times since ${episode.since}${episode.budgetWaits ? ` (and ${episode.budgetWaits} more for the Xero call budget)` : ''} (last for ${episode.reason === 'awaiting-receipt' ? 'Xero to show the receipt it would return' : 'another refund of the order, which held the cash or the order lock'}), so IMS stopped waiting and failed it for a person. The last reason: ${message} `
       + 'Check the invoice and the credit note in Xero with the accountant (a receipt that never posted, an invoice paid by an allocated overpayment, a stuck sibling settlement), then retry this row or settle the credit note in Xero.')
-    const failed = await db.accountingSyncLog.updateMany({
-      where: { ...heldClaimWhere(entryId, lease), connector: XERO_CONNECTOR },
-      // FAILED with its retries spent: an ordinary failure on /sync, which Retry revives (with a fresh episode: the wait record is cleared here).
-      data: { status: 'FAILED', retryCount: MAX_RETRIES, errorMessage: why, processingStartedAt: null, payload: waitBase as unknown as Prisma.InputJsonValue },
+    // #1127 R2 L2: fenced on the claim AND the attempt (an operator's decision moves the revision), with the mirrored accounting event, as every terminal failure.
+    const failed = await db.$transaction(async (tx) => {
+      const written = await tx.accountingSyncLog.updateMany({
+        where: { ...heldClaimWhere(entryId, lease), attemptRevision: attempt.attemptRevision, connector: XERO_CONNECTOR },
+        // FAILED with its retries spent: an ordinary failure on /sync, which Retry revives (with a fresh episode: the wait record is cleared here).
+        data: { status: 'FAILED', retryCount: MAX_RETRIES, errorMessage: why, processingStartedAt: null, payload: waitBase as unknown as Prisma.InputJsonValue },
+      })
+      if (written.count === 1) {
+        await updateMirroredEventForSyncLog(tx, { syncLogId: entryId, type, referenceType, referenceId, payload: waitBase, status: 'FAILED', message: why })
+      }
+      return written.count
     })
-    if (failed.count !== 1) {
+    if (failed !== 1) {
       const lost = lostClaimMessage(entryId, 'credit-note-settlement-wait')
       return { success: false, error: lost, notPosted: { reason: 'claim-lost', operation: 'credit-note-settlement-wait', message: lost } }
     }
@@ -6567,7 +6608,7 @@ async function processCreditNoteAllocation(args: {
 
   // What Xero says is left on the documents sizes the settlement. READS ONLY, before the fence; FIRST of the Xero reads (#1127 R1 H1), so a row that only waits for
   // its receipt never pays for the credit-note search.
-  if (!spendSettlementXeroCalls(2)) return waitFor('awaiting-budget', 'Not sent yet: this run\'s Xero call budget for credit-note settlements is spent (the day allowance is shared with Xeroom); it is offered again later.')
+  if (!(await spendSettlementXeroCalls(2))) return waitFor('awaiting-budget', 'Not sent yet: today\'s Xero call budget for credit-note settlements is spent (the organisation\'s Xero allowance is shared with Xeroom); it is offered again later.')
   const balances = await readCreditNoteSettlementBalances(creditNoteId, accountingInvoiceId)
   if (!balances.ok) return { success: false, error: balances.error }
   if (balances.creditNoteStatus !== 'AUTHORISED') {
@@ -6605,7 +6646,7 @@ async function processCreditNoteAllocation(args: {
     creditNotes: witnessRead.creditNotes, settlingCreditNoteId: creditNoteId, imsCreditNotes: witnessKeys.imsCreditNotes,
     isDuplicate: (cn) => duplicateVerdict({ ...cn, date: cn.date ?? null }, dupCtx) === 'duplicate',
   })
-  await recordDuplicateHold(referenceId, witnessDecision.kind === 'duplicate' ? witnessDecision.creditNotes : [])
+  await recordDuplicateHold(referenceId, entryId, witnessDecision.kind === 'duplicate' ? witnessDecision.creditNotes : [])
   if (witnessDecision.kind === 'duplicate') {
     return {
       success: false,
@@ -6804,7 +6845,7 @@ async function processCreditNoteAllocation(args: {
     { connector: XERO_CONNECTOR, type, referenceType: 'SalesOrder', referenceId: facts.order.id, documentKey: JSON.stringify(['credit_note_refund_order', facts.order.id]) },
     async (held): Promise<Guarded> => {
       orderLock = held
-      if (!spendSettlementXeroCalls(2)) return { refused: { error: 'Not sent yet: this run\'s Xero call budget for credit-note settlements is spent; it is offered again later.', wait: 'awaiting-budget' } }
+      if (!(await spendSettlementXeroCalls(2))) return { refused: { error: 'Not sent yet: today\'s Xero call budget for credit-note settlements is spent; it is offered again later.', wait: 'awaiting-budget' } }
       const lockedBalances = await readCreditNoteSettlementBalances(creditNoteId, accountingInvoiceId)
       if (!lockedBalances.ok) return { refused: { error: lockedBalances.error, wait: null } }
       lockedAmountPaid = lockedBalances.amountPaid
@@ -7479,7 +7520,7 @@ export async function processClaimedEntry(
         : undefined
       // o3d-pnc8p note 1 / o3d-0lpnb MED-3 (switch xero_credit_note_duplicate_check_enabled, default off): never create a second credit note for a refund Xero already
       // credits (162199 was duplicated on 2026-11-21 because the search was by order id alone). Read-only; unreadable is a refusal.
-      const duplicateRefusal = await salesCreditNoteDuplicateRefusal(referenceType, referenceId, payload)
+      const duplicateRefusal = await salesCreditNoteDuplicateRefusal(entryId, referenceType, referenceId, payload)
       if (duplicateRefusal) return duplicateRefusal
       // The erasure state is read BEFORE the claim is re-taken and fails closed: if it cannot be read, nothing is posted and the entry is retried.
       const creditContact = await resolveSalesPostContact(referenceType, referenceId, payload)
@@ -7569,7 +7610,7 @@ export async function processClaimedEntry(
     }
 
     case 'CREDIT_NOTE_ALLOCATION':
-      return processCreditNoteAllocation({ entryId, type, referenceType, referenceId, payload, lease })
+      return processCreditNoteAllocation({ entryId, type, referenceType, referenceId, payload, lease, attempt })
 
     case 'PURCHASE_CREDIT_NOTE_ALLOCATION': {
       // audit-v08m: follow-up that applies a posted ACCPAYCREDIT to the freight

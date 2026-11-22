@@ -6523,3 +6523,12 @@ model WcWithdrawalOutcome {
   @@unique([orderId, requestKey, outcomeKind], map: "wc_withdrawal_outcomes_once_key")
   @@map("wc_withdrawal_outcomes")
 }
+
+/// #1127 R2 MED-1: the Xero calls credit-note settlements and duplicate checks spent per UTC day (lib/connectors/xero/sync-processor.ts spendSettlementXeroCalls),
+/// shared by every sync run on every host; the daily cap keeps them well clear of the organisation's Xero allowance, which Xeroom shares.
+model XeroSettlementCallBudget {
+  day  DateTime @id @db.Date
+  used Int      @default(0)
+
+  @@map("xero_settlement_call_budget")
+}

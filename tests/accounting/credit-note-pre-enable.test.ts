@@ -13,6 +13,7 @@ import {
 import type { DuplicateContext, OrderRefundKey } from '@/lib/connectors/xero/order-credit-notes'
 import {
   CREDIT_NOTE_DUPLICATE_CHECK_SETTING_KEY,
+  creditNoteBelongsTo,
   creditNoteCreateDuplicates,
   creditNotePaidOutCents,
   creditNotePayloadGrossCents,
@@ -243,16 +244,34 @@ test('[0lpnb MED-3] the reader FAILS CLOSED: a failed or full search, an unreada
 // pnc8p note 1: before IMS CREATES a credit note
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 
-test('[pnc8p note 1, #1127 R1 M4] before a create: 162199\'s hand-raised CN-11573 (reference = refund id) is found; IMS\'s own number always CONVERGES (a lost response re-posts it)', () => {
+test('[pnc8p note 1, #1127 R1 M4 / R2 MED-3] before a create: CN-11573 (reference = refund id) is found; IMS\'s own number converges only after an earlier claim or with IMS\'s own content', () => {
   const read = (over: Record<string, unknown>) => ({ creditNoteId: 'x', creditNoteNumber: 'CN-11573', reference: '162199', status: 'AUTHORISED', currency: 'GBP', total: 39.71, date: '2026-11-21', byOrder: [], byRefund: ['162199'], paidOutCents: 0, ...over })
-  const c = ctx({ self: { externalRefundId: '162199', totalCents: 3971, creditNoteNumber: 'CN-2026-00077', refundedOn: '2026-11-21' }, refunds: [refundKey({ externalRefundId: '162199', creditNoteId: null, refundedOn: '2026-11-21' })] })
-  const noIms = { ...c, imsCreditNotes: new Map<string, string>() }
+  const base = ctx({ self: { externalRefundId: '162199', totalCents: 3971, creditNoteNumber: 'SC-162199', refundedOn: '2026-11-21', reference: 'Order 158671' }, refunds: [refundKey({ externalRefundId: '162199', creditNoteId: null, refundedOn: '2026-11-21' })] })
+  const noIms = { ...base, imsCreditNotes: new Map<string, string>() }
   assert.equal(creditNoteCreateDuplicates([read({})], noIms).length, 1)
   assert.equal(creditNoteCreateDuplicates([read({ status: 'VOIDED' })], noIms).length, 0)
-  const own = read({ creditNoteNumber: 'CN-2026-00077', byRefund: [], reference: 'order 158671', byOrder: ['158671'] })
-  assert.equal(creditNoteCreateDuplicates([own], noIms).length, 0, 'a document under IMS\'s own minted number is IMS\'s (landed after a lost response): the re-post converges on it')
-  assert.equal(duplicateVerdict(own, noIms), 'own')
+  const xeroomSc = read({ creditNoteNumber: 'SC-162199', reference: 'Xeroom 162199', byRefund: ['162199'] })
+  assert.equal(duplicateVerdict(xeroomSc, noIms), 'duplicate', 'an SC-<id> Xeroom raised before the cut-over: IMS\'s POST would overwrite it, so it is held')
+  assert.equal(duplicateVerdict(xeroomSc, { ...noIms, self: { ...noIms.self, earlierClaim: true } }), 'own', 'after an earlier claim it may be IMS\'s own, landed: converges')
+  assert.equal(duplicateVerdict({ ...xeroomSc, reference: 'Order 158671', total: 39.71 }, noIms), 'own', 'IMS\'s own content (total and reference): converges')
+  assert.equal(duplicateVerdict({ ...xeroomSc, reference: 'Order 158671', total: 40 }, noIms), 'duplicate', 'another total: not IMS\'s')
   assert.equal(creditNoteCreateDuplicates([read({ byRefund: [], byOrder: ['158671'], total: 12.79 })], noIms).length, 0, 'another refund\'s credit')
+})
+
+test('[#1127 R2 MED-4] another owner is a live refund IMS will never raise a credit note for: a deleted refund, or one with a live CREDIT_NOTE row, is not', () => {
+  const orderOnly = cn({ creditNoteId: 'x1', byOrder: ['158671'], total: 40, date: '2026-11-12' })
+  const sibling = (over: Partial<OrderRefundKey>) => ctx({ refunds: [refundKey({}), refundKey({ id: 'r-equal', externalRefundId: '158690', creditNoteId: null, grossCents: 4000, ...over })] })
+  assert.equal(duplicateVerdict(orderOnly, sibling({})), 'other', 'a Xeroom-era sibling of the same amount could own it')
+  assert.equal(duplicateVerdict(orderOnly, sibling({ deleted: true })), 'duplicate', 'a deleted refund owns nothing')
+  assert.equal(duplicateVerdict(orderOnly, sibling({ imsRaisesCreditNote: true })), 'duplicate', 'IMS raises that sibling\'s own credit note')
+})
+
+test('[#1127 R2 L4] creditNoteBelongsTo: a credit note found by number belongs to the order or refund only when its number or reference names one of them', () => {
+  const keys = { orderIds: ['158671'], refundIds: ['166130'] }
+  assert.equal(creditNoteBelongsTo({ creditNoteId: 'a', creditNoteNumber: 'CN-11629', reference: '166130' }, keys), true)
+  assert.equal(creditNoteBelongsTo({ creditNoteId: 'a', creditNoteNumber: 'CN-11629', reference: '158671-Jane' }, keys), true)
+  assert.equal(creditNoteBelongsTo({ creditNoteId: 'a', creditNoteNumber: 'SC-166130', reference: null }, keys), true)
+  assert.equal(creditNoteBelongsTo({ creditNoteId: 'a', creditNoteNumber: 'CN-11629', reference: '170000' }, keys), false)
 })
 
 test('[#1127 R1 M5] the create-time total comes from the refund\'s stated gross, else the payload\'s tax-inclusive lines, else orderTotal: a PARTIAL refund\'s duplicate is caught', () => {
@@ -303,23 +322,51 @@ test('[#1127 R1 H1] the wait backoff doubles from its base to a 12-hour cap; an 
   assert.equal(p.readSettlementWait({ _settlementWait: { reason: 'nope', since: 'x', count: 1 } }), null)
 })
 
-test('[#1127 R1 H1] the per-run Xero call budget: spent call by call, refused (nothing spent) when too few are left, reset by each run', async () => {
+test('[#1127 R2 MED-1] the Xero call budget is PER DAY and persistent: one atomic upsert that refuses (spending nothing) past the cap; the reader stops at it unasked', async () => {
   const p = await import('@/lib/connectors/xero/sync-processor')
-  p.beginSettlementXeroCallBudget(3)
-  assert.equal(p.spendSettlementXeroCalls(2), true)
-  assert.equal(p.spendSettlementXeroCalls(2), false, 'one left: a 2-call read is refused')
-  assert.equal(p.spendSettlementXeroCalls(1), true)
-  assert.equal(p.spendSettlementXeroCalls(1), false)
-  p.beginSettlementXeroCallBudget()
-  assert.equal(p.spendSettlementXeroCalls(p.SETTLEMENT_XERO_CALL_BUDGET), true)
-  p.beginSettlementXeroCallBudget()
-  // The reader stops at the budget without asking Xero.
-  let spent = 0
+  const statements: string[] = []
+  let used = 0
+  // A fake of the one statement: it adds n only while the day stays within the cap, as the WHERE on the conflict update does.
+  const client = { $queryRaw: async (q: TemplateStringsArray, ...values: unknown[]) => {
+    statements.push(q.join('?'))
+    const n = values[0] as number
+    const cap = values[values.length - 1] as number
+    if (used + n > cap) return []
+    used += n
+    return [{ used }]
+  } }
+  assert.equal(await p.spendSettlementXeroCalls(2, client as never, 3), true)
+  assert.equal(await p.spendSettlementXeroCalls(2, client as never, 3), false, 'one left: a 2-call read is refused')
+  assert.equal(used, 2, 'and nothing was spent by the refusal')
+  assert.equal(await p.spendSettlementXeroCalls(1, client as never, 3), true)
+  assert.equal(await p.spendSettlementXeroCalls(5, client as never, 3), false, 'more than a day holds is never asked')
+  assert.match(statements[0]!, /INSERT INTO "xero_settlement_call_budget"[\s\S]*\(now\(\) AT TIME ZONE 'UTC'\)::date[\s\S]*ON CONFLICT \("day"\) DO UPDATE[\s\S]*WHERE "xero_settlement_call_budget"\."used" \+ \? <= \?/)
+  assert.ok(p.SETTLEMENT_XERO_CALL_BUDGET_PER_DAY <= 250, 'well clear of the organisation\'s 1,000-call allowance, which Xeroom shares')
   const calls: string[] = []
-  const res = await readOrderCreditNotesFromXero({ orderIds: ['158671'], refundIds: [] }, 'GBP', { get: async () => { calls.push('x'); return { ok: true, status: 200, data: { CreditNotes: [] } } as never }, spend: () => (spent++ < 0) })
+  const res = await readOrderCreditNotesFromXero({ orderIds: ['158671'], refundIds: [] }, 'GBP', { get: async () => { calls.push('x'); return { ok: true, status: 200, data: { CreditNotes: [] } } as never }, spend: async () => false })
   assert.equal(res.ok, false)
   assert.equal((res as { budget?: boolean }).budget, true)
   assert.deepEqual(calls, [], 'nothing was asked')
+})
+
+test('[#1127 R2 H-A] the lease renewal keeps stamping custody ONLY for CREDIT_NOTE_ALLOCATION; every other type gets the statement development always wrote', async () => {
+  const p = await import('@/lib/connectors/xero/sync-processor')
+  assert.deepEqual([...p.STAMPING_CUSTODY_KEPT_TYPES], ['CREDIT_NOTE_ALLOCATION'])
+  assert.deepEqual(p.stampingCustodyOptionsFor('CREDIT_NOTE_ALLOCATION'), { keepStampingCustody: true })
+  for (const type of ['INVOICE_PAYMENT', 'BILL_PAYMENT', 'PURCHASE_CREDIT_NOTE_ALLOCATION', 'CREDIT_NOTE', 'COGS_REVERSAL', 'SALES_INVOICE', 'MANUAL_JOURNAL']) {
+    assert.equal(p.stampingCustodyOptionsFor(type), undefined, type)
+  }
+  const { readFile } = await import('node:fs/promises')
+  const src = await readFile('lib/connectors/xero/sync-processor.ts', 'utf8')
+  const fn = src.slice(src.indexOf('export async function renewClaimForRemoteWrite('), src.indexOf('What to say when a claim was lost before anything was sent'))
+  const plain = fn.slice(fn.indexOf('} : {'))
+  assert.match(plain, /where: \{ \.\.\.heldClaimWhere\(entryId, held\), connector: XERO_CONNECTOR, \.\.\.xeroNotBeforeCutoffWhere\(xeroCutoffFloor\(\)\) \},/, 'the default statement: development\'s where')
+  assert.match(plain, /data: write \? \{ processingStartedAt: renewedAt, \.\.\.write \} : \{ processingStartedAt: renewedAt \},/, 'and development\'s data: custody is left to the trigger')
+  assert.ok(fn.includes('updateMany(options?.keepStampingCustody ? keepCustody : {'), 'the custody statement is the opt-in branch of the one write')
+  assert.equal(fn.split('accountingSyncLog.updateMany(').length - 1, 1, 'still exactly one write')
+  for (const runner of ['openRemoteWriteLease(entry.id, claimedAt, undefined, undefined, stampingCustodyOptionsFor(entry.type))', 'openRemoteWriteLease(entry.id, claimedAt, job, undefined, stampingCustodyOptionsFor(entry.type))']) {
+    assert.ok(src.includes(runner), runner)
+  }
 })
 
 test('[#1127 R1 L7] the reader refuses a search that spans pages, and one with more live matches than it reads one by one', async () => {
@@ -341,17 +388,18 @@ test('[#1127 R1 L7] readOrderCreditNoteKeys: the order id, EVERY refund id (olde
   const client = {
     shoppingOrderLink: { findMany: async () => [{ externalOrderId: '158671' }] },
     salesOrderRefund: { findMany: async () => [
-      { id: 'r1', externalRefundId: 158690, accountingCreditNoteId: 'cn-1', statedGrossForeign: { toString: () => '-12.79' }, refundedAt: new Date('2026-11-01T10:00:00Z'), creditNoteNotDuplicate: [{ creditNoteId: 'X9', creditNoteNumber: 'CN-9', by: 'Jan', reason: 'r', at: 'now' }] },
-      { id: 'r2', externalRefundId: 158700, accountingCreditNoteId: null, statedGrossForeign: null, refundedAt: new Date('2026-11-12T10:00:00Z'), creditNoteNotDuplicate: null },
-      { id: 'r3', externalRefundId: null, accountingCreditNoteId: null, statedGrossForeign: null, refundedAt: new Date('2026-11-13T10:00:00Z'), creditNoteNotDuplicate: 'junk' },
+      { id: 'r1', externalRefundId: 158690, accountingCreditNoteId: 'cn-1', statedGrossForeign: { toString: () => '-12.79' }, refundedAt: new Date('2026-11-01T10:00:00Z'), creditNoteNotDuplicate: [{ creditNoteId: 'X9', creditNoteNumber: 'CN-9', by: 'Jan', reason: 'r', at: 'now' }], deletedAt: null },
+      { id: 'r2', externalRefundId: 158700, accountingCreditNoteId: null, statedGrossForeign: null, refundedAt: new Date('2026-11-12T10:00:00Z'), creditNoteNotDuplicate: null, deletedAt: null },
+      { id: 'r3', externalRefundId: null, accountingCreditNoteId: null, statedGrossForeign: null, refundedAt: new Date('2026-11-13T10:00:00Z'), creditNoteNotDuplicate: 'junk', deletedAt: new Date() },
     ] },
     shoppingSyncLog: { findMany: async () => [{ externalId: '158710' }, { externalId: 'not-a-number' }, { externalId: null }] },
+    accountingSyncLog: { findMany: async () => [{ referenceId: 'r2' }] },
   }
   const out = await readOrderCreditNoteKeys(client as unknown as Parameters<typeof readOrderCreditNoteKeys>[0], 'o-1')
   assert.deepEqual(out.keys, { orderIds: ['158671'], refundIds: ['158690', '158700', '158710'] })
   assert.deepEqual([...out.imsCreditNotes], [['cn-1', 'r1']])
-  assert.deepEqual(out.refunds.map((r) => [r.id, r.externalRefundId, r.grossCents, r.refundedOn, r.notDuplicateOf]), [
-    ['r1', '158690', 1279, '2026-11-01', ['x9']], ['r2', '158700', null, '2026-11-12', []], ['r3', null, null, '2026-11-13', []],
+  assert.deepEqual(out.refunds.map((r) => [r.id, r.externalRefundId, r.grossCents, r.refundedOn, r.notDuplicateOf, r.deleted, r.imsRaisesCreditNote]), [
+    ['r1', '158690', 1279, '2026-11-01', ['x9'], false, false], ['r2', '158700', null, '2026-11-12', [], false, true], ['r3', null, null, '2026-11-13', [], true, false],
   ])
 })
 
@@ -384,7 +432,7 @@ test('[#1127 R1 L6] BOTH runners route a settlement wait through its own hand-ba
     assert.ok(branch.slice(wait, guard).includes(call), `${name}: and calls the settlement hand-back`)
   }
   const create = src.slice(src.indexOf("case 'CREDIT_NOTE': {"), src.indexOf("case 'CREDIT_NOTE_VOID': {"))
-  const check = create.indexOf('const duplicateRefusal = await salesCreditNoteDuplicateRefusal(referenceType, referenceId, payload)')
+  const check = create.indexOf('const duplicateRefusal = await salesCreditNoteDuplicateRefusal(entryId, referenceType, referenceId, payload)')
   assert.ok(check > 0 && check < create.indexOf("lease.fenceBeforeRemoteWrite('credit-note')"), 'the duplicate check runs before the fence')
   assert.ok(create.includes('if (duplicateRefusal) return duplicateRefusal'))
   const fn = src.slice(src.indexOf('async function salesCreditNoteDuplicateRefusal('))

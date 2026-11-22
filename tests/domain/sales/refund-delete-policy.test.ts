@@ -113,6 +113,15 @@ test('accounting row verdicts: unsent is retired, posted is voided, anything unp
   // Never sent, never attempted: nothing could have reached the ledger.
   assert.equal(classifyRefundSyncRow(row(), 'credit note').kind, 'retire')
   assert.equal(classifyRefundSyncRow(row({ status: 'FAILED' }), 'credit note').kind, 'retire')
+  // #1127 R2: a credit note (or COGS reversal) is never stamped by the money fence, so once it has been CLAIMED (revision >= 1) a null stamp proves nothing: its
+  // response may have been lost while the customer was credited in Xero. Refused, never retired, whatever its custody says.
+  for (const type of ['CREDIT_NOTE', 'COGS_REVERSAL']) {
+    const claimed = classifyRefundSyncRow(row({ type, status: 'FAILED', attemptRevision: 1 }), 'credit note')
+    assert.equal(claimed.kind === 'refuse' && claimed.refusal.code, 'accounting_uncertain', type)
+    assert.equal(classifyRefundSyncRow(row({ type, status: 'PENDING', attemptRevision: 2 }), 'credit note').kind, 'refuse', type)
+  }
+  // A money row is stamped before every call, so its null stamp under custody stays the proof it always was.
+  assert.equal(classifyRefundSyncRow(row({ type: 'CREDIT_NOTE_ALLOCATION', status: 'FAILED', attemptRevision: 3 }), 'credit note settlement').kind, 'retire')
   // Posted.
   assert.equal(classifyRefundSyncRow(row({ status: 'SYNCED', externalTransactionId: 'cn-1' }), 'credit note').kind, 'posted')
   // In flight.

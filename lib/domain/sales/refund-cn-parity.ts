@@ -418,3 +418,9 @@ export function feeRepaymentInstruction(input: { externalRefundId: number | null
   const paid = input.storefrontAmountForeign == null ? null : money(Math.abs(cents(input.storefrontAmountForeign)))
   return withLedgerCheck(`refund ${input.externalRefundId ?? '(IMS)'}: credit note ${input.creditNoteNumber ?? '(not numbered yet)'} credits the landed-cost fee ${gap} ${input.currency} that EAS left out of the refund amount${paid ? ` ${paid}` : ''} - apply the fee repayment to it in Xero`)
 }
+
+/** #1127 R2 MED-6: the sentence vatOnlyRefundHold writes, by which the VAT-only hold is recognised (the one hold "Settled outside IMS" may close with no credit note). */
+const VAT_ONLY_HOLD_MARK = 'but its lines carry no net amount: it refunds VAT only'
+export function isVatOnlyRefundHold(errorMessage: string | null | undefined): boolean {
+  return typeof errorMessage === 'string' && errorMessage.includes(VAT_ONLY_HOLD_MARK) && isRefundParityHold(errorMessage)
+}
