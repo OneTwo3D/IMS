@@ -11,8 +11,11 @@
  * low (they wait), never as plenty.
  */
 
-/** A shared observation older than this is not used (the allowance may have been spent since). */
-export const DAY_LIMIT_OBSERVATION_FRESH_MS = 60 * 60_000
+/**
+ * A shared observation older than this is not used (the allowance may have been spent since). #1132 LOW-7: 15 minutes, not an hour: a busy
+ * hour (a backlog drained, Xeroom's own run) can spend a large part of the day's 1,000 calls, so an hour-old figure could read as plenty.
+ */
+export const DAY_LIMIT_OBSERVATION_FRESH_MS = 15 * 60_000
 /** At most one write per tenant per process in this interval, unless the figure has fallen to the warning level. */
 export const DAY_LIMIT_PERSIST_INTERVAL_MS = 15_000
 const LOW_WATERMARK = 100
@@ -54,12 +57,16 @@ export async function persistDayLimitObservation(
   }
 }
 
-/** The fewest calls left across every tenant's FRESH shared observation, or null when there is none. Throws if the table cannot be read. */
-export async function sharedDayCallsRemaining(now: number = Date.now(), client?: RawClient): Promise<number | null> {
+/**
+ * The calls left for THIS organisation (`tenantId`) by its FRESH shared observation, or null when there is none. Throws if the table cannot be read.
+ * #1132 LOW-7: keyed by the tenant: a figure another organisation's calls left behind (a reconnect to a different organisation, a second tenant)
+ * says nothing about this one's allowance.
+ */
+export async function sharedDayCallsRemaining(tenantId: string, now: number = Date.now(), client?: RawClient): Promise<number | null> {
   const c = client ?? await defaultClient()
   const since = new Date(now - DAY_LIMIT_OBSERVATION_FRESH_MS)
   const rows = await c.$queryRaw<Array<{ remaining: number | null }>>`
-    SELECT MIN("day_remaining")::int AS remaining FROM "xero_day_limit_observations" WHERE "observed_at" >= ${since}`
+    SELECT MIN("day_remaining")::int AS remaining FROM "xero_day_limit_observations" WHERE "tenant_id" = ${tenantId} AND "observed_at" >= ${since}`
   const value = rows[0]?.remaining
   return value === null || value === undefined ? null : Number(value)
 }
@@ -69,10 +76,12 @@ export async function sharedDayCallsRemaining(now: number = Date.now(), client?:
  * is no fresh shared observation or it cannot be read: every worker that called Xero within the freshness window has written one, so a process's
  * own figure alone (possibly hours old, and blind to the others) is not taken as the answer.
  */
-export async function organisationDayCallsRemaining(local: number | null, now: number = Date.now(), client?: RawClient): Promise<number | null> {
+export async function organisationDayCallsRemaining(local: number | null, tenantId: string | null, now: number = Date.now(), client?: RawClient): Promise<number | null> {
+  // No connected organisation known: nothing can be said about its allowance, so the caller waits.
+  if (!tenantId) return null
   let shared: number | null
   try {
-    shared = await sharedDayCallsRemaining(now, client)
+    shared = await sharedDayCallsRemaining(tenantId, now, client)
   } catch {
     return null
   }

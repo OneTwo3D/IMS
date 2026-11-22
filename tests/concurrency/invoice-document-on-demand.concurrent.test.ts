@@ -329,7 +329,7 @@ test('o3d-hvzdx THE RACE BETWEEN WORKERS: worker A observes a low allowance and 
       const barrier = new Promise<void>((resolve) => { written = resolve })
       const b = ledger([order])
       // B's own process has made no Xero call: its local figure is null, exactly a fresh cron worker.
-      b.deps.dayCallsRemaining = () => observation.organisationDayCallsRemaining(null)
+      b.deps.dayCallsRemaining = () => observation.organisationDayCallsRemaining(null, tenant)
       const workerA = (async () => {
         const wrote = await observation.persistDayLimitObservation(tenant, ctx.sweep.LAZY_MIN_DAY_CALLS_REMAINING - 50)
         written()

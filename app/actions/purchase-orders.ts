@@ -5134,6 +5134,8 @@ export async function updateInvoice(
           postingVerdictForChart: accountingPostingVerdictForChart,
           queueAccountingSyncTx,
           recordTransitSubledgerMovement,
+          // #1132 MED-4: asked again by the producer itself, in this transaction and under the same locks, right before the update is queued.
+          assertNoPendingDeletion: (tx, billId) => assertNoPendingDeletion(billId, tx),
         },
       })
     }, STOCK_TX_OPTIONS)
@@ -6076,6 +6078,13 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     // are still in scope, rather than in the outer catch — which sees neither and would report a
     // stack-trace string.
     const postSupplierCreditNoteTransaction = () => db.$transaction(async (tx) => {
+      // #1132 MED-4: the binding pending-delete check, under the locks the bill delete request takes (the purchase order, then the bill); the read
+      // before the transaction is only an early answer.
+      if (cn.purchaseInvoiceId) {
+        await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${cn.poId} FOR UPDATE`
+        await tx.$queryRaw`SELECT id FROM purchase_invoices WHERE id = ${cn.purchaseInvoiceId} FOR UPDATE`
+        await assertNoPendingDeletion(cn.purchaseInvoiceId, tx)
+      }
       const claimed = await tx.supplierCreditNote.updateMany({
         where: { id, status: 'DRAFT' },
         data: { status: 'POSTED', postedAt: creditNotePostedAt },
@@ -6167,6 +6176,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     try {
       posted = await postSupplierCreditNoteTransaction()
     } catch (declined) {
+      if (declined instanceof PendingDocumentDeletionError) return { success: false, error: declined.message }
       if (!(declined instanceof SupplierCreditNoteEnqueueDeclined)) throw declined
       await logActivity({
         entityType: 'PURCHASE_ORDER',

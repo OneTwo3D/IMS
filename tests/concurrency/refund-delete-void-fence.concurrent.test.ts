@@ -139,10 +139,13 @@ async function refundWithQueuedVoid(rig: Rig, w: World): Promise<{ refundId: str
 function fakeLedger(over: { onVoid?: (state: { status: string; writes: number }) => Promise<void> } = {}) {
   const state = { status: 'AUTHORISED', writes: 0, reads: 0, voidCalls: 0, bounds: [] as number[] }
   const ledger = {
-    voidInLedger: async (bounded: { timeoutMs: number }) => {
+    voidInLedger: async (bounded: { timeoutMs: number; beforePost?: () => Promise<string | null> }) => {
       state.voidCalls++
       state.bounds.push(bounded.timeoutMs)
       if (state.status === 'VOIDED') return { success: true }
+      // As voidCreditNote does: the caller's check (and attempt stamp) immediately before the POST.
+      const refusal = bounded.beforePost ? await bounded.beforePost() : null
+      if (refusal) return { success: false, notSent: true, error: refusal }
       state.status = 'VOIDED'
       state.writes++
       if (over.onVoid) await over.onVoid(state)
@@ -152,7 +155,14 @@ function fakeLedger(over: { onVoid?: (state: { status: string; writes: number })
   }
   return { state, ledger }
 }
-const spyLedger = (fn: () => Promise<{ success: boolean; error?: string }>) => ({ voidInLedger: async () => fn(), readCreditNoteStatus: async () => 'AUTHORISED' })
+const spyLedger = (fn: () => Promise<{ success: boolean; error?: string; notSent?: boolean }>) => ({
+  voidInLedger: async (bounded: { beforePost?: () => Promise<string | null> }) => {
+    const refusal = bounded.beforePost ? await bounded.beforePost() : null
+    if (refusal) return { success: false, notSent: true, error: refusal }
+    return fn()
+  },
+  readCreditNoteStatus: async () => 'AUTHORISED',
+})
 
 const returnsStock = async (rig: Rig, w: World) => Number((await rig.db.stockLevel.findUniqueOrThrow({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } } })).quantity)
 
@@ -396,6 +406,266 @@ test('REVIEW HIGH-1 (c) VOIDED IN XERO, THE UNWIND REFUSES: the retry reads Xero
     assert.equal(tasks[0]!.status, 'OPEN')
     assert.equal((await rig.db.salesOrderRefund.findUniqueOrThrow({ where: { id: refundId } })).deletedAt, null)
   } finally {
+    await w.cleanup()
+    await rig.db.$disconnect()
+    await rig.appDb.$disconnect()
+  }
+})
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// #1132 review follow-ups (round 1 MED-2 / MED-3 / LOW-3 / round 2 R2-MED-2 / R2-LOW-4 / R2-LOW-5)
+// ---------------------------------------------------------------------------------------------------------------------------
+
+/** Model the processor's claim of the void row (PROCESSING at `claimedAt`, revision 1), as the runner leaves it before processEntry. */
+async function claimVoidRow(rig: Rig, voidRowId: string): Promise<{ claimedAt: Date; attemptRevision: number }> {
+  const claimedAt = new Date()
+  await rig.db.accountingSyncLog.update({ where: { id: voidRowId }, data: { status: 'PROCESSING', processingStartedAt: claimedAt, attemptRevision: 1 } })
+  return { claimedAt, attemptRevision: 1 }
+}
+
+const drawReturnedUnit = async (rig: Rig, w: World) => {
+  const layer = await rig.db.costLayer.findFirstOrThrow({ where: { productId: w.productId, warehouseId: w.returnsId } })
+  await rig.db.costLayer.update({ where: { id: layer.id }, data: { remainingQty: 0 } })
+  await rig.db.stockLevel.update({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } }, data: { quantity: 0 } })
+  return async () => {
+    await rig.db.costLayer.update({ where: { id: layer.id }, data: { remainingQty: 1 } })
+    await rig.db.stockLevel.update({ where: { productId_warehouseId: { productId: w.productId, warehouseId: w.returnsId } }, data: { quantity: 1 } })
+  }
+}
+
+test('#1132 MED-2 A CRASH AFTER PHASE 2 COMMITTED, BEFORE ITS FOLLOW-UPS: the retry finds the refund deleted and runs them from the tombstone, once', { skip }, async () => {
+  const rig = await openRig()
+  const w = await buildWorld(rig)
+  try {
+    const { refundId, voidRowId } = await refundWithQueuedVoid(rig, w)
+    await rig.db.salesOrder.update({ where: { id: w.orderId }, data: { status: 'PROCESSING' } })
+    // Phase 2 committed (the void confirmed), and the worker stopped there: no re-reservation, no stock push.
+    const committed = await rig.deleteService.deleteSalesOrderRefund(rig.db, { refundId, actorUserId: null, reason: null, voidConfirmed: { syncLogId: voidRowId } })
+    assert.ok(committed.success && !committed.alreadyDeleted, JSON.stringify(committed))
+    assert.equal((await rig.db.salesOrderRefundDeletion.findUniqueOrThrow({ where: { refundId } })).followUpsDoneAt, null, 'the tombstone says the follow-ups are owed')
+    allocationCalls.length = 0
+    allocationAnswer = { success: true }
+    let voidCalls = 0
+    const retried = await rig.deleteService.voidCreditNoteThenCompleteRefundDeletion(rig.db as never, { refundId, voidSyncLogId: voidRowId, actorUserId: null, reason: null }, spyLedger(async () => { voidCalls++; return { success: true } }))
+    assert.ok(retried.ok && retried.alreadyDeleted && retried.followUpsRan, JSON.stringify(retried))
+    assert.equal(voidCalls, 0, 'nothing more is sent for a finished delete')
+    assert.equal(allocationCalls.length, 1, 'THE FIX: the order is re-reserved on the retry (before, it never was)')
+    assert.equal(allocationCalls[0]!.orderId, w.orderId)
+    assert.deepEqual(retried.ok ? retried.productIds : [], [w.productId], 'the stock push is rebuilt from the tombstone')
+    assert.notEqual((await rig.db.salesOrderRefundDeletion.findUniqueOrThrow({ where: { refundId } })).followUpsDoneAt, null)
+    const again = await rig.deleteService.voidCreditNoteThenCompleteRefundDeletion(rig.db as never, { refundId, voidSyncLogId: voidRowId, actorUserId: null, reason: null }, spyLedger(async () => { voidCalls++; return { success: true } }))
+    assert.ok(again.ok && again.alreadyDeleted && !again.followUpsRan)
+    assert.equal(allocationCalls.length, 1, 'once')
+  } finally {
+    allocationAnswer = { success: true }
+    await w.cleanup()
+    await rig.db.$disconnect()
+    await rig.appDb.$disconnect()
+  }
+})
+
+test('#1132 MED-3 A REFUSAL UNDER THE LOCKS IS TERMINAL: the void row is closed CANCELLED, proven never sent, with a WARNING; a new request queues a fresh void', { skip }, async () => {
+  const rig = await openRig()
+  const w = await buildWorld(rig)
+  try {
+    const { refundId, voidRowId } = await refundWithQueuedVoid(rig, w)
+    const claim = await claimVoidRow(rig, voidRowId)
+    const restore = await drawReturnedUnit(rig, w)
+    const { state, ledger } = fakeLedger()
+    const refused = await rig.deleteService.voidCreditNoteThenCompleteRefundDeletion(rig.db as never, { refundId, voidSyncLogId: voidRowId, actorUserId: null, reason: null }, ledger)
+    assert.ok(!refused.ok && refused.voided === false && refused.refusedUnderLocks && refused.provenNeverSent === true && refused.notSent, JSON.stringify(refused))
+    assert.equal(state.voidCalls, 0)
+    assert.equal(state.reads, 0, 'proven never sent: Xero is not even read')
+
+    const retired = await rig.deleteService.retireRefusedRefundDeleteVoid(rig.appDb, { voidSyncLogId: voidRowId, attemptRevision: claim.attemptRevision, claimedAt: claim.claimedAt, refundId, why: refused.ok ? '' : refused.error })
+    assert.equal(retired, true)
+    const row = await rig.db.accountingSyncLog.findUniqueOrThrow({ where: { id: voidRowId } })
+    assert.equal(row.status, 'CANCELLED')
+    assert.equal(row.abandonedBeforeRemoteCall, true)
+    assert.equal(row.attemptRevision, 2, 'the claim is fenced off')
+    const { ledgerStanding } = await import('@/lib/domain/accounting/ledger-standing')
+    assert.equal(ledgerStanding(row), 'PROVEN_NOT_POSTED')
+    const warning = await rig.db.activityLog.findFirst({ where: { entityId: w.orderId, action: 'refund_delete_void_cancelled' } })
+    assert.equal(warning?.level, 'WARNING')
+    assert.match(String(warning?.description), /Nothing was sent to Xero/)
+    // A second retirement (a replayed attempt) changes nothing.
+    assert.equal(await rig.deleteService.retireRefusedRefundDeleteVoid(rig.appDb, { voidSyncLogId: voidRowId, attemptRevision: claim.attemptRevision, claimedAt: claim.claimedAt, refundId, why: 'again' }), false)
+
+    // THE CLEAN RE-REQUEST: the delete no longer waits on the closed row, and asking again queues a fresh void under the same key.
+    await restore()
+    const evaluated = await rig.deleteService.evaluateRefundDeletion(rig.db, refundId)
+    assert.equal(evaluated.plan?.voidRow, null, 'the closed row is not a void the delete waits on')
+    const again = await rig.deleteService.deleteSalesOrderRefund(rig.db, { refundId, actorUserId: null, reason: 'asked again' })
+    assert.ok(again.success && again.pending, JSON.stringify(again))
+    const voids = await rig.db.accountingSyncLog.findMany({ where: { type: 'CREDIT_NOTE_VOID', referenceId: refundId }, select: { id: true, status: true } })
+    assert.equal(voids.length, 2)
+    assert.ok(voids.some((v) => v.id !== voidRowId && v.status === 'PENDING'), 'a fresh void row was queued')
+  } finally {
+    await w.cleanup()
+    await rig.db.$disconnect()
+    await rig.appDb.$disconnect()
+  }
+})
+
+test('#1132 MED-3 THE PROOF: a void row an attempt stamped (it reached the POST) is never closed as never sent; the refusal reads Xero first', { skip }, async () => {
+  const rig = await openRig()
+  const w = await buildWorld(rig)
+  try {
+    const { refundId, voidRowId } = await refundWithQueuedVoid(rig, w)
+    // An attempt that reached the POST and whose reply was lost: the stamp is written outside the transaction, so it survives the rollback.
+    const lost = await rig.deleteService.voidCreditNoteThenCompleteRefundDeletion(rig.db as never, { refundId, voidSyncLogId: voidRowId, actorUserId: null, reason: null }, spyLedger(async () => { throw new Error('reply lost') }))
+    assert.ok(!lost.ok && lost.voided === 'unknown' && !lost.notSent, JSON.stringify(lost))
+    assert.notEqual((await rig.db.accountingSyncLog.findUniqueOrThrow({ where: { id: voidRowId } })).remoteAttemptedAt, null, 'the attempt was stamped before the POST')
+    const claim = await claimVoidRow(rig, voidRowId)
+    await drawReturnedUnit(rig, w)
+    const { state, ledger } = fakeLedger()
+    const refused = await rig.deleteService.voidCreditNoteThenCompleteRefundDeletion(rig.db as never, { refundId, voidSyncLogId: voidRowId, actorUserId: null, reason: null }, ledger)
+    assert.ok(!refused.ok && refused.refusedUnderLocks && refused.provenNeverSent === false, JSON.stringify(refused))
+    assert.equal(state.reads, 1, 'an attempt may have voided it: Xero is read before IMS says anything')
+    assert.equal(await rig.deleteService.retireRefusedRefundDeleteVoid(rig.appDb, { voidSyncLogId: voidRowId, attemptRevision: claim.attemptRevision, claimedAt: claim.claimedAt, refundId, why: 'x' }), false)
+    assert.equal((await rig.db.accountingSyncLog.findUniqueOrThrow({ where: { id: voidRowId } })).status, 'PROCESSING', 'left for the retries')
+  } finally {
+    await w.cleanup()
+    await rig.db.$disconnect()
+    await rig.appDb.$disconnect()
+  }
+})
+
+test('#1132 R2-MED-2 THE RACE: a lock wait that runs out (another writer holds the returned stock) sends nothing and says so: notSent, not "unknown"', { skip }, async () => {
+  const rig = await openRig()
+  const w = await buildWorld(rig)
+  try {
+    const { refundId, voidRowId } = await refundWithQueuedVoid(rig, w)
+    const { state, ledger } = fakeLedger()
+    let workerResult: Awaited<ReturnType<typeof rig.deleteService.voidCreditNoteThenCompleteRefundDeletion>> | null = null
+    let parked = false
+    await rig.db.$transaction(async (holder) => {
+      // Another order's despatch holds the returned stock level, longer than the worker's lock_timeout.
+      await holder.$queryRaw`SELECT id FROM stock_levels WHERE "productId" = ${w.productId} AND "warehouseId" = ${w.returnsId} FOR UPDATE`
+      const holderPid = Number((await holder.$queryRaw<Array<{ pid: number }>>`SELECT pg_backend_pid()::int AS pid`)[0]!.pid)
+      const worker = rig.deleteService.voidCreditNoteThenCompleteRefundDeletion(rig.db as never, { refundId, voidSyncLogId: voidRowId, actorUserId: null, reason: null }, ledger)
+      // THE BARRIER: the worker is observed parked behind this holder on the stock level row.
+      const deadline = Date.now() + 4_000
+      while (Date.now() < deadline && !parked) {
+        const rows = await rig.appDb.$queryRaw<Array<{ query: string }>>`
+          SELECT a.query AS query FROM pg_stat_activity a WHERE ${holderPid}::int = ANY(pg_blocking_pids(a.pid)) AND a.wait_event_type = 'Lock'`
+        parked = rows.some((row) => /stock_levels/i.test(row.query))
+        if (!parked) await new Promise((resolve) => setTimeout(resolve, 10))
+      }
+      workerResult = await worker
+    }, { timeout: 25_000, maxWait: 10_000 })
+    assert.ok(parked, 'the worker was parked behind the holder')
+    const result = workerResult as unknown as Awaited<ReturnType<typeof rig.deleteService.voidCreditNoteThenCompleteRefundDeletion>>
+    assert.ok(!result.ok, JSON.stringify(result))
+    assert.equal(result.ok ? null : result.notSent, true, 'THE FIX: a lock wait is a not-sent attempt (handed back, no retry spent), not an unknown outcome')
+    assert.equal(result.ok ? null : result.voided, false)
+    assert.match(result.ok ? '' : result.error, /was not started: a row it needs stayed locked/)
+    assert.equal(state.voidCalls, 0)
+    assert.equal((await rig.db.accountingSyncLog.findUniqueOrThrow({ where: { id: voidRowId } })).remoteAttemptedAt, null, 'no attempt stamp: nothing was sent')
+    assert.equal((await rig.db.salesOrderRefund.findUniqueOrThrow({ where: { id: refundId } })).deletedAt, null)
+  } finally {
+    await w.cleanup()
+    await rig.db.$disconnect()
+    await rig.appDb.$disconnect()
+  }
+})
+
+test('#1132 LOW-3 THE LOCK DATE MOVED PAST THE CREDIT NOTE\'S DAY SINCE PHASE 1: re-checked before the void is posted; refused, nothing sent, no stamp', { skip }, async () => {
+  const rig = await openRig()
+  const w = await buildWorld(rig)
+  const { XERO_BOOKS_LOCK_DATE_KEY } = await import('@/lib/connectors/xero/books-lock-date')
+  const prior = await rig.db.setting.findUnique({ where: { key: XERO_BOOKS_LOCK_DATE_KEY } })
+  try {
+    const { refundId, voidRowId } = await refundWithQueuedVoid(rig, w)
+    const future = new Date(Date.now() + 3 * 86_400_000).toISOString().slice(0, 10)
+    await rig.db.setting.upsert({ where: { key: XERO_BOOKS_LOCK_DATE_KEY }, create: { key: XERO_BOOKS_LOCK_DATE_KEY, value: future }, update: { value: future } })
+    const { state, ledger } = fakeLedger()
+    const result = await rig.deleteService.voidCreditNoteThenCompleteRefundDeletion(rig.db as never, { refundId, voidSyncLogId: voidRowId, actorUserId: null, reason: null }, ledger)
+    assert.ok(!result.ok && result.refusedUnderLocks && result.voided === false, JSON.stringify(result))
+    assert.match(result.ok ? '' : result.error, /lock/i)
+    assert.equal(state.writes, 0, 'THE FIX: the void was not posted into a locked period')
+    assert.equal((await rig.db.accountingSyncLog.findUniqueOrThrow({ where: { id: voidRowId } })).remoteAttemptedAt, null)
+    assert.equal((await rig.db.salesOrderRefund.findUniqueOrThrow({ where: { id: refundId } })).deletedAt, null)
+    // A credit note an earlier attempt already voided is not posted again, so the moved lock does not stop the unwind.
+    state.status = 'VOIDED'
+    const done = await rig.deleteService.voidCreditNoteThenCompleteRefundDeletion(rig.db as never, { refundId, voidSyncLogId: voidRowId, actorUserId: null, reason: null }, ledger)
+    assert.ok(done.ok, JSON.stringify(done))
+  } finally {
+    if (prior) await rig.db.setting.update({ where: { key: XERO_BOOKS_LOCK_DATE_KEY }, data: { value: prior.value } }).catch(() => {})
+    else await rig.db.setting.deleteMany({ where: { key: XERO_BOOKS_LOCK_DATE_KEY } }).catch(() => {})
+    await w.cleanup()
+    await rig.db.$disconnect()
+    await rig.appDb.$disconnect()
+  }
+})
+
+test('#1132 R2-LOW-4 / R2-LOW-5: the voided-not-unwound ERROR row is written once with its task, and a later unwind closes the task', { skip }, async () => {
+  const rig = await openRig()
+  const w = await buildWorld(rig)
+  try {
+    const { refundId, voidRowId } = await refundWithQueuedVoid(rig, w)
+    const crash = fakeLedger({ onVoid: async () => { throw new Error('the process died after Xero answered 200') } })
+    await rig.deleteService.voidCreditNoteThenCompleteRefundDeletion(rig.db as never, { refundId, voidSyncLogId: voidRowId, actorUserId: null, reason: null }, crash.ledger)
+    const restore = await drawReturnedUnit(rig, w)
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const result = await rig.deleteService.voidCreditNoteThenCompleteRefundDeletion(rig.db as never, { refundId, voidSyncLogId: voidRowId, actorUserId: null, reason: null }, crash.ledger)
+      assert.ok(!result.ok && result.voided === true)
+    }
+    assert.equal(await rig.db.activityLog.count({ where: { entityId: w.orderId, action: 'refund_delete_voided_not_unwound' } }), 1, 'THE FIX (R2-LOW-4): one ERROR row, not one per retry')
+    const task = await rig.db.wmsOperatorTask.findFirstOrThrow({ where: { orderId: w.orderId, reason: 'REFUND_DELETE_VOIDED_NOT_UNWOUND' } })
+    assert.equal(task.status, 'OPEN')
+    // The cause is cleared; the entry is retried and the refund is deleted.
+    await restore()
+    const done = await rig.deleteService.voidCreditNoteThenCompleteRefundDeletion(rig.db as never, { refundId, voidSyncLogId: voidRowId, actorUserId: null, reason: null }, crash.ledger)
+    assert.ok(done.ok && !done.alreadyDeleted, JSON.stringify(done))
+    assert.equal((await rig.db.wmsOperatorTask.findUniqueOrThrow({ where: { id: task.id } })).status, 'DONE', 'THE FIX (R2-LOW-5): the task closes with the unwind')
+    const tombstone = await rig.db.salesOrderRefundDeletion.findUniqueOrThrow({ where: { refundId } })
+    assert.equal((tombstone.reversal as { refundDeleteTasksClosed?: number }).refundDeleteTasksClosed, 1)
+  } finally {
+    await w.cleanup()
+    await rig.db.$disconnect()
+    await rig.appDb.$disconnect()
+  }
+})
+
+test('#1132 R2-MED-2 THE PROCESSOR\'S MAPPING: not sent is a wait (no retry spent) up to its cap; refused and proven never sent closes the row; the last failure raises one task', { skip }, async () => {
+  const rig = await openRig()
+  const w = await buildWorld(rig)
+  let systemRowsFor = '-'
+  try {
+    const { refundId, voidRowId } = await refundWithQueuedVoid(rig, w)
+    systemRowsFor = voidRowId
+    const processor = await import('@/lib/connectors/xero/sync-processor')
+    const claim = await claimVoidRow(rig, voidRowId)
+    const lease = { heldFrom: () => claim.claimedAt } as never
+    const attempt = { id: voidRowId, attemptRevision: claim.attemptRevision }
+    const notSent = { ok: false as const, voided: false, notSent: true as const, error: 'The credit note void was not started: a row it needs stayed locked by other work for over 5s' }
+    const waited = await processor.refundDeleteVoidFailure({ entryId: voidRowId, referenceId: refundId, attempt, lease, finished: notSent, refundDelete: rig.deleteService })
+    assert.equal(waited.notPosted?.reason, 'refund-delete-deferred', 'a wait, handed back without spending a retry')
+    assert.equal(waited.notPosted?.retryDelayMs, processor.REFUND_DELETE_DEFER_DELAY_MS)
+    assert.equal(processor.handsBackUnsentWithoutAttempt('refund-delete-deferred'), true)
+    // Past the cap of waits, it fails like anything else.
+    await rig.db.activityLog.createMany({ data: Array.from({ length: processor.REFUND_DELETE_MAX_DEFERRALS }, () => ({ entityType: 'SYSTEM', entityId: voidRowId, action: 'xero_sync_refund_delete_deferred_before_post', tag: 'sync', level: 'INFO', description: 'wait' })) })
+    const capped = await processor.refundDeleteVoidFailure({ entryId: voidRowId, referenceId: refundId, attempt, lease, finished: notSent, refundDelete: rig.deleteService })
+    assert.equal(capped.notPosted, undefined)
+    assert.equal(capped.success, false)
+    // The failure that makes the row FAILED raises the operator task, once.
+    await rig.db.accountingSyncLog.update({ where: { id: voidRowId }, data: { retryCount: 4 } })
+    const failure = { ok: false as const, voided: 'unknown' as const, error: 'The credit note void did not complete: HTTP 500' }
+    for (let i = 0; i < 2; i++) await processor.refundDeleteVoidFailure({ entryId: voidRowId, referenceId: refundId, attempt, lease, finished: failure, refundDelete: rig.deleteService })
+    const stuck = await rig.db.wmsOperatorTask.findMany({ where: { orderId: w.orderId, reason: 'REFUND_DELETE_VOID_STUCK' } })
+    assert.equal(stuck.length, 1)
+    assert.equal(stuck[0]!.connector, 'xero')
+    // Refused under the locks and proven never sent: the row is closed for good and the entry is a resolved no-op.
+    await rig.db.accountingSyncLog.update({ where: { id: voidRowId }, data: { retryCount: 0 } })
+    const terminal = await processor.refundDeleteVoidFailure({
+      entryId: voidRowId, referenceId: refundId, attempt, lease, refundDelete: rig.deleteService,
+      finished: { ok: false, voided: false, notSent: true, refusedUnderLocks: true, provenNeverSent: true, error: 'The credit note was not voided: stock moved.' },
+    })
+    assert.deepEqual(terminal, { success: true, skipped: true })
+    assert.equal((await rig.db.accountingSyncLog.findUniqueOrThrow({ where: { id: voidRowId } })).status, 'CANCELLED')
+  } finally {
+    await rig.db.activityLog.deleteMany({ where: { entityId: systemRowsFor } }).catch(() => {})
     await w.cleanup()
     await rig.db.$disconnect()
     await rig.appDb.$disconnect()
