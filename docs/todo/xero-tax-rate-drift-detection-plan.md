@@ -12,6 +12,7 @@ This plan adds a daily reconciliation cron that compares the IMS `TaxRate` profi
 ## Non-goals
 
 - Auto-resync from Xero to IMS. Drift detection is an alert, not a writeback. The operator decides which side is correct and triggers the existing IMS-side sync after correcting whichever shape was wrong.
+- QuickBooks parity. QBO has no equivalent `TaxComponents` API; see `quickbooks-tax-parity-plan.md`.
 
 ## Scope
 

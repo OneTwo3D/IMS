@@ -6,6 +6,7 @@ Prepare the codebase for:
 
 - parallel shopping connectors running at the same time
 - future Shopify implementation without another database reshaping pass
+- future QuickBooks implementation without another database reshaping pass
 - removal of early single-connector assumptions rather than preserving temporary compatibility-only patches
 
 This groundwork should leave WooCommerce and Xero functional during development, but the design target is the final generic model, not a legacy-preserving intermediate.
@@ -59,10 +60,10 @@ Behavioral expectations for the Mintsoft plugin:
 ## Constraints
 
 - The system is not live yet, so schema and internal variable breaks are acceptable if they move the codebase to the correct long-term shape.
-- Avoid database structures that would require another migration when Shopify is implemented fully.
+- Avoid database structures that would require another migration when Shopify or QuickBooks are implemented fully.
 - Multiple shopping connectors must be able to exist and run in parallel.
 - Current WooCommerce and Xero implementations should be migrated onto the new generic foundations instead of keeping connector-specific one-off paths where practical.
-- Connector implementation decisions should be based on the current official Shopify APIs, not on WooCommerce/Xero symmetry assumptions.
+- Connector implementation decisions should be based on the current official Shopify and QuickBooks APIs, not on WooCommerce/Xero symmetry assumptions.
 
 ## Rollout / Backout
 
@@ -86,6 +87,13 @@ Behavioral expectations for the Mintsoft plugin:
 - Fulfilment and delivery tracking are available, but the model is `Order` + `FulfillmentOrder` + `Fulfillment`, not a WooCommerce-style single order-status write path.
 - Webhooks are first-class and app-scoped.
 
+### QuickBooks
+
+- OAuth 2.0, webhooks, chart of accounts, customers/vendors, items, invoices, bills, journal entries, payments, vendor credits, credit memos, and tax codes are all available through the QuickBooks Online API.
+- QuickBooks requires referenced entities such as accounts, tax codes, customers, vendors, and items to exist before many transactions can be created.
+- The connector must therefore support pre-sync / lookup flows for referenced entities instead of assuming Xero-style on-demand creation everywhere.
+- QuickBooks inventory behavior is available, but inventory support depends on the connected company configuration and is not a substitute for IMS stock control.
+
 ## Target Architecture
 
 ### 1. Connector Registries
@@ -93,7 +101,7 @@ Behavioral expectations for the Mintsoft plugin:
 Introduce explicit registries for both connector families:
 
 - shopping: `woocommerce`, `shopify`
-- accounting: `xero`
+- accounting: `xero`, `quickbooks`
 
 These registries should define:
 
@@ -206,6 +214,7 @@ The skeleton modules and real modules should implement the same contracts so “
 Add empty connector skeletons that match the target structure:
 
 - `lib/connectors/shopify/`
+- `lib/connectors/quickbooks/`
 
 The skeletons should include the module boundaries expected by future work:
 
@@ -245,10 +254,10 @@ Webhook ingress must be connector-aware by path.
 
 Expand plugin and integration UI plumbing so the new connectors exist cleanly in the system:
 
-- plugin state includes `shopify`
+- plugin state includes `shopify` and `quickbooks`
 - system plugin settings can enable / disable them
 - sync dashboard can render dormant skeleton cards or placeholder connector views for them
-- module visibility rules consider the accounting connector and any enabled shopping connector
+- module visibility rules consider either accounting connector and any enabled shopping connector
 
 The UI should not imply the connectors are fully implemented, but it should recognize them as first-class connectors.
 
@@ -328,13 +337,14 @@ Target outcome:
 - shared code can identify connectors generically
 - shared code can aggregate shopping writes across multiple runnable connectors
 - shared code can keep using Woo/Xero as the only fully implemented handlers for now
-- the dispatch shape is final enough that Shopify implementation can slot in later without another API redesign
+- the dispatch shape is final enough that Shopify/QuickBooks implementation can slot in later without another API redesign
 
 ### Phase 5. Skeleton Connectors
 
 Create structured but empty connector modules for:
 
 - Shopify shopping connector
+- QuickBooks accounting connector
 
 Each skeleton should:
 
@@ -358,7 +368,7 @@ Update:
 - plugin settings UI
 - system settings page data flow
 - sync dashboard visibility/filtering
-- placeholder views for Shopify
+- placeholder views for Shopify and QuickBooks
 
 Goal:
 
@@ -428,11 +438,14 @@ Manual verification minimum:
 ### New Skeletons
 
 - `lib/connectors/shopify/...`
+- `lib/connectors/quickbooks/...`
 
 ## Non-Goals For This Groundwork Pass
 
 - full Shopify business logic
+- full QuickBooks business logic
 - final Shopify webhook processing
+- final QuickBooks OAuth/account sync implementation
 - full multi-connector UX for choosing a connector per operation
 
 Those come later. This groundwork only ensures the database and shared code shape do not need another architectural reset.
@@ -444,6 +457,6 @@ This pass is successful when:
 - the database can represent multiple shopping connectors in parallel
 - connector-specific sync/mapping/accounting tables are connector-scoped
 - WooCommerce and Xero are migrated onto the new generic schema shape
-- The Shopify skeleton module exists and compiles
-- plugin/UI plumbing recognizes Shopify
-- future Shopify implementation should not require another schema redesign
+- Shopify and QuickBooks skeleton modules exist and compile
+- plugin/UI plumbing recognizes Shopify and QuickBooks
+- future Shopify and QuickBooks implementation should not require another schema redesign

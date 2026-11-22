@@ -1149,7 +1149,7 @@ Run lint, type-check, and reconciliation tests.
 
 Define connector-agnostic accounting event payloads for commercial documents that are not simple debit/credit journals.
 
-This stage covers sales invoices, sales credit notes, and purchase invoices before Xero posting is migrated to an outbox. It should not force document payloads into journal-line semantics.
+This stage covers sales invoices, sales credit notes, and purchase invoices before Xero/QuickBooks posting is migrated to an outbox. It should not force document payloads into journal-line semantics.
 
 ### Target files
 
@@ -1164,7 +1164,7 @@ lib/domain/accounting/accounting-event-mirror.ts
 
 - Document-shaped event types exist for `SALES_INVOICE`, `CREDIT_NOTE`, and `PURCHASE_INVOICE`.
 - Credit note events preserve customer/contact, currency, tax, line amount mode, quantity, unit amount, source refund ID, and deterministic idempotency key.
-- Invoice and purchase invoice document events preserve the connector-neutral fields needed to recreate Xero documents.
+- Invoice and purchase invoice document events preserve the connector-neutral fields needed to recreate Xero/QuickBooks documents.
 - Existing journal-shaped events remain unchanged.
 - Existing `AccountingSyncLog` rows remain source of truth for posting until Stage 7.
 - Tests prove current sync-log payloads map to stable document event payloads without changing posting behavior.
@@ -1177,7 +1177,7 @@ Define document-shaped AccountingEvent payloads for invoices and credit notes.
 Do not coerce credit notes or invoices into debit/credit journal lines.
 Add connector-neutral event builders for SALES_INVOICE, CREDIT_NOTE, and PURCHASE_INVOICE payloads.
 Mirror existing sync-log document payloads into AccountingEvent rows idempotently where the source payload has enough information.
-Preserve existing Xero posting behavior and keep AccountingSyncLog as source of truth.
+Preserve existing Xero/QuickBooks posting behavior and keep AccountingSyncLog as source of truth.
 Add tests for sales invoice, sales credit note/refund, purchase invoice, currency, tax, and idempotency behavior.
 Run lint, type-check, and accounting document-event tests.
 ```
@@ -1216,7 +1216,7 @@ Add a controlled accounting-event backfill for old AccountingSyncLog rows missin
 Use the reconciliation report to identify candidate gaps.
 Default to dry-run/report-only mode.
 Backfill only rows whose payload can be mapped deterministically to the journal-shaped or document-shaped event builders.
-Do not post to Xero and do not mutate source business records.
+Do not post to Xero/QuickBooks and do not mutate source business records.
 Log created events and skipped rows with reasons.
 Add tests for dry-run, idempotency, unsupported payload skips, and successful backfill.
 Run lint, type-check, and accounting-event backfill tests.

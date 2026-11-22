@@ -13,7 +13,7 @@ Add a Mintsoft warehouse management system (WMS) integration to One Two Inventor
 - avoid double-booking stock when partial ASN booking and PO receipt both touch the same goods
 - keep Mintsoft-specific code isolated behind a generic `wms-*` contract so a future WMS (e.g. Peoplevox, Scurri, Linnworks-Warehouse) can replace it with no core rewrites
 
-This plan sits alongside the existing shopping (WooCommerce/Shopify) and accounting (Xero) connector frameworks. It does **not** replace the shared external-fulfillment entry point described in `connector-groundwork-plan.md` — Mintsoft will keep using `applyExternalFulfillmentUpdate(...)` for outbound shipment progression. This plan adds the inbound, stock, bundle, product, and returns surfaces.
+This plan sits alongside the existing shopping (WooCommerce/Shopify) and accounting (Xero/QuickBooks) connector frameworks. It does **not** replace the shared external-fulfillment entry point described in `connector-groundwork-plan.md` — Mintsoft will keep using `applyExternalFulfillmentUpdate(...)` for outbound shipment progression. This plan adds the inbound, stock, bundle, product, and returns surfaces.
 
 ## Principles (locked in before coding)
 

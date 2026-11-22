@@ -3,7 +3,7 @@
 **Goal:** make IMS the single source of truth for FX rates so WooCommerce (currently
 Aelia Currency Switcher) and Xero both consume the same daily rate. Implementation
 must stay agnostic of which shopping/accounting plugin is in use — Aelia, CURCY,
-WPML, Shopify Markets on one side; Xero on the other.
+WPML, Shopify Markets on one side; Xero, QuickBooks on the other.
 
 ---
 
@@ -41,6 +41,7 @@ shows up as unexplained variance on COGS/margin reports and reconciliation.
              ▼                            ▼
    ShoppingConnector.pushFxRates    AccountingConnector.upsertInvoice
    ─ WooCommerce → Aelia adapter    ─ Xero  (CurrencyRate field)
+   ─ Shopify    → Markets adapter   ─ QuickBooks (ExchangeRate field)
 ```
 
 Two new responsibilities, both expressed on the existing connector interfaces in
@@ -142,6 +143,7 @@ export type InvoiceData = {
    * MUST forward this to the platform if provided, so the accounting system
    * does not substitute its own daily rate.
    *   - Xero    → `CurrencyRate` (note: Xero defines as "1 doc-ccy = X base")
+   *   - QuickBooks → `ExchangeRate`
    */
   currencyRate?: number
 }
@@ -247,6 +249,8 @@ sending `CurrencyRate`, so Xero applies its own daily XE rate. Change:
    "1 unit of base in doc currency"). Add a unit test for the inversion.
 
 Same change for `bills.ts` and `credit-notes.ts`.
+
+QuickBooks adapter (when added) does the same thing into its `ExchangeRate`
 field.
 
 ---
@@ -282,8 +286,8 @@ override (per the dialog-forms feedback rule).
    `5e5b8be` + `c34f4d1`). `currencyRateToBase` added to `InvoiceData` /
    `BillData` / `CreditNoteData`. Xero adapter inverts to `CurrencyRate` at
    6dp. Stamped at every queue site: WooCommerce import, manual sales invoice,
-   sales credit note, purchase invoice.
-   Outcome: IMS and Xero now agree on every multi-currency document.
+   sales credit note, purchase invoice. QuickBooks adapter ignores the field
+   for now. Outcome: IMS and Xero now agree on every multi-currency document.
 2. **Phase 2 — companion WP plugin + IMS push.** ✅ **Shipped in 1.7.3.**
    - Unified PHP plugin **onetwoInventory Helper** at `lib/connectors/woocommerce/wp-plugin/onetwoinventory-helper.php`. Rolls up the old `wc-invoice-buttons.php` (now removed) plus a new FX rate receiver module.
    - REST endpoint `POST /wp-json/oti/v1/fx-rates` validated with HMAC-SHA256 (shared secret = `WC_WEBHOOK_SECRET`, pasted in via the plugin's settings page).

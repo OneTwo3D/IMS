@@ -4,7 +4,7 @@
 
 The existing `docs/mintsoft-wms-connector-plan.md` is a good architectural design but is too abstract for direct implementation. This plan restates it as a concrete, file-by-file build plan keyed to the real OTI codebase so that Codex (or any other agent) can implement it with minimal guesswork.
 
-**Goal:** add a Mintsoft WMS connector to One Two Inventory as a plugin-style module sitting behind a generic `warehouse`-category contract, mirroring the existing `shopping` (WooCommerce/Shopify) and `accounting` (Xero) connector frameworks. The connector must support two stock-sync modes (notification-only / align-to-wms), product sync IMS→Mintsoft with **barcode safety rules**, bundle sync (directional), inbound ASN flow from POs/transfers with booked-in reconciliation that never double-books stock, and a returns inbox.
+**Goal:** add a Mintsoft WMS connector to One Two Inventory as a plugin-style module sitting behind a generic `warehouse`-category contract, mirroring the existing `shopping` (WooCommerce/Shopify) and `accounting` (Xero/QuickBooks) connector frameworks. The connector must support two stock-sync modes (notification-only / align-to-wms), product sync IMS→Mintsoft with **barcode safety rules**, bundle sync (directional), inbound ASN flow from POs/transfers with booked-in reconciliation that never double-books stock, and a returns inbox.
 
 **Why now:** Mintsoft is already a pre-reserved source in `ExternalFulfillmentSource` (`lib/fulfillment/external-fulfillment.ts:5`), but nothing in the codebase implements it. The groundwork for parallel connectors (link tables, cron registry, encrypted settings, external-fulfillment entry point) has landed. This plan fills in the warehouse-side connector category that was deferred.
 
@@ -727,17 +727,17 @@ These names already exist in `lib/permissions.ts` today. Do not introduce a para
 
 ## Plugin integration scope (touch points beyond `integration-plugins.ts`)
 
-The plugin shape at the time of writing (`woocommerce | shopify | xero`) is hard-coded in more places than v1 acknowledged. Every one of these must be updated:
+The current 4-plugin shape (`woocommerce | shopify | xero | quickbooks`) is hard-coded in more places than v1 acknowledged. Every one of these must be updated:
 
 1. `lib/integration-plugins.ts` — add `'mintsoft'` to the union, `PLUGIN_SETTING_KEYS`, `DEFAULT_PLUGIN_STATE`, `isIntegrationModuleVisible` switch.
 2. `components/settings/integration-plugins-settings.tsx` plus `app/(dashboard)/settings/system/page.tsx` — System → Plugins is the **current** plugin-toggle surface; Mintsoft must be added there.
-3. Onboarding flow (`app/(dashboard)/onboarding/onboarding-client.tsx`, `components/onboarding/integrations-step.tsx`) — the integration-picker step currently enumerates only the pre-existing plugins and has shopping/accounting exclusivity logic baked in.
+3. Onboarding flow (`app/(dashboard)/onboarding/onboarding-client.tsx`, `components/onboarding/integrations-step.tsx`) — the integration-picker step currently enumerates only four plugins and has shopping/accounting exclusivity logic baked in.
 4. `/sync` page gating — `app/(dashboard)/sync/page.tsx` currently redirects when no shopping/accounting connector is enabled; update the condition to include WMS plugins.
 5. `app/(dashboard)/sync/sync-dashboard.tsx` — category union (`'shopping' | 'accounting'`) must be extended to `'warehouse'`, and connector selection / rendering must handle Mintsoft.
 6. Dashboard layout + sidebar (`app/(dashboard)/layout.tsx`, `components/layout/sidebar.tsx`) — current props only consider WooCommerce/Xero visibility, so Mintsoft would stay hidden from navigation without changes here.
 7. Scheduler UI (`app/(dashboard)/settings/system/page.tsx`) — new Mintsoft cron jobs should appear automatically via the cron registry, but the plugin-based filtering must include the new module id.
 
-Grep for each of `'woocommerce'`, `'shopify'`, `'xero'` as literal string tokens during Phase 1 and list every file that branches on them — every such branch is a candidate update site.
+Grep for each of `'woocommerce'`, `'shopify'`, `'xero'`, `'quickbooks'` as literal string tokens during Phase 1 and list every file that branches on them — every such branch is a candidate update site.
 
 ---
 
