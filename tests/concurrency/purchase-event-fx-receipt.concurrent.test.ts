@@ -69,7 +69,11 @@ async function withSwitch<T>(on: boolean, fn: () => Promise<T>): Promise<T> {
   }
 }
 
-/** A fresh three-letter currency per arm, so no other arm's (or file's) rates can be the latest. */
+/**
+ * A fresh three-letter currency per arm, so no other arm's (or file's) rates can be the latest. Removed with its rates after the file: a `currencies`
+ * row left behind makes every later file's scratch-database guard refuse the database as an installed application.
+ */
+const createdCurrencies: string[] = []
 async function freshCurrency(): Promise<string> {
   const { db } = await import('@/lib/db')
   const letters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'
@@ -77,6 +81,7 @@ async function freshCurrency(): Promise<string> {
     const code = `Q${letters[Math.floor(Math.random() * 26)]}${letters[Math.floor(Math.random() * 26)]}`
     if (await db.currency.findUnique({ where: { code } })) continue
     await db.currency.create({ data: { code, name: `purchfx ${code}`, symbol: code } })
+    createdCurrencies.push(code)
     return code
   }
 }
@@ -151,6 +156,13 @@ test.before(async () => {
   await setSetting('xero_realised_fx_gain_loss_account', '4900')
   await setSetting('xero_purchase_price_variance_account', '5050')
   await setSetting(SWITCH, 'false')
+})
+
+test.after(async () => {
+  if (!RUN || createdCurrencies.length === 0) return
+  const { db } = await import('@/lib/db')
+  await db.fxRate.deleteMany({ where: { toCurrency: { in: createdCurrencies } } })
+  await db.currency.deleteMany({ where: { code: { in: createdCurrencies } } })
 })
 
 test.beforeEach(() => {
