@@ -2,7 +2,7 @@
 
 import { describeLedgerStanding } from '@/lib/domain/accounting/ledger-standing-display'
 import { db } from '@/lib/db'
-import { UNPAID_INVOICE_BASIS_A1_WHERE, proveInvoiceBasisOrders, readInvoiceBasisDeferralSwitch } from '@/lib/domain/accounting/invoice-basis-deferral'
+import { UNPAID_INVOICE_BASIS_A1_WHERE, findProvenInvoiceBasisCandidates, readInvoiceBasisDeferralSwitch } from '@/lib/domain/accounting/invoice-basis-deferral'
 import { requirePermission } from '@/lib/auth/server'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { parseCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
@@ -189,15 +189,13 @@ async function computePreview(): Promise<DailyBatchPreview> {
   // switch-on are deferred too; listed after the paid ones. Off, nothing is added.
   const invoiceBasisSwitch = await readInvoiceBasisDeferralSwitch(db)
   if (invoiceBasisSwitch.on) {
-    const unpaid = await db.salesOrder.findMany({
-      where: UNPAID_INVOICE_BASIS_A1_WHERE,
-      select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, totalBase: true, taxBase: true },
+    const proven = await findProvenInvoiceBasisCandidates(db, invoiceBasisSwitch.since)
+    const unpaid = proven.size === 0 ? [] : await db.salesOrder.findMany({
+      where: { ...UNPAID_INVOICE_BASIS_A1_WHERE, id: { in: [...proven.keys()].slice(0, 1000) } },
+      select: { id: true, orderNumber: true, externalOrderNumber: true, totalBase: true, taxBase: true },
       orderBy: { id: 'asc' },
     })
-    const proven = await proveInvoiceBasisOrders(db, unpaid, invoiceBasisSwitch.since)
-    for (const order of unpaid) {
-      if (proven.has(order.id)) a1Orders.push(order)
-    }
+    a1Orders.push(...unpaid)
   }
 
   const a1 = {
@@ -316,6 +314,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
           refundStatus: true,
           totalBase: true,
           unearnedRevenueAmount: true,
+          revenueDeferralUnwoundAmount: true,
           lines: {
             select: {
               id: true,
@@ -500,7 +499,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
       unearnedReversalWarnings.push(`Order ${getSalesOrderReference({ id: orderId, ...order })}: ${unreadableUnearnedReversals.length} UNEARNED_REV_REVERSAL row(s) have no readable lines and no preserved account summary, so the run will not journal this order's shipments (they are retried once the reversal is readable).`)
       continue
     }
-    const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
+    const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal - Number(order.revenueDeferralUnwoundAmount ?? 0)))
     let runningRevenue = 0
 
     let isTrueUpEligible = isFullyShippedTerminalStatus(order.status) && order.refundStatus !== 'PARTIAL'

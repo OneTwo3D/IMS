@@ -98,7 +98,7 @@ import {
   type DailyBatchRecreateBucket,
 } from '@/lib/domain/accounting/daily-batch-reference'
 import { resolveScheduledDailyBatchSweep } from '@/lib/domain/accounting/daily-batch-sweep-schedule'
-import { UNPAID_INVOICE_BASIS_A1_WHERE, deferralAnchorDay, proveInvoiceBasisOrders, readInvoiceBasisDeferralSwitch, type InvoiceBasisProof } from '@/lib/domain/accounting/invoice-basis-deferral'
+import { INVOICE_BASIS_UNWIND_OWED_WHERE, UNPAID_INVOICE_BASIS_A1_WHERE, deferralAnchorDay, deferralJournalsThatMayHavePosted, findProvenInvoiceBasisCandidates, openInvoiceBasisDeferral, readInvoiceBasisDeferralSwitch, type InvoiceBasisProof } from '@/lib/domain/accounting/invoice-basis-deferral'
 import { calculateCoverageByLine } from '@/lib/products/fulfillment-coverage'
 import { isFullyShippedTerminalStatus, recognizeShipmentRevenue } from '@/lib/domain/accounting/revenue-recognition'
 import {
@@ -1835,6 +1835,8 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
               // unpaid-invoice deferral: or, for a deferral made from the invoice (unpaid order), before the invoice's document day.
               revenueDeferralBasis: true,
               revenueDeferralEventAt: true,
+              // Unpaid-invoice deferral: what an unwind (invoice deleted or voided) already took back out of Unearned Revenue.
+              revenueDeferralUnwoundAmount: true,
               totalBase: true,
               unearnedRevenueAmount: true,
               // ACC-H12: an order with no deferral stamp is on the COGS-on-shipment path, and the revenue share
@@ -2160,7 +2162,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
         // recorded further down), so shipmentJournalDate stays null and a later run picks them up once the reversal is readable, exactly
         // once. Recognising 0 and stamping the shipment journaled would strand the deferral for good.
         if (unreadableUnearnedReversals.length > 0) continue
-        const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal))
+        const remainingDeferred = round2(Math.max(0, deferredBase - recognizedPreviously - postedUnearnedReversal - Number(firstShipment.order.revenueDeferralUnwoundAmount ?? 0)))
         let runningRevenue = 0
 
         // scjz.68: a fully-shipped terminal order trues up the remainder; a
@@ -2670,29 +2672,36 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     const invoiceBasisProofs = new Map<string, InvoiceBasisProof>()
     let invoiceBasisHasMore = false
     if (invoiceBasisSwitch.on && orderWindow.rows.length < batchLimit) {
-      const unpaidCandidates = await db.salesOrder.findMany({
-        where: UNPAID_INVOICE_BASIS_A1_WHERE,
-        select: { id: true, accountingInvoiceId: true },
-        orderBy: { id: 'asc' },
-      })
-      const proofs = await proveInvoiceBasisOrders(db, unpaidCandidates, invoiceBasisSwitch.since)
-      const provenIds = [...proofs.keys()].sort((a, b) => {
-        const byDay = (proofs.get(a) as InvoiceBasisProof).eventAt.getTime() - (proofs.get(b) as InvoiceBasisProof).eventAt.getTime()
-        return byDay !== 0 ? byDay : (a < b ? -1 : a > b ? 1 : 0)
-      })
-      const slots = batchLimit - orderWindow.rows.length
-      const chosen = provenIds.slice(0, slots)
-      invoiceBasisHasMore = provenIds.length > slots
-      if (chosen.length > 0) {
-        // Re-read with the eligibility test as a WHERE: an order paid, cancelled or deferred since the probe is not returned.
-        const rows = await db.salesOrder.findMany({ where: { ...UNPAID_INVOICE_BASIS_A1_WHERE, id: { in: chosen } }, select: a1Select })
-        const byId = new Map(rows.map((row) => [row.id, row]))
-        for (const id of chosen) {
-          const row = byId.get(id)
-          if (!row) continue
-          invoiceBasisProofs.set(id, proofs.get(id) as InvoiceBasisProof)
+      // ISOLATED: a failure anywhere in the invoice-basis read is reported and only this part is skipped; the paid
+      // orders already in the window are deferred exactly as with the switch off.
+      try {
+        const proofs = await findProvenInvoiceBasisCandidates(db, invoiceBasisSwitch.since)
+        // An order already in the paid window is never also taken here (a payment landing between the two reads).
+        const paidWindowIds = new Set(orderWindow.rows.map((row) => row.id))
+        const provenIds = [...proofs.keys()].filter((id) => !paidWindowIds.has(id)).sort((a, b) => {
+          const byDay = (proofs.get(a) as InvoiceBasisProof).eventAt.getTime() - (proofs.get(b) as InvoiceBasisProof).eventAt.getTime()
+          return byDay !== 0 ? byDay : (a < b ? -1 : a > b ? 1 : 0)
+        })
+        const slots = batchLimit - orderWindow.rows.length
+        const chosen = provenIds.slice(0, slots)
+        const picked: Array<(typeof orderWindow.rows)[number]> = []
+        if (chosen.length > 0) {
+          // Re-read with the eligibility test as a WHERE: an order paid, cancelled or deferred since the probe is not returned.
+          const rows = await db.salesOrder.findMany({ where: { ...UNPAID_INVOICE_BASIS_A1_WHERE, id: { in: chosen } }, select: a1Select })
+          const byId = new Map(rows.map((row) => [row.id, row]))
+          for (const id of chosen) {
+            const row = byId.get(id)
+            if (row) picked.push(row)
+          }
+        }
+        for (const row of picked) {
+          invoiceBasisProofs.set(row.id, proofs.get(row.id) as InvoiceBasisProof)
           orderWindow.rows.push(row)
         }
+        invoiceBasisHasMore = provenIds.length > slots
+      } catch (error) {
+        invoiceBasisProofs.clear()
+        result.errors.push(`Group A1 (unpaid invoices): the invoice-basis read failed and no unpaid order was deferred this run; paid orders were not affected: ${String(error)}`)
       }
     }
     // ACC-H12: an order whose shipment left before it was paid and is still waiting for its direct cost is not
@@ -2863,6 +2872,15 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
 
           const deferralByOrderId = new Map(group.rows.map((order) => [order.orderId, order.storedAmount]))
           for (const deferral of group.rows) {
+            // Re-checked under the fence's row locks: the order is still undeferred and still in the state it was chosen in
+            // (paid for the paid window, unpaid for the invoice basis). Anything else refuses the whole group (rolled
+            // back, nothing staged) and the next run recalculates, so one order can never be deferred twice.
+            // (Only with the switch on: the paid window alone cannot meet an order twice, and a switch-off run is left as it was.)
+            const chosenUnpaid = invoiceBasisProofs.has(deferral.orderId)
+            const stillEligible = invoiceBasisSwitch.on
+              ? await tx.salesOrder.count({ where: { id: deferral.orderId, revenueDeferredDate: null, paidAt: chosenUnpaid ? null : { not: null } } })
+              : 1
+            if (stillEligible !== 1) throw new Error(`A1: order ${deferral.orderId} was deferred or changed paid state since it was selected; the group is refused and retried next run`)
             await tx.salesOrder.update({
               where: { id: deferral.orderId },
               data: {
@@ -2888,6 +2906,99 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     // OUTSIDE the rolled-back transaction, before it becomes one more line in result.errors.
     if (e instanceof StaleDailyBatchDeferralError) await logStaleDailyBatchDeferral(XERO_CONNECTOR, e)
     result.errors.push(`Group A1 error: ${String(e)}`)
+  }
+
+  // --- Group A1 (unwind): an INVOICE-basis deferral whose invoice is gone ---
+  //
+  // The invoice an unpaid order was deferred from was deleted (IMS document delete) or voided in Xero, which took its
+  // Sales credit back; the deferral would otherwise stay in Unearned Revenue for good. The obligation was recorded on the
+  // order in the transaction that learned it (`revenueDeferralUnwindOwedAt`); this posts DR Unearned Revenue / CR Sales
+  // for what is still open, dated the day the invoice went (subject to the lock rule), one journal per date, and records
+  // the pounds and the journal on the order in the same transaction. A figure that cannot be proved is refused and
+  // reported; the order stays owed. Only INVOICE-basis orders are ever marked, so with none this reads nothing else.
+  groupA1UnwindSkip: try {
+    batchLock.assertHeld('Group A1 (deferral unwind)')
+    if (lockBlocked) break groupA1UnwindSkip
+    const owed = await db.salesOrder.findMany({
+      where: INVOICE_BASIS_UNWIND_OWED_WHERE,
+      select: { id: true },
+      orderBy: [{ revenueDeferralUnwindOwedAt: 'asc' }, { id: 'asc' }],
+      take: batchLimit,
+    })
+    if (owed.length > 0) {
+      const unwindPlans: Array<{ date: string; rows: Array<{ orderId: string; amount: string }>; referenceId: string; movedFromLockedDays: string[] }> = []
+      await db.$transaction(async (tx) => {
+        await lockSalesOrders(tx, owed.map((row) => row.id).sort())
+        const orders = await tx.salesOrder.findMany({
+          where: { ...INVOICE_BASIS_UNWIND_OWED_WHERE, id: { in: owed.map((row) => row.id) } },
+          select: {
+            id: true,
+            orderNumber: true,
+            externalOrderNumber: true,
+            unearnedRevenueAmount: true,
+            revenueDeferralUnwoundAmount: true,
+            revenueDeferralUnwindOwedAt: true,
+            revenueDeferredBatchRef: true,
+            shipments: { select: { shipmentJournalDate: true, revenueRecognizedAmount: true } },
+            refunds: { select: { id: true, deferralAdjustmentRef: true, unearnedReversedAmount: true, reversalStagingState: true, accountingRetryRequired: true } },
+          },
+        })
+        const refs = orders.map((order) => order.revenueDeferredBatchRef).filter((ref): ref is string => !!ref)
+        const postedRefs = await deferralJournalsThatMayHavePosted(tx, refs)
+        const ready: Array<{ orderId: string; amount: string; day: string | null }> = []
+        for (const order of orders) {
+          const label = order.orderNumber ?? order.externalOrderNumber ?? order.id.slice(0, 8)
+          const open = openInvoiceBasisDeferral(order)
+          if (!open.ok) {
+            result.errors.push(`Group A1 unwind: order ${label}: the open deferral cannot be proved (${open.reason}); nothing was posted and the unwind stays owed`)
+            continue
+          }
+          if (open.open.greaterThan(0) && !(order.revenueDeferredBatchRef && postedRefs.has(order.revenueDeferredBatchRef))) {
+            result.errors.push(`Group A1 unwind: order ${label}: its deferral journal ${order.revenueDeferredBatchRef ?? '(none)'} is not known to have reached the ledger, so the £${open.open.toFixed(2)} is not reversed; check the Unearned Revenue account and post by hand if it did`)
+            continue
+          }
+          ready.push({ orderId: order.id, amount: open.open.toFixed(2), day: businessDay(order.revenueDeferralUnwindOwedAt) })
+        }
+        const dated = groupByPostingDate(ready, (row) => row.day, dateContext)
+        for (const group of dated.groups) {
+          const total = group.rows.reduce((sum, row) => addMoney(sum, row.amount), toDecimal(0))
+          const referenceId = buildDailyBatchReferenceId('A1', group.date, group.rows.map((row) => `deferral-unwind:${row.orderId}`))
+          if (total.greaterThan(0)) {
+            await createPendingSyncLog(tx, {
+              type: 'DAILY_BATCH_REVENUE_DEFERRAL',
+              referenceId,
+              currency: baseCurrency,
+              payload: {
+                date: group.date,
+                reference: `Revenue Deferral unwind ${group.date} ${referenceId.slice(-8)}`,
+                narration: `Revenue deferral unwind for unpaid order(s) whose invoice was deleted or voided: ${group.rows.filter((row) => toDecimal(row.amount).greaterThan(0)).length} order(s), £${total.toFixed(2)}${lockedPeriodNarration(group.movedFromLockedDays, lockDate)}`,
+                lines: [
+                  { accountCode: settings.xero_unearned_revenue_account, description: `Deferral unwind (invoice gone) — ${group.rows.length} order(s)`, debit: Number(total.toFixed(2)) },
+                  { accountCode: settings.xero_sales_account, description: `Deferral unwind (invoice gone) — ${group.rows.length} order(s)`, credit: Number(total.toFixed(2)) },
+                ],
+                deferralUnwinds: group.rows.map((row) => ({ orderId: row.orderId, amount: row.amount })),
+                batchReferenceId: referenceId,
+                batchDate: group.date,
+                batchGroup: 'A1',
+                batchEntityCount: group.rows.length,
+                _postingMode: 'submitted',
+              },
+            })
+          }
+          for (const row of group.rows) {
+            const stamped = await tx.salesOrder.updateMany({
+              where: { id: row.orderId, revenueDeferralUnwoundAmount: null },
+              data: { revenueDeferralUnwoundAmount: row.amount, revenueDeferralUnwindRef: toDecimal(row.amount).greaterThan(0) ? referenceId : null },
+            })
+            if (stamped.count !== 1) throw new Error(`Group A1 unwind: order ${row.orderId} was unwound concurrently; the whole unwind is rolled back and retried next run`)
+          }
+          unwindPlans.push({ date: group.date, rows: group.rows, referenceId, movedFromLockedDays: group.movedFromLockedDays })
+        }
+      })
+      for (const plan of unwindPlans) await reportLockedPeriodMoves('A1', plan.date, plan.movedFromLockedDays, lockDate)
+    }
+  } catch (e) {
+    result.errors.push(`Group A1 unwind error: ${String(e)}`)
   }
 
   // --- Group A2: Inventory Reclassification ---

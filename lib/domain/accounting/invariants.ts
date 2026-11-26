@@ -8,6 +8,7 @@ import { loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory
 import { loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
 import { COGS_CROSS_CHECK_FLOWS, TRANSIT_CROSS_CHECK_FLOWS, crossCheckSubledgerAgainstQueuedJournals, type SubledgerCrossCheck } from '@/lib/domain/accounting/subledger-journal-cross-check'
 import { loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
+import { openInvoiceBasisDeferral, type OpenDeferralInputs } from '@/lib/domain/accounting/invoice-basis-deferral'
 import { reversalRecordVerdict } from '@/lib/domain/sales/refund-reversal-record'
 
 export type AccountingInvariantSeverity = 'info' | 'warning' | 'critical'
@@ -48,6 +49,8 @@ type SalesOrderAccountingRow = {
   revenueDeferredDate: Date | string | null
   // unpaid-invoice deferral: INVOICE = deferred from the invoice while unpaid (switch `xero_defer_unpaid_invoiced_revenue_enabled`). Absent/NULL = PAID.
   revenueDeferralBasis?: string | null
+  // Unpaid-invoice deferral: what an unwind (invoice deleted or voided) already took back out of Unearned Revenue.
+  revenueDeferralUnwoundAmount?: DecimalLike | null
   // o3d-0qoo: the exact A1 batch referenceId stamped on this row in the same
   // transaction as revenueDeferredDate. Optional for the same reason as paidAt
   // (pure-evaluator fixtures); the DB loader always selects it. Absent/null means
@@ -230,6 +233,24 @@ export type AccountingInvariantRows = {
    * forgot it would make the drop invisible again, which is the whole defect.
    */
   reversalNeverRecordedRefunds: ReversalNeverRecordedRefundRow[]
+  /**
+   * Unpaid-invoice deferral: every order Group A1 deferred FROM its invoice whose deferral is not yet unwound and whose
+   * invoice is gone (none linked, or Xero reported it voided) or which is CANCELLED. CANCELLED orders are deliberately
+   * included: the lifecycle checks above skip them, and a cancelled order never ships, so nothing would release it.
+   * Optional for pure-evaluator fixtures; the DB loader always reads it.
+   */
+  strandedInvoiceBasisDeferrals?: StrandedInvoiceBasisDeferralRow[]
+}
+
+export type StrandedInvoiceBasisDeferralRow = OpenDeferralInputs & {
+  id: string
+  orderNumber: string | null
+  externalOrderNumber: string | null
+  status: string
+  accountingInvoiceId: string | null
+  revenueDeferralUnwindOwedAt: Date | string | null
+  revenueDeferralUnwindReason: string | null
+  revenueDeferralBasis: string | null
 }
 
 type AccountingInvariantClient = {
@@ -669,7 +690,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
       postedShipments.length > 0 &&
       order.shipments.every((shipment) => shipment.shipmentJournalDate != null || shipment.status !== 'SHIPPED')
     ) {
-      const deferred = decimalToNumber(order.unearnedRevenueAmount)
+      const deferred = decimalToNumber(order.unearnedRevenueAmount) - decimalToNumber(order.revenueDeferralUnwoundAmount ?? 0)
       const recognized = postedShipments.reduce(
         (sum, shipment) => sum + decimalToNumber(shipment.revenueRecognizedAmount),
         0,
@@ -1100,6 +1121,40 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     })
   }
 
+  // Unpaid-invoice deferral: a deferral still open on an order whose invoice is gone, or which is cancelled. Nothing will
+  // ever release it (no shipment of a voided invoice, or of a cancelled order, recognises revenue), so Unearned Revenue
+  // is overstated by it until the daily batch's unwind posts (when the invoice was deleted or voided) or an operator
+  // credits the order (a cancellation with its invoice still standing).
+  for (const order of rows.strandedInvoiceBasisDeferrals ?? []) {
+    // Restated on the rows: only a deferral made from the invoice, not yet unwound, with its invoice gone or the order cancelled.
+    if (order.revenueDeferralBasis !== 'INVOICE' || order.revenueDeferralUnwoundAmount != null) continue
+    if (!(order.status === 'CANCELLED' || order.accountingInvoiceId == null || order.revenueDeferralUnwindOwedAt != null)) continue
+    const open = openInvoiceBasisDeferral(order)
+    const label = order.orderNumber ?? order.externalOrderNumber ?? order.id.slice(0, 8)
+    if (open.ok && !open.open.greaterThan('0.01')) continue
+    const why = order.status === 'CANCELLED'
+      ? 'the order is cancelled'
+      : order.revenueDeferralUnwindOwedAt != null
+        ? `its invoice was ${order.revenueDeferralUnwindReason === 'INVOICE_VOIDED' ? 'voided in Xero' : 'deleted'}`
+        : 'it has no invoice'
+    findings.push({
+      severity: 'warning',
+      code: 'invoice_basis_deferral_stranded',
+      orderId: order.id,
+      message: open.ok
+        ? `Sales order ${label} still holds £${open.open.toFixed(2)} of revenue deferred from its invoice in Unearned Revenue, but ${why}, so no shipment will release it`
+          + (order.revenueDeferralUnwindOwedAt != null ? '; the daily batch owes its unwind and has not posted it yet' : '; credit the order (refund) or post the release by hand')
+        : `Sales order ${label} holds revenue deferred from its invoice, but ${why}, and the open amount cannot be established (${open.reason})`,
+      details: {
+        status: order.status,
+        accountingInvoiceId: order.accountingInvoiceId,
+        unwindOwedAt: order.revenueDeferralUnwindOwedAt,
+        unwindReason: order.revenueDeferralUnwindReason,
+        openDeferral: open.ok ? Number(open.open.toFixed(2)) : null,
+      },
+    })
+  }
+
   return findings
 }
 
@@ -1154,6 +1209,30 @@ export async function collectAccountingInvariantRows(
           SHADOWED_OBLIGATION_WHERE,
         ],
       }
+  // Unpaid-invoice deferral: CANCELLED orders included on purpose (see the row set's comment). Bounded by what qualifies:
+  // INVOICE-basis deferrals not yet unwound, so with the switch never turned on this returns nothing.
+  const strandedInvoiceBasisDeferrals = await client.salesOrder.findMany({
+    where: {
+      revenueDeferralBasis: 'INVOICE',
+      revenueDeferredDate: { not: null },
+      revenueDeferralUnwoundAmount: null,
+      OR: [{ accountingInvoiceId: null }, { status: 'CANCELLED' }, { revenueDeferralUnwindOwedAt: { not: null } }],
+    },
+    select: {
+      id: true,
+      orderNumber: true,
+      externalOrderNumber: true,
+      status: true,
+      accountingInvoiceId: true,
+      revenueDeferralBasis: true,
+      unearnedRevenueAmount: true,
+      revenueDeferralUnwoundAmount: true,
+      revenueDeferralUnwindOwedAt: true,
+      revenueDeferralUnwindReason: true,
+      shipments: { select: { shipmentJournalDate: true, revenueRecognizedAmount: true } },
+      refunds: { select: { id: true, deferralAdjustmentRef: true, unearnedReversedAmount: true, reversalStagingState: true, accountingRetryRequired: true } },
+    },
+  }) as unknown as StrandedInvoiceBasisDeferralRow[]
   const [salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds, reversalNeverRecordedRefunds] = await Promise.all([
     client.salesOrder.findMany({
       where: {
@@ -1183,6 +1262,7 @@ export async function collectAccountingInvariantRows(
         revenueDeferredDate: true,
         // unpaid-invoice deferral: an INVOICE-basis deferral is not evidence of a payment.
         revenueDeferralBasis: true,
+        revenueDeferralUnwoundAmount: true,
         // o3d-0qoo: the persisted batch refs are what the evidence check matches on;
         // omitting them silently demotes every row to the derive-from-stamp fallback.
         revenueDeferredBatchRef: true,
@@ -1352,7 +1432,7 @@ export async function collectAccountingInvariantRows(
     }) as unknown as Promise<ReversalNeverRecordedRefundRow[]>,
   ])
 
-  return { salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds, reversalNeverRecordedRefunds, historicalBatchCutoff: retentionCutoff }
+  return { salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds, reversalNeverRecordedRefunds, strandedInvoiceBasisDeferrals, historicalBatchCutoff: retentionCutoff }
 }
 
 /**

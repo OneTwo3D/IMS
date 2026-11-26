@@ -18,6 +18,7 @@
  * An activity-log entry is written in the same transaction.
  */
 
+import { markInvoiceBasisDeferralUnwindOwed } from '@/lib/domain/accounting/invoice-basis-deferral'
 import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
@@ -465,6 +466,13 @@ export async function completeAccountingDocumentDeletion(externalDocumentId: str
         })
         unwound.orderLinkCleared = cleared.count === 1
         unwound.invoiceNumberReleased = cleared.count === 1 ? order.invoiceNumber : null
+        // Unpaid-invoice deferral: an order Group A1 deferred FROM this invoice (unpaid, switch on) has that deferral in
+        // Unearned Revenue with nothing left to release it once the invoice is gone. The obligation to unwind it is
+        // recorded HERE, in the transaction that unwinds the document, and the daily batch posts DR Unearned / CR Sales for
+        // what is still open. A PAID-basis deferral is not touched (the refund and chargeback paths own it).
+        unwound.deferralUnwindOwed = cleared.count === 1
+          ? (await markInvoiceBasisDeferralUnwindOwed(tx, { orderIds: [order.id] }, 'INVOICE_DELETED')) === 1
+          : false
         const withdrawn = await tx.salesOrderInvoiceDocument.updateMany({
           where: { orderId: order.id, externalDocumentId, withdrawnAt: null },
           data: { withdrawnAt: new Date() },

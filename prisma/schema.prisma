@@ -2384,6 +2384,16 @@ model SalesOrder {
   // revenue-without-payment check does not apply (the order was never deferred because it was paid).
   revenueDeferralBasis   RevenueDeferralBasis?  @map("accounting_revenue_deferral_basis")
   revenueDeferralEventAt DateTime?              @map("accounting_revenue_deferral_event_at")
+  // Unpaid-invoice deferral: the invoice an INVOICE-basis deferral was made from is gone (IMS document delete completed,
+  // or Xero reports it VOIDED). `revenueDeferralUnwindOwedAt` is the durable obligation, written in the transaction that
+  // learned it; the daily batch then posts DR Unearned Revenue / CR Sales for what is still open and records the pounds
+  // (`revenueDeferralUnwoundAmount`, 0 when nothing was open) and the journal (`revenueDeferralUnwindRef`). The A1 stamp
+  // stays: A2 may hold the units in Allocated Inventory, so later shipments must keep the ordinary path. Every reader of
+  // the open deferral (Group B, refunds, the tie-out) subtracts the unwound amount.
+  revenueDeferralUnwindOwedAt  DateTime?            @map("accounting_revenue_deferral_unwind_owed_at")
+  revenueDeferralUnwindReason  String?              @map("accounting_revenue_deferral_unwind_reason")
+  revenueDeferralUnwoundAmount Decimal?             @db.Decimal(18, 4) @map("accounting_revenue_deferral_unwound_amount")
+  revenueDeferralUnwindRef     String?              @map("accounting_revenue_deferral_unwind_ref")
   inventoryAllocatedDate DateTime?              @map("accounting_inventory_allocated_date") // Set by Group A2 — inventory reclassified to Allocated
   allocationBatchAmount  Decimal?  @db.Decimal(18, 4) @map("accounting_allocation_batch_amount") // Cost value reclassified
   // o3d-0qoo: the EXACT AccountingSyncLog.referenceId of the batch this row was staged into,

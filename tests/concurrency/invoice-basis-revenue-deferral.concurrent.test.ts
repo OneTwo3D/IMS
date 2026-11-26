@@ -23,16 +23,19 @@ const DAY = 24 * 60 * 60 * 1000
 async function openRig() {
   config({ path: '.env.local', quiet: true })
   config({ quiet: true })
-  const [{ Prisma, PrismaClient }, { PrismaPg }, { createSalesOrderRefund }, { runDailyBatchSync }, { db: appDb }, { businessDay }] = await Promise.all([
+  const [{ Prisma, PrismaClient }, { PrismaPg }, { createSalesOrderRefund }, { runDailyBatchSync }, { db: appDb }, { businessDay }, { completeAccountingDocumentDeletion }, { markInvoiceBasisDeferralUnwindOwed }, { collectAccountingInvariantRows, evaluateAccountingInvariantRows }] = await Promise.all([
     import('@/app/generated/prisma/client'),
     import('@prisma/adapter-pg'),
     import('@/lib/domain/sales/refund-service'),
     import('@/lib/connectors/xero/daily-sync'),
     import('@/lib/db'),
     import('@/lib/domain/accounting/daily-batch-event-date'),
+    import('@/lib/domain/accounting/document-delete-service'),
+    import('@/lib/domain/accounting/invoice-basis-deferral'),
+    import('@/lib/domain/accounting/invariants'),
   ])
   const db = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL!, max: 4 }) })
-  return { Prisma, db, appDb, createSalesOrderRefund, runDailyBatchSync, businessDay }
+  return { Prisma, db, appDb, createSalesOrderRefund, runDailyBatchSync, businessDay, completeAccountingDocumentDeletion, markInvoiceBasisDeferralUnwindOwed, collectAccountingInvariantRows, evaluateAccountingInvariantRows }
 }
 type Rig = Awaited<ReturnType<typeof openRig>>
 
@@ -123,6 +126,7 @@ async function clean(rig: Rig, fixtures: Fixture[]) {
   await db.setting.deleteMany({ where: { key: { in: [SWITCH, SWITCH_AT] } } }).catch(() => {})
   for (const fx of fixtures) {
     await db.accountingSyncLog.deleteMany({ where: { referenceType: 'SalesOrder', referenceId: fx.orderId } }).catch(() => {})
+    await db.accountingDocumentDeletion.deleteMany({ where: { documentId: fx.orderId } }).catch(() => {})
     await db.activityLog.deleteMany({ where: { entityId: fx.orderId } }).catch(() => {})
     await db.integrationOutbox.deleteMany({ where: { operation: 'refund.reservation-release', payloadJson: { path: ['orderId'], equals: fx.orderId } } }).catch(() => {})
     await db.stockMovement.deleteMany({ where: { productId: fx.productId } }).catch(() => {})
@@ -484,6 +488,169 @@ test('unpaid-invoice deferral: a cancelled unpaid order is never deferred, even 
     assert.deepEqual(run.errors, [])
     assert.equal(run.groupA1, 0)
     assert.equal((await journals(rig)).length, 0)
+  } finally {
+    await clean(rig, fixtures)
+    await close(rig)
+  }
+})
+
+/** Settle every batch journal as posted (the refund and unwind paths ask whether the deferral reached the ledger). */
+async function settleBatchJournals(rig: Rig, tag: string) {
+  await rig.db.accountingSyncLog.updateMany({
+    where: { type: { in: ['DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B'] }, status: 'PENDING' },
+    data: { status: 'SYNCED', syncedAt: new Date(), externalTransactionId: `JNL-${tag}` },
+  })
+}
+
+async function strandedFindings(rig: Rig, orderId: string) {
+  const rows = await rig.collectAccountingInvariantRows(rig.db as never)
+  return rig.evaluateAccountingInvariantRows(rows).filter((f) => f.code === 'invoice_basis_deferral_stranded' && f.orderId === orderId)
+}
+
+test('unpaid-invoice deferral: the IMS document delete of the invoice owes the unwind in the same transaction; the batch reverses the open deferral and the books net to zero', { skip }, async () => {
+  const rig = await openRig()
+  const fixtures: Fixture[] = []
+  try {
+    await clean(rig, [])
+    await setup(rig, { since: new Date(Date.now() - 10 * DAY) })
+    const docDay = ymd(noonDaysAgo(4))
+    const suffix = suffixOf()
+    const fx = await seed(rig, suffix, { invoice: { mode: 'submitted', docDay, syncedAt: new Date(Date.now() - 4 * DAY) } })
+    fixtures.push(fx)
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    await settleBatchJournals(rig, suffix)
+    assert.equal(net(await journals(rig), '2100'), -400, 'deferred 400')
+
+    // The delete was requested and Xero has voided the document: IMS completes the unwind.
+    await rig.db.accountingDocumentDeletion.create({
+      data: { kind: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: fx.orderId, documentId: fx.orderId, externalDocumentId: `INV-${suffix}`, originalNumber: `INV-${suffix}`, releasedNumber: `INV-${suffix}-X`, targetStatus: 'VOIDED' },
+    })
+    assert.equal(await rig.completeAccountingDocumentDeletion(`INV-${suffix}`), 'completed')
+    let order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+    assert.equal(order.accountingInvoiceId, null)
+    assert.ok(order.revenueDeferralUnwindOwedAt, 'the unwind is owed, recorded with the delete')
+    assert.equal(order.revenueDeferralUnwindReason, 'INVOICE_DELETED')
+    assert.equal((await strandedFindings(rig, fx.orderId)).length, 1, 'the invariant reports the open deferral until the unwind posts')
+
+    const run = await rig.runDailyBatchSync()
+    assert.deepEqual(run.errors, [])
+    const all = await journals(rig)
+    assertBalanced(all, 'unwind')
+    const unwind = all.filter((j) => /unwind/i.test(j.narration))
+    assert.equal(unwind.length, 1)
+    assert.equal(net(unwind, '2100'), 400, 'DR Unearned 400')
+    assert.equal(net(unwind, '4000'), -400, 'CR Sales 400')
+    assert.equal(net(all, '2100'), 0, 'Unearned Revenue nets to zero')
+    assert.equal(net(all, '4000'), 0, 'the deferral and its unwind cancel in Sales; the void took the invoice credit back')
+    order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+    assert.equal(Number(order.revenueDeferralUnwoundAmount), 400)
+    assert.ok(order.revenueDeferralUnwindRef)
+    assert.equal((await strandedFindings(rig, fx.orderId)).length, 0)
+
+    // Idempotent.
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    assert.equal((await journals(rig)).length, all.length, 'a rerun posts no second unwind')
+    // And the order cancelled afterwards stays clean.
+    await rig.db.salesOrder.update({ where: { id: fx.orderId }, data: { status: 'CANCELLED' } })
+    assert.equal((await strandedFindings(rig, fx.orderId)).length, 0)
+  } finally {
+    await clean(rig, fixtures)
+    await close(rig)
+  }
+})
+
+test('unpaid-invoice deferral: a VOIDED invoice on a partially shipped order unwinds only what is still open; later shipments release nothing more', { skip }, async () => {
+  const rig = await openRig()
+  const fixtures: Fixture[] = []
+  try {
+    await clean(rig, [])
+    await setup(rig, { since: new Date(Date.now() - 10 * DAY) })
+    const suffix = suffixOf()
+    const fx = await seed(rig, suffix, { invoice: { mode: 'submitted', docDay: ymd(noonDaysAgo(5)), syncedAt: new Date(Date.now() - 5 * DAY) } })
+    fixtures.push(fx)
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    await fx.ship(2, noonDaysAgo(2))
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    await settleBatchJournals(rig, suffix)
+    assert.equal(net(await journals(rig), '2100'), -200, '200 still deferred after the first shipment released 200')
+
+    // What the payment poller does for an ACCREC invoice Xero reports VOIDED.
+    assert.equal(await rig.markInvoiceBasisDeferralUnwindOwed(rig.db, { accountingInvoiceIds: [`INV-${suffix}`] }, 'INVOICE_VOIDED'), 1)
+    assert.equal(await rig.markInvoiceBasisDeferralUnwindOwed(rig.db, { accountingInvoiceIds: [`INV-${suffix}`] }, 'INVOICE_VOIDED'), 0, 'idempotent')
+    assert.equal((await strandedFindings(rig, fx.orderId)).length, 1)
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    let all = await journals(rig)
+    assertBalanced(all, 'void')
+    assert.equal(net(all.filter((j) => /unwind/i.test(j.narration)), '2100'), 200, 'only the open 200 is unwound')
+    assert.equal(net(all, '2100'), 0, 'Unearned Revenue nets to zero')
+    assert.equal((await strandedFindings(rig, fx.orderId)).length, 0)
+
+    // The rest still ships (stock left): COGS from Allocated as A2 reclassified it, and no revenue is released.
+    await fx.ship(2)
+    await rig.db.salesOrder.update({ where: { id: fx.orderId }, data: { status: 'SHIPPED' } })
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    all = await journals(rig)
+    assertBalanced(all, 'after the rest shipped')
+    assert.equal(net(all, '2100'), 0, 'Unearned stays at zero: nothing is released twice')
+    assert.equal(net(all, '1210'), 0, 'Allocated Inventory nets to zero')
+    assert.equal(net(all, '5000'), 40, 'COGS once per unit')
+  } finally {
+    await clean(rig, fixtures)
+    await close(rig)
+  }
+})
+
+test('unpaid-invoice deferral: a deferral journal proven never sent is rebuilt first and the unwind follows it (never alone), and a PAID-basis order is never marked', { skip }, async () => {
+  const rig = await openRig()
+  const fixtures: Fixture[] = []
+  try {
+    await clean(rig, [])
+    await setup(rig, { since: new Date(Date.now() - 10 * DAY) })
+    const suffix = suffixOf()
+    const fx = await seed(rig, suffix, { invoice: { mode: 'submitted', docDay: ymd(noonDaysAgo(3)), syncedAt: new Date(Date.now() - 3 * DAY) } })
+    fixtures.push(fx)
+    const paidSuffix = suffixOf()
+    const paid = await seed(rig, paidSuffix, { paidAt: noonDaysAgo(2), invoice: { mode: 'submitted', docDay: ymd(noonDaysAgo(3)), syncedAt: new Date(Date.now() - 3 * DAY) } })
+    fixtures.push(paid)
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    // Both deferral journals proven never sent.
+    await rig.db.accountingSyncLog.updateMany({
+      where: { type: 'DAILY_BATCH_REVENUE_DEFERRAL', status: 'PENDING' },
+      data: { status: 'CANCELLED', abandonedBeforeRemoteCall: true },
+    })
+    assert.equal(await rig.markInvoiceBasisDeferralUnwindOwed(rig.db, { accountingInvoiceIds: [`INV-${suffix}`, `INV-${paidSuffix}`] }, 'INVOICE_VOIDED'), 1, 'only the INVOICE-basis order')
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    const live = (await rig.db.accountingSyncLog.findMany({ where: { type: 'DAILY_BATCH_REVENUE_DEFERRAL', status: { not: 'CANCELLED' } }, select: { payload: true } }))
+      .map((row) => row.payload as { lines: Line[]; narration: string })
+    const liveJournals = live.map((p) => ({ type: 'DAILY_BATCH_REVENUE_DEFERRAL', date: '', lines: p.lines, narration: p.narration }))
+    assert.ok(liveJournals.some((j) => /Recreated/.test(j.narration)), 'the lost deferral journal was rebuilt')
+    const unwound = liveJournals.filter((j) => /unwind/i.test(j.narration))
+    assert.equal(unwound.length, 1)
+    assert.equal(net(unwound, '2100'), 400)
+    const order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+    assert.equal(Number(order.revenueDeferralUnwoundAmount), 400)
+    const paidOrder = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: paid.orderId } })
+    assert.equal(paidOrder.revenueDeferralUnwindOwedAt, null, 'a PAID-basis deferral is left to the refund and chargeback paths')
+  } finally {
+    await clean(rig, fixtures)
+    await close(rig)
+  }
+})
+
+test('unpaid-invoice deferral: a CANCELLED order still holding an open deferral is reported (cancelled orders included)', { skip }, async () => {
+  const rig = await openRig()
+  const fixtures: Fixture[] = []
+  try {
+    await clean(rig, [])
+    await setup(rig, { since: new Date(Date.now() - 10 * DAY) })
+    const fx = await seed(rig, suffixOf(), { invoice: { mode: 'submitted', docDay: ymd(noonDaysAgo(3)), syncedAt: new Date(Date.now() - 3 * DAY) } })
+    fixtures.push(fx)
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    assert.equal((await strandedFindings(rig, fx.orderId)).length, 0, 'an ordinary deferred order is not reported')
+    await rig.db.salesOrder.update({ where: { id: fx.orderId }, data: { status: 'CANCELLED' } })
+    const findings = await strandedFindings(rig, fx.orderId)
+    assert.equal(findings.length, 1)
+    assert.match(findings[0].message, /cancelled/)
   } finally {
     await clean(rig, fixtures)
     await close(rig)

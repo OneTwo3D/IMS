@@ -42,6 +42,7 @@ import {
   retireBillPaymentRegistrationsReversedInLedger,
   type LedgerClassifierProof,
 } from '@/lib/domain/accounting/payment-reversal'
+import { markInvoiceBasisDeferralUnwindOwed } from '@/lib/domain/accounting/invoice-basis-deferral'
 import { handleDetectedReversal, type DetectedReversalOrder } from '@/lib/domain/accounting/reversal-handling'
 import {
   matchRemovedRegisteredPayments,
@@ -1224,6 +1225,17 @@ async function processDeltaChunk(
   // payment IMS posted seconds ago reads exactly like one that was taken away.
   const salesReversal = partitionPaymentReversals(changed, 'ACCREC')
   const voidedSalesIds = salesReversal.voided
+  // Unpaid-invoice deferral: an unpaid order Group A1 deferred FROM its invoice holds that deferral in Unearned Revenue, and
+  // a VOIDED invoice took its Sales credit back. Record the unwind the daily batch owes (idempotent; only INVOICE-basis
+  // orders are ever marked, and paid orders keep the reversal handling below). A failed write is an error on this chunk,
+  // so it is not checkpointed and the void is seen again on the next poll.
+  if (voidedSalesIds.size > 0) {
+    try {
+      await markInvoiceBasisDeferralUnwindOwed(db, { accountingInvoiceIds: [...voidedSalesIds] }, 'INVOICE_VOIDED')
+    } catch (error) {
+      result.errors.push(`Recording the deferral unwind owed for voided invoice(s) failed: ${String(error)}`)
+    }
+  }
   const paidBillIds = idsWhere(changed, 'ACCPAY', ['PAID'])
   const billReversal = partitionPaymentReversals(changed, 'ACCPAY')
   const invoiceById = new Map(changed.map((i) => [i.InvoiceID, i]))

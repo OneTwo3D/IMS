@@ -23,6 +23,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
 
 import { recoverPostedBusinessDate } from '@/lib/domain/accounting/back-reference'
 import { businessDay } from '@/lib/domain/accounting/daily-batch-event-date'
+import { subtractMoney, toDecimal } from '@/lib/domain/math/decimal'
 import { LEDGER_STANDING_SELECT, ledgerStanding, mayHaveReachedLedger } from '@/lib/domain/accounting/ledger-standing'
 
 /** The switch (default OFF) and its switch-on instant, written by `npm run settings:set` (lib/domain/settings/system-switches.ts, which holds the same literals). */
@@ -150,4 +151,148 @@ export function deferralAnchorDay(order: {
 /** An INVOICE-basis deferral was not made because the order was paid: a removed payment owes no revenue unwind. */
 export function isInvoiceBasisDeferral(order: { revenueDeferralBasis?: string | null }): boolean {
   return order.revenueDeferralBasis === 'INVOICE'
+}
+
+// ---------------------------------------------------------------------------------------------------------------------
+// UNWINDING AN INVOICE-BASIS DEFERRAL WHOSE INVOICE IS GONE.
+//
+// The deferral (DR Sales / CR Unearned Revenue) was made because the invoice credited Sales. When that invoice is deleted
+// or voided (IMS's document delete completing, or Xero reporting it VOIDED), Xero reverses the invoice's Sales credit but
+// the deferral stays in Unearned Revenue, and nothing would ever release it: no shipment of a voided invoice recognises
+// revenue, and a cancelled order never ships. So the moment IMS learns the invoice is gone it records the obligation on
+// the order (`revenueDeferralUnwindOwedAt`, in the same transaction), and the daily batch posts the reversal
+// (DR Unearned Revenue / CR Sales) for exactly what is still open, recording the pounds and the journal.
+// ---------------------------------------------------------------------------------------------------------------------
+
+export type InvoiceBasisUnwindReason = 'INVOICE_DELETED' | 'INVOICE_VOIDED'
+
+type UnwindMarkClient = Pick<Prisma.TransactionClient, 'salesOrder'>
+
+/**
+ * Record that an INVOICE-basis deferral is owed an unwind. Idempotent: only an order deferred from its invoice, with no
+ * unwind owed or done yet, is marked. Returns how many orders were marked. A PAID-basis deferral is never touched: its
+ * deferral came from the payment, and the refund and chargeback paths own it.
+ */
+export async function markInvoiceBasisDeferralUnwindOwed(
+  client: UnwindMarkClient,
+  target: { orderIds?: readonly string[]; accountingInvoiceIds?: readonly string[] },
+  reason: InvoiceBasisUnwindReason,
+  at: Date = new Date(),
+): Promise<number> {
+  const orderIds = [...(target.orderIds ?? [])]
+  const invoiceIds = [...(target.accountingInvoiceIds ?? [])]
+  if (orderIds.length === 0 && invoiceIds.length === 0) return 0
+  let marked = 0
+  for (const where of [
+    ...(orderIds.length > 0 ? [{ id: { in: orderIds } }] : []),
+    ...(invoiceIds.length > 0 ? [{ accountingInvoiceId: { in: invoiceIds } }] : []),
+  ]) {
+    const result = await client.salesOrder.updateMany({
+      where: {
+        ...where,
+        revenueDeferralBasis: 'INVOICE',
+        revenueDeferredDate: { not: null },
+        revenueDeferralUnwindOwedAt: null,
+        revenueDeferralUnwoundAmount: null,
+      },
+      data: { revenueDeferralUnwindOwedAt: at, revenueDeferralUnwindReason: reason },
+    })
+    marked += result.count
+  }
+  return marked
+}
+
+/** The facts the open deferral is reckoned from: all durable (order, shipment and refund rows), never sync-log rows, which retention deletes. */
+export type OpenDeferralInputs = {
+  unearnedRevenueAmount: Prisma.Decimal | number | string | null
+  revenueDeferralUnwoundAmount?: Prisma.Decimal | number | string | null
+  shipments: ReadonlyArray<{ shipmentJournalDate: Date | null; revenueRecognizedAmount: Prisma.Decimal | number | string | null }>
+  refunds: ReadonlyArray<{ id: string; deferralAdjustmentRef?: string | null; unearnedReversedAmount: Prisma.Decimal | number | string | null; reversalStagingState?: string | null; accountingRetryRequired?: boolean | null }>
+}
+
+/**
+ * Pure: how much of an order's deferral is still in Unearned Revenue — what A1 stored, less what its journaled shipments
+ * recognised, less what each refund recorded taking out, less any unwind already posted. Exact decimals. A refund whose
+ * reversal is not durably recorded (or still owes a retry) makes the figure unprovable: the caller refuses rather than
+ * reverse a figure that may already have been taken (the refund path's own rule).
+ */
+export function openInvoiceBasisDeferral(order: OpenDeferralInputs): { ok: true; open: Prisma.Decimal } | { ok: false; reason: string } {
+  let open = toDecimal(order.unearnedRevenueAmount ?? 0)
+  for (const shipment of order.shipments) {
+    if (shipment.shipmentJournalDate) open = subtractMoney(open, shipment.revenueRecognizedAmount ?? 0)
+  }
+  for (const refund of order.refunds) {
+    // A refund entered before the first run was netted out of the deferral itself (its adjustment journal); it took nothing later.
+    if (refund.deferralAdjustmentRef) continue
+    if (refund.accountingRetryRequired) return { ok: false, reason: `refund ${refund.id} still owes an accounting retry` }
+    if (refund.unearnedReversedAmount != null) {
+      open = subtractMoney(open, refund.unearnedReversedAmount)
+    } else if (refund.reversalStagingState !== 'NOT_STAGED') {
+      return { ok: false, reason: `refund ${refund.id} recorded no unearned-revenue reversal amount` }
+    }
+  }
+  open = subtractMoney(open, order.revenueDeferralUnwoundAmount ?? 0)
+  return { ok: true, open: open.isNegative() ? toDecimal(0) : open.toDecimalPlaces(2) }
+}
+
+/** The orders the daily batch owes an unwind: marked, and not yet unwound. */
+export const INVOICE_BASIS_UNWIND_OWED_WHERE = {
+  revenueDeferralBasis: 'INVOICE',
+  revenueDeferredDate: { not: null },
+  revenueDeferralUnwindOwedAt: { not: null },
+  revenueDeferralUnwoundAmount: null,
+} satisfies Prisma.SalesOrderWhereInput
+
+/**
+ * Which of these A1 deferral journals may have reached the ledger (judged by ledgerStanding: anything but PROVEN_NOT_POSTED
+ * counts, so a queued journal counts, as it will post before or after the unwind and the account nets either way). A
+ * deferral journal with no row at all, or only rows proven never sent, is not unwound: reversing a credit that never
+ * landed would put the pounds into Sales twice.
+ */
+export async function deferralJournalsThatMayHavePosted(client: SyncLogReader, refs: readonly string[]): Promise<Set<string>> {
+  if (refs.length === 0) return new Set()
+  const rows = await client.accountingSyncLog.findMany({
+    where: { type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: { in: [...refs] } },
+    select: { ...LEDGER_STANDING_SELECT, referenceId: true },
+  })
+  return new Set(rows.filter((row) => mayHaveReachedLedger(row)).map((row) => row.referenceId))
+}
+
+/** Prisma expands `{ in: [...] }` into one bind parameter per id; reads over many ids are chunked. */
+export const INVOICE_BASIS_ID_CHUNK = 1000
+
+function chunk<T>(items: readonly T[], size = INVOICE_BASIS_ID_CHUNK): T[][] {
+  const out: T[][] = []
+  for (let i = 0; i < items.length; i += size) out.push(items.slice(i, i + size))
+  return out
+}
+
+/**
+ * The unpaid orders that may qualify, found from the INVOICE side and bounded by time: sales-invoice rows of a sales
+ * order synced at or after the switch-on instant (so the read never grows with the open invoices from before
+ * switch-on, which stay in Sales), then those orders that are still unpaid and undeferred, then the proof over them.
+ * Every `in` list is chunked. Returns the proofs, keyed by order id.
+ */
+export async function findProvenInvoiceBasisCandidates(
+  client: SyncLogReader & Pick<Prisma.TransactionClient, 'salesOrder'>,
+  since: Date,
+): Promise<Map<string, InvoiceBasisProof>> {
+  const posted = await client.accountingSyncLog.findMany({
+    where: { type: 'SALES_INVOICE', referenceType: 'SalesOrder', syncedAt: { gte: since } },
+    select: { referenceId: true },
+    distinct: ['referenceId'],
+  })
+  const orderIds = [...new Set(posted.map((row) => row.referenceId))].sort()
+  const candidates: Array<{ id: string; accountingInvoiceId: string | null }> = []
+  for (const ids of chunk(orderIds)) {
+    candidates.push(...await client.salesOrder.findMany({
+      where: { ...UNPAID_INVOICE_BASIS_A1_WHERE, id: { in: ids } },
+      select: { id: true, accountingInvoiceId: true },
+    }))
+  }
+  const proofs = new Map<string, InvoiceBasisProof>()
+  for (const group of chunk(candidates)) {
+    for (const [id, proof] of await proveInvoiceBasisOrders(client, group, since)) proofs.set(id, proof)
+  }
+  return proofs
 }

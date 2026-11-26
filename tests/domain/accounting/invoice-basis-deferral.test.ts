@@ -62,3 +62,44 @@ test('the anchor day: payment day for PAID / NULL (switch-off behaviour unchange
   assert.equal(deferralAnchorDay({ paidAt, revenueDeferralBasis: 'INVOICE', revenueDeferralEventAt: eventAt }), '2026-11-30', 'a later payment does not move it')
   assert.equal(deferralAnchorDay({ paidAt: null, revenueDeferralBasis: 'INVOICE', revenueDeferralEventAt: eventAt }), '2026-11-30')
 })
+
+test('the open deferral: stored, less journaled shipments, less recorded refund reversals, less any unwind; unprovable refunds refuse', async () => {
+  const { openInvoiceBasisDeferral } = await import('@/lib/domain/accounting/invoice-basis-deferral')
+  const base = { unearnedRevenueAmount: '400', shipments: [], refunds: [] }
+  assert.equal((openInvoiceBasisDeferral(base) as { open: { toFixed(n: number): string } }).open.toFixed(2), '400.00')
+  const partial = openInvoiceBasisDeferral({
+    ...base,
+    shipments: [{ shipmentJournalDate: new Date(), revenueRecognizedAmount: '200' }, { shipmentJournalDate: null, revenueRecognizedAmount: '100' }],
+    refunds: [
+      { id: 'r1', unearnedReversedAmount: '50' },
+      { id: 'r2', deferralAdjustmentRef: 'A1-x', unearnedReversedAmount: null },
+      { id: 'r3', unearnedReversedAmount: null, reversalStagingState: 'NOT_STAGED' },
+    ],
+  })
+  assert.equal(partial.ok && partial.open.toFixed(2), '150.00', 'an unjournaled shipment and a netted or never-staged refund take nothing')
+  assert.equal((openInvoiceBasisDeferral({ ...base, revenueDeferralUnwoundAmount: '400' }) as { open: { toFixed(n: number): string } }).open.toFixed(2), '0.00')
+  assert.equal(openInvoiceBasisDeferral({ ...base, refunds: [{ id: 'r4', unearnedReversedAmount: null }] }).ok, false, 'a reversal not durably recorded')
+  assert.equal(openInvoiceBasisDeferral({ ...base, refunds: [{ id: 'r5', unearnedReversedAmount: '10', accountingRetryRequired: true }] }).ok, false, 'a refund still owing a retry')
+  assert.equal((openInvoiceBasisDeferral({ ...base, shipments: [{ shipmentJournalDate: new Date(), revenueRecognizedAmount: '500' }] }) as { open: { toFixed(n: number): string } }).open.toFixed(2), '0.00', 'never negative')
+})
+
+test('the stranded-deferral invariant: INVOICE basis only, not yet unwound, and only with no invoice, a voided one, or a cancelled order', async () => {
+  const { evaluateAccountingInvariantRows } = await import('@/lib/domain/accounting/invariants')
+  const row = (over: Record<string, unknown>) => ({
+    id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'ALLOCATED', accountingInvoiceId: 'INV-1', revenueDeferralBasis: 'INVOICE',
+    unearnedRevenueAmount: '400', revenueDeferralUnwoundAmount: null, revenueDeferralUnwindOwedAt: null, revenueDeferralUnwindReason: null,
+    shipments: [], refunds: [], ...over,
+  })
+  const codes = (over: Record<string, unknown>) => evaluateAccountingInvariantRows({
+    salesOrders: [], postedShipments: [], syncLogs: [], unresolvedAllocationBasisRefunds: [], reversalNeverRecordedRefunds: [],
+    strandedInvoiceBasisDeferrals: [row(over) as never],
+  }).filter((f) => f.code === 'invoice_basis_deferral_stranded')
+  assert.equal(codes({}).length, 0, 'an ordinary deferred order with its invoice')
+  assert.equal(codes({ status: 'CANCELLED' }).length, 1, 'cancelled orders are included')
+  assert.equal(codes({ accountingInvoiceId: null }).length, 1, 'no invoice')
+  assert.equal(codes({ revenueDeferralUnwindOwedAt: new Date(), revenueDeferralUnwindReason: 'INVOICE_VOIDED' }).length, 1, 'voided, unwind not posted yet')
+  assert.equal(codes({ status: 'CANCELLED', revenueDeferralUnwoundAmount: '400' }).length, 0, 'unwound')
+  assert.equal(codes({ status: 'CANCELLED', revenueDeferralBasis: 'PAID' }).length, 0, 'a PAID-basis deferral is not this check')
+  assert.equal(codes({ status: 'CANCELLED', revenueDeferralBasis: null }).length, 0)
+  assert.equal(codes({ status: 'CANCELLED', shipments: [{ shipmentJournalDate: new Date(), revenueRecognizedAmount: '400' }] }).length, 0, 'fully released')
+})
