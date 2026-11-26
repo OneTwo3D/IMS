@@ -51,7 +51,7 @@ type LayerReadClient = Pick<Prisma.TransactionClient, 'costLayer'>
  * ever booked when an operator enters it. Exact: the stored 6dp Decimal, never a blend.
  *
  * Only a layer that records what was PAID or what making it COST qualifies (o3d-jwa8m): a purchase receipt (poLineId set, which includes a
- * Mintsoft align-up receipt-reconciliation layer: it carries the PO line AND an adjustment movement) or a production OUTPUT (productionOrderId set
+ * WMS align-up receipt-reconciliation layer: it carries the PO line AND an adjustment movement) or a production OUTPUT (productionOrderId set
  * and the product is the order's output product, so a disassembly's component layers do not count). Excluded, because each carries a figure that is
  * not a fresh price: a transfer's recreated layers (the source layers' old cost, stamped received now), a refund restock (returnMovementId), and a
  * plain adjustment layer (an earlier default would perpetuate itself). A refund restock, a transfer layer and a plain adjustment carry neither id.
