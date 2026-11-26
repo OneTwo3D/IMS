@@ -11,6 +11,7 @@
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { isRegisteredAccountingConnector, type AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 import { db } from '@/lib/db'
+import { INVOICE_PAYMENT_HELD_DOCUMENT_DELETE_ACTION } from '@/lib/domain/accounting/invoice-payment-hold-action'
 import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
@@ -1923,9 +1924,18 @@ export async function registerInvoicePaymentWithLedger(params: {
     // room this one was measured against, so it is reported exactly as if it had been refused up front
     // — the operator sees one message naming the reason, not a silent no-op.
     if (typeof outcome === 'object' && 'deletePending' in outcome) {
-      await warn('invoice_payment_not_registered',
-        `The payment for order ${params.orderReference} is recorded in IMS but was NOT registered in the accounting system: ${outcome.deletePending}`,
-        { amount: amountNumber, currency: params.currency, refusal: 'DOCUMENT_DELETE_PENDING' })
+      // o3d-2gv2g LOW-6: A HOLD, NOT A DECIDED REFUSAL. Its own action, so the receipt sweep (which treats `invoice_payment_not_registered` as
+      // decided for good) picks the receipt up again and registers it once the delete has cleared (a refused or cancelled delete leaves the
+      // invoice standing). Written once per receipt, not on every sweep that finds the delete still pending.
+      let alreadyHeld = 0
+      try {
+        alreadyHeld = await db.activityLog.count({ where: { entityType: 'SALES_ORDER', entityId: params.orderId, action: INVOICE_PAYMENT_HELD_DOCUMENT_DELETE_ACTION, metadata: { path: ['paymentId'], equals: params.paymentId } } })
+      } catch { /* unreadable: the notice is written again, which is the visible side */ }
+      if (alreadyHeld === 0) {
+        await warn(INVOICE_PAYMENT_HELD_DOCUMENT_DELETE_ACTION,
+          `The payment for order ${params.orderReference} is recorded in IMS but is not registered in the accounting system yet: ${outcome.deletePending} It is registered automatically once the delete has finished or been cancelled.`,
+          { amount: amountNumber, currency: params.currency, refusal: 'DOCUMENT_DELETE_PENDING' })
+      }
       return registeredFor.connector
     }
     if (typeof outcome === 'object' && 'refused' in outcome) {

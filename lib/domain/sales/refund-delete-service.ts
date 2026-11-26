@@ -637,9 +637,6 @@ async function retireSyncRow(tx: Tx, row: SyncRow, reason: string): Promise<void
   if (retired.count === 0) throw new RefundDeleteRefused([refundDeleteRefusals.accountingInFlight('accounting entry')])
 }
 
-/** Why phase 2 stopped after the ledger confirmed the void. */
-const phase2Stopped = (detail: string): string => `The credit note is closed in the accounting system, but the refund could not be deleted in IMS yet: ${detail}`
-
 /** The worker's follow-ups after a committed phase 2, reported to it (it records them), never swallowed and never undoing the delete. */
 export type RefundDeleteFollowUps = { stockSyncFailed: boolean; reallocationWarning: string | null }
 
@@ -707,28 +704,6 @@ async function completeRefundDeleteFollowUpsIfOwed(client: typeof db, refundId: 
 }
 
 /**
- * PHASE 2 of deleting a refund whose credit note was posted, for a void the ledger has ALREADY confirmed (a resume). It unwinds the rest exactly as the
- * one-step delete does. If it cannot (a rule now refuses), it returns the refusal. The void worker does not call this: it runs
- * voidCreditNoteThenCompleteRefundDeletion, which re-checks and fences the refund's stock before it lets the void reach the ledger.
- */
-export async function completeRefundDeletionAfterVoid(
-  client: RefundDeleteClient,
-  input: { refundId: string; voidSyncLogId: string; actorUserId: string | null; reason: string | null },
-): Promise<{ ok: true; productIds: string[]; stockSyncFailed: boolean; reallocationWarning: string | null } | { ok: false; error: string }> {
-  const result = await deleteSalesOrderRefund(client, { refundId: input.refundId, actorUserId: input.actorUserId, reason: input.reason, voidConfirmed: { syncLogId: input.voidSyncLogId } })
-  if (!result.success) return { ok: false, error: phase2Stopped(result.error) }
-  const appClient = (isTx(client) ? (await import('@/lib/db')).db : client) as typeof db
-  if (result.alreadyDeleted) {
-    const owed = await completeRefundDeleteFollowUpsIfOwed(appClient, input.refundId)
-    return { ok: true, productIds: owed?.productIds ?? [], stockSyncFailed: owed?.stockSyncFailed ?? false, reallocationWarning: owed?.reallocationWarning ?? null }
-  }
-  // The delete is committed; the follow-ups are reported to the caller (it records them), never swallowed.
-  const followUps = await runRefundDeleteFollowUps(result.orderId, result.productIds)
-  if (!isTx(client)) await markRefundDeleteFollowUpsDone(appClient, input.refundId)
-  return { ok: true, productIds: result.productIds, ...followUps }
-}
-
-/**
  * o3d-0syfq (review HIGH-1): THE TIME BUDGET OF THE WORKER'S LOCKED TRANSACTION.
  *
  * The transaction holds the order, stock-level and cost-layer locks while the ledger is asked, so it must never outlive the ledger call it wraps:
@@ -777,8 +752,14 @@ export type VoidThenCompleteResult =
    * #1132 R2-MED-2 `notSent`: THIS attempt sent no void (refused before it, no time, a lock wait, the transport's own named refusal, Xero's 429):
    * the caller hands the work back without spending a retry. #1132 MED-3 `refusedUnderLocks` + `provenNeverSent`: the delete itself was refused
    * under the locks and no attempt of this void row can have reached Xero, so the row may be closed for good (retireRefusedRefundDeleteVoid).
+   *
+   * o3d-2gv2g MED-1: `provenNeverSent` is true only when the row's own facts say so AND Xero was read and shows the credit note standing
+   * (`ledgerStatus`, the status read). The row's facts alone are not enough: a rolled-back or deploy-overlap build that claims the row (which
+   * re-asserts custody) and posts the void without stamping it leaves the same facts as a row that never sent one. `ledgerUnread`: the row's facts
+   * say never sent, but Xero could not be read (an error, a timeout, the call budget): nothing is closed on an unread, the work is handed back
+   * without spending a retry and Xero is read again on the next attempt.
    */
-  | { ok: false; voided: boolean | 'unknown'; error: string; passthrough?: unknown; notSent?: true; refusedUnderLocks?: true; provenNeverSent?: boolean }
+  | { ok: false; voided: boolean | 'unknown'; error: string; passthrough?: unknown; notSent?: true; refusedUnderLocks?: true; provenNeverSent?: boolean; ledgerStatus?: string; ledgerUnread?: true }
 
 export type RefundDeleteLedger = {
   /**
@@ -813,10 +794,14 @@ function stampsVoidAttempts(payload: unknown): boolean {
 }
 
 /**
- * #1132 MED-3: NO ATTEMPT OF THIS VOID ROW CAN HAVE REACHED THE LEDGER. A row queued by this build carries the marker, and its worker stamps
- * `remoteAttemptedAt` (on its own connection, so it survives a rollback) immediately before every void POST: an unstamped row under custody
- * has never sent one, however often it was claimed and handed back. An older row has no stamp to read, so only a row never failed and never
- * re-claimed counts (the pre-#1132 rule).
+ * #1132 MED-3: THE ROW'S OWN FACTS SAY NO ATTEMPT OF THIS VOID ROW REACHED THE LEDGER. A row queued by this build carries the marker, and its
+ * worker stamps `remoteAttemptedAt` (on its own connection, so it survives a rollback) immediately before every void POST: an unstamped row
+ * under custody has never sent one from a build that stamps. An older row has no stamp to read, so only a row never failed and never re-claimed
+ * counts (the pre-#1132 rule).
+ *
+ * o3d-2gv2g MED-1: NECESSARY, NOT SUFFICIENT. A rollback to (or a deploy overlap with) a build that does not stamp can claim the row, which
+ * re-asserts custody, and post the void unstamped. So a row is never closed as never sent on these facts alone: reportVoidFailure always reads
+ * the credit note in Xero first, and retireRefusedRefundDeleteVoid requires that read.
  */
 export function voidRowProvenNeverSent(row: VoidRowFacts): boolean {
   if (!row) return false
@@ -850,13 +835,36 @@ async function raiseVoidedButStandingTask(client: typeof db, input: { refundId: 
 }
 
 /**
- * #1132 R2-MED-2: the void entry has used up its retries (its last failure is about to make it FAILED): a person is told, once per refund. Not
- * raised when the credit note is known voided in Xero (the voided task above says that), nor for a wait (a wait spends no retry).
+ * #1132 R2-MED-2: the void entry has used up its retries (its last failure made it FAILED): a person is told. Not raised for a wait (a wait spends
+ * no retry).
+ *
+ * o3d-2gv2g LOW-2: raised by the processor's fenced failure write itself (applyMainSyncFailureRetry), in its transaction, only by the write that
+ * made the row FAILED: never from an unfenced read of the retry count beforehand. Once per GIVE-UP, not once per row: `giveUp` is the attempt
+ * revision that gave up (every claim moves it, so an operator's retry that fails for good again is a new give-up and is told again; a task marked
+ * done no longer swallows it). Not raised while a task for this refund is still open: the open stuck task, or the voided-not-unwound task (Xero
+ * holds the credit note voided; that task already says what to do).
  */
-export async function raiseRefundDeleteVoidStuckTask(client: typeof db, input: { refundId: string; voidSyncLogId: string; error: string }): Promise<boolean> {
+/**
+ * o3d-2gv2g LOW-2: the canonical lock order (the order before the sync row) for the failure write that gives a refund delete's void up: it then
+ * writes the give-up task, whose row references the order. The refund's order is locked first; nothing when the refund is gone.
+ */
+export async function lockOrderOfRefundDeleteVoid(tx: Pick<Prisma.TransactionClient, 'salesOrderRefund'>, refundId: string): Promise<void> {
+  // soft-delete exception: the refund the void row belongs to, standing or not.
+  const refund = await tx.salesOrderRefund.findUnique({ where: { id: refundId }, select: { orderId: true } })
+  if (refund && typeof (tx as { $queryRaw?: unknown }).$queryRaw === 'function') await lockSalesOrder(tx as Prisma.TransactionClient, refund.orderId)
+}
+
+export async function raiseRefundDeleteVoidStuckTask(
+  client: Pick<Prisma.TransactionClient, 'salesOrderRefund' | 'wmsOperatorTask' | 'activityLog'>,
+  input: { refundId: string; voidSyncLogId: string; giveUp: number; error: string },
+): Promise<boolean> {
   // soft-delete exception: the refund the task names is the one still standing.
   const refund = await client.salesOrderRefund.findUnique({ where: { id: input.refundId }, select: { orderId: true, creditNoteNumber: true, deletedAt: true, order: { select: { orderNumber: true } } } })
   if (!refund || refund.deletedAt) return false
+  const open = await client.wmsOperatorTask.count({
+    where: { connector: 'xero', orderId: refund.orderId, externalOrderId: input.refundId, reason: { in: ['REFUND_DELETE_VOID_STUCK', 'REFUND_DELETE_VOIDED_NOT_UNWOUND'] }, status: 'OPEN' },
+  })
+  if (open > 0) return false
   const { raiseWmsOperatorTask } = await import('@/lib/domain/wms/operator-tasks')
   const cn = refund.creditNoteNumber ?? input.refundId
   const queryText = `The deletion of refund ${cn} stopped: IMS tried to void its credit note in Xero and gave up after repeated failures (${input.error}). `
@@ -864,13 +872,13 @@ export async function raiseRefundDeleteVoidStuckTask(client: typeof db, input: {
     + 'if it is not voided, either retry the entry once the cause is cleared, or cancel the entry and keep the refund.'
   const created = await raiseWmsOperatorTask(client, {
     connector: 'xero', orderId: refund.orderId, externalOrderId: input.refundId, reason: 'REFUND_DELETE_VOID_STUCK',
-    queryText, dedupeBasis: `refund-delete-void-stuck:${input.voidSyncLogId}`, payload: { orderNumber: refund.order.orderNumber ?? null },
+    queryText, dedupeBasis: `refund-delete-void-stuck:${input.voidSyncLogId}:give-up-${input.giveUp}`, payload: { orderNumber: refund.order.orderNumber ?? null },
   })
   if (created) {
     await client.activityLog.create({
       data: {
         entityType: 'SALES_ORDER', entityId: refund.orderId, action: 'refund_delete_void_stuck', tag: 'sales', level: 'ERROR', userId: null,
-        description: queryText, metadata: { refundId: input.refundId, voidSyncLogId: input.voidSyncLogId },
+        description: queryText, metadata: { refundId: input.refundId, voidSyncLogId: input.voidSyncLogId, giveUp: input.giveUp },
       },
     })
   }
@@ -883,11 +891,16 @@ export async function raiseRefundDeleteVoidStuckTask(client: typeof db, input: {
  * UPDATE (`abandonedBeforeRemoteCall`, so its standing is PROVEN_NOT_POSTED: the delete no longer waits on it and a new request queues a fresh
  * void under the same key), fenced on the claim this worker holds and re-asserting the proof in the predicate. A WARNING on the order says why
  * and how to ask again. Returns false (nothing changed) when the claim or the proof no longer holds.
+ *
+ * o3d-2gv2g MED-1: AND ONLY ON XERO'S WORD. `ledgerStatus` is the credit note's status as Xero returned it in this attempt (reportVoidFailure's
+ * bounded read). A missing read, or VOIDED / DELETED, retires nothing: the row's facts cannot tell a row that never sent a void from one a
+ * rolled-back build voided without stamping.
  */
 export async function retireRefusedRefundDeleteVoid(
   client: typeof db,
-  input: { voidSyncLogId: string; attemptRevision: number; claimedAt: Date; refundId: string; why: string },
+  input: { voidSyncLogId: string; attemptRevision: number; claimedAt: Date; refundId: string; why: string; ledgerStatus: string | null | undefined },
 ): Promise<boolean> {
+  if (!creditNoteStandsInLedger(input.ledgerStatus)) return false
   const reason = `Cancelled: the refund delete was refused (${input.why}). Nothing was sent to Xero; the refund and its credit note both stand. Request the delete again once the cause is cleared.`
   return client.$transaction(async (tx) => {
     // soft-delete exception: the refund the row belongs to, still standing.
@@ -918,6 +931,11 @@ export async function retireRefusedRefundDeleteVoid(
   }, { maxWait: 5_000, timeout: 20_000 })
 }
 
+/** o3d-2gv2g MED-1: Xero was read and the credit note stands there (any status but VOIDED / DELETED). Null or empty: not read, so not known. */
+export function creditNoteStandsInLedger(status: string | null | undefined): status is string {
+  return typeof status === 'string' && status !== '' && status !== 'VOIDED' && status !== 'DELETED'
+}
+
 /** A Postgres lock wait that ran out (`lock_timeout`, SQLSTATE 55P03), however the driver wraps it. */
 function isLockTimeout(error: unknown): boolean {
   const text = error instanceof Error ? `${error.message} ${String((error as { code?: unknown }).code ?? '')}` : String(error)
@@ -934,9 +952,10 @@ function isLockTimeout(error: unknown): boolean {
  * bounded void reach the ledger. Anything that refuses (the re-decision, the unwind itself, too little time left, the void) throws and rolls the
  * whole transaction back, so IMS is unchanged and, for everything before the void, nothing was sent.
  *
- *   refused before the void  the ledger is NOT asked to void. If the void row shows an earlier attempt that may have reached Xero, the credit note
- *                            is READ first: voided there, the refund still stands in IMS, so an operator task says exactly that (never "not
- *                            voided"); not voided, the refusal stands. Proven never sent (#1132 MED-3): the caller closes the row for good.
+ *   refused before the void  the ledger is NOT asked to void. The credit note is READ first, always (o3d-2gv2g MED-1): voided there, the refund
+ *                            still stands in IMS, so an operator task says exactly that (never "not voided"); not voided, the refusal stands,
+ *                            and when the row's facts also say no attempt was sent (#1132 MED-3) the caller closes the row for good. Unread:
+ *                            nothing is closed; the work waits and Xero is read again.
  *   the void fails           the unwind rolls back with it; the entry fails and retries (the void reads the document first, so a retry converges).
  *                            Not sent at all (#1132 R2-MED-2): handed back without spending a retry.
  *   lost after the void      (the commit itself, a crash): the retry runs the unwind again under the locks and its void read finds the credit note
@@ -1063,21 +1082,25 @@ async function reportVoidFailure(
     ? `The credit note void was not sent, so the refund was not deleted in IMS: ${detail}`
     : `The credit note void was not started: ${detail}`
   const row = await client.accountingSyncLog.findUnique({ where: { id: input.voidSyncLogId }, select: VOID_ROW_FACTS_SELECT }).catch(() => null)
-  const provenNeverSent = voidRowProvenNeverSent(row)
-  if (provenNeverSent) {
-    return refused
-      ? { ok: false, voided: false, ...notSentHere, refusedUnderLocks: true, provenNeverSent: true, error: `The credit note was not voided, so the refund and its credit note both stand: ${failure.error}` }
-      : { ok: false, voided: false, ...notSentHere, ...passthrough, error: notStarted(failure.error) }
-  }
-  // An earlier attempt may have voided it: Xero is read (read only) before IMS says anything about it.
+  const rowSaysNeverSent = voidRowProvenNeverSent(row)
+  // o3d-2gv2g LOW-1: an attempt refused before its void (no time, a lock wait, the transport's own named refusal, the call budget, a 429) is a
+  // wait: the next attempt decides, and its void reads the credit note before it writes. Nothing here is decided on what Xero holds, so Xero is
+  // not read for it (a stuck entry would otherwise spend a GET on every wait). What Xero holds is not claimed either way.
+  if (!refused) return { ok: false, voided: rowSaysNeverSent ? false : 'unknown', ...notSentHere, ...passthrough, error: notStarted(failure.error) }
+  // REFUSED UNDER THE LOCKS: the one outcome that can close the row or raise a task, so it is decided on Xero's word. o3d-2gv2g MED-1: ALWAYS
+  // read, even when the row's facts say no attempt was sent: a rolled-back or deploy-overlap build can claim the row (re-asserting custody) and
+  // post the void without stamping it, leaving exactly those facts while Xero holds the credit note voided.
   const status = await ledger.readCreditNoteStatus(bounded).catch(() => null)
-  if (status === null) return { ok: false, voided: 'unknown', ...notSentHere, ...(refused ? { refusedUnderLocks: true as const, provenNeverSent: false } : {}), error: `The refund was not deleted in IMS (${failure.error}), and the credit note could not be read in Xero, so whether an earlier attempt voided it is not known; it is read again on the next attempt.` }
-  if (status !== 'VOIDED' && status !== 'DELETED') {
-    return refused
-      ? { ok: false, voided: false, ...notSentHere, refusedUnderLocks: true, provenNeverSent: false, error: `The credit note was not voided, so the refund and its credit note both stand: ${failure.error}` }
-      : { ok: false, voided: false, ...notSentHere, ...passthrough, error: notStarted(failure.error) }
+  if (status === null || status === '') {
+    // Never closed on an unread. A row whose facts say never sent is handed back without spending a retry (`ledgerUnread`) and read again.
+    return {
+      ok: false, voided: 'unknown', ...notSentHere, refusedUnderLocks: true, provenNeverSent: false, ...(rowSaysNeverSent ? { ledgerUnread: true as const } : {}),
+      error: `The refund was not deleted in IMS (${failure.error}), and the credit note could not be read in Xero, so whether an earlier attempt voided it is not known; it is read again on the next attempt.`,
+    }
   }
-  if (!refused) return { ok: false, voided: true, ...notSentHere, error: `The credit note is already voided in Xero; the refund is unwound in IMS on the next attempt (${failure.error})` }
+  if (creditNoteStandsInLedger(status)) {
+    return { ok: false, voided: false, ...notSentHere, refusedUnderLocks: true, provenNeverSent: rowSaysNeverSent, ledgerStatus: status, error: `The credit note was not voided, so the refund and its credit note both stand: ${failure.error}` }
+  }
   // Voided in Xero, and the unwind refused under the locks: the one state IMS cannot repair itself. A person is told, once.
   // soft-delete exception: the refund the task names is the one still standing.
   const refund = await client.salesOrderRefund.findUnique({ where: { id: input.refundId }, select: { orderId: true, creditNoteNumber: true } })
