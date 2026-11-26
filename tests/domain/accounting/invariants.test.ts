@@ -231,7 +231,7 @@ test('flags posted revenue whose payment was reversed with no compensating credi
   assert.equal(finding?.orderId, 'order-1')
 })
 
-// o3d-r2nkq: an order Group A1 deferred from its invoice while unpaid has revenue and no payment by design (an open receivable).
+// unpaid-invoice deferral: an order Group A1 deferred from its invoice while unpaid has revenue and no payment by design (an open receivable).
 test('does not flag an INVOICE-basis deferral with no payment as revenue posted without payment', () => {
   const rows = cleanRows()
   rows.salesOrders[0] = { ...rows.salesOrders[0], paidAt: null, refunds: [], revenueDeferralBasis: 'INVOICE' }

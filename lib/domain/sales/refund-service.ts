@@ -3588,7 +3588,7 @@ async function stageRefundAccountingReversals(
         data: {
           revenueDeferredDate: null,
           revenueDeferredBatchRef: null,
-          // o3d-r2nkq: the basis and its day go with the stamp they describe (NULL on every order deferred with the switch off).
+          // unpaid-invoice deferral: the basis and its day go with the stamp they describe (NULL on every order deferred with the switch off).
           revenueDeferralBasis: null,
           revenueDeferralEventAt: null,
           ...(allocationBasisUnresolved ? {} : {

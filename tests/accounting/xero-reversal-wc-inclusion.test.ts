@@ -419,7 +419,7 @@ test('a WC-handled reversal clears paidAt last as well (o3d-w00 Codex r10 #1)', 
   assert.match(result.error ?? '', /paidAt was NOT cleared/)
 })
 
-// o3d-r2nkq (owner ruling 2026-11-26): a payment removed from an order Group A1 deferred from its INVOICE while unpaid only reopens
+// Unpaid-invoice deferral (owner ruling 2026-11-26): a payment removed from an order Group A1 deferred from its INVOICE while unpaid only reopens
 // the receivable. That deferral did not come from the payment, so no chargeback credit note is raised; paidAt is still cleared and finance still alerted.
 test('INVOICE-basis deferral: a removed payment raises NO chargeback, still clears paidAt and alerts', async () => {
   const { effects, calls } = makeEffects({ recentWcRefund: false })

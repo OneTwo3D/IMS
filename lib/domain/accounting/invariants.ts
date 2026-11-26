@@ -46,7 +46,7 @@ type SalesOrderAccountingRow = {
   // null — i.e. a payment reversal cleared it). The DB loader always selects it.
   paidAt?: Date | string | null
   revenueDeferredDate: Date | string | null
-  // o3d-r2nkq: INVOICE = deferred from the invoice while unpaid (switch `xero_defer_unpaid_invoiced_revenue_enabled`). Absent/NULL = PAID.
+  // unpaid-invoice deferral: INVOICE = deferred from the invoice while unpaid (switch `xero_defer_unpaid_invoiced_revenue_enabled`). Absent/NULL = PAID.
   revenueDeferralBasis?: string | null
   // o3d-0qoo: the exact A1 batch referenceId stamped on this row in the same
   // transaction as revenueDeferredDate. Optional for the same reason as paidAt
@@ -707,7 +707,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     // amount is unknown (<= 0) fall back to presence to avoid false positives.
     const fullyCompensated = creditNotes.length > 0
       && (postedRevenue <= 0 || creditedTotal + 0.01 >= postedRevenue)
-    // o3d-r2nkq: an order Group A1 deferred from its invoice while unpaid never took that deferral from a payment, so
+    // unpaid-invoice deferral: an order Group A1 deferred from its invoice while unpaid never took that deferral from a payment, so
     // revenue with no cash is its ordinary state (an open receivable), not a reversed payment.
     if ((hasA1 || hasA2 || stagedPostedShipments.length > 0) && order.paidAt === null && !fullyCompensated && order.revenueDeferralBasis !== 'INVOICE') {
       findings.push({
@@ -1181,7 +1181,7 @@ export async function collectAccountingInvariantRows(
         status: true,
         paidAt: true,
         revenueDeferredDate: true,
-        // o3d-r2nkq: an INVOICE-basis deferral is not evidence of a payment.
+        // unpaid-invoice deferral: an INVOICE-basis deferral is not evidence of a payment.
         revenueDeferralBasis: true,
         // o3d-0qoo: the persisted batch refs are what the evidence check matches on;
         // omitting them silently demotes every row to the derive-from-stamp fallback.

@@ -350,7 +350,7 @@ test('purchase_event_fx_rates_enabled: the write transaction re-checks the accou
   assert.equal(f.settings.get('purchase_event_fx_rates_enabled'), undefined)
 }))
 
-// o3d-r2nkq: unpaid invoiced revenue deferral. Off by default, ADMIN, stamps its switch-on instant, and its keys are the ones the daily batch reads.
+// unpaid-invoice deferral: unpaid invoiced revenue deferral. Off by default, ADMIN, stamps its switch-on instant, and its keys are the ones the daily batch reads.
 test('xero_defer_unpaid_invoiced_revenue_enabled: off by default, ADMIN, stamped on and cleared off; keys equal the reader\'s', async () => {
   const def = findSwitch('xero_defer_unpaid_invoiced_revenue_enabled')!
   assert.equal(def.defaultValue, 'false')

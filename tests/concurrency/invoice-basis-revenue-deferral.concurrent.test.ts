@@ -5,7 +5,7 @@ import test from 'node:test'
 import { config } from 'dotenv'
 
 /**
- * o3d-r2nkq (FRS 102 s23.10): an UNPAID order whose AUTHORISED invoice IMS posted after the switch
+ * Unpaid-invoice deferral (FRS 102 s23.10): an UNPAID order whose AUTHORISED invoice IMS posted after the switch
  * `xero_defer_unpaid_invoiced_revenue_enabled` went on has its unshipped revenue deferred by Group A1, dated on the
  * invoice's document day, and released by Group B on each shipment's day — through the real daily batch and refund
  * service against a real Postgres.
@@ -180,7 +180,7 @@ async function setup(rig: Rig, switchOn: { since: Date } | 'off' | 'value-only')
 
 const suffixOf = () => randomUUID().replace(/-/g, '').slice(0, 12)
 
-test('o3d-r2nkq: unpaid, unshipped: A1 defers the whole order on the invoice day; each shipment releases its part on the day it ships', { skip }, async () => {
+test('unpaid-invoice deferral: unpaid, unshipped: A1 defers the whole order on the invoice day; each shipment releases its part on the day it ships', { skip }, async () => {
   const rig = await openRig()
   const fixtures: Fixture[] = []
   try {
@@ -242,7 +242,7 @@ test('o3d-r2nkq: unpaid, unshipped: A1 defers the whole order on the invoice day
   }
 })
 
-test('o3d-r2nkq: partially shipped before the first run: the shipped part is costed directly and stays in Sales; A1 defers only the unshipped part', { skip }, async () => {
+test('unpaid-invoice deferral: partially shipped before the first run: the shipped part is costed directly and stays in Sales; A1 defers only the unshipped part', { skip }, async () => {
   const rig = await openRig()
   const fixtures: Fixture[] = []
   try {
@@ -286,7 +286,7 @@ test('o3d-r2nkq: partially shipped before the first run: the shipped part is cos
   }
 })
 
-test('o3d-r2nkq: deferred from the invoice, shipped, THEN paid: the release is dated the ship day, not the later payment day', { skip }, async () => {
+test('unpaid-invoice deferral: deferred from the invoice, shipped, THEN paid: the release is dated the ship day, not the later payment day', { skip }, async () => {
   const rig = await openRig()
   const fixtures: Fixture[] = []
   try {
@@ -347,7 +347,7 @@ async function paidThenShippedShape(rig: Rig, switchSetting: { since: Date } | '
   }
 }
 
-test('o3d-r2nkq: paid then shipped is unchanged by the switch: same journals, same dates (the payment day)', { skip }, async () => {
+test('unpaid-invoice deferral: paid then shipped is unchanged by the switch: same journals, same dates (the payment day)', { skip }, async () => {
   const rig = await openRig()
   try {
     const off = await paidThenShippedShape(rig, 'off')
@@ -364,7 +364,7 @@ test('o3d-r2nkq: paid then shipped is unchanged by the switch: same journals, sa
   }
 })
 
-test('o3d-r2nkq: switch OFF (and the refusals with it on): an unpaid invoiced order is never deferred and the batch output is what it was', { skip }, async () => {
+test('unpaid-invoice deferral: switch OFF (and the refusals with it on): an unpaid invoiced order is never deferred and the batch output is what it was', { skip }, async () => {
   const rig = await openRig()
   const fixtures: Fixture[] = []
   try {
@@ -401,7 +401,7 @@ test('o3d-r2nkq: switch OFF (and the refusals with it on): an unpaid invoiced or
   }
 })
 
-test('o3d-r2nkq: refunds of an invoice-deferred unpaid order: a pre-batch refund is netted (dated from the invoice day), a later refund reverses Unearned, a full refund clears the basis', { skip }, async () => {
+test('unpaid-invoice deferral: refunds of an invoice-deferred unpaid order: a pre-batch refund is netted (dated from the invoice day), a later refund reverses Unearned, a full refund clears the basis', { skip }, async () => {
   const rig = await openRig()
   const fixtures: Fixture[] = []
   try {
@@ -471,7 +471,7 @@ test('o3d-r2nkq: refunds of an invoice-deferred unpaid order: a pre-batch refund
   }
 })
 
-test('o3d-r2nkq: a cancelled unpaid order is never deferred, even with a proved invoice', { skip }, async () => {
+test('unpaid-invoice deferral: a cancelled unpaid order is never deferred, even with a proved invoice', { skip }, async () => {
   const rig = await openRig()
   const fixtures: Fixture[] = []
   try {

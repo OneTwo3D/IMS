@@ -7,7 +7,7 @@ import {
   readInvoiceBasisDeferralSwitch,
 } from '@/lib/domain/accounting/invoice-basis-deferral'
 
-// o3d-r2nkq: the proof Group A1 needs before it defers an UNPAID order's revenue from its invoice.
+// unpaid-invoice deferral: the proof Group A1 needs before it defers an UNPAID order's revenue from its invoice.
 
 const SINCE = new Date('2026-12-01T09:00:00.000Z')
 const order = { id: 'so-1', accountingInvoiceId: 'INV-1' }

@@ -185,7 +185,7 @@ async function computePreview(): Promise<DailyBatchPreview> {
     },
     orderBy: { paidAt: 'asc' },
   })
-  // o3d-r2nkq: with `xero_defer_unpaid_invoiced_revenue_enabled` on, unpaid orders whose AUTHORISED invoice was posted after
+  // unpaid-invoice deferral: with `xero_defer_unpaid_invoiced_revenue_enabled` on, unpaid orders whose AUTHORISED invoice was posted after
   // switch-on are deferred too; listed after the paid ones. Off, nothing is added.
   const invoiceBasisSwitch = await readInvoiceBasisDeferralSwitch(db)
   if (invoiceBasisSwitch.on) {

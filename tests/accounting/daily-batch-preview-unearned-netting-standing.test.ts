@@ -59,7 +59,7 @@ mock.module('@/lib/connectors/xero/books-lock-date', {
 mock.module('@/lib/db', {
   namedExports: {
     db: {
-      // o3d-r2nkq: the unpaid-invoice deferral switch is read (off).
+      // unpaid-invoice deferral: the unpaid-invoice deferral switch is read (off).
       setting: { findUnique: async () => null },
       salesOrder: { findMany: async () => [] },
       shipment: { findMany: async () => [SHIPMENT] },

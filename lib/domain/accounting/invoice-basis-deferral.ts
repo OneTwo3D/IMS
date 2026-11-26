@@ -1,5 +1,5 @@
 /**
- * o3d-r2nkq (FRS 102 s23.10) — DEFERRING THE REVENUE OF AN UNPAID INVOICE UNTIL THE GOODS SHIP.
+ * Unpaid-invoice deferral (FRS 102 s23.10) — DEFERRING THE REVENUE OF AN UNPAID INVOICE UNTIL THE GOODS SHIP.
  *
  * Group A1 defers an order's unshipped revenue (DR Sales / CR Unearned Revenue) once the order is PAID. An unpaid order
  * whose invoice IMS posted as AUTHORISED (a manual or B2B order: the invoice goes out when the order is created or a draft

@@ -1,4 +1,4 @@
--- o3d-r2nkq: additive only. Two NULLABLE columns with no default and one new enum type. NULL is the meaning every existing
+-- unpaid-invoice deferral: additive only. Two NULLABLE columns with no default and one new enum type. NULL is the meaning every existing
 -- row already has (deferred on the day it was paid), so nothing is backfilled and a predecessor serving across the window
 -- writes rows that read exactly as before. Only Group A1 with `xero_defer_unpaid_invoiced_revenue_enabled` on writes them.
 CREATE TYPE "RevenueDeferralBasis" AS ENUM ('PAID', 'INVOICE');

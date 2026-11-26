@@ -121,7 +121,7 @@ enum RefundDisposition {
 // Invoicing state of a sales order, orthogonal to the fulfilment lifecycle status (and to RefundDisposition): an order can
 // be SHIPPED and NOT_INVOICED, or CANCELLED and FULLY_INVOICED. Derived from the order's invoice evidence, never set by hand:
 // lib/domain/sales/invoicing-state.ts (SalesOrder.invoicingState).
-// o3d-r2nkq: why Group A1 deferred an order's revenue (SalesOrder.revenueDeferralBasis). NULL reads as PAID.
+// unpaid-invoice deferral: why Group A1 deferred an order's revenue (SalesOrder.revenueDeferralBasis). NULL reads as PAID.
 enum RevenueDeferralBasis {
   PAID
   INVOICE
@@ -2376,7 +2376,7 @@ model SalesOrder {
   // Accounting sub-ledger tracking
   revenueDeferredDate    DateTime?              @map("accounting_revenue_deferred_date") // Set by Group A1 — revenue deferred to Unearned
   unearnedRevenueAmount  Decimal?  @db.Decimal(18, 4) @map("accounting_unearned_revenue_amount") // Amount deferred
-  // o3d-r2nkq: WHY and FROM WHEN Group A1 deferred this order. NULL (every order deferred with the switch
+  // unpaid-invoice deferral: WHY and FROM WHEN Group A1 deferred this order. NULL (every order deferred with the switch
   // `xero_defer_unpaid_invoiced_revenue_enabled` off, and every order before it) means PAID: deferred on the day the
   // order was paid. INVOICE: an UNPAID order whose AUTHORISED invoice IMS posted after the switch went on, deferred
   // on the invoice's document day (`revenueDeferralEventAt`). A2, Group B and the pre-batch refund adjustments

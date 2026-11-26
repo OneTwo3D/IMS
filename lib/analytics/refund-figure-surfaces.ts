@@ -509,14 +509,14 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
     figures: ['xero_defer_unpaid_invoiced_revenue_enabled', 'xero_defer_unpaid_invoiced_revenue_enabled_at'],
     treatment: 'not-refund-sensitive',
     reason:
-      'o3d-r2nkq: the registry entry (key, ADMIN, switch-on stamp) of the unpaid-invoice revenue deferral switch. A setting name, not a figure.',
+      'unpaid-invoice deferral: the registry entry (key, ADMIN, switch-on stamp) of the unpaid-invoice revenue deferral switch. A setting name, not a figure.',
   },
   {
     file: 'lib/domain/accounting/invoice-basis-deferral.ts',
     figures: ['revenueDeferralBasis', 'revenueDeferralEventAt', 'revenueDeferredDate', 'xero_defer_unpaid_invoiced_revenue_enabled', 'xero_defer_unpaid_invoiced_revenue_enabled_at'],
     treatment: 'not-refund-sensitive',
     reason:
-      'o3d-r2nkq: decides WHETHER and FROM WHICH DAY Group A1 defers an unpaid order (the switch, its switch-on instant, the invoice proof and the anchor day). It computes no amount: the deferral figure is the one Group A1 already nets of refunds.',
+      'unpaid-invoice deferral: decides WHETHER and FROM WHICH DAY Group A1 defers an unpaid order (the switch, its switch-on instant, the invoice proof and the anchor day). It computes no amount: the deferral figure is the one Group A1 already nets of refunds.',
   },
   {
     file: 'lib/connectors/xero/payment-poller.ts',

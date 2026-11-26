@@ -1832,7 +1832,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
               refundStatus: true,
               // ACC-H11: Group B never dates a journal before the payment that created the deferral it draws on.
               paidAt: true,
-              // o3d-r2nkq: or, for a deferral made from the invoice (unpaid order), before the invoice's document day.
+              // unpaid-invoice deferral: or, for a deferral made from the invoice (unpaid order), before the invoice's document day.
               revenueDeferralBasis: true,
               revenueDeferralEventAt: true,
               totalBase: true,
@@ -2349,7 +2349,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       // payment that created the Unearned Revenue it draws on). Revenue and COGS of one shipment share
       // that date. Each date is its own journal with its own reference, the identity the stamps carry.
       const processedShipments = shipments.filter((shipment) => shipmentResults.has(shipment.id))
-      // o3d-r2nkq: the deferral's own day (`deferralAnchorDay`): the payment day, as before, unless the order was deferred
+      // unpaid-invoice deferral: the deferral's own day (`deferralAnchorDay`): the payment day, as before, unless the order was deferred
       // from its invoice, when it is the invoice's document day and a later payment does not move the release.
       const groupBDay = (shipment: (typeof shipments)[number]): string | null => laterDay(
         businessDay(shipment.shippedAt ?? shipment.createdAt),
@@ -2662,7 +2662,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
       orderBy: [{ paidAt: 'asc' }, { id: 'asc' }],
       take: batchLimit + 1,
     }), batchLimit)
-    // o3d-r2nkq: with `xero_defer_unpaid_invoiced_revenue_enabled` on, the slots the paid window left are given to
+    // unpaid-invoice deferral: with `xero_defer_unpaid_invoiced_revenue_enabled` on, the slots the paid window left are given to
     // UNPAID orders whose AUTHORISED invoice IMS posted at or after the switch went on (proved from the invoice's own
     // sync row), oldest invoice document day first. With the switch off this reads one setting and nothing else, so
     // the window, the journals and every stamp are what they were.
@@ -2697,7 +2697,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
     }
     // ACC-H12: an order whose shipment left before it was paid and is still waiting for its direct cost is not
     // deferred yet. Deferring it first would send the ship-date COGS down the ordinary path at the payment date.
-    // o3d-r2nkq: an UNPAID order (only ever in the window with the switch on) has every unjournaled shipment before
+    // unpaid-invoice deferral: an UNPAID order (only ever in the window with the switch on) has every unjournaled shipment before
     // payment, so any such shipment holds it back until the direct pass has costed it.
     const awaitingDirectCost = (order: (typeof orderWindow.rows)[number]): boolean => (order.shipments ?? []).some((shipment) => (
       !shipment.cogsRelievedFromInventoryAt
@@ -2869,7 +2869,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
                 revenueDeferredDate: new Date(),
                 revenueDeferredBatchRef: referenceId,
                 unearnedRevenueAmount: deferralByOrderId.get(deferral.orderId) ?? 0,
-                // o3d-r2nkq: written only with the switch on, so a switch-off run writes exactly what it always did.
+                // unpaid-invoice deferral: written only with the switch on, so a switch-off run writes exactly what it always did.
                 ...(invoiceBasisProofs.has(deferral.orderId)
                   ? { revenueDeferralBasis: 'INVOICE' as const, revenueDeferralEventAt: invoiceBasisProofs.get(deferral.orderId)?.eventAt ?? null }
                   : invoiceBasisSwitch.on ? { revenueDeferralBasis: 'PAID' as const } : {}),
@@ -2980,7 +2980,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             status: true,
             // ACC-H11: the journal is dated by the event - paid, and stock allocated.
             paidAt: true,
-            // o3d-r2nkq: an order deferred from its invoice dates from the invoice's document day instead of payment.
+            // unpaid-invoice deferral: an order deferred from its invoice dates from the invoice's document day instead of payment.
             revenueDeferralBasis: true,
             revenueDeferralEventAt: true,
             // o3d-0i5y r5 (rebase onto o3d-o97): what EARLIER A2 passes already recorded posting for
