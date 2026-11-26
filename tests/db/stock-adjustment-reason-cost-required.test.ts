@@ -59,6 +59,8 @@ test('stock adjustments: reason and unit cost required (switch on) and unchanged
   const productIds: string[] = []
   const reasonIds: string[] = []
   const countIds: string[] = []
+  const poIds: string[] = []
+  const supplierIds: string[] = []
   const savedSettings = await db.setting.findMany({ where: { key: { in: [SWITCH, ...ACCOUNTING.map(([k]) => k)] } } })
   const savedActiveReasons = await db.adjustmentReason.findMany({ where: { active: true }, select: { id: true } })
   t.after(async () => {
@@ -69,6 +71,9 @@ test('stock adjustments: reason and unit cost required (switch on) and unchanged
     await db.cogsEntry.deleteMany({ where: { movementId: { in: movementIds } } })
     await db.costLayer.deleteMany({ where: { productId: { in: productIds } } })
     await db.stockMovement.deleteMany({ where: { productId: { in: productIds } } })
+    await db.purchaseOrderLine.deleteMany({ where: { poId: { in: poIds } } })
+    await db.purchaseOrder.deleteMany({ where: { id: { in: poIds } } })
+    await db.supplier.deleteMany({ where: { id: { in: supplierIds } } })
     await db.stockCountLine.deleteMany({ where: { countId: { in: countIds } } })
     await db.stockCount.deleteMany({ where: { id: { in: countIds } } })
     await db.stockLevel.deleteMany({ where: { warehouseId: { in: warehouseIds } } })
@@ -106,11 +111,27 @@ test('stock adjustments: reason and unit cost required (switch on) and unchanged
     productIds.push(p.id)
     return p
   }
-  /** Two layers: an older dear one and a newer cheap one, so the average (and the warehouse average) differs from the latest. */
+  /** A purchase-order line for the product: the default addition cost reads receipt layers only (o3d-jwa8m), so the test layers are receipt layers. */
+  const poLineFor = async (productId: string) => {
+    const supplier = await db.supplier.create({ data: { name: `${RUN}-sup-${supplierIds.length}` }, select: { id: true } })
+    supplierIds.push(supplier.id)
+    const po = await db.purchaseOrder.create({
+      data: {
+        reference: `${RUN}-PO-${poIds.length}`, supplierId: supplier.id, status: 'RECEIVED', currency: 'GBP', fxRateToBase: 1,
+        subtotalForeign: 1, subtotalBase: 1, totalForeign: 1, totalBase: 1,
+        lines: { create: [{ productId, qty: 1, unitCostForeign: 1, unitCostBase: 1, totalForeign: 1, totalBase: 1 }] },
+      },
+      select: { id: true, lines: { select: { id: true } } },
+    })
+    poIds.push(po.id)
+    return po.lines[0]!.id
+  }
+  /** Two receipt layers: an older dear one and a newer cheap one, so the average (and the warehouse average) differs from the latest. */
   const stockWithLayers = async (productId: string, warehouseId: string) => {
+    const poLineId = await poLineFor(productId)
     await db.stockLevel.create({ data: { productId, warehouseId, quantity: 20 } })
-    await db.costLayer.create({ data: { productId, warehouseId, receivedQty: 10, remainingQty: 10, unitCostBase: 10, receivedAt: new Date(Date.now() - 120_000) } })
-    await db.costLayer.create({ data: { productId, warehouseId, receivedQty: 10, remainingQty: 10, unitCostBase: 2, receivedAt: new Date(Date.now() - 60_000) } })
+    await db.costLayer.create({ data: { productId, warehouseId, receivedQty: 10, remainingQty: 10, unitCostBase: 10, receivedAt: new Date(Date.now() - 120_000), poLineId } })
+    await db.costLayer.create({ data: { productId, warehouseId, receivedQty: 10, remainingQty: 10, unitCostBase: 2, receivedAt: new Date(Date.now() - 60_000), poLineId } })
   }
   const lastMovement = (productId: string) => db.stockMovement.findFirst({ where: { productId, type: 'ADJUSTMENT' }, orderBy: { createdAt: 'desc' } })
   const movementCount = (productId: string) => db.stockMovement.count({ where: { productId } })
@@ -179,7 +200,7 @@ test('stock adjustments: reason and unit cost required (switch on) and unchanged
     assert.match(refused.message ?? '', /Enter a unit cost for this addition/)
     assert.equal(await movementCount(p.id), 0)
     await db.stockLevel.create({ data: { productId: p.id, warehouseId: w2.id, quantity: 5 } })
-    await db.costLayer.create({ data: { productId: p.id, warehouseId: w2.id, receivedQty: 5, remainingQty: 0, unitCostBase: '7.123456', receivedAt: new Date(Date.now() - 60_000) } })
+    await db.costLayer.create({ data: { productId: p.id, warehouseId: w2.id, receivedQty: 5, remainingQty: 0, unitCostBase: '7.123456', receivedAt: new Date(Date.now() - 60_000), poLineId: await poLineFor(p.id) } })
     const fallback = await single({ productId: p.id, warehouseId: w1.id, qty: '1', reasonId: mapped })
     assert.equal(fallback.success, true, JSON.stringify(fallback))
     assert.equal((await lastMovement(p.id))!.unitCostBase!.toFixed(6), '7.123456', 'a consumed layer still counts as the latest cost')
@@ -275,6 +296,8 @@ test('stock adjustments: reason and unit cost required (switch on) and unchanged
       const p = await product(`edit-${on}`)
       await stockWithLayers(p.id, w.id)
       await setSwitch(on)
+      // ON: with accounting posting off the edit owes no journal, so the valuation rule is what is under test (the posting-on refusal is the next test).
+      if (on) await db.setting.deleteMany({ where: { key: { in: ACCOUNTING.map(([k]) => k) } } })
       const removed = await single({ productId: p.id, warehouseId: w.id, qty: '-1', reasonId: mapped })
       assert.equal(removed.success, true, JSON.stringify(removed))
       const mv = await lastMovement(p.id)
@@ -285,7 +308,130 @@ test('stock adjustments: reason and unit cost required (switch on) and unchanged
       const after = await db.stockMovement.findUniqueOrThrow({ where: { id: mv!.id } })
       if (on) assert.equal(after.unitCostBase!.toFixed(6), '2.000000', 'ON: latest layer')
       else assert.notEqual(after.unitCostBase!.toFixed(6), '2.000000', 'OFF: the average, as before')
+      for (const [key, value] of ACCOUNTING) await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
     }
+    await setSwitch(false)
+  })
+
+  await t.test('MED-3: ON and posting applies, +5 at 0 edited to -5 is refused (no silent valued removal); same-value edits still work', async () => {
+    const w = await warehouse('med3')
+    const p = await product('med3')
+    await stockWithLayers(p.id, w.id)
+    await setSwitch(true)
+    // +5 at an entered 0 under an UNMAPPED reason: value 0, so it owes no journal and is accepted.
+    const free = await single({ productId: p.id, warehouseId: w.id, qty: '5', reasonId: unmapped, unitCostBase: '0' })
+    assert.equal(free.success, true, JSON.stringify(free))
+    const mv = await lastMovement(p.id)
+    assert.equal(mv!.totalValueBase!.toFixed(6), '0.000000')
+    const before = await onHand(p.id, w.id)
+    const layersBefore = await db.costLayer.count({ where: { productId: p.id } })
+
+    const flipped = await stock.updateAdjustmentMovement(mv!.id, -5, null)
+    assert.match(flipped.message ?? '', /would change the value of the adjustment/)
+    assert.match(flipped.message ?? '', /Reverse this adjustment/)
+    assert.equal(await onHand(p.id, w.id), before, 'nothing was re-booked')
+    assert.equal(await db.costLayer.count({ where: { productId: p.id } }), layersBefore)
+    const unchanged = await db.stockMovement.findUniqueOrThrow({ where: { id: mv!.id } })
+    assert.equal(unchanged.toWarehouseId, mv!.toWarehouseId)
+    assert.equal(unchanged.qty.toFixed(6), '5.000000')
+    assert.equal(await owed(mv!.id), 0)
+
+    // A zero-value edit that stays zero is not a value change: +5 at 0 -> +7 at 0.
+    const grown = await stock.updateAdjustmentMovement(mv!.id, 7, 'recount')
+    assert.equal(grown.success, true, JSON.stringify(grown))
+
+    // ON but accounting posting off: no journal is owed, so the value-changing flip is accepted as before.
+    await db.setting.deleteMany({ where: { key: { in: ACCOUNTING.map(([k]) => k) } } })
+    const flippedNoPosting = await stock.updateAdjustmentMovement(mv!.id, -5, null)
+    assert.equal(flippedNoPosting.success, true, JSON.stringify(flippedNoPosting))
+    for (const [key, value] of ACCOUNTING) await db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+
+    // OFF: the flip is accepted exactly as before.
+    await setSwitch(false)
+    const w2 = await warehouse('med3-off')
+    const p2 = await product('med3-off')
+    await stockWithLayers(p2.id, w2.id)
+    const free2 = await single({ productId: p2.id, warehouseId: w2.id, qty: '5', reasonId: unmapped, unitCostBase: '0' })
+    assert.equal(free2.success, true, JSON.stringify(free2))
+    const mv2 = await lastMovement(p2.id)
+    await db.accountingPostingRefusal.deleteMany({ where: { referenceType: 'StockMovement', referenceId: mv2!.id } })
+    const flipped2 = await stock.updateAdjustmentMovement(mv2!.id, -5, null)
+    assert.equal(flipped2.success, true, JSON.stringify(flipped2))
+  })
+
+  await t.test('MED-3: ON refuses to edit a supplier return, a stock-count variance and a Mintsoft align-down; OFF does not refuse them for that reason', async () => {
+    const w = await warehouse('nonplain')
+    for (const [label, referenceType] of [['ret', 'PurchaseReturn'], ['cnt', 'StockCount'], ['wms', 'WmsSyncJob']] as const) {
+      const p = await product(`nonplain-${label}`)
+      await stockWithLayers(p.id, w.id)
+      // The DB requires inbound movements to carry their cost-layer evidence at commit, so the layer is written in the same transaction.
+      const movement = await db.$transaction(async (tx) => {
+        const m = await tx.stockMovement.create({
+          data: { type: 'ADJUSTMENT', productId: p.id, toWarehouseId: w.id, qty: 1, unitCostBase: 3, totalValueBase: 3, referenceType, referenceId: `${RUN}-${label}` },
+          select: { id: true },
+        })
+        await tx.costLayer.create({ data: { productId: p.id, warehouseId: w.id, receivedQty: 1, remainingQty: 1, unitCostBase: 3, adjustmentMovementId: m.id } })
+        return m
+      })
+      await setSwitch(true)
+      const refused = await stock.updateAdjustmentMovement(movement.id, 2, null)
+      assert.match(refused.message ?? '', /not a plain stock adjustment/, referenceType)
+      const noteOnly = await stock.updateAdjustmentMovement(movement.id, 1, 'x')
+      assert.match(noteOnly.message ?? '', /not a plain stock adjustment/, `${referenceType}: a note-only edit too`)
+      await setSwitch(false)
+      const off = await stock.updateAdjustmentMovement(movement.id, 2, null)
+      assert.doesNotMatch(off.message ?? '', /not a plain stock adjustment/, `${referenceType}: OFF is not judged by the new rule`)
+    }
+    await setSwitch(false)
+  })
+
+  await t.test('MED-4: the default addition cost reads receipt/production layers only, and breaks a receivedAt tie by creation order', async () => {
+    const w = await warehouse('med4')
+    const p = await product('med4')
+    const poLineId = await poLineFor(p.id)
+    const base = Date.now() - 600_000
+    await db.stockLevel.create({ data: { productId: p.id, warehouseId: w.id, quantity: 10 } })
+    // The receipt layer (4) is OLDER than a transfer-recreated one (9, no po line), a refund restock-style one and an opening layer.
+    await db.costLayer.create({ data: { productId: p.id, warehouseId: w.id, receivedQty: 5, remainingQty: 5, unitCostBase: 4, receivedAt: new Date(base), poLineId } })
+    await db.costLayer.create({ data: { productId: p.id, warehouseId: w.id, receivedQty: 1, remainingQty: 1, unitCostBase: 9, receivedAt: new Date(base + 60_000) } })
+    await db.costLayer.create({ data: { productId: p.id, warehouseId: w.id, receivedQty: 1, remainingQty: 1, unitCostBase: 8, receivedAt: new Date(base + 90_000), isOpeningStock: true } })
+    await setSwitch(true)
+    const defaulted = await single({ productId: p.id, warehouseId: w.id, qty: '2', reasonId: mapped })
+    assert.equal(defaulted.success, true, JSON.stringify(defaulted))
+    const mv = await lastMovement(p.id)
+    assert.equal(mv!.unitCostBase!.toFixed(6), '4.000000', 'the transfer and opening layers are not the default; the adjustment layer just written is not either')
+    // The adjustment layer it just wrote (4) does not perpetuate: a further default still reads the receipt layer, not the adjustment layer.
+    await db.costLayer.updateMany({ where: { productId: p.id, poLineId }, data: { unitCostBase: 5 } })
+    const again = await single({ productId: p.id, warehouseId: w.id, qty: '1', reasonId: mapped })
+    assert.equal(again.success, true, JSON.stringify(again))
+    assert.equal((await lastMovement(p.id))!.unitCostBase!.toFixed(6), '5.000000')
+
+    // Two receipt layers at the same receivedAt: the one created second wins, whatever the cuids sort to.
+    const p2 = await product('med4-tie')
+    const poLine2 = await poLineFor(p2.id)
+    await db.stockLevel.create({ data: { productId: p2.id, warehouseId: w.id, quantity: 10 } })
+    const at = new Date(base)
+    await db.costLayer.create({ data: { id: 'zzzz-tie-first', productId: p2.id, warehouseId: w.id, receivedQty: 1, remainingQty: 1, unitCostBase: 3, receivedAt: at, poLineId: poLine2 } })
+    await db.costLayer.create({ data: { id: 'aaaa-tie-second', productId: p2.id, warehouseId: w.id, receivedQty: 1, remainingQty: 1, unitCostBase: 6, receivedAt: at, poLineId: poLine2 } })
+    const tie = await single({ productId: p2.id, warehouseId: w.id, qty: '1', reasonId: mapped })
+    assert.equal(tie.success, true, JSON.stringify(tie))
+    assert.equal((await lastMovement(p2.id))!.unitCostBase!.toFixed(6), '6.000000', 'creation sequence, not cuid order')
+    await setSwitch(false)
+  })
+
+  await t.test('LOW-7: ON builds the journal from the 6dp movement total (no one-penny mismatch)', async () => {
+    const w = await warehouse('low7')
+    const p = await product('low7')
+    await stockWithLayers(p.id, w.id)
+    await setSwitch(true)
+    // 0.5 x 0.009999 = 0.0049995 exactly: the movement stores 0.005000 (6dp), which is a penny; rounding the exact product to 2dp would be 0.00.
+    const res = await single({ productId: p.id, warehouseId: w.id, qty: '0.5', reasonId: mapped, unitCostBase: '0.009999' })
+    assert.equal(res.success, true, JSON.stringify(res))
+    const mv = await lastMovement(p.id)
+    assert.equal(mv!.totalValueBase!.toFixed(6), '0.005000')
+    const sync = await db.accountingSyncLog.findFirst({ where: { referenceType: 'StockMovement', referenceId: mv!.id } })
+    assert.ok(sync, 'the journal is built from the stored 6dp total')
+    assert.deepEqual((sync!.payload as { lines: Array<{ debit?: number; credit?: number }> }).lines.map((l) => l.debit ?? l.credit), [0.01, 0.01])
     await setSwitch(false)
   })
 })

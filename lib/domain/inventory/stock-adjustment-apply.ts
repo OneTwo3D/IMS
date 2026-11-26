@@ -252,7 +252,11 @@ export async function applyStockAdjustment({
     // The same verdict that, with the switch off, decides whether the unmapped adjustment is owed to the exception inbox.
     const { verdict } = await accountingPostingVerdictForChart(requiredSettings.connector, 'INVENTORY_ADJUSTMENT')
     if (verdict !== 'post' && verdict !== 'chart-retired') return
-    throw new Error(unmappedReasonMessage({ reasonName: resolvedReason?.name ?? null, inventoryAccountMapped: Boolean(requiredSettings.inventoryAccount) }))
+    throw new Error(unmappedReasonMessage({
+      reasonName: resolvedReason?.name ?? null,
+      inventoryAccountMapped: Boolean(requiredSettings.inventoryAccount),
+      chartRetired: verdict === 'chart-retired',
+    }))
   }
   if (reasonCostRequired) {
     const productRow = await tx.product.findUnique({ where: { id: productId }, select: { sku: true } })
@@ -316,7 +320,9 @@ export async function applyStockAdjustment({
       productLabel,
     }), 6)
     additionUnitCost = requiredAdditionUnitCost.toNumber()
-    requiredValueBase = multiplyMoney(Math.abs(qty), requiredAdditionUnitCost)
+    // LOW-7 (o3d-jwa8m): the 6dp total the movement stores (qty x cost rounded once, at 6dp, exactly as buildStockMovementValueFields computes it), so the journal's 2dp rounding starts from
+    // the booked figure and cannot differ from it by a penny (round2 of the exact product is not round2 of round6 of it).
+    requiredValueBase = roundQuantity(multiplyMoney(absQty, requiredAdditionUnitCost), 6)
     // Refused BEFORE anything is written.
     await assertAdjustmentPostable(requiredValueBase)
   } else if (isAddition) {

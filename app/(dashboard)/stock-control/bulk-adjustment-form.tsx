@@ -75,8 +75,12 @@ export function BulkAdjustmentDialog({ warehouses, products, reasons, onClose, r
     if (!missingKey) return
     let cancelled = false
     const pairs = missingKey.split('|').map((k) => { const [productId, warehouseId] = k.split(':'); return { productId: productId!, warehouseId: warehouseId! } })
-    getAdjustmentDefaultUnitCosts(pairs)
-      .then((rows) => {
+    // The server answers at most 200 pairs per call (o3d-jwa8m): ask in chunks of that size.
+    const chunks: Array<typeof pairs> = []
+    for (let i = 0; i < pairs.length; i += 200) chunks.push(pairs.slice(i, i + 200))
+    Promise.all(chunks.map((chunk) => getAdjustmentDefaultUnitCosts(chunk)))
+      .then((chunkRows) => {
+        const rows = chunkRows.flat()
         if (cancelled) return
         setCostDefaults((prev) => {
           const next = { ...prev }

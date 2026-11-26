@@ -351,6 +351,27 @@ export type MintsoftAlignDownInput = {
   priorDiscrepancy: MintsoftAlignDownPriorDiscrepancy | null
   /** Start of the current sync run; the prior discrepancy must predate it. */
   runStartedAt: Date | string
+  /**
+   * o3d-jwa8m (switch `stock_adjustment_reason_cost_required` on): true when the reason is usable but no inventory account is mapped, so
+   * the hold names that instead of the reason. Omitted/false everywhere else (the switch-off message is unchanged).
+   */
+  inventoryAccountMissing?: boolean
+}
+
+/**
+ * o3d-jwa8m: whether the binding's align-down reason is usable. Always: active and carrying an account. With the switch
+ * `stock_adjustment_reason_cost_required` ON also an inventory account mapped, because applyStockAdjustment then refuses a valued
+ * adjustment without one INSIDE the transaction, which the sweep would count as an error on every run. The plan holds instead.
+ */
+export function mintsoftAlignDownReasonState(params: {
+  reason: { active: boolean; accountCode: string | null } | null | undefined
+  reasonCostRequired: boolean
+  inventoryAccount: string | null | undefined
+}): { reasonConfigured: boolean; inventoryAccountMissing: boolean } {
+  const reasonUsable = Boolean(params.reason?.active && params.reason?.accountCode)
+  if (!reasonUsable) return { reasonConfigured: false, inventoryAccountMissing: false }
+  if (params.reasonCostRequired && !params.inventoryAccount) return { reasonConfigured: false, inventoryAccountMissing: true }
+  return { reasonConfigured: true, inventoryAccountMissing: false }
 }
 
 export type MintsoftAlignDownDecision =
@@ -390,6 +411,13 @@ export type MintsoftAlignDownDecision =
 export function planMintsoftAlignDown(input: MintsoftAlignDownInput): MintsoftAlignDownDecision {
   if (input.delta >= 0) {
     return { action: 'hold', reason: 'Align-down only handles negative deltas.' }
+  }
+
+  if (!input.reasonConfigured && input.inventoryAccountMissing) {
+    return {
+      action: 'hold',
+      reason: 'Align To WMS holds this delta because no inventory account is mapped in the accounting settings: the adjustment would be refused, so the delta stays a manual discrepancy.',
+    }
   }
 
   if (!input.reasonConfigured) {
