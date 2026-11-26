@@ -137,6 +137,7 @@ const IDENTIFIER_COLUMNS: Record<string, 'erased' | 'retained' | 'surrogate' | '
   // not customer data: suppliers, products, ledger accounts, staff users, purchasing documents
   'Product.accountingItemId': 'not-customer',
   'Supplier.accountingContactId': 'not-customer',
+  'PurchaseOrderFxLock.xeroContactId': 'not-customer',
   'PurchaseInvoice.accountingInvoiceId': 'not-customer',
   'PurchaseInvoice.paymentAccountId': 'not-customer',
   'SupplierCreditNote.accountingCreditNoteId': 'not-customer',

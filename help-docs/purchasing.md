@@ -212,6 +212,8 @@ When stock is received:
 
 The unit cost is validated as finite and non-negative before stock movements are written. A landed-cost recalculation that produces a NaN or infinite cost is rejected at the receipt boundary, before any stock or cost layer is created.
 
+**Foreign-currency orders while per-event FX rates are switched on** (`purchase_event_fx_rates_enabled`, off by default and still being built; see Xero Accounting Sync). With the switch off, a foreign order's goods are received at the order's own rate, as always. With it on, the goods are received at the rate of the order's supplier prepayment in Xero (Spend Money > Prepayment, Reference = the PO number), and, when Xero holds none, at the exchange-rate table rate on the day of the receipt. The order page then shows a **Xero prepayment exchange rate** panel: the locked rate, the Xero prepayment and its date, and **Read from Xero** to read it now (finance permission). It is read before the first receipt in any case, by hand, by the warehouse book-in or by an alignment. A receipt is refused, and nothing is booked, when the prepayment is ambiguous (several with the same reference, another currency, another contact, the supplier not linked to its Xero contact), when Xero cannot be read, or when there is no prepayment and no table rate. Once a receipt has used the rate it stays fixed for the order. Later landed-cost changes add the new freight share to each stock layer without changing the rate its goods were received at.
+
 
 ### Sales orders pegged to this purchase order
 

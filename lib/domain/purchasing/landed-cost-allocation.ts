@@ -98,6 +98,13 @@ export type LandedAllocationLine = {
    * bill that pays for it and the difference is stranded in Stock in Transit.
    */
   headerDiscountFactor?: DecimalInput | null
+  /**
+   * Per-event FX (switch `purchase_event_fx_rates_enabled`): the GOODS unit cost in base currency at the rate the policy locked for these goods,
+   * already after the header discount (6dp, `lib/domain/purchasing/purchase-receipt-fx.ts`). When set it REPLACES `unitCostBase` x
+   * `headerDiscountFactor` as the goods part of the gross cost; the freight share is unchanged (its distribution basis is still `totalBase`, and
+   * every line of one order is in the one currency, so the proportions do not depend on the rate). Absent or null = exactly as before.
+   */
+  goodsUnitCostBase?: DecimalInput | null
 }
 
 /**
@@ -132,7 +139,24 @@ export function goodsUnitCostAfterHeaderDiscount(unitCostBase: DecimalInput, hea
 }
 
 function effectiveGoodsUnitCost(line: LandedAllocationLine): Prisma.Decimal {
+  if (line.goodsUnitCostBase != null) return decimal(line.goodsUnitCostBase)
   return goodsUnitCostAfterHeaderDiscount(line.unitCostBase, line.headerDiscountFactor)
+}
+
+/**
+ * THE GROSS UNIT COST OF ONE GOODS COST: goods + this line's landed share per unit, 6dp HALF_UP, then the zero floor. The one formula the allocation
+ * below uses for every line and the landed-cost recalculation uses for a cost layer that carries its own `goodsUnitCostBase` (per-event FX), so a
+ * layer laid at receipt and the same layer revalued later cannot differ for the same cost lines. `qty` must be > 0.
+ */
+export function grossUnitCostForGoods(
+  goodsUnitCostBase: DecimalInput,
+  landedAmountBase: DecimalInput,
+  qty: DecimalInput,
+): { gross: Prisma.Decimal; unfloored: Prisma.Decimal } {
+  const unfloored = decimal(goodsUnitCostBase)
+    .add(decimal(landedAmountBase).div(decimal(qty)))
+    .toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
+  return { gross: floorUnitCostAtZero(unfloored), unfloored }
 }
 
 /** 0 = the order's own (direct) cost lines; 1 = the cost lines of the freight orders linked to it. */
@@ -260,9 +284,7 @@ export function allocateLandedCost(
       grossUnitCostBaseByLine.set(line.id, effectiveGoodsUnitCost(line))
       continue
     }
-    const rounded = effectiveGoodsUnitCost(line)
-      .add(decimal(landedByLine.get(line.id)).div(qty))
-      .toDecimalPlaces(6, Prisma.Decimal.ROUND_HALF_UP)
+    const rounded = grossUnitCostForGoods(effectiveGoodsUnitCost(line), decimal(landedByLine.get(line.id)), qty).unfloored
     if (rounded.lt(0)) {
       floors.push({
         lineId: line.id,

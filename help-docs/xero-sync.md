@@ -993,7 +993,19 @@ Group A1 reads each order's subtotal, shipping and discount to work out how much
 
 ### Per-event FX rates for purchasing (off, being built)
 
-A switch, **`purchase_event_fx_rates_enabled`**, is being prepared to value foreign-currency purchases at the rate of each accounting event instead of the rate the order was raised at, with any bill-vs-order price difference on its own line on the bill, coded to **Purchase Price Variance**, and the exchange difference to **Realised FX Gain/Loss**. **It is off and changes nothing yet**: receipts, bills, stock layers, journals and everything sent to Xero are exactly as before. It is set by an admin from the command line (`npm run settings:set`), and it refuses to turn on while Xero sync is on and either the **Realised FX Gain/Loss** or the **Purchase Price Variance** account is unmapped. The GR/IR report already has an **FX difference** column for it, which stays at zero.
+A switch, **`purchase_event_fx_rates_enabled`**, is being built in three steps to value foreign-currency purchases at the rate of each accounting event instead of the rate the order was raised at. **It is off by default, and while it is off nothing changes**: receipts, bills, stock layers, journals and everything sent to Xero are exactly as before. It is set by an admin from the command line (`npm run settings:set`), and it refuses to turn on while Xero sync is on and either the **Realised FX Gain/Loss** or the **Purchase Price Variance** account is unmapped.
+
+**What step 2 (this release) does while it is on: goods received at the prepayment rate.**
+
+- Record each supplier payment in Xero as **Spend Money > Prepayment**, at the exact rate your bank used, with the **purchase order number as the Reference**, paid to the supplier's Xero contact.
+- IMS **reads** that prepayment from Xero (it never changes it): from the order page (**Xero prepayment exchange rate > Read from Xero**), or by itself just before the order's first receipt. It reads each order once; after that it uses the rate it stored.
+- The goods of the receipt are valued at the prepayment's rate: the stock layer, the receipt, the GR/IR accrual and the stock receipt journal all use it, and the journal's description names the rate. Freight and duty are added on top as before.
+- **No prepayment in Xero:** the goods use the exchange-rate table rate on the day of the receipt. If the table has no rate for that currency, the receipt is refused and nothing is booked; add the rate (Settings > Accounting > FX Rates) and try again.
+- **IMS will not guess.** The receipt is refused, with the reason, if Xero holds more than one live prepayment with that reference, if the prepayment is in another currency, if it was paid to a different contact, if the supplier is not linked to its Xero contact, or if Xero could not be read. Fix it in Xero and receive again.
+- Once a receipt has used the rate it is fixed for that order; reading again later reports a difference instead of changing it.
+- While it is on and Xero sync is on, receipts are refused if the **Realised FX Gain/Loss** or **Purchase Price Variance** account is blanked.
+
+**Not yet (step 3):** bills at the prepayment rate, the bill-vs-order price difference on its own **Purchase Price Variance** bill line, the exchange-difference journal when there was no prepayment, returns and credit notes. Until step 3 is released, keep the switch off. The GR/IR report's **FX difference** column stays at zero.
 
 ### GR/IR accrual posting (goods received, not invoiced)
 

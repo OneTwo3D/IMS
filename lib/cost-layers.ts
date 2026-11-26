@@ -860,6 +860,11 @@ export async function createCostLayer(
     productionOrderId?: string
     isOpeningStock?: boolean
     receivedAt?: Date
+    /**
+     * Per-event FX (switch `purchase_event_fx_rates_enabled`, lib/domain/purchasing/purchase-receipt-fx.ts): the goods part of `unitCostBase` at
+     * the locked rate (6dp) and that rate (8dp). Both or neither; absent = NULL, the layer is valued from the PO line like every layer before.
+     */
+    purchaseFx?: { goodsUnitCostBase: DecimalInput; fxRateToBase: DecimalInput }
   },
 ): Promise<string> {
   const layer = await tx.costLayer.create({
@@ -874,6 +879,9 @@ export async function createCostLayer(
       productionOrderId: data.productionOrderId ?? null,
       isOpeningStock: data.isOpeningStock ?? false,
       ...(data.receivedAt ? { receivedAt: data.receivedAt } : {}),
+      ...(data.purchaseFx
+        ? { goodsUnitCostBase: roundQuantity(data.purchaseFx.goodsUnitCostBase, 6).toFixed(6), fxRateToBase: roundQuantity(data.purchaseFx.fxRateToBase, 8).toFixed(8) }
+        : {}),
     },
     select: { id: true },
   })

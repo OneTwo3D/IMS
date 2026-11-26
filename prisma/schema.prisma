@@ -1014,10 +1014,11 @@ model CostLayer {
   /// Lets a deleted refund remove exactly the layers its own return created; a refund whose layers are not tagged cannot have its return reversed and is refused.
   returnMovementId String?  @map("return_movement_id")
   /// Per-event FX (switch `purchase_event_fx_rates_enabled`, off by default): the GOODS part of this layer's unit cost in base currency, at the
-  /// rate the purchase-event FX policy locked for these goods, 6dp. RESERVED: nothing writes it yet. NULL = valued from the PO line at the PO rate,
-  /// as every layer is today; a landed-cost recalculation of a NULL layer is unchanged.
+  /// rate the purchase-event FX policy locked for these goods, 6dp (written by the three receipt paths through lib/domain/purchasing/purchase-receipt-fx.ts
+  /// while the switch is on, for a foreign order). NULL = valued from the PO line at the PO rate, as every layer before; a landed-cost recalculation
+  /// keeps a non-NULL goods cost and adds only the freight share, and recalculates a NULL layer exactly as before.
   goodsUnitCostBase Decimal? @db.Decimal(18, 6) @map("goods_unit_cost_base")
-  /// The rate that valued this layer's goods (1 base = rate foreign). RESERVED like the column above; NULL = the PO rate.
+  /// The rate that valued this layer's goods (1 base = rate foreign), 8dp, audit only (the goods cost above was computed at the exact rate). NULL = the PO rate.
   fxRateToBase    Decimal?  @db.Decimal(18, 8) @map("fx_rate_to_base")
 
   product         Product   @relation(fields: [productId], references: [id])
@@ -1588,6 +1589,7 @@ model PurchaseOrder {
   // This PO as freight/secondary
   asFreightFor    LandedCostLink[]   @relation("FreightPO")
   freightCostLines FreightCostLine[]
+  fxLock          PurchaseOrderFxLock?
 
   @@index([supplierId])
   @@index([createdAt])
@@ -1713,8 +1715,11 @@ model PurchaseReceipt {
   receivedAt  DateTime  @default(now())
   notes       String?
   /// Per-event FX (switch `purchase_event_fx_rates_enabled`), kept for audit: the rate that valued this receipt's goods (1 base = rate foreign).
-  /// RESERVED: nothing writes it yet. NULL = valued at the PO rate.
+  /// 8dp; written with `fxRateSource` while the switch is on, for a foreign order. NULL = valued at the PO rate.
   fxRateToBase Decimal? @db.Decimal(18, 8) @map("fx_rate_to_base")
+  /// Per-event FX: which rule valued this receipt's goods. 'XERO_PREPAYMENT' (the PO's purchase_order_fx_locks row) or 'FX_TABLE' (the fx_rates rate at
+  /// the receipt instant, no prepayment found). NULL = valued at the PO rate (switch off, a base-currency order, or a receipt from before the column).
+  fxRateSource String?  @map("fx_rate_source")
   createdAt   DateTime  @default(now())
 
   po          PurchaseOrder        @relation(fields: [poId], references: [id])
@@ -6556,4 +6561,34 @@ model XeroDayLimitObservation {
   observedAt   DateTime @map("observed_at")
 
   @@map("xero_day_limit_observations")
+}
+
+/// Per-event FX rates for purchasing (switch `purchase_event_fx_rates_enabled`, off by default): the rate a FOREIGN purchase order's goods lock at,
+/// read READ-ONLY from the supplier prepayment the owner records in Xero (Spend Money > Prepayment at the exact bank rate, Reference = the PO
+/// number). One row per order. Written by lib/domain/purchasing/purchase-prepayment-lock.ts only; nothing writes it while the switch is off.
+/// `rateToBase` is IMS's convention (1 base = rate foreign), which is ALSO Xero's CurrencyRate convention, so it is Xero's value exactly.
+/// `firstUsedAt` is set by the first receipt valued at this rate; from then on the row is never replaced.
+model PurchaseOrderFxLock {
+  id               String    @id @default(cuid())
+  poId             String    @unique @map("po_id")
+  /// 'XERO_PREPAYMENT' (the only source today).
+  source           String
+  currency         String
+  rateToBase       Decimal   @db.Decimal(28, 12) @map("rate_to_base")
+  xeroPrepaymentId String    @map("xero_prepayment_id")
+  /// The Xero organisation the read was addressed to.
+  xeroTenantId     String?   @map("xero_tenant_id")
+  xeroContactId    String    @map("xero_contact_id")
+  prepaymentDate   DateTime  @db.Date @map("prepayment_date")
+  /// The prepayment total in the order's currency, as Xero holds it.
+  prepaymentTotal  Decimal   @db.Decimal(18, 4) @map("prepayment_total")
+  prepaymentStatus String    @map("prepayment_status")
+  readAt           DateTime  @map("read_at")
+  /// The user who read it on demand; NULL = read lazily by a receipt.
+  readById         String?   @map("read_by_id")
+  firstUsedAt      DateTime? @map("first_used_at")
+
+  po               PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Restrict)
+
+  @@map("purchase_order_fx_locks")
 }

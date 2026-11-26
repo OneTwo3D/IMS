@@ -30,11 +30,13 @@ import { sliceTransferSnapshotForReceipt } from '@/lib/domain/wms/asn-reconcilia
 import { scheduleLandedCostJournalOutbox } from './landed-cost-journal-outbox'
 import {
   allocateLandedCost,
+  grossUnitCostForGoods,
   headerDiscountFactorForPo,
   unabsorbedBaseForQty,
   type LandedAllocation,
   type LandedAllocationCostLine,
   type LandedAllocationEvent,
+  type LandedAllocationFloor,
   type LandedAllocationSourceRank,
 } from './landed-cost-allocation'
 import { logFlooredLandedCredit } from './landed-cost-floor-activity'
@@ -57,6 +59,8 @@ export type PendingGrossCostLine = {
   weight?: Prisma.Decimal | number | string | null
   /** See LandedAllocationLine.headerDiscountFactor; every caller sets it from headerDiscountFactorForPo. */
   headerDiscountFactor?: Prisma.Decimal | number | string | null
+  /** See LandedAllocationLine.goodsUnitCostBase: the per-event FX goods unit cost of the units being received; absent = the PO line's. */
+  goodsUnitCostBase?: Prisma.Decimal | number | string | null
 }
 
 export type PendingGrossCostLineSource = {
@@ -1056,6 +1060,7 @@ export function computeLandedCostForPendingLines(params: {
       totalBase: line.totalBase,
       weight: line.weight ?? null,
       headerDiscountFactor: line.headerDiscountFactor ?? null,
+      goodsUnitCostBase: line.goodsUnitCostBase ?? null,
     })),
     [...toCostLines(params.directCostLines, 0), ...toCostLines(params.linkedCostLines, 1)],
   )
@@ -1070,6 +1075,34 @@ export function computeLandedCostForPendingLines(params: {
     }
   }
   return allocation
+}
+
+/**
+ * PER-LAYER LANDED COST (per-event FX, o3d-hqvrp.51 step 2): the unit cost a recalculation gives ONE cost layer of a PO line.
+ *
+ * A legacy layer (`goodsUnitCostBase` NULL: every layer laid with the switch off, a base-currency order, a layer from before the column) takes the
+ * line's gross cost and the line's floor, EXACTLY as the recalculation always has. A layer that carries its own goods cost (laid at the rate the
+ * per-event FX policy locked for it) keeps that goods cost and takes only the line's landed share per unit, through the same formula the allocation
+ * uses (`grossUnitCostForGoods`), so the recalculation never revalues its goods to the PO rate. `allocationQty` is the quantity the allocation
+ * divided the line's landed amount by; at or below zero there is no share and the goods cost stands.
+ */
+export function layerUnitCostAfterRecalc(params: {
+  layerGoodsUnitCostBase: Prisma.Decimal | number | string | null | undefined
+  lineGrossUnitCostBase: Prisma.Decimal
+  lineLandedAmountBase: Prisma.Decimal
+  allocationQty: Prisma.Decimal
+  lineFloor: LandedAllocationFloor | undefined
+  lineId: string
+}): { newUnitCost: Prisma.Decimal; floor: LandedAllocationFloor | undefined } {
+  if (params.layerGoodsUnitCostBase == null) return { newUnitCost: params.lineGrossUnitCostBase, floor: params.lineFloor }
+  const goods = decimal(params.layerGoodsUnitCostBase)
+  if (params.allocationQty.lte(0)) return { newUnitCost: goods, floor: undefined }
+  const { gross, unfloored } = grossUnitCostForGoods(goods, params.lineLandedAmountBase, params.allocationQty)
+  if (!unfloored.lt(0)) return { newUnitCost: gross, floor: undefined }
+  return {
+    newUnitCost: gross,
+    floor: { lineId: params.lineId, qty: params.allocationQty, unflooredGrossUnitCostBase: unfloored, unabsorbedPerUnitBase: unfloored.neg() },
+  }
 }
 
 export function computeGrossUnitCostBaseByLine(params: {
@@ -1382,6 +1415,7 @@ export async function recalculateLandedCosts(
               select: {
                 id: true,
                 unitCostBase: true,
+                goodsUnitCostBase: true,
                 receivedQty: true,
                 remainingQty: true,
               },
@@ -1478,6 +1512,7 @@ export async function recalculateLandedCosts(
       const landedForLine = decimal(allocation.landedAmountByLine.get(line.id))
       const grossUnitCostBase = allocation.grossUnitCostBaseByLine.get(line.id)!
       const floor = floorByLine.get(line.id)
+      let entryFloor = floor
       let lineUnabsorbedBase = new Prisma.Decimal(0)
       const afterLayers: AfterLayerAudit[] = []
 
@@ -1488,7 +1523,11 @@ export async function recalculateLandedCosts(
 
       for (const cl of line.costLayers) {
         const oldUnitCost = decimal(cl.unitCostBase)
-        const newUnitCost = grossUnitCostBase
+        // Per-event FX: a layer that carries its own goods cost keeps it and takes only the new freight share; a legacy (NULL) layer takes the
+        // line's gross cost exactly as before (layerUnitCostAfterRecalc).
+        const layerCost = layerUnitCostAfterRecalc({ layerGoodsUnitCostBase: cl.goodsUnitCostBase, lineGrossUnitCostBase: grossUnitCostBase, lineLandedAmountBase: landedForLine, allocationQty: lineQty, lineFloor: floor, lineId: line.id })
+        const newUnitCost = layerCost.newUnitCost
+        const layerFloor = layerCost.floor
         const receivedQty = decimal(cl.receivedQty)
         const remainingQty = decimal(cl.remainingQty)
         const consumedQty = receivedQty.sub(remainingQty)
@@ -1524,7 +1563,7 @@ export async function recalculateLandedCosts(
         }
         await tx.costLayer.update({
           where: { id: cl.id },
-          data: { unitCostBase: grossUnitCostBase },
+          data: { unitCostBase: newUnitCost },
         })
         await serviceDeps.recordCostLayerRevaluation(tx, {
           costLayerId: cl.id,
@@ -1551,7 +1590,7 @@ export async function recalculateLandedCosts(
         let affectedShipments = 0
         let affectedSalesOrderLines = 0
         if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
-          affectedRefundSnapshots = await serviceDeps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
+          affectedRefundSnapshots = await serviceDeps.updateSnapshotsForCostLayerChange(tx, cl.id, newUnitCost)
           const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id, { recalcRunId, revaluationContext, offsetCostDeltaToTransit: true, ...(options.accountingSettings !== undefined ? { accountingSettings: options.accountingSettings } : {}) })
           affectedShipments = shipmentRefresh.shipmentsUpdated
           // audit-3aph: the shipment path now owns the COGS revaluation for sold
@@ -1561,8 +1600,9 @@ export async function recalculateLandedCosts(
           affectedSalesOrderLines = await serviceDeps.refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
         }
         // The zero floor's footprint on this layer (units the floor could not absorb), exact Decimal.
-        const layerUnabsorbedBase = floor ? unabsorbedBaseForQty(floor.unflooredGrossUnitCostBase, receivedQty) : null
-        if (floor && layerUnabsorbedBase) {
+        const layerUnabsorbedBase = layerFloor ? unabsorbedBaseForQty(layerFloor.unflooredGrossUnitCostBase, receivedQty) : null
+        if (layerFloor && layerUnabsorbedBase) {
+          entryFloor ??= layerFloor
           lineUnabsorbedBase = lineUnabsorbedBase.add(layerUnabsorbedBase)
           if (!oldUnitCost.eq(newUnitCost)) floorFootprint.activityDue = true
         }
@@ -1581,19 +1621,19 @@ export async function recalculateLandedCosts(
           affectedRefundSnapshots,
           affectedShipments,
           affectedSalesOrderLines,
-          ...(floor && layerUnabsorbedBase
+          ...(layerFloor && layerUnabsorbedBase
             ? {
-              unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase.toString(),
+              unflooredGrossUnitCostBase: layerFloor.unflooredGrossUnitCostBase.toString(),
               unabsorbedBase: layerUnabsorbedBase.toString(),
             }
             : {}),
         })
       }
-      if (floor && lineUnabsorbedBase.gt(0)) {
+      if (entryFloor && lineUnabsorbedBase.gt(0)) {
         floorFootprint.entries.push({
           label: `PO line ${line.id}`,
           unabsorbedBase: lineUnabsorbedBase,
-          unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase,
+          unflooredGrossUnitCostBase: entryFloor.unflooredGrossUnitCostBase,
         })
       }
       afterLines.push({
@@ -1726,6 +1766,7 @@ export async function recalculateDirectLandedCosts(
             select: {
               id: true,
               unitCostBase: true,
+              goodsUnitCostBase: true,
               receivedQty: true,
               remainingQty: true,
             },
@@ -1824,6 +1865,7 @@ export async function recalculateDirectLandedCosts(
     const landedForLine = decimal(allocation.landedAmountByLine.get(line.id))
     const grossUnitCostBase = allocation.grossUnitCostBaseByLine.get(line.id)!
     const floor = floorByLine.get(line.id)
+    let entryFloor = floor
     let lineUnabsorbedBase = new Prisma.Decimal(0)
     const afterLayers: AfterLayerAudit[] = []
 
@@ -1834,7 +1876,11 @@ export async function recalculateDirectLandedCosts(
 
     for (const cl of line.costLayers) {
       const oldUnitCost = decimal(cl.unitCostBase)
-      const newUnitCost = grossUnitCostBase
+      // Per-event FX: a layer that carries its own goods cost keeps it and takes only the new freight share; a legacy (NULL) layer takes the
+        // line's gross cost exactly as before (layerUnitCostAfterRecalc).
+        const layerCost = layerUnitCostAfterRecalc({ layerGoodsUnitCostBase: cl.goodsUnitCostBase, lineGrossUnitCostBase: grossUnitCostBase, lineLandedAmountBase: landedForLine, allocationQty: options.landedQtyBasis ? decimal(options.landedQtyBasis.get(line.id) ?? 0) : lineQty, lineFloor: floor, lineId: line.id })
+        const newUnitCost = layerCost.newUnitCost
+        const layerFloor = layerCost.floor
       const receivedQty = decimal(cl.receivedQty)
       const remainingQty = decimal(cl.remainingQty)
       const consumedQty = receivedQty.sub(remainingQty)
@@ -1870,7 +1916,7 @@ export async function recalculateDirectLandedCosts(
       }
       await tx.costLayer.update({
         where: { id: cl.id },
-        data: { unitCostBase: grossUnitCostBase },
+        data: { unitCostBase: newUnitCost },
       })
       await serviceDeps.recordCostLayerRevaluation(tx, {
         costLayerId: cl.id,
@@ -1897,7 +1943,7 @@ export async function recalculateDirectLandedCosts(
       let affectedShipments = 0
       let affectedSalesOrderLines = 0
       if (deltas.costDelta.abs().gt(LANDED_COST_DELTA_EPSILON)) {
-        affectedRefundSnapshots = await serviceDeps.updateSnapshotsForCostLayerChange(tx, cl.id, grossUnitCostBase)
+        affectedRefundSnapshots = await serviceDeps.updateSnapshotsForCostLayerChange(tx, cl.id, newUnitCost)
         const shipmentRefresh = await serviceDeps.refreshShipmentCogsForCostLayerChange(tx, cl.id, { recalcRunId, revaluationContext, offsetCostDeltaToTransit: true, ...(options.accountingSettings !== undefined ? { accountingSettings: options.accountingSettings } : {}) })
         affectedShipments = shipmentRefresh.shipmentsUpdated
         // audit-3aph: shipment path owns the sold-goods COGS revaluation — remove
@@ -1906,8 +1952,9 @@ export async function recalculateDirectLandedCosts(
         affectedSalesOrderLines = await serviceDeps.refreshSalesOrderLineCogsForCostLayerChange(tx, cl.id)
       }
       // The zero floor's footprint on this layer (units the floor could not absorb), exact Decimal.
-      const layerUnabsorbedBase = floor ? unabsorbedBaseForQty(floor.unflooredGrossUnitCostBase, receivedQty) : null
-      if (floor && layerUnabsorbedBase) {
+      const layerUnabsorbedBase = layerFloor ? unabsorbedBaseForQty(layerFloor.unflooredGrossUnitCostBase, receivedQty) : null
+      if (layerFloor && layerUnabsorbedBase) {
+          entryFloor ??= layerFloor
         lineUnabsorbedBase = lineUnabsorbedBase.add(layerUnabsorbedBase)
         if (!oldUnitCost.eq(newUnitCost)) floorFootprint.activityDue = true
       }
@@ -1926,19 +1973,19 @@ export async function recalculateDirectLandedCosts(
         affectedRefundSnapshots,
         affectedShipments,
         affectedSalesOrderLines,
-        ...(floor && layerUnabsorbedBase
+        ...(layerFloor && layerUnabsorbedBase
           ? {
-            unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase.toString(),
+            unflooredGrossUnitCostBase: layerFloor.unflooredGrossUnitCostBase.toString(),
             unabsorbedBase: layerUnabsorbedBase.toString(),
           }
           : {}),
       })
     }
-    if (floor && lineUnabsorbedBase.gt(0)) {
+    if (entryFloor && lineUnabsorbedBase.gt(0)) {
       floorFootprint.entries.push({
         label: `PO line ${line.id}`,
         unabsorbedBase: lineUnabsorbedBase,
-        unflooredGrossUnitCostBase: floor.unflooredGrossUnitCostBase,
+        unflooredGrossUnitCostBase: entryFloor.unflooredGrossUnitCostBase,
       })
     }
     afterLines.push({

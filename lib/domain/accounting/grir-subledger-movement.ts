@@ -15,7 +15,9 @@ import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib
  *
  * SIGN: CREDIT-POSITIVE. `baseDelta` > 0 raises the GR/IR liability, < 0 lowers it.
  *
- *   RECEIPT               +  received qty x PO goods unit cost, 6dp.      Written with the stock, the layer and the receipt journal.
+ *   RECEIPT               +  received qty x PO goods unit cost, 6dp.      Written with the stock, the layer and the receipt journal. With per-event
+ *                            FX on (`purchase_event_fx_rates_enabled`), a foreign order's receipt is credited at the rate-locked goods unit cost its
+ *                            layers carry instead (`goodsUnitCostByLine`); bills, returns and credit notes stay at the PO valuation until step 3.
  *   BILL                  -  billed qty x PO goods unit cost.             Written with the bill. Only goods lines (a freight cost line is not here).
  *   BILL_UPDATE           -  the signed delta of an edited bill's goods quantity, valued the same way.
  *   SUPPLIER_RETURN       -  returned qty x PO goods unit cost: reverses the receipt portion. Written with the return.
@@ -132,11 +134,20 @@ function sumByLine(lines: ReadonlyArray<{ poLineId: string; qty: DecimalInput }>
  */
 export async function recordGrirReceipt(
   client: GrirClient,
-  input: { poId: string; sourceRef: string; keyBase: string; at: Date; journalDate?: Date | string; lines: ReadonlyArray<{ poLineId: string; qty: DecimalInput }> },
+  input: {
+    poId: string; sourceRef: string; keyBase: string; at: Date; journalDate?: Date | string; lines: ReadonlyArray<{ poLineId: string; qty: DecimalInput }>
+    /**
+     * Per-event FX (switch `purchase_event_fx_rates_enabled`): the goods unit cost THIS receipt's layers carry (the rate-locked goods cost,
+     * lib/domain/purchasing/purchase-receipt-fx.ts), per order line. A line in it is credited at that cost instead of the PO valuation, so the
+     * accrual equals the goods value the receipt put into inventory. Absent = the PO valuation, exactly as before.
+     */
+    goodsUnitCostByLine?: ReadonlyMap<string, Decimal>
+  },
 ): Promise<void> {
   const valuation = await loadGrirPoValuation(client, input.poId)
   for (const [poLineId, qty] of sumByLine(input.lines)) {
     if (qty.lte(0)) continue
+    const lockedUnit = input.goodsUnitCostByLine?.get(poLineId)
     await writeGrirMovement(client, {
       sourceType: 'RECEIPT',
       sourceRef: input.sourceRef,
@@ -145,7 +156,7 @@ export async function recordGrirReceipt(
       poLineId,
       supplierId: valuation.supplierId,
       qtyDelta: qty,
-      baseDelta: qty.mul(unitCostFor(valuation, poLineId)),
+      baseDelta: qty.mul(lockedUnit ?? unitCostFor(valuation, poLineId)),
       journalDate: input.journalDate ?? input.at,
       occurredAt: input.at,
     })

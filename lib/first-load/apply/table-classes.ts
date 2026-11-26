@@ -93,6 +93,7 @@ export const TABLE_CLASSES: Readonly<Record<string, TableClass>> = {
   products: { kind: 'RUNNER_WRITES', reason: 'the product catalogue' },
   purchase_invoice_lines: { kind: 'MUST_BE_EMPTY', reason: 'purchase invoices, receipts and returns' },
   purchase_invoices: { kind: 'MUST_BE_EMPTY', reason: 'purchase invoices, receipts and returns' },
+  purchase_order_fx_locks: { kind: 'MUST_BE_EMPTY', reason: 'per-event FX rate locks read from Xero prepayments: runtime state written at receipt, a first load starts empty' },
   purchase_order_lines: { kind: 'RUNNER_WRITES', reason: 'lines of the purchase orders the runner may load' },
   purchase_orders: { kind: 'RUNNER_WRITES', reason: 'the purchase orders the runner may load' },
   purchase_receipt_lines: { kind: 'MUST_BE_EMPTY', reason: 'purchase invoices, receipts and returns' },
