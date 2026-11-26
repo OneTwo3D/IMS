@@ -54,9 +54,12 @@ Traps, each failing in a way that looks like something else:
   do not rely on the passwd home either.
 - **`NODE_OPTIONS='--import tsx'`** is set by the npm script. Calling `npx playwright test`
   directly drops it and fails with `exports is not defined in ES module scope`.
-- **Login rate limiter.** `lib/auth/config.ts` throttles login to 10/15 min, fail-closed,
-  memory-backed. Repeated debug logins trip it; `auth.setup.ts` then hangs 60s as if the
-  credentials were wrong. A **service restart** clears the in-memory buckets.
+- **Login throttle.** `lib/auth/login-throttle.ts` counts failed password sign-ins per account in the
+  database (`one_time_tokens`): the first 5 failures cost nothing, then each attempt must wait out a
+  cooldown that starts at 1 s and doubles to a 15 min cap. Repeated debug logins trip it; `auth.setup.ts`
+  then hangs 60s as if the credentials were wrong. A **service restart does not clear it** (the state is
+  in the database); a correct password after the wait clears the account's counter, and the counter ages out
+  15 min after the last failure.
 
 ### After a code/schema/prisma change
 
@@ -97,9 +100,11 @@ e2e DB `settings` table (values are encrypted; the harness decrypts with
 
 ### Batch-cron rate limit — required for running >1 batch test per invocation (o3d-lgo.13)
 
-`accounting-daily-batch` is rate-limited to **2 per 24h per IP** (derived from its daily schedule; `lib/cron-rate-limit.ts`, defence-in-
-depth over `CRON_SECRET`). A single suite run that drives the daily batch more than twice —
-**OC-08, X-01 and X-02 together do** — otherwise 429s on the third trigger (the spec detects it and
+`accounting-daily-batch` is rate-limited to **3 per 24h per IP** (derived from its daily schedule: a job whose cadence is an hour or
+more gets three runs per cadence window; `lib/cron-rate-limit.ts`, defence-in-depth over `CRON_SECRET`), and as a live-Xero job also
+spends an IP-independent daily run budget of 4 (scheduled runs per day, plus a quarter, plus 2). A single suite run that drives the
+daily batch more than three times —
+**OC-08, X-01 and X-02 together do** — otherwise 429s on the fourth trigger (the spec detects it and
 **skips loudly**, never a false pass). To let one invocation cover both, the rig's `.env.local`
 sets **both** of:
 
@@ -112,7 +117,7 @@ E2E_CRON_RATE_LIMIT_MAX=10000
 job is the allowlisted `accounting-daily-batch`, and it can only **raise** the limit — so it
 cannot widen any other cron or tighten production (production leaves both unset). These are
 **server-side** env vars: after adding them, **rebuild + restart** `ims-e2e-dev.service` (Next
-reads them at server start). Without them the rig keeps the 1/hour limit and batch tests must run
+reads them at server start). Without them the rig keeps the derived limit above and batch tests must run
 in **separate invocations** (or restart the service — memory-backed limiter — between them).
 
 ## The quiesce lock (single point of failure)

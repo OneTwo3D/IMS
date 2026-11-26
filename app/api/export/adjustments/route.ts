@@ -2,7 +2,7 @@ import { db } from '@/lib/db'
 import { buildTemplateCsv, toCsv, csvResponse } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
-import { readStockAdjustmentReasonCostRequired } from '@/lib/domain/inventory/stock-adjustment-policy'
+import { readStockAdjustmentReasonCostRequired, splitReasonFromNote } from '@/lib/domain/inventory/stock-adjustment-policy'
 
 // unitCost (base currency) is optional but REQUIRED for a positive adjustment of a
 // product with no existing cost basis (cogs-audit scjz.2); blank uses the derived
@@ -31,6 +31,13 @@ export async function GET(req: Request) {
     return csvResponse(buildTemplateCsv(TEMPLATE_HEADERS, REQUIRED_HEADERS), 'adjustments-import-template.csv')
   }
 
+  // o3d-jwa8m: with the switch ON the import needs a `reason` on every row, so the export carries one too and a downloaded file re-imports.
+  // A movement stores its reason as the note's prefix ("<reason name>" or "<reason name>: <note>"), so it is read back from there.
+  const reasonCostRequired = await readStockAdjustmentReasonCostRequired(db)
+  const reasonNames = reasonCostRequired
+    ? (await db.adjustmentReason.findMany({ select: { name: true } })).map((r) => r.name)
+    : []
+
   const movements = await db.stockMovement.findMany({
     where: { type: 'ADJUSTMENT' },
     include: {
@@ -47,15 +54,17 @@ export async function GET(req: Request) {
     const warehouse = isAddition
       ? m.toWarehouse
       : m.fromWarehouse
-    return {
+    const base = {
       sku: m.product.sku,
       warehouseCode: warehouse?.code ?? '',
       qty: String(isAddition ? Number(m.qty) : -Number(m.qty)),
       unitCost: isAddition && m.unitCostBase != null ? String(Number(m.unitCostBase)) : '',
-      note: m.note ?? '',
     }
+    if (!reasonCostRequired) return { ...base, note: m.note ?? '' }
+    const split = splitReasonFromNote(m.note, reasonNames)
+    return { ...base, note: split.note, reason: split.reason }
   })
 
   const filename = `adjustments-${new Date().toISOString().slice(0, 10)}.csv`
-  return csvResponse(toCsv(rows, HEADERS), filename)
+  return csvResponse(toCsv(rows, reasonCostRequired ? [...HEADERS, 'reason'] : HEADERS), filename)
 }

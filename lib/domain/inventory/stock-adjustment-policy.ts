@@ -18,9 +18,10 @@ import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
  *      blank, at the unit cost of the product's LATEST cost layer with a non-zero cost in that warehouse, else in any warehouse.
  *      Never at an average. With no such layer it is refused.
  *
- * The in-place edit (updateAdjustmentMovement) is NOT re-judged for reason or account (rules 1-2 do not apply to it); it only
- * values a removal edited into an addition at the latest costed layer, never an average, and refuses when there is none.
- * Removals keep consuming FIFO layers exactly as before.
+ * The in-place edit (updateAdjustmentMovement), with the switch ON: only a plain stock adjustment (no reference) is editable at all (a supplier
+ * return, stock-count variance or WMS align-down is refused); an edit that changes the movement's value to the penny while accounting posting
+ * applies is refused (reverse and re-enter instead), because an in-place edit cannot post or revise a journal; and a removal edited into an
+ * addition is valued at the latest costed layer, never an average, and refused when there is none. Removals keep consuming FIFO layers exactly as before.
  */
 export const STOCK_ADJUSTMENT_REASON_COST_REQUIRED_KEY = 'stock_adjustment_reason_cost_required'
 
@@ -40,20 +41,33 @@ export type LatestLayerUnitCost = { unitCostBase: Decimal; source: 'warehouse' |
 type LayerReadClient = Pick<Prisma.TransactionClient, 'costLayer'>
 
 /**
- * The unit cost of the product's most recently received cost layer with a non-zero cost, in this warehouse, else in any warehouse.
- * A consumed layer counts (it is still the latest price paid). Zero-cost layers (samples, free stock) are skipped: a zero is only
+ * The unit cost of the product's most recently received RECEIPT or PRODUCTION cost layer with a non-zero cost, in this warehouse, else in any
+ * warehouse. A consumed layer counts (it is still the latest price paid). Zero-cost layers (samples, free stock) are skipped: a zero is only
  * ever booked when an operator enters it. Exact: the stored 6dp Decimal, never a blend.
+ *
+ * Only a layer that records what was PAID or what making it COST qualifies (o3d-jwa8m): a purchase receipt (poLineId set) or a production
+ * output (productionOrderId set). Excluded, because each carries a figure that is not a fresh price: a transfer's recreated layers (the source
+ * layers' old cost, stamped received now), a refund restock (returnMovementId), an adjustment layer (an earlier default would perpetuate
+ * itself) and an opening-stock layer (a moving average). A layer for a refund restock or a transfer carries none of the two ids, so it falls out.
+ * "Latest" is by receivedAt, ties by the creation sequence (createdSeq), never by the cuid.
  */
 export async function getLatestLayerUnitCost(client: LayerReadClient, productId: string, warehouseId: string): Promise<LatestLayerUnitCost | null> {
-  const orderBy: Prisma.CostLayerOrderByWithRelationInput[] = [{ receivedAt: 'desc' }, { id: 'desc' }]
+  const orderBy: Prisma.CostLayerOrderByWithRelationInput[] = [{ receivedAt: 'desc' }, { createdSeq: 'desc' }]
+  const qualifying: Prisma.CostLayerWhereInput = {
+    unitCostBase: { gt: 0 },
+    adjustmentMovementId: null,
+    returnMovementId: null,
+    isOpeningStock: false,
+    OR: [{ poLineId: { not: null } }, { productionOrderId: { not: null } }],
+  }
   const inWarehouse = await client.costLayer.findFirst({
-    where: { productId, warehouseId, unitCostBase: { gt: 0 } },
+    where: { productId, warehouseId, ...qualifying },
     orderBy,
     select: { unitCostBase: true },
   })
   if (inWarehouse) return { unitCostBase: toDecimal(inWarehouse.unitCostBase), source: 'warehouse' }
   const anywhere = await client.costLayer.findFirst({
-    where: { productId, unitCostBase: { gt: 0 } },
+    where: { productId, ...qualifying },
     orderBy,
     select: { unitCostBase: true },
   })
@@ -80,17 +94,60 @@ export function resolveRequiredAdditionUnitCost(params: {
   )
 }
 
+/** Most (product, warehouse) pairs one getAdjustmentDefaultUnitCosts call answers; the bulk dialog asks in chunks of this size. */
+export const MAX_DEFAULT_COST_PAIRS = 200
+
+export function defaultCostCapMessage(max: number): string {
+  return `Default unit costs can be looked up for at most ${max} product and warehouse pairs at a time. Ask in batches of ${max} or fewer.`
+}
+
+/** The in-place edit refused for a movement that is not a plain stock adjustment (switch on). */
+export function editNotPlainAdjustmentRefusedMessage(referenceType: string | null): string {
+  const kind = referenceType === 'PurchaseReturn' ? 'a supplier return'
+    : referenceType === 'StockCount' ? 'a stock-count variance'
+    : referenceType === 'WmsSyncJob' ? 'a warehouse sync align-down'
+    : 'a movement booked by another process'
+  return `This movement is ${kind}, not a plain stock adjustment, so it cannot be edited here. `
+    + 'Correct it from where it came from, or enter a compensating stock adjustment.'
+}
+
+/** The in-place edit refused because it would change a value the ledger should see (switch on, accounting posting applies). */
+export function editChangesValueRefusedMessage(): string {
+  return 'This edit would change the value of the adjustment, and an in-place edit cannot post or revise its accounting journal. '
+    + 'Reverse this adjustment with a new one of the opposite sign, then enter the correct adjustment with a reason and unit cost.'
+}
+
 export function missingReasonMessage(productLabel: string): string {
   return `Choose an adjustment reason for ${productLabel}. Every stock adjustment needs a reason.`
 }
 
-export function unmappedReasonMessage(params: { reasonName: string | null; inventoryAccountMapped: boolean }): string {
+export function unmappedReasonMessage(params: { reasonName: string | null; inventoryAccountMapped: boolean; chartRetired?: boolean }): string {
+  if (params.chartRetired) {
+    // Mapping an account to the reason does not help here: the accounts on file belong to a connector that is no longer active.
+    return 'The accounting connector these accounts were set up for is no longer the active one, so this adjustment could not be posted to the ledger. '
+      + 'Reconnect it or re-map the reason account and the inventory account for the active connector in the accounting settings first. Nothing was saved.'
+  }
   if (!params.inventoryAccountMapped) {
     return 'No inventory account is mapped in the accounting settings, so this adjustment could not be posted to the ledger. '
       + 'Map the inventory account first. Nothing was saved.'
   }
   return `The adjustment reason "${params.reasonName ?? ''}" has no account, so this adjustment could not be posted to the ledger. `
     + `Map an account to "${params.reasonName ?? ''}" in Settings > Adjustment reasons first. Nothing was saved.`
+}
+
+/**
+ * A movement stores its reason as the note's prefix: "<reason name>" or "<reason name>: <note>". Split it back into the two cells the
+ * adjustments CSV import reads (the longest matching reason name wins). A note with no known reason prefix keeps all of it as the note. Pure.
+ */
+export function splitReasonFromNote(note: string | null | undefined, reasonNames: string[]): { reason: string; note: string } {
+  const text = note ?? ''
+  let best: string | null = null
+  for (const name of reasonNames) {
+    if (!name) continue
+    if ((text === name || text.startsWith(`${name}: `)) && (best === null || name.length > best.length)) best = name
+  }
+  if (best === null) return { reason: '', note: text }
+  return { reason: best, note: text === best ? '' : text.slice(best.length + 2) }
 }
 
 export type ReasonMatchCandidate = { id: string; name: string }

@@ -75,21 +75,24 @@ npm run lint | type-check | db:seed | db:studio
 
 ## Deployment
 
-The stage instance runs as the non-root `ims` user from `/opt/ims/onetwo3d-ims` (`/root/ims/onetwo3d-ims` symlinks to it) under systemd on port 3000. Live unit: `ims-stage-dev.service` (`next dev`, hot reload, `development` branch). Its intended replacement is the hardened `ims-stage.service` (`next start`, loopback-only, sandboxed); see `deploy/README.md`.
+Three paths exist; the code that implements each is the reference (`deploy/README.md` has the detail).
+- **Stage** (this host): runs as the non-root `ims` user from `/opt/ims/onetwo3d-ims` (`/root/ims/onetwo3d-ims` symlinks to it) under systemd on port 3000. The installed unit is `ims-stage-dev.service` (`next dev`, hot reload, `development` branch). The unit file in `deploy/systemd/ims-stage-dev.service` is the older root/`0.0.0.0` variant marked DEPRECATED and does NOT match the installed one; `deploy/systemd/ims-stage.service` (`next start`, `User=ims`, loopback-only, sandboxed) is the hardened production-build unit the stage host has not moved to. `deploy/systemd/ims-e2e-dev.service` is the full-chain rig (port 3002, `next start`).
+- **Bare-metal install** (`scripts/install.sh`, then `scripts/update.sh`): a systemd service `one-two-inventory.service` that runs `next start -p <APP_PORT>` as `imsapp` from `/opt/one-two-inventory`. See `docs/installation.md`.
+- **Production host** (`deploy/bin/deploy.sh <full-commit-sha>`): CI-built container images in blue/green slots behind nginx. See `deploy/README.md`, "Production host: blue/green deploy".
 
-After code changes (hot-reloaded, usually no rebuild):
+After code changes on stage:
 1. Merge to `development` (IMS PRs target `development`, not `main`).
-2. On the host, as `ims`: `git -C /opt/ims/onetwo3d-ims pull`. Never run git in this tree as root.
-3. If dependencies/schema changed: `npm install`, `prisma migrate deploy`, `prisma generate`.
-4. Restart only when needed: `systemctl restart ims-stage-dev.service` (or `ims-stage.service` once migrated).
+2. On the host, as `ims`: `git -C /opt/ims/onetwo3d-ims pull`. Never run git in this tree as root. `next dev` hot-reloads source changes, so usually nothing else is needed.
+3. If dependencies or the schema changed, do not run a bare `prisma migrate deploy` under the running server. Run `scripts/deploy.sh` as root (header usage: `--dry-run`, `--skip-build`, `--skip-migrate`, `--restart-only`): build, validate, stop and drain every writer, migrate, verify, start. A migration needs `DEPLOY_ADMIN_DATABASE_URL` and a systemd unit serving the tree (`IMS_SERVICE_UNIT` if it cannot be detected). It does not pull code.
+4. Restart only when needed: `systemctl restart ims-stage-dev.service`.
 5. Verify on `http://127.0.0.1:3000` (nginx fronts the stage hostname).
 
-Deploy order: the old process must be fully stopped before the new one starts. Never run two versions against the same database (no rolling restart, no blue/green overlap).
+Deploy order on stage and bare-metal hosts: the old process must be fully stopped before the new one starts or the schema moves (`scripts/deploy.sh`, `scripts/update.sh`). Never run two versions against the same database there: no rolling restart, no second instance on another port. The production blue/green deploy is the one deliberate exception: the previous release keeps serving while the new one migrates and starts in the idle slot, which is why its migrations must be expand-only (below).
 
 Money posts stamp `accounting_sync_logs.remoteAttemptedAt` before the remote call, and an unstamped row is proof nothing was sent from it. Whether that proof holds is recorded on the row in `attemptStampingCustodyAt`: a version that does not write the column leaves it NULL when it creates a row, and a database trigger nulls it when such a version claims one. Rows outside custody are never recycled, and the first sync run of a version that stamps marks them as attempted. So an overlap, or a rollback (which no deploy order can prevent, since rolling back is a sequential deploy), is self-declaring and heals at the next sync run: no operator step, no setting to clear. See `lib/domain/accounting/money-attempt-provenance.ts`.
 
 Database migrations:
-- Applied during `npm run build` via `prisma migrate deploy` (postinstall hook). Review `schema.prisma` changes before deploying; test migrations on staging first.
+- `npm run build` is plain `next build` and applies no migration (`package.json` has no postinstall or prebuild hook). Migrations are applied by `prisma migrate deploy` inside `scripts/install.sh`, `scripts/update.sh` and `scripts/deploy.sh` (after the writers are stopped), and by the migrate image in `deploy/bin/deploy.sh`. Review `schema.prisma` changes before deploying; test migrations on staging first.
 - Follow `docs/migration-conventions.md` (NOT NULL add-columns, NOT VALID constraints, column renames, large-table indexes, column drops).
 - Expand-only rule for the production blue/green deploy: a migration in a normal deploy must work with the previous release, which keeps serving while it runs. Make `-- expand-only` the FIRST line of its `migration.sql` (additive changes only). `deploy/bin/deploy.sh` refuses any pending migration without the marker and `rollback.sh` refuses to roll back across one. A contract (destructive) migration ships alone as a maintenance deploy (`--allow-contract-migration --maintenance`). See `deploy/README.md`, "Production host: blue/green deploy".
 

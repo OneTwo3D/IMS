@@ -15,11 +15,13 @@ import {
   collectMissingInWmsCandidates,
   consolidateMintsoftStockLines,
   hasMintsoftThresholdBreach,
+  mintsoftAlignDownReasonState,
   planMintsoftAlignDown,
   planMintsoftAlignmentAllocations,
   parseMintsoftThresholds,
 } from './stock-sync-helpers'
 import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
+import { readStockAdjustmentReasonCostRequired } from '@/lib/domain/inventory/stock-adjustment-policy'
 import {
   isTransferUsableForWmsReceipt,
   remainingCostableSnapshotQty,
@@ -65,6 +67,7 @@ import { enqueueStockSync } from '@/lib/shopping'
 // the WMS book-in in lib/domain/wms/booked-in-service.ts).
 import { classifyStockEnqueueFailure, type StockEnqueueOutcome } from '@/lib/domain/integrations/stock-enqueue-failure'
 import {
+  getAccountingSettings,
   getAccountingSettingsFor,
   getActiveAccountingConnectorId,
   queueAccountingSyncTx,
@@ -2493,7 +2496,7 @@ async function applyMintsoftAlignDownForProduct(params: {
   stockEnqueue?: Exclude<StockEnqueueOutcome, 'ok'>
   reason: string
 }> {
-  const [priorDiscrepancy, openAsnPendingQty, inFlightDispatch, stockLevel, alignDownReason] = await Promise.all([
+  const [priorDiscrepancy, openAsnPendingQty, inFlightDispatch, stockLevel, alignDownReason, reasonCostRequired] = await Promise.all([
     db.wmsStockDiscrepancy.findFirst({
       where: buildDiscrepancyWhere(params.binding, 'QTY_MISMATCH', params.productId, params.sku),
       select: { delta: true, lastSeenAt: true },
@@ -2519,14 +2522,24 @@ async function applyMintsoftAlignDownForProduct(params: {
           select: { active: true, accountCode: true },
         })
       : Promise.resolve(null),
+    // o3d-jwa8m: switch off = no further read; the plan below sees exactly the inputs it always did.
+    readStockAdjustmentReasonCostRequired(db),
   ])
+  const reasonState = mintsoftAlignDownReasonState({
+    reason: alignDownReason,
+    reasonCostRequired,
+    inventoryAccount: reasonCostRequired && alignDownReason?.active && alignDownReason?.accountCode
+      ? (await getAccountingSettings()).inventoryAccount
+      : null,
+  })
 
   const decision = planMintsoftAlignDown({
     delta: params.delta,
     imsQty: params.imsQty,
     wmsQty: params.wmsQty,
     reservedQty: Number(stockLevel?.reservedQty ?? 0),
-    reasonConfigured: Boolean(alignDownReason?.active && alignDownReason?.accountCode),
+    reasonConfigured: reasonState.reasonConfigured,
+    ...(reasonState.inventoryAccountMissing ? { inventoryAccountMissing: true } : {}),
     thresholds: parseMintsoftThresholds(params.binding.discrepancyThresholds),
     openAsnPendingQty,
     inFlightDispatchQty: inFlightDispatch.qty,

@@ -6,7 +6,7 @@ const stockSyncHelpers = 'default' in stockSyncHelpersNs
   ? stockSyncHelpersNs.default as typeof import('../lib/connectors/mintsoft/sync/stock-sync-helpers.ts')
   : stockSyncHelpersNs
 
-const { planMintsoftAlignDown } = stockSyncHelpers
+const { planMintsoftAlignDown, mintsoftAlignDownReasonState } = stockSyncHelpers
 
 const RUN_START = new Date('2026-07-11T10:00:00Z')
 const PRIOR_RUN = new Date('2026-07-11T09:00:00Z')
@@ -134,4 +134,40 @@ test('planMintsoftAlignDown holds while a despatch is in flight, even when the d
 
 test('planMintsoftAlignDown applies again once no despatch is in flight', () => {
   assert.equal(planMintsoftAlignDown(baseInput({ inFlightDispatchQty: 0 })).action, 'apply')
+})
+
+// o3d-jwa8m MED-5: with the reason/cost switch ON, a missing inventory account must degrade to a hold (a manual discrepancy), not a per-SKU sweep error.
+test('mintsoftAlignDownReasonState: switch on and no inventory account is not configured, naming the inventory account', () => {
+  const reason = { active: true, accountCode: '500' }
+  assert.deepEqual(
+    mintsoftAlignDownReasonState({ reason, reasonCostRequired: true, inventoryAccount: null }),
+    { reasonConfigured: false, inventoryAccountMissing: true },
+  )
+  assert.deepEqual(
+    mintsoftAlignDownReasonState({ reason, reasonCostRequired: true, inventoryAccount: '' }),
+    { reasonConfigured: false, inventoryAccountMissing: true },
+  )
+  assert.deepEqual(
+    mintsoftAlignDownReasonState({ reason, reasonCostRequired: true, inventoryAccount: '630' }),
+    { reasonConfigured: true, inventoryAccountMissing: false },
+  )
+})
+
+test('mintsoftAlignDownReasonState: switch off never looks at the inventory account (unchanged)', () => {
+  const reason = { active: true, accountCode: '500' }
+  assert.deepEqual(
+    mintsoftAlignDownReasonState({ reason, reasonCostRequired: false, inventoryAccount: null }),
+    { reasonConfigured: true, inventoryAccountMissing: false },
+  )
+  assert.equal(mintsoftAlignDownReasonState({ reason: { active: false, accountCode: '500' }, reasonCostRequired: false, inventoryAccount: '630' }).reasonConfigured, false)
+  assert.equal(mintsoftAlignDownReasonState({ reason: { active: true, accountCode: null }, reasonCostRequired: true, inventoryAccount: '630' }).reasonConfigured, false)
+  assert.equal(mintsoftAlignDownReasonState({ reason: null, reasonCostRequired: true, inventoryAccount: null }).inventoryAccountMissing, false)
+})
+
+test('planMintsoftAlignDown holds naming the inventory account when it is the missing piece', () => {
+  const decision = planMintsoftAlignDown(baseInput({ reasonConfigured: false, inventoryAccountMissing: true }))
+  assert.equal(decision.action, 'hold')
+  assert.match((decision as { reason: string }).reason, /inventory account/)
+  // Without the flag the message is the one it always was.
+  assert.match((planMintsoftAlignDown(baseInput({ reasonConfigured: false })) as { reason: string }).reason, /adjustment reason/)
 })

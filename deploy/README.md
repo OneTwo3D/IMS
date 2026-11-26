@@ -5,12 +5,15 @@
 | Unit | Purpose | Status |
 |------|---------|--------|
 | `systemd/ims-stage.service` | Production build (`next start`) as a non-root, loopback-only, sandboxed service | **Current** |
-| `systemd/ims-stage-dev.service` | `next dev` as root on `0.0.0.0` | **Deprecated — do not run on any internet-facing host** (see `onetwo3d-ims-k0ei` / `dg42`) |
+| `systemd/ims-stage-dev.service` | `next dev` as root, from `/root/ims/onetwo3d-ims-isolated`, hostname `127.0.0.1` in the file (its `Description` says DEPRECATED, local dev only) | **Deprecated — do not run on any internet-facing host** (see `onetwo3d-ims-k0ei` / `dg42`) |
+| `systemd/ims-e2e-dev.service` | Full-chain E2E rig: `next start` as `ims` on port 3002 with its own database; see [`docs/ops/full-chain-e2e-runbook.md`](../docs/ops/full-chain-e2e-runbook.md) | Current |
 
 The dev unit ran the Next.js development server as **root**, in `NODE_ENV=development`,
 bound to `0.0.0.0` behind the public staging hostname. Dev mode leaks stack traces
 and source to clients, is not DoS-hardened, and a dev-cache corruption took staging
 fully down during the security review. `ims-stage.service` replaces it.
+
+The stage host does not currently run either file as written: its installed `/etc/systemd/system/ims-stage-dev.service` is a hardened `next dev` variant (`User=ims`, `/opt/ims/onetwo3d-ims`, hot reload, `HOSTNAME=0.0.0.0` because the ingress proxy reaches it over the LAN) that is not the copy in `deploy/systemd/`.
 
 ## One-time migration to `ims-stage.service`
 
@@ -66,6 +69,8 @@ fully down during the security review. `ims-stage.service` replaces it.
 sudo -u ims bash -lc 'cd /opt/ims/onetwo3d-ims && git pull && npm ci && npm run build'
 sudo systemctl restart ims-stage
 ```
+
+`npm run build` is plain `next build` and applies no migration. When the schema changed, run `scripts/deploy.sh` (build, stop and drain every writer, migrate, verify, start) instead of these two commands.
 
 The `restart` is not optional and `start` will not do: a running process is not
 replaced by a `start`, so a rebuilt tree with the old process still up leaves
@@ -212,8 +217,7 @@ Every `child_process` call in `app/` and `lib/` was checked:
 
 `/api/cron/reconciliation-pack` normally runs `npm run reconcile:pack` (`tsx scripts/reconciliation-pack.ts`), and that
 command in turn runs `npm run read-sync:status`. The image has no `scripts/` tree and no `tsx`, so the build stage bundles those
-two entry points with esbuild into self-contained files, `/app/dist-scripts/reconciliation-pack.mjs` and
-`/app/dist-scripts/read-sync-status.mjs`. `lib/ops/readiness-gate-collect.ts` (`bundledScriptPath`) runs `node <bundle>` when
+two entry points, plus `render-managed-crontab` (used by host cron setup, not a child process), with esbuild into self-contained files, `/app/dist-scripts/reconciliation-pack.mjs`, `/app/dist-scripts/read-sync-status.mjs` and `/app/dist-scripts/render-managed-crontab.mjs`. `lib/ops/readiness-gate-collect.ts` (`bundledScriptPath`) runs `node <bundle>` when
 `<cwd>/dist-scripts/<file>` exists for one of those two scripts, and `npm run <script>` otherwise, so the stage host and
 checkouts are unchanged. `/app` is owned by the `ims` user because the pack only runs when the running uid is root or owns the
 checkout root. Its reports go to `/var/tmp/ims-reconciliation-pack-reports` inside the container (not a declared volume;
