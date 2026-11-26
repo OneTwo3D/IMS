@@ -1408,6 +1408,9 @@ const MIGRATIONS_THAT_DELETE_RETIRED_PLUGIN_KEYS: Record<string, string> = {
   '20261122140000_purge_retired_accounting_settings':
     'Deletes the plugin flag of a retired accounting connector. No current plugin reads or writes that key, '
     + 'so the active connector cannot change and there is nothing for the selection lock to serialize.',
+  '20261126120000_purge_retired_storefront_wms_settings':
+    'Deletes the plugin flags of a retired storefront and a retired WMS. No current plugin reads or writes '
+    + 'either key, so the active connector cannot change and there is nothing for the selection lock to serialize.',
 }
 
 test('no repo migration writes a plugin selection key', () => {
@@ -1555,6 +1558,10 @@ const MIGRATIONS_THAT_MUTATE_SETTINGS: Record<string, string> = {
     'Deletes the plugin flag and the prefixed settings rows of a retired accounting connector, by one exact '
     + 'key and one escaped LIKE prefix. No current plugin key matches either, and nothing in the build reads '
     + 'those rows, so it cannot change the active connector or race the orphan-cancel sweep.',
+  '20261126120000_purge_retired_storefront_wms_settings':
+    'Deletes two plugin flags of retired connectors by exact key, plus two escaped LIKE prefixes of their '
+    + 'settings rows. No current plugin key matches any of them, and nothing in the build reads those rows, '
+    + 'so it cannot change the active connector or race the orphan-cancel sweep.',
   '20260819210000_xero_pin_write_consumes_release':
     'Deletes ONE key by exact literal match (xero_pin_release_witness), in two places: the backfill, '
     + 'and the body of the trigger it installs. Neither can reach a plugin key — the literal is the '
