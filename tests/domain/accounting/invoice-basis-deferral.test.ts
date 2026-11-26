@@ -12,7 +12,7 @@ import {
 const SINCE = new Date('2026-12-01T09:00:00.000Z')
 const order = { id: 'so-1', accountingInvoiceId: 'INV-1' }
 const good = {
-  type: 'SALES_INVOICE', referenceId: 'so-1', externalTransactionId: 'INV-1', status: 'SYNCED', settlementBasis: null,
+  type: 'SALES_INVOICE', referenceId: 'so-1', externalTransactionId: 'INV-1', status: 'SYNCED', settlementBasis: null, abandonedBeforeRemoteCall: false,
   syncedAt: new Date('2026-12-02T10:00:00.000Z'), payload: { _postingMode: 'submitted', date: '2026-11-30' },
 }
 
@@ -28,7 +28,7 @@ test('anything less is not proof: the order stays in Sales', () => {
     ['DRAFT mode', { payload: { _postingMode: 'draft', date: '2026-11-30' } }],
     ['no posting mode recorded', { payload: { date: '2026-11-30' } }],
     ['no document date', { payload: { _postingMode: 'submitted' } }],
-    ['not synced', { status: 'PENDING' }],
+    ['not synced', { status: 'PENDING', externalTransactionId: null }],
     ['operator assertion, not a connector confirmation', { settlementBasis: 'OPERATOR_ASSERTION' }],
     ['another document', { externalTransactionId: 'INV-OTHER' }],
     ['another order', { referenceId: 'so-2' }],

@@ -499,14 +499,28 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/connectors/xero/daily-sync.ts',
-    figures: ['shippedRevenue', 'shippedRevenueOf', 'proportionalRevenue', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueProportion', 'revenueRecognizedAmount', 'runningRevenue', 'totalRevenueDeferred', 'groupRevenue', 'groupRevenueRaw', 'unearnedRevenueAmount', 'xero_unearned_revenue_account'],
+    figures: ['shippedRevenue', 'shippedRevenueOf', 'proportionalRevenue', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueProportion', 'revenueRecognizedAmount', 'runningRevenue', 'totalRevenueDeferred', 'groupRevenue', 'groupRevenueRaw', 'unearnedRevenueAmount', 'xero_unearned_revenue_account', 'revenueDeferralEventAt', 'revenueDeferralBasis'],
     treatment: 'not-refund-sensitive',
     reason:
       'Revenue deferral/recognition journal amounts. Ledger postings (per event date).',
   },
   {
+    file: 'lib/domain/settings/system-switches.ts',
+    figures: ['xero_defer_unpaid_invoiced_revenue_enabled', 'xero_defer_unpaid_invoiced_revenue_enabled_at'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'o3d-r2nkq: the registry entry (key, ADMIN, switch-on stamp) of the unpaid-invoice revenue deferral switch. A setting name, not a figure.',
+  },
+  {
+    file: 'lib/domain/accounting/invoice-basis-deferral.ts',
+    figures: ['revenueDeferralBasis', 'revenueDeferralEventAt', 'revenueDeferredDate', 'xero_defer_unpaid_invoiced_revenue_enabled', 'xero_defer_unpaid_invoiced_revenue_enabled_at'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'o3d-r2nkq: decides WHETHER and FROM WHICH DAY Group A1 defers an unpaid order (the switch, its switch-on instant, the invoice proof and the anchor day). It computes no amount: the deferral figure is the one Group A1 already nets of refunds.',
+  },
+  {
     file: 'lib/connectors/xero/payment-poller.ts',
-    figures: ['revenueDeferredDate'],
+    figures: ['revenueDeferredDate', 'revenueDeferralBasis'],
     treatment: 'not-refund-sensitive',
     reason:
       'Ledger deferral date.',
@@ -562,7 +576,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/accounting/invariants.ts',
-    figures: ['postedRevenue', 'recognizedRevenueTotal', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueRecognizedAmount', 'revenue_posted_without_payment', 'sales_order_inventory_allocated_without_revenue_deferral', 'sales_order_recognized_revenue_deferral_mismatch', 'sales_order_revenue_deferral_missing_amount', 'sales_order_revenue_deferral_without_sync_evidence', 'shipment_posted_missing_revenue_amount', 'unearnedRevenueAmount'],
+    figures: ['postedRevenue', 'recognizedRevenueTotal', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueRecognizedAmount', 'revenue_posted_without_payment', 'sales_order_inventory_allocated_without_revenue_deferral', 'sales_order_recognized_revenue_deferral_mismatch', 'sales_order_revenue_deferral_missing_amount', 'sales_order_revenue_deferral_without_sync_evidence', 'shipment_posted_missing_revenue_amount', 'unearnedRevenueAmount', 'revenueDeferralBasis'],
     treatment: 'not-refund-sensitive',
     reason:
       'Ledger invariant codes and amounts.',
@@ -583,7 +597,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/accounting/reversal-handling.ts',
-    figures: ['revenueDeferredDate'],
+    figures: ['revenueDeferredDate', 'revenueDeferralBasis'],
     treatment: 'not-refund-sensitive',
     reason:
       'Reversal of a posted revenue-deferral journal. A ledger operation, not a published figure.',
@@ -632,7 +646,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/sales/refund-service.ts',
-    figures: ['aUnitRevenue', 'assignedRevenue', 'bUnitRevenue', 'lineDrivenRevenue', 'margin', 'nonQtyRevenue', 'refundRevenue', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueRecognizedAmount', 'shippedQtyRevenue', 'shippedRevenue', 'toNetRevenue', 'unearnedRevenueAccount', 'unearnedRevenueAmount', 'unitRevenue', 'unshippedQtyRevenue', 'unshippedRevenue'],
+    figures: ['aUnitRevenue', 'assignedRevenue', 'bUnitRevenue', 'lineDrivenRevenue', 'margin', 'nonQtyRevenue', 'refundRevenue', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueRecognizedAmount', 'shippedQtyRevenue', 'shippedRevenue', 'toNetRevenue', 'unearnedRevenueAccount', 'unearnedRevenueAmount', 'unitRevenue', 'unshippedQtyRevenue', 'unshippedRevenue', 'revenueDeferralEventAt', 'revenueDeferralBasis'],
     treatment: 'not-refund-sensitive',
     reason:
       'The refund WRITER. It creates the rows the reports classify; it publishes no report figure. `margin` is the word in the comment where an adopting refund (returned stock the warehouse had already restocked) says IMS posts nothing for the margin and raises an owed-posting record for a person: it names a ledger reclass, not a rendered or netted margin figure.',

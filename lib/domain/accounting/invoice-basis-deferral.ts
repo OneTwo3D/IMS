@@ -23,6 +23,7 @@ import type { Prisma } from '@/app/generated/prisma/client'
 
 import { recoverPostedBusinessDate } from '@/lib/domain/accounting/back-reference'
 import { businessDay } from '@/lib/domain/accounting/daily-batch-event-date'
+import { LEDGER_STANDING_SELECT, ledgerStanding, mayHaveReachedLedger } from '@/lib/domain/accounting/ledger-standing'
 
 /** The switch (default OFF) and its switch-on instant, written by `npm run settings:set` (lib/domain/settings/system-switches.ts, which holds the same literals). */
 export const INVOICE_BASIS_DEFERRAL_SWITCH_KEY = 'xero_defer_unpaid_invoiced_revenue_enabled'
@@ -69,6 +70,7 @@ type ProofRow = {
   externalTransactionId: string | null
   status: string
   settlementBasis: string | null
+  abandonedBeforeRemoteCall: boolean | null
   syncedAt: Date | null
   payload: unknown
 }
@@ -80,10 +82,11 @@ function postingModeOf(payload: unknown): unknown {
 /**
  * Pure: which orders carry PROOF that their invoice reached Xero as AUTHORISED at or after `since`.
  *
- * Proof is a SALES_INVOICE row of the order that the CONNECTOR confirmed (status SYNCED, no operator settlement basis),
- * names the order's own invoice id, was synced at or after `since`, was sent with posting mode `submitted` (AUTHORISED)
- * and carries the document date it was sent with. An order with any synced invoice row sent in `draft` mode is refused,
- * whatever else it has. Anything less is not proof, and the order stays in Sales.
+ * Proof is a SALES_INVOICE row of the order whose ledger standing is CONFIRMED_POSTED (the connector's own writeback,
+ * never an operator's assertion; lib/domain/accounting/ledger-standing.ts), names the order's own invoice id, was synced
+ * at or after `since`, was sent with posting mode `submitted` (AUTHORISED) and carries the document date it was sent with.
+ * An order with any invoice row that may have reached the ledger in `draft` mode is refused, whatever else it has.
+ * Anything less is not proof, and the order stays in Sales.
  */
 export function provenInvoiceBasisOrders(
   orders: ReadonlyArray<{ id: string; accountingInvoiceId: string | null }>,
@@ -93,12 +96,13 @@ export function provenInvoiceBasisOrders(
   const proven = new Map<string, InvoiceBasisProof>()
   for (const order of orders) {
     if (!order.accountingInvoiceId) continue
-    const own = rows.filter((row) => row.referenceId === order.id && row.status === 'SYNCED')
-    if (own.some((row) => postingModeOf(row.payload) === 'draft')) continue
+    const own = rows.filter((row) => row.referenceId === order.id)
+    if (own.some((row) => mayHaveReachedLedger(row) && postingModeOf(row.payload) === 'draft')) continue
     const create = own
       .filter((row) => row.type === 'SALES_INVOICE'
-        && row.externalTransactionId === order.accountingInvoiceId
+        && ledgerStanding(row) === 'CONFIRMED_POSTED'
         && row.settlementBasis === null
+        && row.externalTransactionId === order.accountingInvoiceId
         && row.syncedAt !== null
         && row.syncedAt.getTime() >= since.getTime()
         && postingModeOf(row.payload) === 'submitted')
@@ -123,9 +127,8 @@ export async function proveInvoiceBasisOrders(
       referenceType: 'SalesOrder',
       referenceId: { in: orders.map((order) => order.id) },
       type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] },
-      status: 'SYNCED',
     },
-    select: { type: true, referenceId: true, externalTransactionId: true, status: true, settlementBasis: true, syncedAt: true, payload: true },
+    select: { ...LEDGER_STANDING_SELECT, type: true, referenceId: true, syncedAt: true, payload: true },
   })
   return provenInvoiceBasisOrders(orders, rows, since)
 }
