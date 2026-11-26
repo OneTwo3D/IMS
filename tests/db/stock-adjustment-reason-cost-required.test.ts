@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import test, { mock } from 'node:test'
 import { config } from 'dotenv'
+import type { CsvImportExecutionResult } from '@/lib/csv-import'
 
 /**
  * o3d-0ypv9 — EVERY WRITER OF A STOCK ADJUSTMENT, against a real database, with the switch
@@ -124,7 +125,8 @@ test('stock adjustments: reason and unit cost required (switch on) and unchanged
   const csv = (body: string) => {
     const fd = new FormData()
     fd.set('file', new File([body], 'adjustments.csv', { type: 'text/csv' }))
-    return imports.importAdjustmentsCsv(fd)
+    // No `mode` is set, so the import executes and returns the execution result.
+    return imports.importAdjustmentsCsv(fd) as Promise<CsvImportExecutionResult>
   }
 
   await t.test('single (adjustStock): ON refuses no reason and an unmapped valued reason; OFF accepts both as before', async () => {
