@@ -501,8 +501,8 @@ The flowchart below shows every path an order can take through the Xero sub-ledg
               ▼                        ▼
     ┌──────────────────┐     ┌──────────────────┐
     │  WooCommerce     │     │  Manual Order    │
-    │  (pre-paid)      │     │  (DRAFT invoice) │
-    │                  │     │                  │
+    │  (pre-paid)      │     │  (AUTHORISED     │
+    │                  │     │   invoice*)      │
     │  • AUTHORISED    │     │  • Payment       │
     │    invoice       │     │    polling every  │
     │  • Payment auto- │     │    15 min detects │
@@ -530,8 +530,9 @@ The flowchart below shows every path an order can take through the Xero sub-ledg
          ▼                          │
   ══════════════════                │
   ║ DAILY BATCH A1 ║◄──────────────┘
-  ║ Revenue        ║   (applies to ALL paid orders)
-  ║ Deferral       ║
+  ║ Revenue        ║   (applies to ALL paid orders, and, with
+  ║ Deferral       ║    the unpaid-invoice switch on, to unpaid
+  ║                ║    orders invoiced after switch-on)
   ══════════════════
   DR Sales Revenue
   CR Unearned Revenue
@@ -597,6 +598,8 @@ The flowchart below shows every path an order can take through the Xero sub-ledg
   └──────────────────┘
 ```
 
+\* A manual order's invoice is sent when the order is created (or when a draft order is finalised), with the status the **Sales invoice** posting mode sets (`xero_sync_sales_invoice`): **submitted**, the default, sends it **AUTHORISED**, so it books Sales and the receivable at once; **draft** sends a Xero DRAFT, which posts nothing until someone approves it in Xero.
+
 ## Sync Cases in Detail
 
 > These cases are verified end-to-end (Woo stage → IMS → Xero Demo, read back from the Xero
@@ -633,15 +636,29 @@ The customer pays but the item is out of stock. Revenue is deferred immediately,
 
 ### Case 3: Manual Order (invoice-first)
 
-A manual order is created in the IMS. A DRAFT invoice is pushed to Xero. Payment is detected when the customer pays via bank transfer and the bank feed matches.
+A manual order is created in the IMS and its invoice is pushed to Xero straight away. With the default posting mode (`submitted`) the invoice is **AUTHORISED**, so Sales and the receivable are booked when the order is created; only the `draft` posting mode sends a Xero DRAFT (which books nothing until it is approved in Xero). Payment is detected when the customer pays via bank transfer and the bank feed matches.
 
 | Step | What Happens | Xero Journal |
 |---|---|---|
-| Order created | DRAFT invoice in Xero | Invoice (DRAFT) |
+| Order created | AUTHORISED invoice in Xero (DRAFT only in `draft` posting mode) | Invoice (DR Receivable / CR Sales) |
 | Customer pays | Bank feed matches in Xero | — |
 | Payment poll | IMS detects paid invoice, sets paidAt, advances status | — |
-| Daily batch A1 | Revenue deferred | DR Sales / CR Unearned Revenue |
+| Daily batch A1 | Revenue deferred (the part not yet shipped) | DR Sales / CR Unearned Revenue |
 | Allocate + ship | Normal flow from here | A2 then B |
+
+Until the order is paid its revenue stays in Sales, even before the goods ship, unless the unpaid-invoice switch below is on.
+
+### Case 3a: Unpaid order, invoice posted, goods not yet shipped (switch off by default)
+
+With the system switch `xero_defer_unpaid_invoiced_revenue_enabled` on, Group A1 also defers an **unpaid** order, so its revenue is recognised when the goods ship (FRS 102 s23.10), not when the invoice is posted.
+
+| Step | What Happens | Xero Journal |
+|---|---|---|
+| Order created | AUTHORISED invoice in Xero | Invoice (DR Receivable / CR Sales) |
+| Daily batch A1 | Unshipped revenue deferred, dated the invoice's document day | DR Sales / CR Unearned Revenue |
+| Daily batch A2 | Stock reclassified once allocated | DR Allocated / CR Inventory |
+| Each shipment | Daily batch B releases its share, dated the day it shipped | DR Unearned / CR Sales + DR COGS / CR Allocated |
+| Customer pays (any time) | Nothing changes in the sub-ledger | — |
 
 ### Case 4: Partial Shipment (multi-warehouse)
 
@@ -959,11 +976,18 @@ The full unified-FX rollout plan is tracked in `docs/todo/unified-fx-rates-plan.
 
 When enabled, the nightly cron job runs three groups in sequence:
 
-- **Group A1 — Revenue Deferral**: Any paid order that hasn't been deferred yet. Prevents Xero from showing inflated revenue before goods ship.
+- **Group A1 — Revenue Deferral**: Any paid order that hasn't been deferred yet. Prevents Xero from showing inflated revenue before goods ship. With the unpaid-invoice switch on (below), also any unpaid order whose invoice IMS posted as AUTHORISED after the switch went on.
 - **Group A2 — Inventory Reclassification**: Allocated orders only. Moves stock value from Available to Allocated on the balance sheet.
 - **Group B — Shipment Recognition**: Per-shipment. Recognises revenue and books COGS using FIFO cost layer consumption.
 
 **COGS is booked when the goods ship, whether or not the order is paid.** A shipment made BEFORE its order was paid (the order is unpaid, or the shipment's ship time is earlier than the payment time) and not yet deferred by Group A1 is costed on its own journal, dated the day it shipped: **DR COGS / CR Inventory**, at the same FIFO cost the ordinary path uses. Allocated Inventory is not involved, because Group A2 has not reclassified that stock. The invoice already put the revenue in Sales, so the shipment posts **no** revenue leg; it only records its revenue share. The shipment is marked (`cogsRelievedFromInventoryAt`, with the amount and the journal that carried it) in the same step. When the order is later paid: Group A1 defers only the part that has **not** shipped yet (the order still stores the full deferral, so the shipping true-up and the refund balances stay consistent); Group A2 reclassifies only the units still to ship and skips the ones already costed; and Group B never costs those units a second time. An order that is never paid and is written off keeps its cost, because the cost was booked when the goods left. A refund entered before the order's first batch run takes value out of the Unearned Revenue deferral only for the part that was deferred (the not-yet-shipped goods are refunded first); the part for goods that already shipped is reversed by the credit note alone, because that revenue never left Sales. A refund that returns stock from such a shipment reverses its cost as **DR Inventory / CR COGS** (never into Allocated Inventory), whether or not the order has been paid since. The shipment is costed in a first pass of the batch that runs before revenue deferral and the inventory reclassification, so paying the order before the next run does not move the cost off the day it shipped. If staging that reversal fails, the refund's accounting retry stages it again. A shipment made at or after the payment time is never costed this way, even if the order's first batch run comes later: it goes through deferral, reclassification and the ordinary shipment pass (a shipment at exactly the payment time counts as after payment). An order with shipments on both sides of payment gets each one on its own path. An unpaid order is only costed once IMS has posted its invoice (the invoice is what books the revenue).
+
+**Unpaid invoiced orders (switch `xero_defer_unpaid_invoiced_revenue_enabled`, off by default).** Without it, an unpaid order whose invoice was posted as AUTHORISED (a manual or B2B order) keeps its revenue in Sales until it is paid, even before the goods ship. With it on, Group A1 defers that order too, with the same journal, the same accounts (DR Sales / CR Unearned Revenue) and the same rules as a paid order: only the part not yet shipped is deferred (a shipment that left before the run is costed first on the direct path and its revenue stays in Sales), refunds entered before the first run are netted, and each shipment releases its share through Group B. Turn it on with `npm run settings:set` (an ADMIN switch: it needs `--confirm-admin`); turning it on records the instant (`xero_defer_unpaid_invoiced_revenue_enabled_at`), and turning it off deletes it.
+- **Which orders.** Only orders whose invoice IMS can prove reached Xero as AUTHORISED at or after the switch-on instant: the invoice's own sales-invoice sync row, confirmed by Xero (not an operator's assertion), sent in `submitted` mode, with the document date it was sent with. Invoices already open when the switch is turned on stay in Sales for manual review; nothing is backfilled. An invoice sent in `draft` mode (or approved by hand in Xero later) is never deferred: IMS cannot see it become AUTHORISED. An invoice IMS did not post (Xeroom, linked by hand) is never deferred. The switch set to `true` without its instant (for example by direct SQL) reads off.
+- **Dates.** The deferral is dated the invoice's **document day** (the day Sales was credited), subject to the locked-period rule. The order is stamped with the basis (`INVOICE`) and that day, and the inventory reclassification, each shipment's revenue release and any pre-batch refund adjustment are dated from that day instead of the payment day, so a shipment releases its revenue on the day it ships even if the customer pays later. Paying the order changes nothing in the sub-ledger.
+- **Paid orders are unchanged.** A paid order is deferred on its payment day exactly as before (stamped `PAID` while the switch is on); with the switch off nothing is stamped and the daily batch output is identical to before.
+- **Refunds and cancellation.** A refund of such an order unwinds Unearned Revenue exactly as for a paid order; a full refund clears the deferral stamp and its basis. A manual cancel of an order whose invoice reached the ledger is still refused until the order is refunded (credit note).
+- **Payment removed.** If a payment on such an order is later removed in Xero, IMS clears the payment and alerts finance, but raises **no** automatic chargeback credit note: the deferral did not come from the payment, so the receivable simply reopens. The accounting check `revenue_posted_without_payment` does not apply to these orders.
 
 **Journal dates.** Each journal carries the date of the event it records, not the day the batch ran: revenue deferral is dated the day the order was **paid**; the inventory reclassification the later of the day it was paid and the day its stock was allocated; shipment revenue and COGS the later of the day the goods **shipped** and the day the order was paid (Group B never recognises revenue before the payment that created the deferral); COGS for a shipment costed before payment is dated the day the goods **shipped**. Rows with different dates in one run become one journal per date, so the nightly batch can raise several journals, and a late run no longer pushes March activity into April. Dates are UTC days.
 
