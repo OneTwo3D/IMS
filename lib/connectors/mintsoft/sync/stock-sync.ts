@@ -16,6 +16,7 @@ import {
   consolidateMintsoftStockLines,
   hasMintsoftThresholdBreach,
   mintsoftAlignDownReasonState,
+  adjustmentPostingWouldBeRefused,
   planMintsoftAlignDown,
   planMintsoftAlignmentAllocations,
   parseMintsoftThresholds,
@@ -68,6 +69,7 @@ import { enqueueStockSync } from '@/lib/shopping'
 import { classifyStockEnqueueFailure, type StockEnqueueOutcome } from '@/lib/domain/integrations/stock-enqueue-failure'
 import {
   getAccountingSettings,
+  accountingPostingVerdictForChart,
   getAccountingSettingsFor,
   getActiveAccountingConnectorId,
   queueAccountingSyncTx,
@@ -197,6 +199,28 @@ export type MintsoftStockSyncResult = {
   /** PRESENT ONLY WHEN NON-ZERO: those the outbound-write hold refused. */
   stockEnqueueHeld?: number
   skippedReason?: string
+}
+
+/**
+ * o3d-jwa8m F5: the value a FIFO removal of `qty` would book, read WITHOUT consuming (same order as consumeFifoLayers: receivedAt, id).
+ * Used only to tell whether the removal is worth zero to the penny (then applyStockAdjustment would not refuse for a missing inventory account).
+ */
+async function estimateFifoRemovalValue(client: Pick<typeof db, 'costLayer'>, productId: string, warehouseId: string, qty: number) {
+  const layers = await client.costLayer.findMany({
+    where: { productId, warehouseId, remainingQty: { gt: 0 } },
+    orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
+    select: { remainingQty: true, unitCostBase: true },
+  })
+  let remaining = toDecimal(qty)
+  let total = toDecimal(0)
+  for (const layer of layers) {
+    if (remaining.lte(0)) break
+    const layerRemaining = toDecimal(layer.remainingQty)
+    const take = layerRemaining.lt(remaining) ? layerRemaining : remaining
+    total = addMoney(total, multiplyMoney(take, toDecimal(layer.unitCostBase)))
+    remaining = remaining.minus(take)
+  }
+  return total
 }
 
 function formatQuantity(value: number): string {
@@ -2525,12 +2549,28 @@ async function applyMintsoftAlignDownForProduct(params: {
     // o3d-jwa8m: switch off = no further read; the plan below sees exactly the inputs it always did.
     readStockAdjustmentReasonCostRequired(db),
   ])
+  // o3d-jwa8m F5: the inventory-account hold applies only where applyStockAdjustment's assertAdjustmentPostable would actually refuse:
+  // reason has an account, no inventory account mapped, a connector present, verdict post/chart-retired, and a write-off value that is not zero.
+  // Evaluated only in that corner (switch off = no further read; the plan sees exactly the inputs it always did).
+  let inventoryAccountForPlan: string | null = null
+  let adjustmentWouldBeRefused = false
+  if (reasonCostRequired && alignDownReason?.active && alignDownReason?.accountCode) {
+    const accountingSettings = await getAccountingSettings()
+    inventoryAccountForPlan = accountingSettings.inventoryAccount
+    if (!inventoryAccountForPlan && accountingSettings.connector && params.delta < 0) {
+      const { verdict } = await accountingPostingVerdictForChart(accountingSettings.connector, 'INVENTORY_ADJUSTMENT')
+      adjustmentWouldBeRefused = adjustmentPostingWouldBeRefused({
+        connectorPresent: true,
+        verdict,
+        valueBase: await estimateFifoRemovalValue(db, params.productId, params.binding.warehouseId, Math.abs(params.delta)),
+      })
+    }
+  }
   const reasonState = mintsoftAlignDownReasonState({
     reason: alignDownReason,
     reasonCostRequired,
-    inventoryAccount: reasonCostRequired && alignDownReason?.active && alignDownReason?.accountCode
-      ? (await getAccountingSettings()).inventoryAccount
-      : null,
+    inventoryAccount: inventoryAccountForPlan,
+    adjustmentWouldBeRefused,
   })
 
   const decision = planMintsoftAlignDown({

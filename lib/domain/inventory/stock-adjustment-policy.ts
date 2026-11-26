@@ -15,8 +15,8 @@ import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
  *      must be mapped. Otherwise it is REFUSED, naming the reason to map, instead of committing a stock change the ledger never
  *      sees;
  *   3. an addition is valued at the unit cost the operator entered (0 only when entered, for genuinely free stock) or, when left
- *      blank, at the unit cost of the product's LATEST cost layer with a non-zero cost in that warehouse, else in any warehouse.
- *      Never at an average. With no such layer it is refused.
+ *      blank, at the unit cost of the product's LATEST receipt or production cost layer with a non-zero cost in that warehouse, else in any
+ *      warehouse; with no such layer, the latest opening-stock batch cost. Never at an average. With none of these it is refused.
  *
  * The in-place edit (updateAdjustmentMovement), with the switch ON: only a plain stock adjustment (no reference) is editable at all (a supplier
  * return, stock-count variance or WMS align-down is refused); an edit that changes the movement's value to the penny while accounting posting
@@ -36,7 +36,12 @@ export async function readStockAdjustmentReasonCostRequired(client: SettingReadC
   return row?.value === 'true'
 }
 
-export type LatestLayerUnitCost = { unitCostBase: Decimal; source: 'warehouse' | 'any_warehouse' }
+export type LatestLayerUnitCost = {
+  unitCostBase: Decimal
+  source: 'warehouse' | 'any_warehouse'
+  /** Which kind of layer the cost came from: a receipt/production layer, or (owner ruling 2026-11-26, only when there is none) the latest opening-stock batch. */
+  basis?: 'receipt_or_production' | 'opening_stock'
+}
 
 type LayerReadClient = Pick<Prisma.TransactionClient, 'costLayer'>
 
@@ -45,33 +50,39 @@ type LayerReadClient = Pick<Prisma.TransactionClient, 'costLayer'>
  * warehouse. A consumed layer counts (it is still the latest price paid). Zero-cost layers (samples, free stock) are skipped: a zero is only
  * ever booked when an operator enters it. Exact: the stored 6dp Decimal, never a blend.
  *
- * Only a layer that records what was PAID or what making it COST qualifies (o3d-jwa8m): a purchase receipt (poLineId set) or a production
- * output (productionOrderId set). Excluded, because each carries a figure that is not a fresh price: a transfer's recreated layers (the source
- * layers' old cost, stamped received now), a refund restock (returnMovementId), an adjustment layer (an earlier default would perpetuate
- * itself) and an opening-stock layer (a moving average). A layer for a refund restock or a transfer carries none of the two ids, so it falls out.
+ * Only a layer that records what was PAID or what making it COST qualifies (o3d-jwa8m): a purchase receipt (poLineId set, which includes a
+ * Mintsoft align-up receipt-reconciliation layer: it carries the PO line AND an adjustment movement) or a production OUTPUT (productionOrderId set
+ * and the product is the order's output product, so a disassembly's component layers do not count). Excluded, because each carries a figure that is
+ * not a fresh price: a transfer's recreated layers (the source layers' old cost, stamped received now), a refund restock (returnMovementId), and a
+ * plain adjustment layer (an earlier default would perpetuate itself). A refund restock, a transfer layer and a plain adjustment carry neither id.
  * "Latest" is by receivedAt, ties by the creation sequence (createdSeq), never by the cuid.
+ *
+ * FALLBACK (owner ruling 2026-11-26): when the product has NO such receipt/production layer in any warehouse, the latest opening-stock
+ * batch layer with a non-zero cost is used (this warehouse first, else any), so a first-loaded product can still take a blank addition or a
+ * stock-count surplus. Never the average (an opening layer is the cost the first load stated for that batch).
  */
 export async function getLatestLayerUnitCost(client: LayerReadClient, productId: string, warehouseId: string): Promise<LatestLayerUnitCost | null> {
   const orderBy: Prisma.CostLayerOrderByWithRelationInput[] = [{ receivedAt: 'desc' }, { createdSeq: 'desc' }]
   const qualifying: Prisma.CostLayerWhereInput = {
     unitCostBase: { gt: 0 },
-    adjustmentMovementId: null,
     returnMovementId: null,
     isOpeningStock: false,
-    OR: [{ poLineId: { not: null } }, { productionOrderId: { not: null } }],
+    OR: [{ poLineId: { not: null } }, { productionOrderId: { not: null }, productionOrder: { outputProductId: productId } }],
   }
-  const inWarehouse = await client.costLayer.findFirst({
-    where: { productId, warehouseId, ...qualifying },
-    orderBy,
-    select: { unitCostBase: true },
-  })
-  if (inWarehouse) return { unitCostBase: toDecimal(inWarehouse.unitCostBase), source: 'warehouse' }
-  const anywhere = await client.costLayer.findFirst({
-    where: { productId, ...qualifying },
-    orderBy,
-    select: { unitCostBase: true },
-  })
-  return anywhere ? { unitCostBase: toDecimal(anywhere.unitCostBase), source: 'any_warehouse' } : null
+  const opening: Prisma.CostLayerWhereInput = {
+    unitCostBase: { gt: 0 },
+    returnMovementId: null,
+    isOpeningStock: true,
+  }
+  const find = (where: Prisma.CostLayerWhereInput) => client.costLayer.findFirst({ where, orderBy, select: { unitCostBase: true } })
+  const inWarehouse = await find({ productId, warehouseId, ...qualifying })
+  if (inWarehouse) return { unitCostBase: toDecimal(inWarehouse.unitCostBase), source: 'warehouse', basis: 'receipt_or_production' }
+  const anywhere = await find({ productId, ...qualifying })
+  if (anywhere) return { unitCostBase: toDecimal(anywhere.unitCostBase), source: 'any_warehouse', basis: 'receipt_or_production' }
+  const openingHere = await find({ productId, warehouseId, ...opening })
+  if (openingHere) return { unitCostBase: toDecimal(openingHere.unitCostBase), source: 'warehouse', basis: 'opening_stock' }
+  const openingAnywhere = await find({ productId, ...opening })
+  return openingAnywhere ? { unitCostBase: toDecimal(openingAnywhere.unitCostBase), source: 'any_warehouse', basis: 'opening_stock' } : null
 }
 
 /** An explicit cost wins (0 included); a blank defaults to the latest layer cost; neither refuses. Pure. */
