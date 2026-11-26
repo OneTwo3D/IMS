@@ -13,6 +13,14 @@ import {
 import { manualStockAdjustmentMovementKey } from '@/lib/domain/inventory/stock-movement-idempotency'
 import { businessDateYmd } from '@/lib/business-date'
 import { withHandPostSafety } from '@/lib/domain/accounting/hand-post-instruction'
+import { multiplyMoney, roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
+import {
+  getLatestLayerUnitCost,
+  missingReasonMessage,
+  readStockAdjustmentReasonCostRequired,
+  resolveRequiredAdditionUnitCost,
+  unmappedReasonMessage,
+} from '@/lib/domain/inventory/stock-adjustment-policy'
 
 // Extracted from app/actions/stock.ts (6oyu.1) so non-action callers — the WMS
 // stock-sync align-down path runs from a cron job — can post an adjustment
@@ -99,7 +107,10 @@ export type ApplyStockAdjustmentInput = {
   note?: string | null
   /**
    * Explicit base-currency unit cost for a positive adjustment. When omitted, the
-   * cost basis is derived (warehouse average → product historical average). If no
+   * cost basis is derived (warehouse average → product historical average); with the
+   * switch `stock_adjustment_reason_cost_required` on, it defaults to the latest cost
+   * layer's unit cost instead (warehouse, else any) and is never an average
+   * (o3d-0ypv9, see stock-adjustment-policy.ts). If no
    * basis can be derived (brand-new product, no cost layers anywhere) an explicit
    * cost is REQUIRED — otherwise the addition would silently book £0 stock and
    * later sell at zero COGS (cogs-audit scjz.2). Pass 0 only for genuinely
@@ -179,15 +190,18 @@ export async function applyStockAdjustment({
 
   let reasonName: string | null = note || null
   let accountCode: string | null = null
+  // o3d-0ypv9: what the switch-on checks below need to know about the reason. Unused with the switch off.
+  let resolvedReason: { name: string; active: boolean | undefined } | null = null
 
   if (reasonId) {
     const reason = await tx.adjustmentReason.findUnique({
       where: { id: reasonId },
-      select: { name: true, accountCode: true },
+      select: { name: true, accountCode: true, active: true },
     })
     if (reason) {
       reasonName = note ? `${reason.name}: ${note}` : reason.name
       accountCode = reason.accountCode
+      resolvedReason = { name: reason.name, active: reason.active }
     }
   }
 
@@ -222,6 +236,31 @@ export async function applyStockAdjustment({
     await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${`stock-adjustment-key:${idempotencyKey}`}, 0))`
     const replay = await findReplayedAdjustment()
     if (replay) return replay
+  }
+
+  // o3d-0ypv9 (switch `stock_adjustment_reason_cost_required`, off by default): read through this transaction, AFTER the replay
+  // check (a retry of an adjustment that already committed is answered, never re-judged) and BEFORE anything is written.
+  const reasonCostRequired = await readStockAdjustmentReasonCostRequired(tx)
+  let productLabel = productId
+  // Settings read once for the switch-on checks; the switch-off path keeps its own reads exactly as before.
+  let requiredSettings: Awaited<ReturnType<typeof getAccountingSettings>> | null = null
+  const assertAdjustmentPostable = async (valueBase: Decimal) => {
+    if (roundQuantity(valueBase.abs(), 2).isZero()) return
+    requiredSettings = requiredSettings ?? providedSettings ?? await getAccountingSettings()
+    if (accountCode && requiredSettings.inventoryAccount) return
+    if (!requiredSettings.connector) return
+    // The same verdict that, with the switch off, decides whether the unmapped adjustment is owed to the exception inbox.
+    const { verdict } = await accountingPostingVerdictForChart(requiredSettings.connector, 'INVENTORY_ADJUSTMENT')
+    if (verdict !== 'post' && verdict !== 'chart-retired') return
+    throw new Error(unmappedReasonMessage({ reasonName: resolvedReason?.name ?? null, inventoryAccountMapped: Boolean(requiredSettings.inventoryAccount) }))
+  }
+  if (reasonCostRequired) {
+    const productRow = await tx.product.findUnique({ where: { id: productId }, select: { sku: true } })
+    productLabel = productRow?.sku ?? productId
+    if (!reasonId || !resolvedReason) throw new Error(missingReasonMessage(productLabel))
+    if (resolvedReason.active === false) {
+      throw new Error(`The adjustment reason "${resolvedReason.name}" is inactive. Choose an active reason for ${productLabel}.`)
+    }
   }
 
   // o3d-hqvrp.80: sales_orders are locked BEFORE stock_levels everywhere, so the release for a removal that
@@ -264,7 +303,23 @@ export async function applyStockAdjustment({
 
   let additionUnitCost: number | null = null
   let removalCostBase: number | null = null
-  if (isAddition) {
+  // o3d-0ypv9 switch on: the exact Decimal cost and value the movement books. Null with the switch off.
+  let requiredAdditionUnitCost: Decimal | null = null
+  let requiredValueBase: Decimal | null = null
+  if (isAddition && reasonCostRequired) {
+    // An entered cost (0 included), else the latest layer cost: never an average.
+    const explicit = unitCostBase ?? null
+    // At the 6dp the cost layer and the movement store, so the journal is valued at exactly what is booked.
+    requiredAdditionUnitCost = roundQuantity(resolveRequiredAdditionUnitCost({
+      explicitUnitCostBase: explicit,
+      latest: explicit == null ? await getLatestLayerUnitCost(tx, productId, warehouseId) : null,
+      productLabel,
+    }), 6)
+    additionUnitCost = requiredAdditionUnitCost.toNumber()
+    requiredValueBase = multiplyMoney(Math.abs(qty), requiredAdditionUnitCost)
+    // Refused BEFORE anything is written.
+    await assertAdjustmentPostable(requiredValueBase)
+  } else if (isAddition) {
     if (unitCostBase != null && Number.isFinite(unitCostBase) && unitCostBase >= 0) {
       // Operator/caller supplied an explicit cost (0 allowed for sample/consigned stock).
       additionUnitCost = unitCostBase
@@ -293,7 +348,7 @@ export async function applyStockAdjustment({
       ...(referenceType ? { referenceType } : {}),
       ...(referenceId ? { referenceId } : {}),
       ...(idempotencyKey ? { idempotencyKey } : {}),
-      ...(isAddition ? buildStockMovementValueFields({ qty: absQty, unitCostBase: additionUnitCost ?? 0 }) : {}),
+      ...(isAddition ? buildStockMovementValueFields({ qty: absQty, unitCostBase: requiredAdditionUnitCost ?? additionUnitCost ?? 0 }) : {}),
     },
   })
 
@@ -319,7 +374,7 @@ export async function applyStockAdjustment({
       productId,
       warehouseId,
       qty: Math.abs(qty),
-      unitCostBase: additionUnitCost ?? 0,
+      unitCostBase: requiredAdditionUnitCost ?? additionUnitCost ?? 0,
       receivedAt: movement.createdAt,
       isOpeningStock: false,
       adjustmentMovementId: movement.id,
@@ -333,6 +388,11 @@ export async function applyStockAdjustment({
     // the cost-layer reduction, not a product-wide blended average.
     const valueFields = buildStockMovementValueFieldsFromConsumed(consumed, absQty)
     removalCostBase = Number(valueFields.totalValueBase)
+    if (reasonCostRequired) {
+      requiredValueBase = toDecimal(valueFields.totalValueBase)
+      // A removal's value is known only once FIFO has been consumed; the refusal rolls the caller's transaction back.
+      await assertAdjustmentPostable(requiredValueBase)
+    }
     await tx.stockMovement.update({
       where: { id: movement.id },
       data: valueFields,
@@ -399,9 +459,11 @@ export async function applyStockAdjustment({
     // average: additions use qty × the booked layer unit cost (scjz.2); removals
     // use the FIFO cost of the layers consumed (cbxu — the prior product-average
     // basis mis-stated both COGS and inventory, especially across warehouses).
-    const totalValueBase = isAddition
-      ? Math.abs(qty) * (additionUnitCost ?? 0)
-      : (removalCostBase ?? 0)
+    const totalValueBase = requiredValueBase
+      ? roundQuantity(requiredValueBase, 2).toNumber()
+      : isAddition
+        ? Math.abs(qty) * (additionUnitCost ?? 0)
+        : (removalCostBase ?? 0)
     const journal = buildInventoryAdjustmentJournal({
       reasonAccountCode: accountCode,
       inventoryAccountCode: settings.inventoryAccount,
