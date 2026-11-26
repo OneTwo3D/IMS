@@ -106,6 +106,12 @@ export const REALISED_FX_ACCOUNT_KEY = 'xero_realised_fx_gain_loss_account'
 // Off by default; turned on only at the owner's go for the one run at the cut-over, and back off afterwards. ADMIN: it lets a command write to the LIVE warehouse.
 export const FIRST_LOAD_WMS_ARCHIVE_SWITCH_KEY = 'first_load_mintsoft_archive_enabled' // wms-connector-boundary-ok: 2026-11-21: operator switch registry names the setting key
 
+// o3d-ngmt.22 / o3d-v7fs5: deleting a refund recorded in error. The reader is refundDeleteEnabledFromSetting in lib/domain/sales/refund-delete-policy.ts (`=== 'true'`); a literal here
+// for the same reason as the others, and tests/settings-cli.test.ts holds it equal to REFUND_DELETE_SETTING. ADMIN: a delete reverses stock, cost layers and journals and voids a
+// credit note in the LIVE ledger. No turn-on prerequisite is encoded: a delete is refused case by case at the moment it is asked for (Xero sync off or the credit-note type off,
+// a credit note the ledger will not void, books locked, stock moved), and the void needs only the baseline accounting.invoices grant, which is held on the connection, not in a settings row.
+export const REFUND_DELETE_SWITCH_KEY = 'refund_delete_enabled'
+
 export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   booleanSwitch('trackship_refire_enabled'),
   booleanSwitch('wc_withdrawal_outcome_enabled'),
@@ -137,6 +143,7 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   // o3d-l9gej: a recorded refund payment against a sales credit note is dated and rated on the day its cash went out, not the credit note's day. Literal, not an
   // import of lib/domain/accounting/credit-note-allocation.ts; tests hold it equal to REFUND_CASH_OUT_DATE_SETTING_KEY.
   booleanSwitch('xero_refund_payment_cash_out_date_enabled'),
+  booleanSwitch(REFUND_DELETE_SWITCH_KEY, undefined, true),
   booleanSwitch(SUPPLIER_CREATE_KEY, undefined, true),
   booleanSwitch(ASN_SEND_SUPPLIER_KEY, undefined, true),
   booleanSwitch(ASN_SUPPLIER_REQUIRED_KEY, [ASN_REQUIRED_NEEDS_SEND], true),
