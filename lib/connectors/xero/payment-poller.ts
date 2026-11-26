@@ -1392,7 +1392,7 @@ async function processDeltaChunk(
       // `paidAt: { not: null }` inside a file that decides reversals carries the provenance", with no
       // exceptions for reads that happen not to need it today. An exception is a hole the next reader
       // walks through, which is the shape of the defect this round exists to close.
-      select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true, revenueDeferredDate: true, unregisteredPaidAt: true },
+      select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true, revenueDeferredDate: true, revenueDeferralBasis: true, unregisteredPaidAt: true },
     })
     if (paidOrders.length > 0) {
       for (const order of detectPaymentReversals(paidOrders, reversedSalesIds)) {

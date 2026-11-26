@@ -2,6 +2,7 @@
 
 import { describeLedgerStanding } from '@/lib/domain/accounting/ledger-standing-display'
 import { db } from '@/lib/db'
+import { UNPAID_INVOICE_BASIS_A1_WHERE, proveInvoiceBasisOrders, readInvoiceBasisDeferralSwitch } from '@/lib/domain/accounting/invoice-basis-deferral'
 import { requirePermission } from '@/lib/auth/server'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { parseCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
@@ -184,6 +185,20 @@ async function computePreview(): Promise<DailyBatchPreview> {
     },
     orderBy: { paidAt: 'asc' },
   })
+  // o3d-r2nkq: with `xero_defer_unpaid_invoiced_revenue_enabled` on, unpaid orders whose AUTHORISED invoice was posted after
+  // switch-on are deferred too; listed after the paid ones. Off, nothing is added.
+  const invoiceBasisSwitch = await readInvoiceBasisDeferralSwitch(db)
+  if (invoiceBasisSwitch.on) {
+    const unpaid = await db.salesOrder.findMany({
+      where: UNPAID_INVOICE_BASIS_A1_WHERE,
+      select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, totalBase: true, taxBase: true },
+      orderBy: { id: 'asc' },
+    })
+    const proven = await proveInvoiceBasisOrders(db, unpaid, invoiceBasisSwitch.since)
+    for (const order of unpaid) {
+      if (proven.has(order.id)) a1Orders.push(order)
+    }
+  }
 
   const a1 = {
     orderCount: a1Orders.length,

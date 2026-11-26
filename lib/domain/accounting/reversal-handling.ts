@@ -38,6 +38,12 @@ export type DetectedReversalOrder = {
   status: string
   accountingInvoiceId: string | null
   revenueDeferredDate: Date | null
+  /**
+   * o3d-r2nkq: INVOICE when Group A1 deferred the order from its invoice while it was unpaid (switch
+   * `xero_defer_unpaid_invoiced_revenue_enabled`). That deferral did not come from the payment, so a removed payment owes no
+   * revenue unwind: the receivable simply reopens and no chargeback credit note is raised (owner ruling 2026-11-26). Absent/NULL = PAID.
+   */
+  revenueDeferralBasis?: string | null
 }
 
 export type ReversalEffects = {
@@ -135,7 +141,7 @@ export async function handleDetectedReversal(
   let chargebackManualReason: string | undefined
   // Revenue unwind — skipped when a recent WC refund already reversed revenue (no
   // double credit note), the invoice is VOIDED, or no revenue was recognised.
-  if (order.revenueDeferredDate && !opts.invoiceVoided && !wcHandled && !opts.ledgerStillHoldsPayment) {
+  if (order.revenueDeferredDate && order.revenueDeferralBasis !== 'INVOICE' && !opts.invoiceVoided && !wcHandled && !opts.ledgerStillHoldsPayment) {
     let error: string | undefined
     let manualResolutionRequired = false
     try {
