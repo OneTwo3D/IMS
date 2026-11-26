@@ -1,6 +1,6 @@
 /**
  * ONE WMS CONNECTOR AT A TIME — AND NOBODY PICKS A WINNER
- * (o3d-remove-shiphero round 10, Codex HIGH 1).
+ * (wms-neutral-refactor round 10, Codex HIGH 1).
  *
  * THE DEFECT ROUND 8 INTRODUCED. Making the Integration Plugins toggles registry-derived is what
  * made a SECOND WMS switch exist. Nothing added the rule that only one may be on: neither writer
@@ -168,7 +168,7 @@ function forceStoredState(enabled: string[]) {
 }
 
 /**
- * THE FIXTURE ITSELF, CHECKED (o3d-remove-shiphero round 12, fixture audit).
+ * THE FIXTURE ITSELF, CHECKED (wms-neutral-refactor round 12, fixture audit).
  *
  * `ALL_KEYS` is this file's statement of "every plugin row", and the settings double uses it to
  * decide which rows `lockIntegrationPluginSelection` may read. Production's statement is
@@ -381,7 +381,7 @@ test('[round 10 HIGH 1] the ASN facade refuses with the CONTRADICTION, not with 
 
 // ---------------------------------------------------------------------------------------------
 // 3. NOT OFFERED — `WmsConnectorDef.available`, which nothing used to read
-// (o3d-remove-shiphero round 12, Codex HIGH 2)
+// (wms-neutral-refactor round 12, Codex HIGH 2)
 //
 // `available` is documented on the definition as "false for a connector that is registered but not
 // offered to operators yet", and NOTHING consulted it. Round 8's registry-derived toggles and round

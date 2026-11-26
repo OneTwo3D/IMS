@@ -1,7 +1,7 @@
 /**
- * THE SECOND-CONNECTOR SEAM (o3d-remove-shiphero).
+ * THE SECOND-CONNECTOR SEAM (wms-neutral-refactor).
  *
- * WHAT THIS FILE IS FOR. Until ShipHero was removed there were two WMS connectors, and
+ * WHAT THIS FILE IS FOR. Until the second WMS was removed there were two WMS connectors, and
  * the generic WMS layer was kept honest by the ordinary fact that both had to work.
  * Mintsoft is now the only one. A one-implementation abstraction reads as ceremony:
  * the next person to touch `lib/connectors/wms/registry.ts`, `create-replay-policy.ts`
@@ -99,8 +99,8 @@ test('seam/registry: registering the same id twice is refused', () => {
 // ---------------------------------------------------------------------------
 
 /**
- * THE MEASUREMENT THIS EXISTS TO FIX. With ShipHero gone, every test that used the
- * literal `'shiphero'` to reach a `client-side-dedupe-only` path was reaching it via an
+ * THE MEASUREMENT THIS EXISTS TO FIX. With the second WMS gone, every test that used its
+ * literal id to reach a `client-side-dedupe-only` path was reaching it via an
  * id the registry does not know — and `wmsCreateReplayPolicy` fails CLOSED on an
  * unknown id, returning null, which produces the identical refusal. Those tests would
  * therefore pass against a build in which `'client-side-dedupe-only'` had been deleted
@@ -131,7 +131,7 @@ test('seam/policy: a REGISTERED unsafe connector is distinguishable from an unkn
 
 /**
  * THE SHIPPED REGISTRY IS EXHAUSTIVE OVER THE CANONICAL ID LIST
- * (o3d-remove-shiphero round 12, Codex HIGH 1).
+ * (wms-neutral-refactor round 12, Codex HIGH 1).
  *
  * `BUILT_IN_WMS_CONNECTORS` was a hand-written array typed `readonly WmsConnectorDef[]` while the
  * panels (round 6) and the plugin toggles (round 8) had both been made total over
@@ -444,7 +444,7 @@ test('seam/asn: the ASN view-model is labelled from the registry, not from a lit
 })
 
 test('seam/asn: a registered connector with no ASN support is named, not anonymised', () => {
-  // o3d-remove-shiphero: the facade used to hardcode 'WMS' on this arm, so an operator
+  // wms-neutral-refactor: the facade used to hardcode 'WMS' on this arm, so an operator
   // running a registered connector that simply cannot do ASNs was told an unnamed
   // system was unavailable.
   const label = makeSeamRegistry().getDef(ACME_WMS_ID).label
@@ -506,8 +506,8 @@ test('seam/order-lookup: the resolver reads the FICTITIOUS connector\'s own conn
   // THE VALUE CONTRAST IS BACK (o3d-r5uk, Codex round 2 HIGH 2).
   //
   // It used to give the two WMS connectors DIFFERENT configured storefronts — 'woocommerce' and
-  // 'shopify' — so a resolver pinned to Mintsoft's row would answer the wrong storefront and link
-  // the fictitious warehouse's fulfilments to a shop that did not sell the order. Archiving Shopify
+  // a second storefront — so a resolver pinned to Mintsoft's row would answer the wrong storefront and link
+  // the fictitious warehouse's fulfilments to a shop that did not sell the order. Archiving that storefront
   // left one shopping id, and this file recorded the contrast as lost.
   //
   // It is recoverable, because the resolver's answers are no longer all of one type: an archived
@@ -515,13 +515,13 @@ test('seam/order-lookup: the resolver reads the FICTITIOUS connector\'s own conn
   // fictitious warehouse the retired storefront and Mintsoft the supported one restores exactly the
   // discriminating pair — a resolver reading Mintsoft's row for every WMS would answer
   // `{ kind: 'one', connector: 'woocommerce' }` below and fail.
-  const retiredRows: Record<string, string> = { [ACME_WMS_ID]: 'shopify', mintsoft: 'woocommerce' }
+  const retiredRows: Record<string, string> = { [ACME_WMS_ID]: 'retired-store', mintsoft: 'woocommerce' }
   const retiredPort = {
     findConnection: async (connector: string) => ({ orderLookupConnector: retiredRows[connector] ?? null }),
   }
   assert.deepEqual(
     await resolveWmsOrderLookupConnector(ACME_WMS_ID, retiredPort),
-    { kind: 'unsupported', connectors: ['shopify'], from: 'connection' },
+    { kind: 'unsupported', connectors: ['retired-store'], from: 'connection' },
     'the answer must follow the row of the connector ASKED about, by value and not only by argument',
   )
   assert.deepEqual(
@@ -564,7 +564,7 @@ test('seam/verify: a connector that asserts an unresolvable doubt CANNOT BE REGI
     label: ACME_WMS_LABEL,
     available: true,
     createReplayPolicy: 'client-side-dedupe-only',
-    // @ts-expect-error o3d-remove-shiphero r2 (Codex HIGH 4): `needsVerification: true` with no
+    // @ts-expect-error wms-neutral-refactor r2 (Codex HIGH 4): `needsVerification: true` with no
     // `verifyPushedOrder` is not a registrable connector. Deleting the union in
     // WmsRegistrableConnector makes this line compile, and THAT is what this test detects.
     create: () => new UnverifiableAcmeWmsConnector(warehouse),
@@ -575,7 +575,7 @@ test('seam/verify: a connector that asserts an unresolvable doubt CANNOT BE REGI
 })
 
 /**
- * THE SECOND UNREGISTRABLE COMBINATION (o3d-remove-shiphero round 4, Codex HIGH 1).
+ * THE SECOND UNREGISTRABLE COMBINATION (wms-neutral-refactor round 4, Codex HIGH 1).
  *
  * `fetchOrderDelta` without `deltaCursorTimeZone`. The cursor a delta is asked for is a WALL-CLOCK
  * string the warehouse compares against its own `LastUpdated`, so a connector that has a delta and
@@ -594,7 +594,7 @@ test('seam/delta: a connector with a bulk delta and NO cursor timezone CANNOT BE
     label: ACME_WMS_LABEL,
     available: true,
     createReplayPolicy: 'client-side-dedupe-only',
-    // @ts-expect-error o3d-remove-shiphero r4 (Codex HIGH 1): `fetchOrderDelta` with no
+    // @ts-expect-error wms-neutral-refactor r4 (Codex HIGH 1): `fetchOrderDelta` with no
     // `deltaCursorTimeZone` is not a registrable connector. Deleting the delta/timezone union in
     // WmsRegistrableConnector makes this line compile, and THAT is what this test detects.
     create: () => new ZonelessDeltaAcmeWmsConnector(),

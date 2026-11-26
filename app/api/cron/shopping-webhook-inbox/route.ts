@@ -163,7 +163,7 @@ export async function GET(request: Request) {
   const { runId, result, outcomeClass, responseStatus } = await runCronWithLogging({
     jobName: 'shopping-webhook-inbox',
     run: async () => {
-      // ONE CONNECTOR TICK TODAY (o3d-remove-parked-connectors). Shopify was the second element of
+      // ONE CONNECTOR TICK TODAY. A second storefront was the other element of
       // this Promise.all and is archived. The per-connector tick helper, its two gate reasons and the
       // `connectors` envelope are deliberately kept: they are what a second storefront adds an
       // element to, and the response shape operators and the cron log already read stays stable.

@@ -2,7 +2,7 @@ import { WMS_CONNECTOR_IDS, type WmsConnectorId } from './types'
 
 /**
  * WHICH WMS CONNECTOR IS ACTIVE — asked once, answered honestly, and never guessed
- * (o3d-remove-shiphero round 10, Codex HIGH 1).
+ * (wms-neutral-refactor round 10, Codex HIGH 1).
  *
  * WHAT THIS REPLACES. Sixteen production sites each wrote `WMS_CONNECTOR_IDS.find((id) => state[id])`
  * inline. That is a DERIVED answer that silently picks a winner: with two connectors enabled it

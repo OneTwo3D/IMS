@@ -40,7 +40,7 @@ const prismaPort: WmsOrderLookupPort = {
  * RETURNS A RESOLUTION, NOT A CONNECTOR-OR-NULL (o3d-r5uk, Codex round 2 HIGH 2). The row's
  * `orderLookupConnector` is a plain String that can still name an ARCHIVED storefront, and the
  * three answers — one connector, nothing configured, a value this build cannot service — are not
- * interchangeable. Collapsing them here is how a Shopify-configured warehouse got its statuses
+ * interchangeable. Collapsing them here is how a warehouse configured for a retired storefront got its statuses
  * looked up against WooCommerce order numbers; see the note in
  * lib/fulfillment/shopping-order-lookup.ts.
  *

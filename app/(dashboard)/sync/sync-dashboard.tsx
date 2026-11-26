@@ -56,7 +56,7 @@ type Props = {
   wmsData: WmsSyncDashboardData | null
   /**
    * The WMS connectors this build OFFERS — read from `WmsConnectorDef.available` on the server
-   * (o3d-remove-shiphero round 12, Codex HIGH 2).
+   * (wms-neutral-refactor round 12, Codex HIGH 2).
    *
    * The WMS cards used to be built with `available: true` written out here, which is a SECOND
    * source for a fact the registry already states: a connector staged as not-offered got a live,
@@ -66,7 +66,7 @@ type Props = {
    */
   availableWmsConnectorIds: readonly WmsConnectorId[]
   /**
-   * The WMS connectors that are enabled when MORE THAN ONE is (o3d-remove-shiphero round 12,
+   * The WMS connectors that are enabled when MORE THAN ONE is (wms-neutral-refactor round 12,
    * Codex MEDIUM) — empty in every other state.
    *
    * Ambiguity resolves to no active connector on purpose, so `wmsData` is `null`; without the ids
@@ -106,7 +106,7 @@ const NON_WMS_CONNECTORS: ConnectorDef[] = [
 ]
 
 /**
- * o3d-remove-shiphero round 6 (Codex HIGH 1) — THE WMS CARDS ARE DERIVED, NOT LISTED.
+ * wms-neutral-refactor round 6 (Codex HIGH 1) — THE WMS CARDS ARE DERIVED, NOT LISTED.
  * A hand-written entry per connector is the same one-arm shape as the panel dispatch it sits next
  * to: a registered, enabled second connector that nobody remembered to add here gets no card at
  * all, so the Warehouse Management section is empty and the connector is unreachable from the UI —
@@ -206,7 +206,7 @@ export function SyncDashboard({ pluginState, shoppingSettings, shoppingTaxMappin
   // EVERY WMS card opens its panel. The old guard also required the DTO to belong to the card that
   // was clicked, so a second enabled connector's card fell through to the grid — a click that did
   // nothing and explained nothing. The panel is total over the cases now, so the mismatch is a
-  // state it renders rather than a branch that vanishes (o3d-remove-shiphero round 6, Codex HIGH 1).
+  // state it renders rather than a branch that vanishes (wms-neutral-refactor round 6, Codex HIGH 1).
   if (activeConnector && isWmsConnectorId(activeConnector)) {
     return (
       <WmsSyncPanel

@@ -311,8 +311,8 @@ test('a scheduler failure AFTER the commit is reported as committed, not as a re
     result.pluginState,
     // EVERY REGISTERED ID, read back under the lock rather than echoed from the request. (It used
     // to be phrased as "six keys, not the five the payload carries"; the payload type is now the
-    // whole id union, and Shopify's removal took the count from six to four —
-    // o3d-remove-parked-connectors. The point is unchanged: this is the database's answer.)
+    // whole id union, and removing the retired connectors took the count down to
+    // four. The point is unchanged: this is the database's answer.)
     { woocommerce: true, xero: true, mintsoft: false },
     'and the COMMITTED state is returned, so the caller need not guess from its own copy',
   )
@@ -461,12 +461,12 @@ test('EVERY plugin key is locked, in one canonical order', async () => {
   // registry, and one order for one lock set is what stops two callers taking the same rows in
   // opposite orders and deadlocking.
   //
-  // o3d-remove-shiphero: this used to assert the literal count 6. A hardcoded count is a worse test
+  // wms-neutral-refactor: this used to assert the literal count 6. A hardcoded count is a worse test
   // than it looks — it fails when a connector is legitimately added OR removed, and it says nothing
   // about which keys those are. What matters is that the lock set is EXACTLY the registry, so that
   // is what is asserted; the non-empty check is what stops the comparison passing vacuously if both
   // sides ever became empty.
-  // o3d-remove-shiphero round 10: this compared the lock order to `Object.values(SETTING_KEYS)`,
+  // wms-neutral-refactor round 10: this compared the lock order to `Object.values(SETTING_KEYS)`,
   // and both are `INTEGRATION_PLUGIN_IDS.map(id => SETTING_KEYS[id])` — the SAME expression, so
   // after `.sort()` they were equal by construction and the deepEqual could fail only on a
   // duplicate id. The expectation is now re-derived from the ID list and the key RULE, which is an

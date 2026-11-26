@@ -1,16 +1,16 @@
 /**
  * The one genuinely connector-agnostic stock-sync primitive.
  *
- * WHAT THIS MODULE USED TO BE, AND WHY IT SHRANK (o3d-remove-shiphero). It was
+ * WHAT THIS MODULE USED TO BE, AND WHY IT SHRANK (wms-neutral-refactor). It was
  * created as a "connector-agnostic" mirror of Mintsoft's connector-local
- * lib/connectors/mintsoft/sync/stock-sync-helpers.ts so the ShipHero stock sync
+ * lib/connectors/mintsoft/sync/stock-sync-helpers.ts so a second WMS's stock sync
  * had something generic to call — but Mintsoft was never migrated onto it, so
  * what shipped was a second COPY, not a shared module. Threshold parsing, line
  * consolidation, binding-due timing and discrepancy computation each existed
- * twice, and when ShipHero was removed every duplicate here lost its only
+ * twice, and when that WMS was removed every duplicate here lost its only
  * caller. They are deleted rather than kept: an unused copy of code that also
  * exists, maintained, somewhere else is not an abstraction, it is drift waiting
- * to happen. Git history has them (see docs/archive/shiphero-connector-removal.md).
+ * to happen. Git history has them (see the removal notes under docs/archive/).
  *
  * `classifyUnresolvedWmsSku` stays because Mintsoft's stock sync genuinely
  * imports it — it is the only line of that module that ever became shared.

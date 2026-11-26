@@ -47,7 +47,7 @@ test('third-party hooks are never touched, however they are addressed', () => {
     'https://api.ecartapi.com/api/v2/webhooks/actions/cUVyTGtUVjgxNzc2Nzc5OTM0MDEw',
     'https://qoblex.example.com/hooks/orders',
     // Stage's host but NOT our route — another connector's inbound hook is not ours to switch off.
-    'https://ims-stage.onetwo3d.co.uk/api/webhooks/shopping/shopify/orders',
+    'https://ims-stage.onetwo3d.co.uk/api/webhooks/shopping/other-store/orders',
   ]) {
     assert.equal(isStageBoundImsWebhook(url, STAGE_HOST), false, url)
   }
