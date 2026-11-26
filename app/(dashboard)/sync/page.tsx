@@ -166,7 +166,7 @@ export default async function SyncPage() {
   // connector "currently" serves the app, which is exactly the claim that is false here
   // (round 12, Codex MEDIUM).
   const ambiguousWmsConnectorIds = wmsResolution.kind === 'ambiguous' ? wmsResolution.ids : []
-  // AMBIGUOUS STILL COUNTS AS "A PLUGIN IS ENABLED" (o3d-remove-shiphero round 10, Codex HIGH 1).
+  // AMBIGUOUS STILL COUNTS AS "A PLUGIN IS ENABLED" (wms-neutral-refactor round 10, Codex HIGH 1).
   // `activeWmsConnector` is null when two WMS connectors are enabled, because nothing may route to a
   // guessed warehouse — but this flag decides whether the page redirects away as an install with no
   // integrations at all. Folding the two together would make the screen that links to the Integration

@@ -135,7 +135,7 @@ test('o3d-272i: resolved, outbound and other-connector rows never block a rebind
   const result = await rebindTo('https://third-store.example.com', [
     { id: 'settled', status: 'SYNCED' },
     { id: 'outbound', direction: 'TO_CONNECTOR' },
-    { id: 'shopify', connector: 'shopify' },
+    { id: 'retired-store', connector: 'retired-store' },
     { id: 'no-order', entityId: null },
     { id: 'product-row', entityType: 'Product' },
   ])

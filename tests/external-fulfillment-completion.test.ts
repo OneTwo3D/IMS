@@ -6,10 +6,10 @@ import * as realTypes from '../lib/connectors/wms/types.ts'
 
 /**
  * A SECOND REGISTERED CONNECTOR, because the predicate's claim is about REGISTRY MEMBERSHIP
- * (o3d-remove-shiphero round 10). `shouldPushStorefrontCompletion` reads `isWmsConnectorId(source)`,
+ * (wms-neutral-refactor round 10). `shouldPushStorefrontCompletion` reads `isWmsConnectorId(source)`,
  * and with one shipped connector every assertion below passes identically against a hardcoded
  * `source === 'mintsoft'` — so nothing could tell the two apart. The branch DELETED the
- * `'shiphero'` case that used to make that distinction and replaced it with a comment asserting the
+ * second-WMS case that used to make that distinction and replaced it with a comment asserting the
  * property in prose. A registered id the shipped build does not know restores the distinction.
  */
 mock.module('@/lib/connectors/wms/types', {

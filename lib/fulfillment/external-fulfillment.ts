@@ -203,7 +203,7 @@ type ResolvedOrder = {
  * o3d-r5uk (Codex round 2 HIGH 2) — A WAREHOUSE POINTED AT AN ARCHIVED STOREFRONT FAILS CLOSED HERE,
  * AND SAYS SO ONCE PER EVENT.
  *
- * `WmsConnection.orderLookupConnector` is a plain String and can still say `shopify`. Returning
+ * `WmsConnection.orderLookupConnector` is a plain String and can still name a retired storefront. Returning
  * `null` is the fail-closed answer — `resolveOrderForExternalFulfillment` finds no order and
  * `applyExternalFulfillmentUpdate` refuses with `order_not_found` — but `order_not_found` is a
  * misleading thing to tell an operator about a misconfiguration, and this path has been bitten by a
@@ -214,7 +214,7 @@ type ResolvedOrder = {
  * `resolveOrderForExternalFulfillment`'s `ResolvedOrder | null` return, which two connectors and the
  * WooCommerce completion flow read, and widening that union changes what
  * `PERMANENT_EXTERNAL_FULFILLMENT_REFUSALS` and `REFUSALS_AWAITING_REFUNDS` are total over. The
- * misread — answering WooCommerce for a Shopify-configured warehouse — is what had to stop; the
+ * misread — answering WooCommerce for a warehouse configured for a retired storefront — is what had to stop; the
  * refusal code it lands on is a separate question, filed rather than smuggled in here.
  */
 async function resolveShoppingConnectorForSource(

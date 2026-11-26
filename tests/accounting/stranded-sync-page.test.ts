@@ -796,7 +796,7 @@ test('every read is made with the arguments it claims, and every result reaches 
   // empty value, NO test observed the 22 reads or the 26 props they feed. Changing
   // getAccountingSyncLogs(50) to another limit, or swapping two same-typed props, stayed green.
   // Distinct sentinels + the ordered call log make each wire individually falsifiable.
-  state.plugins = { woocommerce: true, shopify: true, xero: true, mintsoft: true }
+  state.plugins = { woocommerce: true, xero: true, mintsoft: true }
 
   const s = {
     shoppingSettings: { sentinel: 'shoppingSettings' },
@@ -804,7 +804,6 @@ test('every read is made with the arguments it claims, and every result reaches 
     shoppingStatusMappings: [{ sentinel: 'shoppingStatusMappings' }],
     shoppingLogs: [{ sentinel: 'shoppingLogs' }],
     shoppingCredentials: { sentinel: 'shoppingCredentials' },
-    // o3d-remove-parked-connectors: three archived Shopify sentinels were here.
     // Shaped: the page maps this to {id,name} for `taxRates` and passes it whole as `imsTaxRates`.
     taxRatesRaw: [{ id: 'tax-id', name: 'tax-name', sentinel: 'taxRatesRaw' }],
     accountingSettings: { sentinel: 'accountingSettings' },
@@ -829,7 +828,6 @@ test('every read is made with the arguments it claims, and every result reaches 
   state.reads.getShoppingStatusMappings = () => s.shoppingStatusMappings
   state.reads.getShoppingSyncLogs = () => s.shoppingLogs
   state.reads.getShoppingConnectorCredentials = () => s.shoppingCredentials
-  // o3d-remove-parked-connectors: the three Shopify reads were here; the connector is archived.
   state.reads.getTaxRates = () => s.taxRatesRaw
   state.reads.getAccountingSettingsMasked = () => s.accountingSettings
   state.reads.getAccountingConnectionStatus = () => s.accountingStatus
@@ -858,7 +856,6 @@ test('every read is made with the arguments it claims, and every result reaches 
     { name: 'getShoppingStatusMappings', args: [] },
     { name: 'getShoppingSyncLogs', args: [100] },
     { name: 'getShoppingConnectorCredentials', args: [] },
-    // o3d-remove-parked-connectors: three archived Shopify reads were here.
     { name: 'getTaxRates', args: [] },
     { name: 'getAccountingSettingsMasked', args: [] },
     { name: 'getAccountingConnectionStatus', args: [] },
@@ -893,13 +890,12 @@ test('every read is made with the arguments it claims, and every result reaches 
     'accountingReadiness', 'accountingSettings',
     'accountingTaxRates', 'accountingTenantName', 'ambiguousWmsConnectorIds', 'availableWmsConnectorIds',
     'currencies', 'imsTaxRates', 'paymentAccountMap',
-    // o3d-remove-parked-connectors: 'shopifyCredentials', 'shopifyLogs', 'shopifySettings' were here.
-    'paymentMethodCombos', 'pluginState',
+      'paymentMethodCombos', 'pluginState',
     'shoppingCredentials', 'shoppingLogs', 'shoppingPaymentMethods', 'shoppingSettings',
     'shoppingStatusMappings', 'shoppingTaxMappings', 'taxRates', 'wmsData',
   ], 'the dashboard prop set is pinned: a new prop must be wired here deliberately')
 
-  // o3d-remove-shiphero round 12. Both are facts the CLIENT grid cannot read for itself — the WMS
+  // wms-neutral-refactor round 12. Both are facts the CLIENT grid cannot read for itself — the WMS
   // registry statically imports the shipped connector (and Prisma behind it) — so the page is where
   // they are resolved, and both used to be written by the grid: `available: true` on every WMS card,
   // and "another connector currently does" inferred from a missing DTO.
@@ -918,7 +914,6 @@ test('every read is made with the arguments it claims, and every result reaches 
   assert.equal(props.shoppingStatusMappings, s.shoppingStatusMappings)
   assert.equal(props.shoppingLogs, s.shoppingLogs)
   assert.equal(props.shoppingCredentials, s.shoppingCredentials)
-  // o3d-remove-parked-connectors: three archived Shopify props were asserted here.
   assert.equal(props.imsTaxRates, s.taxRatesRaw)
   assert.deepEqual(props.taxRates, [{ id: 'tax-id', name: 'tax-name' }], 'projected to id+name, not passed whole')
   assert.equal(props.accountingSettings, s.accountingSettings)

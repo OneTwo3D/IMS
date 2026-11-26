@@ -59,7 +59,8 @@ import {
   CONTRIBUTING_LANDED_COST_LINK_WHERE,
 } from '@/lib/domain/purchasing/landed-cost-service'
 import {
-  NO_PREPAYMENT_CHECKS, preparePurchaseReceiptFx, purchaseFxLayerColumns, resolveReceiptFxValuation,
+  NO_PREPAYMENT_CHECKS, isTransientPurchaseFxRefusal, markPurchaseFxLockUsed, preparePurchaseReceiptFx, purchaseFxLayerColumns,
+  reportPurchaseFxFallback, resolveReceiptFxValuation, type ReceiptFxValuation,
 } from '@/lib/domain/purchasing/purchase-receipt-fx'
 import { isPurchaseEventFxEnabled } from '@/lib/domain/purchasing/purchase-event-fx-settings'
 import { headerDiscountFactorForPo, unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
@@ -165,6 +166,12 @@ export type ProcessMintsoftBookedInResult =
     error: string
     /** The unattended read declined to log in (stored key expired): not a processing fault, and not counted toward dead-lettering. */
     loginRefused?: true
+    /**
+     * MED-4: the purchase FX valuation could not be completed for a reason that says nothing about the event (Xero unreadable or out of request budget,
+     * no fx_rates rate yet, a mapping blank): it waits and is retried, and is not counted toward dead-lettering. Real ambiguity (several prepayments, a
+     * foreign currency, another supplier's) is NOT this: it fails and counts.
+     */
+    transientFxRefusal?: true
   }
 
 export type ProcessMintsoftBookedInEventOptions = {
@@ -447,9 +454,12 @@ export async function processBookedInEvent(
       })).map((row) => row.sourceLineId)
       if (purchaseLineIds.length > 0) {
         const purchaseLines = await db.purchaseOrderLine.findMany({ where: { id: { in: purchaseLineIds } }, select: { poId: true } })
-        purchaseFxChecks = await preparePurchaseReceiptFx(purchaseLines.map((line) => line.poId))
+        // MED-3: a refusal is recorded PER ORDER; only an order this event actually receives against refuses it (inside the transaction).
+        purchaseFxChecks = await preparePurchaseReceiptFx(purchaseLines.map((line) => line.poId), { collectRefusals: true })
       }
     }
+    // The valuations this event laid goods at, reported after the commit (MED-5).
+    const purchaseFxValuations = new Map<string, ReceiptFxValuation>()
 
     const processed = await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM wms_inbound_receipt_events WHERE id = ${event.id} FOR UPDATE`
@@ -1259,6 +1269,9 @@ export async function processBookedInEvent(
                   ...purchaseFxLayerColumns(fxValuation, poLine.id),
                 },
               })
+              // Per-event FX: the lock is used once goods are laid at its rate (LOW-11).
+              await markPurchaseFxLockUsed(tx, fxValuation, now)
+              if (fxValuation) purchaseFxValuations.set(poId, fxValuation)
 
               // GR/IR accrual: the same units the layer above carries, at the PO goods unit cost, keyed on the stock movement's own key so a replayed
               // book-in (which the movement's unique key already refused) records nothing. In this transaction, whether or not Xero posting is on.
@@ -1949,6 +1962,9 @@ export async function processBookedInEvent(
       }
     }
 
+    // MED-5: an order whose goods were laid at the table rate while Xero sync is on and Xero holds no prepayment with its reference.
+    for (const valuation of purchaseFxValuations.values()) await reportPurchaseFxFallback(valuation, `WMS ASN ${event.externalAsnId}`)
+
     const arrivedNotYetBookedIn = ('arrivedNotYetBookedIn' in processed && processed.arrivedNotYetBookedIn) || []
     await logActivity({
       entityType: 'SYNC',
@@ -2009,6 +2025,29 @@ export async function processBookedInEvent(
         externalAsnId: event.externalAsnId,
         error: message,
         loginRefused: true,
+      }
+    }
+    // MED-4: a purchase FX refusal that is only "the answer is not available yet" (Xero unreadable or out of request budget, no fx_rates rate, a blank
+    // mapping) waits like a login refusal: it learned nothing about the event, so it must not spend the 8-attempt ladder and dead-letter a receipt that
+    // is perfectly processable once Xero answers. Real ambiguity falls through to the counted failure below.
+    if (isTransientPurchaseFxRefusal(error)) {
+      await markEventLoginRefused(event.id, message)
+      if (shouldEmitWarning(`mintsoft-booked-in-fx-waiting:${event.id}`)) await logActivity({
+        entityType: 'SYNC',
+        entityId: event.id,
+        tag: 'sync',
+        action: 'mintsoft_booked_in_fx_waiting',
+        level: 'WARNING',
+        description: `Booked-in processing for ASN ${event.externalAsnId} is waiting on the purchase exchange rate and will retry in ${LOGIN_REFUSED_RETRY_DELAY_MS / 60_000} minutes; it has not been counted as a failed attempt. ${message}`,
+        metadata: { externalAsnId: event.externalAsnId },
+        resolveUser: false,
+      })
+      return {
+        status: 'failed',
+        eventId: event.id,
+        externalAsnId: event.externalAsnId,
+        error: message,
+        transientFxRefusal: true,
       }
     }
     await markEventFailed(event.id, message)

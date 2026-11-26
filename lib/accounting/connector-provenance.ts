@@ -81,7 +81,7 @@ export const CONNECTOR_NATIVE_PAYLOAD_ID_KEYS = [
  *
  * The provenance columns (`SalesOrder.accountingInvoiceConnector` and its three siblings) are plain
  * `TEXT`, because that is what `AccountingSyncLog.connector` is and because a connector can be removed
- * from the build while rows written under it remain (see the ShipHero removal in #680). A value this
+ * from the build while rows written under it remain (an archived connector's rows outlive its code). A value this
  * build does not know is therefore possible, and it must NOT be narrowed to whatever this build happens
  * to support — that is the mis-attribution the whole issue is about. `null` is the answer, and `null`
  * makes the enqueue guard refuse and say the posting is owed.

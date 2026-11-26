@@ -22,7 +22,7 @@ const state = {
   linkUpdates: [] as Row[],
   /**
    * WHICH WMS CONNECTOR IS ENABLED — ONE field, three-valued, and the two-valued helper DERIVED
-   * from it (o3d-remove-shiphero round 12, Codex MEDIUM).
+   * from it (wms-neutral-refactor round 12, Codex MEDIUM).
    *
    * The fixture used to hold `connectorId: string | null` and answer both
    * `resolveEnabledWmsConnectorSelection` and `getEnabledWmsConnectorId` from it, which cannot

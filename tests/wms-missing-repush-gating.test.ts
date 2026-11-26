@@ -135,10 +135,10 @@ mock.module('@/lib/connectors/wms/registry', {
   },
 })
 /**
- * o3d-remove-shiphero: a build in which a SECOND WMS connector is registered.
+ * wms-neutral-refactor: a build in which a SECOND WMS connector is registered.
  *
  * These cases contrast a replay-safe connector with one whose create cannot be repeated. That used
- * to be Mintsoft vs ShipHero. With one connector shipping, the second id is not in
+ * to be Mintsoft vs a second WMS. With one connector shipping, the second id is not in
  * WMS_CONNECTOR_IDS — and `resetMissingWmsOrderPush` resolves the active connector by scanning
  * exactly that list, so every second-connector case short-circuited on "this finding belongs to a
  * connector that is no longer active" and never reached the create-replay gate it was written to

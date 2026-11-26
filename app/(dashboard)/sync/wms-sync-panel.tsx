@@ -9,7 +9,7 @@ import { ambiguousWmsConnectorReason } from '@/lib/connectors/wms/enabled-connec
 /**
  * THE WMS PANEL REGISTRY — the /sync detail screen for whichever WMS connector is active.
  *
- * o3d-remove-shiphero round 6 (Codex HIGH 1) — WHY THIS IS A TOTAL RECORD AND NOT AN `if`.
+ * wms-neutral-refactor round 6 (Codex HIGH 1) — WHY THIS IS A TOTAL RECORD AND NOT AN `if`.
  * Round 4 moved the two UI FACADES (app/actions/wms-sync.ts, app/actions/wms-onboarding.ts) off
  * `connectorId === 'mintsoft'` and onto capability hooks, and keyed their DTOs by connector. The
  * file that READS those DTOs was not changed: it still rendered one arm and returned `null`
@@ -35,7 +35,7 @@ import { ambiguousWmsConnectorReason } from '@/lib/connectors/wms/enabled-connec
 
 /**
  * WHAT A CONNECTOR'S PANEL IS GIVEN — the payload AND the envelope's verdict
- * (o3d-remove-shiphero round 14, Codex HIGH 2).
+ * (wms-neutral-refactor round 14, Codex HIGH 2).
  *
  * `render` used to take the payload alone, so a connector panel had nothing to read `configured`
  * from but its OWN payload — and Mintsoft's duly carried a second copy of it, recomputed from the
@@ -88,7 +88,7 @@ export const WMS_PANEL_ENTRIES: ReadonlyArray<{ id: WmsConnectorId } & WmsConnec
 
 /**
  * The registered WMS connectors as the Integrations grid lists them, WITH the registry's own
- * `available` flag (o3d-remove-shiphero round 12, Codex HIGH 2).
+ * `available` flag (wms-neutral-refactor round 12, Codex HIGH 2).
  *
  * The grid used to build these entries itself and write `available: true` into every one — a second
  * source for a fact the connector's definition already states, so a connector registered
@@ -124,7 +124,7 @@ function lookupWmsPanel(connectorId: string): WmsConnectorPanel | null {
  *     "not set up";
  *   - `not-active`: another connector is the one serving the app, and this screen can name it;
  *   - `ambiguous`: MORE THAN ONE WMS connector is enabled, so nothing is active
- *     (o3d-remove-shiphero round 12, Codex MEDIUM). This used to render as `not-active` with no
+ *     (wms-neutral-refactor round 12, Codex MEDIUM). This used to render as `not-active` with no
  *     `activeLabel`, which printed "another connector currently does" — a claim that some other
  *     connector is serving the app, in the one state where NONE is. The remedy is on the
  *     Integration Plugins screen and the reason names the rows that are fighting, so it is the
@@ -197,7 +197,7 @@ type Props = {
   data: WmsSyncDashboardData | null
   /**
    * The enabled WMS connectors when MORE THAN ONE is enabled; empty otherwise
-   * (o3d-remove-shiphero round 12, Codex MEDIUM).
+   * (wms-neutral-refactor round 12, Codex MEDIUM).
    *
    * `data` is `null` in that state because the resolver refuses to pick a winner, and `null` alone
    * cannot tell "nothing is enabled" from "too much is" — so the panel said the same false thing

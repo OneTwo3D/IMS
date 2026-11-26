@@ -269,7 +269,7 @@ with a seam registry holding the fictitious `acme-wms` and an **inert Mintsoft t
 no hooks at all** — that is what makes them able to prove the generic layer is generic. It
 is also why they say nothing about whether **the connector this build ships** still declares
 the hooks that layer routes to. Three of those hooks were inline code before
-`o3d-remove-shiphero` moved them onto the registration, and for each one, deleting it from
+`wms-neutral-refactor` moved them onto the registration, and for each one, deleting it from
 `BUILT_IN_WMS_CONNECTOR_REGISTRATIONS` left every suite in the repo green:
 
 | Hook | What silently stops | Test that now goes red |

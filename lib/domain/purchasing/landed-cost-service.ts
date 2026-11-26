@@ -1877,10 +1877,10 @@ export async function recalculateDirectLandedCosts(
     for (const cl of line.costLayers) {
       const oldUnitCost = decimal(cl.unitCostBase)
       // Per-event FX: a layer that carries its own goods cost keeps it and takes only the new freight share; a legacy (NULL) layer takes the
-        // line's gross cost exactly as before (layerUnitCostAfterRecalc).
-        const layerCost = layerUnitCostAfterRecalc({ layerGoodsUnitCostBase: cl.goodsUnitCostBase, lineGrossUnitCostBase: grossUnitCostBase, lineLandedAmountBase: landedForLine, allocationQty: options.landedQtyBasis ? decimal(options.landedQtyBasis.get(line.id) ?? 0) : lineQty, lineFloor: floor, lineId: line.id })
-        const newUnitCost = layerCost.newUnitCost
-        const layerFloor = layerCost.floor
+      // line's gross cost exactly as before (layerUnitCostAfterRecalc).
+      const layerCost = layerUnitCostAfterRecalc({ layerGoodsUnitCostBase: cl.goodsUnitCostBase, lineGrossUnitCostBase: grossUnitCostBase, lineLandedAmountBase: landedForLine, allocationQty: options.landedQtyBasis ? decimal(options.landedQtyBasis.get(line.id) ?? 0) : lineQty, lineFloor: floor, lineId: line.id })
+      const newUnitCost = layerCost.newUnitCost
+      const layerFloor = layerCost.floor
       const receivedQty = decimal(cl.receivedQty)
       const remainingQty = decimal(cl.remainingQty)
       const consumedQty = receivedQty.sub(remainingQty)
@@ -1954,7 +1954,7 @@ export async function recalculateDirectLandedCosts(
       // The zero floor's footprint on this layer (units the floor could not absorb), exact Decimal.
       const layerUnabsorbedBase = layerFloor ? unabsorbedBaseForQty(layerFloor.unflooredGrossUnitCostBase, receivedQty) : null
       if (layerFloor && layerUnabsorbedBase) {
-          entryFloor ??= layerFloor
+        entryFloor ??= layerFloor
         lineUnabsorbedBase = lineUnabsorbedBase.add(layerUnabsorbedBase)
         if (!oldUnitCost.eq(newUnitCost)) floorFootprint.activityDue = true
       }

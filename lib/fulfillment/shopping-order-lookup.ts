@@ -15,12 +15,12 @@ import { SHOPPING_CONNECTORS, type ShoppingConnectorId } from '@/lib/connectors/
  * ── A RETIRED CONNECTOR'S ROWS OUTLIVE ITS CODE (o3d-r5uk, Codex round 2 HIGH 2) ──
  *
  * `WmsConnection.orderLookupConnector` and `ShoppingOrderLink.connector` are plain `String`
- * columns, and archiving Shopify shipped no migration, so both can still say `shopify`. Narrowing
+ * columns, and archiving a storefront shipped no migration, so both can still name the retired storefront. Narrowing
  * `isShoppingConnectorId` to WooCommerce did not make those values go away; it made them
  * UNRECOGNISED, and the resolver then treated "unrecognised" exactly like "not configured" and
  * inferred. With a WooCommerce link present that inference answers `woocommerce`:
  *
- *   a warehouse configured to look its orders up in Shopify → the WMS order-status sweep queries
+ *   a warehouse configured to look its orders up in a retired storefront → the WMS order-status sweep queries
  *   the 3PL by WOOCOMMERCE order numbers, stores whatever comes back against those WooCommerce
  *   orders, and pushes the status to WooCommerce. Where the two stores' numbers overlap, one
  *   customer's dispatch lands on another customer's order.
@@ -29,12 +29,12 @@ import { SHOPPING_CONNECTORS, type ShoppingConnectorId } from '@/lib/connectors/
  * the value, never an invitation to guess. Inference is for one case only: nothing was configured.
  *
  * The same trap sat one function lower, and Codex did not flag it: the inference itself used to ask
- * the database `connector IN ('woocommerce', 'shopify')`. Narrowing that list to WooCommerce turned
+ * the database `connector IN ('woocommerce', <the retired storefront>)`. Narrowing that list to WooCommerce turned
  * an installation with BOTH stores' links — which used to see two candidates and refuse as ambiguous
  * — into one that sees a single candidate and confidently answers WooCommerce. The observation query
  * is therefore UNFILTERED now: it asks what the links actually say, and an unsupported value in the
- * answer is a refusal, because the honest reading of "this database holds Shopify orders" is "this
- * build cannot decide", not "there are no Shopify orders".
+ * answer is a refusal, because the honest reading of "this database holds orders of a retired storefront" is
+ * "this build cannot decide", not "there are no such orders".
  */
 
 export function isShoppingConnectorId(value: string | null | undefined): value is ShoppingConnectorId {
