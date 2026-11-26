@@ -26,6 +26,7 @@ import { syncChartOfAccounts, getXeroTaxRates } from '@/lib/connectors/xero'
 import { syncXeroAccountBalanceSnapshots } from '@/lib/connectors/xero/account-balances'
 import { processPendingXeroSync } from '@/lib/connectors/xero'
 import { getXeroSettings, XERO_SETTING_KEYS, type XeroSettings } from '@/lib/connectors/xero/settings'
+import { xeroMissingAccountMappings } from '@/lib/connectors/xero/readiness-accounts'
 import { buildAccountingCallbackUri } from '@/lib/accounting/callback-url'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getSettingValue, maskSettingSecret, serializeSettingValue } from '@/lib/settings-store'
@@ -1065,6 +1066,8 @@ export type XeroSyncReadiness = {
    */
   mappingOwnership: { state: 'owned' | 'unconfirmed' | 'other-organisation'; boundTenantId: string | null; boundTenantName: string | null }
   missingAccounts: Array<{ key: string; label: string }>
+  /** o3d-n2ci4: unmapped accounts that only the IMS FX gain/loss report reads. Listed for information; never part of `ready`. */
+  reportOnlyMissingAccounts?: Array<{ key: string; label: string }>
   missingTaxTypes: Array<{ id: string; name: string }>
   /**
    * Scopes this connection was asked for but NOT granted (o3d-g2i). Empty when the grant is complete —
@@ -1072,21 +1075,6 @@ export type XeroSyncReadiness = {
    */
   missingScopes: string[]
 }
-
-const REQUIRED_ACCOUNTS: Array<{ key: keyof XeroSettings; label: string }> = [
-  { key: 'xero_sales_account', label: 'Sales Revenue' },
-  { key: 'xero_shipping_account', label: 'Shipping Income' },
-  { key: 'xero_discount_account', label: 'Discounts Given' },
-  { key: 'xero_transit_account', label: 'Stock in Transit' },
-  { key: 'xero_inventory_account', label: 'Inventory Asset' },
-  { key: 'xero_allocated_inventory_account', label: 'Allocated Inventory' },
-  { key: 'xero_cogs_account', label: 'Cost of Goods Sold' },
-  { key: 'xero_unearned_revenue_account', label: 'Unearned Revenue' },
-  { key: 'xero_accounts_receivable_account', label: 'Accounts Receivable' },
-  { key: 'xero_accounts_payable_account', label: 'Accounts Payable' },
-  { key: 'xero_realised_fx_gain_loss_account', label: 'Realised FX Gain/Loss' },
-  { key: 'xero_unrealised_fx_gain_loss_account', label: 'Unrealised FX Gain/Loss' },
-]
 
 export async function getXeroSyncReadiness(): Promise<XeroSyncReadiness> {
   // o3d-1fel: reads settings + tax rates + the granted OAuth scopes.
@@ -1102,9 +1090,7 @@ export async function getXeroSyncReadiness(): Promise<XeroSyncReadiness> {
     getGrantedScopes(),
   ])
 
-  const missingAccounts = REQUIRED_ACCOUNTS
-    .filter(a => !settings[a.key])
-    .map(a => ({ key: a.key as string, label: a.label }))
+  const { missingAccounts, reportOnlyMissingAccounts } = xeroMissingAccountMappings(settings)
 
   const missingTaxTypes = taxRates
     .filter(r => !r.accountingTaxType)
@@ -1121,6 +1107,7 @@ export async function getXeroSyncReadiness(): Promise<XeroSyncReadiness> {
     notConnected: !connStatus.connected,
     mappingOwnership: { state: ownership.state, boundTenantId: ownership.boundTenantId, boundTenantName: ownership.boundTenantName },
     missingAccounts,
+    reportOnlyMissingAccounts,
     missingTaxTypes,
     missingScopes: missing,
   }

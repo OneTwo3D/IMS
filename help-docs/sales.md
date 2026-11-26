@@ -497,6 +497,14 @@ The delete is a **soft delete**: the refund is marked deleted and hidden everywh
 
 The delete is idempotent: pressing it twice, or retrying after an interruption, reports success and does nothing a second time. If the accounting system cannot void the credit note (for example it was allocated there since), the queued entry fails with the reason and can be retried from the sync page after the allocation is removed in Xero.
 
+**When the second step stops (two-step deletes).**
+
+- **Refused when the void entry runs, nothing sent.** If the delete is no longer allowed when the void entry runs (the returned stock was used, refund delete was switched off, the books are now locked on the credit note's date, and so on) and no attempt of that entry can have reached Xero, IMS closes the entry (cancelled, never sent) and writes a warning on the order's activity log (*refund_delete_void_cancelled*) with the reason. The refund and its credit note both stand. Clear the cause and press **Delete refund** again: that queues a fresh void.
+- **Waiting, nothing sent.** If the entry could not even try (another task held the order's stock for more than a few seconds, too little time was left, Xero's rate limit, outbound writes held, the Xero connection could not be refreshed), nothing was sent and the entry simply waits 15 minutes and tries again, without using up a retry. After a day of such waits it fails like any other entry.
+- **Gave up.** When the entry has used up its retries, the order gets the task **Credit note void in Xero gave up after repeated failures for a refund being deleted** (Sync > Exceptions, *Refund deletes that need you*). Check the credit note in Xero and follow the task's text.
+- **Interrupted after the unwind.** If IMS stops after the refund was deleted but before it re-reserved the order and queued the stock change for the storefront, the entry's retry does both (the deletion record notes when they ran).
+- The refund delete's tasks close by themselves when the refund is finally deleted. Marking one **Done** only records that you dealt with it; it changes nothing in Xero, the warehouse or the refund.
+
 ## Payments
 
 You can record payments against a sales order:

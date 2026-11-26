@@ -10,6 +10,7 @@ import { holdInvoiceOnRegimePolicyChange, REGIME_ACCOUNT_CHANGED_REFUSAL, REGIME
 import { resolveSalesPostContact } from '@/lib/domain/erasure/accounting-contact'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { getRateLimitBackoffMs, isRateLimitError } from './deferral'
+import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
 import { createAccountingSyncLogRow } from '@/lib/domain/accounting/sync-log-row'
@@ -34,6 +35,8 @@ import {
   LEDGER_STANDING_SELECT,
   WORK_SLOT_OCCUPIED_WHERE,
   isProvenLedgerFact,
+  ledgerStanding,
+  namesADocument,
   type LedgerStandingRow,
 } from '@/lib/domain/accounting/ledger-standing'
 import { logActivity, logActivityInTransaction, logActivityPersisted, redactActivityLogText, sanitizeActivityLogMetadata } from '@/lib/activity-log'
@@ -58,7 +61,7 @@ import {
 import { computeRealisedFx, describeFxRefusal, resolveSettlementFxRateToBase, settlementAsOfFromInput, settlementAsOfFromStored } from '@/lib/accounting-fx'
 import { isMissingFxRateError } from '@/lib/currencies/fx-select'
 import { prepareManualJournal, postPreparedManualJournal } from './journals'
-import { getGrantedScopes } from './auth'
+import { getAccessToken, getGrantedScopes, type XeroAccessGrant } from './auth'
 import { blockingScopeFor, scopeBlockedError } from './scopes'
 import {
   carryAccountingOriginRecord,
@@ -72,6 +75,7 @@ import { withAccountingPostingIntent } from '@/lib/connectors/accounting-posting
 import { xeroUploadAttachment, xeroPost, type XeroBoundedCall } from './api'
 import { CREDIT_NOTE_DUPLICATE_CHECK_SETTING_KEY, creditNoteCreateDuplicates, creditNotePayloadGrossCents, describeCreditNote, duplicateVerdict, readOrderCreditNoteKeys, readOrderCreditNotesFromXero, type DuplicateContext } from './order-credit-notes'
 import { accountingBankAccountBelongsTo, accountingPostingKey, lookupPaymentAccount, getPaymentAccountMap } from '@/lib/accounting'
+import { accountingPostingKeyForRow } from '@/lib/accounting/posting-key'
 import { parsePaymentAccountMap } from '@/lib/accounting/payment-account-map'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
@@ -2979,7 +2983,11 @@ function unsentPostEvidence(
                   ? 'xero_sync_awaiting_sibling_before_post'
                   : notPosted.reason === 'awaiting-budget'
                     ? 'xero_sync_awaiting_budget_before_post'
-                    : 'xero_sync_claim_lost_before_post',
+                    : notPosted.reason === 'refund-delete-deferred'
+                      ? 'xero_sync_refund_delete_deferred_before_post'
+                      : notPosted.reason === 'awaiting-document-delete'
+                        ? 'xero_sync_awaiting_document_delete_before_post'
+                        : 'xero_sync_claim_lost_before_post',
     tag: 'sync',
     level: 'WARNING' as const,
     description: notPosted.message,
@@ -3634,7 +3642,9 @@ async function reportUnsentHandBackAcknowledgementLost(
  */
 /** o3d-0lpnb: the two credit-note settlement WAITS (see handBackSettlementWait). */
 export function isSettlementWait(reason: NonNullable<EntryResult['notPosted']>['reason']): boolean {
-  return reason === 'awaiting-receipt' || reason === 'awaiting-sibling' || reason === 'awaiting-budget'
+  // #1132: the refund delete's not-sent void and a credit-note allocation held behind a document delete are waits of the same shape (handed back
+  // through the same fenced hand-back, at their own delay, no retry spent).
+  return reason === 'awaiting-receipt' || reason === 'awaiting-sibling' || reason === 'awaiting-budget' || reason === 'refund-delete-deferred' || reason === 'awaiting-document-delete'
 }
 
 /**
@@ -5321,7 +5331,7 @@ function xeroPostingMode(payload: SyncPayload): LedgerPostingMode {
  * o3d-q0x56.2 - THE `CurrencyRate` A XERO PAYMENT CARRIES, OR A NAMED REFUSAL.
  *
  * The payload's `settlementRateToBase` is the rate IMS resolved for THIS payment when it recorded it (1 base = X payment currency). It is
- * converted here (1 / rate, 6 dp) and sent as the payment's `CurrencyRate`, so Xero books the realised FX gain/loss at IMS's rate and
+ * rounded here (the same rate, 6 dp: Xero's CurrencyRate is also 1 base = X foreign) and sent as the payment's `CurrencyRate`, so Xero books the realised FX gain/loss at IMS's rate and
  * never at its own XE.com day rate. This function never looks a rate up: the work carries it, or the payment is not sent.
  *
  *   - a payment with no `currency` in its payload is refused: whether it is foreign cannot be told, and guessing "base" is what would
@@ -5411,6 +5421,10 @@ type EntryResult = {
      * a retry, exactly like `producer-held` (see handsBackUnsentWithoutAttempt).
      */
     reason: 'claim-lost' | 'lease-expired' | 'dispatch-unrecorded' | 'transport-refused' | 'producer-held' | 'producer-shadowed' | 'before-cutoff' | 'awaiting-receipt' | 'awaiting-sibling' | 'awaiting-budget'
+      /** #1132 R2-MED-2: a refund delete's void attempt that sent nothing (no time under the locks, a lock wait, the transport's refusal, Xero's 429). */
+      | 'refund-delete-deferred'
+      /** #1132 MED-4: a credit-note allocation against an invoice whose delete is pending: nothing is sent while the delete runs. */
+      | 'awaiting-document-delete'
     operation: string
     message: string
     /** #1127 R1 H1: a settlement wait's own delay (its bounded backoff); absent = the reason's default (unsentHandBackDelayMs). */
@@ -6334,6 +6348,55 @@ async function refuseNonPositivePayment(params: {
   return { success: true, skipped: true }
 }
 
+/** #1132 R2-MED-2: how long a refund delete's void waits after an attempt that sent nothing, and how many such waits it takes before it fails. */
+export const REFUND_DELETE_DEFER_DELAY_MS = 15 * 60_000
+/** 96 waits of 15 minutes: a day. Past that a not-sent attempt fails like any other (it spends retries, and the last raises an operator task). */
+export const REFUND_DELETE_MAX_DEFERRALS = 96
+
+/**
+ * #1132 R2-MED-2 / MED-3: WHAT A FAILED REFUND-DELETE VOID ATTEMPT DOES TO ITS ROW.
+ *
+ *   the claim fence's own result     returned as it is (it names its own not-posted reason).
+ *   refused under the locks, and no  TERMINAL (MED-3): the row is closed CANCELLED, proven never sent, with a WARNING on the order; a new delete
+ *   attempt can have sent the void   request queues a fresh void. Nothing is retried.
+ *   nothing sent this attempt        a WAIT (R2-MED-2): handed back without spending a retry (`refund-delete-deferred`, 15 minutes), up to
+ *   (no time, a lock wait, the       REFUND_DELETE_MAX_DEFERRALS waits; past them it fails as below.
+ *   transport's refusal, a 429)
+ *   anything else                    a failure that spends a retry; the one that makes the row FAILED raises the operator task
+ *                                    REFUND_DELETE_VOID_STUCK (unless Xero is known to hold the credit note voided: that task is already raised).
+ */
+export async function refundDeleteVoidFailure(args: {
+  entryId: string
+  referenceId: string
+  attempt: AttemptRef
+  lease: RemoteWriteLease
+  finished: Extract<Awaited<ReturnType<typeof import('@/lib/domain/sales/refund-delete-service').voidCreditNoteThenCompleteRefundDeletion>>, { ok: false }>
+  refundDelete: typeof import('@/lib/domain/sales/refund-delete-service')
+}): Promise<EntryResult> {
+  const { entryId, referenceId, attempt, lease, finished, refundDelete } = args
+  const passed = finished.passthrough as EntryResult | undefined
+  if (passed?.notPosted) return passed
+  if (finished.refusedUnderLocks && finished.provenNeverSent) {
+    const retired = await refundDelete.retireRefusedRefundDeleteVoid(db, { voidSyncLogId: entryId, attemptRevision: attempt.attemptRevision, claimedAt: lease.heldFrom(), refundId: referenceId, why: finished.error })
+      .catch(() => false)
+    if (retired) return { success: true, skipped: true }
+  }
+  if (finished.notSent && !finished.refusedUnderLocks) {
+    const waits = await db.activityLog.count({ where: { entityType: 'SYSTEM', entityId: entryId, action: 'xero_sync_refund_delete_deferred_before_post' } }).catch(() => REFUND_DELETE_MAX_DEFERRALS)
+    if (waits < REFUND_DELETE_MAX_DEFERRALS) {
+      return { success: false, error: finished.error, notPosted: { reason: 'refund-delete-deferred', operation: 'credit-note-void', message: finished.error, retryDelayMs: REFUND_DELETE_DEFER_DELAY_MS } }
+    }
+  }
+  const error = passed?.error ?? finished.error
+  if (finished.voided !== true && !isRateLimitError(error)) {
+    const row = await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { retryCount: true } }).catch(() => null)
+    if (row && row.retryCount + 1 >= MAX_RETRIES) {
+      await refundDelete.raiseRefundDeleteVoidStuckTask(db, { refundId: referenceId, voidSyncLogId: entryId, error }).catch(() => { /* the failure stands; the FAILED row is still on the sync page */ })
+    }
+  }
+  return passed ?? { success: false, error }
+}
+
 /**
  * o3d-19gy / o3d-s36z / o3d-gfh: every remote call this entry makes is attributed to this entry's row.
  *
@@ -6382,6 +6445,8 @@ async function processEntry(
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 export const SETTLEMENT_XERO_CALL_BUDGET_PER_DAY = 200
 export const AWAITING_BUDGET_RETRY_DELAY_MS = 30 * 60_000
+/** #1132 MED-4: how long a credit-note allocation waits for a pending delete of its invoice to finish. */
+export const AWAITING_DOCUMENT_DELETE_RETRY_DELAY_MS = 15 * 60_000
 
 type BudgetClient = { $queryRaw: <T>(query: TemplateStringsArray, ...values: unknown[]) => Promise<T> }
 /** Spend `n` calls from today's budget: true when spent, false (nothing spent) when the day's budget would be exceeded. One atomic statement. */
@@ -6514,10 +6579,18 @@ async function processCreditNoteAllocation(args: {
   if (!refundRow) return retire('the refund no longer exists', 'REFUND_GONE')
   const reading = await db.$transaction(async (tx) => {
     await lockSalesOrder(tx, refundRow.orderId)
+    // #1132 MED-4: the pending-delete fence of the invoice this allocation would settle, read under the order lock the delete request takes.
+    const deletePending = await pendingDeletionError(refundRow.orderId, tx)
+    if (deletePending) return { deletePending, facts: null, attempted: false }
     const facts = await readCreditNoteSettlementFacts(tx, referenceId, entryId)
     const row = await tx.accountingSyncLog.findUnique({ where: { id: entryId }, select: { remoteAttemptedAt: true } })
-    return { facts, attempted: row?.remoteAttemptedAt != null }
+    return { deletePending: null, facts, attempted: row?.remoteAttemptedAt != null }
   })
+  if (reading.deletePending) {
+    // Nothing is sent while the invoice is being deleted; once the delete has finished the next attempt finds the invoice moved and retires the row.
+    const message = `Not sent: ${reading.deletePending}`
+    return { success: false, error: message, notPosted: { reason: 'awaiting-document-delete', operation: 'credit-note-allocation', message, retryDelayMs: AWAITING_DOCUMENT_DELETE_RETRY_DELAY_MS } }
+  }
   const facts = reading.facts
   if (!facts) return retire('the refund or its order could not be read', 'REFUND_UNREADABLE')
   const plan = planCreditNoteSettlement(facts)
@@ -6892,6 +6965,161 @@ async function processCreditNoteAllocation(args: {
     return wait ? waitFor(wait, error) : { success: false, error }
   }
   return outer.result.outcome
+}
+
+/**
+ * o3d-n2ci4 (#1135 review MED-1): THE NOTICE FOR A RETIRED FX JOURNAL ROW THAT MAY HAVE REACHED XERO. Exported so a test pins the words.
+ *
+ * A row whose record carries a create-dispatch marker, a remote-attempt stamp or a document id was, or may have been, sent by an earlier
+ * attempt: "Retired, not sent" would be a claim IMS cannot make. It is parked FAILED for a person instead, naming where to look.
+ */
+export function fxJournalMayHavePostedNotice(params: { type: 'REALISED_FX_JOURNAL' | 'UNREALISED_FX_JOURNAL'; reference: string | null; evidence: string }): string {
+  const where = params.type === 'UNREALISED_FX_JOURNAL'
+    ? `Xero Manual Journals with the reference ${params.reference ?? 'FXREV-<valuation date>'}`
+    : `Xero Manual Journals for ${params.reference ? `the reference ${params.reference}` : 'this settlement'} (narration "Realised FX ...")`
+  return withLedgerCheck(`Not sent now, and NOT retired as "not sent": this ${params.type} may have posted on an earlier attempt (${params.evidence}). `
+    + `IMS no longer posts this journal because Xero books currency gains itself, so if it did post it is a second booking. `
+    + `Check ${where}: if it is there, reverse it by hand in Xero; if it is not, nothing is owed. IMS will not send or re-queue this row.`)
+}
+
+/**
+ * o3d-n2ci4 (#1135 review MED-2): THE ACTIVITY TEXT FOR A RETIRED REVERSAL WHOSE SOURCE REVALUATION POSTED. Exported so a test pins the words.
+ *
+ * The generic retirement reason says sending the journal would count a movement twice, which is true of a revaluation and FALSE of the
+ * reversal of one that already posted: not sending it is what leaves the IMS revaluation standing in Xero beside Xero's own.
+ */
+export function fxReversalOfPostedRevaluationNotice(params: { sourceEntryId: string; sourceJournalId: string | null; reference: string | null; sourceValuationDate: string | null }): string {
+  const journal = params.sourceJournalId ? `Xero manual journal ${params.sourceJournalId}` : 'its Xero manual journal (no id recorded on the row)'
+  return withLedgerCheck(`Retired, not sent: the reversal of the unrealised FX revaluation${params.sourceValuationDate ? ` of ${params.sourceValuationDate}` : ''} `
+    + `(sync row ${params.sourceEntryId}). That revaluation POSTED to Xero as ${journal}${params.reference ? `, reference ${params.reference}` : ''}, `
+    + 'and IMS no longer posts revaluation journals or their reversals, so it stays in Xero\'s books beside Xero\'s own revaluation and '
+    + 'counts the same movement twice until someone reverses it. Reverse that journal by hand in Xero, then mark the exception-inbox row handled.')
+}
+
+/**
+ * THE ONE RETIREMENT OF A RETIRED FX JOURNAL ROW (REALISED_FX_JOURNAL / UNREALISED_FX_JOURNAL). Sends nothing in any branch.
+ *
+ *   - MAY HAVE POSTED (createDispatchedAt / remoteAttemptedAt / externalTransactionId on the row): parked FAILED, retries spent, claim- and
+ *     attempt-fenced, with the mirrored event, as every terminal failure (the escalateWait pattern; retire-held-backlog's PARK). Never
+ *     CANCELLED "not sent", which would tell the operator the wrong thing.
+ *   - OTHERWISE: CANCELLED with the reason, claim-fenced (retireOverSettlingInvoicePayment), as #1135 shipped.
+ *   - AND a reversal whose source revaluation is SYNCED (or carries a document id): logged at ERROR with the corrected text, and recorded
+ *     in the exception inbox (AccountingPostingRefusal, kind unrealised_fx_journal) naming the Xero journal, where it stands until someone
+ *     marks it handled. Only when THIS attempt retired the row: a lost claim retires nothing and the new holder reports it.
+ */
+async function retireFxJournalRow(args: {
+  entryId: string
+  type: 'REALISED_FX_JOURNAL' | 'UNREALISED_FX_JOURNAL'
+  referenceType: string
+  referenceId: string
+  payload: SyncPayload
+  lease: RemoteWriteLease
+  attempt: AttemptRef
+}): Promise<EntryResult> {
+  const { entryId, type, referenceType, referenceId, payload, lease, attempt } = args
+  const realised = type === 'REALISED_FX_JOURNAL'
+  const reason = realised ? REALISED_FX_JOURNAL_RETIRED_REASON : UNREALISED_FX_JOURNAL_RETIRED_REASON
+  const action = realised ? 'xero_realised_fx_journal_retired' : 'xero_unrealised_fx_journal_retired'
+  const kind = typeof payload.kind === 'string' ? payload.kind : null
+  const reference = typeof payload.reference === 'string' && payload.reference ? payload.reference : null
+
+  const own = await db.accountingSyncLog.findUnique({
+    where: { id: entryId },
+    select: { ...LEDGER_STANDING_SELECT, createDispatchedAt: true, remoteAttemptedAt: true },
+  })
+  const evidence = [
+    own?.createDispatchedAt ? `a create-dispatch marker at ${own.createDispatchedAt.toISOString()}` : null,
+    own?.remoteAttemptedAt ? `a remote attempt at ${own.remoteAttemptedAt.toISOString()}` : null,
+    own && namesADocument(own) ? 'a document id on the row' : null,
+  ].filter((e): e is string => e !== null)
+
+  if (evidence.length > 0) {
+    const notice = fxJournalMayHavePostedNotice({ type, reference, evidence: evidence.join(', ') })
+    const parked = await db.$transaction(async (tx) => {
+      const written = await tx.accountingSyncLog.updateMany({
+        where: { ...heldClaimWhere(entryId, lease), attemptRevision: attempt.attemptRevision, connector: XERO_CONNECTOR },
+        data: { status: 'FAILED', retryCount: MAX_RETRIES, errorMessage: notice, processingStartedAt: null },
+      })
+      if (written.count === 1) {
+        await updateMirroredEventForSyncLog(tx, { syncLogId: entryId, type, referenceType, referenceId, payload, status: 'FAILED', message: notice })
+      }
+      return written.count === 1
+    })
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: realised ? 'xero_realised_fx_journal_parked_may_have_posted' : 'xero_unrealised_fx_journal_parked_may_have_posted',
+      tag: 'accounting',
+      level: parked ? 'ERROR' : 'INFO',
+      description: parked
+        ? `${notice} (sync row ${entryId}, ${referenceType} ${referenceId}).`
+        : `Not parked by this attempt: sync row ${entryId} (${type}, ${referenceType} ${referenceId}) is no longer held by it, so the attempt that now holds it decides. Nothing was sent.`,
+      metadata: { syncLogId: entryId, referenceType, referenceId, kind, parked, evidence },
+    }).catch(() => { /* logging must never turn a safe park into a failure */ })
+    return { success: true, skipped: true }
+  }
+
+  // A reversal names the revaluation it undoes. Read BEFORE the retirement, so the report below states what the reversal was for.
+  const sourceEntryId = !realised && kind === 'reversal' && typeof payload.sourceEntryId === 'string' ? payload.sourceEntryId : null
+  const source = sourceEntryId
+    ? await db.accountingSyncLog.findUnique({ where: { id: sourceEntryId }, select: { ...LEDGER_STANDING_SELECT, connector: true } })
+    : null
+  // POSTED in the one reading of a row's ledger standing: the connector's writeback, or an operator's assertion that it posted.
+  const sourceStanding = source !== null && source.connector === XERO_CONNECTOR ? ledgerStanding(source) : null
+  const sourcePosted = sourceStanding === 'CONFIRMED_POSTED' || sourceStanding === 'ASSERTED_POSTED'
+
+  const retired = await db.$transaction((tx) => retireOverSettlingInvoicePayment(tx, { entryId, claim: lease, reason }))
+
+  if (source !== null && sourcePosted && sourceEntryId) {
+    // The Xero journal to name to the operator: read once, for the text and the inbox row only.
+    const sourceJournalId = source.externalTransactionId
+    const sourceValuationDate = typeof payload.sourceValuationDate === 'string' ? payload.sourceValuationDate : null
+    const description = fxReversalOfPostedRevaluationNotice({ sourceEntryId, sourceJournalId, reference, sourceValuationDate })
+    await logActivity({
+      entityType: 'SYSTEM',
+      action: retired ? 'xero_unrealised_fx_reversal_retired_source_posted' : 'xero_unrealised_fx_journal_not_retired_claim_moved',
+      tag: 'accounting',
+      level: retired ? 'ERROR' : 'INFO',
+      description: retired
+        ? `${description} (sync row ${entryId}, ${referenceType} ${referenceId}).`
+        : `Not retired by this attempt: sync row ${entryId} (${type}, ${referenceType} ${referenceId}) is no longer held by it, so the attempt that now holds it decides. Nothing was sent.`,
+      metadata: { syncLogId: entryId, referenceType, referenceId, kind, retired, sourceEntryId, sourceStatus: source.status, sourceStanding, sourceJournalId },
+    }).catch(() => { /* logging must never turn a safe retirement into a failure */ })
+    if (retired) {
+      // The key of the posting THIS ROW carries, derived from exactly the fields its enqueue stored (accountingPostingKeyForRow equals
+      // accountingPostingKey over that enqueue's params), so the inbox row and any later clear agree on which posting it is.
+      const reversalPosting = accountingPostingKeyForRow({ type, referenceType, referenceId, payload })
+      // THE STANDING FINDING: outstanding work in the exception inbox, keyed on this reversal's own posting, so it stays listed until a
+      // person marks it handled (nothing will ever queue this posting again: the enqueue chokepoint suppresses it).
+      // Not wrapped: recordAccountingPostingRefusal reports a write that failed and does not rethrow it.
+      await recordAccountingPostingRefusal(
+        db as unknown as PostingRefusalClient,
+        reversalPosting,
+        {
+          kind: 'unrealised_fx_journal',
+          chartConnector: XERO_CONNECTOR,
+          activeConnector: XERO_CONNECTOR,
+          reason: 'retired_reversal_source_posted',
+          committed: `the unrealised FX revaluation${sourceValuationDate ? ` of ${sourceValuationDate}` : ''} posted to Xero as ${sourceJournalId ? `manual journal ${sourceJournalId}` : 'a manual journal (no id recorded)'} and its reversal was retired unsent`,
+          remedy: `Reverse ${sourceJournalId ? `Xero manual journal ${sourceJournalId}` : 'that Xero manual journal'}${reference ? ` (reference ${reference})` : ''} by hand in Xero, then mark this row handled.`,
+          detail: { syncLogId: entryId, sourceEntryId, sourceJournalId, sourceStatus: source.status, sourceValuationDate, reference },
+        },
+      )
+    }
+    return { success: true, skipped: true }
+  }
+
+  await logActivity({
+    entityType: 'SYSTEM',
+    action: retired ? action : realised ? 'xero_realised_fx_journal_not_retired_claim_moved' : 'xero_unrealised_fx_journal_not_retired_claim_moved',
+    tag: 'accounting',
+    // #1135 review LOW-1: only a retirement this attempt made is reported as one.
+    level: retired ? 'WARNING' : 'INFO',
+    description: retired
+      ? `${reason} (sync row ${entryId}, ${referenceType} ${referenceId}).`
+      : `Not retired by this attempt: sync row ${entryId} (${type}, ${referenceType} ${referenceId}) is no longer held by it, so the attempt that now holds it decides. Nothing was sent.`,
+    metadata: { syncLogId: entryId, referenceType, referenceId, ...(realised ? {} : { kind }), retired },
+  }).catch(() => { /* logging must never turn a safe retirement into a failure */ })
+  return { success: true, skipped: true }
 }
 
 export async function processClaimedEntry(
@@ -7312,7 +7540,7 @@ export async function processClaimedEntry(
             Account: { AccountID: account.externalAccountId },
             Date: paymentDate,
             Amount: amount,
-            // o3d-q0x56.2: IMS's settlement rate for this payment (1 / rate, 6 dp), so Xero books the realised FX at IMS's rate, not its XE.com day
+            // o3d-q0x56.2: IMS's settlement rate for this payment (as is, 6 dp), so Xero books the realised FX at IMS's rate, not its XE.com day
             // rate. Absent only for a base-currency payment.
             ...(paymentRate.currencyRate !== undefined ? { CurrencyRate: paymentRate.currencyRate } : {}),
             // o3d-0m56: IMS's own mark, so a later attempt can recognise THIS payment even if its
@@ -7506,7 +7734,7 @@ export async function processClaimedEntry(
             Account: { AccountID: account.externalAccountId },
             Date: paymentDate,
             Amount: amount,
-            // o3d-q0x56.2: IMS's settlement rate for this payment (1 / rate, 6 dp); absent only for a base-currency bill payment.
+            // o3d-q0x56.2: IMS's settlement rate for this payment (as is, 6 dp); absent only for a base-currency bill payment.
             ...(billPaymentRate.currencyRate !== undefined ? { CurrencyRate: billPaymentRate.currencyRate } : {}),
             // The operator's reference is KEPT and the mark appended, never replaced: it is what they
             // will look for on the bank reconciliation. See INVOICE_PAYMENT above for the mark.
@@ -7576,14 +7804,14 @@ export async function processClaimedEntry(
       if (!voidCreditNoteId) return { success: false, error: 'Missing creditNoteId for CREDIT_NOTE_VOID' }
       // The claim fence and the void, as the last thing before the socket. `bounded`: called from inside the refund delete's locked transaction,
       // so no in-request sleep or retry and a hard timeout (o3d-0syfq); unbounded for any other reference type, as before.
-      const voidInLedger = async (bounded?: XeroBoundedCall): Promise<EntryResult> => {
+      const voidInLedger = async (bounded?: XeroBoundedCall, beforePost?: () => Promise<string | null>): Promise<EntryResult & { notSent?: boolean }> => {
         const fence = await lease.fenceBeforeRemoteWrite('credit-note-void')
         if (!fence.ok) return fence.result
         const voided = await voidCreditNote(
           { creditNoteId: voidCreditNoteId, creditNoteNumber: typeof payload.creditNoteNumber === 'string' ? payload.creditNoteNumber : null },
-          { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note-void'), ...(bounded ? { bounded } : {}) },
+          { idempotencyKey: buildXeroIdempotencyKey(entryId, 'credit-note-void'), ...(bounded ? { bounded } : {}), ...(beforePost ? { beforePost } : {}) },
         )
-        return voided.success ? { success: true } : { success: false, error: voided.error ?? 'the void failed' }
+        return voided.success ? { success: true } : { success: false, error: voided.error ?? 'the void failed', ...(voided.notSent ? { notSent: true } : {}) }
       }
       if (referenceType !== 'SalesOrderRefund') {
         const voided = await voidInLedger()
@@ -7595,17 +7823,30 @@ export async function processClaimedEntry(
       // (bounded) void is the last statement before the commit, so the returned stock cannot move between the void and the unwind. Refused under
       // the locks, the ledger is not asked to void at all (idempotent: an already deleted refund is a success).
       const meta = (payload as { _refundDelete?: { actorUserId?: string | null; reason?: string | null } })._refundDelete
-      const { voidCreditNoteThenCompleteRefundDeletion } = await import('@/lib/domain/sales/refund-delete-service')
-      const finished = await voidCreditNoteThenCompleteRefundDeletion(
+      const refundDelete = await import('@/lib/domain/sales/refund-delete-service')
+      // #1132 R2-MED-1: the token is resolved (refreshed if due) BEFORE the locked transaction and handed to both bounded calls.
+      let boundedAuth: XeroAccessGrant | null = null
+      const finished = await refundDelete.voidCreditNoteThenCompleteRefundDeletion(
         db,
         { refundId: referenceId, voidSyncLogId: entryId, actorUserId: meta?.actorUserId ?? null, reason: meta?.reason ?? null },
-        { voidInLedger: (bounded) => voidInLedger(bounded), readCreditNoteStatus: (bounded) => readCreditNoteStatus(voidCreditNoteId, bounded) },
+        {
+          prepare: async () => {
+            boundedAuth = await getAccessToken()
+            return boundedAuth ? null : 'Xero is not connected, or its connection could not be refreshed'
+          },
+          voidInLedger: (bounded) => voidInLedger(
+            { timeoutMs: bounded.timeoutMs, ...(bounded.deadlineAt !== undefined ? { deadlineAt: bounded.deadlineAt } : {}), ...(boundedAuth ? { auth: boundedAuth } : {}) },
+            // The service's own check and attempt stamp, asked by the void immediately before its POST (see voidCreditNote's beforePost).
+            bounded.beforePost,
+          ),
+          readCreditNoteStatus: (bounded) => readCreditNoteStatus(voidCreditNoteId, { timeoutMs: bounded.timeoutMs, ...(boundedAuth ? { auth: boundedAuth } : {}) }),
+        },
       )
-      if (!finished.ok) return finished.passthrough !== undefined ? finished.passthrough as EntryResult : { success: false, error: finished.error }
+      if (!finished.ok) return refundDeleteVoidFailure({ entryId, referenceId, attempt, lease, finished, refundDelete })
       if (finished.stockSyncFailed) {
         await logActivity({ entityType: 'SALES_ORDER', entityId: finished.orderId ?? referenceId, action: 'refund_delete_stock_sync_failed', tag: 'sales', level: 'WARNING', description: 'The refund was deleted, but its stock change could not be queued for the storefront. It will go with the next stock sync; push the stock from the product page if it is urgent.', metadata: { refundId: referenceId } }).catch(() => { /* the delete is done; the warning is advisory */ })
       }
-      if (!finished.alreadyDeleted) {
+      if (finished.followUpsRan) {
         // The same follow-up row the server action writes, so an order the worker could not re-reserve is visible to a person.
         await logActivity({ entityType: 'SALES_ORDER', entityId: finished.orderId, action: 'refund_delete_follow_up', tag: 'sales', level: finished.reallocationWarning ? 'WARNING' : 'INFO', description: finished.reallocationWarning ? `The refund was deleted. ${finished.reallocationWarning}` : 'Refund deleted; the order was re-reserved and the stock change queued.', metadata: { refundId: referenceId } }).catch(() => { /* the delete is done; the row is advisory */ })
       }
@@ -7713,20 +7954,8 @@ export async function processClaimedEntry(
       // reason on the row, claim-fenced, before any request. Skipping it is the safe direction in both ways it could be wrong: if its payment
       // was also queued, sending both would book the gain or loss twice; if its payment already posted without a rate, the journal would
       // still be a second booking of what Xero already recorded. `computeRealisedFx` stays, for the IMS FX gain/loss report only.
-      const retired = await db.$transaction((tx) => retireOverSettlingInvoicePayment(tx, {
-        entryId,
-        claim: lease,
-        reason: REALISED_FX_JOURNAL_RETIRED_REASON,
-      }))
-      await logActivity({
-        entityType: 'SYSTEM',
-        action: 'xero_realised_fx_journal_retired',
-        tag: 'accounting',
-        level: 'WARNING',
-        description: `${REALISED_FX_JOURNAL_RETIRED_REASON} (sync row ${entryId}, ${referenceType} ${referenceId}).`,
-        metadata: { syncLogId: entryId, referenceType, referenceId, retired },
-      }).catch(() => { /* logging must never turn a safe retirement into a failure */ })
-      return { success: true, skipped: true }
+      // o3d-n2ci4: a row whose record shows it MAY have reached Xero is parked FAILED for a person, never CANCELLED as "not sent".
+      return retireFxJournalRow({ entryId, type, referenceType, referenceId, payload, lease, attempt })
     }
 
     case 'UNREALISED_FX_JOURNAL': {
@@ -7737,20 +7966,11 @@ export async function processClaimedEntry(
       // retired (lib/accounting-fx-revaluation.ts). Any row already queued, of either kind, is retired here exactly as the realised journal
       // is above: CANCELLED with the reason on the row, claim-fenced, before any request. Sending less is the only safe direction: Xero's
       // own revaluation is already in its reports.
-      const retired = await db.$transaction((tx) => retireOverSettlingInvoicePayment(tx, {
-        entryId,
-        claim: lease,
-        reason: UNREALISED_FX_JOURNAL_RETIRED_REASON,
-      }))
-      await logActivity({
-        entityType: 'SYSTEM',
-        action: 'xero_unrealised_fx_journal_retired',
-        tag: 'accounting',
-        level: 'WARNING',
-        description: `${UNREALISED_FX_JOURNAL_RETIRED_REASON} (sync row ${entryId}, ${referenceType} ${referenceId}).`,
-        metadata: { syncLogId: entryId, referenceType, referenceId, kind: typeof payload.kind === 'string' ? payload.kind : null, retired },
-      }).catch(() => { /* logging must never turn a safe retirement into a failure */ })
-      return { success: true, skipped: true }
+      //
+      // o3d-n2ci4: and honestly. A row whose record shows it MAY have reached Xero (a create-dispatch marker or a remote-attempt stamp) is
+      // parked FAILED for a person instead, and a reversal whose source revaluation POSTED is retired with an ERROR and a standing
+      // exception-inbox row naming the Xero journal that is now left unreversed (retireFxJournalRow).
+      return retireFxJournalRow({ entryId, type, referenceType, referenceId, payload, lease, attempt })
     }
 
     case 'COGS_JOURNAL':

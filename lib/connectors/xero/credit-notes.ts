@@ -183,8 +183,8 @@ export type CreditNoteVoidReadback = {
 }
 
 type CreditNoteVoidDeps = {
-  get: <T>(path: string, opts?: { bounded?: XeroBoundedCall }) => Promise<{ ok: boolean; status: number; data?: T; error?: string }>
-  post: <T>(path: string, body: unknown, opts?: { idempotencyKey?: string; bounded?: XeroBoundedCall }) => Promise<{ ok: boolean; status: number; data?: T; error?: string }>
+  get: <T>(path: string, opts?: { bounded?: XeroBoundedCall }) => Promise<{ ok: boolean; status: number; data?: T; error?: string; notSent?: string }>
+  post: <T>(path: string, body: unknown, opts?: { idempotencyKey?: string; bounded?: XeroBoundedCall }) => Promise<{ ok: boolean; status: number; data?: T; error?: string; notSent?: string }>
 }
 
 /** The decision half of the void, pure so it is tested without a ledger. */
@@ -220,9 +220,29 @@ export function decideCreditNoteVoid(note: CreditNoteVoidReadback | undefined, e
 export async function voidCreditNote(
   data: { creditNoteId: string; creditNoteNumber?: string | null },
   /** `bounded` (o3d-0syfq): both calls without in-request sleeps or retries and with a hard timeout each (see XeroBoundedCall). */
-  opts?: { idempotencyKey?: string; bounded?: XeroBoundedCall },
+  opts?: {
+    idempotencyKey?: string
+    bounded?: XeroBoundedCall
+    /**
+     * #1132: asked after the read decided a void is needed and immediately before the void request: a sentence (or a throw) and nothing is
+     * sent. The refund delete's books-lock re-check and its attempt stamp.
+     */
+    beforePost?: () => Promise<string | null>
+  },
   deps: CreditNoteVoidDeps = { get: (path, o) => xeroGet(path, o), post: (path, body, o) => xeroPost(path, body, o) },
-): Promise<{ success: boolean; alreadyDone?: boolean; error?: string; permanent?: boolean }> {
+): Promise<{
+  success: boolean
+  alreadyDone?: boolean
+  error?: string
+  permanent?: boolean
+  /**
+   * #1132 R2-MED-2: PROVEN NOT SENT, so the caller may hand the work back without spending a retry. Set only when no void request reached
+   * Xero: the read before the void failed (a read cannot void anything), the transport refused the void with a named not-sent reason, or Xero
+   * answered the void 429 (rejected, not applied). Absent for a refusal decided from the document (allocated, paid, wrong type): nothing was
+   * sent there either, but it is not a wait, so it fails as before. Absent for every case the void may have reached Xero.
+   */
+  notSent?: true
+}> {
   if (!data.creditNoteId || /[^A-Za-z0-9-]/.test(data.creditNoteId)) {
     return { success: false, permanent: true, error: 'the credit note carries no usable ledger id to void' }
   }
@@ -230,23 +250,34 @@ export async function voidCreditNote(
   try {
     read = await deps.get<{ CreditNotes?: CreditNoteVoidReadback[] }>(`CreditNotes/${data.creditNoteId}`, opts?.bounded ? { bounded: opts.bounded } : undefined)
   } catch (error) {
-    return { success: false, error: `the credit note could not be read before voiding: ${String(error)}` }
+    return { success: false, notSent: true, error: `the credit note could not be read before voiding, so no void was sent: ${String(error)}` }
   }
-  if (!read.ok) return { success: false, error: read.error ?? `reading the credit note failed with HTTP ${read.status}` }
+  if (!read.ok) return { success: false, notSent: true, error: `${read.error ?? `reading the credit note failed with HTTP ${read.status}`}; no void was sent` }
   const decision = decideCreditNoteVoid(read.data?.CreditNotes?.[0], data.creditNoteId, data.creditNoteNumber)
   if (decision.action === 'already-done') return { success: true, alreadyDone: true }
   if (decision.action === 'refuse') return { success: false, permanent: decision.permanent, error: decision.error }
-  let res: { ok: boolean; status: number; error?: string }
+  if (opts?.beforePost) {
+    let refusal: string | null
+    try {
+      refusal = await opts.beforePost()
+    } catch (error) {
+      refusal = `the check before the void could not be made (${String(error)})`
+    }
+    if (refusal) return { success: false, notSent: true, error: `${refusal}; the void was not sent` }
+  }
+  let res: { ok: boolean; status: number; error?: string; notSent?: string }
   try {
     res = await deps.post<XeroCreditNoteResponse>(
       `CreditNotes/${data.creditNoteId}`,
       { CreditNotes: [{ CreditNoteID: data.creditNoteId, Status: decision.status }] },
-      opts,
+      { ...(opts?.idempotencyKey !== undefined ? { idempotencyKey: opts.idempotencyKey } : {}), ...(opts?.bounded ? { bounded: opts.bounded } : {}) },
     )
   } catch (error) {
     // A timeout or a reset after the request may have left: the outcome is unknown. Reported as a failure; the next attempt reads the document first.
     return { success: false, error: `voiding the credit note did not complete (the outcome in Xero is not known until it is read again): ${String(error)}` }
   }
+  // Refused before the socket (a named not-sent reason), or rejected by Xero's rate limit (a 429 is not applied): no void reached Xero.
+  if (!res.ok && (res.notSent !== undefined || res.status === 429)) return { success: false, notSent: true, error: `${res.error ?? `voiding the credit note was refused with HTTP ${res.status}`}; the void was not sent` }
   if (!res.ok) return { success: false, error: res.error ?? `voiding the credit note failed with HTTP ${res.status}` }
   return { success: true }
 }
@@ -854,7 +885,7 @@ export function deriveCreditNoteRefundIdempotencyKey(rowKey: string, creditNoteI
 
 /**
  * Pay a posted sales credit note OUT as a refund: a Xero Payment against the credit note (`CreditNote.CreditNoteID`, the refund shape of the Payments
- * API) from the bank or clearing account the original receipt used. `currencyRate` is IMS's settlement rate for the cash-out (1 / rate, 6 dp, absent
+ * API) from the bank or clearing account the original receipt used. `currencyRate` is IMS's settlement rate for the cash-out (the rate as is, 6 dp, never inverted; absent
  * for a base-currency refund), so Xero books the realised FX gain or loss at IMS's rate - the same field and the same rate source a receipt carries.
  *
  * Idempotent: the credit note's RemainingCredit is read first and a refund larger than it is REFUSED (nothing sent). A retry of a refund that

@@ -6,6 +6,7 @@ import { freshAuthFailureResult, requireFreshPermission, requirePermission } fro
 import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
 import { completeWmsOperatorTask } from '@/lib/domain/wms/operator-task-done'
 import { WMS_OPERATOR_TASK_REASON_LABELS, type WmsOperatorTaskPayload } from '@/lib/domain/wms/operator-tasks'
+import { REFUND_DELETE_TASK_REASONS } from '@/lib/domain/sales/refund-delete-task-reasons'
 
 /**
  * SYNC > EXCEPTIONS: RAISE A WAREHOUSE QUERY.
@@ -37,8 +38,9 @@ export type WmsOperatorTaskPage = { rows: WmsOperatorTaskRow[]; total: number; p
 export async function listWmsOperatorTasks(pageInput = 0): Promise<WmsOperatorTaskPage> {
   await requirePermission('sync')
   const page = Number.isInteger(pageInput) && pageInput > 0 ? pageInput : 0
-  // A shop refund task is not a warehouse query: it has its own section (app/actions/shop-refund-tasks.ts).
-  const where = { status: 'OPEN' as const, reason: { not: 'SHOP_REFUND_DUE' as const } }
+  // A shop refund task is not a warehouse query: it has its own section (app/actions/shop-refund-tasks.ts). Nor are the refund delete's own tasks
+  // (#1132 R2-LOW-6): they are about Xero and IMS, and have their own section (listRefundDeleteTasks).
+  const where = { status: 'OPEN' as const, reason: { notIn: ['SHOP_REFUND_DUE' as const, ...REFUND_DELETE_TASK_REASONS] } }
   const [total, tasks] = await Promise.all([
     db.wmsOperatorTask.count({ where }),
     db.wmsOperatorTask.findMany({
@@ -61,6 +63,33 @@ export async function listWmsOperatorTasks(pageInput = 0): Promise<WmsOperatorTa
     }
   })
   return { rows, total, page, pageSize: OPERATOR_TASK_PAGE_SIZE }
+}
+
+export type RefundDeleteTaskRow = { id: string; orderId: string; orderNumber: string; reason: string; reasonLabel: string; queryText: string; createdAt: string }
+export type RefundDeleteTaskPage = { rows: RefundDeleteTaskRow[]; total: number; page: number; pageSize: number }
+
+/**
+ * #1132 R2-LOW-6: THE REFUND DELETE'S OWN TASKS (a credit note voided in Xero while the IMS refund stands; a void entry that gave up), oldest first.
+ * Not warehouse queries: Done records who and when and changes nothing in Xero, the warehouse or the refund.
+ */
+export async function listRefundDeleteTasks(pageInput = 0): Promise<RefundDeleteTaskPage> {
+  await requirePermission('sync')
+  const page = Number.isInteger(pageInput) && pageInput > 0 ? pageInput : 0
+  const where = { status: 'OPEN' as const, reason: { in: [...REFUND_DELETE_TASK_REASONS] } }
+  const [total, tasks] = await Promise.all([
+    db.wmsOperatorTask.count({ where }),
+    db.wmsOperatorTask.findMany({
+      where, orderBy: [{ createdAt: 'asc' }, { id: 'asc' }], skip: page * OPERATOR_TASK_PAGE_SIZE, take: OPERATOR_TASK_PAGE_SIZE,
+      select: { id: true, orderId: true, reason: true, queryText: true, createdAt: true, order: { select: { orderNumber: true } } },
+    }),
+  ])
+  return {
+    rows: tasks.map((task) => ({
+      id: task.id, orderId: task.orderId, orderNumber: task.order.orderNumber ?? task.orderId, reason: task.reason,
+      reasonLabel: WMS_OPERATOR_TASK_REASON_LABELS[task.reason], queryText: task.queryText, createdAt: task.createdAt.toISOString(),
+    })),
+    total, page, pageSize: OPERATOR_TASK_PAGE_SIZE,
+  }
 }
 
 export type MarkWmsOperatorTaskDoneResult = { success: boolean; error?: string; notice?: string } | FreshAuthFailureResult

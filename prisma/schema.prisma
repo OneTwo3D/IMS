@@ -2809,6 +2809,8 @@ model SalesOrderRefundDeletion {
   voidSyncLogId           String?  @map("void_sync_log_id")
   /// What was reversed, from the recorded movements: stock out, layers removed, the COGS journal reversed, syncs retired. Amounts and ids only.
   reversal                Json     @default("{}")
+  /// #1132 MED-2: when the post-commit follow-ups (re-reserving the order, the storefront stock push) ran. Null: still owed; the void worker's retry runs them.
+  followUpsDoneAt         DateTime? @map("follow_ups_done_at")
 
   @@index([orderId])
   @@map("sales_order_refund_deletions")
@@ -4850,6 +4852,8 @@ enum WmsOperatorTaskReason {
   MERGE_HOLD_OVERDUE
   /// A withdrawal (or an IMS cancel) reached an order that is on merge hold: IMS did not cancel or release it, a person decides in the warehouse.
   MERGE_HOLD_WITHDRAWAL
+  /// #1132 R2-MED-2: a refund delete's credit-note void entry used up its retries: the refund still stands in IMS and a person decides. Not a warehouse query: raised with connector 'xero'.
+  REFUND_DELETE_VOID_STUCK
 }
 
 enum WmsOperatorTaskStatus {
