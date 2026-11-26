@@ -498,7 +498,9 @@ export async function completeAccountingDocumentDeletion(externalDocumentId: str
         await tx.purchaseInvoice.delete({ where: { id: bill.id } })
         // Per-event FX: the deleted bill's GR/IR rows go back to zero and its FX-difference journal is reversed (and any later bill of the order
         // re-matched to the receipts this one took), in this transaction, under the order's row lock taken above.
-        if (billFxManaged) {
+        // HIGH-2: a PO-rate bill whose FX difference this writer has already recorded (receipts valued under the switch) is reversed too.
+        const fxHistory = billFxManaged || (await tx.grirSubledgerMovement.count({ where: { sourceRef: bill.id, idempotencyKey: { startsWith: 'grir:bill-fx:' } } })) > 0
+        if (fxHistory) {
           const { reconcilePurchaseBillFx } = await import('@/lib/domain/purchasing/purchase-bill-fx')
           const syncEnabled = (await tx.setting.findUnique({ where: { key: 'xero_sync_enabled' }, select: { value: true } }))?.value === 'true'
           const fx = await reconcilePurchaseBillFx(tx, { poId: bill.poId, connector: 'xero', syncEnabled, at: new Date() })

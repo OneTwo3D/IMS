@@ -170,6 +170,13 @@ export type InvoiceLine = {
   accountCode: string
   taxType?: string
   /**
+   * Supplier bills only (per-event purchase FX PPV split, lib/domain/purchasing/purchase-bill-fx.ts): the line's exact 2dp amount and tax, sent as
+   * Xero's LineAmount and TaxAmount so that the stock line plus its price-variance line total exactly what the supplier's single line did. Absent =
+   * the ledger computes them, as for every other line.
+   */
+  lineAmount?: number
+  taxAmount?: number
+  /**
    * Why this SALES line may carry no tax (taxType NONE). A sales invoice or credit-note line with no `taxType` is refused, and an
    * explicit NONE is refused unless this names an allowed kind: lib/domain/accounting/sales-document-tax-types.ts. Never sent to
    * the accounting system. A supplier bill or supplier credit-note line follows the same rule with its own kinds (lib/domain/accounting/purchase-document-tax-types.ts).

@@ -82,6 +82,9 @@ export function buildPurchaseBillPayload(
       AccountCode: line.accountCode,
       TaxType: line.taxType,
     }
+    // Per-event purchase FX PPV split: the exact amount and tax IMS decided for the line (see InvoiceLine.lineAmount / taxAmount).
+    if (typeof line.lineAmount === 'number') xeroLine.LineAmount = line.lineAmount
+    if (typeof line.taxAmount === 'number') xeroLine.TaxAmount = line.taxAmount
     if (line.itemCode) xeroLine.ItemCode = line.itemCode
     return xeroLine
   })

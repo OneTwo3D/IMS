@@ -116,9 +116,23 @@ async function withXeroPosting<T>(fn: () => Promise<T>): Promise<T> {
     await setSettings({ xero_sync_enabled: 'false' })
   }
 }
+/**
+ * The bills here are recorded with Xero sync off (so no tax mapping is needed); this writes the PURCHASE_BILL transit row a queued bill posting
+ * writes, which is what MED-1 requires before an FX journal is owed for the bill.
+ */
+async function markBillsPosted(po: Po) {
+  for (const bill of await s.db.purchaseInvoice.findMany({ where: { poId: po.id }, select: { id: true, subtotalBase: true, ppvBase: true, invoiceDate: true } })) {
+    const key = `purchase-invoice:${bill.id}:test`
+    await s.db.transitSubledgerMovement.upsert({
+      where: { idempotencyKey: key }, update: {},
+      create: { sourceType: 'PURCHASE_BILL', sourceRef: po.id, idempotencyKey: key, baseDelta: bill.subtotalBase.sub(bill.ppvBase ?? 0), journalDate: bill.invoiceDate },
+    })
+  }
+}
 /** Run the reconciliation as a later event would (a receipt, an edit), with Xero posting on, and read the FX journals it queued for the order. */
-async function reconcileWithPosting(po: Po) {
+async function reconcileWithPosting(po: Po, options: { posted?: boolean } = {}) {
   const { reconcilePurchaseBillFx } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  if (options.posted !== false) await markBillsPosted(po)
   return withXeroPosting(async () => {
     const { db } = await import('@/lib/db')
     const result = await db.$transaction(async (tx) => {
@@ -291,4 +305,51 @@ test('switch OFF (or the interlock not complete): the bill is exactly as before 
       setPurchaseEventFxStepsCompleteForTests(true)
     }
   }
+})
+
+// [mutation: queue the FX journal for a bill whose own posting was not queued (MED-1)]
+test('MED-1: no FX journal for a bill whose own posting is not in transit (sync off, declined or posted by hand); it follows once the bill is', async () => {
+  const po = await seedPo(10)
+  assert.equal((await receive(po, 10)).success, true) // table 1.25
+  await lockAt(po)
+  assert.equal((await bill(po, 10, 12.5)).success, true)
+  const unposted = await reconcileWithPosting(po, { posted: false })
+  assert.equal(unposted.logs.length, 0, 'the bill is not in the ledger\'s transit account: nothing to clear')
+  const posted = await reconcileWithPosting(po)
+  assert.equal(posted.logs.length, 1)
+  close(posted.transitNet, 21.88, 'cleared once the bill posting is in transit')
+})
+
+// [mutation: leave PO-rate bills out of the reconciliation (HIGH-2)]
+test('HIGH-2: a bill at the PO rate before switch-on, goods received at the lock rate after: the difference is cleared, GR/IR and transit net to zero', async () => {
+  const { setPurchaseEventFxStepsCompleteForTests } = await import('@/lib/domain/purchasing/purchase-event-fx-settings')
+  const { listPurchaseFxInFlightOrders, rerunPurchaseBillFx } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  const po = await seedPo(10)
+  setPurchaseEventFxStepsCompleteForTests(null) // switch-on has not happened yet: the bill is valued at the PO rate
+  try {
+    assert.equal((await bill(po, 10, 12.5)).success, true)
+  } finally {
+    setPurchaseEventFxStepsCompleteForTests(true)
+  }
+  const row = await billOf(po)
+  assert.equal(row.fxRateSource, null)
+  close(Number(row.subtotalBase), 100, 'the bill at the PO rate 1.25')
+  const inFlight = await listPurchaseFxInFlightOrders(s.db as never)
+  assert.ok(inFlight.some((o) => o.poId === po.id), 'the turn-on check lists the order billed and not received')
+  await lockAt(po)
+  assert.equal((await receive(po, 10)).success, true) // at the lock rate 1.6: 78.125
+  close(await grir(po, 'BILL_FX_VARIANCE'), 21.875, 'the PO-rate bill (100) is dearer in base than the goods received (78.125)')
+  close((await balance(po)).toNumber(), 0, 'GR/IR nets to zero')
+  const keys = (await s.db.grirSubledgerMovement.findMany({ where: { poId: po.id, sourceType: 'BILL' } })).map((r) => r.idempotencyKey)
+  assert.deepEqual(keys, [`grir:bill:${row.id}:${po.lineId}`], 'no new BILL row: the standard one stays')
+  const posted = await reconcileWithPosting(po)
+  assert.equal(posted.logs.length, 1)
+  close(posted.transitNet, -21.88, 'transit CREDITED: the bill debited 100, the receipt credited 78.125')
+  const billDebit = 100
+  const receiptCredit = 78.125
+  close(billDebit - receiptCredit + posted.transitNet, -0.005, 'transit nets to zero (to the penny the journal rounds to)')
+  // HIGH-1: the supported re-run queues nothing more for an order that owes nothing.
+  await markBillsPosted(po)
+  const again = await withXeroPosting(() => rerunPurchaseBillFx(po.id))
+  assert.equal(again.journals.length, 0, 'the re-run is idempotent')
 })

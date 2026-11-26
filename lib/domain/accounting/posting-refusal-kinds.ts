@@ -140,7 +140,7 @@ export const POSTING_REFUSAL_KINDS = {
   },
   purchase_fx_variance: {
     type: 'PURCHASE_FX_VARIANCE', referenceType: 'PurchaseOrder', clearing: 'manual',
-    how: 'The journal is queued for one change of the bill or its receipts; the next change queues only the difference that is still owed.',
+    how: 'IMS queues only what is still owed whenever the bill or its receipts change, or when `npm run purchase-fx:reconcile -- --po <order> --apply` is run; a copy keyed into the ledger by hand as well would be booked twice.',
   },
   allocation_reversal: {
     type: 'ALLOCATION_REVERSAL', referenceType: 'SalesOrder', clearing: 'manual',

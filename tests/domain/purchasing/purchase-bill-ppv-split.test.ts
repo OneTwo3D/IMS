@@ -66,3 +66,33 @@ test('matching: per receipt, in order; earlier (even unmanaged) bills take the e
   assert.equal(two[0]!.accruedBase.toString(), '62.5', '6 at the second receipt (46.875) plus 2 not received, at the bill (2 x 7.8125)')
   assert.equal(two[0]!.fxVarianceBase.toString(), '0', 'all matched at the lock rate')
 })
+
+// [mutation: send the PPV line at 4dp and let the ledger tax each part (MED-4)]
+test('MED-4: qty 2 x 1.0025 against a PO cost of 1.0000: the two parts total the supplier\'s line to the penny, tax included', () => {
+  const result = calculatePurchaseInvoice({
+    lines: [{ kind: 'product', poLineId: 'p', qtyBilled: 2, unitCostForeign: 1.0025 }], fxRateToBase: 1, currency: 'GBP', poReference: 'PO-1', transitAccount: '631',
+    poTaxRatePercent: 0.2, poLineById, costLineById: new Map(), ppvSplit: { stockUnitForeignByPoLine: new Map([['p', 1]]), ppvAccount: '5050' },
+  })
+  const [stock, ppv] = result.accountingLines
+  assert.deepEqual([stock!.lineAmount, stock!.taxAmount], [2, 0.4])
+  assert.deepEqual([ppv!.unitAmount, ppv!.lineAmount, ppv!.taxAmount], [0.01, 0.01, 0], 'round2(2.005) - 2.00, and tax(line) - tax(stock)')
+  assert.equal(stock!.lineAmount! + ppv!.lineAmount!, 2.01, 'the supplier\'s line amount')
+  assert.equal(Math.round((stock!.taxAmount! + ppv!.taxAmount!) * 100) / 100, result.taxForeign, 'the bill\'s VAT')
+  assert.equal(result.taxForeign, 0.4)
+})
+
+test('MED-4 on the wire: the Xero bill carries the split lines\' LineAmount and TaxAmount; a line without them carries neither', async () => {
+  const { buildPurchaseBillPayload } = await import('@/lib/connectors/xero/bills')
+  const payload = buildPurchaseBillPayload({
+    invoiceNumber: 'B-1', contactName: 'S', date: '2026-11-22', currency: 'GBP',
+    lines: [
+      { description: 'Goods', quantity: 2, unitAmount: 1, accountCode: '631', taxType: 'INPUT2', lineAmount: 2, taxAmount: 0.4 },
+      { description: 'PPV', quantity: 1, unitAmount: 0.01, accountCode: '5050', taxType: 'INPUT2', lineAmount: 0.01, taxAmount: 0 },
+      { description: 'Plain', quantity: 1, unitAmount: 5, accountCode: '631', taxType: 'INPUT2' },
+    ],
+  } as never, 'AUTHORISED', 'c1', 'GBP') as { LineItems: Array<Record<string, unknown>> }
+  assert.deepEqual([payload.LineItems[0]!.LineAmount, payload.LineItems[0]!.TaxAmount], [2, 0.4])
+  assert.deepEqual([payload.LineItems[1]!.LineAmount, payload.LineItems[1]!.TaxAmount], [0.01, 0])
+  assert.equal('LineAmount' in payload.LineItems[2]!, false)
+  assert.equal('TaxAmount' in payload.LineItems[2]!, false)
+})

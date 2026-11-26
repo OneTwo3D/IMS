@@ -111,6 +111,9 @@ export type PurchaseInvoiceAccountingLine = {
   unitAmount: number
   accountCode: string
   taxType?: string
+  /** PPV split only: the exact 2dp LineAmount and TaxAmount the ledger is sent (so the two parts total the supplier's line, tax included). */
+  lineAmount?: number
+  taxAmount?: number
   /** Why this line may carry NONE (lib/domain/accounting/purchase-document-tax-types.ts); never sent to the ledger. */
   noTaxKind?: PurchaseNoTaxLineKind
   /** The rate `taxType` was read from; never sent (the enqueue guard binds the code to it, lib/tax/retired-tax-code-guard.ts). */
@@ -357,15 +360,16 @@ export function calculatePurchaseInvoice(params: {
       const stockUnitInput = params.ppvSplit?.stockUnitForeignByPoLine.get(line.poLineId)
       if (params.ppvSplit && stockUnitInput === undefined) throw new Error(`No PO goods unit cost for ${poLine.product.sku} to split the bill line at`)
       const stockUnitForeign = stockUnitInput === undefined ? null : roundQuantity(stockUnitInput, 4)
-      const stockForeign = stockUnitForeign ? roundQuantity(multiplyMoney(line.qtyBilled, stockUnitForeign), 4) : null
-      const ppvForeign = stockForeign ? toDecimal(totalForeign).sub(stockForeign) : null
-      if (stockForeign && ppvForeign) {
-        taxForeignSum = addMoney(taxForeignSum, roundMoney(multiplyMoney(stockForeign, lineRate), currency))
-        if (!ppvForeign.isZero()) taxForeignSum = addMoney(taxForeignSum, roundMoney(multiplyMoney(ppvForeign, lineRate), currency))
+      // The line's tax is the line's tax, split or not (MED-4): the stock part and the PPV part are sent with exact 2dp amounts and tax that add up to
+      // the supplier's single line (amount rounded to the currency, tax on the line), so the Xero bill total and VAT equal the supplier's.
+      const lineTax = roundMoney(multiplyMoney(totalForeign, lineRate), currency)
+      taxForeignSum = addMoney(taxForeignSum, lineTax)
+      const stockForeign = stockUnitForeign ? roundMoney(multiplyMoney(line.qtyBilled, stockUnitForeign), currency) : null
+      const ppvForeign = stockForeign ? roundMoney(totalForeign, currency).sub(stockForeign) : null
+      const stockTax = stockForeign ? roundMoney(multiplyMoney(stockForeign, lineRate), currency) : null
+      if (stockForeign) {
         const stockBase = roundQuantity(stockForeign.div(params.fxRateToBase), 4)
         ppvBaseSum = ppvBaseSum.add(toDecimal(totalBase).sub(stockBase))
-      } else {
-        taxForeignSum = addMoney(taxForeignSum, roundMoney(multiplyMoney(totalForeign, lineRate), currency))
       }
 
       lineData.push({
@@ -406,20 +410,27 @@ export function calculatePurchaseInvoice(params: {
           : recorded?.code ? rateBinding(recorded.code.taxRateId, 'plain')
           : poLine.taxRate?.id ? rateBinding(poLine.taxRate.id, 'purchase_line') : rateBinding(params.fallbackTaxRateId, 'plain')),
       }
+      const hasPpvLine = Boolean(params.ppvSplit && ppvForeign && !ppvForeign.isZero())
+      // Reverse charge: the ledger works the self-assessed tax out itself; no amount is imposed.
+      const sendsTax = stockTax !== null && !productReverseCharge
       accountingLines.push({
         description: `PO ${params.poReference} line`,
         quantity: line.qtyBilled,
         unitAmount: stockUnitForeign ? stockUnitForeign.toNumber() : rounded4(line.unitCostForeign),
         accountCode: params.transitAccount,
         ...taxFields,
+        ...(stockForeign ? { lineAmount: stockForeign.toNumber() } : {}),
+        ...(sendsTax ? { taxAmount: (hasPpvLine ? stockTax! : lineTax).toNumber() } : {}),
       })
-      if (params.ppvSplit && ppvForeign && !ppvForeign.isZero()) {
+      if (params.ppvSplit && hasPpvLine && ppvForeign) {
         accountingLines.push({
           description: `PO ${params.poReference} ${poLine.product.sku}: price difference to the order`,
           quantity: 1,
-          unitAmount: rounded4(ppvForeign),
+          unitAmount: ppvForeign.toNumber(),
           accountCode: params.ppvSplit.ppvAccount,
           ...taxFields,
+          lineAmount: ppvForeign.toNumber(),
+          ...(sendsTax ? { taxAmount: lineTax.sub(stockTax!).toNumber() } : {}),
         })
       }
       continue

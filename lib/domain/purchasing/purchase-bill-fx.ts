@@ -3,9 +3,9 @@ import { resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { businessDateYmd } from '@/lib/business-date'
 import { endOfBusinessDateUtc, getFxRateToBase, isMissingFxRateError } from '@/lib/currencies/fx-lookup'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
-import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
+import { roundMoney, roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import {
-  GRIR_FX_VARIANCE_SOURCE_TYPE, GRIR_PRICE_VARIANCE_SOURCE_TYPE, writeGrirMovement, type GrirSourceType,
+  GRIR_FX_VARIANCE_SOURCE_TYPE, GRIR_PRICE_VARIANCE_SOURCE_TYPE, loadGrirPoValuation, writeGrirMovement, type GrirSourceType,
 } from '@/lib/domain/accounting/grir-subledger-movement'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
@@ -157,7 +157,10 @@ export type ReceiptLot = { qty: Decimal; valueBase: Decimal }
 
 export type BillForMatching = {
   invoiceId: string
-  /** A bill valued under the switch; an unmanaged bill only takes its receipts first. */
+  /**
+   * A bill valued under the switch. A bill valued at the PO rate (before the switch) takes its receipts first too, and gets a target only when
+   * `poGoodsUnitBaseByLine` is given (HIGH-2): its stock is valued at the PO goods unit cost it debited transit with.
+   */
   managed: boolean
   /** Managed only: the bill's exact rate. */
   rateToBase: Decimal | null
@@ -175,6 +178,8 @@ export type BillLineFxTarget = {
   /** stockBase - accruedBase (positive = the bill costs more in base than the goods were received at). */
   fxVarianceBase: Decimal
   ppvBase: Decimal
+  /** False for a PO-rate bill (valued before the switch): only its FX difference is this writer's; its BILL and PPV rows are the standard writer's. */
+  managed: boolean
 }
 
 /**
@@ -182,7 +187,12 @@ export type BillLineFxTarget = {
  * A matched quantity is accrued at the receipt's own value (per receipt: mixed rates on one order are valued receipt by receipt); a quantity no
  * receipt covers yet is accrued at the bill's stock value and so carries no difference until its receipt arrives.
  */
-export function matchBillsToReceipts(lotsByLine: ReadonlyMap<string, ReadonlyArray<ReceiptLot>>, bills: ReadonlyArray<BillForMatching>): BillLineFxTarget[] {
+export function matchBillsToReceipts(
+  lotsByLine: ReadonlyMap<string, ReadonlyArray<ReceiptLot>>,
+  bills: ReadonlyArray<BillForMatching>,
+  /** HIGH-2: the PO goods unit cost per line (base, 6dp), to value the PO-rate bills; absent = they get no target. */
+  poGoodsUnitBaseByLine?: ReadonlyMap<string, Decimal>,
+): BillLineFxTarget[] {
   const remaining = new Map<string, Array<{ qty: Decimal; valueBase: Decimal }>>()
   for (const [lineId, lots] of lotsByLine) remaining.set(lineId, lots.filter((lot) => lot.qty.gt(0)).map((lot) => ({ qty: lot.qty, valueBase: lot.valueBase })))
   const out: BillLineFxTarget[] = []
@@ -215,11 +225,22 @@ export function matchBillsToReceipts(lotsByLine: ReadonlyMap<string, ReadonlyArr
           lot.valueBase = lot.valueBase.sub(value)
         }
       }
-      if (!bill.managed || !bill.rateToBase) continue
-      const stockBase = roundQuantity(line.stockForeign.div(bill.rateToBase), 6)
       const unmatched = line.qty.sub(matchedQty)
-      const accruedBase = roundQuantity(matchedValue.add(stockBase.mul(unmatched).div(line.qty)), 6)
-      out.push({ invoiceId: bill.invoiceId, poLineId, qty: line.qty, accruedBase, stockBase, fxVarianceBase: stockBase.sub(accruedBase), ppvBase: roundQuantity(line.ppvBase, 6) })
+      if (bill.managed && bill.rateToBase) {
+        const stockBase = roundQuantity(line.stockForeign.div(bill.rateToBase), 6)
+        const accruedBase = roundQuantity(matchedValue.add(stockBase.mul(unmatched).div(line.qty)), 6)
+        out.push({ invoiceId: bill.invoiceId, poLineId, qty: line.qty, accruedBase, stockBase, fxVarianceBase: stockBase.sub(accruedBase), ppvBase: roundQuantity(line.ppvBase, 6), managed: true })
+        continue
+      }
+      const poUnit = poGoodsUnitBaseByLine?.get(poLineId)
+      if (!poUnit) continue
+      // A PO-rate bill debited GR/IR (and transit) at the PO goods value; a receipt valued under the switch credited its own value. Receipts valued at
+      // the PO rate leave no difference, so the dust of the proportional split is dropped below 0.0001.
+      const stockBase = roundQuantity(line.qty.mul(poUnit), 6)
+      const accruedBase = roundQuantity(matchedValue.add(poUnit.mul(unmatched)), 6)
+      let fxVarianceBase = stockBase.sub(accruedBase)
+      if (fxVarianceBase.abs().lt('0.0001')) fxVarianceBase = new Prisma.Decimal(0)
+      out.push({ invoiceId: bill.invoiceId, poLineId, qty: line.qty, accruedBase: stockBase.sub(fxVarianceBase), stockBase, fxVarianceBase, ppvBase: new Prisma.Decimal(0), managed: false })
     }
   }
   return out
@@ -283,10 +304,9 @@ export async function reconcilePurchaseBillFx(
     lotsByLine.set(row.poLineId, lots)
   }
   const managed = new Map(bills.filter((bill) => bill.fxRateSource && bill.fxEventRateToBase).map((bill) => [bill.id, bill]))
-  const anyHistory = managed.size > 0
-    || (await tx.grirSubledgerMovement.count({ where: { poId: params.poId, idempotencyKey: { startsWith: GRIR_KEY_PREFIX } } })) > 0
-    || (await tx.transitSubledgerMovement.count({ where: { sourceType: 'PURCHASE_FX_VARIANCE', sourceRef: params.poId } })) > 0
-  if (!anyHistory) return NO_BILL_FX_RECONCILE
+  const billById = new Map(bills.map((bill) => [bill.id, bill]))
+  // HIGH-2: bills valued at the PO rate (before the switch) are valued at the PO goods unit cost, the figure they debited GR/IR and transit with.
+  const poGoods = (await loadGrirPoValuation(tx, params.poId)).goodsUnitCostByLine
   const targets = matchBillsToReceipts(lotsByLine, bills.map((bill) => {
     const rate = bill.fxEventRateToBase ? toDecimal(bill.fxEventRateToBase) : null
     return {
@@ -296,12 +316,12 @@ export async function reconcilePurchaseBillFx(
       lines: bill.lines.flatMap((line) => {
         if (!line.poLineId) return []
         const qty = toDecimal(line.qtyBilled)
-        const stockForeign = line.stockUnitForeign !== null ? roundQuantity(qty.mul(toDecimal(line.stockUnitForeign)), 4) : toDecimal(line.totalForeign)
+        const stockForeign = line.stockUnitForeign !== null ? roundMoney(qty.mul(toDecimal(line.stockUnitForeign)), po.currency) : toDecimal(line.totalForeign)
         const stockBase4 = rate ? roundQuantity(stockForeign.div(rate), 4) : toDecimal(line.totalBase)
         return [{ poLineId: line.poLineId, qty, stockForeign, ppvBase: toDecimal(line.totalBase).sub(stockBase4) }]
       }),
     }
-  }))
+  }), poGoods)
 
   // ── GR/IR: target rows per (bill, line), against what is recorded under this writer's keys (a deleted bill's rows go back to zero). ──
   const recorded = await tx.grirSubledgerMovement.findMany({
@@ -325,10 +345,20 @@ export async function reconcilePurchaseBillFx(
   }
   const wanted = new Map<string, { invoiceId: string; poLineId: string; balQty: Decimal; balBase: Decimal; fx: Decimal; ppv: Decimal; journalDate: Date }>()
   for (const target of targets) {
-    const bill = managed.get(target.invoiceId)!
+    const bill = billById.get(target.invoiceId)!
+    if (target.managed) {
+      wanted.set(keyOf(target.invoiceId, target.poLineId), {
+        invoiceId: target.invoiceId, poLineId: target.poLineId,
+        balQty: target.qty.neg(), balBase: target.accruedBase.neg(), fx: target.fxVarianceBase, ppv: target.ppvBase, journalDate: bill.invoiceDate,
+      })
+      continue
+    }
+    // HIGH-2: a PO-rate bill keeps its standard BILL and PPV rows (the PO goods value); this writer only moves its GR/IR debit from that value to the
+    // value the receipts credited (a BILL_UPDATE of base only) and records the FX difference, dated on the event that revealed it.
+    if (target.fxVarianceBase.isZero() && !current.has(keyOf(target.invoiceId, target.poLineId))) continue
     wanted.set(keyOf(target.invoiceId, target.poLineId), {
       invoiceId: target.invoiceId, poLineId: target.poLineId,
-      balQty: target.qty.neg(), balBase: target.accruedBase.neg(), fx: target.fxVarianceBase, ppv: target.ppvBase, journalDate: bill.invoiceDate,
+      balQty: zero(), balBase: target.fxVarianceBase, fx: target.fxVarianceBase, ppv: zero(), journalDate: params.at,
     })
   }
   // A bill that is gone (deleted, or voided in Xero) or no longer bills the line: its rows go back to zero.
@@ -349,7 +379,8 @@ export async function reconcilePurchaseBillFx(
     }
     const balQtyDelta = roundQuantity(want.balQty.sub(have.balQty), 6)
     const balBaseDelta = roundQuantity(want.balBase.sub(have.balBase), 6)
-    if (!balQtyDelta.isZero() || !balBaseDelta.isZero()) await write(have.rows === 0 ? 'BILL' : 'BILL_UPDATE', 'bal', balQtyDelta, balBaseDelta)
+    const firstRowOfManagedBill = have.rows === 0 && managed.has(want.invoiceId)
+    if (!balQtyDelta.isZero() || !balBaseDelta.isZero()) await write(firstRowOfManagedBill ? 'BILL' : 'BILL_UPDATE', 'bal', balQtyDelta.isZero() && !firstRowOfManagedBill ? null : balQtyDelta, balBaseDelta)
     await write(GRIR_FX_VARIANCE_SOURCE_TYPE, 'fx', null, want.fx.sub(have.fx))
     await write(GRIR_PRICE_VARIANCE_SOURCE_TYPE, 'ppv', null, want.ppv.sub(have.ppv))
   }
@@ -381,11 +412,18 @@ export async function reconcilePurchaseBillFx(
     entry.rows += 1
     postedByBill.set(invoiceId, entry)
   }
-  const billIds = new Set([...managed.keys(), ...postedByBill.keys()])
+  // MED-1: only a bill whose OWN posting was queued (its PURCHASE_BILL transit row exists, keyed `purchase-invoice:<bill>:...`) can leave a difference
+  // in the ledger's transit account. A bill posted by hand, declined, or recorded with bill sync off has nothing in transit to clear: its target is 0.
+  const billTransitKeys = (await tx.transitSubledgerMovement.findMany({
+    where: { sourceType: 'PURCHASE_BILL', sourceRef: params.poId }, select: { idempotencyKey: true },
+  })).map((row) => row.idempotencyKey)
+  const billPosted = (invoiceId: string): boolean => billTransitKeys.some((key) => key.startsWith(`purchase-invoice:${invoiceId}:`))
+  const billIds = new Set([...fxByBill.keys(), ...postedByBill.keys()])
   const result: PurchaseBillFxReconcileResult = { journals: [], notQueued: [] }
   let accounts: { transit: string; realisedFx: string } | null = null
   for (const invoiceId of billIds) {
-    const targetTransit = roundQuantity((fxByBill.get(invoiceId) ?? zero()).neg(), 2)
+    const owed = billById.has(invoiceId) && billPosted(invoiceId)
+    const targetTransit = owed ? roundQuantity((fxByBill.get(invoiceId) ?? zero()).neg(), 2) : zero()
     const posted = postedByBill.get(invoiceId) ?? { sum: zero(), rows: 0 }
     const delta = roundQuantity(targetTransit.sub(posted.sum), 2)
     if (delta.isZero()) continue
@@ -404,7 +442,7 @@ export async function reconcilePurchaseBillFx(
       }
       accounts = { transit: receiptAccounts.transitAccount, realisedFx: realised }
     }
-    const bill = managed.get(invoiceId)
+    const bill = billById.get(invoiceId)
     const amount = delta.abs().toNumber()
     const label = bill ? `bill ${bill.invoiceNumber ?? bill.id}` : `deleted bill ${invoiceId}`
     const description = `Exchange-rate difference: ${po.reference} ${label}`
@@ -450,9 +488,81 @@ export async function reportPurchaseFxVarianceNotQueued(poId: string, poReferenc
       kind: 'purchase_fx_variance',
       posting: `the exchange-rate difference journal for PO ${poReference} (bill ${entry.invoiceId})`,
       committed: 'the bill and the receipts are recorded in IMS',
-      remedy: 'Stock in Transit still holds the exchange-rate difference between the receipts and the bill. Post the journal (Realised FX against Stock in Transit) by hand.',
+      // HIGH-1: never by hand. The reconciliation works from target state, so the next run queues what is still owed; a journal posted by hand as
+      // well would be booked twice.
+      remedy: 'Stock in Transit still holds the exchange-rate difference between the receipts and the bill. Leave the ledger as it is (a copy keyed in by hand would be booked twice): '
+        + `once the cause is fixed, run \`npm run purchase-fx:reconcile -- --po ${poId} --apply\`, which queues only what is still owed (the next bill `
+        + 'edit or receipt of the order does the same), then mark this row handled.',
       outcome: entry.outcome,
       metadata: { reference: poReference, invoiceId: entry.invoiceId, chartConnector: 'xero' },
     })
   }
+}
+
+// ─── THE SUPPORTED RE-RUN AND THE TURN-ON CHECK (HIGH-1, HIGH-2) ─────────────────────────────────────────────────────────────────────────
+
+/**
+ * The foreign orders this writer may owe something for: a bill valued under the switch, a receipt or layer valued under it, or a row it wrote.
+ * Read-only.
+ */
+export async function purchaseFxOrdersToReconcile(client: Pick<Prisma.TransactionClient, 'purchaseInvoice' | 'purchaseReceipt' | 'costLayer' | 'grirSubledgerMovement' | 'transitSubledgerMovement'>): Promise<string[]> {
+  const ids = new Set<string>()
+  for (const row of await client.purchaseInvoice.findMany({ where: { fxRateSource: { not: null } }, select: { poId: true } })) ids.add(row.poId)
+  for (const row of await client.purchaseReceipt.findMany({ where: { fxRateSource: { not: null } }, select: { poId: true } })) ids.add(row.poId)
+  for (const row of await client.costLayer.findMany({ where: { fxRateSource: { not: null }, poLineId: { not: null } }, select: { poLine: { select: { poId: true } } } })) {
+    if (row.poLine) ids.add(row.poLine.poId)
+  }
+  for (const row of await client.grirSubledgerMovement.findMany({ where: { idempotencyKey: { startsWith: GRIR_KEY_PREFIX } }, select: { poId: true }, distinct: ['poId'] })) ids.add(row.poId)
+  for (const row of await client.transitSubledgerMovement.findMany({ where: { sourceType: 'PURCHASE_FX_VARIANCE' }, select: { sourceRef: true }, distinct: ['sourceRef'] })) ids.add(row.sourceRef)
+  return [...ids].sort()
+}
+
+/**
+ * HIGH-1, THE SUPPORTED RE-RUN: bring one order's bills to their target state now, under its purchase_orders row lock, exactly as the next bill edit
+ * or receipt would. Idempotent: an order that owes nothing writes nothing. What the queue declines is reported (and stays owed for the next run).
+ */
+export async function rerunPurchaseBillFx(poId: string, options: { at?: Date } = {}): Promise<PurchaseBillFxReconcileResult> {
+  const { db } = await import('@/lib/db')
+  const { getAccountingSettings } = await import('@/lib/accounting')
+  const settings = await getAccountingSettings()
+  const po = await db.purchaseOrder.findUnique({ where: { id: poId }, select: { reference: true } })
+  if (!po) throw new Error(`Purchase order ${poId} not found`)
+  const result = await db.$transaction(async (tx) => {
+    await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
+    return reconcilePurchaseBillFx(tx, { poId, connector: settings.connector, syncEnabled: settings.syncEnabled, at: options.at ?? new Date() })
+  }, { timeout: 60_000, maxWait: 10_000 })
+  await reportPurchaseFxVarianceNotQueued(poId, po.reference, result)
+  return result
+}
+
+export type PurchaseFxInFlightOrder = { poId: string; reference: string; currency: string; status: string; lines: Array<{ poLineId: string; billedQty: string; receivedQty: string }> }
+
+/**
+ * HIGH-2, THE TURN-ON CHECK: foreign orders with a bill valued at the PO rate for goods not received yet. Their later receipts are valued under the
+ * switch, so each leaves an exchange-rate difference that this writer clears per receipt; the list is what the owner reviews before turning it on.
+ * Read-only.
+ */
+export async function listPurchaseFxInFlightOrders(client: Pick<Prisma.TransactionClient, 'purchaseOrder' | 'organisation' | 'grirSubledgerMovement'>): Promise<PurchaseFxInFlightOrder[]> {
+  const baseCurrency = (await resolveBaseCurrencyCode({ organisation: client.organisation })).toUpperCase()
+  const orders = await client.purchaseOrder.findMany({
+    where: { status: { not: 'CANCELLED' }, NOT: { currency: baseCurrency }, invoices: { some: { fxRateSource: null } } },
+    orderBy: { reference: 'asc' },
+    select: { id: true, reference: true, currency: true, status: true, invoices: { where: { fxRateSource: null }, select: { lines: { select: { poLineId: true, qtyBilled: true } } } } },
+  })
+  const out: PurchaseFxInFlightOrder[] = []
+  for (const order of orders) {
+    if (order.currency.trim().toUpperCase() === baseCurrency) continue
+    const billed = new Map<string, Decimal>()
+    for (const invoice of order.invoices) for (const line of invoice.lines) {
+      if (line.poLineId) billed.set(line.poLineId, (billed.get(line.poLineId) ?? zero()).add(toDecimal(line.qtyBilled)))
+    }
+    const received = new Map<string, Decimal>()
+    for (const row of await client.grirSubledgerMovement.groupBy({ by: ['poLineId'], where: { poId: order.id, sourceType: 'RECEIPT' }, _sum: { qtyDelta: true } })) {
+      if (row.poLineId) received.set(row.poLineId, toDecimal(row._sum.qtyDelta ?? 0))
+    }
+    const lines = [...billed].filter(([lineId, qty]) => qty.gt(received.get(lineId) ?? 0))
+      .map(([poLineId, qty]) => ({ poLineId, billedQty: qty.toString(), receivedQty: (received.get(poLineId) ?? zero()).toString() }))
+    if (lines.length > 0) out.push({ poId: order.id, reference: order.reference, currency: order.currency, status: order.status, lines })
+  }
+  return out
 }
