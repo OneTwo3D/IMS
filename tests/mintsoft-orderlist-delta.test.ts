@@ -24,7 +24,7 @@ import {
 } from '../lib/connectors/mintsoft/settings/schema.ts'
 
 /**
- * wms-neutral-refactor round 2 (Codex HIGH 2): the cursor rows are now DERIVED FROM THE CONNECTOR ID,
+ * o3d-remove-shiphero round 2 (Codex HIGH 2): the cursor rows are now DERIVED FROM THE CONNECTOR ID,
  * so every call below names the connector whose cursors it is talking about. For `mintsoft` these
  * are byte-for-byte the three keys that already exist in every deployment, which is why the
  * literal key names in the fixtures below are unchanged.
@@ -114,7 +114,7 @@ test('[o3d-bjc #3] isMintsoftDispatchClientScoped: a positive integer ClientId i
   // Mintsoft, configured → scoped → the sweep runs.
   assert.equal(isMintsoftDispatchClientScoped('1234'), true)
   assert.equal(isMintsoftDispatchClientScoped(' 1234 '), true)
-  // wms-neutral-refactor round 2 (Codex HIGH 2): the "a different WMS is always scoped" assertions
+  // o3d-remove-shiphero round 2 (Codex HIGH 2): the "a different WMS is always scoped" assertions
   // that used to sit here were of a GENERIC function whose first line was `if (connectorId !==
   // 'mintsoft') return true` — i.e. they proved that a Mintsoft rule exempts non-Mintsoft ids,
   // which is a fact about this function and not about any second connector. The gate is now

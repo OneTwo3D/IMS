@@ -6,7 +6,7 @@ import test, { mock } from 'node:test'
  * SILENTLY BECOME WOOCOMMERCE.
  *
  * `WmsConnection.orderLookupConnector` and `ShoppingOrderLink.connector` are plain `String` columns
- * and archiving a storefront connector shipped NO migration, so both can still say `retired-store`.
+ * and archiving the Shopify connector shipped NO migration, so both can still say `shopify`.
  * Narrowing `isShoppingConnectorId` to WooCommerce did not remove those values — it made them
  * unrecognised, and the resolver then treated unrecognised exactly like unconfigured and inferred.
  * With a WooCommerce order link present, that inference answered `woocommerce`.
@@ -14,14 +14,14 @@ import test, { mock } from 'node:test'
  * WHAT THAT COSTS, measured at the surface rather than at the predicate: the WMS order-status sweep
  * takes the resolved connector, reads the in-flight orders' order NUMBERS for it, asks the 3PL about
  * those numbers, stores whatever comes back against those orders and pushes the status to that
- * storefront. So a warehouse configured for a retired storefront had its statuses looked up by WooCommerce order
+ * storefront. So a Shopify-configured warehouse had its statuses looked up by WooCommerce order
  * numbers and written onto WooCommerce orders. Where two stores' numbering overlaps — and `INWC-`
  * style prefixes are per-connector settings precisely because they do — one customer's dispatch
  * lands on another customer's order.
  *
  * Both halves are tested here: the explicitly persisted value (Codex's finding) and the INFERENCE
  * (not flagged, same defect) — the observation query used to read `connector IN ('woocommerce',
- * 'retired-store')`, so narrowing the list turned "two candidates, refuse" into "one candidate, WooCommerce".
+ * 'shopify')`, so narrowing the list turned "two candidates, refuse" into "one candidate, WooCommerce".
  */
 
 type LinkRow = { connector: string }
@@ -78,7 +78,7 @@ mock.module('@/lib/db', {
          *
          * With a stub that ignored the filter, re-adding `where: { connector: { in: ['woocommerce'] } }`
          * to the observation query — the exact pre-fix code — left every test below GREEN, because the
-         * stub handed back the retired-store link either way. The test would then have been proof of an
+         * stub handed back the Shopify link either way. The test would then have been proof of an
          * adjacent property: that the CLASSIFICATION of an unsupported observed value is right, given
          * rows that reach it. Whether they reach it is the half the fix is about.
          */
@@ -122,19 +122,19 @@ function reset() {
 // 1. The resolver
 // ---------------------------------------------------------------------------
 
-test('a persisted `retired-store` refuses BY NAME even though WooCommerce links exist', async () => {
+test('a persisted `shopify` refuses BY NAME even though WooCommerce links exist', async () => {
   reset()
-  // The exact production shape: the warehouse is configured for a retired storefront, and the database also
+  // The exact production shape: the warehouse is configured for Shopify, and the database also
   // holds WooCommerce links — which is what made the old fallback look plausible.
   linkRows = [{ connector: 'woocommerce' }]
   const { resolveShoppingOrderLookupConnector, shoppingOrderLookupSkipReason } =
     await import('@/lib/fulfillment/shopping-order-lookup')
 
-  const resolution = await resolveShoppingOrderLookupConnector('retired-store')
+  const resolution = await resolveShoppingOrderLookupConnector('shopify')
 
-  assert.deepEqual(resolution, { kind: 'unsupported', connectors: ['retired-store'], from: 'connection' })
+  assert.deepEqual(resolution, { kind: 'unsupported', connectors: ['shopify'], from: 'connection' })
   const reason = resolution.kind === 'one' ? '<resolved>' : shoppingOrderLookupSkipReason(resolution)
-  assert.match(reason, /retired-store/, 'the refusal must NAME the value that caused it')
+  assert.match(reason, /shopify/, 'the refusal must NAME the value that caused it')
   assert.match(reason, /does not ship/)
   assert.ok(
     !reason.includes('No order-lookup connector resolved'),
@@ -147,7 +147,7 @@ test('the inference fallback is NOT consulted once a connector is persisted', as
   linkRows = [{ connector: 'woocommerce' }]
   const { resolveShoppingOrderLookupConnector } = await import('@/lib/fulfillment/shopping-order-lookup')
 
-  await resolveShoppingOrderLookupConnector('retired-store')
+  await resolveShoppingOrderLookupConnector('shopify')
 
   assert.deepEqual(
     dbCalls,
@@ -163,7 +163,7 @@ test('the null-returning convenience wrapper fails CLOSED for a retired value', 
   const { inferShoppingOrderLookupConnector } = await import('@/lib/fulfillment/shopping-order-lookup')
 
   assert.equal(
-    await inferShoppingOrderLookupConnector('retired-store'),
+    await inferShoppingOrderLookupConnector('shopify'),
     null,
     'this returned `woocommerce` before the fix — the whole finding in one call',
   )
@@ -198,16 +198,16 @@ test('order links naming a RETIRED connector make the inference refuse, not narr
   // THE SECOND HALF, which Codex did not flag. Before the fix the observation query filtered
   // `connector IN ('woocommerce')`, so this installation — two stores' links, nothing configured —
   // saw exactly one candidate and answered WooCommerce. Pre-removal it saw two and refused.
-  linkRows = [{ connector: 'woocommerce' }, { connector: 'retired-store' }]
+  linkRows = [{ connector: 'woocommerce' }, { connector: 'shopify' }]
   const { resolveShoppingOrderLookupConnector, shoppingOrderLookupSkipReason } =
     await import('@/lib/fulfillment/shopping-order-lookup')
 
   const resolution = await resolveShoppingOrderLookupConnector(null)
 
-  assert.deepEqual(resolution, { kind: 'unsupported', connectors: ['retired-store'], from: 'order-links' })
+  assert.deepEqual(resolution, { kind: 'unsupported', connectors: ['shopify'], from: 'order-links' })
   assert.match(
     resolution.kind === 'one' ? '<resolved>' : shoppingOrderLookupSkipReason(resolution),
-    /retired-store/,
+    /shopify/,
   )
   assert.deepEqual(
     shoppingLinkFilters,
@@ -219,11 +219,11 @@ test('order links naming a RETIRED connector make the inference refuse, not narr
 
 test('links naming ONLY a retired connector refuse too — an archived store is not "no store"', async () => {
   reset()
-  linkRows = [{ connector: 'retired-store' }]
+  linkRows = [{ connector: 'shopify' }]
   const { resolveShoppingOrderLookupConnector } = await import('@/lib/fulfillment/shopping-order-lookup')
   assert.deepEqual(
     await resolveShoppingOrderLookupConnector(null),
-    { kind: 'unsupported', connectors: ['retired-store'], from: 'order-links' },
+    { kind: 'unsupported', connectors: ['shopify'], from: 'order-links' },
   )
 })
 
@@ -256,9 +256,9 @@ test('no links, one enabled shopping plugin: still resolved from the plugin stat
 // 2. THE SURFACE THE FINDING IS ABOUT — the WMS order-status sweep
 // ---------------------------------------------------------------------------
 
-test('the WMS order-status sweep queries NOTHING for a warehouse configured for a retired storefront, and names why', async () => {
+test('the WMS order-status sweep queries NOTHING for a Shopify-configured warehouse, and names why', async () => {
   reset()
-  connectionRow = { orderLookupConnector: 'retired-store' }
+  connectionRow = { orderLookupConnector: 'shopify' }
   linkRows = [{ connector: 'woocommerce' }]
   const { runWmsOrderStatusSweep } = await import('@/lib/domain/wms/order-status-sweep')
 
@@ -267,7 +267,7 @@ test('the WMS order-status sweep queries NOTHING for a warehouse configured for 
   assert.equal(result.scanned, 0)
   assert.equal(result.updated, 0)
   assert.equal(result.failed, 0)
-  assert.match(String(result.skipped), /retired-store/, 'the skip reason must name the configured value')
+  assert.match(String(result.skipped), /shopify/, 'the skip reason must name the configured value')
   assert.ok(
     !dbCalls.includes('salesOrder.findMany'),
     'BEFORE THE FIX this resolved to woocommerce and ran the order query: '
@@ -276,7 +276,7 @@ test('the WMS order-status sweep queries NOTHING for a warehouse configured for 
   assert.deepEqual(
     fetchOrderStatusCalls,
     [],
-    'and then asked the 3PL about WooCommerce order numbers on a retired-store warehouse\'s behalf',
+    'and then asked the 3PL about WooCommerce order numbers on a Shopify warehouse\'s behalf',
   )
   // The precondition, asserted rather than assumed: the resolver WAS reached through the sweep.
   assert.ok(dbCalls.includes('wmsConnection.findFirst'), 'the sweep must have read the connection row')

@@ -74,7 +74,7 @@ const DISPATCH_DELTA_DEFAULT_OVERLAP_SECONDS = 900
 const DISPATCH_DELTA_DEFAULT_LOOKBACK_SECONDS = 24 * 60 * 60
 const DISPATCH_DELTA_DEFAULT_RECONCILE_INTERVAL_SECONDS = 30 * 60
 /**
- * THERE IS NO DEFAULT DELTA TIMEZONE HERE ANY MORE (wms-neutral-refactor round 4, Codex HIGH 1).
+ * THERE IS NO DEFAULT DELTA TIMEZONE HERE ANY MORE (o3d-remove-shiphero round 4, Codex HIGH 1).
  *
  * `DISPATCH_DELTA_DEFAULT_TIMEZONE = 'Europe/London'` used to sit on this line. It is one
  * warehouse's fact — Mintsoft compares `SinceLastUpdated` against `LastUpdated` in the tenant
@@ -300,7 +300,7 @@ export function isUnresolvedDriftSystemic(unresolvedLinks: number, linksTouched:
  * scope and are always considered scoped.
  */
 /**
- * wms-neutral-refactor round 2 (Codex HIGH 2). This used to be `isDispatchClientScoped(connectorId,
+ * o3d-remove-shiphero round 2 (Codex HIGH 2). This used to be `isDispatchClientScoped(connectorId,
  * clientIdRaw)` right here, and its first line was `if (connectorId !== 'mintsoft') return true` —
  * a Mintsoft precondition wearing a generic signature, reading a Mintsoft setting key, in the
  * generic sweep. It is now `hooks.dispatchPrecondition` on the connector DEFINITION (see
@@ -2859,7 +2859,7 @@ export type WmsDeltaCursorReadTx = WmsDeltaScopeLockTx & {
 /**
  * The two cursor rows, in the order both sides touch them — DERIVED FROM THE CONNECTOR ID.
  *
- * wms-neutral-refactor round 2 (Codex HIGH 2). These were two fixed strings naming ONE warehouse,
+ * o3d-remove-shiphero round 2 (Codex HIGH 2). These were two fixed strings naming ONE warehouse,
  * and every connector that implements `fetchOrderDelta` was wired to them. A second connector
  * therefore started life holding the first one's watermark, which does not fail — it makes the new
  * connector's first sweep skip its entire backlog and report a clean pass.
@@ -3305,7 +3305,7 @@ export function createPrismaDispatchDeps(connectorId: WmsConnectorId, connector:
             // watermark with a new-scope token, which is exactly what makes the CAS at save time
             // wave the stale advance through — see readWmsDeltaCursors.
             //
-            // wms-neutral-refactor round 2 (Codex HIGH 2): BOTH the rows and the lock are THIS
+            // o3d-remove-shiphero round 2 (Codex HIGH 2): BOTH the rows and the lock are THIS
             // CONNECTOR'S. They used to be one warehouse's, for every connector that implemented a
             // bulk delta, so switching connectors handed the new one a watermark it never earned
             // and its backlog was skipped in silence.
@@ -3898,7 +3898,7 @@ export async function runWmsDispatchSweep(
   // flag defaults ON; `<connector>_inbound_delta_enabled === 'false'` turns it off (behaves exactly
   // as pre-delta). The cursor is sent in the connector's tenant timezone.
   //
-  // wms-neutral-refactor round 2 (Codex HIGH 2): both keys used to be Mintsoft's, so a second
+  // o3d-remove-shiphero round 2 (Codex HIGH 2): both keys used to be Mintsoft's, so a second
   // connector inherited Mintsoft's enable flag and Mintsoft's timezone. The timezone is the quieter
   // of the two — the delta cursor is formatted as a wall-clock string in it, so a wrong zone shifts
   // the window by hours and the orders in the gap are never re-read.

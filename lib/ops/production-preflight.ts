@@ -619,6 +619,6 @@ export function formatPreflightResult(result: PreflightResult): string {
   }
   lines.push(result.ok ? 'Production preflight passed.' : 'Production preflight failed.')
   // A newline-joined preflight report. The separator is os.EOL, which the boundary guard cannot fold.
-  // wms-connector-boundary-ok: wms-neutral-refactor: no element can be a connector-id fragment.
+  // wms-connector-boundary-ok: o3d-remove-shiphero: no element can be a connector-id fragment.
   return lines.join(os.EOL)
 }

@@ -1,6 +1,6 @@
 /**
  * ONE VERDICT ON "IS THIS CONNECTION SET UP?", ALL THE WAY TO THE MARKUP
- * (wms-neutral-refactor round 14, Codex HIGH 2).
+ * (o3d-remove-shiphero round 14, Codex HIGH 2).
  *
  * THE DEFECT. Round 12 made `isMintsoftConfigured()` reject an UNPARSEABLE stored base URL: it reads
  * `getMintsoftApiConfiguration().baseUrl`, which is `normalizeMintsoftBaseUrl(stored) ?? ''`, and
@@ -314,7 +314,7 @@ test('[round 14 HIGH 2] the nested `configured` is not merely absent — it is U
     lastAuthAt: null,
     lastStockSyncAt: null,
   }
-  // @ts-expect-error wms-neutral-refactor r14 (Codex HIGH 2): MintsoftConnectionStatus has no
+  // @ts-expect-error o3d-remove-shiphero r14 (Codex HIGH 2): MintsoftConnectionStatus has no
   // `configured`. Putting the field back makes this line compile, and this file then fails to
   // compile because the directive is unused — THAT is the detection.
   assert.equal(status.configured, undefined)

@@ -1,5 +1,5 @@
 /**
- * THE SECOND-CONNECTOR SEAM, DRIVEN THROUGH THE REAL UI (wms-neutral-refactor round 6, Codex HIGH 1).
+ * THE SECOND-CONNECTOR SEAM, DRIVEN THROUGH THE REAL UI (o3d-remove-shiphero round 6, Codex HIGH 1).
  *
  * WHY THIS FILE EXISTS SEPARATELY FROM tests/wms-second-connector-seam-production.test.ts. That
  * file proves the two UI FACADES dispatch to whichever connector is active and hand back a DTO
@@ -176,7 +176,7 @@ test('seam/ui: the /sync panel tells the operator a registered connector has no 
 })
 
 /**
- * THE UI HALF OF THE TEST THAT PINNED THE DEFECT (wms-neutral-refactor round 8, Codex HIGH 1).
+ * THE UI HALF OF THE TEST THAT PINNED THE DEFECT (o3d-remove-shiphero round 8, Codex HIGH 1).
  *
  * WHAT IT ASSERTED, AND WHY THAT WAS WRONG. Until round 8 the second half of this case read
  * `assert.match(visibleText(html), /is not set up yet/i, 'and an unconfigured connector is not
@@ -275,7 +275,7 @@ test('seam/ui: opening a card that is NOT the active connector says why, instead
 
 /**
  * TWO ENABLED CONNECTORS — the state the case above was NAMED for and never reached
- * (wms-neutral-refactor round 12, Codex MEDIUM).
+ * (o3d-remove-shiphero round 12, Codex MEDIUM).
  *
  * With more than one WMS connector enabled the resolver answers `ambiguous`, so the facade returns
  * NO dashboard DTO: there is no connector it could name without guessing. The panel then had only
@@ -316,7 +316,7 @@ test('seam/ui: with TWO WMS connectors enabled the panel says AMBIGUOUS, not "an
 
 /**
  * THE INTEGRATIONS GRID READS `available` FROM THE REGISTRY, NOT FROM ITSELF
- * (wms-neutral-refactor round 12, Codex HIGH 2).
+ * (o3d-remove-shiphero round 12, Codex HIGH 2).
  *
  * The WMS cards are derived from the panel record (round 6), and the derivation wrote
  * `available: true` into every one of them — a second source for a fact the connector's own
@@ -454,7 +454,7 @@ function pluginStateWithAcme(enabled: boolean): IntegrationPluginState {
 }
 
 /**
- * ONE LAYER OUT AGAIN (wms-neutral-refactor round 8, Codex HIGH 1).
+ * ONE LAYER OUT AGAIN (o3d-remove-shiphero round 8, Codex HIGH 1).
  *
  * The re-audit asked what READS `WmsOnboardingConnectionData.configured`. The wizard's step does —
  * it seeds `wmsConnected` from it and gates Continue on `wmsEnabled ? wmsConnected : true`. So the
@@ -555,9 +555,9 @@ test('seam/ui: the panel and form registries are TOTAL over the connector id uni
   //     exactly that mistake, and a mutation that widened the record stayed green. Indexing with an
   //     id the union does not contain must be a TYPE ERROR; if it ever compiles, the record has
   //     stopped being a statement about which connectors exist.
-  // @ts-expect-error wms-neutral-refactor r6 (Codex HIGH 1): `acme-wms` is not a registered id, so
+  // @ts-expect-error o3d-remove-shiphero r6 (Codex HIGH 1): `acme-wms` is not a registered id, so
   // it is not indexable. Widening WMS_PANELS to `Record<string, …>` makes this line legal.
   assert.equal(panelModule.WMS_PANELS['acme-wms'], undefined)
-  // @ts-expect-error wms-neutral-refactor r6 (Codex HIGH 1): the same, for the onboarding forms.
+  // @ts-expect-error o3d-remove-shiphero r6 (Codex HIGH 1): the same, for the onboarding forms.
   assert.equal(formModule.WMS_CONNECTION_FORMS['acme-wms'], undefined)
 })

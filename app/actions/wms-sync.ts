@@ -9,7 +9,7 @@ import { type WmsConnectorId } from '@/lib/connectors/wms/types'
 /**
  * Connector-agnostic /sync WMS panel data.
  *
- * wms-neutral-refactor round 4 (Codex HIGH 2) — WHY THIS IS NOT AN `id === 'mintsoft'` CHECK.
+ * o3d-remove-shiphero round 4 (Codex HIGH 2) — WHY THIS IS NOT AN `id === 'mintsoft'` CHECK.
  * This facade used to dispatch only when the active connector was literally one id, and fall
  * through to `return null` otherwise. `null` is the SAME answer the facade gives when no WMS
  * connector is enabled at all, so a second enabled, registered, fully configured connector showed
@@ -21,7 +21,7 @@ import { type WmsConnectorId } from '@/lib/connectors/wms/types'
  * does not is reported as resolved-but-panel-less rather than as absent, because those call for
  * different things from an operator (enable a WMS / administer this one elsewhere).
  *
- * wms-neutral-refactor round 8 (Codex HIGH 1) — AND CAPABILITY IS NOT STATE. Round 6's no-hook arm
+ * o3d-remove-shiphero round 8 (Codex HIGH 1) — AND CAPABILITY IS NOT STATE. Round 6's no-hook arm
  * answered `configured: false`, which is a claim about the CONNECTION, from a branch that had only
  * established something about the BUILD. `configured` is now read from `isConfigured()` — the one
  * mandatory method on the connector contract — on every path, before the hook is even looked up.
@@ -42,7 +42,7 @@ import { type WmsConnectorId } from '@/lib/connectors/wms/types'
 export type WmsSyncDashboardData = {
   connectorId: WmsConnectorId
   /**
-   * The active connector's registered display name (wms-neutral-refactor round 6, Codex HIGH 1).
+   * The active connector's registered display name (o3d-remove-shiphero round 6, Codex HIGH 1).
    *
    * Carried in the DTO, as the onboarding envelope already carries it, because the /sync panel is
    * a CLIENT component and cannot read the registry: without this it had nothing but the raw id to
@@ -54,7 +54,7 @@ export type WmsSyncDashboardData = {
   connectorLabel: string
   /**
    * Whether the ACTIVE CONNECTOR'S CONNECTION is set up — a fact about STATE, read from the one
-   * mandatory statement a connector makes about itself (wms-neutral-refactor round 8, Codex HIGH 1).
+   * mandatory statement a connector makes about itself (o3d-remove-shiphero round 8, Codex HIGH 1).
    *
    * It is NOT a fact about capability, and round 6 shipped it conflated with one: the no-hook arm
    * below answered `configured: false` for a connector that simply declares no dashboard, so a

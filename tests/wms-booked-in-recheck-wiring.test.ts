@@ -3,7 +3,7 @@
  *
  * WHAT WAS UNCOVERED. `lib/domain/wms/post-maintenance-recheck.ts` used to read
  * `if (connectorId !== 'mintsoft') return null` and then call
- * `enqueueMintsoftBookedInRecheckForAsn` by name. wms-neutral-refactor replaced both with
+ * `enqueueMintsoftBookedInRecheckForAsn` by name. o3d-remove-shiphero replaced both with
  * `hooks.bookedInRecheck` on the connector's registry entry — correctly — and nothing tested the
  * replacement. `runPostMaintenanceRecheckForActiveConnector` had exactly two references in the repo:
  * its own definition, and its one production caller (app/actions/sync-exceptions.ts). The test file

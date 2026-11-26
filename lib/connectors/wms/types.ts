@@ -6,7 +6,7 @@
  * IntegrationPluginId + setting key, and per-connector cron/webhook ingress)
  * when a new WMS connector lands; core sales/PO/transfer/stock flows need no edits.
  *
- * ONE ENTRY TODAY. A second WMS was removed (wms-neutral-refactor); Mintsoft is the
+ * ONE ENTRY TODAY. ShipHero was removed (o3d-remove-shiphero); Mintsoft is the
  * only shipped WMS. A one-element tuple reads like a constant begging to be
  * inlined — it is not. Everything downstream (the registry, the create-replay
  * policy table, the plugin-enabled resolution order) derives from this list, and
@@ -53,8 +53,8 @@ export type WmsCreateReplayPolicy =
    * A create whose outcome is unknown is therefore NEVER re-dispatched automatically on such a
    * connector. The park is the outcome, and the resolution is a person who can look at the WMS.
    *
-   * NO SHIPPED CONNECTOR TAKES THIS VALUE TODAY. A removed push-primary WMS did (its order-create call did not enforce
-   * a client-supplied order reference's uniqueness). The value stays because it is a real property
+   * NO SHIPPED CONNECTOR TAKES THIS VALUE TODAY. ShipHero did (its `order_create` does not enforce
+   * `partner_order_id` uniqueness) and was removed. The value stays because it is a real property
    * of real 3PL APIs and because every refusal path in the push sweep, the held-release rule and
    * the exception inbox is built on it; `tests/wms-second-connector-seam.test.ts` registers a
    * fictitious connector that takes it, so those paths keep being executed rather than merely
@@ -605,7 +605,7 @@ type WmsOrderPushResultBase = {
  * the ClientId on the row it selects, for instance. Nothing further is owed, so the link goes
  * straight to SYNCED.
  *
- * wms-neutral-refactor round 2 (Codex HIGH 4): `needsVerification` is pinned to `false` here, rather
+ * o3d-remove-shiphero round 2 (Codex HIGH 4): `needsVerification` is pinned to `false` here, rather
  * than merely omitted, so this type is NOT satisfied by a push that might assert doubt. That is what
  * lets `WmsRegistrableConnector` refuse the combination described below.
  */
@@ -623,7 +623,7 @@ export type WmsOrderPushUnverifiedResult = WmsOrderPushResultBase & {
 }
 
 /**
- * THE COMBINATION THIS TYPE USED TO PERMIT (wms-neutral-refactor round 2, Codex HIGH 4).
+ * THE COMBINATION THIS TYPE USED TO PERMIT (o3d-remove-shiphero round 2, Codex HIGH 4).
  *
  * `needsVerification?: boolean` and `verifyPushedOrder?` were INDEPENDENTLY optional, so a connector
  * could say "I minted this id and cannot prove it is ours" while offering no way to ever prove it.
@@ -773,7 +773,7 @@ export interface WmsConnector<Id extends string = WmsConnectorId> {
   fetchOrderDelta?(sinceIso: string): Promise<WmsOrderStatus[]>
   /**
    * THE ZONE `fetchOrderDelta`'s CURSOR IS A WALL-CLOCK TIME IN — a fact about the WAREHOUSE,
-   * which is why it lives on the connector and nowhere else (wms-neutral-refactor round 4, Codex
+   * which is why it lives on the connector and nowhere else (o3d-remove-shiphero round 4, Codex
    * HIGH 1).
    *
    * The cursor is not an instant on the wire: it is a `YYYY-MM-DDTHH:MM:SS` string the warehouse

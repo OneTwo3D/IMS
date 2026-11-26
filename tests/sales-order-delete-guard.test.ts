@@ -1326,7 +1326,7 @@ test('o3d-272i: a resolved park, a park on another order and an outbound row are
         { id: 'log-synced', status: 'SYNCED' },
         { id: 'log-other-order', entityId: 'order-2' },
         { id: 'log-outbound', direction: 'TO_CONNECTOR' },
-        { id: 'log-other-connector', connector: 'retired-store' },
+        { id: 'log-other-connector', connector: 'shopify' },
         { id: 'log-product', entityType: 'Product' },
       ],
     }),

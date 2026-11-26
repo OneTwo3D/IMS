@@ -195,19 +195,19 @@ test('shopping webhook route rejects empty non-ping bodies', async () => {
   assert.deepEqual(await response.json(), { error: 'Shopping webhook body is required.' })
 })
 
-// DELETED: 'shopping webhook route rejects empty bodies' for a storefront without WooCommerce's ping quirk.
+// DELETED (o3d-remove-parked-connectors): 'shopping webhook route rejects empty Shopify bodies'.
 //
 // It proved that the route's empty-body rule applies to a connector that does NOT have
 // WooCommerce's ping quirk — i.e. that the rule is per-connector rather than "empty bodies are
-// always fine". That storefront was the only such connector and is archived; the route resolves its
+// always fine". Shopify was the only such connector and is archived; the route resolves its
 // connector through `parseShoppingConnectorId`, which now rejects every id but 'woocommerce' with
 // a 404 before the body rule is reached, so there is no id left that can exercise it here.
 //
 // The per-connector RULE itself is still covered, one layer down, by
 // tests/connectors/shopping-webhook-empty-body.test.ts, which drives
 // `isEmptyShoppingWebhookBodyAllowed` directly (including with an unregistered id). What is lost is
-// the proof that the ROUTE consults that rule for a connector other than WooCommerce. Recorded in the
-// removal note under docs/archive/.
+// the proof that the ROUTE consults that rule for a connector other than WooCommerce. Recorded in
+// docs/archive/shopify-connector-removal.md.
 
 test('shopping webhook route allows WooCommerce empty ping bodies', async () => {
   const response = await handleShoppingWebhookRoute(

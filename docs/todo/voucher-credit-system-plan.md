@@ -22,6 +22,7 @@ The current codebase already has the right top-level connector structure:
 - accounting facade: `lib/accounting.ts`
 - shared connector contracts: `lib/connectors/types.ts`
 - WooCommerce connector: `lib/connectors/woocommerce/index.ts`
+- Shopify connector: `lib/connectors/shopify/index.ts`
 - Xero connector: `lib/connectors/xero/index.ts`
 
 This module should extend those abstractions, not bypass them.
@@ -31,6 +32,9 @@ This module should extend those abstractions, not bypass them.
 These official references should be treated as the starting point for connector implementation and payload validation:
 
 - WooCommerce REST API: <https://developer.woocommerce.com/docs/apis/rest-api/>
+- Shopify Admin GraphQL API: <https://shopify.dev/docs/api/admin-graphql/latest>
+- Shopify Gift Card API surface: <https://shopify.dev/docs/api/admin-graphql/latest/objects/GiftCard>
+- Shopify Store Credit Account API surface: <https://shopify.dev/docs/api/admin-graphql/2025-07/objects/storecreditaccount>
 - Xero Accounting API overview: <https://developer.xero.com/documentation/api/accounting/overview>
 
 Useful WooCommerce extension references for likely first adapters:
@@ -189,7 +193,7 @@ These entities should preserve correlation to:
 - customers
 - external accounting records
 
-`customer_identity` should be keyed by source platform and source customer id, with optional merge relationships. Loyalty balances must not auto-merge across platforms. A customer may be represented in one IMS profile view, but Woo loyalty, Woo gift cards, and any other platform's instruments remain separate source instruments unless an explicit finance operation links them.
+`customer_identity` should be keyed by source platform and source customer id, with optional merge relationships. Loyalty balances must not auto-merge across platforms. A customer may be represented in one IMS profile view, but Woo loyalty, Shopify loyalty, Woo gift cards, and Shopify store credit remain separate source instruments unless an explicit finance operation links them.
 
 `accounting_profile` should use a discriminator-based shape rather than separate duplicated voucher and loyalty routing tables. Voucher and loyalty routing can still expose type-specific views in application code, but the underlying persistence model should avoid duplicated connector account fields.
 
@@ -456,6 +460,22 @@ Normalization must distinguish Smart Coupons stored-value instruments from gener
 
 Current public Smart Coupons documentation confirms that store credit and gift certificates are represented as discount-type coupons. It does not expose a stable public metadata contract, so exact meta keys should be confirmed from the installed plugin code before the adapter schema is finalized rather than guessed in the plan.
 
+### Shopify
+
+Shopify should be treated as the first native platform implementation for:
+
+- gift cards
+- store credit accounts
+
+Shopify loyalty points should still use an app-adapter model because points are not a single native Shopify loyalty surface in the same way gift cards and store credit are.
+
+Required Shopify workstream:
+
+- add gift card ingestion and reconciliation
+- add store credit account sync and transaction mirror
+- normalize redemption and refund flows into shared IMS voucher and loyalty events
+- add app-level adapter hooks for non-native loyalty providers
+
 ### Xero
 
 Xero should consume normalized IMS accounting events and map them into:
@@ -550,6 +570,19 @@ Exit criteria:
 
 - WooCommerce is fully represented in the baseline plan and can flow voucher and loyalty data into IMS through the shared event model
 
+### Workstream 5. Shopify integration
+
+Build:
+
+- Shopify gift card sync
+- Shopify store credit sync
+- Shopify native redemption and refund normalization
+- loyalty app adapter entry points
+
+Exit criteria:
+
+- Shopify native stored-value instruments can be mirrored and reconciled end-to-end
+
 ### Workstream 6. Loyalty sync ledger
 
 Build:
@@ -607,10 +640,11 @@ Recommended milestone order:
 1. core schema, event model, and voucher ledger
 2. reservation, concurrency, and customer identity foundations for stored value
 3. WooCommerce connector foundation for voucher, refund-credit, and loyalty ingestion
-4. WooCommerce extension adapters for Smart Coupons, gift card, and points plugins
-5. loyalty mirror and points-to-voucher bridge
-6. Xero accounting adapter
-7. finance UI, reconciliation screens, admin controls, and backfill tooling
+4. Shopify native gift card and store credit ingestion
+5. WooCommerce extension adapters for Smart Coupons, gift card, and points plugins
+6. loyalty mirror and points-to-voucher bridge across both channels
+7. Xero accounting adapter
+8. finance UI, reconciliation screens, admin controls, and backfill tooling
 
 ## UI Plan
 
@@ -671,7 +705,7 @@ Must show:
 - WooCommerce extension-source mismatches explicitly
 - loyalty balance adjustments where source totals overrule mirrored history
 
-Multi-platform behavior is intentionally not a balance-unification feature in phase 1. Stored-value instruments from different platforms can be shown in one customer-facing IMS view, but they remain separate source balances and separate redemption domains unless a later project explicitly introduces cross-platform value unification.
+Dual-platform behavior is intentionally not a balance-unification feature in phase 1. WooCommerce and Shopify stored-value instruments can be shown in one customer-facing IMS view, but they remain separate source balances and separate redemption domains unless a later project explicitly introduces cross-platform value unification.
 
 ## Security and Controls
 
@@ -740,9 +774,10 @@ Chargeback policy defaults:
 Before engineering starts, confirm:
 
 1. which WooCommerce plugins are in scope first
-2. whether refund credits always create new vouchers or may top up existing customer credit instruments
-3. whether marketing stored-value vouchers are always contra-revenue or allow profile overrides
-4. whether any channels cannot support reserve / commit / release semantics for stored value
+2. which Shopify loyalty apps or integration surfaces need adapter support first
+3. whether refund credits always create new vouchers or may top up existing customer credit instruments
+4. whether marketing stored-value vouchers are always contra-revenue or allow profile overrides
+5. whether any channels cannot support reserve / commit / release semantics for stored value
 6. whether encrypted full voucher-code storage is operationally required
 7. which jurisdictions require SPV / MPV support in the first release
 8. confirm the default MPV treatment for multi-jurisdiction tenants with external accountant review

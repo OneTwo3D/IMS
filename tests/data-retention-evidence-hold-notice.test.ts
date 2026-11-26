@@ -122,7 +122,7 @@ function seed() {
     row('already-compacted', { payloadJson: {} }),
     // Not held at all: the compaction's ordinary population.
     row('wc-product', { resource: 'products' }),
-    row('other-store-order', { connector: 'retired-store' }),
+    row('shopify-order', { connector: 'shopify' }),
   ]
   store.settings = [{ key: 'retention_webhook_events_months', value: '3' }]
   store.counts = []
@@ -147,7 +147,7 @@ test('the total evidence population is reported separately, and it is a DIFFEREN
   if (!hold) throw new Error('the hold must be in force')
 
   // Every held row still carrying a payload: the two overdue ones plus young/pending/failed/dead.
-  // `already-compacted` has no payload; the product and other-store rows are not held.
+  // `already-compacted` has no payload; the product and Shopify rows are not held.
   assert.equal(hold.evidenceRowsWithPayload, 6)
   assert.notEqual(
     hold.evidenceRowsWithPayload,

@@ -10,8 +10,8 @@
  * Add a new entry here when a new shopping connector lands (e.g. BigCommerce).
  * No changes required to the Numbering UI — it reads this list.
  *
- * ONE ENTRY TODAY. A second storefront entry was archived — see
- * archive/connectors/README.md and the removal notes under docs/archive/. The list, the id
+ * ONE ENTRY TODAY (o3d-remove-parked-connectors). Shopify was the second entry and was archived —
+ * see archive/connectors/README.md and docs/archive/shopify-connector-removal.md. The list, the id
  * union, the parser and the prefix reader are all still driven by the list rather than by a
  * WooCommerce literal, so a second entry needs no edit here beyond the entry itself. What a union of
  * one costs is stated in that note: `tests/connectors/shopping-contract.test.ts` can still hand a

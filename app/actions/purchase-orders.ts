@@ -141,8 +141,7 @@ import {
 } from '@/lib/domain/purchasing/landed-cost-service'
 import { headerDiscountFactorForPo, unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
 import {
-  isPurchaseFxRefusalError, markPurchaseFxLockUsed, preparePurchaseReceiptFx, purchaseFxLayerFields, readPurchaseOrderPrepaymentOnDemand,
-  reportPurchaseFxFallback, resolveReceiptFxValuation,
+  isPurchaseFxRefusalError, preparePurchaseReceiptFx, purchaseFxLayerFields, readPurchaseOrderPrepaymentOnDemand, resolveReceiptFxValuation,
   type OnDemandPrepaymentResult, type PrepaymentChecks,
 } from '@/lib/domain/purchasing/purchase-receipt-fx'
 import {
@@ -2928,30 +2927,14 @@ export async function receivePurchaseOrder(
     // unaffected, which is exactly what makes it dangerous: the guard still works and the types stop
     // being able to say so. A property of an object is re-widened by the intervening call.
     const receiptPostingOutcome: { outcome?: EnqueueOutcomeLike } = {}
-    // Per-event FX (o3d-hqvrp.51 step 2): ask Xero for the order's supplier prepayment where the answer is not already known (a used lock, a recent read,
-    // a "no prepayment" answer inside its cache window), BEFORE the transaction (a network call never runs inside it). A no-op while the switch is off or
-    // for a base-currency order. A refusal (ambiguous prepayment, failed read) returns here, unwritten, and is logged (LOW-8). A retry that carries an
-    // idempotency token for a receipt that already committed asks Xero nothing: the transaction reports it applied (LOW-8).
-    let purchaseFxChecks: PrepaymentChecks = new Map()
-    const alreadyCommitted = idempotencyToken
-      ? await db.stockMovement.findFirst({ where: { idempotencyKey: { startsWith: `purchase-receipt:${idempotencyToken}:` } }, select: { id: true } })
-      : null
-    if (!alreadyCommitted) {
-      try {
-        purchaseFxChecks = await preparePurchaseReceiptFx([id])
-      } catch (refusal) {
-        if (!isPurchaseFxRefusalError(refusal)) throw refusal
-        await logActivity({
-          entityType: 'PURCHASE_ORDER',
-          entityId: id,
-          action: 'purchase_receipt_fx_refused',
-          tag: 'purchase',
-          level: 'WARNING',
-          description: `Receipt of ${po.reference} refused before it started: ${refusal.message}`,
-          metadata: { transient: refusal.transient },
-        })
-        return { success: false, error: refusal.message }
-      }
+    // Per-event FX (o3d-hqvrp.51 step 2): read the order's Xero supplier prepayment, at most once, BEFORE the transaction (a network call never runs
+    // inside it). A no-op while the switch is off or for a base-currency order. A refusal (ambiguous prepayment, failed read) returns here, unwritten.
+    let purchaseFxChecks: PrepaymentChecks
+    try {
+      purchaseFxChecks = await preparePurchaseReceiptFx([id])
+    } catch (refusal) {
+      if (isPurchaseFxRefusalError(refusal)) return { success: false, error: refusal.message }
+      throw refusal
     }
     const receiptInstant = new Date()
     const receiptResult = await db.$transaction(async (tx) => {
@@ -3109,8 +3092,6 @@ export async function receivePurchaseOrder(
           },
         },
       })
-      // Per-event FX: this receipt lays goods at the lock's rate, so the lock is now used and is never replaced (LOW-11: only here, not when a valuation is merely computed).
-      await markPurchaseFxLockUsed(tx, fxValuation, receiptInstant)
       // GR/IR accrual: the goods quantity this receipt lays (the same rounded quantity the layer, the movement and the stock level take), valued at
       // the PO goods unit cost. Recorded below with the stock, in this transaction, whether or not the Xero posting is on.
       const grirReceiptLines: Array<{ poLineId: string; qty: Prisma.Decimal }> = []
@@ -3357,7 +3338,6 @@ export async function receivePurchaseOrder(
         freightPoIds,
         totalReceiptValue: totalReceiptValue.toNumber(),
         creditFloorEntries: [...creditFloorByPoLine.values()],
-        fxValuation,
       }
     }, STOCK_TX_OPTIONS)
 
@@ -3477,9 +3457,6 @@ export async function receivePurchaseOrder(
         entries: receiptResult.creditFloorEntries,
       }))
     }
-    // MED-5: a foreign receipt that fell back to the table rate while Xero sync is on (Xero holds no prepayment with the PO number as its Reference).
-    const fxFallbackWarning = await reportPurchaseFxFallback(receiptResult.fxValuation, 'manual receipt')
-    if (fxFallbackWarning) warnings.push(fxFallbackWarning)
     return warnings.length > 0 ? { success: true, warnings } : { success: true }
   } catch (e) {
     if (e instanceof ManualReceiptRefusedByLiveAsnError) return { success: false, error: e.message }
@@ -3521,7 +3498,6 @@ export async function readPurchaseOrderXeroPrepayment(poId: string): Promise<{ s
         level: 'INFO',
         description: result.status === 'locked'
           ? `Locked the goods exchange rate at ${result.rateToBase} from Xero prepayment ${result.xeroPrepaymentId} (${result.prepaymentDate})`
-            + (result.earlierTableRateReceipts > 0 ? `; ${result.earlierTableRateReceipts} earlier receipt(s) keep the exchange-rate table rate, the lock applies to later receipts` : '')
           : 'Removed an unused exchange-rate lock: Xero no longer holds a live prepayment for this order',
         metadata: { ...result },
       })

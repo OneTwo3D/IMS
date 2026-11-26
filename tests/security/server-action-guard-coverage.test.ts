@@ -70,7 +70,7 @@ const ALLOWLIST: Record<string, string> = {
   //     with that name and inherit a blanket exemption nobody reviewed — so the
   //     "no dead entries" test below now fails the build on one.
   //   * 'shopping-sync.ts:getShoppingSyncLogsForConnector' claimed "dispatcher →
-  //     guarded storefront sync-log actions; no unguarded arm". True, as it
+  //     guarded shopify/wc sync-log actions; no unguarded arm". True, as it
   //     happens — and now VERIFIED, by resolution, so the claim does not need to
   //     be taken on trust or re-checked by hand each round.
   //   * a daily-batch module's wildcard said "verified: both getters gate on

@@ -48,12 +48,6 @@ export type SwitchDefinition = {
    * in the dry run and again inside the write transaction.
    */
   readonly requiresMappedSettings?: { whenKey: string; whenValue: string; settings: ReadonlyArray<{ key: string; label: string }>; why: string }
-  /**
-   * Turning ON is refused until the code the switch depends on is installed (`installed` is a constant in this file that the last step of the work flips to
-   * true), however well the settings are mapped. For a switch whose later steps are not built yet, so that turning it on cannot leave the books half-way
-   * through a policy (purchase FX step 3).
-   */
-  readonly turnOnBlockedUntil?: { installed: boolean; why: string }
 }
 
 const BOOLEAN_VALUES = ['true', 'false'] as const
@@ -92,13 +86,6 @@ export const STOREFRONT_EMAIL_ENABLED_AT_KEY = 'storefront_customer_email_enable
 // refused while Xero sync is on and either account the variances post to is unmapped (literals, not imports of lib/connectors/xero/settings.ts: that module
 // reads the store; tests/settings-cli.test.ts holds them equal to its keys).
 export const PURCHASE_EVENT_FX_SWITCH_KEY = 'purchase_event_fx_rates_enabled'
-/**
- * LOW-18 (step-2 review): THE INTERLOCK. Per-event FX for purchasing is built in three steps (1 the switch and accounts, 2 receipt-date valuation, 3 the
- * bill at the locked rate, the price-variance line and the FX-difference journal). Steps 1 and 2 alone value the stock at the prepayment rate while the
- * bill still goes to Xero at the PO rate, so turning the switch on before step 3 would leave a foreign purchase half-way through the policy. Turning it on
- * is refused while this is false; step 3 flips it to true in the change that installs the bill side.
- */
-export const PURCHASE_EVENT_FX_STEPS_COMPLETE = false
 export const PURCHASE_PRICE_VARIANCE_ACCOUNT_KEY = 'xero_purchase_price_variance_account'
 export const REALISED_FX_ACCOUNT_KEY = 'xero_realised_fx_gain_loss_account'
 
@@ -145,10 +132,6 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   // ADMIN: it changes how purchase receipts and bills are valued in the LIVE ledger.
   {
     ...booleanSwitch(PURCHASE_EVENT_FX_SWITCH_KEY, undefined, true),
-    turnOnBlockedUntil: {
-      installed: PURCHASE_EVENT_FX_STEPS_COMPLETE,
-      why: 'step 3 of the per-event purchase FX work (the supplier bill at the locked rate, the price-variance line and the FX-difference journal) is not installed yet; without it the stock would be valued at the prepayment rate while the bill still posts at the order rate',
-    },
     requiresMappedSettings: {
       whenKey: 'xero_sync_enabled',
       whenValue: 'true',
@@ -213,9 +196,6 @@ type ReadClient = { setting: { findUnique(args: { where: { key: string } }): Pro
  */
 export async function crossKeyRefusal(client: ReadClient, def: SwitchDefinition, proposed: string): Promise<string | null> {
   if (isOn(def, proposed)) {
-    if (def.turnOnBlockedUntil && !def.turnOnBlockedUntil.installed) {
-      return `${def.key} cannot be turned on yet: ${def.turnOnBlockedUntil.why}. It stays off until that step is installed (PURCHASE_EVENT_FX_STEPS_COMPLETE in lib/domain/settings/system-switches.ts).`
-    }
     const mapped = def.requiresMappedSettings
     if (mapped) {
       const when = await client.setting.findUnique({ where: { key: mapped.whenKey } })

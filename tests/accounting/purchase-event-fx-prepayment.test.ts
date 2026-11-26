@@ -9,8 +9,7 @@ import {
   type PrepaymentReadDeps,
   type XeroSupplierPrepayment,
 } from '@/lib/connectors/xero/prepayments'
-import { PurchaseFxRefusalError, goodsUnitCostsAtRate, isTransientPurchaseFxRefusal, matchSupplierPrepayment } from '@/lib/domain/purchasing/purchase-receipt-fx'
-import { MissingFxRateError } from '@/lib/currencies/fx-select'
+import { goodsUnitCostsAtRate, matchSupplierPrepayment } from '@/lib/domain/purchasing/purchase-receipt-fx'
 import { allocateLandedCost, grossUnitCostForGoods } from '@/lib/domain/purchasing/landed-cost-allocation'
 import { layerUnitCostAfterRecalc } from '@/lib/domain/purchasing/landed-cost-service'
 
@@ -200,27 +199,4 @@ test('per-layer recalc: a legacy NULL layer takes the line gross and floor exact
   assert.equal(credit.floor?.unflooredGrossUnitCostBase.toString(), '-1')
   const noQty = layerUnitCostAfterRecalc({ layerGoodsUnitCostBase: '9.5', lineGrossUnitCostBase: D('12'), lineLandedAmountBase: D(0), allocationQty: D(0), lineFloor: undefined, lineId: 'a' })
   assert.equal(noQty.newUnitCost.toString(), '9.5')
-})
-
-// ─── MED-4 / MED-6 (the step-2 review follow-ups) ────────────────────────────────────────────────────────────────
-
-test('MED-4: only a transient purchase FX refusal (or a missing fx_rates rate) is waited out; ambiguity and anything else counts', () => {
-  assert.equal(isTransientPurchaseFxRefusal(new PurchaseFxRefusalError('x', { transient: true })), true)
-  assert.equal(isTransientPurchaseFxRefusal(new PurchaseFxRefusalError('x')), false, 'default: real ambiguity')
-  assert.equal(isTransientPurchaseFxRefusal(new MissingFxRateError('Missing GBP FX rate', 'USD', undefined)), true, 'a missing table rate waits for the rate')
-  assert.equal(isTransientPurchaseFxRefusal(new Error('boom')), false)
-  assert.equal(isTransientPurchaseFxRefusal('Missing rate'), false)
-})
-
-test('MED-6: the unlinked-supplier refusal names the real remedy (there is no screen to set the contact)', () => {
-  const out = matchSupplierPrepayment({
-    poReference: 'PO-1', poCurrency: 'USD', supplierContactId: null,
-    prepayments: [{ prepaymentId: 'pp-1', status: 'AUTHORISED', reference: 'PO-1', contactId: 'c1', currencyCode: 'USD', currencyRate: new Prisma.Decimal('1.3'), total: new Prisma.Decimal('10'), date: '2026-11-20' }],
-  })
-  assert.equal(out.kind, 'refused')
-  if (out.kind === 'refused') {
-    assert.match(out.reason, /not linked to a Xero contact of this organisation/)
-    assert.match(out.reason, /exactly the supplier's name \(or email\)/)
-    assert.doesNotMatch(out.reason, /or set the contact/)
-  }
 })

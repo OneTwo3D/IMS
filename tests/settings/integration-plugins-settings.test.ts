@@ -57,7 +57,7 @@ mock.module('@/app/actions/cron', {
 /**
  * The server-rendered selection: WooCommerce + Xero.
  *
- * ONE ROW PER REGISTERED PLUGIN, derived (o3d-m0ad, wms-neutral-refactor round 8). This used to be
+ * ONE ROW PER REGISTERED PLUGIN, derived (o3d-m0ad, o3d-remove-shiphero round 8). This used to be
  * five named boolean props, handed to the component through
  * `as unknown as (props: typeof serverRendered) => unknown` — and that cast is why `tsc` had
  * nothing to say when a sixth registered connector had no switch at all. The props are now the

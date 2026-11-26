@@ -1,9 +1,9 @@
 /**
  * Generic shopping facade — core code imports ONLY from here, never from connector modules.
  *
- * WHY EVERY DISPATCH IS STILL A `switch (connector)` WITH ONE ARM.
- * A second storefront was archived (see archive/connectors/README.md and the removal notes under
- * docs/archive/), so `ShoppingConnectorId` is a union of one and each of
+ * WHY EVERY DISPATCH IS STILL A `switch (connector)` WITH ONE ARM (o3d-remove-parked-connectors).
+ * Shopify was archived (see archive/connectors/README.md and
+ * docs/archive/shopify-connector-removal.md), so `ShoppingConnectorId` is a union of one and each of
  * the fifteen switches below has a single `case 'woocommerce'`. They are deliberately NOT inlined:
  * this file is the seam a second storefront is threaded through, and the switches are the list of ports it must
  * answer. Collapsing them to direct WooCommerce calls would delete that list, and re-deriving it
@@ -14,7 +14,7 @@
  * WHAT IS UNPROVEN WHILE ONE CONNECTOR SHIPS. `tests/connectors/shopping-contract.test.ts` drives
  * the generic layer with a fictitious `'newshop'` id, but nothing routes a second id through these
  * switches, because no second id exists to route. The genericity of THIS file is therefore
- * type-checked, not tested. See the archived storefront's removal note under docs/archive/, "What is no longer
+ * type-checked, not tested. See docs/archive/shopify-connector-removal.md, "What is no longer
  * proven".
  */
 
@@ -70,19 +70,19 @@ export type ShoppingExternalLink = {
 }
 export type ShoppingProductLinkResult = { link: ShoppingExternalLink | null; error?: string }
 
-// DELETED, NOT KEPT: `computeKitAvailability` and
+// DELETED, NOT KEPT (o3d-remove-parked-connectors): `computeKitAvailability` and
 // `buildShoppingStockUpdates` — a ~185-line connector-agnostic stock-update builder (kit
-// availability, warehouse scoping, SKU/lifecycle skip accounting) whose ONLY caller was the
-// archived storefront's `syncStock`. WooCommerce has never used it: `pushStockToWc` builds its own updates inside the
+// availability, warehouse scoping, SKU/lifecycle skip accounting) whose ONLY caller was Shopify's
+// `syncStock`. WooCommerce has never used it: `pushStockToWc` builds its own updates inside the
 // connector, under its own advisory lock and settings snapshot.
 //
-// This is the WMS `stock-sync-helpers.ts` lesson repeating, and it is worth recording rather
+// This is the ShipHero `stock-sync-helpers.ts` lesson repeating, and it is worth recording rather
 // than quietly deleting: a module presented as the shared, connector-neutral layer was in fact a
 // SECOND implementation that one connector used and the other did not. The generic-looking name was
 // the only thing generic about it. A future storefront should expect to write its own builder (or to
 // lift WooCommerce's out of the connector deliberately), not to find one waiting.
 //
-// Recoverable from the archived storefront connector's tag (see archive/connectors/README.md).
+// Recoverable at `git show archive/shopify-connector:lib/shopping.ts`.
 // `emitStockSyncSkipLog` below SURVIVES: the WooCommerce arm calls it directly.
 
 async function emitStockSyncSkipLog(
@@ -642,13 +642,13 @@ export async function handleShoppingWebhook(
     // depend entirely on WooCommerce's finite retry, after which the order is lost.
     //
     // STATICALLY UNREACHABLE FOR A REGISTERED ID TODAY, AND KEPT ON PURPOSE
-    // With the second storefront archived, the only registered `connector` is
+    // (o3d-remove-parked-connectors). With Shopify archived, the only registered `connector` is
     // `'woocommerce'`, so no registered id can take this branch. It is the DEFAULT-DENY half of the
     // rule — a connector that has not declared a deferred-persist path must not have its deliveries
     // dropped while its plugin is off — and deleting it would mean the next connector's first
     // webhook is accepted by omission. `tests/shopping-dispatcher-disabled-persist.test.ts` still
     // drives it, with an id the union does not contain; that is a weaker subject than a second
-    // shipped connector and is recorded in the removal note under docs/archive/.
+    // shipped connector and is recorded in docs/archive/shopify-connector-removal.md.
     //
     // THE LABEL IS RESOLVED DEFENSIVELY, and that is not cosmetic: `getShoppingConnector` THROWS on
     // an id it does not know, so composing the refusal message out of it turned a refusal into a
@@ -665,7 +665,7 @@ export async function handleShoppingWebhook(
     }
   }
 
-  // DEFAULT-DENY for an id with no webhook arm Archiving the second storefront
+  // DEFAULT-DENY for an id with no webhook arm (o3d-remove-parked-connectors). Archiving Shopify
   // removed the second `case`, and without this the switch would fall off its end and the function
   // would return `undefined` — which is a runtime crash in the route, not a refusal. A registered
   // connector that has not wired a webhook handler gets a named 501 instead.
@@ -693,8 +693,8 @@ export async function isEmptyShoppingWebhookBodyAllowed(
     }
   }
 
-  // DEFAULT-DENY, and it has to be written rather than implied.
-  // The archived storefront's arm used to BE this answer (`return false`), so archiving it left the
+  // DEFAULT-DENY, and it has to be written rather than implied (o3d-remove-parked-connectors).
+  // Shopify's arm used to BE this answer (`case 'shopify': return false`), so archiving it left the
   // switch falling off its end and returning `undefined` for any id it does not name. `undefined` is
   // falsy, so the route happens to behave the same — which is precisely the kind of accident that
   // stops being true the first time a caller writes `=== false`. The rule is: a connector that has

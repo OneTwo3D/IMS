@@ -1,6 +1,6 @@
 /**
  * A REGISTERED ID WITH NO DEFINITION MUST NOT PRODUCE A BUILD
- * (wms-neutral-refactor round 12, Codex HIGH 1).
+ * (o3d-remove-shiphero round 12, Codex HIGH 1).
  *
  * THE DEFECT. `WMS_CONNECTOR_IDS` is the canonical list every derived thing hangs off — the plugin
  * id union, the setting keys, the exclusivity group, the settings toggles, the /sync cards, the

@@ -22,7 +22,7 @@ const state = {
   linkUpdates: [] as Row[],
   /**
    * WHICH WMS CONNECTOR IS ENABLED — ONE field, three-valued, and the two-valued helper DERIVED
-   * from it (wms-neutral-refactor round 12, Codex MEDIUM).
+   * from it (o3d-remove-shiphero round 12, Codex MEDIUM).
    *
    * The fixture used to hold `connectorId: string | null` and answer both
    * `resolveEnabledWmsConnectorSelection` and `getEnabledWmsConnectorId` from it, which cannot
@@ -477,7 +477,7 @@ test('o3d-rbyg r4: the same-number answer on a link with no stable id is accepte
 
 // ---------------------------------------------------------------------------------------------
 // AMBIGUITY IS NOT ABSENCE — the exception inbox's three WMS actions
-// (wms-neutral-refactor round 12, Codex MEDIUM)
+// (o3d-remove-shiphero round 12, Codex MEDIUM)
 //
 // Round 10 gave the resolver a three-valued answer precisely so "none enabled" and "more than one
 // enabled" would stop being the same answer, and then these three callers collapsed it back to two

@@ -123,6 +123,7 @@ function commitBypassingWrite(to: string | null): Promise<void> {
 function pluginRows() {
   return [
     { key: 'plugin_mintsoft_enabled', value: 'false' },
+    { key: 'plugin_shopify_enabled', value: 'false' },
     { key: 'plugin_woocommerce_enabled', value: 'false' },
     { key: 'plugin_xero_enabled', value: String(state.activeConnector === 'xero') },
   ]

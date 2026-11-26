@@ -30,7 +30,7 @@ import type { WmsMutationEventInput } from '../lib/domain/wms/mutation-audit.ts'
  * So the release takes the two keys the rest of the branch takes, and this suite is that regression
  * plus the shape of both keys.
  *
- * wms-neutral-refactor: the unsafe connector these cases are driven through was a removed WMS. It is now
+ * o3d-remove-shiphero: the unsafe connector these cases are driven through was ShipHero. It is now
  * the REGISTERED fictitious connector from tests/helpers/fictitious-wms-connector.ts, passed in as
  * a registry. Substituting a bare unknown id would have kept every assertion below green while
  * proving something weaker — an unknown id fails closed for a different reason.

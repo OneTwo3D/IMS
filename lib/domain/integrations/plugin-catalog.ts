@@ -1,5 +1,5 @@
 /**
- * WHAT THE PLUGIN TOGGLES SAY, FOR EVERY REGISTERED PLUGIN (o3d-m0ad, wms-neutral-refactor round 8).
+ * WHAT THE PLUGIN TOGGLES SAY, FOR EVERY REGISTERED PLUGIN (o3d-m0ad, o3d-remove-shiphero round 8).
  *
  * WHY THIS EXISTS. `components/settings/integration-plugins-settings.tsx` used to declare five
  * `useState` hooks, five `<Switch>` blocks and five hand-written copy strings — one per plugin, the
@@ -56,7 +56,7 @@ const NON_WMS_PLUGIN_COPY: Record<NonWmsIntegrationPluginId, { label: string; de
 
 /**
  * WHETHER THIS BUILD OFFERS A PLUGIN TO OPERATORS — the one reader of `WmsConnectorDef.available`
- * (wms-neutral-refactor round 12, Codex HIGH 2).
+ * (o3d-remove-shiphero round 12, Codex HIGH 2).
  *
  * WHAT WENT WRONG. `available` is documented on the registry definition as "false for a connector
  * that is registered but not offered to operators yet", and NOTHING consulted it. Round 8 made the
@@ -93,7 +93,7 @@ export function unavailableIntegrationPluginConflict(id: IntegrationPluginId): s
 
 /**
  * EVERY RULE A PLUGIN-STATE WRITE HAS TO SATISFY — one call, so neither writer can hold half of
- * them (wms-neutral-refactor round 12, Codex HIGH 2).
+ * them (o3d-remove-shiphero round 12, Codex HIGH 2).
  *
  * Round 10 added exclusivity and wired it into both writers; round 12 adds availability. They are
  * combined HERE rather than left as two calls a writer has to remember, because "the settings

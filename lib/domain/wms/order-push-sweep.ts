@@ -3079,7 +3079,7 @@ export async function runWmsOrderPushSweepCore(
         // exists in the warehouse now, and re-pushing would duplicate it — so
         // it gets its own state, and only the scoped verification is retried.
         //
-        // wms-neutral-refactor round 2 (Codex HIGH 4) — AND THAT IS TRUE WHETHER OR NOT THE
+        // o3d-remove-shiphero round 2 (Codex HIGH 4) — AND THAT IS TRUE WHETHER OR NOT THE
         // CONNECTOR CAN VERIFY. This read `push.needsVerification && connector.verifyPushedOrder`,
         // so a connector that declared the doubt and offered no resolver got SYNCED — the state
         // the update, hold, cancel and dispatch passes act on. IMS would then amend or cancel an

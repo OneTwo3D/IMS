@@ -8,8 +8,8 @@ function isManualSyncType(value: unknown): value is ManualSyncType {
   return value === 'orders' || value === 'products' || value === 'stock'
 }
 
-// DERIVED FROM THE REGISTRY, not a second id union. This route used
-// to spell the connector ids itself, so the ingress accepted exactly the ids somebody had
+// DERIVED FROM THE REGISTRY, not a second id union (o3d-remove-parked-connectors). This route used
+// to spell `'woocommerce' | 'shopify'` itself, so the ingress accepted exactly the ids somebody had
 // remembered here. Registering a connector now widens what this route accepts by construction.
 function isShoppingConnector(value: unknown): value is ShoppingConnectorId {
   return typeof value === 'string' && SHOPPING_CONNECTORS.some((connector) => connector.id === value)

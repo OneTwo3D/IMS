@@ -1,5 +1,5 @@
 /**
- * THE INBOUND-DELTA CURSOR STATE, PER CONNECTOR (wms-neutral-refactor round 2, Codex HIGH 2).
+ * THE INBOUND-DELTA CURSOR STATE, PER CONNECTOR (o3d-remove-shiphero round 2, Codex HIGH 2).
  *
  * WHAT WENT WRONG. The dispatch sweep wires `getDeltaState`/`saveDeltaState` for ANY connector
  * that implements `fetchOrderDelta`, and it used to wire them to functions that named ONE

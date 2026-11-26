@@ -6,7 +6,7 @@
 # sql-server in "shared server" mode, ENABLED PER-PROJECT via config.yaml
 #   dolt.shared-server: true
 # (set in every IMS clone — NOT a machine-wide env var, so non-IMS bd projects
-# like /root and other repos stay on their own embedded stores).
+# like /root and woocommerce-shiphero-sync stay on their own embedded stores).
 # The server lives at  ~/.beads/shared-server/dolt  (fixed port 3308) and is
 # auto-started by bd on demand; the IMS database on it is "onetwo3d_ims". With
 # dolt.shared-server set, bd auto-repairs the clone's metadata.json to

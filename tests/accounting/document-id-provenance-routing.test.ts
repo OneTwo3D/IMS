@@ -604,7 +604,7 @@ test('[o3d-j625 r3] a recorded value this build cannot route is `null`, never na
   // columns are plain strings that can hold one, and a literal pair would have gone on routing a connector
   // whose queue is gone.
   assert.equal(asRoutableAccountingConnector('retired-ledger'), null)
-  assert.equal(asRoutableAccountingConnector('retired-wms'), null)
+  assert.equal(asRoutableAccountingConnector('shiphero'), null)
   assert.equal(asRoutableAccountingConnector(''), null)
   assert.equal(asRoutableAccountingConnector(null), null)
   assert.equal(asRoutableAccountingConnector(undefined), null)

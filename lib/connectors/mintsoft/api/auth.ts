@@ -453,7 +453,7 @@ export async function getMintsoftAccessToken(options?: { forceRefresh?: boolean 
 
 /**
  * WHETHER THIS CONNECTION IS SET UP — and the one predicate the WMS boundary now answers with
- * (o3d-pow3 / wms-neutral-refactor round 12, Codex HIGH 3).
+ * (o3d-pow3 / o3d-remove-shiphero round 12, Codex HIGH 3).
  *
  * EVERY TOKEN THIS READS IS TRIMMED, because a whitespace-only token is not a credential. Round 10
  * made this predicate AUTHORITATIVE for the `configured` flag on the onboarding wizard and the

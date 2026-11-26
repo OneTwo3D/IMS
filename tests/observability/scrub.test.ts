@@ -211,7 +211,7 @@ const SIG_HEADERS = {
   'x-oti-signature': 'SIGSENTINEL2',
   'x-wc-webhook-signature': 'SIGSENTINEL3',
   'X-Hub-Signature-256': 'SIGSENTINEL4',
-  'x-store-hmac-sha256': 'SIGSENTINEL5',
+  'x-shopify-hmac-sha256': 'SIGSENTINEL5',
   'x-request-nonce': 'SIGSENTINEL6',
   'x-sig': 'SIGSENTINEL7',
   'user-agent': 'curl/8',

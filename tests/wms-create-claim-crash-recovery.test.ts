@@ -13,8 +13,8 @@ import { wmsAmbiguousCreateRefusal } from '../lib/domain/wms/create-replay-polic
 import { ACME_WMS_ID, makeSeamRegistry } from './helpers/fictitious-wms-connector.ts'
 
 /**
- * wms-neutral-refactor: the unsafe-create warehouse these cases contrast against Mintsoft was
- * a removed WMS. It is now the REGISTERED fictitious connector, driven through the sweep's registry
+ * o3d-remove-shiphero: the unsafe-create warehouse these cases contrast against Mintsoft was
+ * ShipHero. It is now the REGISTERED fictitious connector, driven through the sweep's registry
  * seam — an unregistered id would fail closed for a different reason and prove less.
  */
 const SEAM_REGISTRY = makeSeamRegistry()

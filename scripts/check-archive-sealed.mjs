@@ -18,7 +18,7 @@
 // this file were advertised as more than they were — which is how three rounds of review each found
 // it blind in a different way.
 //
-// THE DEFECT IT EXISTS FOR. #698 archived the retired connectors as
+// THE DEFECT IT EXISTS FOR. #698 archived the QuickBooks, Shopify and ShipHero connectors as
 // RENAMES: `lib/connectors/quickbooks/... -> archive/connectors/quickbooks/...`. Any branch that had
 // modified one of those files gets its hunks auto-merged INTO the archived copy by git's rename
 // detection, WITH NO CONFLICT MARKER. It happened twice within a day: o3d-c08y took +5/-10 into

@@ -99,7 +99,7 @@ export function makeWcSyncRowMatrix(probe: string): {
     row('park-no-entity', { entityId: null }),
     row('unstamped', { recordKind: null }),
     row('other-kind', { recordKind: 'WC_SOMETHING_ELSE' }),
-    row('other-connector', { connector: 'retired-store' }),
+    row('other-connector', { connector: 'shopify' }),
     row('outbound', { direction: 'TO_CONNECTOR' }),
     row('other-entity-type', { entityType: 'Product' }),
     row('park-no-external', { externalId: null }),

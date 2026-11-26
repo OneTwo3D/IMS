@@ -8,7 +8,7 @@ import { logActivity } from '@/lib/activity-log'
 import { requireInternalUser, requirePermission } from '@/lib/auth/server'
 import { canViewDashboardCostFigures } from '@/lib/security/dashboard-cost-redaction'
 import { wcFetch } from '@/lib/connectors/woocommerce/api'
-import { getAccountingSettings } from '@/lib/accounting'
+import { accountingPostingVerdictForChart, getAccountingSettings } from '@/lib/accounting'
 import { enqueueStockSync } from '@/lib/shopping'
 import { getSettingValue } from '@/lib/settings-store'
 import { allocateBackordersForProducts } from '@/lib/fulfillment/backorder-allocator'
@@ -25,13 +25,20 @@ import {
 } from '@/lib/domain/inventory/stock-level-map'
 import { toInventoryConstraintMessage } from '@/lib/domain/inventory/prisma-errors'
 import { adjustmentJournalMayHaveReachedLedger, calculateAdjustmentStockDelta, assertAdjustmentEditFifoFeasible } from '@/lib/domain/inventory/stock-adjustment-edit'
-import { addMoney, toDecimal } from '@/lib/domain/math/decimal'
+import { addMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import {
   buildStockMovementValueFields,
   buildStockMovementValueFieldsFromConsumed,
 } from '@/lib/domain/inventory/stock-movement-value'
 import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
-import { getLatestLayerUnitCost, readStockAdjustmentReasonCostRequired } from '@/lib/domain/inventory/stock-adjustment-policy'
+import {
+  defaultCostCapMessage,
+  editChangesValueRefusedMessage,
+  editNotPlainAdjustmentRefusedMessage,
+  getLatestLayerUnitCost,
+  MAX_DEFAULT_COST_PAIRS,
+  readStockAdjustmentReasonCostRequired,
+} from '@/lib/domain/inventory/stock-adjustment-policy'
 
 const STOCK_TX_OPTIONS = { maxWait: 5000, timeout: 20000 }
 
@@ -427,6 +434,14 @@ export async function getAdjustmentHistory(limit = 200): Promise<AdjustmentMovem
   })
 }
 
+/** The verdict that decides whether an inventory-adjustment journal would be posted (or is owed): the same one applyStockAdjustment uses. */
+async function accountingPostingAppliesToAdjustments(): Promise<boolean> {
+  const settings = await getAccountingSettings()
+  if (!settings.connector) return false
+  const { verdict } = await accountingPostingVerdictForChart(settings.connector, 'INVENTORY_ADJUSTMENT')
+  return verdict === 'post' || verdict === 'chart-retired'
+}
+
 export type UpdateAdjustmentResult = {
   success?: boolean
   message?: string
@@ -456,6 +471,9 @@ export async function updateAdjustmentMovement(
           toWarehouseId: true,
           qty: true,
           createdAt: true,
+          referenceType: true,
+          referenceId: true,
+          totalValueBase: true,
           cogsEntries: {
             select: { id: true, costLayerId: true, qty: true },
           },
@@ -467,6 +485,13 @@ export async function updateAdjustmentMovement(
       if (!movement) throw new Error('Movement not found')
       if (movement.type !== 'ADJUSTMENT') {
         throw new Error('Only stock adjustments can be edited')
+      }
+      // o3d-jwa8m MED-3 (switch `stock_adjustment_reason_cost_required` on): only a PLAIN stock adjustment (one the adjustment form, bulk
+      // dialog or CSV import wrote: no reference) is editable in place. A supplier return, stock-count variance or WMS align-down
+      // carries a reference and its own journal or sub-ledger; an edit here would re-book it under none of those. Off: unchanged.
+      const reasonCostRequired = await readStockAdjustmentReasonCostRequired(tx)
+      if (reasonCostRequired && (movement.referenceType !== null || movement.referenceId !== null)) {
+        throw new Error(editNotPlainAdjustmentRefusedMessage(movement.referenceType))
       }
 
       const oldIsAddition = movement.toWarehouseId !== null
@@ -637,7 +662,7 @@ export async function updateAdjustmentMovement(
         let unitCostBase: number | Prisma.Decimal
         if (Number.isFinite(originalUnitCost) && originalUnitCost >= 0) {
           unitCostBase = originalUnitCost
-        } else if (await readStockAdjustmentReasonCostRequired(tx)) {
+        } else if (reasonCostRequired) {
           // o3d-0ypv9 (switch on): a removal edited into an addition is valued at the latest cost layer's unit cost, never an
           // average. With no costed layer to default to, the edit is refused: there is no unit cost box on an edit.
           const latest = await getLatestLayerUnitCost(tx, movement.productId, newWarehouseId)
@@ -682,6 +707,18 @@ export async function updateAdjustmentMovement(
           await tx.cogsEntry.createMany({
             data: consumed.map((entry) => cogsEntryDataFromConsumed(id, entry)),
           })
+        }
+      }
+
+      // o3d-jwa8m MED-3 (switch on): an in-place edit cannot post, revise or re-queue a journal, and an adjustment that was written at 0 (or
+      // as a removal of zero-cost layers) owes none, so an edit that moves its value to something the ledger should see would drift
+      // silently (+5 at 0 edited to -5: a valued removal with no journal and no inbox row). While accounting posting applies, an edit
+      // that changes the value (to the penny) is refused; the operator reverses it and enters the right adjustment. Rolls this transaction back.
+      if (reasonCostRequired) {
+        const oldValue = roundQuantity(toDecimal(movement.totalValueBase ?? 0), 2)
+        const newValue = roundQuantity(toDecimal(nextMovementValueFields.totalValueBase), 2)
+        if (!oldValue.eq(newValue) && await accountingPostingAppliesToAdjustments()) {
+          throw new Error(editChangesValueRefusedMessage())
         }
       }
 
@@ -919,7 +956,8 @@ export async function getAdjustmentDefaultUnitCosts(
   pairs: Array<{ productId: string; warehouseId: string }>,
 ): Promise<AdjustmentDefaultUnitCost[]> {
   const session = await requirePermission('stock_control.adjust')
-  const parsed = z.array(z.object({ productId: z.string().min(1), warehouseId: z.string().min(1) })).max(200).safeParse(pairs)
+  if (pairs.length > MAX_DEFAULT_COST_PAIRS) throw new Error(defaultCostCapMessage(MAX_DEFAULT_COST_PAIRS))
+  const parsed = z.array(z.object({ productId: z.string().min(1), warehouseId: z.string().min(1) })).max(MAX_DEFAULT_COST_PAIRS).safeParse(pairs)
   if (!parsed.success) return []
   const showCost = canViewDashboardCostFigures(session.user.role)
   const out: AdjustmentDefaultUnitCost[] = []

@@ -50,7 +50,7 @@ async function getStoredContactId(ref?: ContactRef): Promise<string | null> {
   return row.accountingContactId
 }
 
-export async function storeContactId(
+async function storeContactId(
   contactId: string,
   issuedByTenantId: string | undefined,
   ref?: ContactRef,
@@ -142,33 +142,4 @@ export async function findOrCreateContact(
   const contactId = createRes.data.Contacts[0].ContactID
   await storeContactId(contactId, createRes.tenantId, ref)
   return { success: true, contactId }
-}
-
-/**
- * READ-ONLY twin of `findOrCreateContact`: the same lookups (the id already stored for a supplier/customer of THIS organisation, then the email, then the
- * exact name), and NEVER a create. `contactId: null` means Xero answered and holds no such contact; a failed read is `success: false` (an unanswered
- * question is not "no contact"). Does not store anything: the caller stores the link with `storeContactId` once it has confirmed it (per-event FX purchasing,
- * where the link of a supplier is confirmed against the contact a Xero prepayment was paid to).
- */
-export async function findXeroContactReadOnly(
-  name: string,
-  email?: string | null,
-  ref?: ContactRef,
-): Promise<{ success: true; contactId: string | null; tenantId?: string } | { success: false; error: string }> {
-  const storedContactId = await getStoredContactId(ref)
-  if (storedContactId) return { success: true, contactId: storedContactId }
-  const normalizedEmail = email?.trim().toLowerCase()
-  if (normalizedEmail) {
-    const emailRes = await xeroGet<XeroContactResponse>(
-      buildWhereQuery(`EmailAddress!=null&&EmailAddress=="${escapeXeroWhereValue(normalizedEmail)}"`),
-    )
-    if (!emailRes.ok) return { success: false, error: emailRes.error ?? 'the Xero contact read failed' }
-    if (emailRes.data?.Contacts?.length) return { success: true, contactId: emailRes.data.Contacts[0].ContactID, tenantId: emailRes.tenantId }
-  }
-  const searchName = normalizeContactName(name)
-  if (!searchName) return { success: true, contactId: null }
-  const res = await xeroGet<XeroContactResponse>(buildWhereQuery(`Name=="${escapeXeroWhereValue(searchName)}"`))
-  if (!res.ok) return { success: false, error: res.error ?? 'the Xero contact read failed' }
-  if (res.data?.Contacts?.length) return { success: true, contactId: res.data.Contacts[0].ContactID, tenantId: res.tenantId }
-  return { success: true, contactId: null, tenantId: res.tenantId }
 }

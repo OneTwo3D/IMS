@@ -18,7 +18,7 @@ import type {
  * registered. Adding a WMS connector means adding `hooks.asn` to its registry definition — not
  * editing this file, and not editing the PO/transfer views.
  *
- * wms-neutral-refactor round 2 (Codex HIGH 1) — WHY THIS IS NOT AN `id === 'mintsoft'` CHECK.
+ * o3d-remove-shiphero round 2 (Codex HIGH 1) — WHY THIS IS NOT AN `id === 'mintsoft'` CHECK.
  * Every action here used to dispatch only when the active connector was literally `mintsoft`, and
  * fall through otherwise. The fall-through arms are not harmless defaults: a registered connector
  * that can perfectly well create an ASN — `createAsn` is REQUIRED by `WmsConnector`, so every

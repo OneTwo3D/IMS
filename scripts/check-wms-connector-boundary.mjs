@@ -11,7 +11,7 @@
  * connector definition's own wiring — never a connector-specific branch.
  * See docs/wms-connector-boundary.md.
  *
- * wms-neutral-refactor round 2 (Codex HIGH 3) — WHY THE GENERIC LAYER IS NOW SCANNED.
+ * o3d-remove-shiphero round 2 (Codex HIGH 3) — WHY THE GENERIC LAYER IS NOW SCANNED.
  * This guard used to allowlist all of `lib/domain/wms/`, `lib/jobs/wms/` and the three
  * `wms-*` facades outright. That is the layer the guard exists to protect, so exempting
  * it meant the only thing it could ever detect was a leak into a file nobody expected to
@@ -20,7 +20,7 @@
  * all passed it for months. A guard that exempts the thing it protects proves an adjacent
  * property.
  *
- * wms-neutral-refactor round 4 (Codex HIGH 3 + HIGH 4) — WHY THIS READS THE REAL PARSE TREE.
+ * o3d-remove-shiphero round 4 (Codex HIGH 3 + HIGH 4) — WHY THIS READS THE REAL PARSE TREE.
  * Round 2 and round 3 hand-rolled the lexing: a character state machine blanked comments,
  * and a regex scraped the id list out of its source. Both were wrong in the same direction,
  * which is the only direction that matters for a guard — BLIND:
@@ -53,7 +53,7 @@
  *     interpolated into a pattern, so an id containing `+`, `.`, `(` or `|` matches itself
  *     and only itself.
  *
- * wms-neutral-refactor round 8 (Codex HIGH 3) — WHAT THE ROUND-6 FOLD STILL GOT WRONG, AND THE RULE
+ * o3d-remove-shiphero round 8 (Codex HIGH 3) — WHAT THE ROUND-6 FOLD STILL GOT WRONG, AND THE RULE
  * THAT ENDS THE SEQUENCE.
  *
  * Rounds 3 through 7 each closed the spelling that had just been found and each revealed another.
@@ -90,7 +90,7 @@
  * files (1,977 with a string literal on one side); a guard that fires on three thousand lines gets
  * allowlisted into silence, which is how you end up with no guard at all.
  *
- * wms-neutral-refactor round 6 (Codex HIGH 2) — WHY IT EVALUATES EXPRESSIONS, NOT TOKENS.
+ * o3d-remove-shiphero round 6 (Codex HIGH 2) — WHY IT EVALUATES EXPRESSIONS, NOT TOKENS.
  * The round-4 rewrite inspects each leaf token INDEPENDENTLY, which is the same blindness one
  * level up: `const id = 'mint' + 'soft'` is two tokens, neither containing the id, and
  * `'\x6dintsoft'` is one token whose SOURCE TEXT is not the id while its VALUE is. Both exited 0
@@ -107,7 +107,7 @@
  * only: the parse tree's tokens, which excludes comments. A comment has no behaviour — it
  * cannot pin a generic code path to one warehouse — and the doc comments in that layer
  * necessarily narrate which connector a rule was learned from ("Mintsoft's Order/List caps
- * Limit at 100", "a second WMS was removed in …"). Deleting that history to satisfy a grep would
+ * Limit at 100", "ShipHero was removed in …"). Deleting that history to satisfy a grep would
  * make the layer harder to maintain and no more generic. Outside that layer NOTHING is
  * exempt: core flows are scanned raw, comments included, because a core flow has no business
  * naming a warehouse at all.
@@ -162,7 +162,7 @@ function unwrapExpression(node) {
  * Every element must resolve to a string literal. An element that does not — an imported
  * constant, a spread, a computed expression — is a HARD FAILURE: the guard would otherwise
  * carry on with a shorter list and report "clean" about the very connector whose id it could
- * not read, which is the wms-neutral-refactor round 3 defect verbatim.
+ * not read, which is the o3d-remove-shiphero round 3 defect verbatim.
  */
 function readConnectorLiterals() {
   let source
@@ -275,7 +275,7 @@ function literalOffsets(text) {
  *   wms-sync-panel.tsx, sync-dashboard.tsx,
  *   components/onboarding/wms-onboarding-connection.tsx.
  *
- * NOT HERE ANY MORE, deliberately (o3d-m0ad / wms-neutral-refactor round 8, Codex HIGH 2):
+ * NOT HERE ANY MORE, deliberately (o3d-m0ad / o3d-remove-shiphero round 8, Codex HIGH 2):
  * components/settings/integration-plugins-settings.tsx and app/(dashboard)/settings/system/page.tsx.
  * The Settings plugin screen used to hard-write five switches, one of them the shipped WMS
  * connector's, with two `as IntegrationPluginState` casts hiding the member a second connector
@@ -291,11 +291,11 @@ function literalOffsets(text) {
  * Plugin-enable persistence that enumerates every connector (woo/xero/wms):
  *   app/actions/onboarding.ts (saveOnboardingPluginState).
  *
- * NOT HERE ANY MORE, deliberately (wms-neutral-refactor round 2): lib/domain/wms/,
+ * NOT HERE ANY MORE, deliberately (o3d-remove-shiphero round 2): lib/domain/wms/,
  * lib/jobs/wms/ as a whole, lib/cron-jobs/wms.ts and the three wms-* facades. That is
  * the generic layer. It is scanned — see COMMENT_EXEMPT_PREFIXES for the one narrowing.
  *
- * NOT HERE ANY MORE, deliberately (wms-neutral-refactor round 4, Codex HIGH 2):
+ * NOT HERE ANY MORE, deliberately (o3d-remove-shiphero round 4, Codex HIGH 2):
  * app/actions/wms-sync.ts and app/actions/wms-onboarding.ts. Both were one-arm dispatchers
  * — `connectorId === 'mintsoft' ? … : null` — behind a DTO with a literal `mintsoft:` member
  * the dashboard and the onboarding wizard read by name. The DTO is now keyed BY CONNECTOR
@@ -321,7 +321,7 @@ const ALLOWLIST = [
   'app/api/admin/wms/',
   'lib/cron-jobs/wms-mintsoft.ts',
   'lib/jobs/wms/process-mintsoft-',
-  // wms-neutral-refactor round 2 — ONE FILE THAT IS CONNECTOR-SPECIFIC DESPITE WHERE IT SITS.
+  // o3d-remove-shiphero round 2 — ONE FILE THAT IS CONNECTOR-SPECIFIC DESPITE WHERE IT SITS.
   //
   // A named FILE, never its directory, and listed because its CONTENT is one warehouse's — not
   // because it lives somewhere convenient. Removing the blanket exemptions on lib/domain/wms/ and
@@ -411,7 +411,7 @@ const COMMENT_EXEMPT_PREFIXES = [
 ]
 
 // ---------------------------------------------------------------------------------------------
-// CONSTANT STRING EXPRESSIONS, FOLDED TO THEIR VALUE (wms-neutral-refactor round 6, Codex HIGH 2)
+// CONSTANT STRING EXPRESSIONS, FOLDED TO THEIR VALUE (o3d-remove-shiphero round 6, Codex HIGH 2)
 //
 // WHY TOKENS ARE NOT ENOUGH. Round 4 replaced the hand-rolled tokenizer with the real parse tree
 // and scanned every LEAF TOKEN. That fixed the blind spots it was aimed at and left one of exactly
@@ -489,7 +489,7 @@ function unwrapFoldable(node) {
  * it), whether every operand was known, the nodes of any opaque assembly inside it, and whether the
  * value is a NUMBER rather than a string.
  *
- * `numeric` IS LOAD-BEARING, NOT BOOKKEEPING (wms-neutral-refactor round 8, Codex HIGH 3). Round 6
+ * `numeric` IS LOAD-BEARING, NOT BOOKKEEPING (o3d-remove-shiphero round 8, Codex HIGH 3). Round 6
  * folded every binary `+` as string concatenation, so
  * `String.fromCharCode(100+9,100+5,100+10,100+16,100+15,100+11,100+2,100+16)` — which evaluates to
  * a connector id at runtime — folded its arguments to `1009`, `1005`, … and produced eight
@@ -568,7 +568,7 @@ function concatFolds(parts, exact) {
 }
 
 /**
- * THE MODULE BOUNDARY, WHICH USED TO BE A BLIND SPOT (wms-neutral-refactor round 8, Codex HIGH 3).
+ * THE MODULE BOUNDARY, WHICH USED TO BE A BLIND SPOT (o3d-remove-shiphero round 8, Codex HIGH 3).
  *
  * Round 6's folder was bound to ONE file, and read an operand it could not resolve as the empty
  * string. An imported constant is exactly such an operand, so
@@ -741,7 +741,7 @@ function makeConstantFolder(sourceFile) {
     if (ts.isNumericLiteral(current)) return foldNumber(Number(current.text), current)
     if (ts.isBigIntLiteral(current)) return foldNumber(Number(current.text.replace(/n$/, '')), current)
 
-    // A NUMBER stays a number through unary +/-/~ (wms-neutral-refactor round 8). Without this,
+    // A NUMBER stays a number through unary +/-/~ (o3d-remove-shiphero round 8). Without this,
     // `String.fromCharCode(-(-109), ...)` folds to nothing and the bound below rescues it only
     // while the argument count is small.
     if (ts.isPrefixUnaryExpression(current)
@@ -853,7 +853,7 @@ function makeConstantFolder(sourceFile) {
 
     // `Buffer.from('bWludHNvZnQ=', 'base64')` is `atob` under another name, and `atob` has been
     // modelled since round 6 — so this is not one more method, it is the second spelling of one
-    // already covered (wms-neutral-refactor round 8, Codex HIGH 3). It is EXACTLY evaluable when the
+    // already covered (o3d-remove-shiphero round 8, Codex HIGH 3). It is EXACTLY evaluable when the
     // input and the encoding are both known, and OPAQUE when they are not: a constant put through a
     // transcoding the guard cannot perform is precisely the thing it must not read as empty.
     //
@@ -989,7 +989,7 @@ function makeConstantFolder(sourceFile) {
       return foldDerived(applied, node, base.exact, base.opaque)
     }
 
-    // THE RULE THAT ENDS THE SEQUENCE OF SPELLINGS (wms-neutral-refactor round 8, Codex HIGH 3).
+    // THE RULE THAT ENDS THE SEQUENCE OF SPELLINGS (o3d-remove-shiphero round 8, Codex HIGH 3).
     //
     // Rounds 3 to 7 each closed the spelling that had just been found and each revealed another:
     // a regex literal, JSX text, `'mint' + 'soft'`, `'\x6dintsoft'`, `.join('')`, `fromCharCode`.
@@ -1040,7 +1040,7 @@ function makeConstantFolder(sourceFile) {
       if (!folder) return foldOpaque(node)
       const remote = folder.exportFold(binding.exported, depth + 1)
       if (!remote) return foldOpaque(node)
-      // BY CONSTRUCTION, NOT BY ENUMERATION (wms-neutral-refactor round 10, Codex HIGH 3).
+      // BY CONSTRUCTION, NOT BY ENUMERATION (o3d-remove-shiphero round 10, Codex HIGH 3).
       //
       // This used to list the fields it carried across — `exact`, `opaque`, `numeric` — and it
       // listed them BEFORE `binary` existed. So `export const B = Buffer.from('…','base64')` folded

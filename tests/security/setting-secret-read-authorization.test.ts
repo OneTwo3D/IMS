@@ -318,9 +318,9 @@ const RAW_MASK_SECRET_IMPORTERS: Record<string, string> = {
   // place that must import it, and the place that adds the set membership check.
   'lib/settings-store.ts': 'implements maskSettingSecret; adds the SENSITIVE_SETTING_KEYS check',
 
-  // BOTH WAIVERS ARE GONE, AND SO IS EVERYTHING THEY WAIVED.
+  // o3d-remove-parked-connectors — BOTH WAIVERS ARE GONE, AND SO IS EVERYTHING THEY WAIVED.
   //
-  // This map held two entries beside the one above: `app/actions/shopping-sync.ts` (a second storefront) and a
+  // This map held two entries beside the one above: `app/actions/shopping-sync.ts` (Shopify) and a
   // second retired connector's sync action, each masking a key that WAS in
   // SENSITIVE_SETTING_KEYS but not routed through `maskSettingSecret` — so nothing was drifting, and
   // nothing stopped the next key they added from drifting. Both connectors are archived and neither
@@ -370,14 +370,98 @@ test('the in-scope maskers were converted — wc-sync, xero-sync and mintsoft-sy
   }
 })
 
-const LEGACY_PLAINTEXT_KEYS = ['email_smtp_pass', 'backup_sftp_password'] as const
+// ---------------------------------------------------------------------------
+// o3d-r5uk — A RETIRED CONNECTOR KEEPS ITS CREDENTIAL GATE
+// ---------------------------------------------------------------------------
 
 /**
- * THE POSITIVE CONTROL: a seeded sensitive row, read by ADMIN, comes back MASKED with its value — and
- * the read re-encrypts the row, which is the opportunistic read-path migration.
+ * Codex round 2, HIGH 1. Archiving the Shopify connector deleted its three credential keys from
+ * SENSITIVE_SETTING_KEYS, and archiving ShipHero (2c2fd9fa, PR #680) had already deleted its three
+ * before that. Neither removal deleted a single `Setting` ROW — there is no migration in either
+ * change — so both converted a stored credential from admin-only into something any WAREHOUSE or
+ * READONLY session could fetch from `getSetting` by naming the key. Measured on the head this block
+ * was added to: all six came back in clear.
  *
- * The seeded value is PLAINTEXT, deliberately: that is the state of a legacy row that predates
- * encryption at rest.
+ * WHY THE SUITE DID NOT CATCH IT. The exhaustive case above — "refuses a WAREHOUSE session for every
+ * sensitive key" — ITERATES SENSITIVE_SETTING_KEYS. Deleting a key from the set deletes the case
+ * that covered it, so the suite stayed green and got one assertion shorter. A set cannot be its own
+ * pin. The literals below are the pin, and they are exhaustive in BOTH directions: an addition that
+ * is not declared here fails just as an unexplained deletion does.
+ */
+// A retired accounting connector's client-secret key was here too. It left this list (and
+// RETIRED_CREDENTIAL_SETTING_KEYS) in the same change as the migration that deletes its rows
+// (prisma/migrations/20261122140000_*), which is the rule the comment above states.
+const RETIRED_CONNECTOR_CREDENTIAL_KEYS = [
+  'shiphero_access_token',          // ShipHero — archived by 2c2fd9fa (PR #680)
+  'shiphero_refresh_token',
+  'shiphero_webhook_secret',
+  'shopify_admin_api_access_token', // Shopify — archived on this branch
+  'shopify_invoice_pdf_secret',
+  'shopify_webhook_secret',
+] as const
+
+test('RETIRED_CREDENTIAL_SETTING_KEYS lists exactly the retired connectors\' credentials', async () => {
+  const { RETIRED_CREDENTIAL_SETTING_KEYS } = await import('@/lib/settings-store')
+  assert.deepEqual(
+    [...RETIRED_CREDENTIAL_SETTING_KEYS].sort(),
+    [...RETIRED_CONNECTOR_CREDENTIAL_KEYS].sort(),
+    'Retiring a connector does not delete its Setting rows, so its credential keys must stay gated. '
+    + 'Removing a key here is a DATA-RETENTION decision (the rows are gone) and needs the migration '
+    + 'that deleted them; adding one needs a line saying which connector it belonged to.',
+  )
+})
+
+test('every retired-connector credential is still in SENSITIVE_SETTING_KEYS', async () => {
+  const { SENSITIVE_SETTING_KEYS } = await import('@/lib/settings-store')
+  for (const key of RETIRED_CONNECTOR_CREDENTIAL_KEYS) {
+    assert.ok(
+      SENSITIVE_SETTING_KEYS.has(key),
+      `${key} belongs to a retired connector whose rows still exist: it must stay in `
+      + 'SENSITIVE_SETTING_KEYS so getSetting gates it and serializeSettingValue encrypts it at rest',
+    )
+  }
+})
+
+for (const role of ['MANAGER', 'WAREHOUSE', 'READONLY'] as const) {
+  test(`getSetting refuses a ${role} session every retired-connector credential, against a SEEDED row`, async () => {
+    currentRole = role
+    const { getSetting } = await import('@/app/actions/settings')
+    let checked = 0
+    for (const key of RETIRED_CONNECTOR_CREDENTIAL_KEYS) {
+      // The row is PRESENT and holds a value. Without this, a refusal and a miss look identical.
+      seededSettingRows.set(key, `seeded-secret-for-${key}`)
+      recorder.reset()
+      await assert.rejects(
+        () => getSetting(key),
+        (error: unknown) => {
+          assert.equal((error as { permission?: string }).permission, 'settings')
+          assert.match(String((error as Error).message), /Forbidden: missing permission settings/)
+          return true
+        },
+        `${role} must not be able to read the stored ${key}`,
+      )
+      recorder.assertNoReads(`${role} reading ${key}`)
+      seededSettingRows.delete(key)
+      checked += 1
+    }
+    assert.equal(checked, RETIRED_CONNECTOR_CREDENTIAL_KEYS.length, 'the loop must have run for every key')
+    assert.ok(checked >= 6, `expected at least 6 retired credential keys, checked ${checked}`)
+  })
+}
+
+/**
+ * THE POSITIVE CONTROL FOR THE THREE CASES ABOVE. It is what makes them a statement about
+ * authorization rather than about an empty stub: the same seeded row, read by ADMIN, comes back with
+ * its value. So the refusals withheld something that was really there and really readable — which is
+ * exactly the exposure that was measured before the fix.
+ *
+ * ROUND 3 — AND THE READ RE-ENCRYPTS THE ROW, WHICH IS THE OTHER HALF OF WHY THE KEY STAYS IN
+ * `SENSITIVE_SETTING_KEYS`.
+ *
+ * The seeded value is PLAINTEXT, deliberately: that is the state an upgraded installation is in.
+ * Retiring a connector ships no migration, so its credential row still holds "whatever form it was
+ * last written" — and `RETIRED_CREDENTIAL_SETTING_KEYS` exists precisely so such a row is gated AND
+ * encrypted at rest rather than left plaintext for good.
  *
  * THE ONLY AUTOMATIC PATH THAT ENCRYPTS IT IS THIS READ. `bulkMigrateEncryptedSettings` has one
  * caller in the tree — `scripts/cli.ts`, a manual command wired into no install, update or deploy
@@ -387,7 +471,7 @@ const LEGACY_PLAINTEXT_KEYS = ['email_smtp_pass', 'backup_sftp_password'] as con
  * second call happened — a call-count assertion alone passes while the write throws and the row
  * stays plaintext, which is exactly what it did before the writer's result was checked.
  */
-test('a seeded legacy plaintext sensitive row is readable, masked, by ADMIN and is re-encrypted by the read', async () => {
+test('the seeded retired-connector rows ARE readable — by ADMIN, and only by ADMIN', async () => {
   currentRole = 'ADMIN'
   const { getSetting } = await import('@/app/actions/settings')
   const { hasSettingsEncryptionKey, isCurrentEncryptedSettingValue, decryptSettingValue } =
@@ -406,7 +490,7 @@ test('a seeded legacy plaintext sensitive row is readable, masked, by ADMIN and 
   const warnings: unknown[][] = []
   console.warn = (...args: unknown[]) => { warnings.push(args) }
   try {
-    for (const key of LEGACY_PLAINTEXT_KEYS) {
+    for (const key of RETIRED_CONNECTOR_CREDENTIAL_KEYS) {
       const plaintext = `seeded-secret-for-${key}`
       seededSettingRows.set(key, plaintext)
       recorder.reset()
@@ -453,8 +537,8 @@ test('a seeded legacy plaintext sensitive row is readable, masked, by ADMIN and 
   } finally {
     console.warn = originalWarn
   }
-  assert.equal(checked, LEGACY_PLAINTEXT_KEYS.length, 'the loop must have run for every key')
-  assert.ok(checked >= 2, `expected at least 2 keys, checked ${checked}`)
+  assert.equal(checked, RETIRED_CONNECTOR_CREDENTIAL_KEYS.length, 'the loop must have run for every key')
+  assert.ok(checked >= 6, `expected at least 6 retired credential keys, checked ${checked}`)
 })
 
 test('getSetting never returns the backup target secrets decrypted, even to an ADMIN (masked: first 4 chars + ****)', async () => {

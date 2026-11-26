@@ -278,7 +278,7 @@ export async function runPostMaintenanceRecheckForActiveConnector(
 ): Promise<(PostMaintenanceRecheckResult & { connector: WmsConnectorId }) | null> {
   const connectorId = await getEnabledWmsConnectorId()
   if (!connectorId) return null
-  // wms-neutral-refactor round 2 (Codex HIGH 3): this used to read `if (connectorId !== 'mintsoft')
+  // o3d-remove-shiphero round 2 (Codex HIGH 3): this used to read `if (connectorId !== 'mintsoft')
   // return null`, justified by "only Mintsoft implements a booked-in re-check". That justification
   // is a fact about today's registry, asserted in the generic layer, where it silently becomes a
   // rule about every future connector. The capability is now DECLARED — a connector with an ASN

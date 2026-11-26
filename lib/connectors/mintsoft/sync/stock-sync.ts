@@ -15,11 +15,13 @@ import {
   collectMissingInWmsCandidates,
   consolidateMintsoftStockLines,
   hasMintsoftThresholdBreach,
+  mintsoftAlignDownReasonState,
   planMintsoftAlignDown,
   planMintsoftAlignmentAllocations,
   parseMintsoftThresholds,
 } from './stock-sync-helpers'
 import { applyStockAdjustment } from '@/lib/domain/inventory/stock-adjustment-apply'
+import { readStockAdjustmentReasonCostRequired } from '@/lib/domain/inventory/stock-adjustment-policy'
 import {
   isTransferUsableForWmsReceipt,
   remainingCostableSnapshotQty,
@@ -65,6 +67,7 @@ import { enqueueStockSync } from '@/lib/shopping'
 // the WMS book-in in lib/domain/wms/booked-in-service.ts).
 import { classifyStockEnqueueFailure, type StockEnqueueOutcome } from '@/lib/domain/integrations/stock-enqueue-failure'
 import {
+  getAccountingSettings,
   getAccountingSettingsFor,
   getActiveAccountingConnectorId,
   queueAccountingSyncTx,
@@ -75,8 +78,7 @@ import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { recordGrirReceipt } from '@/lib/domain/accounting/grir-subledger-movement'
 import {
-  NO_PREPAYMENT_CHECKS, isPurchaseFxRefusalError, markPurchaseFxLockUsed, preparePurchaseReceiptFx, purchaseFxLayerFields, reportPurchaseFxFallback,
-  resolveReceiptFxValuation,
+  NO_PREPAYMENT_CHECKS, isPurchaseFxRefusalError, preparePurchaseReceiptFx, purchaseFxLayerFields, resolveReceiptFxValuation,
   type PrepaymentChecks, type ReceiptFxValuation,
 } from '@/lib/domain/purchasing/purchase-receipt-fx'
 import { isPurchaseEventFxEnabled } from '@/lib/domain/purchasing/purchase-event-fx-settings'
@@ -1536,27 +1538,14 @@ async function loadAlignmentPurchaseLineCost(
   return requested
 }
 
-/**
- * Per-event FX: the purchase orders this product's open Mintsoft ASN lines in this warehouse could ABSORB a rise into, read before the transaction. An
- * unlocked SUPERSET of the candidates the locked re-read will keep, but only orders with capacity left (MED-2): an ASN line with nothing left to expect,
- * a closed/cancelled order, or a PO line already fully received offers none, so asking Xero about it would spend the request budget shared with the
- * other integrations for an order no unit can land on.
- */
+/** Per-event FX: the purchase orders this product's open Mintsoft ASN lines in this warehouse belong to (an unlocked superset, read before the transaction). */
 async function alignmentPurchaseOrderIds(binding: SyncBinding, productId: string): Promise<string[]> {
-  const maps = await db.wmsAsnLineMap.findMany({
+  const lineIds = (await db.wmsAsnLineMap.findMany({
     where: { productId, sourceType: 'PURCHASE_ORDER_LINE', asn: { connector: 'mintsoft', warehouseId: binding.warehouseId, closedAt: null } },
-    select: { sourceLineId: true, expectedQty: true, qtyAccountedViaSnapshot: true, lastProcessedReceivedQty: true },
-  })
-  const withRoom = maps.filter((map) => resolveWmsAsnLineResidualQty({ asnLineMapId: '', ...map }).qty.gt(0))
-  if (withRoom.length === 0) return []
-  const lines = await db.purchaseOrderLine.findMany({
-    where: { id: { in: [...new Set(withRoom.map((map) => map.sourceLineId))] } },
-    select: { poId: true, qty: true, qtyReceived: true, po: { select: { status: true } } },
-  })
-  // `qty - qtyReceived` over-states the room (the alignment lands units without writing qtyReceived), which is the safe direction for a superset.
-  return lines
-    .filter((line) => isPurchaseOrderUsableForWmsReceipt(line.po.status) && new Prisma.Decimal(line.qty).gt(line.qtyReceived))
-    .map((line) => line.poId)
+    select: { sourceLineId: true },
+  })).map((row) => row.sourceLineId)
+  if (lineIds.length === 0) return []
+  return (await db.purchaseOrderLine.findMany({ where: { id: { in: lineIds } }, select: { poId: true } })).map((line) => line.poId)
 }
 
 /**
@@ -1624,12 +1613,13 @@ export async function applyMintsoftAlignmentForProduct(params: {
   // before any cost is read. A refusal leaves stock unchanged and is reported as this alignment's reason, like any other refusal here.
   let purchaseFxChecks: PrepaymentChecks = NO_PREPAYMENT_CHECKS
   if (!params.dryRun && await isPurchaseEventFxEnabled(db)) {
-    // MED-3: refusals are recorded PER ORDER (collectRefusals). One order's ambiguous prepayment or failed read refuses the alignment only if that order
-    // is really a candidate the plan allocates to (the cost pass below throws it then); an order the plan never reaches costs the others nothing.
-    purchaseFxChecks = await preparePurchaseReceiptFx(await alignmentPurchaseOrderIds(params.binding, params.productId), { collectRefusals: true })
+    try {
+      purchaseFxChecks = await preparePurchaseReceiptFx(await alignmentPurchaseOrderIds(params.binding, params.productId))
+    } catch (refusal) {
+      if (!isPurchaseFxRefusalError(refusal)) throw refusal
+      return { applied: false, dryRun: false, correctedQty: 0, reason: refusal.message }
+    }
   }
-  // The valuations this alignment laid goods at, reported after the commit (MED-5).
-  const purchaseFxValuations = new Map<string, ReceiptFxValuation>()
 
   const outcome = await db.$transaction(async (tx) => {
     // THE LOCKS, IN THE GLOBAL ORDER (6oyu.19, Codex round-9 HIGH-1).
@@ -2055,9 +2045,6 @@ export async function applyMintsoftAlignmentForProduct(params: {
           adjustmentMovementId: movement.id,
           ...purchaseFxLayerFields(purchaseCost.fxValuation, candidate.sourceLineId),
         })
-        // Per-event FX: the lock is used once goods are laid at its rate (LOW-11).
-        await markPurchaseFxLockUsed(tx, purchaseCost.fxValuation, now)
-        if (purchaseCost.fxValuation) purchaseFxValuations.set(purchaseCost.fxValuation.poId, purchaseCost.fxValuation)
 
         // ─── o3d-6nd55: THE RECEIPT JOURNAL, IN THE SAME TRANSACTION AS THE STOCK ───
         //
@@ -2376,8 +2363,6 @@ export async function applyMintsoftAlignmentForProduct(params: {
 
   let alignEnqueue: StockEnqueueOutcome = 'ok'
   if (outcome.kind === 'applied') {
-    // MED-5: an order whose goods were laid at the table rate while Xero sync is on and Xero holds no prepayment with its reference.
-    for (const valuation of purchaseFxValuations.values()) await reportPurchaseFxFallback(valuation, 'Mintsoft alignment')
     // A negative landed cost larger than the goods cost was held at zero for some of these layers: the
     // durable WARNING is written now, AFTER the commit, one entry per purchase order.
     const floorReportsByPo = new Map<string, { poReference: string; entries: FlooredLandedCreditEntry[] }>()
@@ -2493,7 +2478,7 @@ async function applyMintsoftAlignDownForProduct(params: {
   stockEnqueue?: Exclude<StockEnqueueOutcome, 'ok'>
   reason: string
 }> {
-  const [priorDiscrepancy, openAsnPendingQty, inFlightDispatch, stockLevel, alignDownReason] = await Promise.all([
+  const [priorDiscrepancy, openAsnPendingQty, inFlightDispatch, stockLevel, alignDownReason, reasonCostRequired] = await Promise.all([
     db.wmsStockDiscrepancy.findFirst({
       where: buildDiscrepancyWhere(params.binding, 'QTY_MISMATCH', params.productId, params.sku),
       select: { delta: true, lastSeenAt: true },
@@ -2519,14 +2504,24 @@ async function applyMintsoftAlignDownForProduct(params: {
           select: { active: true, accountCode: true },
         })
       : Promise.resolve(null),
+    // o3d-jwa8m: switch off = no further read; the plan below sees exactly the inputs it always did.
+    readStockAdjustmentReasonCostRequired(db),
   ])
+  const reasonState = mintsoftAlignDownReasonState({
+    reason: alignDownReason,
+    reasonCostRequired,
+    inventoryAccount: reasonCostRequired && alignDownReason?.active && alignDownReason?.accountCode
+      ? (await getAccountingSettings()).inventoryAccount
+      : null,
+  })
 
   const decision = planMintsoftAlignDown({
     delta: params.delta,
     imsQty: params.imsQty,
     wmsQty: params.wmsQty,
     reservedQty: Number(stockLevel?.reservedQty ?? 0),
-    reasonConfigured: Boolean(alignDownReason?.active && alignDownReason?.accountCode),
+    reasonConfigured: reasonState.reasonConfigured,
+    ...(reasonState.inventoryAccountMissing ? { inventoryAccountMissing: true } : {}),
     thresholds: parseMintsoftThresholds(params.binding.discrepancyThresholds),
     openAsnPendingQty,
     inFlightDispatchQty: inFlightDispatch.qty,

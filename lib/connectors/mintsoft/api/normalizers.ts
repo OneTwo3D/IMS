@@ -174,6 +174,7 @@ export function normalizeMintsoftWarehouse(value: unknown): WmsWarehouseRef | nu
  *   reconciliation pack R1 ("IMS stock_levels equal Mintsoft on-hand"): declarative; its claim
  *     was already on-hand and is now true of the sync's figure    NO CHANGE
  *   first-load: operator-supplied 3PL export file, never this API  NO CHANGE
+ *   ShipHero: removed from the repo (docs/archive/shiphero-connector-removal.md)  N/A
  * `available` is carried for diagnostics only; nothing may compare it with IMS on hand.
  */
 function readStockInteger(record: Record<string, unknown>, field: string, where: string): number | undefined {

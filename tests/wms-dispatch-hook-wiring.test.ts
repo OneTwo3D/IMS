@@ -4,9 +4,9 @@
  * WHY THIS FILE EXISTS ALONGSIDE tests/wms-second-connector-seam-production.test.ts. That file
  * REPLACES the registry module with a seam registry holding a fictitious `acme-wms` and an inert
  * Mintsoft that declares no hooks at all, so it can prove the generic layer routes by capability.
- * What it cannot prove — and what the round-10 audit of wms-neutral-refactor found nothing proved —
+ * What it cannot prove — and what the round-10 audit of o3d-remove-shiphero found nothing proved —
  * is that THE CONNECTOR THIS BUILD SHIPS still declares the hooks the generic layer routes to. Two
- * of those hooks were inline code before wms-neutral-refactor:
+ * of those hooks were inline code before o3d-remove-shiphero:
  *
  *   - `hooks.dispatchPrecondition` was `if (!isDispatchClientScoped(...)) return { SKIPPED }` inside
  *     lib/domain/wms/dispatch-sweep.ts. It is a FAIL-CLOSED CROSS-TENANT GATE: unscoped, every

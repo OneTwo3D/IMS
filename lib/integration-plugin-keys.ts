@@ -19,7 +19,7 @@
  * resolver setting. (Module mocks are unaffected: `mock.module('@/lib/connectors/wms/types')`
  * resolves to the same file URL and still intercepts this import.)
  *
- * o3d-m0ad / wms-neutral-refactor round 8 (Codex HIGH 2) — WHY THE WMS IDS ARE NOT SPELLED HERE.
+ * o3d-m0ad / o3d-remove-shiphero round 8 (Codex HIGH 2) — WHY THE WMS IDS ARE NOT SPELLED HERE.
  * This module used to enumerate five literal ids, one of which happened to be the shipped WMS
  * connector. A SECOND registered WMS connector was therefore not an integration plugin at all: it
  * had no id in the union, no setting key, no place in the state record and no row in the lock set —
@@ -51,7 +51,7 @@ export const INTEGRATION_PLUGIN_IDS: readonly IntegrationPluginId[] = [
 
 /**
  * THE MUTUALLY EXCLUSIVE GROUPS — derived, so a registered WMS connector joins one by construction
- * (wms-neutral-refactor round 10, Codex HIGH 1).
+ * (o3d-remove-shiphero round 10, Codex HIGH 1).
  *
  * WHAT WENT WRONG. Exclusivity used to be two hand-written `if` pairs inside each of the two
  * writers (one per pair of mutually exclusive connectors). Round 8 made the settings toggles

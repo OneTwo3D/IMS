@@ -40,11 +40,11 @@ test('a DISABLED WooCommerce plugin still reaches handleWcWebhook (durable persi
   assert.deepEqual(await res.json(), { accepted: true, deferred: true, reason: 'woocommerce_plugin_disabled' })
 })
 
-// The subject used to be a second REGISTERED storefront connector.
+// o3d-remove-parked-connectors: the subject used to be 'shopify', the second REGISTERED connector.
 // It is archived, so this now drives an id the union does not contain — which is what the branch
 // itself has become: statically unreachable, kept as the default-deny for whatever is registered
-// next. Weaker than a second shipped connector, and recorded as such in the
-// removal note under docs/archive/.
+// next. Weaker than a second shipped connector, and recorded as such in
+// docs/archive/shopify-connector-removal.md.
 test('a connector with no durable-persist path still rejects with a retryable 423 (o3d-56b)', async () => {
   const handleShoppingWebhook = await loadDispatcher()
   const res = await handleShoppingWebhook(UNREGISTERED_CONNECTOR, 'orders', req(), '{}')

@@ -127,11 +127,11 @@ function makeFakeRepo(store: FakeStore, connector: ShoppingWebhookEventConnector
  * o3d-remove-parked-connectors — WHAT THIS ASSERTION USED TO SAY, AND WHY IT SAYS LESS NOW.
  *
  * It was `>= 2`, and that was the one place the SHIPPED registry was proved to be genuinely
- * multi-entry rather than a WooCommerce constant with extra steps. The second storefront entry
- * was archived, so no assertion over the shipped registry can prove that any more: with one entry,
+ * multi-entry rather than a WooCommerce constant with extra steps. Shopify was the second entry and
+ * is archived, so no assertion over the shipped registry can prove that any more: with one entry,
  * "the ingress is registry-driven" and "the ingress hardcodes WooCommerce" produce identical
  * results here. Lowering it to `>= 1` is therefore a REAL loss of coverage, not a cosmetic edit,
- * and it is recorded as such in the archived storefront's removal note under docs/archive/ ("What is no longer
+ * and it is recorded as such in docs/archive/shopify-connector-removal.md ("What is no longer
  * proven"). What IS still proved below, and matters more, is that the persist and process CORES
  * take the connector as a parameter — those tests drive a fictitious 'newshop' through them and
  * would fail if the core grew a `=== 'woocommerce'` branch.
@@ -199,9 +199,9 @@ test('persist core dedups a replayed event by (connector, resource, payloadHash)
   assert.equal(replay.event.id, first.event.id)
 })
 
-// ONE WRAPPER LEFT. This case used to compare TWO connector-specific
-// wrappers -- persistWcWebhookEvent and the archived storefront's -- and the comparison is what
-// showed neither of them did anything but name its connector. With the second storefront archived there is one
+// ONE WRAPPER LEFT (o3d-remove-parked-connectors). This case used to compare TWO connector-specific
+// wrappers -- persistWcWebhookEvent and persistShopifyWebhookEvent -- and the comparison is what
+// showed neither of them did anything but name its connector. With Shopify archived there is one
 // wrapper, so the case now shows only that IT delegates with its own connector; a core that
 // hardcoded 'woocommerce' would still pass it. The delegation is covered above instead, by driving
 // the core directly with 'newshop'.

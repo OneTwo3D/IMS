@@ -36,11 +36,11 @@ onetwo3d-ims/
 │   ├── api/                  # API routes and webhooks
 │   │   ├── auth/             # NextAuth routes, TOTP, passkey setup
 │   │   ├── cron/             # Scheduled jobs
-│   │   │   ├── fx-rates      # Daily FX rate refresh (source per fx_rate_source: ecb/frankfurter or aelia)
+│   │   │   ├── fx-rates      # Daily FX rate fetch (frankfurter.dev)
 │   │   │   ├── wc-sync       # WooCommerce polling sync (if webhooks disabled)
-│   │   │   ├── accounting-daily-batch # Daily accounting sub-ledger batch sync (Xero)
-│   │   │   ├── accounting-sync # Accounting sync-row processing (Xero)
-│   │   │   ├── accounting-payment-poll # Payment status polling from Xero
+│   │   │   ├── xero-daily-batch # Daily Xero sub-ledger batch sync
+│   │   │   ├── xero-sync     # Real-time Xero sync (deprecated, use daily-batch)
+│   │   │   ├── xero-payment-poll # Payment status polling from Xero
 │   │   │   ├── delivery-status # Update delivery status on SalesOrders
 │   │   │   ├── activity-cleanup # Archive old activity logs
 │   │   │   └── backup        # Automated database backups

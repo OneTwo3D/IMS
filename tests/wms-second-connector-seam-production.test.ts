@@ -1,6 +1,6 @@
 /**
  * THE SECOND-CONNECTOR SEAM, DRIVEN THROUGH THE PRODUCTION ENTRYPOINTS
- * (wms-neutral-refactor round 2, Codex HIGH 1 + HIGH 2).
+ * (o3d-remove-shiphero round 2, Codex HIGH 1 + HIGH 2).
  *
  * WHY THIS FILE EXISTS SEPARATELY FROM tests/wms-second-connector-seam.test.ts. That file proves
  * the generic layer BEHAVES generically when it is handed a fictitious connector. Codex's finding
@@ -276,7 +276,7 @@ test('seam/production: the /sync dashboard facade dispatches to a registered non
   assert.equal(
     data!.connectorLabel, ACME_WMS_LABEL,
     'the /sync panel is a CLIENT component and cannot read the registry, so the label travels in the DTO'
-    + ' (wms-neutral-refactor round 6) — without it an unknown connector is shown to an operator as a raw id',
+    + ' (o3d-remove-shiphero round 6) — without it an unknown connector is shown to an operator as a raw id',
   )
   assert.equal(data!.configured, true, 'the connector said it is configured, and the facade must carry that through')
 
@@ -307,7 +307,7 @@ test('seam/production: the onboarding facade reports a registered non-Mintsoft c
 })
 
 /**
- * THE TEST THAT USED TO PIN THE DEFECT (wms-neutral-refactor round 8, Codex HIGH 1).
+ * THE TEST THAT USED TO PIN THE DEFECT (o3d-remove-shiphero round 8, Codex HIGH 1).
  *
  * WHAT IT ASSERTED, AND WHY THAT WAS WRONG. Until round 8 this case ended
  * `assert.equal(dashboard!.configured, false)` — for a connector whose `isConfigured()` returns
@@ -367,7 +367,7 @@ test('seam/production: the SAME no-panel connector reports unconfigured when its
 })
 
 test('seam/production: a connector whose isConfigured THROWS is reported unconfigured, not propagated', async () => {
-  // wms-neutral-refactor round 10, Codex HIGH 2 — and the case the round-10 comment on the registry
+  // o3d-remove-shiphero round 10, Codex HIGH 2 — and the case the round-10 comment on the registry
   // mock above would otherwise only CLAIM. `AcmeWmsConnector.isConfigured()` returns a boolean and
   // cannot throw, so without this the contained reader and the bare `findWmsConnector(id)
   // .isConfigured()` it replaced are indistinguishable in this file: the try/catch is never entered.

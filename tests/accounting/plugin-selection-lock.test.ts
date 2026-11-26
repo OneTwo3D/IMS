@@ -311,8 +311,8 @@ test('a scheduler failure AFTER the commit is reported as committed, not as a re
     result.pluginState,
     // EVERY REGISTERED ID, read back under the lock rather than echoed from the request. (It used
     // to be phrased as "six keys, not the five the payload carries"; the payload type is now the
-    // whole id union, and removing the retired connectors took the count down to
-    // four. The point is unchanged: this is the database's answer.)
+    // whole id union, and Shopify's removal took the count from six to four —
+    // o3d-remove-parked-connectors. The point is unchanged: this is the database's answer.)
     { woocommerce: true, xero: true, mintsoft: false },
     'and the COMMITTED state is returned, so the caller need not guess from its own copy',
   )
@@ -461,12 +461,12 @@ test('EVERY plugin key is locked, in one canonical order', async () => {
   // registry, and one order for one lock set is what stops two callers taking the same rows in
   // opposite orders and deadlocking.
   //
-  // wms-neutral-refactor: this used to assert the literal count 6. A hardcoded count is a worse test
+  // o3d-remove-shiphero: this used to assert the literal count 6. A hardcoded count is a worse test
   // than it looks — it fails when a connector is legitimately added OR removed, and it says nothing
   // about which keys those are. What matters is that the lock set is EXACTLY the registry, so that
   // is what is asserted; the non-empty check is what stops the comparison passing vacuously if both
   // sides ever became empty.
-  // wms-neutral-refactor round 10: this compared the lock order to `Object.values(SETTING_KEYS)`,
+  // o3d-remove-shiphero round 10: this compared the lock order to `Object.values(SETTING_KEYS)`,
   // and both are `INTEGRATION_PLUGIN_IDS.map(id => SETTING_KEYS[id])` — the SAME expression, so
   // after `.sort()` they were equal by construction and the deepEqual could fail only on a
   // duplicate id. The expectation is now re-derived from the ID list and the key RULE, which is an
@@ -1408,9 +1408,6 @@ const MIGRATIONS_THAT_DELETE_RETIRED_PLUGIN_KEYS: Record<string, string> = {
   '20261122140000_purge_retired_accounting_settings':
     'Deletes the plugin flag of a retired accounting connector. No current plugin reads or writes that key, '
     + 'so the active connector cannot change and there is nothing for the selection lock to serialize.',
-  '20261126120000_purge_retired_storefront_wms_settings':
-    'Deletes the plugin flags of a retired storefront and a retired WMS. No current plugin reads or writes '
-    + 'either key, so the active connector cannot change and there is nothing for the selection lock to serialize.',
 }
 
 test('no repo migration writes a plugin selection key', () => {
@@ -1558,10 +1555,6 @@ const MIGRATIONS_THAT_MUTATE_SETTINGS: Record<string, string> = {
     'Deletes the plugin flag and the prefixed settings rows of a retired accounting connector, by one exact '
     + 'key and one escaped LIKE prefix. No current plugin key matches either, and nothing in the build reads '
     + 'those rows, so it cannot change the active connector or race the orphan-cancel sweep.',
-  '20261126120000_purge_retired_storefront_wms_settings':
-    'Deletes two plugin flags of retired connectors by exact key, plus two escaped LIKE prefixes of their '
-    + 'settings rows. No current plugin key matches any of them, and nothing in the build reads those rows, '
-    + 'so it cannot change the active connector or race the orphan-cancel sweep.',
   '20260819210000_xero_pin_write_consumes_release':
     'Deletes ONE key by exact literal match (xero_pin_release_witness), in two places: the backfill, '
     + 'and the body of the trigger it installs. Neither can reach a plugin key — the literal is the '

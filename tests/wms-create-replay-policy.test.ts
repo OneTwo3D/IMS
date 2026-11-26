@@ -17,7 +17,7 @@ import { ACME_WMS_ID, makeSeamRegistry } from './helpers/fictitious-wms-connecto
  * not a cosmetic error: `remote-refuses-duplicate` on a connector that does not refuse duplicates
  * re-enables the exact duplicate-fulfilment this round exists to stop.
  *
- * wms-neutral-refactor: the unsafe half of this table used to be covered by a removed WMS. It is now
+ * o3d-remove-shiphero: the unsafe half of this table used to be covered by ShipHero. It is now
  * covered by a REGISTERED fictitious connector, because covering it with a bare unknown id would
  * not cover it at all — see the fail-closed test below for why those two are not the same thing.
  */
