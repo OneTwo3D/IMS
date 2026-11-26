@@ -245,7 +245,7 @@ for (const runner of ['outbox', 'direct'] as const) {
     assert.equal(refunds[0]!.creditNoteId, s.creditNoteId)
     assert.equal(refunds[0]!.accountId, account.externalAccountId, 'from the account the original receipt\'s method maps to')
     assert.equal(refunds[0]!.amount, 24, 'the credit left on the note (a shop refund is paid back whole)')
-    assert.equal(refunds[0]!.currencyRate, 0.8, 'IMS\'s settlement rate (1 / 1.25) is the payment\'s CurrencyRate, so Xero books the realised FX')
+    assert.equal(refunds[0]!.currencyRate, 1.25, 'IMS\'s settlement rate (1.25, as is: Xero\'s CurrencyRate is foreign per base; it was 1 / 1.25 = 0.8 until the direction was verified) is the payment\'s CurrencyRate, so Xero books the realised FX')
     assert.equal(payload.settlementRateToBase, 1.25)
   })
 }

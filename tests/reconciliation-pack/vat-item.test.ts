@@ -368,27 +368,30 @@ test('BASE CURRENCY: an IMS or Xero base currency other than GBP compares nothin
   assert.deepEqual([xero.xero.calls.length, xero.woo.calls.length], [1, 0], 'only the organisation read was made')
 })
 
-// [mutation: Xero's rate divided instead of multiplied / the Woo rate multiplied instead of divided]
-test('FX: a foreign Xero invoice is put in GBP by MULTIPLYING Xero\'s CurrencyRate (1 document-currency = X base, connectors/xero/fx.ts) and a foreign Woo order by DIVIDING the fxRateToBase IMS recorded (1 base = X foreign)', async () => {
-  // A realistic EUR order. IMS records fxRateToBase 1.25 (1 GBP = 1.25 EUR); the connector posts Xero CurrencyRate 1/1.25 = 0.8 (GBP per EUR).
+// [mutation: Xero's rate multiplied instead of divided / the Woo rate multiplied instead of divided]
+// GOLDEN VALUES CHANGED DELIBERATELY: this arm pinned the inverted reading (Xero CurrencyRate 0.8 GBP per EUR, multiplied). Xero's
+// CurrencyRate is foreign per base, the same convention as fxRateToBase (verified on the live organisation, lib/connectors/xero/fx.ts),
+// so the Xero side is DIVIDED by it, exactly as the Woo side is divided by fxRateToBase.
+test('FX: a foreign Xero invoice is put in GBP by DIVIDING Xero\'s CurrencyRate (1 base = X document-currency, connectors/xero/fx.ts) and a foreign Woo order by DIVIDING the fxRateToBase IMS recorded (1 base = X foreign)', async () => {
+  // A realistic EUR order. IMS records fxRateToBase 1.25 (1 GBP = 1.25 EUR); the connector posts Xero CurrencyRate 1.25 as is.
   // EUR 50 of VAT is GBP 40 in all three places.
   const s = standard({
     xero: [
       invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }]),
-      invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 50 }], { CurrencyCode: 'EUR', CurrencyRate: 0.8 }),
+      invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 50 }], { CurrencyCode: 'EUR', CurrencyRate: 1.25 }),
       invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }]),
     ],
     woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '60.00']]), wooOrder(102, '2026-09-21T10:00:00', [[11, '50.00']], { currency: 'EUR' }), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
     ims: { wooFx: [{ externalOrderId: '102', currency: 'EUR', fxRateToBase: '1.25' }] },
   })
   assert.deepEqual(reasons(await run(s.ctx)), ['pass'])
-  // The reversed calculation (EUR 50 at 1.25 treated as GBP per EUR) gives GBP 62.50, not 40: a finding, never a pass.
-  const reversed = standard({ xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 50 }], { CurrencyCode: 'EUR', CurrencyRate: 1.25 }), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] })
+  // An inverted rate on the Xero invoice (0.8, GBP per EUR) puts EUR 50 at GBP 62.50, not 40: a finding, never a pass.
+  const reversed = standard({ xero: [invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }]), invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 50 }], { CurrencyCode: 'EUR', CurrencyRate: 0.8 }), invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])] })
   const item = await run(reversed.ctx)
   assert.equal(item.outcome, 'fail')
   assert.deepEqual(keys(item, 'bothDiffer').sort(), ['ims-xero|2026-09|GB|domestic', 'xero-woo|2026-09|GB|domestic'])
   const entry = item.entries!.bothDiffer!.find((e) => e.key === 'ims-xero|2026-09|GB|domestic')!
-  assert.equal(entry.vendor, '122.5', '60 + 50 x 1.25')
+  assert.equal(entry.vendor, '122.5', '60 + 50 / 0.8')
 })
 
 test('FX: a foreign Woo order with no linked IMS rate, a different currency, or a non-positive rate is CURRENCY_UNKNOWN; a foreign zero-tax order needs none', async () => {

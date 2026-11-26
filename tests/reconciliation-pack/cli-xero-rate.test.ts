@@ -13,6 +13,7 @@ import { binding, creditNoteRow, eurInvoice, noSleep, paymentRow, rateDouble, uu
  * THE WHOLE COMMAND, R16: the pack run end to end against a FAKE Xero client (a GET-only port, nothing on any network) and a scripted IMS
  * connection. Without --vendor-reads-only nothing is read; with it the rate check reads the IMS rates and the three Xero lists, publishes its
  * report and evidence, and makes no write. Mutations are listed in the PR.
+ * Xero-side rates are foreign per base (IMS's convention): the equal euro rate is 1.25 (it was the reciprocal 0.8 until the direction was verified).
  */
 
 const bases: string[] = []
@@ -52,7 +53,7 @@ const argv = (dir: string, ...more: string[]) => ['--phase', 'P1', '--as-of', D,
 const line = (r: Rig) => r.out.find((l) => l.startsWith('R16 '))
 
 test('WITHOUT --vendor-reads-only R16 is inconclusive VENDOR_READS_OFF: the fake Xero is never touched and the IMS rates are never read', async () => {
-  const xero = rateDouble({ invoices: [eurInvoice(1, 0.8)] })
+  const xero = rateDouble({ invoices: [eurInvoice(1, 1.25)] })
   const r = rig(xero)
   assert.equal(await run(r, argv(scratchDir(bases))), 5)
   assert.equal(line(r), 'R16 inconclusive VENDOR_READS_OFF')
@@ -64,9 +65,9 @@ test('WITHOUT --vendor-reads-only R16 is inconclusive VENDOR_READS_OFF: the fake
 // [mutation: the runner not registered / the vendor ports not handed to it / a write in the run]
 test('WITH --vendor-reads-only R16 checks every foreign document and payment against the IMS rate, publishes its entries, and the whole run only reads', async () => {
   const xero = rateDouble({
-    invoices: [eurInvoice(1, 0.8), eurInvoice(2, 0.8)],
-    creditNotes: [creditNoteRow({ n: 3, date: '2026-09-11', currency: 'EUR', rate: 0.8 })],
-    payments: [paymentRow({ n: 4, date: '2026-09-12', currency: 'EUR', rate: 0.8 })],
+    invoices: [eurInvoice(1, 1.25), eurInvoice(2, 1.25)],
+    creditNotes: [creditNoteRow({ n: 3, date: '2026-09-11', currency: 'EUR', rate: 1.25 })],
+    payments: [paymentRow({ n: 4, date: '2026-09-12', currency: 'EUR', rate: 1.25 })],
   })
   const r = rig(xero)
   const dir = scratchDir(bases)
@@ -87,7 +88,7 @@ test('WITH --vendor-reads-only R16 checks every foreign document and payment aga
 })
 
 test('a differing Xero rate fails the item with both rates in the evidence, and a missing IMS rate is listed with the lookup\'s reason', async () => {
-  const xero = rateDouble({ invoices: [eurInvoice(1, 0.8), eurInvoice(2, 0.82), eurInvoice(3, 0.8, '2026-09-09')] })
+  const xero = rateDouble({ invoices: [eurInvoice(1, 1.25), eurInvoice(2, 0.82), eurInvoice(3, 1.25, '2026-09-09')] })
   const r = rig(xero)
   const dir = scratchDir(bases)
   assert.equal(await run(r, argv(dir, '--vendor-reads-only')), 1)
@@ -96,12 +97,12 @@ test('a differing Xero rate fails the item with both rates in the evidence, and 
   assert.ok(chain.ok && chain.head)
   const evidence = allFiles(dir).filter((f) => f.endsWith('evidence.jsonl')).map((f) => readFileSync(f, 'utf8')).join('\n')
   const rows = evidence.split('\n').filter((l) => l.startsWith('{')).map((l) => JSON.parse(l) as Record<string, unknown>).filter((l) => l.item === 'R16')
-  assert.deepEqual(rows.filter((l) => l.bucket === 'bothDiffer').map((l) => [l.key, l.ims, l.vendor]), [[`xero-rate|sales-invoice|${uuid(2)}`, '0.8', '0.82']])
-  assert.deepEqual(rows.filter((l) => l.bucket === 'onlyVendor').map((l) => [l.key, l.ims, l.vendor]), [[`xero-rate|sales-invoice|${uuid(3)}|ims-rate-missing|no-rate`, null, '0.8']])
+  assert.deepEqual(rows.filter((l) => l.bucket === 'bothDiffer').map((l) => [l.key, l.ims, l.vendor]), [[`xero-rate|sales-invoice|${uuid(2)}`, '1.25', '0.82']])
+  assert.deepEqual(rows.filter((l) => l.bucket === 'onlyVendor').map((l) => [l.key, l.ims, l.vendor]), [[`xero-rate|sales-invoice|${uuid(3)}|ims-rate-missing|no-rate`, null, '1.25']])
 })
 
 test('an unproven Xero list makes the command report R16 inconclusive and still publish', async () => {
-  const xero = rateDouble({ invoices: [eurInvoice(1, 0.8)] }, { tweak: (call, _n, page) => (call.resource === 'CreditNotes' ? { ...page, body: { CreditNotes: [] } } : undefined) })
+  const xero = rateDouble({ invoices: [eurInvoice(1, 1.25)] }, { tweak: (call, _n, page) => (call.resource === 'CreditNotes' ? { ...page, body: { CreditNotes: [] } } : undefined) })
   const r = rig(xero)
   assert.equal(await run(r, argv(scratchDir(bases), '--vendor-reads-only')), 5)
   assert.equal(line(r), 'R16 inconclusive SOURCE_UNREADABLE')

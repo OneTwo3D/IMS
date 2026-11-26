@@ -35,7 +35,7 @@ export type ForeignRateRefusal = {
   detail: Record<string, unknown>
 }
 
-/** True when the value is a usable IMS rate: a finite number (or numeric string) greater than zero that survives the 1/rate, 6 dp conversion. */
+/** True when the value is a usable IMS rate: a finite number (or numeric string) greater than zero that survives the 6 dp rounding Xero's CurrencyRate takes. */
 export function isUsableImsRate(value: unknown): boolean {
   if (typeof value !== 'number' && typeof value !== 'string') return false
   if (typeof value === 'string' && value.trim() === '') return false

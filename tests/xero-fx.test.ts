@@ -5,11 +5,14 @@ import { XERO_SALES_CREDIT_NOTE_TYPE } from '../lib/connectors/xero/credit-notes
 import { imsRateToXeroCurrencyRate } from '../lib/connectors/xero/fx.ts'
 import { buildXeroIdempotencyKey } from '../lib/connectors/xero/sync-processor.ts'
 
-test('inverts IMS fxRateToBase into Xero CurrencyRate', () => {
-  // Base GBP, document EUR. IMS stores 1 GBP = 1.18 EUR.
-  // Xero expects 1 EUR = X GBP → 1 / 1.18 ≈ 0.847458 (6dp).
+// GOLDEN VALUES CHANGED DELIBERATELY: these four arms pinned the INVERTED rate (1 / fxRateToBase). Xero's CurrencyRate is units of
+// foreign per one base, the same convention as IMS's fxRateToBase (verified on the live organisation's own bills, see
+// lib/connectors/xero/fx.ts and tests/connectors/xero-currency-rate-direction.test.ts), so the rate is sent as is, rounded to 6 dp.
+test('sends IMS fxRateToBase as Xero CurrencyRate unchanged, never inverted', () => {
+  // Base GBP, document EUR. IMS stores 1 GBP = 1.18 EUR, and so does Xero.
   const got = imsRateToXeroCurrencyRate(1.18)
-  assert.equal(got, 0.847458)
+  assert.equal(got, 1.18)
+  assert.notEqual(got, 0.847458, 'the reciprocal is the old, wrong direction')
 })
 
 test('passes through 1.0 unchanged for same-currency invoices', () => {
@@ -17,16 +20,16 @@ test('passes through 1.0 unchanged for same-currency invoices', () => {
 })
 
 test('rounds to 6 decimal places to match Xero Decimal(18,6) schema', () => {
-  // 1 / 3 = 0.333... → must be 6dp, not full float precision.
-  const got = imsRateToXeroCurrencyRate(3)
-  assert.equal(got, 0.333333)
+  // A stored rate with more precision than Xero accepts is rounded half up to 6dp, not sent at full float precision.
+  assert.equal(imsRateToXeroCurrencyRate(1.3526509931), 1.352651)
+  assert.equal(imsRateToXeroCurrencyRate(1.1835295458), 1.18353)
+  assert.equal(imsRateToXeroCurrencyRate(8.937375334), 8.937375)
 })
 
-test('handles JPY-scale rates (very small inverted rate) without underflow', () => {
-  // Base GBP, doc JPY. 1 GBP ≈ 190 JPY → 1/190 ≈ 0.005263 (6dp).
-  // Make sure the rate doesn't get rounded to 0 or to a wrong order of magnitude.
-  const got = imsRateToXeroCurrencyRate(190)
-  assert.equal(got, 0.005263)
+test('handles JPY-scale rates (a large rate) without losing magnitude', () => {
+  // Base GBP, doc JPY. 1 GBP ≈ 190 JPY: Xero holds 190, never 1/190 ≈ 0.005263.
+  assert.equal(imsRateToXeroCurrencyRate(190), 190)
+  assert.equal(imsRateToXeroCurrencyRate(190.1234567), 190.123457)
 })
 
 test('returns undefined for missing, zero, negative, and non-finite rates', () => {

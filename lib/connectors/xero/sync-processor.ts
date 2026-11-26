@@ -5331,7 +5331,7 @@ function xeroPostingMode(payload: SyncPayload): LedgerPostingMode {
  * o3d-q0x56.2 - THE `CurrencyRate` A XERO PAYMENT CARRIES, OR A NAMED REFUSAL.
  *
  * The payload's `settlementRateToBase` is the rate IMS resolved for THIS payment when it recorded it (1 base = X payment currency). It is
- * converted here (1 / rate, 6 dp) and sent as the payment's `CurrencyRate`, so Xero books the realised FX gain/loss at IMS's rate and
+ * rounded here (the same rate, 6 dp: Xero's CurrencyRate is also 1 base = X foreign) and sent as the payment's `CurrencyRate`, so Xero books the realised FX gain/loss at IMS's rate and
  * never at its own XE.com day rate. This function never looks a rate up: the work carries it, or the payment is not sent.
  *
  *   - a payment with no `currency` in its payload is refused: whether it is foreign cannot be told, and guessing "base" is what would
@@ -7540,7 +7540,7 @@ export async function processClaimedEntry(
             Account: { AccountID: account.externalAccountId },
             Date: paymentDate,
             Amount: amount,
-            // o3d-q0x56.2: IMS's settlement rate for this payment (1 / rate, 6 dp), so Xero books the realised FX at IMS's rate, not its XE.com day
+            // o3d-q0x56.2: IMS's settlement rate for this payment (as is, 6 dp), so Xero books the realised FX at IMS's rate, not its XE.com day
             // rate. Absent only for a base-currency payment.
             ...(paymentRate.currencyRate !== undefined ? { CurrencyRate: paymentRate.currencyRate } : {}),
             // o3d-0m56: IMS's own mark, so a later attempt can recognise THIS payment even if its
@@ -7734,7 +7734,7 @@ export async function processClaimedEntry(
             Account: { AccountID: account.externalAccountId },
             Date: paymentDate,
             Amount: amount,
-            // o3d-q0x56.2: IMS's settlement rate for this payment (1 / rate, 6 dp); absent only for a base-currency bill payment.
+            // o3d-q0x56.2: IMS's settlement rate for this payment (as is, 6 dp); absent only for a base-currency bill payment.
             ...(billPaymentRate.currencyRate !== undefined ? { CurrencyRate: billPaymentRate.currencyRate } : {}),
             // The operator's reference is KEPT and the mark appended, never replaced: it is what they
             // will look for on the bank reconciliation. See INVOICE_PAYMENT above for the mark.

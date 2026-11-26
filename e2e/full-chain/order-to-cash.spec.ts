@@ -962,12 +962,12 @@ test.describe.serial('@full-chain @wc @xero order to cash', () => {
         expect(invoice.Status).toBe('AUTHORISED') // see OC-01: "not DELETED" would accept a DRAFT
         expect(invoice.CurrencyCode, 'Xero recorded the invoice in EUR, not the base currency').toBe('EUR')
         // THE RATE actually crossed into Xero, not just the currency label. IMS stamps CurrencyRate =
-        // 1/fxRateToBase (lib/connectors/xero/fx.ts) precisely so Xero does NOT substitute its own daily XE
+        // fxRateToBase (lib/connectors/xero/fx.ts) precisely so Xero does NOT substitute its own daily XE
         // rate. Without this assertion a dropped, inverted, or Xero-substituted rate would still post an
         // AUTHORISED EUR invoice at the right EUR face value — every other assertion here would pass while
-        // the GBP ledger value silently diverged. Xero's CurrencyRate is the inverse (1 EUR = X GBP).
+        // the GBP ledger value silently diverged. Xero's CurrencyRate is IMS's own convention (1 GBP = X EUR).
         expect(invoice.CurrencyRate, 'Xero echoes a CurrencyRate for the EUR invoice').toBeDefined()
-        expect(Number(invoice.CurrencyRate), 'Xero held the seeded rate (its inverse), not its own daily rate').toBeCloseTo(1 / fxRate, 5)
+        expect(Number(invoice.CurrencyRate), 'Xero held the seeded rate as is (never its inverse), not its own daily rate').toBeCloseTo(fxRate, 5)
 
         const salesAccount = await settingValue('xero_sales_account')
         // Xero invoice lines are denominated in the invoice currency, so the EUR line value stands unconverted.
