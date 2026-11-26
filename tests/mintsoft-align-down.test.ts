@@ -1,12 +1,13 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import * as stockSyncHelpersNs from '../lib/connectors/mintsoft/sync/stock-sync-helpers.ts'
+import { toDecimal } from '../lib/domain/math/decimal.ts'
 
 const stockSyncHelpers = 'default' in stockSyncHelpersNs
   ? stockSyncHelpersNs.default as typeof import('../lib/connectors/mintsoft/sync/stock-sync-helpers.ts')
   : stockSyncHelpersNs
 
-const { planMintsoftAlignDown, mintsoftAlignDownReasonState } = stockSyncHelpers
+const { planMintsoftAlignDown, mintsoftAlignDownReasonState, adjustmentPostingWouldBeRefused } = stockSyncHelpers
 
 const RUN_START = new Date('2026-07-11T10:00:00Z')
 const PRIOR_RUN = new Date('2026-07-11T09:00:00Z')
@@ -136,21 +137,48 @@ test('planMintsoftAlignDown applies again once no despatch is in flight', () => 
   assert.equal(planMintsoftAlignDown(baseInput({ inFlightDispatchQty: 0 })).action, 'apply')
 })
 
-// o3d-jwa8m MED-5: with the reason/cost switch ON, a missing inventory account must degrade to a hold (a manual discrepancy), not a per-SKU sweep error.
-test('mintsoftAlignDownReasonState: switch on and no inventory account is not configured, naming the inventory account', () => {
+// o3d-jwa8m MED-5 / F5: with the reason/cost switch ON, a missing inventory account degrades to a hold (a manual discrepancy, not a per-SKU sweep
+// error) ONLY where applyStockAdjustment's assertAdjustmentPostable would refuse: connector present, verdict post/chart-retired, value non-zero.
+test('mintsoftAlignDownReasonState: switch on, no inventory account and the refusal applies is not configured, naming the inventory account', () => {
   const reason = { active: true, accountCode: '500' }
   assert.deepEqual(
-    mintsoftAlignDownReasonState({ reason, reasonCostRequired: true, inventoryAccount: null }),
+    mintsoftAlignDownReasonState({ reason, reasonCostRequired: true, inventoryAccount: null, adjustmentWouldBeRefused: true }),
     { reasonConfigured: false, inventoryAccountMissing: true },
   )
   assert.deepEqual(
-    mintsoftAlignDownReasonState({ reason, reasonCostRequired: true, inventoryAccount: '' }),
+    mintsoftAlignDownReasonState({ reason, reasonCostRequired: true, inventoryAccount: '', adjustmentWouldBeRefused: true }),
     { reasonConfigured: false, inventoryAccountMissing: true },
   )
   assert.deepEqual(
-    mintsoftAlignDownReasonState({ reason, reasonCostRequired: true, inventoryAccount: '630' }),
+    mintsoftAlignDownReasonState({ reason, reasonCostRequired: true, inventoryAccount: '630', adjustmentWouldBeRefused: true }),
     { reasonConfigured: true, inventoryAccountMissing: false },
   )
+})
+
+test('mintsoftAlignDownReasonState: no hold when the adjustment would not be refused (F5)', () => {
+  const reason = { active: true, accountCode: '500' }
+  assert.deepEqual(
+    mintsoftAlignDownReasonState({ reason, reasonCostRequired: true, inventoryAccount: null, adjustmentWouldBeRefused: false }),
+    { reasonConfigured: true, inventoryAccountMissing: false },
+  )
+  assert.deepEqual(
+    mintsoftAlignDownReasonState({ reason, reasonCostRequired: true, inventoryAccount: null }),
+    { reasonConfigured: true, inventoryAccountMissing: false },
+    'omitted = not refused',
+  )
+})
+
+test('adjustmentPostingWouldBeRefused: same test as assertAdjustmentPostable (connector, verdict post/chart-retired, value non-zero at 2dp)', () => {
+  const v = (s: string) => toDecimal(s)
+  assert.equal(adjustmentPostingWouldBeRefused({ connectorPresent: true, verdict: 'post', valueBase: v('-12.50') }), true)
+  assert.equal(adjustmentPostingWouldBeRefused({ connectorPresent: true, verdict: 'chart-retired', valueBase: v('3') }), true)
+  assert.equal(adjustmentPostingWouldBeRefused({ connectorPresent: false, verdict: 'post', valueBase: v('3') }), false, 'no connector')
+  for (const verdict of ['no-chart', 'not-configured', null, undefined]) {
+    assert.equal(adjustmentPostingWouldBeRefused({ connectorPresent: true, verdict, valueBase: v('3') }), false, `verdict ${String(verdict)}`)
+  }
+  assert.equal(adjustmentPostingWouldBeRefused({ connectorPresent: true, verdict: 'post', valueBase: v('0') }), false, 'zero value')
+  assert.equal(adjustmentPostingWouldBeRefused({ connectorPresent: true, verdict: 'post', valueBase: v('0.004') }), false, 'rounds to 0.00')
+  assert.equal(adjustmentPostingWouldBeRefused({ connectorPresent: true, verdict: 'post', valueBase: v('-0.005') }), true, 'rounds to 0.01')
 })
 
 test('mintsoftAlignDownReasonState: switch off never looks at the inventory account (unchanged)', () => {
@@ -161,13 +189,13 @@ test('mintsoftAlignDownReasonState: switch off never looks at the inventory acco
   )
   assert.equal(mintsoftAlignDownReasonState({ reason: { active: false, accountCode: '500' }, reasonCostRequired: false, inventoryAccount: '630' }).reasonConfigured, false)
   assert.equal(mintsoftAlignDownReasonState({ reason: { active: true, accountCode: null }, reasonCostRequired: true, inventoryAccount: '630' }).reasonConfigured, false)
-  assert.equal(mintsoftAlignDownReasonState({ reason: null, reasonCostRequired: true, inventoryAccount: null }).inventoryAccountMissing, false)
+  assert.equal(mintsoftAlignDownReasonState({ reason: null, reasonCostRequired: true, inventoryAccount: null, adjustmentWouldBeRefused: true }).inventoryAccountMissing, false)
 })
 
 test('planMintsoftAlignDown holds naming the inventory account when it is the missing piece', () => {
   const decision = planMintsoftAlignDown(baseInput({ reasonConfigured: false, inventoryAccountMissing: true }))
   assert.equal(decision.action, 'hold')
-  assert.match((decision as { reason: string }).reason, /inventory account/)
+  assert.match((decision as { reason: string }).reason, /inventory account is mapped.*would post this write-off/)
   // Without the flag the message is the one it always was.
   assert.match((planMintsoftAlignDown(baseInput({ reasonConfigured: false })) as { reason: string }).reason, /adjustment reason/)
 })
