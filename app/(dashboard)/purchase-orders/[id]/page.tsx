@@ -29,7 +29,7 @@ import { PoPrepaymentFxCard } from './po-prepayment-fx-card'
 import { db } from '@/lib/db'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { isPurchaseEventFxEnabled } from '@/lib/domain/purchasing/purchase-event-fx-settings'
-import { getPurchaseOrderFxLockView } from '@/lib/domain/purchasing/purchase-receipt-fx'
+import { getPurchaseOrderFxView } from '@/lib/domain/purchasing/purchase-receipt-fx'
 
 export const metadata: Metadata = { title: 'Purchase Order' }
 
@@ -100,7 +100,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
   // Per-event FX rates for purchasing (o3d-hqvrp.51): the Xero prepayment rate card, only while the switch is on and for a foreign order.
   const baseCurrency = await getBaseCurrencyCode()
   const showPrepaymentFx = po.currency.toUpperCase() !== baseCurrency.toUpperCase() && await isPurchaseEventFxEnabled(db)
-  const prepaymentFxLock = showPrepaymentFx ? await getPurchaseOrderFxLockView(id) : null
+  const prepaymentFx = showPrepaymentFx ? await getPurchaseOrderFxView(id) : null
 
   const products = productsResult.products.filter(
     (p) => !['VARIABLE', 'NON_INVENTORY', 'KIT'].includes(p.type) && (p.lifecycleStatus === 'ACTIVE' || p.lifecycleStatus === 'DRAFT'),
@@ -116,7 +116,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
       </div>
       <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} showMargin={showMargin} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} wmsAsnState={wmsAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} prepaidReconciliation={prepaidReconciliation} poEmailEnabled={poEmailEnabled} supplierSkus={supplierSkus} canEditLineNotes={!!session && hasPermission(session.user.role, 'purchasing.create')} canApprove={!!session && hasPermission(session.user.role, 'purchasing.approve')} currentUserId={session?.user.id} billDeleteStates={billDeleteStates} />
       {showPrepaymentFx && (
-        <PoPrepaymentFxCard poId={po.id} poReference={po.reference} currency={po.currency} baseCurrency={baseCurrency} lock={prepaymentFxLock} canRead={!!session && hasPermission(session.user.role, 'purchasing.invoice')} />
+        <PoPrepaymentFxCard poId={po.id} poReference={po.reference} currency={po.currency} baseCurrency={baseCurrency} fx={prepaymentFx} canRead={!!session && hasPermission(session.user.role, 'purchasing.invoice')} />
       )}
       <PoPegsCard pegs={pegs} lineLabels={pegLineLabels} />
       <OrderAttachmentsCard kind="purchase" orderId={po.id} attachments={attachments} canEdit={canEditAttachments} />

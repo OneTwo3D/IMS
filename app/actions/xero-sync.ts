@@ -27,6 +27,7 @@ import { syncXeroAccountBalanceSnapshots } from '@/lib/connectors/xero/account-b
 import { processPendingXeroSync } from '@/lib/connectors/xero'
 import { getXeroSettings, XERO_SETTING_KEYS, type XeroSettings } from '@/lib/connectors/xero/settings'
 import { xeroMissingAccountMappings } from '@/lib/connectors/xero/readiness-accounts'
+import { isPurchaseEventFxEnabled } from '@/lib/domain/purchasing/purchase-event-fx-settings'
 import { buildAccountingCallbackUri } from '@/lib/accounting/callback-url'
 import { getPublicAppUrl } from '@/lib/public-app-url'
 import { getSettingValue, maskSettingSecret, serializeSettingValue } from '@/lib/settings-store'
@@ -1090,7 +1091,7 @@ export async function getXeroSyncReadiness(): Promise<XeroSyncReadiness> {
     getGrantedScopes(),
   ])
 
-  const { missingAccounts, reportOnlyMissingAccounts } = xeroMissingAccountMappings(settings)
+  const { missingAccounts, reportOnlyMissingAccounts } = xeroMissingAccountMappings(settings, { purchaseEventFxEnabled: await isPurchaseEventFxEnabled(db) })
 
   const missingTaxTypes = taxRates
     .filter(r => !r.accountingTaxType)

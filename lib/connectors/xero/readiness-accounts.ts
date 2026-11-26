@@ -33,13 +33,28 @@ export const REPORT_ONLY_ACCOUNTS: Array<{ key: keyof XeroSettings; label: strin
   { key: 'xero_realised_fx_gain_loss_account', label: 'Realised FX Gain/Loss' },
 ]
 
+/**
+ * #1140 LOW-1 / purchase FX step-2 LOW-14: WHILE `purchase_event_fx_rates_enabled` IS ON these two accounts are REQUIRED, not reported. The per-event
+ * purchase FX journals post the FX difference to Realised FX Gain/Loss and the bill-vs-order price difference to Purchase Price Variance, so a sync
+ * that is "ready" without them is ready to refuse (the receipt valuation refuses while either is blank). Realised FX moves from the report-only list
+ * to the required one while the switch is on, so it is never listed twice.
+ */
+export const PURCHASE_FX_REQUIRED_ACCOUNTS: Array<{ key: keyof XeroSettings; label: string }> = [
+  { key: 'xero_realised_fx_gain_loss_account', label: 'Realised FX Gain/Loss' },
+  { key: 'xero_purchase_price_variance_account', label: 'Purchase Price Variance' },
+]
+
 /** The pure split, exported so a test pins which mappings block `ready` and which are only reported. */
-export function xeroMissingAccountMappings(settings: XeroSettings): {
+export function xeroMissingAccountMappings(settings: XeroSettings, options: { purchaseEventFxEnabled?: boolean } = {}): {
   missingAccounts: Array<{ key: string; label: string }>
   reportOnlyMissingAccounts: Array<{ key: string; label: string }>
 } {
   const missing = (list: Array<{ key: keyof XeroSettings; label: string }>) => list
     .filter(a => !settings[a.key])
     .map(a => ({ key: a.key as string, label: a.label }))
-  return { missingAccounts: missing(REQUIRED_ACCOUNTS), reportOnlyMissingAccounts: missing(REPORT_ONLY_ACCOUNTS) }
+  const purchaseFx = options.purchaseEventFxEnabled === true
+  const required = purchaseFx ? [...REQUIRED_ACCOUNTS, ...PURCHASE_FX_REQUIRED_ACCOUNTS] : REQUIRED_ACCOUNTS
+  const requiredKeys = new Set<string>(required.map((a) => a.key as string))
+  const reportOnly = REPORT_ONLY_ACCOUNTS.filter((a) => !requiredKeys.has(a.key as string))
+  return { missingAccounts: missing(required), reportOnlyMissingAccounts: missing(reportOnly) }
 }
