@@ -73,6 +73,7 @@ const SECTION_TITLES: Array<{ prefix: string; title: string }> = [
   { prefix: '/analytics/currency-summary', title: 'Currency Summary' },
   { prefix: '/analytics/customers', title: 'Customer Mix' },
   { prefix: '/analytics/dead-stock', title: 'Dead Stock' },
+  { prefix: '/analytics/slow-stock', title: 'Slow Stock' },
   { prefix: '/analytics/fulfillment', title: 'Fulfillment KPIs' },
   { prefix: '/analytics/fx-gain-loss', title: 'FX Gain/Loss' },
   { prefix: '/analytics/grir', title: 'GR/IR' },

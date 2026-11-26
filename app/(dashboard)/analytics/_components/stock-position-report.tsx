@@ -57,6 +57,11 @@ export type StockPositionFilterValues = {
   groupBy?: string
   // reorder-only growth percentage, carried as typed so the page address and CSV link keep it.
   growthPercent?: string
+  // slow-stock only: carried so the page address, Reset-free pagination and CSV link keep them.
+  perWarehouse?: boolean
+  minAgeDays?: string
+  noSaleDays?: string
+  minValue?: string
 }
 
 /** Optional grouped layout: each group is a header row (spanning every column) followed by its rows. Reorder uses it for the supplier view. */
@@ -71,7 +76,7 @@ export type StockPositionRowGroup<Row> = {
 type StockPositionReportPageProps<Row> = {
   title: string
   description: string
-  reportKey: 'stock-on-hand' | 'stock-allocations' | 'negative-stock' | 'inventory-aging' | 'dead-stock' | 'reorder' | 'backorder' | 'component-shortage'
+  reportKey: 'stock-on-hand' | 'stock-allocations' | 'negative-stock' | 'inventory-aging' | 'dead-stock' | 'slow-stock' | 'reorder' | 'backorder' | 'component-shortage'
   exportBasePath?: string
   filters: StockPositionFilterValues
   filterOptions: StockPositionFilterOptions
