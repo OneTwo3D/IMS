@@ -60,7 +60,7 @@ test('the allowance names only modules that really are in the file, and really a
   const specifiers = staticImportSpecifiers(source)
   for (const allowed of CONNECTOR_AGNOSTIC_IMPORTS) {
     assert.ok(specifiers.includes(allowed), `${allowed} is allowed but not imported — delete the allowance`)
-    assert.ok(!/xero|woocommerce|mintsoft|shopify/i.test(allowed),
+    assert.ok(!/xero|woocommerce|mintsoft/i.test(allowed),
       `${allowed} names a connector, so it cannot be allowed as connector-agnostic`)
   }
 })

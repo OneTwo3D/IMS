@@ -1550,7 +1550,7 @@ test('[o3d-bjc.8] a minted-but-unverified id lands PENDING_VERIFY, not SYNCED', 
   assert.equal(upserts[0].create.externalOrderId, 'wms-1', 'the minted id is KEPT — the order exists')
 })
 
-test('[o3d-bjc.8 / o3d-remove-shiphero r2] a connector that CANNOT verify does not get SYNCED', async () => {
+test('[o3d-bjc.8 / wms-neutral-refactor r2] a connector that CANNOT verify does not get SYNCED', async () => {
   // THIS TEST USED TO ASSERT THE OPPOSITE, and it was pinning the defect Codex found (HIGH 4).
   // Its reasoning was "otherwise enabling the state machine would park every order a non-verifying
   // connector creates, forever" — true of a connector that returns `needsVerification: false`, and

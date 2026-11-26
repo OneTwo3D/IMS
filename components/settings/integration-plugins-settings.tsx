@@ -14,7 +14,7 @@ import {
 } from '@/lib/integration-plugin-keys'
 
 /**
- * THE PLUGIN SWITCHES, ONE PER REGISTERED PLUGIN (o3d-m0ad, o3d-remove-shiphero round 8 HIGH 2).
+ * THE PLUGIN SWITCHES, ONE PER REGISTERED PLUGIN (o3d-m0ad, wms-neutral-refactor round 8 HIGH 2).
  *
  * This screen used to take five named boolean props, hold five `useState` hooks, render five
  * hard-written `<Switch>` blocks, and assemble its selection with two `as IntegrationPluginState`

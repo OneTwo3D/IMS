@@ -1,6 +1,6 @@
 /**
  * A MALFORMED AUTH MODE MUST NOT TAKE THE ONBOARDING WIZARD OFF THE SCREEN
- * (o3d-remove-shiphero round 10, Codex HIGH 2).
+ * (wms-neutral-refactor round 10, Codex HIGH 2).
  *
  * THE DEFECT. Round 8 moved the `configured` flag on both UI facades onto
  * `WmsConnector.isConfigured()` and argued the move behaviour-preserving BY INSPECTION. It was not.
@@ -175,7 +175,7 @@ test('[round 10 HIGH 2] a framework REDIRECT thrown by the predicate is rethrown
 
   await assert.rejects(
     () => registry.isWmsConnectorConfigured('acme', {
-      // `id: 'acme'` — the id the caller asks for (o3d-remove-shiphero round 14, Codex HIGH 1).
+      // `id: 'acme'` — the id the caller asks for (wms-neutral-refactor round 14, Codex HIGH 1).
       // `findWmsConnector` now refuses a factory that builds a connector for a different id, and a
       // connector with NO id is a shape production forbids; a stub without one would be rejected on
       // identity before this predicate ran, and this case would assert about the WRONG throw.

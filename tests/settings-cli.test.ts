@@ -287,7 +287,32 @@ test('purchase_event_fx_rates_enabled: off by default and ADMIN; its account key
 
 const FX_ON = ['--key', 'purchase_event_fx_rates_enabled', '--value', 'true', ...SET, '--yes', '--confirm-admin']
 
-test('purchase_event_fx_rates_enabled: refused on while Xero sync is on and the realised FX or PPV account is unmapped, in the dry run and with --yes; nothing is written (MUTATION: drop the check => red)', async () => {
+/** The interlock (LOW-18) is on until step 3 installs the bill side; the account/mapping rules below are proved with it opened, on the real definition, restored after. */
+async function withStepsInstalled<T>(fn: () => Promise<T>): Promise<T> {
+  const def = findSwitch('purchase_event_fx_rates_enabled')! as { turnOnBlockedUntil?: { installed: boolean; why: string } }
+  const before = def.turnOnBlockedUntil
+  def.turnOnBlockedUntil = { installed: true, why: before?.why ?? '' }
+  try { return await fn() } finally { def.turnOnBlockedUntil = before }
+}
+
+test('purchase_event_fx_rates_enabled: INTERLOCK (LOW-18): turning it on is refused until step 3 is installed, however well mapped; turning it off is never refused (MUTATION: drop the check or flip the constant => red)', async () => {
+  const { PURCHASE_EVENT_FX_STEPS_COMPLETE } = await import('../lib/domain/settings/system-switches')
+  assert.equal(PURCHASE_EVENT_FX_STEPS_COMPLETE, false, 'step 3 flips this to true; until then the switch cannot be turned on')
+  const mapped = fakeDb({ xero_sync_enabled: 'true', xero_realised_fx_gain_loss_account: '499', xero_purchase_price_variance_account: '510' })
+  for (const argv of [FX_ON.slice(0, -2), FX_ON]) {
+    const r = await run('set', argv, mapped)
+    assert.equal(r.code, 3, r.out)
+    assert.match(r.err, /cannot be turned on yet: step 3 of the per-event purchase FX work/)
+  }
+  assert.equal(mapped.settings.get('purchase_event_fx_rates_enabled'), undefined)
+  assert.equal(mapped.audits.length, 0)
+  const syncOff = fakeDb({ xero_sync_enabled: 'false' })
+  assert.equal((await run('set', FX_ON, syncOff)).code, 3, 'not only while Xero sync is on')
+  const on = fakeDb({ purchase_event_fx_rates_enabled: 'true' })
+  assert.equal((await run('set', ['--key', 'purchase_event_fx_rates_enabled', '--value', 'false', ...SET, '--yes', '--confirm-admin'], on)).code, 0)
+})
+
+test('purchase_event_fx_rates_enabled: refused on while Xero sync is on and the realised FX or PPV account is unmapped, in the dry run and with --yes; nothing is written (MUTATION: drop the check => red)', () => withStepsInstalled(async () => {
   for (const [name, rows, missing] of [
     ['both unmapped', { xero_sync_enabled: 'true' }, /Realised FX Gain\/Loss.*and Purchase Price Variance/],
     ['PPV unmapped', { xero_sync_enabled: 'true', xero_realised_fx_gain_loss_account: '499' }, /Purchase Price Variance \(xero_purchase_price_variance_account\) is not mapped/],
@@ -302,9 +327,9 @@ test('purchase_event_fx_rates_enabled: refused on while Xero sync is on and the 
       assert.equal(f.audits.length, 0, name)
     }
   }
-})
+}))
 
-test('purchase_event_fx_rates_enabled: turns on when both accounts are mapped, or when Xero sync is off; turning it off is never refused', async () => {
+test('purchase_event_fx_rates_enabled: turns on when both accounts are mapped, or when Xero sync is off; turning it off is never refused', () => withStepsInstalled(async () => {
   const mapped = fakeDb({ xero_sync_enabled: 'true', xero_realised_fx_gain_loss_account: '499', xero_purchase_price_variance_account: '510' })
   const on = await run('set', FX_ON, mapped)
   assert.equal(on.code, 0, on.err)
@@ -315,15 +340,15 @@ test('purchase_event_fx_rates_enabled: turns on when both accounts are mapped, o
   const off = await run('set', ['--key', 'purchase_event_fx_rates_enabled', '--value', 'false', ...SET, '--yes', '--confirm-admin'], unmappedButOn)
   assert.equal(off.code, 0, off.err)
   assert.equal(unmappedButOn.settings.get('purchase_event_fx_rates_enabled')!.value, 'false')
-})
+}))
 
-test('purchase_event_fx_rates_enabled: the write transaction re-checks the accounts (an unmapping committed after the dry run still refuses)', async () => {
+test('purchase_event_fx_rates_enabled: the write transaction re-checks the accounts (an unmapping committed after the dry run still refuses)', () => withStepsInstalled(async () => {
   const { writeSwitch } = await import('../lib/domain/settings/system-switches')
   const f = fakeDb({ xero_sync_enabled: 'true', xero_realised_fx_gain_loss_account: '499' })
   const result = await writeSwitch(f.db as never, { def: findSwitch('purchase_event_fx_rates_enabled')!, value: 'true', by: 'jan', reason: 'test', adminConfirmed: true })
   assert.equal(result.ok, false)
   assert.equal(f.settings.get('purchase_event_fx_rates_enabled'), undefined)
-})
+}))
 
 // o3d-r2nkq: unpaid invoiced revenue deferral. Off by default, ADMIN, stamps its switch-on instant, and its keys are the ones the daily batch reads.
 test('xero_defer_unpaid_invoiced_revenue_enabled: off by default, ADMIN, stamped on and cleared off; keys equal the reader\'s', async () => {

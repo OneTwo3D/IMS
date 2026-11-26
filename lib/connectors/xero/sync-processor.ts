@@ -1140,7 +1140,8 @@ export async function markSyncLogForFollowUpRetry(
  * through to the lost-race branch and reports the row as it actually stands.
  */
 export async function applyMainSyncFailureRetry(
-  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog'>,
+  // o3d-2gv2g LOW-2: the three tables a refund delete's give-up task is written to, in this transaction.
+  tx: Pick<Prisma.TransactionClient, 'accountingSyncLog' | 'accountingEvent' | 'accountingEventLog' | 'salesOrderRefund' | 'wmsOperatorTask' | 'activityLog'>,
   attempt: AttemptRef,
   entry: { retryCount: number; type: AccountingSyncType; referenceType: string; referenceId: string },
   errorMessage: string,
@@ -1152,6 +1153,10 @@ export async function applyMainSyncFailureRetry(
   const computedFinal = retryCount >= MAX_RETRIES
   // Canonical lock order (order row, then sync row): a sales invoice's order is locked BEFORE its row is written. lib/domain/sales/invoicing-state.ts.
   await lockOrderForRow(tx, entry)
+  // o3d-2gv2g LOW-2: and a refund delete's void that gives up here writes its task (which references the order) below: its order first, too.
+  const refundDeleteGiveUp = computedFinal && entry.type === 'CREDIT_NOTE_VOID' && entry.referenceType === 'SalesOrderRefund'
+  const refundDelete = refundDeleteGiveUp ? await import('@/lib/domain/sales/refund-delete-service') : null
+  if (refundDelete) await refundDelete.lockOrderOfRefundDeleteVoid(tx, entry.referenceId)
   // o3d-e2mz: fenced on the claimed attempt as well as the observed retryCount. A
   // failure belongs to ONE attempt; without the revision this write reopens a row an
   // operator settled while this attempt was in flight, sending it round again as
@@ -1186,6 +1191,14 @@ export async function applyMainSyncFailureRetry(
         status: 'FAILED',
         message: errorMessage,
       })
+      // o3d-2gv2g LOW-2: a refund delete's void that has given up tells a person, from THIS write: the one fenced on the claim, the attempt and
+      // the observed retry count, so it is raised exactly once per give-up and in the same commit as the FAILED status (never from a read of the
+      // count taken before it). Keyed on the attempt that gave up, so a later give-up after an operator's retry is told again.
+      if (refundDelete) {
+        await refundDelete.raiseRefundDeleteVoidStuckTask(tx, {
+          refundId: entry.referenceId, voidSyncLogId: attempt.id, giveUp: attempt.attemptRevision, error: errorMessage,
+        })
+      }
     }
     return { finalFailure: computedFinal }
   }
@@ -2971,7 +2984,7 @@ function unsentPostEvidence(
                   : notPosted.reason === 'awaiting-budget'
                     ? 'xero_sync_awaiting_budget_before_post'
                     : notPosted.reason === 'refund-delete-deferred'
-                      ? 'xero_sync_refund_delete_deferred_before_post'
+                      ? REFUND_DELETE_DEFERRED_ACTION
                       : notPosted.reason === 'awaiting-document-delete'
                         ? 'xero_sync_awaiting_document_delete_before_post'
                         : 'xero_sync_claim_lost_before_post',
@@ -2979,6 +2992,8 @@ function unsentPostEvidence(
     level: 'WARNING' as const,
     description: notPosted.message,
     metadata: {
+      // o3d-2gv2g LOW-3: first, so it can never stand in for the fields below.
+      ...(notPosted.evidenceMetadata ?? {}),
       syncLogId: entry.id,
       type: entry.type,
       ...(outboxJobId ? { outboxJobId } : {}),
@@ -5418,6 +5433,8 @@ type EntryResult = {
     retryDelayMs?: number
     /** #1127 R1 H1: false = not the first wait of its episode, so no evidence row is written (one INFO row per episode, not per cycle). */
     recordEvidence?: boolean
+    /** o3d-2gv2g LOW-3: extra facts for the evidence row's metadata (ids and counts only), e.g. the retry count a refund-delete wait was taken at. */
+    evidenceMetadata?: Record<string, string | number | boolean | null>
     /**
      * o3d-gvzu — PRESENT ONLY WHEN THE HAND-BACK MUST ALSO RELEASE THE DISPATCH MARKER, and carrying
      * the two facts that licensed it so the evidence row can name them.
@@ -6339,18 +6356,49 @@ async function refuseNonPositivePayment(params: {
 export const REFUND_DELETE_DEFER_DELAY_MS = 15 * 60_000
 /** 96 waits of 15 minutes: a day. Past that a not-sent attempt fails like any other (it spends retries, and the last raises an operator task). */
 export const REFUND_DELETE_MAX_DEFERRALS = 96
+const REFUND_DELETE_DEFERRED_ACTION = 'xero_sync_refund_delete_deferred_before_post'
+
+/**
+ * o3d-2gv2g LOW-3: HOW MANY TIMES THIS VOID ROW HAS WAITED SINCE ITS LAST FAILURE OR OPERATOR RETRY, not over its whole life. Each wait's evidence
+ * row carries the row's `retryCount` at the wait (`waitRetryCount`); a failure moves the count up and an operator's retry puts it back to 0, so
+ * the run of waits at the row's CURRENT count, newest first, is the run since the last of those. The walk stops at the first wait recorded at
+ * another count, or with none (written before this build). Residual, stricter only: an operator retry of a row that failed with no wait since
+ * its last wait at count 0 continues that run (it fails sooner, never later). Unreadable: the cap (the wait is not taken).
+ */
+export async function refundDeleteWaitsSinceLastFailure(entryId: string, retryCount: number, client: Pick<typeof db, 'activityLog'> = db): Promise<number> {
+  try {
+    const rows = await client.activityLog.findMany({
+      where: { entityType: 'SYSTEM', entityId: entryId, action: REFUND_DELETE_DEFERRED_ACTION },
+      orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
+      take: REFUND_DELETE_MAX_DEFERRALS + 1,
+      select: { metadata: true },
+    })
+    let waits = 0
+    for (const row of rows) {
+      const at = (row.metadata as { waitRetryCount?: unknown } | null)?.waitRetryCount
+      if (at !== retryCount) break
+      waits++
+    }
+    return waits
+  } catch {
+    return REFUND_DELETE_MAX_DEFERRALS
+  }
+}
 
 /**
  * #1132 R2-MED-2 / MED-3: WHAT A FAILED REFUND-DELETE VOID ATTEMPT DOES TO ITS ROW.
  *
  *   the claim fence's own result     returned as it is (it names its own not-posted reason).
- *   refused under the locks, and no  TERMINAL (MED-3): the row is closed CANCELLED, proven never sent, with a WARNING on the order; a new delete
- *   attempt can have sent the void   request queues a fresh void. Nothing is retried.
+ *   refused under the locks, no      TERMINAL (MED-3): the row is closed CANCELLED, proven never sent, with a WARNING on the order; a new delete
+ *   attempt can have sent the void,  request queues a fresh void. Nothing is retried. o3d-2gv2g MED-1: only on Xero's word, read in this attempt
+ *   AND Xero shows it standing       (`ledgerStatus`); the row's own facts are not enough.
+ *   refused, the row's facts say     a WAIT (o3d-2gv2g MED-1): never closed on an unread; handed back without spending a retry and read again.
+ *   never sent, Xero unread
  *   nothing sent this attempt        a WAIT (R2-MED-2): handed back without spending a retry (`refund-delete-deferred`, 15 minutes), up to
- *   (no time, a lock wait, the       REFUND_DELETE_MAX_DEFERRALS waits; past them it fails as below.
- *   transport's refusal, a 429)
- *   anything else                    a failure that spends a retry; the one that makes the row FAILED raises the operator task
- *                                    REFUND_DELETE_VOID_STUCK (unless Xero is known to hold the credit note voided: that task is already raised).
+ *   (no time, a lock wait, the       REFUND_DELETE_MAX_DEFERRALS waits since the last failure or operator retry (o3d-2gv2g LOW-3); past them it
+ *   transport's refusal, a 429)      fails as below.
+ *   anything else                    a failure that spends a retry. The one that makes the row FAILED raises the operator task
+ *                                    REFUND_DELETE_VOID_STUCK, inside the fenced failure write (applyMainSyncFailureRetry, o3d-2gv2g LOW-2).
  */
 export async function refundDeleteVoidFailure(args: {
   entryId: string
@@ -6363,25 +6411,23 @@ export async function refundDeleteVoidFailure(args: {
   const { entryId, referenceId, attempt, lease, finished, refundDelete } = args
   const passed = finished.passthrough as EntryResult | undefined
   if (passed?.notPosted) return passed
-  if (finished.refusedUnderLocks && finished.provenNeverSent) {
-    const retired = await refundDelete.retireRefusedRefundDeleteVoid(db, { voidSyncLogId: entryId, attemptRevision: attempt.attemptRevision, claimedAt: lease.heldFrom(), refundId: referenceId, why: finished.error })
+  if (finished.refusedUnderLocks && finished.provenNeverSent && refundDelete.creditNoteStandsInLedger(finished.ledgerStatus)) {
+    const retired = await refundDelete.retireRefusedRefundDeleteVoid(db, { voidSyncLogId: entryId, attemptRevision: attempt.attemptRevision, claimedAt: lease.heldFrom(), refundId: referenceId, why: finished.error, ledgerStatus: finished.ledgerStatus })
       .catch(() => false)
     if (retired) return { success: true, skipped: true }
   }
-  if (finished.notSent && !finished.refusedUnderLocks) {
-    const waits = await db.activityLog.count({ where: { entityType: 'SYSTEM', entityId: entryId, action: 'xero_sync_refund_delete_deferred_before_post' } }).catch(() => REFUND_DELETE_MAX_DEFERRALS)
-    if (waits < REFUND_DELETE_MAX_DEFERRALS) {
-      return { success: false, error: finished.error, notPosted: { reason: 'refund-delete-deferred', operation: 'credit-note-void', message: finished.error, retryDelayMs: REFUND_DELETE_DEFER_DELAY_MS } }
-    }
-  }
-  const error = passed?.error ?? finished.error
-  if (finished.voided !== true && !isRateLimitError(error)) {
+  const waits = (finished.notSent && !finished.refusedUnderLocks) || (finished.refusedUnderLocks && finished.ledgerUnread === true)
+  if (waits) {
     const row = await db.accountingSyncLog.findUnique({ where: { id: entryId }, select: { retryCount: true } }).catch(() => null)
-    if (row && row.retryCount + 1 >= MAX_RETRIES) {
-      await refundDelete.raiseRefundDeleteVoidStuckTask(db, { refundId: referenceId, voidSyncLogId: entryId, error }).catch(() => { /* the failure stands; the FAILED row is still on the sync page */ })
+    const waited = row ? await refundDeleteWaitsSinceLastFailure(entryId, row.retryCount) : REFUND_DELETE_MAX_DEFERRALS
+    if (row && waited < REFUND_DELETE_MAX_DEFERRALS) {
+      return {
+        success: false, error: finished.error,
+        notPosted: { reason: 'refund-delete-deferred', operation: 'credit-note-void', message: finished.error, retryDelayMs: REFUND_DELETE_DEFER_DELAY_MS, evidenceMetadata: { waitRetryCount: row.retryCount } },
+      }
     }
   }
-  return passed ?? { success: false, error }
+  return passed ?? { success: false, error: finished.error }
 }
 
 /**
@@ -6434,6 +6480,8 @@ export const SETTLEMENT_XERO_CALL_BUDGET_PER_DAY = 200
 export const AWAITING_BUDGET_RETRY_DELAY_MS = 30 * 60_000
 /** #1132 MED-4: how long a credit-note allocation waits for a pending delete of its invoice to finish. */
 export const AWAITING_DOCUMENT_DELETE_RETRY_DELAY_MS = 15 * 60_000
+/** o3d-2gv2g LOW-5: how long, from its first wait, a credit-note allocation waits for that delete before it fails instead. */
+export const AWAITING_DOCUMENT_DELETE_MAX_MS = 3 * 86_400_000
 
 type BudgetClient = { $queryRaw: <T>(query: TemplateStringsArray, ...values: unknown[]) => Promise<T> }
 /** Spend `n` calls from today's budget: true when spent, false (nothing spent) when the day's budget would be exceeded. One atomic statement. */
@@ -6576,7 +6624,19 @@ async function processCreditNoteAllocation(args: {
   if (reading.deletePending) {
     // Nothing is sent while the invoice is being deleted; once the delete has finished the next attempt finds the invoice moved and retires the row.
     const message = `Not sent: ${reading.deletePending}`
-    return { success: false, error: message, notPosted: { reason: 'awaiting-document-delete', operation: 'credit-note-allocation', message, retryDelayMs: AWAITING_DOCUMENT_DELETE_RETRY_DELAY_MS } }
+    // o3d-2gv2g LOW-5: one INFO evidence row for the wait (the first), not one every 15 minutes, and the wait is CAPPED: past
+    // AWAITING_DOCUMENT_DELETE_MAX_MS since that first wait it becomes an ordinary failure (it spends retries, and the row fails for a person).
+    const firstWait = await db.activityLog.findFirst({
+      where: { entityType: 'SYSTEM', entityId: entryId, action: 'xero_sync_awaiting_document_delete_before_post' }, orderBy: { createdAt: 'asc' }, select: { createdAt: true },
+    }).catch(() => undefined)
+    if (firstWait === undefined) return { success: false, error: `${message} (IMS could not read how long this settlement has waited, so it is not handed back as a wait.)` }
+    if (firstWait && Date.now() - firstWait.createdAt.getTime() > AWAITING_DOCUMENT_DELETE_MAX_MS) {
+      return {
+        success: false,
+        error: `${message} This settlement has waited for that delete since ${firstWait.createdAt.toISOString()}, over ${AWAITING_DOCUMENT_DELETE_MAX_MS / 86_400_000} days, so IMS stopped waiting. Finish or cancel the pending delete on the order (Sync > Exceptions shows a delete under review), then retry this row.`,
+      }
+    }
+    return { success: false, error: message, notPosted: { reason: 'awaiting-document-delete', operation: 'credit-note-allocation', message, retryDelayMs: AWAITING_DOCUMENT_DELETE_RETRY_DELAY_MS, recordEvidence: firstWait === null } }
   }
   const facts = reading.facts
   if (!facts) return retire('the refund or its order could not be read', 'REFUND_UNREADABLE')

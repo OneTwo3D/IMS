@@ -1,6 +1,6 @@
 /**
  * A REGISTRATION'S KEY CONSTRAINS ITS FACTORY'S CONNECTOR
- * (o3d-remove-shiphero round 14, Codex HIGH 1).
+ * (wms-neutral-refactor round 14, Codex HIGH 1).
  *
  * THE DEFECT. Round 12 made the registration record TOTAL over `WmsConnectorId`, so a registered id
  * with no definition stopped compiling. It spelled that totality `Record<Id,
@@ -108,10 +108,10 @@ test('[round 14 HIGH 1] a registration whose factory builds ANOTHER connector do
   // then fails to compile because the `@ts-expect-error`s are unused. Each value is kept on ONE line
   // so the suppression cannot drift off the construct it is about.
   const crossWired: WmsConnectorRegistrations<TwoWmsIds> = {
-    // @ts-expect-error o3d-remove-shiphero r14 (Codex HIGH 1): a MINTSOFT entry may not build Acme's
+    // @ts-expect-error wms-neutral-refactor r14 (Codex HIGH 1): a MINTSOFT entry may not build Acme's
     // connector. Widening the record back to `Record<Id, …>` makes this compile.
     mintsoft: { label: 'Mintsoft', available: true, createReplayPolicy: 'remote-refuses-duplicate', create: () => identityStubConnector(ACME_WMS_ID) },
-    // @ts-expect-error o3d-remove-shiphero r14 (Codex HIGH 1): and the computed-key half — an ACME
+    // @ts-expect-error wms-neutral-refactor r14 (Codex HIGH 1): and the computed-key half — an ACME
     // entry may not build the Mintsoft connector, which is the direction that would have sent every
     // Acme operation to a live Mintsoft warehouse.
     [ACME_WMS_ID]: { label: ACME_WMS_LABEL, available: true, createReplayPolicy: 'client-side-dedupe-only', create: () => identityStubConnector('mintsoft') },
@@ -135,7 +135,7 @@ test('[round 14 HIGH 1] a registration whose factory builds ANOTHER connector do
       createReplayPolicy: 'remote-refuses-duplicate',
       create: () => identityStubConnector('mintsoft'),
     },
-    // @ts-expect-error o3d-remove-shiphero r14 (Codex HIGH 1): the derivation's registrations
+    // @ts-expect-error wms-neutral-refactor r14 (Codex HIGH 1): the derivation's registrations
     // parameter is keyed per entry too — this Acme entry may not build the Mintsoft connector.
     [ACME_WMS_ID]: { label: ACME_WMS_LABEL, available: true, createReplayPolicy: 'client-side-dedupe-only', create: () => identityStubConnector('mintsoft') },
   })
@@ -151,7 +151,7 @@ test('[round 14 HIGH 1] a registration still cannot carry an id of its own', () 
     available: true,
     createReplayPolicy: 'remote-refuses-duplicate',
     create: () => identityStubConnector('mintsoft'),
-    // @ts-expect-error o3d-remove-shiphero r14 (Codex HIGH 1): the id comes from the KEY. Putting
+    // @ts-expect-error wms-neutral-refactor r14 (Codex HIGH 1): the id comes from the KEY. Putting
     // `id` back on `WmsConnectorRegistration` makes this legal, and the spread order is then the
     // only defence left.
     id: 'acme-wms',

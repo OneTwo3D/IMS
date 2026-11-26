@@ -44,3 +44,23 @@ test('neither list names the unrealised FX account, and the two lists do not ove
   }
   assert.equal(required.filter((k) => reported.includes(k)).length, 0)
 })
+
+/**
+ * #1140 LOW-1 / purchase FX step-2 LOW-14: while `purchase_event_fx_rates_enabled` is ON the Realised FX and Purchase Price Variance accounts are REQUIRED
+ * (the receipt valuation refuses while either is blank), and Realised FX is then not also listed as report-only. Off: exactly as before.
+ * [mutation: ignore the option; list Realised FX twice; leave PPV out]
+ */
+test('purchase FX switch ON: Realised FX and Purchase Price Variance block readiness when unmapped, and Realised FX is not also reported', () => {
+  const unmapped = mappedExcept('xero_realised_fx_gain_loss_account', 'xero_purchase_price_variance_account', 'xero_accounts_payable_account')
+  const on = xeroMissingAccountMappings(unmapped, { purchaseEventFxEnabled: true })
+  assert.deepEqual(on.missingAccounts, [
+    { key: 'xero_realised_fx_gain_loss_account', label: 'Realised FX Gain/Loss' },
+    { key: 'xero_purchase_price_variance_account', label: 'Purchase Price Variance' },
+  ])
+  assert.deepEqual(on.reportOnlyMissingAccounts.map((a) => a.key), ['xero_accounts_payable_account'])
+  const off = xeroMissingAccountMappings(unmapped, { purchaseEventFxEnabled: false })
+  assert.deepEqual(off.missingAccounts, [], 'off: neither blocks')
+  assert.deepEqual(xeroMissingAccountMappings(unmapped), off, 'no option = off')
+  const everything = { ...mappedExcept(), xero_purchase_price_variance_account: '100' } as unknown as XeroSettings
+  assert.deepEqual(xeroMissingAccountMappings(everything, { purchaseEventFxEnabled: true }).missingAccounts, [])
+})

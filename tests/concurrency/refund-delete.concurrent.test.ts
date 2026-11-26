@@ -30,7 +30,13 @@ async function openRig() {
     import('@/lib/domain/accounting/money-attempt-provenance'),
   ])
   const db = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL!, max: 6 }) })
-  return { Prisma, db, appDb, createSalesOrderRefund: refundService.createSalesOrderRefund, deleteSalesOrderRefund: deleteService.deleteSalesOrderRefund, evaluateRefundDeletion: deleteService.evaluateRefundDeletion, completeAfterVoid: deleteService.completeRefundDeletionAfterVoid, lockSalesOrder: alloc.lockSalesOrder, custody: custody.stampingCustodyOnCreate }
+  // Phase 2 for a void the ledger has confirmed: the delete re-run with the confirmation (o3d-2gv2g LOW-12 removed the service's own wrapper,
+  // which had no production caller; the worker runs voidCreditNoteThenCompleteRefundDeletion).
+  const completeAfterVoid = async (client: Parameters<typeof deleteService.deleteSalesOrderRefund>[0], input: { refundId: string; voidSyncLogId: string; actorUserId: string | null; reason: string | null }) => {
+    const result = await deleteService.deleteSalesOrderRefund(client, { refundId: input.refundId, actorUserId: input.actorUserId, reason: input.reason, voidConfirmed: { syncLogId: input.voidSyncLogId } })
+    return result.success ? { ok: true as const } : { ok: false as const, error: result.error }
+  }
+  return { Prisma, db, appDb, createSalesOrderRefund: refundService.createSalesOrderRefund, deleteSalesOrderRefund: deleteService.deleteSalesOrderRefund, evaluateRefundDeletion: deleteService.evaluateRefundDeletion, completeAfterVoid, lockSalesOrder: alloc.lockSalesOrder, custody: custody.stampingCustodyOnCreate }
 }
 type Rig = Awaited<ReturnType<typeof openRig>>
 

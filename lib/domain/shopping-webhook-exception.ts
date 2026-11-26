@@ -6,7 +6,7 @@ import { WC_WEBHOOK_EVENT_STATUS, WOOCOMMERCE_CONNECTOR } from '@/lib/connectors
 
 /**
  * The connectors whose inbox is actually DRAINED. A dead letter of any other connector (archived
- * Shopify rows, say) would be offered for a replay that nothing would ever process.
+ * storefront rows, say) would be offered for a replay that nothing would ever process.
  */
 export const DRAINED_SHOPPING_WEBHOOK_CONNECTORS: string[] = [WOOCOMMERCE_CONNECTOR]
 

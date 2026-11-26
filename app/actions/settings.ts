@@ -1306,7 +1306,7 @@ export async function saveIntegrationPluginState(
   const outcome = await db.$transaction(async (tx): Promise<{ conflict: string } | { committed: IntegrationPluginState }> => {
     const resulting = { ...(await lockIntegrationPluginSelection(tx)) }
     for (const [id, enabled] of entries) resulting[id] = enabled
-    // EVERY RULE, IN ONE CALL (o3d-remove-shiphero rounds 10 and 12). Exclusivity was two
+    // EVERY RULE, IN ONE CALL (wms-neutral-refactor rounds 10 and 12). Exclusivity was two
     // hand-written pairs — accounting and shopping — and round 8's registry-derived toggles then
     // gave the WMS connectors a switch apiece with no rule over them. Enabling a second WMS beside
     // the first committed, reported success, and changed nothing: every routing site resolved the

@@ -2496,12 +2496,11 @@ test('the unconfirmed-restore message describes only the protection that exists'
   // only as good as the measurement behind the wording, so the classification itself is now
   // measured from the route files in 'the webhook fencing claim is measured FROM THE ROUTES'.
   assert.match(message, /Scheduled jobs \(app\/api\/cron\/\*\), WooCommerce webhooks and the Mintsoft ASN webhook are stopped by maintenance mode/)
-  // o3d-hl8l: was /MINTSOFT AND SHIPHERO WEBHOOK ROUTES/, then /SHIPHERO WEBHOOK ROUTE/ alone once
-  // the Mintsoft half was fenced. o3d-remove-shiphero removed the ShipHero route outright, so the
-  // message must no longer name ANY WMS webhook route as unstopped — naming a route that does not
-  // exist is the same class of false claim, just pointing the other way.
+  // o3d-hl8l: this used to name the WMS webhook routes as unstopped. Once the Mintsoft half was
+  // fenced and the other WMS route was removed, the message must no longer name ANY WMS webhook
+  // route as unstopped — naming a route that does not exist is the same class of false claim, just
+  // pointing the other way.
   assert.match(message, /THE ACCOUNTING OAUTH CALLBACK AND ALL[\s\S]*?NOT STOPPED BY ANYTHING/)
-  assert.doesNotMatch(message, /SHIPHERO/i, 'the ShipHero route no longer exists')
   assert.doesNotMatch(message, /MINTSOFT[\s\S]*?NOT STOPPED BY ANYTHING/, 'the Mintsoft route IS stopped now')
   assert.match(message, /INTERACTIVE WRITES FROM THE DASHBOARD ARE NOT STOPPED BY ANYTHING/)
   assert.match(message, /Backend pid 4242, started 2026-08-18 09:00:00\.123456\+00/, 'the operator is told what to look for')
@@ -2528,10 +2527,10 @@ test('the webhook fencing claim is measured FROM THE ROUTES, not from the flag r
   // Round 11 measured `getMaintenanceModeResponse` callers and concluded "inbound connector
   // webhooks are fenced". That measurement CANNOT produce that conclusion. Enumerating the
   // callers answers "what consults the flag?"; it can only ever confirm the routes that do,
-  // because a route that does not contains nothing to grep for. The unfenced Mintsoft and ShipHero
+  // because a route that does not contains nothing to grep for. The unfenced WMS
   // webhook entry points were invisible to it by construction, and the operator message told
-  // whoever read it that they were stopped. (The ShipHero route is gone as of
-  // o3d-remove-shiphero; the enumeration below is what makes its absence a fact rather than a
+  // whoever read it that they were stopped. (The second WMS's route is gone as of
+  // wms-neutral-refactor; the enumeration below is what makes its absence a fact rather than a
   // memory, because a re-added unfenced route would fail here.)
   //
   // So this test starts from the ROUTE FILES and classifies every one of them. A new webhook route
@@ -2579,15 +2578,10 @@ test('the webhook fencing claim is measured FROM THE ROUTES, not from the flag r
     )
   }
 
-  // ...and no WMS webhook route is classified 'no' any more. The ShipHero route was the only one,
-  // and o3d-remove-shiphero removed it rather than fencing it — a real change in reach, so it is
-  // pinned as such. The enumeration above is what proves the inventory still matches the tree;
-  // this asserts what the inventory now SAYS.
-  assert.equal(
-    MAINTENANCE_MODE_REACH.inboundWebhooks.some((w) => /shiphero/i.test(w.route)),
-    false,
-    'the ShipHero webhook route was removed, not merely reclassified',
-  )
+  // ...and no WMS webhook route is classified 'no' any more. The removed WMS's route was the only
+  // one, and it was removed rather than fenced — a real change in reach, so it is pinned as such.
+  // The enumeration above is what proves the inventory still matches the tree; this asserts what
+  // the inventory now SAYS.
   assert.deepEqual(
     MAINTENANCE_MODE_REACH.inboundWebhooks.filter((w) => w.fenced === 'no').map((w) => w.route),
     ['app/api/accounting/callback'],
@@ -2597,9 +2591,8 @@ test('the webhook fencing claim is measured FROM THE ROUTES, not from the flag r
   // The shopping route is fenced by the HANDLER it dispatches to, not by the route file. Pinned by
   // reading the dispatch, because that asymmetry is what the round-11 claim flattened.
   //
-  // o3d-remove-parked-connectors: this used to assert both halves of the asymmetry — a WooCommerce
-  // arm reaching the fenced handler and a `shopify` arm reaching an unfenced one. Shopify is
-  // archived, so the unfenced half no longer exists and asserting it would just hard-fail. What is
+  // This used to assert both halves of the asymmetry — a WooCommerce arm reaching the fenced
+  // handler and a second storefront's arm reaching an unfenced one. That storefront is archived, so the unfenced half no longer exists and asserting it would just hard-fail. What is
   // asserted instead is stronger about today's build and keeps the same alarm: the dispatcher has
   // exactly ONE connector arm and it is the fenced one. A second arm added without its own fence
   // fails this, which is precisely the condition the classification 'woocommerce-only' warns about.

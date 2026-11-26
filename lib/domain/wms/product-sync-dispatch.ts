@@ -12,7 +12,7 @@ import type { WmsProductSyncOutcome, WmsSyncTrigger } from '@/lib/connectors/wms
  * implementation, so a 2nd WMS connector picks up product-mutation sync without
  * editing the product server actions. Best-effort: never throws.
  *
- * o3d-remove-shiphero round 2: the forward is by CAPABILITY (`hooks.productSync` on the
+ * wms-neutral-refactor round 2: the forward is by CAPABILITY (`hooks.productSync` on the
  * connector's registry definition), not by `connectorId === 'mintsoft'`. The old form claimed to be
  * connector-agnostic in its own doc comment while being a one-armed switch — a second connector's
  * product mutations went nowhere, silently, which is the failure mode this whole layer exists to

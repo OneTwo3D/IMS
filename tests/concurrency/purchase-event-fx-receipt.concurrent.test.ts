@@ -34,6 +34,20 @@ mock.module('@/lib/connectors/xero/prepayments', {
     },
   },
 })
+/** MED-6: the read-only Xero contact lookup the supplier link is confirmed through (nothing here reaches Xero either). */
+const contactLedger: { calls: number; answer: () => { success: true; contactId: string | null; tenantId?: string } | { success: false; error: string } } = {
+  calls: 0,
+  answer: () => ({ success: true, contactId: null }),
+}
+mock.module('@/lib/connectors/xero/contacts', {
+  namedExports: {
+    findXeroContactReadOnly: async () => { contactLedger.calls += 1; return contactLedger.answer() },
+    storeContactId: async (contactId: string, tenantId: string, ref: { supplierId: string }) => {
+      const { db } = await import('@/lib/db')
+      await db.supplier.update({ where: { id: ref.supplierId }, data: { accountingContactId: contactId, accountingContactProvenance: `xero:${tenantId}` } })
+    },
+  },
+})
 mock.module('@/lib/auth/server', {
   namedExports: {
     requirePermission: async () => ({ user: { id: 'test-user', role: 'ADMIN' } }),
@@ -166,6 +180,8 @@ test.after(async () => {
 })
 
 test.beforeEach(() => {
+  contactLedger.calls = 0
+  contactLedger.answer = () => ({ success: true, contactId: null })
   ledger.calls = []
   ledger.answer = () => ({ ok: true, tenantId: TENANT, prepayments: [] })
 })
@@ -275,7 +291,7 @@ test('ON: an ambiguous or foreign prepayment, a failed read and a supplier with 
       answerWith(po, [prepaymentFor(po)])
       const row = await db.purchaseOrder.findUniqueOrThrow({ where: { id: po.poId }, select: { supplierId: true } })
       await db.supplier.update({ where: { id: row.supplierId }, data: { accountingContactProvenance: 'xero:another-org' } })
-    }, /not linked to a contact/],
+    }, /not linked to a Xero contact of this organisation/],
     ['failed read', async () => { ledger.answer = () => ({ ok: false, error: 'HTTP 503' }) }, /Could not read the Xero supplier prepayment/],
   ]
   for (const [label, arrange, message] of cases) {
