@@ -1590,6 +1590,9 @@ model PurchaseOrder {
   asFreightFor    LandedCostLink[]   @relation("FreightPO")
   freightCostLines FreightCostLine[]
   fxLock          PurchaseOrderFxLock?
+  /// Per-event FX (switch `purchase_event_fx_rates_enabled`): when Xero was last asked for this order's supplier prepayment and held none. A receipt
+  /// inside the cache window does not ask again (lib/domain/purchasing/purchase-receipt-fx.ts). NULL = never asked, or one was found since.
+  fxNoPrepaymentCheckedAt DateTime? @map("fx_no_prepayment_checked_at")
 
   @@index([supplierId])
   @@index([createdAt])
@@ -6565,7 +6568,7 @@ model XeroDayLimitObservation {
 
 /// Per-event FX rates for purchasing (switch `purchase_event_fx_rates_enabled`, off by default): the rate a FOREIGN purchase order's goods lock at,
 /// read READ-ONLY from the supplier prepayment the owner records in Xero (Spend Money > Prepayment at the exact bank rate, Reference = the PO
-/// number). One row per order. Written by lib/domain/purchasing/purchase-prepayment-lock.ts only; nothing writes it while the switch is off.
+/// number). One row per order. Written by lib/domain/purchasing/purchase-receipt-fx.ts only; nothing writes it while the switch is off.
 /// `rateToBase` is IMS's convention (1 base = rate foreign), which is ALSO Xero's CurrencyRate convention, so it is Xero's value exactly.
 /// `firstUsedAt` is set by the first receipt valued at this rate; from then on the row is never replaced.
 model PurchaseOrderFxLock {
