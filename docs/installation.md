@@ -2452,6 +2452,8 @@ To update to a newer version:
 sudo bash /etc/ims-cutover-driver/driver/update.sh
 ```
 
+`update.sh` takes `--no-git` (use the current source files instead of pulling), `--skip-build` (migrate and restart only), `--dry-run` (print the plan, change nothing) and `--print-fence-digest` (print the fence artefact digest the checkout would publish and exit). `deploy.sh`, for a host whose code is already in place (it does not pull), takes `--dry-run`, `--skip-build`, `--skip-migrate` and `--restart-only`; the last two are refused while adopting a fence left by a run that had started a migration.
+
 **Run it from there, not from `/opt/one-two-inventory`.** The command used to be
 `cd /opt/one-two-inventory && bash scripts/update.sh`, and that made `root` execute a script — and
 the four shell libraries and two node helpers beside it — out of a directory `imsapp` owns:
