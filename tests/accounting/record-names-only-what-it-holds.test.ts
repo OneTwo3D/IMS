@@ -9,12 +9,10 @@ import {
   DOCUMENT_INCIDENT_WORDING,
   NON_DOCUMENT_INCIDENT_WORDING,
   OPERATION_SEMANTIC_BY_TYPE,
-  QBO_OPERATIONS_WITHOUT_REQUEST_ID,
   RECORD_LOOKUP_FIELDS,
   PostedDocumentEvidenceUnwritten,
   describePreservedUnrecordedIncidents,
   describeUnburiedOutboxJobForUnwrittenEvidence,
-  describeUnpersistedQboPost,
   describeUnrecordablePostedDocument,
   describeUnrecordedPostedDocumentRecordedOutOfTransaction,
   incidentKindForOperation,
@@ -25,7 +23,6 @@ import {
   type UnrecordedIncidentKind,
 } from '@/lib/domain/accounting/unrecorded-posted-document'
 import {
-  LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE,
   LOCAL_DIRECTION_CAP,
   LOCAL_DIRECTION_SEQUENCES,
   LOCAL_DIRECTIONS,
@@ -34,7 +31,6 @@ import {
   renderLocalDirectionSequence,
   type LocalDirection,
   type LocalDirectionContext,
-  type OutboxReadAxis,
   type LocalDirectionSequence,
 } from '@/lib/domain/accounting/local-operator-direction'
 import * as DIRECTION_MODULE from '@/lib/domain/accounting/local-operator-direction'
@@ -110,13 +106,6 @@ function everyIncidentMessage(): { label: string; text: string }[] {
     for (const outcome of OUTCOMES) {
       const o = JSON.stringify(outcome ?? null)
       for (const posted of [null, 'EXT-1']) {
-        messages.push({
-          label: `qbo ${type} posted=${String(posted)} outcome=${o}`,
-          text: describeUnpersistedQboPost(
-            { entry: ENTRY(type), postedExternalId: posted, outcome },
-            new Error('write conflict'),
-          ),
-        })
         for (const named of [null, 'EXT-OTHER']) {
           for (const reason of ['ROW_MISSING', 'ANOTHER_DOCUMENT_NAMED'] as const) {
             const incident = {
@@ -183,17 +172,13 @@ function everyIncidentMessage(): { label: string; text: string }[] {
 
 /**
  * The metadata keys each record builder actually writes, read from its source — PER BUILDER, and
- * then intersected. The wording is shared by both connectors, so a key only ONE of them writes is
- * not a key the wording may rely on: a QuickBooks incident would arrive without it. (Asserting
- * against the UNION was the first shape of this test, and dropping `referenceId` from the
- * QuickBooks builder passed it.)
+ * then intersected. The wording is shared by every record builder, so a key only ONE of them writes
+ * is not a key the wording may rely on. (Asserting against the UNION was the first shape of this
+ * test, and dropping `referenceId` from one builder passed it.)
  */
 async function retainedMetadataKeys(): Promise<{ perBuilder: Map<string, Set<string>>; common: Set<string> }> {
   const sources: [string, string][] = [
     ['lib/connectors/xero/sync-processor.ts', 'unrecordedPostedDocumentRecord'],
-    // o3d-remove-parked-connectors: the archived QuickBooks builder was the second source, so this
-    // rule was checked against TWO builders — which is what the finding above was about (dropping a
-    // field from ONE builder used to pass). One builder now.
   ]
   const perBuilder = new Map<string, Set<string>>()
   for (const [file, builder] of sources) {
@@ -260,34 +245,6 @@ function everyWordingEntry(): WordingEntryView[] {
   return out
 }
 
-/**
- * THE THIRD WORDING TABLE, WHICH ROUND 11 NAMED AS A HOLE AND ROUND 12 PUT INSIDE THE FENCE.
- *
- * `QBO_OPERATIONS_WITHOUT_REQUEST_ID` is shipped operator prose exactly like the other two — it is
- * what the QuickBooks frames print under "WHAT A REPLAY WOULD COST" and "WHAT TO DO ABOUT THE
- * EFFECT" — and round 11 left it outside every check here, writing that the hole was "named rather
- * than left to be found". It had a live instance in it: `BILL_ATTACHMENT.MADE.check` said "open the
- * bill in QuickBooks and delete any duplicate attachment" about a bill nothing in the record named.
- */
-function everyReplayWordingEntry(): WordingEntryView[] {
-  const out: WordingEntryView[] = []
-  for (const [type, entry] of Object.entries(QBO_OPERATIONS_WITHOUT_REQUEST_ID)) {
-    if (!entry) continue
-    const variants = 'effect' in entry ? { '': entry } : entry
-    for (const [variant, w] of Object.entries(variants)) {
-      const { needs, lookup, ...rest } = w
-      out.push({
-        label: `QBO_OPERATIONS_WITHOUT_REQUEST_ID.${type}${variant ? `.${variant}` : ''}`,
-        templates: Object.values(rest),
-        fields: rest as Record<string, string>,
-        needs: needs ?? [],
-        lookup: lookup ?? [],
-      })
-    }
-  }
-  return out
-}
-
 // ---------------------------------------------------------------------------------------------
 // ROUND 11 (Codex MEDIUM) — THE THIRD GENERATION OF THIS INVARIANT, AND THE HONEST ACCOUNT OF IT.
 //
@@ -327,11 +284,8 @@ function everyReplayWordingEntry(): WordingEntryView[] {
 //      already has, not at data they must go and find. A field the record does NOT print cannot be
 //      named this way and still be usable, but nothing here stops the sentence being written.
 //   3. IT COVERS THE TWO INCIDENT WORDING TABLES, NOT EVERY STRING IN THE MODULE. The formatter
-//      frames and `QBO_OPERATIONS_WITHOUT_REQUEST_ID`'s `check` are outside it. That is deliberate
-//      for the `check`: it instructs a query of the LOCAL EmailOutbox table by that table's own
-//      columns, which is a different act from looking this incident's effect up in a ledger, and
-//      every column it names was walked into the schema in rounds 6 through 9. It is a hole all the
-//      same, and it is named here rather than left to be found.
+//      frames are outside it. It is a hole all the same, and it is named here rather than left to
+//      be found.
 //
 // The mutation Codex asked for is a REQUIRED FAILING CASE below, run against the shipped checker,
 // so the bypass this round closes cannot quietly reopen.
@@ -360,19 +314,19 @@ const PLACEHOLDER = /\{([A-Za-z]+)\}/g
 
 // MUTATION THAT KILLS THIS (run): add `'grossTotal'` to any entry's `needs` or `lookup` — it is not
 // a `RecordLookupField`, so the BUILD fails before the test does; declare an existing field the
-// builders do not both write (e.g. `'rowNamesExternalId'`, which only the Xero builder writes) and
-// this test fails naming the entry. Deleting `postedExternalId` from the QuickBooks builder's
+// builder does not write (e.g. `'rowNamesExternalId'`) and
+// this test fails naming the entry. Deleting `postedExternalId` from the builder's
 // metadata object kills it the other way, and was RUN: it fails here with
-// 'DOCUMENT_INCIDENT_WORDING.CREATE_LIVE declares "postedExternalId", which is not a key both
+// 'DOCUMENT_INCIDENT_WORDING.CREATE_LIVE declares "postedExternalId", which is not a key the
 // record builders write'.
 //
 // ROUND 11, THE OTHER HALF: declaring a `lookup` field the INCIDENT does not carry — e.g. adding
-// `'syncLogId'` to CREATE_LIVE's lookup, which both builders do write but which no formatter puts
+// `'syncLogId'` to CREATE_LIVE's lookup, which the builder does write but which no formatter puts
 // in the slots — is caught one test along instead, because `lookupInstruction` throws while
 // rendering. RUN: it fails 'ROUND 10: no message this module can produce leaks an unresolved slot'.
 //
 // ROUTE: the declarations come from the SHIPPED wording tables, and the retained keys are PARSED
-// OUT OF THE TWO CONNECTOR SOURCE FILES. Neither side of the comparison is written down here, so it
+// OUT OF THE CONNECTOR SOURCE FILE. Neither side of the comparison is written down here, so it
 // cannot pass by agreeing with itself.
 test('ROUND 10 (Codex MEDIUM): every field a wording DECLARES is one every record builder writes', async () => {
   const { common: retained } = await retainedMetadataKeys()
@@ -399,7 +353,7 @@ test('ROUND 10 (Codex MEDIUM): every field a wording DECLARES is one every recor
   // ROUND 12: the replay table is in here now. Its `BILL_ATTACHMENT.MADE` entry is what declares
   // `ledgerTargetId`, so this assertion is what proves BOTH record builders retain the bill id the
   // remedy sends an operator to — parsed out of the two connector sources, not written down here.
-  const entries = [...everyWordingEntry(), ...everyReplayWordingEntry()]
+  const entries = everyWordingEntry()
   assert.ok(entries.length >= 16, `sanity: ${entries.length} wording entries were found`)
   for (const { label, needs, lookup } of entries) {
     // ROUND 11: `lookup` is held to the same rule as `needs`, and for the same reason — the clause
@@ -429,7 +383,7 @@ test('ROUND 10: a wording names a record value only through a slot it declared, 
   const known = new Set<string>([...RECORD_LOOKUP_FIELDS, 'ledger', 'LEDGER', 'lookup', 'Lookup'])
   let sawOne = false
   let sawLookup = false
-  for (const { label, templates, needs, lookup } of [...everyWordingEntry(), ...everyReplayWordingEntry()]) {
+  for (const { label, templates, needs, lookup } of everyWordingEntry()) {
     for (const template of templates) {
       for (const [, slot] of template.matchAll(PLACEHOLDER)) {
         assert.ok(known.has(slot), `${label} names the slot "${slot}", which is not a thing this record holds`)
@@ -456,7 +410,7 @@ test('ROUND 10: a wording names a record value only through a slot it declared, 
   assert.ok(sawLookup, 'and a generated lookup clause, or the round-11 half proves nothing')
 
   // The other direction: a declaration nobody renders is a declaration nobody checks.
-  for (const { label, templates, lookup } of [...everyWordingEntry(), ...everyReplayWordingEntry()]) {
+  for (const { label, templates, lookup } of everyWordingEntry()) {
     if (lookup.length === 0) continue
     assert.ok(
       templates.some((template) => /\{Lookup\}|\{lookup\}/.test(template)),
@@ -475,21 +429,7 @@ test('ROUND 10: a wording names a record value only through a slot it declared, 
 // written down here, and it is a grammatical class rather than a list of data names — read the
 // block above this file's helpers for exactly what that does and does not cover.
 test('ROUND 11 (Codex MEDIUM): only the renderer may instruct a lookup, never a remedy in its own words', () => {
-  // ROUND 12: the replay table is scanned too, minus ONE named string. Round 11 exempted the WHOLE
-  // table on the strength of `INVOICE_EMAIL.check` instructing a query of the LOCAL EmailOutbox by
-  // its own columns — a different act from looking this incident's effect up in a ledger. That
-  // reasoning covers exactly that one string, and covering the table with it is how
-  // `BILL_ATTACHMENT.MADE.check` came to say "open the bill" unchecked.
-  const EXEMPT = 'QBO_OPERATIONS_WITHOUT_REQUEST_ID.INVOICE_EMAIL'
-  const replay = everyReplayWordingEntry()
-  const exempt = replay.find((entry) => entry.label === EXEMPT)
-  assert.ok(exempt, 'the exemption must name an entry that exists')
-  assert.notDeepEqual(
-    lookupVerbsWrittenInProse(exempt!.templates), [],
-    'and it must still NEED the exemption — if it no longer writes a lookup verb, delete the '
-    + 'exemption rather than keeping a hole nothing is standing in',
-  )
-  const entries = [...everyWordingEntry(), ...replay.filter((entry) => entry.label !== EXEMPT)]
+  const entries = everyWordingEntry()
   assert.ok(entries.length >= 15, `sanity: ${entries.length} wording entries were scanned`)
   for (const { label, templates } of entries) {
     const verbs = lookupVerbsWrittenInProse(templates)
@@ -647,8 +587,6 @@ const PROHIBITION_TEMPLATES: readonly string[] = [
   'DO NOT REMOVE AN ATTACHMENT FROM A BILL THIS RECORD CANNOT NAME',
   'DO NOT REMOVE AN ATTACHMENT ON THE STRENGTH OF THIS RECORD',
   'THERE IS NOTHING TO UNDO',
-  'nothing this attempt did needs undoing',
-  'rather than clearing an attachment off a bill picked out any other way',
   // INVOICE_PDF and WC_INVOICE_NOTE.
   'There is nothing to void in {ledger}',
   'rather than clearing notes off an order picked out any other way',
@@ -727,7 +665,7 @@ function legacyActsInstructed(templates: readonly string[]): string[] {
 
 /** The templates of every entry that declares no lookup — the corpus this fence governs. */
 function lookupLessTemplates(): { label: string; templates: string[] }[] {
-  return [...everyWordingEntry(), ...everyReplayWordingEntry()]
+  return everyWordingEntry()
     .filter((entry) => entry.lookup.length === 0)
     .map(({ label, templates }) => ({ label, templates }))
 }
@@ -745,7 +683,7 @@ function lookupLessTemplates(): { label: string; templates: string[] }[] {
 // declaration each entry is judged against is the entry's own `lookup`. The verb list and the
 // allowlist are the only things written down here, and both are closed sets.
 test('ROUND 14 (Codex HIGH): an entry that declares no lookup may not contain a mutation lexeme at all', () => {
-  const entries = [...everyWordingEntry(), ...everyReplayWordingEntry()]
+  const entries = everyWordingEntry()
   assert.ok(entries.length >= 16, `sanity: ${entries.length} wording entries were scanned`)
 
   let sawPermitted = false
@@ -936,12 +874,11 @@ test('ROUND 10: no message this module can produce leaks an unresolved slot', ()
 //
 // ROUTE: the promise is read out of the SHIPPED tail string, the keys out of the SHIPPED builders,
 // and the timestamp out of prisma/schema.prisma.
-test('ROUND 9: every field the record promises it holds is one EVERY builder writes', async () => {
+test('ROUND 9: every field the record promises it holds is one the builder writes', async () => {
   const { perBuilder } = await retainedMetadataKeys()
-  const tail = describeUnpersistedQboPost(
-    { entry: ENTRY('INVOICE_PAYMENT'), postedExternalId: null },
-    new Error('write conflict'),
-  )
+  const tail = describeUnrecordablePostedDocument({
+    entry: ENTRY('INVOICE_PAYMENT'), postedExternalId: null, namedExternalId: null, reason: 'ROW_MISSING',
+  })
   assert.match(tail, /WHAT THIS RECORD HOLDS/, 'the tail is what makes the promise')
 
   // Each clause of the tail, and the key it commits the builders to.
@@ -1022,7 +959,7 @@ test('ROUND 9 (Codex HIGH): a Xero non-document incident with no identifier gets
 // MUTATION THAT KILLS THIS (run): move any type in OPERATION_SEMANTIC_BY_TYPE to
 // 'LEDGER_NON_DOCUMENT' without adding a wording entry — the build fails on the Record<> key set,
 // and deleting an entry from NON_DOCUMENT_INCIDENT_WORDING fails this test's first assertion.
-test('ROUND 9: every operation the map calls a non-document has its own remedy, on both connectors', () => {
+test('ROUND 9: every operation the map calls a non-document has its own remedy', () => {
   const nonDocuments = OPERATION_TYPES.filter(
     (type) => incidentKindForOperation(type, null) === 'LEDGER_NON_DOCUMENT'
       || incidentKindForOperation(type, null) === 'NO_IDENTIFIER_SIDE_EFFECT',
@@ -1036,18 +973,14 @@ test('ROUND 9: every operation the map calls a non-document has its own remedy, 
       const xero = describeUnrecordablePostedDocument({
         entry: ENTRY(type), postedExternalId: posted, namedExternalId: null, reason: 'ROW_MISSING',
       })
-      const qbo = describeUnpersistedQboPost({ entry: ENTRY(type), postedExternalId: posted }, new Error('boom'))
-      for (const [connector, message] of [['xero', xero], ['quickbooks', qbo]] as const) {
-        assert.doesNotMatch(message, /void any duplicate\./, `${connector} ${type}`)
-        assert.doesNotMatch(message, /confirm exactly one document exists/, `${connector} ${type}`)
-        assert.doesNotMatch(message, /keep it \(re-enter the reference manually\)/, `${connector} ${type}`)
-      }
-      // The QuickBooks four keep the o3d-qn21 replay wording they already had; the rest take the
-      // shared non-document message. Either way, no document instruction.
+      assert.doesNotMatch(xero, /void any duplicate\./, type)
+      assert.doesNotMatch(xero, /confirm exactly one document exists/, type)
+      assert.doesNotMatch(xero, /keep it \(re-enter the reference manually\)/, type)
+      // Every non-document type takes the shared non-document message: no document instruction.
       assert.ok(
-        /NOTHING WAS CREATED IN/.test(qbo) || /NO REQUEST ID PROTECTS IT/.test(qbo)
-          || /THIS IS NOT A DOCUMENT/.test(qbo) || /NOTHING LEFT THIS PROCESS/.test(qbo)
-          || /IMS DID NOT RECORD WHETHER THE UPLOAD HAPPENED/.test(qbo),
+        /NOTHING WAS CREATED IN/.test(xero)
+          || /THIS IS NOT A DOCUMENT/.test(xero) || /NOTHING LEFT THIS PROCESS/.test(xero)
+          || /IMS DID NOT RECORD WHETHER THE UPLOAD HAPPENED/.test(xero),
         `${type} must say what it was instead of a document`,
       )
     }
@@ -1056,8 +989,7 @@ test('ROUND 9: every operation the map calls a non-document has its own remedy, 
 
 // MUTATION THAT KILLS THIS (run): restore "the copies that record tells you to count are gone with
 // it and the count cannot be made after the fact" to the side-effect sentence — the verb the
-// breadcrumb attributes becomes "count", and the second assertion fails against the wording that
-// forbids reporting one.
+// breadcrumb attributes becomes "count", and the second assertion fails.
 //
 // ROUTE: both strings are generated from the shipped module; the verb is extracted from the
 // breadcrumb rather than written down here, so the two can only agree by actually agreeing.
@@ -1067,10 +999,9 @@ test('ROUND 9 (Codex MEDIUM): the reset breadcrumb attributes to the incident on
     LEDGER_OUTCOME_UNRECORDED: 0, LEDGER_NON_DOCUMENT: 0, NO_IDENTIFIER_SIDE_EFFECT: 1,
     UNCLASSIFIED: 0,
   })
-  const emailRecord = describeUnpersistedQboPost(
-    { entry: ENTRY('INVOICE_EMAIL'), postedExternalId: null },
-    new Error('write conflict'),
-  )
+  const emailRecord = describeUnrecordablePostedDocument({
+    entry: ENTRY('INVOICE_EMAIL'), postedExternalId: null, namedExternalId: null, reason: 'ROW_MISSING',
+  })
 
   const attributed = /that record tells you to ([a-z]+)/.exec(breadcrumb)
   assert.ok(attributed, 'the breadcrumb must say what the record it preserved asks for')
@@ -1084,7 +1015,7 @@ test('ROUND 9 (Codex MEDIUM): the reset breadcrumb attributes to the incident on
   // THE DEFECT: the breadcrumb still described the count instruction round 7 deleted, and the reset
   // has already destroyed the rows that would settle which of the two was right.
   assert.notEqual(verb, 'count')
-  assert.match(emailRecord, /DO NOT REPORT A COUNT/, 'the record forbids exactly what the breadcrumb used to attribute')
+  assert.doesNotMatch(emailRecord, /\bcount\b/i, 'and the record itself asks for no count either')
   assert.doesNotMatch(breadcrumb, /the count cannot be made/i)
   assert.match(breadcrumb, /statuses can no longer be inspected/)
 })
@@ -1099,7 +1030,7 @@ test('ROUND 9 (Codex MEDIUM): the reset breadcrumb attributes to the incident on
 // FINDING 1 — IT SCANNED THE TABLES, NOT THE MESSAGE. `lookupLessTemplates()` reads the three
 // wording tables. What an operator reads is what the FORMATTERS emit, and they concatenate their
 // own prose around those entries. So every word the frames contribute was outside the fence, and
-// Codex named a live instance: the QuickBooks frame ends every no-request-id record with "o3d-3lhp
+// Codex named a live instance: a frame once ended every no-request-id record with "o3d-3lhp
 // (a per-row remediation, and A WAY TO CANCEL A QUEUED EMAIL)". Delete the two enumerated email
 // prohibitions and the round-14 test still passes while the shipped message still says `cancel`.
 // Twelve rounds of these records have gone wrong in the FRAMING at least as often as in the table.
@@ -1157,9 +1088,7 @@ const LEDGER_ID_FIXTURES = ['EXT-1', 'EXT-OTHER', 'LEDGER-BILL-1']
 function normaliseRenderedValues(text: string): string {
   return text
     .split('log-1').join('{syncRowId}')
-    .split('QuickBooks').join('{ledger}')
     .split('Xero').join('{ledger}')
-    .split('QUICKBOOKS').join('{LEDGER}')
     .split('XERO').join('{LEDGER}')
 }
 
@@ -1180,15 +1109,8 @@ function everyNamelessMessage(): { label: string; text: string }[] {
  * These four are the frames’ own sentences. They were never scanned before this round.
  */
 const FRAME_TEMPLATES: readonly string[] = [
-  'AND THE RESPONSE CARRIED NO ID EITHER, so there is nothing to open — do not go looking for '
-    + 'one.',
   'NO ID WAS RETURNED, so there is nothing to open — do not go looking for one.',
   'ONE OF THE TWO IDS IS NOT RECORDED HERE, so they cannot both be opened.',
-  'Leave the toggle off and ESCALATE sync row {syncRowId}, with this record, to whoever '
-    + 'administers this installation: closing it safely needs someone who can read the database '
-    + 'directly, and the machinery that would make an operator remedy sound is filed as o3d-4b5p (a '
-    + 'quiescence fence the cron, the manual sync, the claim and the writeback all honour) and '
-    + 'o3d-3lhp (a per-row remediation, and a way to cancel a queued email).',
   // ROUND 17 (Codex MEDIUM): the unclassified frame's refusal. It names three acts — open, keep,
   // void — and refuses all three in the same breath, which is the only reason a record that can
   // establish nothing is allowed to mention them at all. It was outside every scan until the
@@ -1209,11 +1131,11 @@ const FRAME_TEMPLATES: readonly string[] = [
  * breadcrumb sentence launder an instruction into a record that can name nothing.
  */
 const RESET_BREADCRUMB_TEMPLATES: readonly string[] = [
-  'name a LIVE effect {ledger} or {ledger} accepted and still holds — real money in somebody '
+  'name a LIVE effect {ledger} accepted and still holds — real money in somebody '
     + 'else\'s books, which no reset of ours undoes.',
   'Open the id in that system, and read the record itself for what the operation actually did '
     + 'before you void, credit or reverse anything.',
-  'are the same kind of write — a DOCUMENT {ledger} or {ledger} accepted, which no reset of '
+  'are the same kind of write — a DOCUMENT {ledger} accepted, which no reset of '
     + 'ours voids — ON A RECORD THAT CARRIES NO ID.',
   'DO NOT GO LOOKING FOR AN ID: there is none to open.',
   'DO NOT void, credit-note or reverse any of them: a reversal POSTS FOR REAL, and would move '
@@ -1223,7 +1145,7 @@ const RESET_BREADCRUMB_TEMPLATES: readonly string[] = [
     + 'attempt ran.',
   'Read the record itself before deleting anything.',
   'Do not void, credit, reverse or delete anything on the strength of these.',
-  'record a write {ledger} or {ledger} ACCEPTED that is NOT a standalone document and has NO id '
+  'record a write {ledger} ACCEPTED that is NOT a standalone document and has NO id '
     + 'to open — a credit note APPLIED to a bill, a tax rate written into the organisation.',
   'The write stands and no reset of ours undoes it, and the allocation moved money.',
   'The queued-email one never had a remote document at all — only a local email-outbox row, '
@@ -1234,7 +1156,7 @@ const RESET_BREADCRUMB_TEMPLATES: readonly string[] = [
 // MUTATION THAT KILLS THIS (run): delete `'IMS CANNOT CANCEL A QUEUED COPY'` and
 // `'no action, route or screen removes an unsent row'` from PROHIBITION_TEMPLATES — the round-14
 // test goes on passing, because it reads the tables, and THIS one fails naming the rendered
-// QuickBooks INVOICE_EMAIL message and `cancel`, which is Codex’s live route. RUN. Deleting any
+// INVOICE_EMAIL message and `cancel`, which is Codex’s live route. RUN. Deleting any
 // FRAME_TEMPLATES line kills it the other way — RUN with the o3d-3lhp sentence removed, it fails on
 // `cancel` in the frame tail, which is the word no table contains.
 //
@@ -1380,7 +1302,7 @@ test('ROUND 15: allowlist removal is a set, not a sequence — the longest span 
 // composition Codex named — must decompose ENTIRELY into three hand-written lists in this file:
 //
 //   LOCAL_DIRECTIONS      the complete inventory of what these records tell an operator to DO.
-//                         Fourteen entries, capped. ROUND 17: they are {action, target} STRUCTURES
+//                         Four entries, capped. ROUND 17: they are {action, target} STRUCTURES
 //                         with no free-text field, and their prose is generated from them, so the
 //                         closed target union produces the sentence instead of labelling it.
 //   BREADCRUMB_DIRECTIONS the reset breadcrumb's own instructions, which may point at a ledger
@@ -1410,7 +1332,7 @@ test('ROUND 15: allowlist removal is a set, not a sequence — the longest span 
 // hand-written `span`, and `object.length > 0` was the only thing joining them, so a direction could
 // declare a local target and instruct something else entirely. LOCAL_DIRECTIONS are now typed
 // {action, target} values whose prose is GENERATED (see `renderLocalDirection`), which is the shape
-// filed as o3d-cvyv, scoped to the fourteen directions rather than the whole module. RECORD_PROSE
+// filed as o3d-cvyv, scoped to the capped directions rather than the whole module. RECORD_PROSE
 // and BREADCRUMB_DIRECTIONS are still reviewed lists of sentences, and that is the residue above.
 //
 // NOTHING HAD TO BE REMOVED FROM THE SHIPPED TEXT TO GET HERE. Every span below was read against
@@ -1462,7 +1384,7 @@ function normaliseIncidentValues(text: string): string {
  * no entry, and the reset breadcrumbs.
  */
 function lookupLessMessages(): { label: string; text: string }[] {
-  const identity = [...everyWordingEntry(), ...everyReplayWordingEntry()]
+  const identity = everyWordingEntry()
     .filter((entry) => entry.lookup.length === 0)
     .flatMap(({ fields }) => Object.entries(fields)
       .filter(([field, value]) => IDENTITY_FIELDS.has(field) && typeof value === 'string')
@@ -1507,7 +1429,7 @@ const LOCAL_DIRECTION_CONTEXT: LocalDirectionContext = { ledger: '{ledger}', syn
  * was introduced to make prose safe, and its output had become the one unreviewed surface in the
  * file.
  *
- * SO THE OUTPUT IS THE INVENTORY. Fourteen directions and one sequence, each written out verbatim
+ * SO THE OUTPUT IS THE INVENTORY. The directions, each written out verbatim
  * beside the direction that produces it, and the renderer is held to EXACT EQUALITY with them (see
  * the round-20 test). A sentence the renderer emits that is not here fails twice over: the equality
  * assertion names the branch, and the corpus closure stops accounting for the words. Updating this
@@ -1523,51 +1445,8 @@ const RENDERED_DIRECTIONS: readonly { direction: LocalDirection; text: string }[
     text: 'confirm the invoice PDF stored against the order is the document you expect',
   },
   {
-    direction: { action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS', form: 'THIS_ORDERS_ROWS' },
+    direction: { action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS' },
     text: "Inspect the outbox rows for this order and read each row's status, attempts, lastError and sentAt.",
-  },
-  {
-    direction: { action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS', form: 'BY_KIND_AND_REFERENCE' },
-    text: 'Then INSPECT the outbox: query it for kind ACCOUNTING_INVOICE, referenceType SalesOrder, referenceId '
-      + "= the order id (no page in IMS lists them) and read each row's status, attempts, lastError, createdAt "
-      + 'and sentAt.',
-  },
-  {
-    direction: { action: 'RE_READ', target: 'EMAIL_OUTBOX_ROWS' },
-    text: 'so re-run the query rather than treating one result as the final list',
-  },
-  {
-    direction: { action: 'READ', target: 'EMAIL_OUTBOX_ROWS' },
-    text: 'Read them by status, lastError and time',
-  },
-  {
-    direction: { action: 'TURN_OFF', target: 'SETTING_SYNC_ENABLED', control: 'LEVER_BELOW' },
-    text: 'TURN THE LEVER BELOW OFF FIRST, so that no NEW run is admitted',
-  },
-  {
-    direction: { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', form: 'THEN_GO_AND_READ_IT' },
-    text: 'THEN GO AND READ quickbooks_sync_attach_pdf AS IT STANDS NOW',
-  },
-  {
-    direction: { action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', form: 'TO_LEARN_WHAT_A_REPLAY_WOULD_DO' },
-    text: 'READ quickbooks_sync_attach_pdf AS IT STANDS NOW to learn what a replay would do',
-  },
-  {
-    direction: { action: 'TURN_OFF', target: 'SETTING_SYNC_ENABLED', control: 'CONNECTOR_PANEL_CHECKBOX' },
-    text: 'HOW TO STOP MORE OF IT: turn {ledger} sync OFF. The control is the checkbox at the top of the SYNC '
-      + 'tab of the {ledger} connector panel, and it writes the setting quickbooks_sync_enabled.',
-  },
-  {
-    direction: { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED', form: 'NOT_A_FENCE' },
-    text: 'THEN LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE.',
-  },
-  {
-    direction: { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED', form: 'BEFORE_ESCALATION' },
-    text: 'Leave the toggle off',
-  },
-  {
-    direction: { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'SYNC_ROW' },
-    text: 'ESCALATE sync row {syncRowId}, with this record, to whoever administers this installation',
   },
   {
     direction: { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
@@ -1586,13 +1465,7 @@ const RENDERED_DIRECTIONS: readonly { direction: LocalDirection; text: string }[
  */
 const SEQUENCE_CONJUNCTION = ' and '
 
-const RENDERED_DIRECTION_SEQUENCES: readonly { sequence: LocalDirectionSequence; text: string }[] = [
-  {
-    sequence: LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE,
-    text: 'Leave the toggle off and ESCALATE sync row {syncRowId}, with this record, to whoever administers '
-      + 'this installation',
-  },
-]
+const RENDERED_DIRECTION_SEQUENCES: readonly { sequence: LocalDirectionSequence; text: string }[] = []
 
 /**
  * The spans the corpus closure is allowed to strip — TAKEN FROM THE REVIEWED INVENTORY, never from
@@ -1624,7 +1497,7 @@ const BREADCRUMB_DIRECTIONS: readonly string[] = [
   // The breadcrumb sends the reader to the activity log it is a breadcrumb FOR. It is local and
   // read-only, and it is here rather than in LOCAL_DIRECTIONS because no per-incident message says
   // it — a line that only the breadcrumb ships is guarded by the breadcrumb's own rule.
-  'Search this log for "xero_posted_document_unrecorded" or "quickbooks_posted_document_unrecorded".',
+  'Search this log for "xero_posted_document_unrecorded".',
 ]
 
 /**
@@ -1648,39 +1521,25 @@ const RECORD_PROSE: readonly string[] = [
   ' (Recorded outside its own transaction, which could not be committed: {cause}.)',
   ' THE OUTBOX JOB {outboxJobId} COULD NOT BE BURIED EITHER: {cause}. The incident IS on record in the activity log, and the next run reads it before completing this job, so the reclaim will bury the job rather than complete it.',
   ' THE OUTBOX JOB {outboxJobId} COULD NOT BE BURIED EITHER: {cause}. NOTHING WAS WRITTEN DOWN: not the record, not the job. This message is the only copy of the identifier, and a reclaim of this job will find a settled row and complete it as a success.',
-  ". AND IMS CANNOT NARROW IT: no outbox row records the sync attempt that queued it, so nothing attributes a copy to this incident; the authenticated accounting-invoice email action writes the identical shape, so ordinary operator sends are in the same result; a SENT row has already gone; and A FAILED ROW IS NOT PROOF THAT NOTHING WENT — it means IMS HOLDS NO DURABLE CONFIRMATION OF DELIVERY. NO FAILED ROW PROVES A COPY WAS NEVER SENT, WHATEVER ITS lastError SAYS — NOT EVEN \"Suppressed recipient:\". The sender stamps SENT only after the transport call has returned, and that stamp is inside the same try whose catch writes FAILED on the fifth attempt (and PENDING before it, which sends the copy again), so a copy that WAS delivered and could not be stamped ends up FAILED; a send is judged from the transport error alone, which cannot say whether the server had already accepted the message; and the suppression check that writes that prefix runs at the top of the sweep, reads only the suppression table, and overwrites whatever the row already carried — so it speaks for the attempt that wrote it and for no attempt before it. IMS keeps no per-attempt outcome, so no row can be read backwards into its own history (o3d-ch0h).",
-  "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 are NOT accounting documents — no invoice, bill, credit note, payment or journal was created in {ledger} or {ledger} for any of them. They record an effect that landed somewhere else and can repeat: a file attached to an EXISTING bill, an invoice PDF written over the stored copy, an invoice email QUEUED to a customer, a note written onto a WooCommerce order. AN ATTACHMENT RECORD IN HERE MAY BE A NO-OP: that handler returns success WITHOUT uploading when attachment upload is off for its connector. Records written since IMS began capturing that outcome say which of the two happened; OLDER ONES SAY THEY DO NOT KNOW, and this count does not separate them, so it cannot tell you how many of either there are. The queued-email one never had a remote document at all — only a local email-outbox row, WHICH THIS RESET HAS JUST DELETED: the outbox rows that record tells you to inspect are gone with it, so their statuses can no longer be inspected.",
-  "do not go looking for a document. 1 are NOT accounting documents — no invoice, bill, credit note, payment or journal was created in {ledger} or {ledger} for any of them. They record an effect that landed somewhere else and can repeat: a file attached to an EXISTING bill, an invoice PDF written over the stored copy, an invoice email QUEUED to a customer, a note written onto a WooCommerce order. AN ATTACHMENT RECORD IN HERE MAY BE A NO-OP: that handler returns success WITHOUT uploading when attachment upload is off for its connector. Records written since IMS began capturing that outcome say which of the two happened; OLDER ONES SAY THEY DO NOT KNOW, and this count does not separate them, so it cannot tell you how many of either there are. The queued-email one never had a remote document at all — only a local email-outbox row, WHICH THIS RESET HAS JUST DELETED: the outbox rows that record tells you to inspect are gone with it, so their statuses can no longer be inspected. 1 carry no operation type this version of IMS has classified, so it cannot say which kind they are.",
-  ": closing it safely needs someone who can read the database directly, and the machinery that would make an operator remedy sound is filed as o3d-4b5p (a quiescence fence the cron, the manual sync, the claim and the writeback all honour) and o3d-3lhp (a per-row remediation, and a way to cancel a queued email). ONE THING ON SCREEN IS ACTIVELY WRONG AND YOU WILL SEE IT: the accounting log renders a settle control for every FAILED or PROCESSING row, and on this one it resolves to the words \"not settleable\" with its reason as the tooltip. DO NOT FOLLOW THAT TOOLTIP. It is the generic reason, written for a connector that stamps attempt revisions, and it tells you to retry the row until it shows one: {ledger} never stamps one, so no number of retries will ever make an attempt appear — and every retry is another replay of the effect above. This is the known hole o3d-qn21. Until the work above lands, this record is the only thing that says the effect repeated.",
-  "Both of those call sites read the setting and then call the processor with nothing in between, so a run admitted a moment before you flipped it keeps going: it can claim THIS row afterwards, run the operation again, and then write over the row — the write that records a {ledger} post updates the row BY ID ALONE, with no claim token, no attempt revision and no status check, so it lands on whatever the row says by then. That claim also leaves the row at attempt revision 0, which is indistinguishable from the abandoned attempt in front of you. Nothing in IMS reports whether such a run is still going, so there is no moment you can point at and call this row quiet. SO DO NOT CLOSE THIS ROW YOURSELF, AND DO NOT TURN {LEDGER} SYNC BACK ON TO FINISH THE JOB.",
-  ": closing it safely needs someone who can read the database directly (o3d-4b5p, o3d-3lhp). ONE THING ON SCREEN IS ACTIVELY WRONG AND YOU WILL SEE IT: the accounting log renders a settle control for every FAILED or PROCESSING row, and on this one it resolves to the words \"not settleable\" with its reason as the tooltip. DO NOT FOLLOW THAT TOOLTIP. It tells you to retry the row until it shows an attempt revision, and the {ledger} claim never stamps one, so no number of retries will ever make an attempt appear. This is the known hole o3d-qn21. WHAT THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time this record was written — the write it describes was made in the same sync attempt. That is all of it.",
+  "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 are NOT accounting documents — no invoice, bill, credit note, payment or journal was created in {ledger} for any of them. They record an effect that landed somewhere else and can repeat: a file attached to an EXISTING bill, an invoice PDF written over the stored copy, an invoice email QUEUED to a customer, a note written onto a WooCommerce order. AN ATTACHMENT RECORD IN HERE MAY BE A NO-OP: that handler returns success WITHOUT uploading when attachment upload is off for its connector. Records written since IMS began capturing that outcome say which of the two happened; OLDER ONES SAY THEY DO NOT KNOW, and this count does not separate them, so it cannot tell you how many of either there are. The queued-email one never had a remote document at all — only a local email-outbox row, WHICH THIS RESET HAS JUST DELETED: the outbox rows that record tells you to inspect are gone with it, so their statuses can no longer be inspected.",
+  "do not go looking for a document. 1 are NOT accounting documents — no invoice, bill, credit note, payment or journal was created in {ledger} for any of them. They record an effect that landed somewhere else and can repeat: a file attached to an EXISTING bill, an invoice PDF written over the stored copy, an invoice email QUEUED to a customer, a note written onto a WooCommerce order. AN ATTACHMENT RECORD IN HERE MAY BE A NO-OP: that handler returns success WITHOUT uploading when attachment upload is off for its connector. Records written since IMS began capturing that outcome say which of the two happened; OLDER ONES SAY THEY DO NOT KNOW, and this count does not separate them, so it cannot tell you how many of either there are. The queued-email one never had a remote document at all — only a local email-outbox row, WHICH THIS RESET HAS JUST DELETED: the outbox rows that record tells you to inspect are gone with it, so their statuses can no longer be inspected. 1 carry no operation type this version of IMS has classified, so it cannot say which kind they are.",
   "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 MOVED NO BALANCES — the posting mode on those rows was `draft`, so what they wrote sits UNPOSTED in {ledger}. DO NOT void, credit-note or reverse any of them: a reversal POSTS FOR REAL, and would move the accounts by exactly the amount the draft never moved. THEY WERE NOT ALL CREATED AS DRAFTS: this count also holds documents that were MODIFIED while unposted, and deleting one of those destroys a draft that stood there before the attempt ran.",
-  ", because this record cannot: if it is off, the replay above stays a no-op and there is nothing to change; if it is ON, the replay uploads to a bill THIS RECORD DOES NOT NAME, so there is no duplicate this record can send you to. The one lever here is that setting, and it stops attachment uploads for EVERY bill on this connector rather than for this one. TURNING IT OFF IS NOT A FENCE EITHER: the handler reads that setting and then uploads, so a run already past the read still uploads, and nothing in IMS reports whether one is. Only closing the row stops the replay, and IMS cannot close it (o3d-4b5p)",
-  "{ledger} {type} for {reference} SUCCEEDED — the external effect has happened — but IMS could not record that it did: {cause}. THIS OPERATION RETURNS NO IDENTIFIER AND NO REQUEST ID PROTECTS IT: unlike a document post it is not sent under a derived Intuit Request-Id, so there is nothing for {ledger} or WooCommerce or a mail server to deduplicate it against. Sync row {syncRowId} was left holding this worker's claim, with no mirrored accounting event written, so once that claim goes stale THE SWEEP WILL RECLAIM THE ROW AND RUN THE OPERATION AGAIN OUTRIGHT —",
-  "{ledger} {type} for {reference} MADE NO EXTERNAL EFFECT. The handler returned success WITHOUT ACTING: no request was sent, nothing was created, changed, uploaded or emailed, and nothing in {ledger} or anywhere else is different because this attempt ran. WHAT COULD NOT BE RECORDED IS THAT IT RAN AT ALL: {cause}. WHAT A REPLAY WOULD COST: sync row {syncRowId} was left holding this worker's claim, with no mirrored accounting event written, so once that claim goes stale the sweep will reclaim the row and run the operation again. Running it again does",
-  ", but IMS could not record the post: {cause}. Sync row {syncRowId} was left naming no document, so nothing in IMS pointed at this one and no mirrored accounting event was written for it — deliberately, because a FAILED one would deny a document that exists. The row was left holding its claim and will be re-attempted once that claim goes stale; that attempt re-posts under the SAME Intuit Request-Id, so it should be deduplicated rather than duplicated. AND THE RESPONSE CARRIED NO ID EITHER, so there is nothing to open — do not go looking for one.",
   "REMEDY: NO DOCUMENT WAS CREATED — this operation changed one that already existed, so there is no duplicate of it in existence and nothing this attempt brought into being. WHAT THIS RECORD DOES NOT SAY is whether the document it changed is LIVE or an UNPOSTED DRAFT: the update is sent with a status resolved from the same posting-mode setting the create uses, and IMS did not record which was in force for this attempt. So it cannot say whether any balance moved. DO NOT void, credit-note, reverse or delete anything on the strength of this record.",
-  ". DO NOT TURN {LEDGER} SYNC OFF FOR THIS ONE. That switch is the containment lever for an incident where something DID reach {ledger}. There is nothing here to contain, and turning it off stops EVERY {ledger} row on this installation — invoices, bills, payments and journals with nothing to do with this row — for as long as it stays off. WHAT IS ACTUALLY WRONG IS THE WRITE, NOT THE OPERATION: sync row {syncRowId} was left PROCESSING at attempt revision 0 with no mirrored event, and nothing in IMS will settle it.",
-  "IT IS LABELLED \"Enable {ledger} Sync\" EVEN THERE, and its helper text says {ledger} too: the {ledger} panel renders the {ledger} client and those two strings are hardcoded. The words are wrong; the checkbox is the right one. (Filed as o3d-m9wm.) The stale-claim sweep and the manual Sync button both READ that setting before they call the {ledger} processor, so while it is off neither one STARTS another run. It stops EVERY {ledger} row, not this one, and it recalls nothing already queued or already done.",
   "REMEDY: THIS RECORD DOES NOT SAY WHETHER THAT WAS A LIVE POSTING OR A DRAFT. This operation creates a live ledger document on one posting-mode setting and an UNPOSTED DRAFT on the other, and IMS did not record which was used for this attempt — so it cannot say whether any balance moved. DO NOT void, credit-note, reverse or delete anything on the strength of this record: the remedy for a live posting is the one that does the most damage to a draft, and the other way round.",
-  "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 name a LIVE effect {ledger} or {ledger} accepted and still holds — real money in somebody else's books, which no reset of ours undoes. THEY ARE NOT ALL NEW DOCUMENTS: this count also holds documents that were MODIFIED rather than created, and payments applied to documents nobody created here.",
-  "Database reset kept 7 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 name a LIVE effect {ledger} or {ledger} accepted and still holds — real money in somebody else's books, which no reset of ours undoes. THEY ARE NOT ALL NEW DOCUMENTS: this count also holds documents that were MODIFIED rather than created, and payments applied to documents nobody created here.",
+  "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 name a LIVE effect {ledger} accepted and still holds — real money in somebody else's books, which no reset of ours undoes. THEY ARE NOT ALL NEW DOCUMENTS: this count also holds documents that were MODIFIED rather than created, and payments applied to documents nobody created here.",
+  "Database reset kept 7 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 name a LIVE effect {ledger} accepted and still holds — real money in somebody else's books, which no reset of ours undoes. THEY ARE NOT ALL NEW DOCUMENTS: this count also holds documents that were MODIFIED rather than created, and payments applied to documents nobody created here.",
   "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 are from operations that create a LIVE ledger document on one posting-mode setting and an UNPOSTED DRAFT on the other, ON RECORDS THAT DO NOT SAY WHICH. IMS cannot tell you whether those balances moved. Do not void, credit, reverse or delete anything on the strength of these.",
-  ", but IMS could not record the post: {cause}. Sync row {syncRowId} was left naming no document, so nothing in IMS pointed at this one and no mirrored accounting event was written for it — deliberately, because a FAILED one would deny a document that exists. The row was left holding its claim and will be re-attempted once that claim goes stale; that attempt re-posts under the SAME Intuit Request-Id, so it should be deduplicated rather than duplicated.",
   "1 MOVED NO BALANCES — the posting mode on those rows was `draft`, so what they wrote sits UNPOSTED in {ledger}. DO NOT void, credit-note or reverse any of them: a reversal POSTS FOR REAL, and would move the accounts by exactly the amount the draft never moved. THEY WERE NOT ALL CREATED AS DRAFTS: this count also holds documents that were MODIFIED while unposted, and deleting one of those destroys a draft that stood there before the attempt ran.",
-  "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 record a write {ledger} or {ledger} ACCEPTED that is NOT a standalone document and has NO id to open — a credit note APPLIED to a bill, a tax rate written into the organisation. The write stands and no reset of ours undoes it, and the allocation moved money.",
-  "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 are the same kind of write — a DOCUMENT {ledger} or {ledger} accepted, which no reset of ours voids — ON A RECORD THAT CARRIES NO ID. DO NOT GO LOOKING FOR AN ID: there is none to open.",
-  "NOTHING — PROVIDED ATTACHMENT UPLOAD IS STILL OFF WHEN THE SWEEP RUNS. What this record knows is that quickbooks_sync_attach_pdf read \"false\" AT THE MOMENT THIS ATTEMPT RAN, which is the only reading it ever took. If that setting is on by the time the row is reclaimed, every sweep uploads the supplier invoice PDF to the bill instead",
-  "this operation succeeds by QUEUEING, not by sending, and IMS CANNOT CANCEL A QUEUED COPY. EmailOutbox has five states — PENDING, PROCESSING, SENT, FAILED, PARKED_SEND_CAP — none of which means \"deliberately not delivered\", and no action, route or screen removes an unsent row, so there is nothing to press.",
+  "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 record a write {ledger} ACCEPTED that is NOT a standalone document and has NO id to open — a credit note APPLIED to a bill, a tax rate written into the organisation. The write stands and no reset of ours undoes it, and the allocation moved money.",
+  "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 are the same kind of write — a DOCUMENT {ledger} accepted, which no reset of ours voids — ON A RECORD THAT CARRIES NO ID. DO NOT GO LOOKING FOR AN ID: there is none to open.",
   "Database reset kept 1 record(s) of things IMS did against an accounting connector and could never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 1 carry no operation type this version of IMS has classified, so it cannot say which kind they are.",
   "1 are from operations that create a LIVE ledger document on one posting-mode setting and an UNPOSTED DRAFT on the other, ON RECORDS THAT DO NOT SAY WHICH. IMS cannot tell you whether those balances moved. Do not void, credit, reverse or delete anything on the strength of these.",
   "it either uploaded a supplier-invoice PDF onto a bill that already existed in {ledger} or did nothing at all — the handler skips the upload and STILL RETURNS SUCCESS when the attachment-upload setting reads as off, and this record does not say which of the two this attempt was",
   ", and note that nothing further will be retried for this row. WHAT THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time this record was written — the write it describes was made in the same sync attempt. That is all of it.",
   "{ledger} {type} for {reference} SUCCEEDED, but IMS RECORDED NEITHER WHAT IT DID NOR THAT IT RAN — this operation has a success path that acts and a success path that does nothing, and this record does not say which one this attempt took. WHAT THE OPERATION DID:",
   ", and note that no further sync attempt will touch either. WHAT THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time this record was written — the write it describes was made in the same sync attempt. That is all of it.",
-  "1 record a write {ledger} or {ledger} ACCEPTED that is NOT a standalone document and has NO id to open — a credit note APPLIED to a bill, a tax rate written into the organisation. The write stands and no reset of ours undoes it, and the allocation moved money.",
+  "1 record a write {ledger} ACCEPTED that is NOT a standalone document and has NO id to open — a credit note APPLIED to a bill, a tax rate written into the organisation. The write stands and no reset of ours undoes it, and the allocation moved money.",
   "; nothing further will be retried for this row. WHAT THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time this record was written — the write it describes was made in the same sync attempt. That is all of it.",
-  "either the supplier invoice PDF is uploaded to that bill in {ledger} AGAIN once per sweep, or nothing happens at all — which of the two depends on quickbooks_sync_attach_pdf as it stands when the sweep runs, and this record carries no reading of it",
   "; no further sync attempt will touch either. WHAT THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time this record was written — the write it describes was made in the same sync attempt. That is all of it.",
   "it uploaded a supplier-invoice PDF onto a bill that already existed in {ledger}. THE UPLOAD HAPPENED. No id came back because an attachment is not a document, and this record does not carry the id of the bill it went onto either",
   "REMEDY: DO NOT OPEN, KEEP OR VOID EITHER THE BILL OR THE CREDIT NOTE ON THE STRENGTH OF THIS RECORD. Both of them existed before this operation and neither was created by it; what happened is that one was applied to the other.",
@@ -1688,16 +1547,14 @@ const RECORD_PROSE: readonly string[] = [
   "REMEDY: IMS CANNOT CANCEL A QUEUED COPY — EmailOutbox has five states (PENDING, PROCESSING, SENT, FAILED, PARKED_SEND_CAP), none of which means \"deliberately not delivered\", and no action, route or screen removes an unsent row.",
   "REMEDY: THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER. It holds the IMS reference above and nothing else, and the IMS record that maps that reference to a WooCommerce order does not survive a database reset.",
   ". WHAT THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time this record was written — the write it describes was made in the same sync attempt. That is all of it.",
-  "THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER — it holds the IMS reference above and nothing else, and the IMS record that maps that reference to a WooCommerce order does not survive a database reset.",
   "WHAT THIS RECORD HOLDS: the operation type, the IMS reference above, the sync row id, and the time this record was written — the write it describes was made in the same sync attempt. That is all of it.",
   "REMEDY: DO NOT REMOVE AN ATTACHMENT FROM A BILL THIS RECORD CANNOT NAME. The upload happened, so a duplicate may exist, but nothing kept here says which bill it is on and nothing kept here derives it.",
   "{ledger} {type} for {reference} SUCCEEDED WITHOUT MAKING ANY EXTERNAL EFFECT — nothing left this process and nothing in {ledger} changed — and IMS could not record that it ran. WHAT THE OPERATION DID:",
   "it did nothing at all. Attachment upload READ AS OFF FOR THIS CONNECTOR AT THE MOMENT THIS ATTEMPT RAN, so the handler returned success without contacting {ledger} and without uploading anything",
   "it APPLIED an already-posted supplier credit note to an already-posted bill. An allocation is a sub-resource of the credit note, not a standalone document, and {ledger} returns no id for one",
-  "1 are the same kind of write — a DOCUMENT {ledger} or {ledger} accepted, which no reset of ours voids — ON A RECORD THAT CARRIES NO ID. DO NOT GO LOOKING FOR AN ID: there is none to open.",
+  "1 are the same kind of write — a DOCUMENT {ledger} accepted, which no reset of ours voids — ON A RECORD THAT CARRIES NO ID. DO NOT GO LOOKING FOR AN ID: there is none to open.",
   "A FAILED ROW IS NOT PROOF THAT NOTHING WENT, whatever its lastError says: IMS keeps no per-attempt outcome, so a row's final error cannot be read backwards into its history (o3d-ch0h).",
   "A FAILED ROW IS NOT PROOF THAT NOTHING WENT, whatever its lastError says: IMS keeps no per-attempt outcome, so a row's final error cannot be read backwards into its history (o3d-ch0h)",
-  "— but it is an ADMISSION CHECK, NOT A FENCE: a run admitted a moment before you flipped it can queue another copy afterwards, and nothing in IMS reports whether one is doing so.",
   "It says what can be done about it, and where IMS could not establish what the effect was, it says that instead of guessing. Nothing else in IMS references any of them any more.",
   ", but its sync row {syncRowId} no longer exists, so nothing in IMS references the draft journal. NO ID WAS RETURNED, so there is nothing to open — do not go looking for one.",
   ", but its sync row {syncRowId} no longer exists, so nothing in IMS references what it created. NO ID WAS RETURNED, so there is nothing to open — do not go looking for one.",
@@ -1708,23 +1565,13 @@ const RECORD_PROSE: readonly string[] = [
   ", but its sync row {syncRowId} no longer exists, so nothing in IMS references the journal. NO ID WAS RETURNED, so there is nothing to open — do not go looking for one.",
   "REMEDY: DO NOT REMOVE AN ATTACHMENT ON THE STRENGTH OF THIS RECORD — this attempt may never have created one, and this record does not name the bill one would be on.",
   ", but its sync row {syncRowId} no longer exists, so nothing in IMS references the draft. NO ID WAS RETURNED, so there is nothing to open — do not go looking for one.",
-  ", and DO NOT REPORT A COUNT OF DUPLICATES, OF PENDING DELIVERIES OR OF COPIES THAT DID NOT ARRIVE FROM THIS QUERY: it cannot establish any of them (o3d-il7a)",
   ", but sync row {syncRowId} already named a DIFFERENT external id ({namedExternalId}) — a newer claim posted while this attempt was on the wire.",
   ", but sync row {syncRowId} already named a DIFFERENT document ({namedExternalId}) — a newer claim posted while this attempt was on the wire.",
   "{ledger} {type} for {reference} SUCCEEDED — the external effect has happened — but IMS could not record that it did. WHAT THE OPERATION DID:",
   "REMEDY: THERE IS NOTHING TO UNDO. No attachment was created, no document was created, and nothing in {ledger} was touched by this attempt.",
   ", but sync row {syncRowId} already named a DIFFERENT draft document (unknown) — a newer claim posted while this attempt was on the wire.",
-  ". The failure that stopped it being recorded: {cause}. Sync row {syncRowId} was left holding this worker's claim and naming no document.",
   ", but sync row {syncRowId} already named a DIFFERENT draft journal (unknown) — a newer claim posted while this attempt was on the wire.",
-  "THIS RECORD DOES NOT NAME THE BILL THE PDF WENT ONTO, so it cannot send you to the duplicates and nothing kept here derives the bill.",
   ", but sync row {syncRowId} already named a DIFFERENT external id (unknown) — a newer claim posted while this attempt was on the wire.",
-  // ROUND 16 (Codex MEDIUM): re-read because o3d-alnk's partial unique index made the old
-  // per-sweep count false. It names no act; it says what happens and what does not.
-  // ROUND 18 (Codex MEDIUM): re-read AGAIN, because round 16's replacement asserted a CADENCE
-  // instead of grepping one. The two schedules are in the repo — accounting-sync `*/5 * * * *`
-  // (lib/cron-jobs/xero.ts) and `/api/cron/email-outbox` Hourly (help-docs/settings.md) — and they
-  // are the opposite way round from what it said. Still prose, still naming no act.
-  "ANOTHER COPY OF THE INVOICE EMAIL IS QUEUED TO THE CUSTOMER — a PENDING accounting-invoice row in the email outbox — on the next sweep that runs once the outbox has FINISHED with the copy before it. COPIES DO NOT PILE UP UNDELIVERED: the email outbox refuses a second undelivered row for this order, so a sweep that lands while one is still PENDING or PROCESSING queues nothing and reports success anyway. THE REPETITION IS PACED BY THE OUTBOX DRAIN, NOT BY THIS SWEEP: this sweep is scheduled every five minutes and the outbox drain is scheduled hourly, so MOST SWEEPS QUEUE NOTHING — around a dozen in a row meet the same undelivered row — and the refusal lifts only when that row is settled to SENT or FAILED (by a drain, or by an operator resolving a row parked at the send cap). Count copies against the OUTBOX cadence, never one per sweep",
   ", but sync row {syncRowId} already named a DIFFERENT document (unknown) — a newer claim posted while this attempt was on the wire.",
   ", but sync row {syncRowId} already named a DIFFERENT payment (unknown) — a newer claim posted while this attempt was on the wire.",
   ", but sync row {syncRowId} already named a DIFFERENT journal (unknown) — a newer claim posted while this attempt was on the wire.",
@@ -1735,7 +1582,6 @@ const RECORD_PROSE: readonly string[] = [
   "The row was left naming the first one. ONE OF THE TWO IDS IS NOT RECORDED HERE, so they cannot both be opened. REMEDY:",
   "The draft it changed is in {ledger} all the same, it stood there before this attempt ran, and it moved no balances.",
   ". Sync row {syncRowId} already named a different external id ({namedExternalId}) and was left naming that one.",
-  ", unbounded, because no retry is consumed while the row never leaves PROCESSING. WHAT TO DO ABOUT THE EFFECT:",
   "it re-downloaded the invoice PDF and wrote it over the copy IMS had stored, so the effect landed inside IMS",
   "MODIFIED an existing {ledger} DRAFT document (no id returned) — it is still unposted, and no balance moved",
   "BOTH documents exist in {ledger}, and NEITHER was created by this attempt — it changed the one it names.",
@@ -1745,25 +1591,18 @@ const RECORD_PROSE: readonly string[] = [
   ". Sync row {syncRowId} already named a different external id (unknown) and was left naming that one.",
   "each one says what it holds, and none of them holds enough to pick that document out of a ledger.",
   "The document it changed is in {ledger} all the same, and it stood there before this attempt ran.",
-  "IMS DID NOT RECORD WHETHER THIS ATTEMPT UPLOADED ANYTHING, and it does not name the bill either.",
   "created a DRAFT manual journal in {ledger} (no id returned) — nothing was posted to the ledger",
   ", but its sync row {syncRowId} no longer exists, so nothing in IMS references what it created.",
-  "WHAT COMES BACK IS A NON-QUIESCENT SNAPSHOT: the set can still grow after you have read it,",
   "The value recorded against this incident ({postedExternalId}) is not a document id. REMEDY:",
   "created a DRAFT document in {ledger} (no id returned) — nothing was posted to the ledger",
-  "the invoice PDF is re-downloaded and written over the stored copy AGAIN, once per sweep",
-  "the supplier invoice PDF is uploaded to that bill in {ledger} AGAIN, once per sweep",
   "The value recorded against this incident ({postedExternalId}) is not a document id.",
   "NOTHING WAS CREATED IN {LEDGER} AT ALL, so there is no document there to open.",
   ". NO ID WAS RETURNED, so there is nothing to open — do not go looking for one.",
   ", but its sync row {syncRowId} no longer exists, so nothing in IMS references",
   ". Its sync row {syncRowId} no longer exists, so nothing in IMS references it.",
   "THERE IS NOTHING TO UNDO. No attachment was created, no document was created",
-  "a second invoice note is written onto the WooCommerce order, once per sweep",
   "The draft journal is in {ledger} all the same, and it moved no balances.",
   "BOTH draft journals exist in {ledger}, and neither has moved a balance.",
-  "rather than clearing an attachment off a bill picked out any other way",
-  "nothing this attempt did needs undoing — it created no attachment.",
   "The draft is in {ledger} all the same, and it moved no balances.",
   "rather than clearing notes off an order picked out any other way",
   "BOTH drafts exist in {ledger}, and neither has moved a balance.",
@@ -1790,7 +1629,6 @@ const RECORD_PROSE: readonly string[] = [
   "do not go looking for a document.",
   "{ledger} {type} for {reference}",
   "BOTH payments are in {ledger}.",
-  ". WHAT TO DO ABOUT THE EFFECT:",
   "POSTED as (no id returned)",
   "the document it changed",
   "the draft it changed",
@@ -1847,7 +1685,7 @@ test('ROUND 16 (Codex HIGH x2): every word of a lookup-less record is one that w
   // was classified, this filter matched nothing, and the two unclassified frames were never
   // decomposed against the three lists. Asserted rather than assumed, because the way that hole
   // opened is that nothing noticed the branch had left the corpus.
-  for (const connector of ['qbo', 'xero']) {
+  for (const connector of ['xero']) {
     assert.ok(
       messages.some(({ label, text }) => label.startsWith(connector) && text.includes(UNCLASSIFIED_MARKER)),
       `no ${connector} message in the corpus reaches the unclassified frame, so its wording is not `
@@ -1887,7 +1725,7 @@ test('ROUND 16 (Codex HIGH x2): every word of a lookup-less record is one that w
   )
 })
 
-// MUTATION THAT KILLS THIS (run): add a fifteenth direction to LOCAL_DIRECTIONS and the cap fails.
+// MUTATION THAT KILLS THIS (run): add a fifth direction to LOCAL_DIRECTIONS and the cap fails.
 // RUN. Put a mutation lexeme in a renderer branch — 'and remove the duplicate' — and the read-only
 // assertion fails naming it.
 //
@@ -1978,7 +1816,7 @@ test('ROUND 17 (Codex HIGH): the instruction inventory is generated from its tar
   // AND THE SWAP IS CAUGHT — for every direction, not merely somewhere in the corpus.
   //
   // Stated at the strength it actually holds: a single message may legitimately name SEVERAL local
-  // objects (the QuickBooks email incident names the outbox rows and the sync toggle in the same
+  // objects (an email incident may name the outbox rows and the sync row in the same
   // breath), so the anchor cannot refuse every other target and claiming it does would be a fence
   // that fails the first time somebody writes a longer message. What it must do is refuse AT LEAST
   // ONE — because round 16's `object.length > 0` was satisfied by all five members equally, and an
@@ -2062,7 +1900,7 @@ const LEGACY_REMOTE_REFERENCE = new RegExp(
   '\\b(?:bills?|invoices?|credit[- ]notes?|journals?|payments?|tax rates?|documents?|attachments?'
   + '|orders?|contacts?|accounts?|quotes?|receipts?|prepayments?|overpayments?|bank transactions?'
   + '|ledgers?|organisations?|systems?|connectors?)\\b'
-  + '|\\{ledger\\}|\\{LEDGER\\}|\\bXero\\b|\\bQuickBooks\\b|\\bWooCommerce\\b|\\bthere\\b',
+  + '|\\{ledger\\}|\\{LEDGER\\}|\\bXero\\b|\\bWooCommerce\\b|\\bthere\\b',
   'i',
 )
 
@@ -2075,17 +1913,16 @@ const LEGACY_REMOTE_REFERENCE = new RegExp(
 //
 // ROUTE: the two sentences are spliced into a SHIPPED rendered message at the two surfaces round 15
 // did not scan — a formatter frame, and the `effect` clause the frame interpolates. The equivalent
-// source mutations are appending the sentence to the QuickBooks no-request-id frame and to
-// QBO_OPERATIONS_WITHOUT_REQUEST_ID.WC_INVOICE_NOTE.effect.
+// source mutations are appending the sentence to the non-document frame and to
+// NON_DOCUMENT_INCIDENT_WORDING.WC_INVOICE_NOTE.did.
 test('ROUND 16 (Codex HIGH): the two sentences no fence caught, in the two surfaces none scanned', () => {
-  const shipped = normaliseIncidentValues(describeUnpersistedQboPost(
-    { entry: ENTRY('WC_INVOICE_NOTE'), postedExternalId: null },
-    new Error('write conflict'),
-  ))
+  const shipped = normaliseIncidentValues(describeUnrecordablePostedDocument({
+    entry: ENTRY('WC_INVOICE_NOTE'), postedExternalId: null, namedExternalId: null, reason: 'ROW_MISSING',
+  }))
   assert.deepEqual(unreviewedWords(shipped, REVIEWED_SPANS), [], 'the shipped message itself is closed')
 
-  const FRAME_SEAM = 'THIS OPERATION RETURNS NO IDENTIFIER AND NO REQUEST ID PROTECTS IT: '
-  const EFFECT_SEAM = ', unbounded, because no retry is consumed'
+  const FRAME_SEAM = 'WHAT THE OPERATION DID: '
+  const EFFECT_SEAM = 'it wrote an invoice note onto the WooCommerce order'
   assert.ok(shipped.includes(FRAME_SEAM), 'sanity: the formatter frame seam is in the shipped message')
   assert.ok(shipped.includes(EFFECT_SEAM), 'sanity: the effect seam is in the shipped message')
 
@@ -2104,7 +1941,7 @@ test('ROUND 16 (Codex HIGH): the two sentences no fence caught, in the two surfa
     )
 
     const inFrame = shipped.split(FRAME_SEAM).join(`${FRAME_SEAM}${sentence} `)
-    const inEffect = shipped.split(EFFECT_SEAM).join(`. ${sentence}${EFFECT_SEAM}`)
+    const inEffect = shipped.split(EFFECT_SEAM).join(`${sentence} ${EFFECT_SEAM}`)
     for (const [surface, spliced] of [['formatter frame', inFrame], ['effect field', inEffect]] as const) {
       const unreviewed = unreviewedWords(spliced, REVIEWED_SPANS)
       assert.notDeepEqual(
@@ -2207,7 +2044,7 @@ function distinctiveFragment(span: string): string {
 // ---------------------------------------------------------------------------
 
 /** The sequences by the name the formatter refers to them by. */
-const DECLARED_SEQUENCES: Record<string, LocalDirectionSequence> = { LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE }
+const DECLARED_SEQUENCES: Record<string, LocalDirectionSequence> = {}
 
 /** Read an object literal of enumerated values into a plain object, or null if it holds anything else. */
 function literalValue(node: ts.Expression): unknown {
@@ -2401,8 +2238,10 @@ function shadowedRendererBindings(sourceText: string): string[] {
     ts.forEachChild(node, visit)
   }
   visit(sourceFile)
-  for (const name of names) {
-    if (!imported.has(name)) offences.push(`${name} is never imported from the production direction model`)
+  // Only the single-direction renderer must be imported: the sequence renderer is composed by no
+  // formatter today (no sequence is declared), so requiring an import of it would demand dead code.
+  if (!imported.has('renderLocalDirection')) {
+    offences.push('renderLocalDirection is never imported from the production direction model')
   }
   return offences
 }
@@ -2566,7 +2405,7 @@ test('ROUND 19 (Codex HIGH): no direction prose is written down, and SPLITTING T
 
   // NON-VACUITY, both ways, on a real direction's real sentence.
   const shipped = renderLocalDirection(
-    { action: 'RE_READ', target: 'EMAIL_OUTBOX_ROWS' }, LOCAL_DIRECTION_CONTEXT,
+    { action: 'CONFIRM', target: 'ORDER_INVOICE_PDF' }, LOCAL_DIRECTION_CONTEXT,
   )
   const half = Math.floor(shipped.length / 2)
   const contiguous = `const message = 'prefix ${shipped}'`
@@ -2583,7 +2422,7 @@ test('ROUND 19 (Codex HIGH): no direction prose is written down, and SPLITTING T
   )
   // ...and the flattening must not bridge a genuine composition point, or every message would read
   // as one run and the check would report prose nobody wrote.
-  const composedNotWritten = `const message = 'prefix ' + renderLocalDirection({ action: 'RE_READ', target: 'EMAIL_OUTBOX_ROWS' }, ctx) + ' suffix'`
+  const composedNotWritten = `const message = 'prefix ' + renderLocalDirection({ action: 'CONFIRM', target: 'ORDER_INVOICE_PDF' }, ctx) + ' suffix'`
   assert.deepEqual(
     handWrittenDirectionProse(composedNotWritten), [],
     'a call between two literals breaks the run — composing is not writing down',
@@ -2710,8 +2549,8 @@ const UNDECLARED_IMPERATIVES: readonly RegExp[] = [
 test('ROUND 19 (Codex HIGH): each direction emits ONE action on its OWN declared target', () => {
   // Route: renderLocalDirection over every member of LOCAL_DIRECTIONS, at runtime.
   //
-  // Mutation: put the round-18 shape back — prefix the ESCALATE branch with 'Leave the toggle off
-  // and ' — and (1) fails, because that prefix IS the LEAVE_OFF direction's whole prose. Put back
+  // Mutation: put the round-18 shape back — prefix the ESCALATE branch with another direction's whole
+  // prose — and (1) fails, because that prefix IS that direction's whole prose. Put back
   // 'Fix the failure named above, and ' and (3) fails on `fix`. Both are run as controls below.
   const rendered = LOCAL_DIRECTIONS.map((direction) => ({
     direction,
@@ -2755,17 +2594,16 @@ test('ROUND 19 (Codex HIGH): each direction emits ONE action on its OWN declared
     }
   }
 
-  // NON-VACUITY, on the two shapes that actually shipped, composed from the live renderings so the
+  // NON-VACUITY, on the two shapes that once shipped, composed from the live renderings so the
   // controls cannot rot into tests of hardcoded sentences.
   const escalate = renderLocalDirection(
-    { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'SYNC_ROW' }, LOCAL_DIRECTION_CONTEXT,
+    { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
+    LOCAL_DIRECTION_CONTEXT,
   )
-  const leaveOff = renderLocalDirection(
-    { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED', form: 'BEFORE_ESCALATION' }, LOCAL_DIRECTION_CONTEXT,
-  )
+  const confirm = renderLocalDirection({ action: 'CONFIRM', target: 'ORDER_INVOICE_PDF' }, LOCAL_DIRECTION_CONTEXT)
   assert.ok(
-    `${leaveOff} and ${escalate}`.includes(leaveOff),
-    'CONTROL for (1): the round-18 compound genuinely contains the LEAVE_OFF direction whole, so the '
+    `${confirm} and ${escalate}`.includes(confirm),
+    'CONTROL for (1): a compound of two directions genuinely contains the first one whole, so the '
     + 'containment check is what refuses it rather than a coincidence of wording',
   )
   assert.ok(
@@ -2777,12 +2615,13 @@ test('ROUND 19 (Codex HIGH): each direction emits ONE action on its OWN declared
     'and the shipped sentence is not, or the banlist rejects everything and proves nothing',
   )
 
-  // AND THE COMPOUND IS REPRESENTED, so removing it was not the fix — it MOVED.
+  // AND A COMPOUND IS REPRESENTED AS A SEQUENCE, so the way to say two things is a structure rather
+  // than an extra clause. No sequence is declared today; this holds the renderer itself to joining
+  // two inventory directions with the reviewed conjunction and nothing else.
   assert.equal(
-    renderLocalDirectionSequence(LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE, LOCAL_DIRECTION_CONTEXT),
-    `${leaveOff} and ${escalate}`,
-    'the sequence renderer must produce exactly the sentence the compound direction used to, or the '
-    + 'record lost an instruction rather than gaining a structure for it',
+    renderLocalDirectionSequence([LOCAL_DIRECTIONS[0]!, LOCAL_DIRECTIONS[2]!], LOCAL_DIRECTION_CONTEXT),
+    `${confirm}${SEQUENCE_CONJUNCTION}${escalate}`,
+    'the sequence renderer must produce exactly the two sentences joined by the reviewed conjunction',
   )
 })
 
@@ -2855,20 +2694,19 @@ test('ROUND 18 (Codex HIGH): a formatter composing a MISMATCHED direction does n
         + "IMS reference above to reach the matching entry and take the second PDF off it.' }, context)",
     },
     {
-      // r21: the read axes are no longer a field on a direction — they are the three named lists in
-      // `OUTBOX_READ_LIST`, whose `satisfies` clause is what still fences them to real columns. So the
+      // r21: the read axes are no longer a field on a direction — they are the named list in
+      // `OUTBOX_READ_LIST`, whose `satisfies` clause is what still fences it to real columns. So the
       // claim is probed where it now lives rather than through a field that has gone.
       what: 'an outbox read axis that is not a column of that table',
       snippet: "((): string => { const axis: OutboxReadAxis = 'grossTotal'; return axis })()",
     },
     {
-      what: 'an outbox read-list name that is not one of the ones that ship',
+      what: 'a free parameter on the outbox direction, which has none',
       snippet: "renderLocalDirection({ action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS', form: 'BY_GROSS_TOTAL' }, context)",
     },
     {
-      what: 'a setting direction naming a setting IMS does not hold',
-      snippet: "renderLocalDirection({ action: 'READ_SETTING', target: 'SETTING_ATTACH_PDF', "
-        + "form: 'THEN_GO_AND_READ_IT', setting: 'xero_sync_enabled' }, context)",
+      what: 'a direction naming a setting, which the model has no member for',
+      snippet: "renderLocalDirection({ action: 'CONFIRM', target: 'ORDER_INVOICE_PDF', setting: 'xero_sync_enabled' }, context)",
     },
     {
       what: 'an action the model has no branch for',
@@ -2897,7 +2735,7 @@ test('ROUND 18 (Codex HIGH): a formatter composing a MISMATCHED direction does n
 //
 // Codex offered two closures — action-specific structured tokens, or an independently reviewed
 // exact-output inventory. THE INVENTORY IS THE ONE TAKEN. The renderer's outputs are a finite,
-// enumerable set (fourteen directions and one sequence), and the file already runs exactly this
+// enumerable set (the capped directions), and the file already runs exactly this
 // discipline for RECORD_PROSE and BREADCRUMB_DIRECTIONS: the sentence is written out where a
 // reviewer reads it, and the module is held to it. `RENDERED_DIRECTIONS` above is that list, and it
 // is what LOCAL_DIRECTION_SPANS is built from — so a drifted renderer fails on exact equality here,
@@ -2919,9 +2757,9 @@ const UNDECLARED_REMOTE_ACTION = 'Go to that bill and take the second PDF off it
  * asserted against the sample the pass actually uses rather than against a description of it.
  */
 const RUNTIME_CONTEXTS: readonly LocalDirectionContext[] = [
-  { ledger: 'QuickBooks', syncRowId: 'log-1' },
+  { ledger: 'Other Ledger', syncRowId: 'log-1' },
   { ledger: 'Xero', syncRowId: 'log-1' },
-  { ledger: 'QuickBooks', syncRowId: 'sync-row-742' },
+  { ledger: 'Other Ledger', syncRowId: 'sync-row-742' },
   { ledger: 'Xero', syncRowId: 'sync-row-742' },
 ]
 
@@ -2936,9 +2774,9 @@ const OFF_SAMPLE_SYNC_ROW = 'sync-row-9c2f41d0e7b84a15'
  * THE REVIEWED SENTENCE AS ONE PARTICULAR CONTEXT WOULD PRINT IT (round 23, Codex HIGH).
  *
  * ROUND 22 COMPARED THE OTHER WAY ROUND. It rendered with a real connector name and pushed the
- * OUTPUT back through `normaliseRenderedValues`, which maps BOTH 'QuickBooks' and 'Xero' onto the
+ * OUTPUT back through `normaliseRenderedValues`, which maps every ledger name onto the
  * same `{ledger}`. That is lossy in exactly the direction that matters: a branch that hard-codes
- * one connector's name is normalised into the other's reviewed sentence and passes, so the runtime
+ * one ledger's name is normalised into another's reviewed sentence and passes, so the runtime
  * pass could not see a wrong-connector sentence even while it was rendering one. The same holds for
  * the sync row id, whose only sampled value was the fixture's own.
  *
@@ -3007,10 +2845,11 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
 
   // AND WITH THE REAL VALUES PRODUCTION SUPPLIES (round 22, Codex HIGH), compared against the
   // reviewed sentence WITH THOSE VALUES SUBSTITUTED INTO IT (round 23, Codex HIGH). The placeholder
-  // context is a FIXTURE: a branch selected by comparing `context.ledger` against 'QuickBooks' or
-  // 'Xero' is never taken while it is what renders, so rendering only with it leaves exactly the
-  // branch production takes unexercised. Round 22 fixed that by normalising the output, which maps
-  // both connector names onto one placeholder and so cannot tell them apart — control (L) below.
+  // context is a FIXTURE: a branch selected by comparing `context.ledger` against a ledger name is
+  // never taken while it is what renders, so rendering only with it leaves exactly the branch
+  // production takes unexercised. No shipped direction reads either context field any more, so the
+  // reviewed sentences carry no placeholder and these passes must agree with the fixture pass byte
+  // for byte — which is exactly what a branch keyed on a context field would break.
   //
   // The sync row id is sampled at a value that is NOT the fixture's for the same reason: coverage
   // that only ever passes 'log-1' cannot see a branch keyed on it (Codex, round 23).
@@ -3026,31 +2865,6 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
       )
     }
   }
-
-  // (L) A CONNECTOR-MISMATCHED SENTENCE (round 23, Codex HIGH), and the one control here that is
-  // about the COMPARISON rather than about the renderer. This renderer prints the QuickBooks-named
-  // sentence for one direction while the context it was handed says Xero — which is what a branch
-  // pruned by an asserted discriminant ships at run time.
-  const xeroRuntime: LocalDirectionContext = { ledger: 'Xero', syncRowId: 'log-1' }
-  const quickBooksRuntime: LocalDirectionContext = { ledger: 'QuickBooks', syncRowId: 'log-1' }
-  const wrongConnector = (direction: LocalDirection): string => renderLocalDirection(
-    direction,
-    direction.action === 'TURN_OFF' && direction.control === 'CONNECTOR_PANEL_CHECKBOX'
-      ? quickBooksRuntime
-      : xeroRuntime,
-  )
-  assert.throws(
-    () => assertRenderedInventory(wrongConnector, (text) => substitutePlaceholders(text, xeroRuntime)),
-    /is NOT the reviewed sentence for it/,
-    'CONTROL: a sentence naming the WRONG connector for the context it was rendered with must be refused. The '
-    + 'reviewed text carries this pass\'s own values, so the only output that matches is the one that printed '
-    + 'them',
-  )
-  // ...AND NORMALISATION ACCEPTED IT, asserted rather than described — the same shape as (J). The
-  // round-22 comparison, run over the SAME mutated renderer, passes: `normaliseRenderedValues` maps
-  // 'QuickBooks' and 'Xero' onto one `{ledger}`, so the wrong connector's sentence is rewritten into
-  // the reviewed one before anything looks at it. That is the mutation of the CHECK itself.
-  assertRenderedInventory((direction) => normaliseRenderedValues(wrongConnector(direction)))
 
   // The sequences too: the conjunction is prose, and it is nobody's element.
   assert.equal(RENDERED_DIRECTION_SEQUENCES.length, LOCAL_DIRECTION_SEQUENCES.length)
@@ -3072,7 +2886,8 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
   // AND WHY THE INVENTORY WAS NEEDED: the round-19 proofs accept that same sentence. Asserted rather
   // than described, so a later round cannot quietly conclude the old checks were sufficient.
   const escalate = renderLocalDirection(
-    { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'SYNC_ROW' }, LOCAL_DIRECTION_CONTEXT,
+    { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'SENTENCE' },
+    LOCAL_DIRECTION_CONTEXT,
   )
   const smuggled = `${escalate} ${UNDECLARED_REMOTE_ACTION}`
   const others = LOCAL_DIRECTIONS
@@ -3151,9 +2966,9 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  * AND THE TWO CONTEXT FIELDS ARE SYMBOLIC, NOT CONCRETE (round 22, Codex HIGH). They used to be
  * bound to the literal strings `{ledger}` and `{syncRowId}` — the placeholders
  * `LOCAL_DIRECTION_CONTEXT` substitutes — because those are what the reviewed inventory is written
- * against. But a literal is a value this walk KNOWS, so `context.ledger === 'QuickBooks'` folded to
+ * against. But a literal is a value this walk KNOWS, so `context.ledger === 'Other Ledger'` folded to
  * FALSE and the arm behind it was PRUNED: a branch reachable only at run time (production supplies
- * `ledger: 'QuickBooks'` and `ledger: 'Xero'`) was never evaluated, and whatever it emitted was
+ * whatever ledger name the message is about) was never evaluated, and whatever it emitted was
  * never compared against the inventory. That is the defect this walk exists to remove, one level in
  * — the checks it replaced could not SEE certain output; this one DECIDED IT DID NOT EXIST.
  *
@@ -3260,8 +3075,8 @@ test('ROUND 20 (Codex HIGH): every string the renderer emits is one written out 
  * now records `argumentOrigin(parameter.initializer)` — the same provenance reader a written-out
  * argument goes through, at the one binding site round 26 stopped looking at. A default with clean
  * provenance records `null` and changes nothing, and the shipped renderers declare no defaults at
- * all, so the computed inventory is untouched: fourteen shapes, fourteen distinct sentences,
- * fourteen reviewed, nothing unresolved — the same numbers every round since 21.
+ * all, so the computed inventory is untouched: one shape per direction, one distinct sentence each,
+ * all of them reviewed, nothing unresolved.
  *
  * Control (O) is the route, and its sequence renderer passes the safe value EXPLICITLY so that the
  * only path to the pruned arm is the root: with the argument omitted there too, round 25's internal
@@ -4056,7 +3871,7 @@ function computeRendererOutput(
    * runtime value" is true ONLY when the literal type has honest provenance. An `as` assertion
    * MANUFACTURES a literal type out of a value that is not known until run time, and the checker
    * reports the manufactured one exactly as confidently as the declared one. So
-   * `const { ledger } = context as { ledger: 'QuickBooks'; syncRowId: string }` restores precisely
+   * `const { ledger } = context as { ledger: 'Other Ledger'; syncRowId: string }` restores precisely
    * the pruning round 22 closed: `ledger` is then ONE literal, a comparison against another
    * connector's name folds FALSE, and the arm production takes at run time is never computed.
    *
@@ -5326,9 +5141,9 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   // (B) A CALLEE THAT RESOLVES TO A PARAMETER — THE OTHER LOAD-BEARING ONE. There is no body here to
   // inspect: what `emit` is bound to at run time is decided outside this program.
   const viaParameterCallee = model.replace(
-    "    case 'RE_READ':\n      return 'so re-run the query rather than treating one result as the final list'",
-    "    case 'RE_READ':\n      return viaCallback(() => 'so re-run the query rather than treating one result "
-    + "as the final list')",
+    "    case 'CONFIRM':\n      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "    case 'CONFIRM':\n      return viaCallback(() => 'confirm the invoice PDF stored against the order is the document "
+    + "you expect')",
   ).replace(
     'export type LocalDirectionContext = {',
     'function viaCallback(emit: () => string): string {\n  return emit()\n}\n\nexport type LocalDirectionContext = {',
@@ -5376,12 +5191,12 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
 
   // (E) A CALL THROUGH A VALUE RATHER THAN A NAME. The shape nobody thought of arrives here.
   const viaUnnamedCallee = model.replace(
-    "    case 'RE_READ':\n      return 'so re-run the query rather than treating one result as the final list'",
-    "    case 'RE_READ':\n      return (true ? viaExpression : viaExpression)()",
+    "    case 'CONFIRM':\n      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "    case 'CONFIRM':\n      return (true ? viaExpression : viaExpression)()",
   ).replace(
     'export type LocalDirectionContext = {',
-    "function viaExpression(): string {\n  return 'so re-run the query rather than treating one result as the "
-    + "final list'\n}\n\nexport type LocalDirectionContext = {",
+    "function viaExpression(): string {\n  return 'confirm the invoice PDF stored against the order is the document "
+    + "you expect'\n}\n\nexport type LocalDirectionContext = {",
   )
   assert.notEqual(viaUnnamedCallee, model, 'the unnamed-callee mutation must actually have been applied')
   const unnamedComplaints = judgeRendererOutput(viaUnnamedCallee)
@@ -5392,8 +5207,9 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
 
   // (F) A SENTENCE APPENDED TO A REACHABLE BRANCH — the round-20 route, still refused.
   const appended = model.replace(
-    'return `ESCALATE sync row ${context.syncRowId}, with this record, ${administrator}`',
-    'return `ESCALATE sync row ${context.syncRowId}, with this record, ${administrator}. ' + UNDECLARED_REMOTE_ACTION + '`',
+    "      return `${direction.caseForm === 'SENTENCE' ? 'Escalate' : 'escalate'} this record ${administrator}`",
+    "      return `${direction.caseForm === 'SENTENCE' ? 'Escalate' : 'escalate'} this record ${administrator}. "
+      + UNDECLARED_REMOTE_ACTION + '`',
   )
   assert.notEqual(appended, model, 'the appended-sentence mutation must actually have been applied')
   assert.ok(
@@ -5460,18 +5276,18 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   const viaSequenceConjunction = model.replace(" + ' and ' + ", " + ' and then delete the other one and ' + ")
   assert.notEqual(viaSequenceConjunction, model, 'the conjunction mutation must actually have been applied')
   assert.ok(
-    judgeRendererOutput(viaSequenceConjunction).some((complaint) => complaint.includes('reviewed sequence')),
+    judgeRendererOutput(viaSequenceConjunction).some((complaint) => complaint.includes('sequence nobody reviewed')),
     'CONTROL: the conjunction the sequence renderer contributes is judged too, because it is nobody\'s element',
   )
 
   // (J) A BRANCH SELECTED BY A CONTEXT VALUE — THE ROUND-22 ROUTE (Codex HIGH), and the one control
   // here that is about the EVALUATOR rather than about the renderer. `context.ledger` is not known
-  // until run time; production supplies 'QuickBooks' and 'Xero'. While the walk bound that field to
-  // the concrete string `{ledger}`, this comparison folded to FALSE, the QuickBooks arm was PRUNED,
-  // and the instruction behind it was never compared against the inventory by anything.
+  // until run time; production supplies a ledger name such as 'Xero'. While the walk bound that field to
+  // the concrete string `{ledger}`, this comparison folded to FALSE, the other ledger's arm was
+  // PRUNED, and the instruction behind it was never compared against the inventory by anything.
   const viaRuntimeLedger = model.replace(
     "    case 'CONFIRM':\n      return 'confirm the invoice PDF stored against the order is the document you expect'",
-    "    case 'CONFIRM':\n      return context.ledger === 'QuickBooks'\n        ? '" + UNDECLARED_REMOTE_ACTION
+    "    case 'CONFIRM':\n      return context.ledger === 'Other Ledger'\n        ? '" + UNDECLARED_REMOTE_ACTION
     + "'\n        : 'confirm the invoice PDF stored against the order is the document you expect'",
   )
   assert.notEqual(viaRuntimeLedger, model, 'the runtime-ledger mutation must actually have been applied')
@@ -5486,7 +5302,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
 
   // ...AND THE BINDING IS WHAT CATCHES IT, asserted rather than described. Re-run the SAME judgement
   // over the SAME mutated renderer with the context fields bound to concrete strings — the round-21
-  // representation — and it reports a clean inventory while the QuickBooks arm ships. That is the
+  // representation — and it reports a clean inventory while the other ledger's arm ships. That is the
   // mutation of the evaluator itself, and it is the reason `constantOf` and `renderedOf` are two
   // functions rather than one.
   assert.deepEqual(
@@ -5495,7 +5311,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     + 'would be passing for some other reason and would prove nothing about the symbolic representation',
   )
 
-  // ...and neither does binding it to the OTHER real ledger name rescue the concrete reading: pick a
+  // ...and neither does binding it to a different ledger name rescue the concrete reading: pick a
   // stand-in and you have chosen which runtime branch to be blind to, whichever one you pick.
   const viaRuntimeLedgerXero = model.replace(
     "    case 'CONFIRM':\n      return 'confirm the invoice PDF stored against the order is the document you expect'",
@@ -5506,7 +5322,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   assert.ok(
     judgeRendererOutput(viaRuntimeLedgerXero).some((complaint) => complaint.startsWith('emits a sentence nobody '
       + 'reviewed') && complaint.includes('take the second PDF off it')),
-    'CONTROL: and the same for the other ledger this installation runs',
+    'CONTROL: and the same whichever ledger name the comparison is keyed on',
   )
   assert.deepEqual(judgeRendererOutput(viaRuntimeLedgerXero, {}, 'CONCRETE'), [])
 
@@ -5534,7 +5350,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   const viaAssertedBinding = model.replace(
     "    case 'CONFIRM':\n      return 'confirm the invoice PDF stored against the order is the document you expect'",
     "    case 'CONFIRM': {\n"
-    + "      const { ledger } = context as { ledger: 'QuickBooks'; syncRowId: string }\n"
+    + "      const { ledger } = context as { ledger: 'Other Ledger'; syncRowId: string }\n"
     + "      const otherLedger: string = 'Xero'\n"
     + "      return ledger === otherLedger\n"
     + "        ? '" + UNDECLARED_REMOTE_ACTION + "'\n"
@@ -5579,17 +5395,19 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   )
 
   // ...and a context field still RENDERS as its placeholder, which is the half that must NOT have
-  // changed: every reviewed sentence that carries one is still emittable, and the shipped model
-  // above raised nothing. Held here explicitly so a later round cannot "fix" the symbol by dropping
-  // the placeholder and quietly turn the inventory comparison vacuous.
-  assert.ok(
-    reviewed.some((value) => value.includes('{ledger}')) && reviewed.some((value) => value.includes('{syncRowId}')),
-    'the inventory must still contain placeholder-bearing sentences, or (J) is checking nothing',
+  // changed. No shipped sentence carries one any more, so it is held on a mutation instead: a branch
+  // that interpolates a context field must COMPUTE to a sentence with the placeholder in place, and
+  // be refused as unreviewed — a symbol that rendered as nothing would make the sentence unemittable
+  // rather than undecidable, and the refusal would name the wrong thing.
+  const viaInterpolatedLedger = model.replace(
+    "    case 'CONFIRM':\n      return 'confirm the invoice PDF stored against the order is the document you expect'",
+    "    case 'CONFIRM':\n      return `confirm the invoice PDF stored against the order in ${context.ledger}`",
   )
+  assert.notEqual(viaInterpolatedLedger, model, 'the interpolated-ledger mutation must actually have been applied')
   assert.ok(
-    emitted.some((value) => value.includes('{ledger}')) && emitted.some((value) => value.includes('{syncRowId}')),
-    'and the walk must still COMPUTE them with the placeholders in place — a symbol that renders as nothing '
-    + 'would make every context-bearing sentence unemittable rather than undecidable',
+    judgeRendererOutput(viaInterpolatedLedger).some((complaint) => complaint.startsWith('emits a sentence nobody '
+      + 'reviewed') && complaint.includes('in {ledger}')),
+    'a context field must still render as its placeholder wherever it is concatenated',
   )
 
   // (L) A DISCRIMINANT LAUNDERED ACROSS A HELPER BOUNDARY — THE ROUND-24 ROUTE (Codex HIGH), and
@@ -5689,32 +5507,27 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   // (L2) IS THE TRUST, and it is the half that survives (1). Here the laundered receiver is not
   // UNKNOWN at all: `direction` is an OPAQUE root, so propagating unknown never fires, and the
   // parameter's asserted literal type folds exactly as before. THIS ONE FIRES AT RUN TIME — the
-  // assertion claims every escalation names its sync row, and two of the fourteen do not.
+  // assertion claims every escalation is the sentence form, and one of the two is not.
   const viaAssertedArgument = model.replace(
     "    case 'ESCALATE': {\n"
     + "      const administrator = 'to whoever administers this installation'\n"
-    + "      if (direction.naming === 'SYNC_ROW') {\n"
-    + '        return `ESCALATE sync row ${context.syncRowId}, with this record, ${administrator}`\n'
-    + '      }\n'
     + "      return `${direction.caseForm === 'SENTENCE' ? 'Escalate' : 'escalate'} this record ${administrator}`\n"
     + '    }',
     "    case 'ESCALATE': {\n"
     + "      const administrator = 'to whoever administers this installation'\n"
     + '      return fromAssertedEscalation(\n'
-    + "        direction as { action: 'ESCALATE'; target: 'THIS_RECORD_AND_ITS_SYNC_ROW'; naming: 'SYNC_ROW' },\n"
-    + "        direction.naming === 'SYNC_ROW'\n"
-    + '          ? `ESCALATE sync row ${context.syncRowId}, with this record, ${administrator}`\n'
-    + "          : `${direction.caseForm === 'SENTENCE' ? 'Escalate' : 'escalate'} this record ${administrator}`,\n"
+    + "        direction as { action: 'ESCALATE'; target: 'THIS_RECORD_AND_ITS_SYNC_ROW'; naming: 'RECORD_ONLY'; caseForm: 'SENTENCE' },\n"
+    + "        `${direction.caseForm === 'SENTENCE' ? 'Escalate' : 'escalate'} this record ${administrator}`,\n"
     + '      )\n'
     + '    }',
   ).replace(
     'export type LocalDirectionContext = {',
     'function fromAssertedEscalation(\n'
-    + "  claimed: { action: 'ESCALATE'; target: 'THIS_RECORD_AND_ITS_SYNC_ROW'; naming: 'SYNC_ROW' },\n"
+    + "  claimed: { action: 'ESCALATE'; target: 'THIS_RECORD_AND_ITS_SYNC_ROW'; naming: 'RECORD_ONLY'; caseForm: 'SENTENCE' },\n"
     + '  reviewed: string,\n'
     + '): string {\n'
-    + "  const recordOnly: string = 'RECORD_ONLY'\n"
-    + "  return claimed.naming === recordOnly ? '" + UNDECLARED_REMOTE_ACTION + "' : reviewed\n"
+    + "  const clause: string = 'CLAUSE'\n"
+    + "  return claimed.caseForm === clause ? '" + UNDECLARED_REMOTE_ACTION + "' : reviewed\n"
     + '}\n\nexport type LocalDirectionContext = {',
   )
   assert.notEqual(viaAssertedArgument, model, 'the asserted-argument mutation must actually have been applied')
@@ -5746,7 +5559,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
   // halves of (L) stated as an assertion rather than left to the reader: it fires for every context,
   // so it is only the STATIC reach that (L2) is about. (L1) is the one no sampling closes.
   const launderedEscalation = (direction: LocalDirection, context: LocalDirectionContext): string => (
-    direction.action === 'ESCALATE' && direction.naming === 'RECORD_ONLY'
+    direction.action === 'ESCALATE' && direction.caseForm === 'CLAUSE'
       ? UNDECLARED_REMOTE_ACTION
       : renderLocalDirection(direction, context)
   )
@@ -6246,7 +6059,7 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
       (text) => substitutePlaceholders(text, context),
     )
   }
-  const offSampleKeyContext: LocalDirectionContext = { ledger: 'QuickBooks', syncRowId: OFF_SAMPLE_SYNC_ROW }
+  const offSampleKeyContext: LocalDirectionContext = { ledger: 'Other Ledger', syncRowId: OFF_SAMPLE_SYNC_ROW }
   assert.throws(
     () => assertRenderedInventory(
       (direction) => byAssertedKey(direction, offSampleKeyContext),
@@ -7065,13 +6878,13 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
     [],
     'THE PRE-FIX ANALYZER MUST STILL LET IT THROUGH, or (S2) proves nothing',
   )
-  // ...and the SHIPPED model still computes its own `const administrator`, `SETTING_NAME` and
+  // ...and the SHIPPED model still computes its own `const administrator` and
   // `OUTBOX_READ_LIST` off their initializers — the floor removed `let` and `var`, not variables.
   assert.ok(
     emitted.some((value) => value.includes('to whoever administers this installation'))
-      && emitted.some((value) => value.includes('quickbooks_sync_attach_pdf')),
+      && emitted.some((value) => value.includes('read each row\'s status, attempts, lastError and sentAt')),
     'the const floor must not have stopped the walk reading a `const` — if it had, the sentences composed out '
-    + 'of `administrator` and `SETTING_NAME` would have stopped being computable and every judgement above '
+    + 'of `administrator` and `OUTBOX_READ_PHRASE` would have stopped being computable and every judgement above '
     + 'would be vacuous',
   )
 
@@ -7420,10 +7233,10 @@ test('ROUND 21 (Codex HIGH): the VALUE of every string the renderer can emit is 
  * Round 30 named this residue and declined to close it, because every proof available quantified
  * over the wrong program: an analyzer that reads the model file can see the initializer and can see
  * no write in any importer, so "nobody writes to a table" was an assumption dressed as a result.
- * The residue was REACHABLE. `SETTING_NAME` was an exported object, `renderLocalDirection` reads it
- * AT INVOCATION TIME, and `SETTING_NAME.SETTING_SYNC_ENABLED = '…'` is an ordinary assignment its
+ * The residue was REACHABLE. A name table was an exported object, `renderLocalDirection` read it
+ * AT INVOCATION TIME, and an assignment to one of its members is an ordinary assignment its
  * `Record<..., string>` type admits — no assertion, no diagnostic, and no diff to the module the
- * analyzer reads. Codex executed it and the shipped TURN_OFF renderer emitted the injected remote
+ * analyzer reads. Codex executed it and the shipped renderer emitted the injected remote
  * instruction, with the reviewed inventory reporting clean throughout.
  *
  * SO THE FIX IS NOT ANOTHER RULE IN THE WALK — no static walk over one file can decide what every
@@ -7440,9 +7253,9 @@ test('ROUND 31 (Codex HIGH): a table the renderer reads at invocation time canno
   // or export either private table again — each assertion below fails naming the table.
   const source = await readFile(path.join(process.cwd(), DIRECTION_MODEL_FILE), 'utf8')
 
-  // (U1) THE TWO TABLES NOTHING OUTSIDE THE MODULE READS ARE OFF THE PUBLIC SURFACE ENTIRELY.
+  // (U1) THE TABLES NOTHING OUTSIDE THE MODULE READS ARE OFF THE PUBLIC SURFACE ENTIRELY.
   const surface = new Set(Object.keys(DIRECTION_MODULE))
-  for (const gone of ['SETTING_NAME', 'OUTBOX_READ_LIST', 'OUTBOX_READ_PHRASE']) {
+  for (const gone of ['OUTBOX_READ_LIST', 'OUTBOX_READ_PHRASE']) {
     assert.ok(
       !surface.has(gone),
       `${gone} is exported again. The renderer reads it at invocation time, so exporting it hands every `
@@ -7458,8 +7271,7 @@ test('ROUND 31 (Codex HIGH): a table the renderer reads at invocation time canno
   // a statement about those two tables rather than about an empty namespace or a regex that matches
   // nothing anywhere.
   for (const kept of [
-    'LOCAL_TARGET', 'LOCAL_DIRECTIONS', 'LOCAL_DIRECTION_SEQUENCES', 'LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE',
-    'renderLocalDirection',
+    'LOCAL_TARGET', 'LOCAL_DIRECTIONS', 'LOCAL_DIRECTION_SEQUENCES', 'renderLocalDirection',
   ]) {
     assert.ok(surface.has(kept), `the namespace read is empty — it cannot find ${kept} either, so (U1) proves nothing`)
     assert.match(source, new RegExp(`export (const|function) ${kept}\\b`), `the source read cannot find ${kept}`)
@@ -7485,7 +7297,7 @@ test('ROUND 31 (Codex HIGH): a table the renderer reads at invocation time canno
     objectExports += 1
     sweepFrozen(value, name)
   }
-  assert.ok(objectExports >= 4, `only ${objectExports} object exports were swept — the sweep read nothing`)
+  assert.ok(objectExports >= 3, `only ${objectExports} object exports were swept — the sweep read nothing`)
   assert.ok(
     swept > objectExports,
     'the sweep never went past the top level, so it says nothing about whether the freeze is DEEP — and a '
@@ -7493,29 +7305,29 @@ test('ROUND 31 (Codex HIGH): a table the renderer reads at invocation time canno
   )
 
   // (U3) THE LOAD-BEARING ONE: a write to a table the SHIPPED renderer reads at invocation time.
-  // `LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE` is composed into `unrecorded-posted-document.ts` and read
-  // by `renderLocalDirectionSequence` on every call, so flipping its first element's `form` changes
-  // what a record tells an operator to do.
+  // The directions in `LOCAL_DIRECTIONS` are what the formatters and `renderLocalDirectionSequence`
+  // read on every call, so flipping one's `caseForm` changes what a record tells an operator to do.
   const isFrozenWrite = (error: unknown): boolean => (
     error instanceof TypeError && /read only|not extensible|Cannot add|object is not/.test(error.message)
   )
-  const before = renderLocalDirectionSequence(LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE, LOCAL_DIRECTION_CONTEXT)
+  const sequence: LocalDirectionSequence = [LOCAL_DIRECTIONS[0]!, LOCAL_DIRECTIONS[2]!]
+  const before = renderLocalDirectionSequence(sequence, LOCAL_DIRECTION_CONTEXT)
   assert.throws(
-    () => { (LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE[0] as unknown as { form: string }).form = 'NOT_A_FENCE' },
+    () => { (LOCAL_DIRECTIONS[2] as unknown as { caseForm: string }).caseForm = 'CLAUSE' },
     isFrozenWrite,
-    'a write to a direction inside a SHIPPED sequence must throw. A module is strict-mode code, so a frozen '
+    'a write to a direction inside the SHIPPED inventory must throw. A module is strict-mode code, so a frozen '
     + 'table refuses the assignment rather than dropping it silently',
   )
   assert.equal(
-    renderLocalDirectionSequence(LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE, LOCAL_DIRECTION_CONTEXT), before,
+    renderLocalDirectionSequence(sequence, LOCAL_DIRECTION_CONTEXT), before,
     'and the sentence it composes is unchanged',
   )
   // ...AND THE WRITE THAT WAS REFUSED IS ONE THAT WOULD HAVE CHANGED THE SHIPPED SENTENCE, asserted
   // rather than assumed. Without this the control passes on a write nobody would have bothered to
   // make.
   const ifItHadLanded: LocalDirectionSequence = [
-    { action: 'LEAVE_OFF', target: 'SETTING_SYNC_ENABLED', form: 'NOT_A_FENCE' },
-    LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE[1]!,
+    LOCAL_DIRECTIONS[0]!,
+    { action: 'ESCALATE', target: 'THIS_RECORD_AND_ITS_SYNC_ROW', naming: 'RECORD_ONLY', caseForm: 'CLAUSE' },
   ]
   assert.notEqual(
     renderLocalDirectionSequence(ifItHadLanded, LOCAL_DIRECTION_CONTEXT), before,
@@ -7543,8 +7355,7 @@ test('ROUND 31 (Codex HIGH): a table the renderer reads at invocation time canno
   // outside can name them. A private mutable table is still mutable from inside the module, so the
   // freeze is asserted at the only place a reader can check it.
   for (const table of [
-    'LOCAL_TARGET', 'OUTBOX_READ_LIST', 'OUTBOX_READ_PHRASE', 'SETTING_NAME', 'LOCAL_DIRECTIONS',
-    'LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE', 'LOCAL_DIRECTION_SEQUENCES',
+    'LOCAL_TARGET', 'OUTBOX_READ_LIST', 'OUTBOX_READ_PHRASE', 'LOCAL_DIRECTIONS', 'LOCAL_DIRECTION_SEQUENCES',
   ]) {
     assert.ok(
       source.includes(`freezeDeep(${table})`),
@@ -7552,27 +7363,27 @@ test('ROUND 31 (Codex HIGH): a table the renderer reads at invocation time canno
     )
   }
 
-  // (U5) NON-VACUITY, THE ROUTE ITSELF. A faithful twin of what `SETTING_NAME` was: a table read at
+  // (U5) NON-VACUITY, THE ROUTE ITSELF. A faithful twin of what a name table is: a table read at
   // invocation time by the sentence that prints it. Unfrozen, an ordinary assignment lands and the
   // sentence changes — which is the finding, executed. Frozen, the same assignment throws and the
   // sentence does not change. So the freeze is what closes it, and not some other property of this
   // file that would have made the assertions above pass anyway.
-  const twin: Record<'SETTING_SYNC_ENABLED', string> = { SETTING_SYNC_ENABLED: 'quickbooks_sync_enabled' }
-  const twinSentence = (): string => `and it writes the setting ${twin.SETTING_SYNC_ENABLED}.`
+  const twin: Record<'THIS_ORDERS_ROWS', string> = { THIS_ORDERS_ROWS: 'status, attempts, lastError and sentAt' }
+  const twinSentence = (): string => `Inspect the outbox rows and read each row's ${twin.THIS_ORDERS_ROWS}.`
   const honest = twinSentence()
-  twin.SETTING_SYNC_ENABLED = 'go to that bill and take the second PDF off it'
+  twin.THIS_ORDERS_ROWS = 'go to that bill and take the second PDF off it'
   assert.notEqual(
     twinSentence(), honest,
     'a table read at INVOCATION TIME does change what the renderer emits when it is written — this is Codex\'s '
     + 'finding reproduced, one table over',
   )
-  const frozenTwin: Record<'SETTING_SYNC_ENABLED', string> = Object.freeze(
-    { SETTING_SYNC_ENABLED: 'quickbooks_sync_enabled' },
+  const frozenTwin: Record<'THIS_ORDERS_ROWS', string> = Object.freeze(
+    { THIS_ORDERS_ROWS: 'status, attempts, lastError and sentAt' },
   )
-  const frozenSentence = (): string => `and it writes the setting ${frozenTwin.SETTING_SYNC_ENABLED}.`
+  const frozenSentence = (): string => `Inspect the outbox rows and read each row's ${frozenTwin.THIS_ORDERS_ROWS}.`
   const frozenHonest = frozenSentence()
   assert.throws(
-    () => { frozenTwin.SETTING_SYNC_ENABLED = 'go to that bill and take the second PDF off it' },
+    () => { frozenTwin.THIS_ORDERS_ROWS = 'go to that bill and take the second PDF off it' },
     isFrozenWrite,
     'and freezing it is what refuses the write',
   )
@@ -7598,8 +7409,8 @@ test('ROUND 31 (Codex HIGH): a table the renderer reads at invocation time canno
  * resolves every method it CALLS through a prototype, and `Array.prototype` is writable by anything
  * in the process. `andList` resolved `slice` and `join` there; the sequence renderer resolved `map`
  * and `join` there. Codex assigned to `Array.prototype.join` after importing the module and the
- * shipped READ sentence changed from "Read them by status, lastError and time" to a remote
- * instruction, with all six freezes long since completed and every static judgement in this file
+ * shipped READ sentence changed from "Read them by status, lastError and time" (a direction since
+ * removed) to a remote instruction, with all six freezes long since completed and every static judgement in this file
  * reporting clean.
  *
  * SO THE DISPATCH IS GONE RATHER THAN GUARDED. Capturing the three methods at module load would
@@ -7623,14 +7434,16 @@ test('ROUND 32 (Codex HIGH): a prototype method written after import cannot reac
   // `slice`/`join`, or the sequence renderer's `map`/`join` — and (V3) fails with the injected
   // instruction in the shipped sentence while (V4) fails naming the call.
   const model = await readFile(path.join(process.cwd(), DIRECTION_MODEL_FILE), 'utf8')
-  const readDirection: LocalDirection = { action: 'READ', target: 'EMAIL_OUTBOX_ROWS' }
-  const reviewedRead = RENDERED_DIRECTIONS.find((entry) => entry.direction.action === 'READ')!.text
-  const reviewedSequence = RENDERED_DIRECTION_SEQUENCES[0]!.text
+  const readDirection: LocalDirection = { action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS' }
+  const reviewedRead = RENDERED_DIRECTIONS.find((entry) => entry.direction.action === 'INSPECT')!.text
+  // No sequence is declared, so the shipped renderer is held on a pair of inventory directions.
+  const pair: LocalDirectionSequence = [LOCAL_DIRECTIONS[0]!, LOCAL_DIRECTIONS[2]!]
+  const reviewedSequence = RENDERED_DIRECTIONS[0]!.text + SEQUENCE_CONJUNCTION + RENDERED_DIRECTIONS[2]!.text
 
   // THE TWO PRE-FIX RENDERERS, REPRODUCED HERE BYTE FOR BYTE FROM THE ROUND-31 MODEL. They are what
   // makes this control a statement about the FIX rather than about a patch nobody would notice: the
   // same assignment runs against both, and the difference between them is the whole finding.
-  const preFixAndList = (items: readonly [OutboxReadAxis, ...OutboxReadAxis[]]): string => (
+  const preFixAndList = (items: readonly [string, ...string[]]): string => (
     items.length < 2
       ? items[0]
       : `${items.slice(0, -1).join(', ')} and ${items[items.length - 1]}`
@@ -7656,12 +7469,12 @@ test('ROUND 32 (Codex HIGH): a prototype method written after import cannot reac
     prototype.map = (): string[] => [UNDECLARED_REMOTE_ACTION]
     probe = ['status', 'lastError'].join(', ')
     patchedPreFixRead = preFixRead()
-    patchedPreFixSequence = preFixSequence(LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE, LOCAL_DIRECTION_CONTEXT)
+    patchedPreFixSequence = preFixSequence(pair, LOCAL_DIRECTION_CONTEXT)
     patchedShippedRead = renderLocalDirection(readDirection, LOCAL_DIRECTION_CONTEXT)
     patchedShippedInspect = renderLocalDirection(
-      { action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS', form: 'THIS_ORDERS_ROWS' }, LOCAL_DIRECTION_CONTEXT,
+      { action: 'INSPECT', target: 'EMAIL_OUTBOX_ROWS' }, LOCAL_DIRECTION_CONTEXT,
     )
-    patchedShippedSequence = renderLocalDirectionSequence(LEAVE_THE_TOGGLE_OFF_THEN_ESCALATE, LOCAL_DIRECTION_CONTEXT)
+    patchedShippedSequence = renderLocalDirectionSequence(pair, LOCAL_DIRECTION_CONTEXT)
   } finally {
     prototype.join = standard.join
     prototype.slice = standard.slice
@@ -7757,9 +7570,9 @@ test('ROUND 32 (Codex HIGH): a prototype method written after import cannot reac
   // NON-VACUITY OF THE WALK, on the code this round removed: it counts exactly the calls that were
   // there before, so a zero above is a fact about the model rather than about the walk.
   const withPrototypeDispatch = model.replace(
-    '      return `Read them by ${OUTBOX_READ_PHRASE.WHEN_NARROWING_IS_IMPOSSIBLE}`',
-    "      return `Read them by ${OUTBOX_READ_LIST.WHEN_NARROWING_IS_IMPOSSIBLE.slice(0, -1).join(', ')} and "
-    + '${OUTBOX_READ_LIST.WHEN_NARROWING_IS_IMPOSSIBLE[2]}`',
+    "      return `Inspect the outbox rows for this order and read each row's ${OUTBOX_READ_PHRASE.THIS_ORDERS_ROWS}.`",
+    "      return `Inspect the outbox rows for this order and read each row's "
+    + "${OUTBOX_READ_LIST.THIS_ORDERS_ROWS.slice(0, -1).join(', ')} and ${OUTBOX_READ_LIST.THIS_ORDERS_ROWS[3]}.`",
   ).replace(SEQUENCE_BODY, "return sequence.map((direction) => renderLocalDirection(direction, context)).join(' and ')")
   assert.notEqual(withPrototypeDispatch, model, 'the prototype-dispatch mutation must actually have been applied')
   assert.equal(
@@ -7883,8 +7696,8 @@ test('ROUND 32 (Codex HIGH): a prototype method written after import cannot reac
     name: match[1]!,
     axes: [...match[2]!.matchAll(/'([a-zA-Z]+)'/g)].map((axis) => axis[1]!),
   }))
-  assert.equal(lists.length, 3, `the axis-list read found ${lists.length} lists rather than the three declared`)
-  const phraseBlock = model.slice(model.indexOf('const OUTBOX_READ_PHRASE = {'), model.indexOf('const SETTING_NAME'))
+  assert.equal(lists.length, 1, `the axis-list read found ${lists.length} lists rather than the one declared`)
+  const phraseBlock = model.slice(model.indexOf('const OUTBOX_READ_PHRASE = {'), model.indexOf('/**\n * WHAT A LOOKUP-LESS RECORD MAY TELL AN OPERATOR TO DO, AS STRUCTURE.'))
   assert.ok(phraseBlock.includes('OUTBOX_READ_LIST.'), 'the phrase block read is empty, so nothing below is checked')
   const andJoin = (axes: readonly string[]): string => (
     axes.length < 2 ? axes[0]! : `${axes.slice(0, -1).join(', ')} and ${axes[axes.length - 1]}`

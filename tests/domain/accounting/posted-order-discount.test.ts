@@ -403,27 +403,8 @@ test('and a credit note is NOT auto-raised for the discount that invoice never c
   assert.equal(decision.action === 'MANUAL' && decision.postedAmount, 0)
 })
 
-test('QuickBooks posts its DiscountLineDetail with or without an account, so the amount stands (o3d-y14 r4 F3)', async () => {
-  // The opposite adapter rule, and the reason this is connector-aware rather than a blanket "no
-  // account code means no line": QBO resolves the account from the payload OR the connector setting
-  // and simply leaves the ref undefined when neither resolves. The line is always there.
-  const { client } = makeClient({
-    events: [
-      postedInvoice({
-        externalSystem: 'quickbooks',
-        linesJson: documentPayload({ discount: { amount: 10 } }),
-      }),
-    ],
-  })
-
-  const resolved = await resolvePostedOrderDiscount(client, { ...RESTATED_ORDER, discountAmount: 10 })
-
-  assert.equal(resolved.source, 'POSTED_DOCUMENT')
-  assert.equal(resolved.source === 'POSTED_DOCUMENT' && resolved.amount, 10)
-})
-
-test('a mirrored event naming no connector is refused — no posting rule can be replayed (o3d-y14 r4 F3)', async () => {
-  for (const externalSystem of [null, 'sage']) {
+test('a mirrored event naming no connector, or one this build cannot replay, is refused — no posting rule can be replayed (o3d-y14 r4 F3)', async () => {
+  for (const externalSystem of [null, 'sage', 'retired-ledger']) {
     const { client } = makeClient({
       events: [postedInvoice({ externalSystem, linesJson: documentPayload({ discount: { amount: 10 } }) })],
     })
@@ -436,8 +417,8 @@ test('a mirrored event naming no connector is refused — no posting rule can be
 
 test('the adapter rules this derivation replays are pinned to the adapters themselves (o3d-y14 r4 F3)', async () => {
   // The derivation is only sound while the connectors keep the conditions it mirrors. Nothing else
-  // in the suite fails if someone makes Xero post the discount unconditionally, or gives QuickBooks
-  // an account-code guard — the recovered "posted" figure would just quietly become wrong.
+  // in the suite fails if someone makes Xero post the discount unconditionally, or changes its
+  // account-code guard — the recovered "posted" figure would just quietly become wrong.
   const { readFileSync } = await import('node:fs')
   const { join } = await import('node:path')
 
@@ -452,11 +433,7 @@ test('the adapter rules this derivation replays are pinned to the adapters thems
     'Xero must still omit the order-discount line when no discount account code is supplied',
   )
 
-  // o3d-remove-parked-connectors: the second half read `lib/connectors/quickbooks/invoices.ts` and
-  // pinned that THAT adapter posts its order-level discount on the amount ALONE, with no account-code
-  // guard. The two adapters DISAGREEING is what this derivation replays — so with one adapter left the
-  // "adapter rules" this test names are now a single rule, and a second connector that guards on an
-  // account code (or does not) must be pinned here in the commit that adds it.
+  // A second connector with its own discount-emission rule must be pinned here in the commit that adds it.
 })
 
 // ---------------------------------------------------------------------------
@@ -797,15 +774,6 @@ test('a blank discount account code is no account code at all', () => {
   )
 
   assert.deepEqual(read, { ok: true, amount: 0, taxBasis: 'EXCLUSIVE' })
-})
-
-test('QuickBooks rounds its discount line to 2dp, and so does the figure recovered for it', () => {
-  const read = readPostedDocumentDiscount(
-    { currency: 'GBP', externalSystem: 'quickbooks', linesJson: documentPayload({ discount: { amount: 10.005 } }) },
-    'GBP',
-  )
-
-  assert.deepEqual(read, { ok: true, amount: 10.01, taxBasis: 'EXCLUSIVE' })
 })
 
 // ---------------------------------------------------------------------------
@@ -1430,26 +1398,6 @@ test('two DISAGREEING documents tied on both columns name them in one order (o3d
     ['INV-B', 'INV-A'],
     'and the one order they are named in is the total one',
   )
-})
-
-test('two AGREEING documents tied on both columns report the same document (o3d-y14 r13 F2)', async () => {
-  // The success variant names the newest document's TYPE and CONNECTOR, and both travel in the
-  // compared position. Two tied documents posted to different connectors — an order invoiced in
-  // Xero and re-raised in QuickBooks, which `connector-orphans.ts` exists for — swapped which
-  // ledger the whole handoff claimed to be about.
-  const a = () => postedInvoice({ ...TIED, externalId: 'INV-A' })
-  const b = () => postedInvoice({ ...TIED, externalId: 'INV-B', externalSystem: 'quickbooks' })
-  const oneWay = makeClient({ events: [a(), b()] })
-  const otherWay = makeClient({ events: [b(), a()] })
-
-  const first = await readPostedInvoiceOrderDiscount(oneWay.client, { id: 'order-1', currency: 'GBP' })
-  const second = await readPostedInvoiceOrderDiscount(otherWay.client, { id: 'order-1', currency: 'GBP' })
-
-  assert.equal(first.ok && second.ok, true)
-  assert.equal(first.ok && first.externalId, second.ok && second.externalId)
-  assert.equal(first.ok && first.externalSystem, second.ok && second.externalSystem)
-  assert.deepEqual(first.ok ? first.externalIds : null, second.ok ? second.externalIds : null)
-  assert.equal(first.ok && first.detail, second.ok && second.detail)
 })
 
 // ---------------------------------------------------------------------------

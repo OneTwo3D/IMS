@@ -10,9 +10,8 @@ import test, { mock } from 'node:test'
  * they never re-verify it — and a Xero ItemID gets handed to another ledger, or to a reconnect against
  * a DIFFERENT Xero org, as if it were that system's own id.
  *
- * The archived QuickBooks connector cleared contacts and Xero did not, which was already live before
- * accountingItemId gave it a second column to leak (o3d-3nc) — i.e. this rule was found by COMPARING
- * two connectors, and only one ships now (o3d-remove-parked-connectors).
+ * A disconnect that cleared contacts but not items was already live before accountingItemId gave
+ * it a second column to leak (o3d-3nc).
  */
 
 type Cleared = { model: string; data: unknown }
@@ -55,11 +54,8 @@ async function disconnectXero() {
   const m = await import('@/lib/connectors/xero/auth')
   return m.disconnect()
 }
-// o3d-remove-parked-connectors: a `disconnectQbo` helper was here, and both cases below ran against
-// BOTH connectors' disconnects. That cross-port was the point — the file's own header says
-// "QuickBooks cleared contacts and Xero did not, which was already live" — so losing it is a real
-// loss: this file now shows one connector's disconnect obeys the rule, not that the rule is the
-// pattern. A second connector's disconnect must be added to the loop below.
+// This file shows one connector's disconnect obeys the rule, not that the rule is the pattern. A second
+// connector's disconnect must be added to the cases below.
 
 test.beforeEach(() => { cleared.length = 0 })
 

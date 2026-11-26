@@ -22,12 +22,10 @@ export type RoutableAccountingConnector = AccountingConnectorId
 
 /**
  * A connector id AS IT WAS STORED — on a sync row, a sales order's `accountingInvoiceConnector`, a held
- * invoice, a persisted retry stage — which is NOT the same type as a routable one (o3d-j625 r12, merging
- * o3d-remove-parked-connectors).
+ * invoice, a persisted retry stage — which is NOT the same type as a routable one (o3d-j625 r12).
  *
- * Those columns are plain strings with no foreign key, and archiving a connector deleted no rows, so a
- * stored value can name a connector this build does not register: development databases hold `quickbooks`
- * rows right now. Typing such a field `AccountingConnectorId` would be a CLAIM THAT CANNOT BE TRUE of a
+ * Those columns are plain strings with no foreign key, and retiring a connector deletes no rows, so a
+ * stored value can name a connector this build does not register. Typing such a field `AccountingConnectorId` would be a CLAIM THAT CANNOT BE TRUE of a
  * value read back from the database, and it would make the code that exists to detect exactly that case
  * impossible to write or to test. `isRegisteredAccountingConnector` is the narrowing from this to
  * {@link RoutableAccountingConnector}, and development's `getAccountingPostingContextFor` types its own
@@ -43,7 +41,7 @@ export type StoredAccountingConnector = string
  * than mis-routing codes — then proved the provenance of one of the two ids in the payload it was
  * arguing about. The reviewer's answer: naming a chart says nothing about a DOCUMENT ID, because
  * document ids DELIBERATELY SURVIVE A CONNECTOR SWITCH. `SalesOrder.accountingInvoiceId` is not
- * cleared when the operator moves to QuickBooks — the Xero invoice it names still exists — so after a
+ * cleared when the operator moves to another connector — the invoice it names still exists in the old ledger — so after a
  * switch the chart check passes (the codes really are the active connector's) while the payload still
  * carries the retired connector's invoice id. The payment then fails, or settles a document that
  * happens to share the id in the other ledger.

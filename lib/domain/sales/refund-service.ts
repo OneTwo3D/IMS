@@ -3924,13 +3924,11 @@ function parseRefundAccountingRetrySyncs(
       // edit here.
       //
       // o3d-r5uk: DROPPING AN UNREGISTERED PIN IS NOT SAFE, and it is not what this line is for.
-      // `AccountingSyncLog`/`accountingRetrySyncs` still hold `quickbooks` pins — retiring the
-      // connector deleted no rows — and an ABSENT `connector` means "resolve the active connector"
+      // `AccountingSyncLog`/`accountingRetrySyncs` can still hold pins naming a retired connector —
+      // retiring a connector deletes no rows — and an ABSENT `connector` means "resolve the active connector"
       // (see the field's own doc at RefundAccountingSyncRequest). So dropping the key here would
-      // re-queue a reversal that was proved against QuickBooks into XERO'S BOOKS, silently. Before
-      // the registry check the literal `=== 'quickbooks'` kept the pin, `pinnedLedgerIsServiced`
-      // found the active connector was not it, and the enqueue answered `refused` — the posting left
-      // owed and visible, which is the correct answer.
+      // re-queue a reversal that was proved against a retired connector into XERO'S BOOKS, silently. The
+      // correct answer is `refused` — the posting left owed and visible — never a re-route.
       //
       // The pin is therefore still only carried when this build can route it, AND
       // `unserviceableRefundAccountingRetryPins` below refuses the whole retry when any entry names
@@ -3962,8 +3960,8 @@ function parseRefundAccountingRetrySyncs(
       // the hand-off refuses it rather than inventing either of the other two answers.
       // REGISTRY-CHECKED (o3d-j625 r12, merging o3d-remove-parked-connectors), and the direction is
       // the opposite of the `connector` pin above for a reason. A pin this build cannot route must be
-      // KEPT, because dropping it means "resolve the active connector" and would post a QuickBooks-proved
-      // reversal into Xero's books. An unroutable CHART must be DROPPED, because absent means "staged
+      // KEPT, because dropping it means "resolve the active connector" and would post a reversal proved
+      // against a retired connector into Xero's books. An unroutable CHART must be DROPPED, because absent means "staged
       // before this field existed", which the hand-off REFUSES — leaving the obligation owed and saying
       // so, which is the right answer for account codes this build cannot attribute to a routable ledger.
       ...(isRegisteredAccountingConnector(entry.chartConnector) || entry.chartConnector === null

@@ -120,7 +120,7 @@ test('two documents take two different locks (o3d-0m56 r4)', async () => {
   const id = moneyPostDocumentLockId(DOCUMENT)
   assert.notEqual(id, moneyPostDocumentLockId({ ...DOCUMENT, documentKey: settlementDocumentKey('INVOICE_PAYMENT', { accountingInvoiceId: 'inv-2' }) }))
   assert.notEqual(id, moneyPostDocumentLockId({ ...DOCUMENT, documentKey: settlementDocumentKey('BILL_PAYMENT', PAYLOAD) }))
-  assert.notEqual(id, moneyPostDocumentLockId({ ...DOCUMENT, connector: 'quickbooks' }))
+  assert.notEqual(id, moneyPostDocumentLockId({ ...DOCUMENT, connector: 'retired-ledger' }))
   // ...and two allocations DRAWN ON DIFFERENT CREDIT NOTES onto one bill are two legitimate
   // settlements, so they must not serialize against each other either.
   assert.notEqual(

@@ -57,7 +57,7 @@ test('a single failed row retries freely — its token is preserved (o3d-0m56)',
 })
 
 test('rows SHARING one token retry freely (o3d-0m56)', () => {
-  // The ordinary QuickBooks shape: repeated receipts all carry invoice-payment:payment:<id>.
+  // The ordinary shape: repeated receipts all carry invoice-payment:payment:<id>.
   // Whichever committed, committed under that token. Refusing these is the mistake the
   // automatic path already had to correct.
   const shared = 'invoice-payment:payment:p1'
@@ -201,50 +201,26 @@ test('non-money-moving types never refuse (o3d-0m56)', () => {
   }
 })
 
-/**
- * o3d-remove-parked-connectors — THE SUBJECT OF THE 'PER CONNECTOR' CASES IS NOW AN UNREGISTERED ID.
- *
- * `effectiveTokenFor` has two derivations: a stamped follow-up key wins for everyone, and failing
- * that, the connector decides whether the generic queue's `_idempotencyKey` counts. QuickBooks
- * honoured it; Xero's payment branches ignore it and derive from the row id. That branch is KEPT in
- * lib/domain/accounting/followup-retry-guard.ts, unreachable while one connector is registered,
- * because folding the two together would apply one connector's reading to the other and could allow
- * a retry that is not safe.
- *
- * These cases are what stop that fold happening by accident, so they are kept — driving an id the
- * union no longer contains rather than a second registered connector. Weaker subject, same property.
- * Recorded in docs/archive/quickbooks-connector-removal.md.
- */
-const RETIRED_CONNECTOR = 'quickbooks' as unknown as Parameters<typeof effectiveTokenFor>[0]
-
-test('the effective token is derived PER CONNECTOR (o3d-0m56)', () => {
+test('the effective token is the stamped follow-up key, else the row id (o3d-0m56)', () => {
+  // Xero's payment branches ignore the generic queue's `_idempotencyKey` and derive from the row id.
   const row = { id: 'log-1', payload: { _idempotencyKey: 'invoice-payment:payment:p1' } }
-  assert.equal(effectiveTokenFor(RETIRED_CONNECTOR, row), 'invoice-payment:payment:p1')
   assert.equal(effectiveTokenFor('xero', row), 'log-1', 'Xero payment branches ignore the generic key')
 
-  // A stamped follow-up key wins for both.
+  // A stamped follow-up key wins.
   const stamped = { id: 'log-2', payload: { _followUpIdempotencyKey: 'stable', _idempotencyKey: 'generic' } }
-  assert.equal(effectiveTokenFor(RETIRED_CONNECTOR, stamped), 'stable')
   assert.equal(effectiveTokenFor('xero', stamped), 'stable')
 
-  // A whitespace generic key is still a STRING, and getIdempotencySource returns it verbatim —
-  // so the guard must too. This assertion previously encoded my own non-blank check and would
-  // have kept the divergence alive.
-  assert.equal(effectiveTokenFor(RETIRED_CONNECTOR, { id: 'log-3', payload: { _idempotencyKey: '  ' } }), '  ')
-  // Absent (or a non-string) falls back to the row id, for both.
-  assert.equal(effectiveTokenFor(RETIRED_CONNECTOR, { id: 'log-3b', payload: { _idempotencyKey: 42 } }), 'log-3b')
+  // Absent (or a non-string, or a whitespace generic key) falls back to the row id.
+  assert.equal(effectiveTokenFor('xero', { id: 'log-3', payload: { _idempotencyKey: '  ' } }), 'log-3')
+  assert.equal(effectiveTokenFor('xero', { id: 'log-3b', payload: { _idempotencyKey: 42 } }), 'log-3b')
   assert.equal(effectiveTokenFor('xero', { id: 'log-4', payload: null }), 'log-4')
 })
 
 // --- Both actions must actually consult the guard ---
 
-// ONE ACTION TODAY (o3d-remove-parked-connectors): `app/actions/quickbooks-sync.ts` was the second
-// entry and is archived. The loop is kept rather than inlined — it is the list a second connector's
-// retry action joins, and every assertion in it is about a SHAPE (plan before reset, reset restricted
-// to the allowed ids, siblings loaded by document) that any connector's action has to satisfy.
-//
-// WHAT IS LOST: the loop no longer shows that TWO independently-written actions satisfy the shape,
-// which is what made "the guard is consulted" a property of the pattern rather than of one file.
+// The loop is the list a connector's retry action joins, and every assertion in it is about a SHAPE
+// (plan before reset, reset restricted to the allowed ids, siblings loaded by document) that any
+// connector's action has to satisfy.
 const ACTIONS = [
   { name: 'xero', file: 'app/actions/xero-sync.ts' },
 ]
@@ -297,41 +273,12 @@ for (const action of ACTIONS) {
   })
 }
 
-test('the token derivation mirrors each processor EXACTLY, empty string included (o3d-0m56)', async () => {
-  // A guard that reasons about a token the connector will not actually send is worse than no
-  // guard. QuickBooks' getIdempotencySource accepts `typeof payload._idempotencyKey === 'string'`
-  // — an EMPTY string included — so two rows carrying '' post under the same token. Requiring a
-  // non-blank value here handed them their row ids instead: two distinct tokens, and a refused
-  // retry that was actually safe.
-  assert.equal(effectiveTokenFor(RETIRED_CONNECTOR, { id: 'log-1', payload: { _idempotencyKey: '' } }), '')
-  assert.equal(effectiveTokenFor(RETIRED_CONNECTOR, { id: 'log-2', payload: { _idempotencyKey: '' } }), '')
-
-  // ...so a pair of them is unambiguous and must NOT refuse.
-  const rows = [
-    { id: 'log-1', effectiveToken: effectiveTokenFor(RETIRED_CONNECTOR, { id: 'log-1', payload: { _idempotencyKey: '' } }), payload: postable('inv-9') },
-    { id: 'log-2', effectiveToken: effectiveTokenFor(RETIRED_CONNECTOR, { id: 'log-2', payload: { _idempotencyKey: '' } }), payload: postable('inv-9') },
-  ]
-  assert.deepEqual(
-    plan({ type: 'INVOICE_PAYMENT', reference: 'SalesOrder so-1', target: rows[0]!, siblings: rows }),
-    { action: 'allow' },
-  )
-
-  // Xero's followUpIdempotencySource is `readFollowUpIdempotencyKey(payload) ?? entryId` and
-  // never consults the generic key, so the same payload derives the row id there.
-  assert.equal(effectiveTokenFor('xero', { id: 'log-1', payload: { _idempotencyKey: '' } }), 'log-1')
-})
-
 test('the guard\'s derivation matches the processor in source (o3d-0m56)', async () => {
   // Pinned against the real definition, so a change to the processor's precedence breaks here rather
-  // than silently desynchronising the guard.
-  //
-  // o3d-remove-parked-connectors: the QuickBooks half of this case read
-  // `lib/connectors/quickbooks/sync-processor.ts` off disk and pinned that IT accepted any string
-  // generic key, empty included. That file is archived, so the assertion would ENOENT. The guard's
-  // corresponding branch is kept and is still covered above, by the per-connector token cases — what
-  // is no longer proven is that the guard's reading MATCHES a real second processor's, which is the
-  // half a source pin was for. `git show archive/quickbooks-connector:lib/connectors/quickbooks/sync-processor.ts`
-  // has the definition it was pinned against.
+  // than silently desynchronising the guard. Xero's followUpIdempotencySource is
+  // `readFollowUpIdempotencyKey(payload) ?? entryId` and never consults the generic key, so a payload
+  // carrying an empty generic key still derives the row id.
+  assert.equal(effectiveTokenFor('xero', { id: 'log-1', payload: { _idempotencyKey: '' } }), 'log-1')
   const xero = await readFile(path.join(process.cwd(), 'lib/connectors/xero/sync-processor.ts'), 'utf8')
   assert.match(
     xero,
@@ -342,7 +289,7 @@ test('the guard\'s derivation matches the processor in source (o3d-0m56)', async
 
 test('BILL_PAYMENT is money-moving too (o3d-0m56)', async () => {
   // isMoneyMovingFollowUp was scoped to the types o3d-h2wx's ENQUEUE helper produces.
-  // BILL_PAYMENT is queued elsewhere, but both processors post a real supplier payment for it,
+  // BILL_PAYMENT is queued elsewhere, but the processor posts a real supplier payment for it,
   // and this guard sees every FAILED row an operator can click. Using the narrower set let two
   // failed bill payments with distinct tokens through, and "Retry All" re-queue both.
   const { isMoneyMovingSyncType } = await import('@/lib/domain/accounting/followup-retry-guard')
@@ -451,7 +398,7 @@ for (const action of ACTIONS) {
       !/status:\s*'FAILED'/.test(query),
       'the sibling snapshot must NOT filter on status — an in-flight or already-synced sibling counts',
     )
-    assert.match(query, /connector: '(xero|quickbooks)'/, 'it must still be scoped to the connector')
+    assert.match(query, /connector: 'xero'/, 'it must still be scoped to the connector')
 
     // The reset itself must stay narrow: only FAILED rows may be re-queued.
     const update = source.slice(source.indexOf('await tx.accountingSyncLog.updateMany'))
@@ -469,7 +416,7 @@ for (const action of ACTIONS) {
     assert.notEqual(at, -1, 'the work must be driven per scope')
     const body = source.slice(at, source.indexOf('const siblingRows', at))
     assert.match(body, /db\.\$transaction/, 'each scope is one transaction')
-    assert.match(body, /await lockFollowUpScope\(tx, \{ connector: '(xero|quickbooks)', \.\.\.scope \}\)/,
+    assert.match(body, /await lockFollowUpScope\(tx, \{ connector: 'xero', \.\.\.scope \}\)/,
       'and the lock is taken first, inside it')
     // The probe is I/O and must NOT be inside that transaction: one unreachable remote would
     // otherwise hold an accounting lock for its whole timeout. Asserted on the LOOP BODY, not on

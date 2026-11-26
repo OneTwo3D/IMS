@@ -101,6 +101,6 @@ test('o3d-tqwjt: a SIMULATED WRITER-MAP CHANGE (IMS owns sales.invoice-update in
 test('o3d-tqwjt: with the hold unset the refusal fires only when a live send would happen (Xero chart and document, type switched on)', () => {
   assert.equal(unknownDay({}), 'refuse', 'legacy and would be sent')
   assert.equal(unknownDay({}, { typeEnabled: false }), 'shadow-unknown', 'sync off: nothing would be sent')
-  assert.equal(unknownDay({}, { chartConnector: 'quickbooks' }), 'shadow-unknown', 'no active Xero connector: nothing would be sent')
+  assert.equal(unknownDay({}, { chartConnector: 'retired-ledger' }), 'shadow-unknown', 'chart is not the Xero connector: nothing would be sent')
   assert.equal(unknownDay({}, { documentConnector: null }), 'shadow-unknown', 'the facade refuses an unattributable document: nothing is sent')
 })

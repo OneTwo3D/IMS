@@ -14,8 +14,8 @@ test('a different tenant/org is NOT trusted (re-auth to another Xero org)', () =
   assert.equal(accountingIdProvenanceMatches('xero:tenant-A', 'xero:tenant-B'), false)
 })
 
-test('a different connector is NOT trusted (Xero id, QuickBooks connection)', () => {
-  assert.equal(accountingIdProvenanceMatches('xero:tenant-A', 'quickbooks:tenant-A'), false)
+test('a different connector is NOT trusted (Xero id, retired-ledger connection)', () => {
+  assert.equal(accountingIdProvenanceMatches('xero:tenant-A', 'retired-ledger:tenant-A'), false)
 })
 
 test('a legacy NULL stored provenance is never trusted — it re-resolves and backfills', () => {

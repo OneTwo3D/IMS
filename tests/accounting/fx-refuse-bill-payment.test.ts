@@ -47,7 +47,7 @@ mock.module('@/lib/accounting', {
     getAccountingSettingsFor: async () => settings,
     getActiveAccountingConnectorInfo: async () => ({ id: 'xero', name: 'xero' }),
     isAccountingSyncTypeEnabled: async () => true,
-    asRoutableAccountingConnector: (value: string | null | undefined) => (value === 'xero' || value === 'quickbooks' ? value : null),
+    asRoutableAccountingConnector: (value: string | null | undefined) => (value === 'xero' ? value : null),
     queueAccountingSync: async (params: { type: string; payload: Record<string, unknown> }) => {
       if (params.type === 'REALISED_FX_JOURNAL') state.fxJournals.push(params)
       return { queued: true, connector: 'xero' }

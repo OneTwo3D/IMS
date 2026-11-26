@@ -264,8 +264,8 @@ type OuterOrderWhere = {
 }
 
 /**
- * The referenceId predicates the two sweeps emit. Xero ORs one alternative per candidate;
- * QuickBooks passes them as a single `in`. Modelling only one of the two is how a probe silently
+ * The referenceId predicates the sweep emits: Xero ORs one alternative per candidate, and a probe
+ * may also pass a single `in`. Modelling only one of the two is how a probe silently
  * matches EVERY row and reports "live", which reads as "nothing missing" and makes a recreate test
  * assert nothing at all — that is not a hypothetical, it is what the first draft of this file did.
  */
@@ -324,8 +324,8 @@ mock.module('@/lib/db', {
           // Three different callers reach this one method and they must not be confused:
           //   `paidAt`                      the A1 POSTING window — answered empty, so no posting
           //                                 group can re-post the rows this file stages.
-          //   `inventoryAllocatedDate: null` the QuickBooks A2 POSTING window (Xero's runs inside
-          //                                 the transaction, against `tx`).
+          //   `inventoryAllocatedDate: null` the A2 POSTING window of a writer that runs
+          //                                 outside the transaction (Xero's runs inside it, against `tx`).
           //   `inventoryAllocatedDate: {…}`  the RECREATE sweep, which is what this file is about.
           if ('paidAt' in where) return []
           if (where.inventoryAllocatedDate === null) {
@@ -395,21 +395,15 @@ mock.module('@/lib/db/pinned-advisory-lock', {
 })
 
 /**
- * o3d-i0o6 r6 — TWO CHARTS OF ACCOUNTS, BECAUSE THAT IS THE POINT.
+ * o3d-i0o6 r6 — THE CHART IS A MAP BY CONNECTOR, NOT A CONSTANT.
  *
- * This file runs BOTH A2 writers and BOTH recreate sweeps over the same orders, and the rule under
- * test — `passIsOfLedger` — is an equality on the pass's connector AND its account code. Giving both
- * connectors the SAME codes makes the account arm a tautology across the whole file and leaves the
- * connector arm carrying the cross-ledger tests alone, so "the QuickBooks sweep used Xero's Allocated
- * Inventory account" would be indistinguishable from "…used its own".
- *
- * That is the shape of the masking fixture found twice already on this branch (the reused sync-log id,
- * and the split test that gave two connectors one account map). `allocation-service.test.ts` already
- * keeps two charts for the same reason; so does this now.
+ * The rule under test — `passIsOfLedger` — is an equality on the pass's connector AND its account code,
+ * and the tests below also vary the configured Allocated Inventory account (`moved`) so the account arm
+ * is not a tautology. Keeping the chart keyed by connector means a second connector's codes join this
+ * map without disturbing the cases.
  */
 const CHART = {
   xero: { sales: '200', unearned: '830', inventory: '630', allocated: '631', moved: '632', cogs: '310' },
-  quickbooks: { sales: '400', unearned: '930', inventory: '730', allocated: '731', moved: '732', cogs: '510' },
 } as const
 
 mock.module('@/lib/connectors/xero/settings', {
@@ -426,8 +420,6 @@ mock.module('@/lib/connectors/xero/settings', {
     }),
   },
 })
-// o3d-remove-parked-connectors: a `mock.module` for an archived QuickBooks module was here.
-
 mock.module('@/lib/integration-plugins', {
   namedExports: {
     isIntegrationPluginEnabled: async (id: 'xero') => state.enabledPlugins.includes(id),
@@ -559,9 +551,7 @@ async function postedThenRoundedAwayUnderANewBatch(connector: 'xero'): Promise<v
   )
 }
 
-// ONE WRITER TODAY (o3d-remove-parked-connectors): the QuickBooks daily-sync writer is archived.
-// The loop shape is kept so a second writer inherits every case; what is lost is the cross-port
-// evidence that the rule holds in an independently-written second writer.
+// ONE WRITER TODAY. The loop shape is kept so a second writer inherits every case.
 for (const connector of ['xero'] as const) {
   test(`${connector}: a batch whose pass ROUNDED TO ZERO is not rebuilt from the CUMULATIVE debit (o3d-i0o6 r4)`, async () => {
     await postedThenRoundedAwayUnderANewBatch(connector)
@@ -673,36 +663,21 @@ function scheduleDailyBatchOn(connector: 'xero' | null): void {
 }
 
 // ---------------------------------------------------------------------------------------------
-// THE CROSS-LEDGER SECTION WAS HERE, AND IS DELETED WITH ITS SUBJECT
-// (o3d-remove-parked-connectors).
+// THE CROSS-LEDGER RULES ARE NOT COVERED HERE.
 // ---------------------------------------------------------------------------------------------
 //
-// Nine cases and one fixture (`xeroThenQuickBooksUnderTwoBatches`) built a state that two REAL
-// writers had left behind — a Xero A2 pass on day one, a books switch, a QuickBooks A2 pass on day
-// two — and asserted the recreate sweep's cross-ledger rules on it:
-//
-//   * o3d-i0o6 r5: Xero's sweep does NOT rebuild a QuickBooks-attributed batch into Xero accounts
-//     (the duplicate-debit rule), and the control that QuickBooks still rebuilds its OWN share;
-//   * o3d-i0o6 r6: a batch whose pounds are in a ledger NO scheduled sweep will rebuild is REPORTED
-//     rather than silently zeroed, and it stays QUIET when that ledger's own sweep IS the scheduled
-//     one (the two halves of "its own sweep will rebuild it" being a claim about the cron);
-//   * o3d-i0o6 r7: an EARLIER batch whose journal went missing is rebuilt by its own ledger's sweep,
-//     and the OTHER ledger's sweep REPORTS it instead of ignoring it; plus the FAILED/CANCELLED
-//     foreign-journal ambiguity cases and their genuinely-gone control.
-//
-// EVERY ONE of those needs two REGISTERED accounting connectors: one to write the foreign pass, and
-// one whose sweep runs. QuickBooks is archived, so there is no second writer to build the state and
-// no second sweep to run it. They cannot be re-pointed at an unregistered id either — the fixture
-// does not fabricate rows, it RUNS both writers, which is exactly why it was trustworthy.
+// The recreate sweep's cross-ledger rules — a sweep does NOT rebuild another ledger's batch into its
+// own accounts (the duplicate-debit rule); a batch whose pounds are in a ledger no scheduled sweep
+// will rebuild is REPORTED rather than silently zeroed; an EARLIER batch whose journal went missing
+// is rebuilt by its own ledger's sweep and REPORTED by the other's — need two REGISTERED accounting
+// connectors: one to write the foreign pass and one whose sweep runs. This build registers one, and
+// the fixtures RUN the writers rather than fabricate rows, which is why they were trustworthy.
 //
 // THE RULES THEMSELVES ARE STILL IN THE CODE. `recreateMissingDailyBatchLogs` still filters live logs
 // by `connector`, still computes a per-ledger share from the pass history, and still reports a
-// foreign share nobody is scheduled to rebuild — and with rows stamped `quickbooks` surviving in
-// development databases, that reporting path is what an operator will actually meet. It is now
-// UNTESTED. This is the single largest coverage loss in the QuickBooks removal and it is recorded as
-// such in docs/archive/quickbooks-connector-removal.md; the revival note says to restore this section
-// from `git show archive/quickbooks-connector:tests/accounting/daily-batch-recreate-pass-share.test.ts`
-// alongside the connector.
+// foreign share nobody is scheduled to rebuild — and with rows stamped by a connector this build no
+// longer registers possibly surviving in a database, that reporting path is what an operator would
+// meet. It is UNTESTED until a second connector is registered.
 //
 // What is KEPT below and above: every case that needs one ledger only — the rounded-to-zero rule, the
 // rebuild-re-points-the-evidence rule, and the retention-window bucket rules.
@@ -716,9 +691,7 @@ function scheduleDailyBatchOn(connector: 'xero' | null): void {
  * Allocated Inventory, and every refund and orphan reversal for the rest of the order's life
  * resolves a dead id, refuses, and withholds the credit.
  */
-// ONE WRITER TODAY (o3d-remove-parked-connectors): the QuickBooks daily-sync writer is archived.
-// The loop shape is kept so a second writer inherits every case; what is lost is the cross-port
-// evidence that the rule holds in an independently-written second writer.
+// ONE WRITER TODAY. The loop shape is kept so a second writer inherits every case.
 for (const connector of ['xero'] as const) {
   test(`${connector}: a rebuilt A2 batch re-points the evidence at the journal it minted (o3d-i0o6 r5)`, async () => {
     reset(connector)

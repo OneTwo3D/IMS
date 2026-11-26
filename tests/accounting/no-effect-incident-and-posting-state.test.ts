@@ -4,7 +4,6 @@ import test from 'node:test'
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import {
   describePreservedUnrecordedIncidents,
-  describeUnpersistedQboPost,
   describeUnrecordablePostedDocument,
   incidentKindForOperation,
   type PostedOperationOutcome,
@@ -14,12 +13,9 @@ import {
 // ---------------------------------------------------------------------------------------------
 // ROUND 11 (Codex HIGH + 3 MEDIUM) — AND THE TEST LESSON THAT COMES WITH THE HIGH.
 //
-// THE HIGH. Round 10 gave the disabled-attachment case its own WORDING and left it inside the
-// generic no-Request-Id frame. That frame opens by asserting an external effect has happened and
-// closes by telling the operator to turn QuickBooks sync off, LEAVE it off and escalate — while
-// itself acknowledging that this stops every QuickBooks row. So an operation that made no request,
-// changed nothing and costs nothing to repeat became the reason to halt unrelated invoice, bill,
-// payment and journal processing across the whole installation.
+// THE HIGH. Round 10 gave the disabled-attachment case its own WORDING and left it inside a
+// generic frame that opens by asserting an external effect has happened. So an operation that made
+// no request and changed nothing was described as one that had acted.
 //
 // ROUND 10'S TESTS ASSERTED THE OUTCOME-SPECIFIC FRAGMENTS AND PASSED. They matched "NOTHING AT
 // ALL — attachment upload is turned off" and "this attempt created none" while the surrounding
@@ -47,43 +43,6 @@ const LIVE: PostedOperationOutcome = { postingMode: 'LIVE' }
 // ---------------------------------------------------------------------------------------------
 // THE WHOLE MESSAGE, NOT THE FRAGMENT (Codex round 11, HIGH).
 // ---------------------------------------------------------------------------------------------
-
-const QBO_NO_EFFECT =
-  'QuickBooks BILL_ATTACHMENT for PurchaseOrder po-1 MADE NO EXTERNAL EFFECT. The handler '
-  + 'returned success WITHOUT ACTING: no request was sent, nothing was created, changed, uploaded '
-  + 'or emailed, and nothing in QuickBooks or anywhere else is different because this attempt '
-  + 'ran. WHAT COULD NOT BE RECORDED IS THAT IT RAN AT ALL: Error: write conflict. WHAT A REPLAY '
-  + 'WOULD COST: sync row log-1 was left holding this worker\'s claim, with no mirrored accounting '
-  + 'event written, so once that claim goes stale the sweep will reclaim the row and run the '
-  + 'operation again. Running it again does NOTHING — PROVIDED ATTACHMENT UPLOAD IS STILL OFF '
-  + 'WHEN THE SWEEP RUNS. What this record knows is that quickbooks_sync_attach_pdf read "false" '
-  + 'AT THE MOMENT THIS ATTEMPT RAN, which is the only reading it ever took. If that setting is '
-  + 'on by the time the row is reclaimed, every sweep uploads the supplier invoice PDF to the '
-  + 'bill instead. WHAT TO DO ABOUT THE EFFECT: nothing this attempt did needs undoing — it '
-  + 'created no attachment. THEN GO AND READ quickbooks_sync_attach_pdf AS IT STANDS NOW, because '
-  + 'this record cannot: if it is off, the replay above stays a no-op and there is nothing to '
-  + 'change; if it is ON, the replay uploads to a bill THIS RECORD DOES NOT NAME, so there is no '
-  + 'duplicate this record can send you to. The one lever here is that setting, and it stops '
-  + 'attachment uploads for EVERY bill on this connector rather than for this one. '
-  + 'TURNING IT OFF IS NOT A '
-  + 'FENCE EITHER: the handler reads that setting and then uploads, so a run already past the '
-  + 'read still uploads, and nothing in IMS reports whether one is. Only closing the row stops '
-  + 'the replay, and IMS cannot close it (o3d-4b5p). DO NOT TURN QUICKBOOKS SYNC OFF FOR THIS '
-  + 'ONE. That switch is the containment lever for an incident where something DID reach '
-  + 'QuickBooks. There is nothing here to contain, and turning it off stops EVERY QuickBooks row '
-  + 'on this installation — invoices, bills, payments and journals with nothing to do with this '
-  + 'row — for as long as it stays off. WHAT IS ACTUALLY WRONG IS THE WRITE, NOT THE OPERATION: '
-  + 'sync row log-1 was left PROCESSING at attempt revision 0 with no mirrored event, and nothing '
-  + 'in IMS will settle it. ESCALATE sync row log-1, with this '
-  + 'record, to whoever administers this installation: closing it safely needs someone who can '
-  + 'read the database directly (o3d-4b5p, o3d-3lhp). ONE THING ON SCREEN IS ACTIVELY WRONG AND '
-  + 'YOU WILL SEE IT: the accounting log renders a settle control for every FAILED or PROCESSING '
-  + 'row, and on this one it resolves to the words "not settleable" with its reason as the '
-  + 'tooltip. DO NOT FOLLOW THAT TOOLTIP. It tells you to retry the row until it shows an attempt '
-  + 'revision, and the QuickBooks claim never stamps one, so no number of retries will ever make '
-  + 'an attempt appear. This is the known hole o3d-qn21. WHAT THIS RECORD HOLDS: the operation '
-  + 'type, the IMS reference above, the sync row id, and the time this record was written — the '
-  + 'write it describes was made in the same sync attempt. That is all of it.'
 
 const XERO_NO_EFFECT =
   'Xero BILL_ATTACHMENT for PurchaseOrder po-1 SUCCEEDED WITHOUT MAKING ANY EXTERNAL EFFECT — '
@@ -114,8 +73,8 @@ const XERO_UPDATE_DRAFT =
 const BREADCRUMB_SIDE_EFFECTS =
   'Database reset kept 4 record(s) of things IMS did against an accounting connector and could '
   + 'never record. THEY ARE NOT ALL THE SAME KIND OF THING, so they are counted separately. 4 are NOT '
-  + 'accounting documents — no invoice, bill, credit note, payment or journal was created in Xero or '
-  + 'QuickBooks for any of them. They record an effect that landed somewhere else and can repeat: a '
+  + 'accounting documents — no invoice, bill, credit note, payment or journal was created in Xero for '
+  + 'any of them. They record an effect that landed somewhere else and can repeat: a '
   + 'file attached to an EXISTING bill, an invoice PDF written over the stored copy, an invoice email '
   + 'QUEUED to a customer, a note written onto a WooCommerce order. AN ATTACHMENT RECORD IN HERE MAY '
   + 'BE A NO-OP: that handler returns success WITHOUT uploading when attachment upload is off for its '
@@ -126,44 +85,7 @@ const BREADCRUMB_SIDE_EFFECTS =
   + 'to inspect are gone with it, so their statuses can no longer be inspected. Read each record. It '
   + 'says what can be done about it, and where IMS could not establish what the effect was, it says '
   + 'that instead of guessing. Nothing else in IMS references any of them any more. Search this log '
-  + 'for "xero_posted_document_unrecorded" or "quickbooks_posted_document_unrecorded".'
-
-// MUTATION THAT KILLS THIS (run): delete the `noExternalEffect` branch from
-// `describeUnpersistedQboPost` so the no-op falls back into the generic no-Request-Id frame — the
-// equality fails on the whole string, and the diff is the frame this finding is about: "SUCCEEDED —
-// the external effect has happened", "HOW TO STOP MORE OF IT: turn QuickBooks sync OFF", "THEN LEAVE
-// IT OFF". Weaker mutations kill it too, which is the point of asserting the whole message:
-// re-wording any sentence anywhere in it fails.
-//
-// ROUTE: the message comes from the exported QuickBooks formatter with the handler's own recorded
-// outcome. Nothing about the expected text is computed from the module.
-test('ROUND 11 (Codex HIGH): an attempt that did nothing gets a whole message that prescribes nothing drastic', () => {
-  const message = describeUnpersistedQboPost(
-    { entry: ATTACH, postedExternalId: null, outcome: { externalEffect: 'NONE' } },
-    new Error('write conflict'),
-  )
-  assert.equal(message, QBO_NO_EFFECT)
-
-  // The three things the frame must never do again, stated as claims rather than left implicit in
-  // the equality above — so a reader of this file can see WHAT the equality is protecting.
-  assert.doesNotMatch(message, /the external effect has happened/,
-    'nothing external happened, and the old frame opened by saying it had')
-  assert.doesNotMatch(message, /turn QuickBooks sync OFF/,
-    'a no-op may not order the connector-wide shutdown')
-  assert.doesNotMatch(message, /THEN LEAVE IT OFF/,
-    'nor order it left off indefinitely')
-  assert.match(message, /DO NOT TURN QUICKBOOKS SYNC OFF FOR THIS ONE/,
-    'it refuses that instruction explicitly, because the operator has seen it on sibling records')
-  // ROUND 12 (Codex HIGH): and it no longer TELLS the operator the setting is off. It names the
-  // setting, says what was read and WHEN, and sends them to read it as it stands — see
-  // tests/accounting/record-reads-settings-as-history.test.ts for the whole of that replacement.
-  assert.match(message, /quickbooks_sync_attach_pdf/,
-    'the one setting that is actually load-bearing here')
-  assert.doesNotMatch(message, /LEAVE ATTACHMENT UPLOAD DISABLED/,
-    'a recorded reading of a mutable setting may not be given as an instruction about its current value')
-  assert.doesNotMatch(message, /Leave it as it is/,
-    'nor may the record tell an operator to leave a setting it has not read')
-})
+  + 'for "xero_posted_document_unrecorded".'
 
 // MUTATION THAT KILLS THIS (run): make `nonDocumentEffectClaim` return 'MADE' unconditionally — the
 // head reverts to "SUCCEEDED — the external effect has happened — but IMS could not record that it

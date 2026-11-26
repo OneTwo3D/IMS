@@ -3,7 +3,7 @@
  */
 
 import { xeroWritePath } from './write-path'
-import { getAccessToken, getStoredTenantBlockReason } from './auth'
+import { getAccessToken, getStoredTenantBlockReason, type XeroAccessGrant } from './auth'
 import { connectorFetch } from '@/lib/security/connector-fetch'
 import { accountingPostingIntentRefusal } from '@/lib/connectors/accounting-posting-intent'
 import { accountingEgressRefusal } from '@/lib/connectors/accounting-egress-authorization'
@@ -105,6 +105,14 @@ const XERO_NOT_SENT_STATUS = 0
  *                               `xeroFetch` straight after `getAccessToken()` answered, before the
  *                               request object is built: no token is used, nothing reaches the
  *                               transport, and the caller's attempt counter does not move.
+ *  • `bounded-deadline`         (#1132 R2-MED-1) a BOUNDED call (XeroBoundedCall) carrying a
+ *                               `deadlineAt` reached the last statement before the socket with too
+ *                               little of that deadline left for the attempt to finish inside it.
+ *                               Written at ONE return in `performRequest`, after the egress
+ *                               authorisation (the last await) and before `noteRequest`, so nothing
+ *                               was counted and `connectorFetch` was never entered. It exists so a
+ *                               caller holding database locks inside a transaction with a deadline
+ *                               never sends after that transaction can have rolled back.
  *
  * WHERE THE LINE IS DRAWN, AND IT IS DRAWN AT THE SOCKET, NOT AT THE FUNCTION BOUNDARY. Every catch
  * above ends BEFORE the statement that can send. `performRequest` is called outside the
@@ -135,6 +143,7 @@ export type XeroNotSentReason =
   | 'rate-budget-unavailable'
   | 'egress-authorisation-unavailable'
   | 'connection-changed'
+  | 'bounded-deadline'
 
 /**
  * The Xero connection a caller's earlier READ was served by, which a later WRITE must be built from or
@@ -458,7 +467,30 @@ function parseRetryAfterMs(value: string | null): number {
  * timeout on the one attempt. For a caller that makes the call while holding database locks inside a transaction with a deadline: the call
  * must take at most `timeoutMs`, and a rate limit is handed straight back (it waits in the queue, not on the locks).
  */
-export type XeroBoundedCall = { timeoutMs: number }
+export type XeroBoundedCall = {
+  timeoutMs: number
+  /**
+   * #1132 R2-MED-1: the auth the call is built from, resolved (and refreshed if due) by the caller BEFORE it took its locks, so no token
+   * refresh (a network call and database writes) runs inside the caller's deadline. Absent: resolved here as for any call.
+   */
+  auth?: XeroAccessGrant
+  /**
+   * #1132 R2-MED-1: epoch milliseconds by which the call's reply must be back (the caller's own transaction deadline less its commit margin).
+   * The one attempt is aborted at the earlier of this and `timeoutMs`, and it is NOT SENT (tagged `bounded-deadline`) if, at the last statement
+   * before the socket, less than XERO_BOUNDED_MIN_SEND_WINDOW_MS of it is left: every await before that point (the claim fence, the egress
+   * authorisation) is then inside the bound whatever it cost.
+   */
+  deadlineAt?: number
+}
+
+/** #1132 R2-MED-1: the least time a bounded call must have left before its deadline to be sent at all. */
+export const XERO_BOUNDED_MIN_SEND_WINDOW_MS = 2_000
+
+/** How long the one attempt of a bounded call may run: its own timeout, cut to what is left of the caller's deadline (never below 1 ms). */
+export function boundedAbortAfterMs(bounded: XeroBoundedCall, now: number = Date.now()): number {
+  const untilDeadline = bounded.deadlineAt === undefined ? Number.POSITIVE_INFINITY : bounded.deadlineAt - now
+  return Math.max(1, Math.min(bounded.timeoutMs, untilDeadline))
+}
 
 async function performRequest(auth: { accessToken: string; tenantId: string }, init: RequestInit, url: string, bounded?: XeroBoundedCall) {
   let lastRateLimitMs = 0
@@ -598,6 +630,14 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
       }) as Response
     }
     if (!budget.ok) {
+      // #1132 R2-LOW-8: a bounded call never waits for minute budget, so its refusal says that, not that a six-minute window was spent.
+      if (budget.reason === 'budget' && bounded) {
+        return markNotSent('rate-budget-refused', {
+          ok: false,
+          status: 429,
+          text: async () => `Rate limited; Xero's minute budget for this organisation is spent (the next slot is in ${Math.round(budget.waitMs / 1000)}s), and this call does not wait for it because it is made while holding database locks. Not sent; the work is retried from the queue.`,
+        } as Response)
+      }
       if (budget.reason === 'budget') return outOfBudgetResponse(budget.waitMs, XERO_IN_REQUEST_RETRY_BUDGET_MS - remainingBeforeCall)
       return markNotSent('rate-budget-refused', {
         ok: false,
@@ -672,6 +712,16 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
     const remainingAtSend = budgetRemainingMs()
     if (remainingAtSend <= 0) {
       return budgetSpentResponse(XERO_IN_REQUEST_RETRY_BUDGET_MS - remainingAtSend)
+    }
+    // #1132 R2-MED-1: A BOUNDED CALL'S OWN DEADLINE, RE-READ HERE, after the last await above and synchronously before the attempt is counted.
+    // What the caller spent before this call (a claim fence, the egress authorisation) is measured by the clock, not estimated.
+    if (bounded?.deadlineAt !== undefined && Date.now() + XERO_BOUNDED_MIN_SEND_WINDOW_MS > bounded.deadlineAt) {
+      const leftMs = Math.max(0, bounded.deadlineAt - Date.now())
+      return markNotSent('bounded-deadline', {
+        ok: false,
+        status: XERO_NOT_SENT_STATUS,
+        text: async () => `Not sent: only ${Math.round(leftMs / 1000)}s were left of this call's deadline at the moment it would have gone out. NOTHING WAS SENT; it is retried.`,
+      }) as Response
     }
 
     noteRequest(auth.tenantId)
@@ -796,7 +846,8 @@ async function xeroFetch<T = unknown>(
 ): Promise<XeroResponse<T>> {
   let auth: Awaited<ReturnType<typeof getAccessToken>>
   try {
-    auth = await getAccessToken()
+    // #1132 R2-MED-1: a bounded call brings the auth its caller resolved before taking its locks; nothing is refreshed inside the bound.
+    auth = opts?.bounded?.auth ?? await getAccessToken()
   } catch (error) {
     // THE RESOLVER CAN THROW, AND THE FIRST ROUND ONLY HANDLED IT RETURNING NULL (o3d-2w2j r2).
     //
@@ -877,7 +928,8 @@ async function xeroFetchWithAuth<T = unknown>(
     }
 
     // A bounded call (o3d-0syfq) carries its own hard timeout: the one attempt it makes is aborted past it.
-    init = { method, headers, ...(opts?.bounded ? { signal: AbortSignal.timeout(opts.bounded.timeoutMs) } : {}) }
+    // #1132 R2-MED-1: and never past the caller's deadline (`deadlineAt`), whichever comes first; the send itself is refused below the bound (performRequest).
+    init = { method, headers, ...(opts?.bounded ? { signal: AbortSignal.timeout(boundedAbortAfterMs(opts.bounded)) } : {}) }
 
     if (body) {
       headers['Content-Type'] = 'application/json'

@@ -3,7 +3,7 @@ import test from 'node:test'
 
 import { resolveAccountingEnqueueOrderScope } from '@/lib/domain/accounting/enqueue-order-guard'
 
-// o3d-3zgy. o3d-hrak made queueXeroSync / queueQuickBooksSync take the sales-order row lock in the
+// o3d-3zgy. o3d-hrak made queueXeroSync take the sales-order row lock in the
 // same transaction that writes the AccountingSyncLog, so an enqueue serialises against a hard
 // delete. queueAccountingSyncTx is the OTHER enqueue path: it writes inside a CALLER's transaction,
 // so it cannot take that lock itself — doing so would take it LATE, after stock-level locks are

@@ -441,7 +441,7 @@ test('sync logs report missing reference metadata, missing idempotency keys, and
     },
     {
       id: 'missing-idempotency',
-      connector: 'quickbooks',
+      connector: 'xero',
       type: 'PURCHASE_INVOICE',
       status: 'PENDING',
       referenceType: 'PurchaseOrder',

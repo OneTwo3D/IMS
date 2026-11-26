@@ -174,7 +174,7 @@ test('A parent of the right type from another reference or another connector bre
     const chains: Array<[string, string, string, string]> = [
       ['same document, same connector', refs.ok, refs.ok, 'xero'],
       ['invoice of another reference', refs.otherRef, `${refs.otherRef}-other`, 'xero'],
-      ['invoice of another connector', refs.otherConn, refs.otherConn, 'quickbooks'],
+      ['invoice of another connector', refs.otherConn, refs.otherConn, 'retired-ledger'],
     ]
     for (const [label, referenceId, invoiceDocument, connector] of chains) {
       const pdf = await mkChain(referenceId, invoiceDocument, connector)

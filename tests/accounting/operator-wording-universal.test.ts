@@ -558,7 +558,6 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/domain/accounting/sync-row-settlement.ts', prefix: 'Without it the row records a post that nothing can be reconciled against.', verdict: 'DESCRIPTION', why: 'states a consequence' },
   { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: 'REMEDY: {lookup} and either keep it', verdict: 'CHECKS_FIRST', why: 'the sentence opens with the lookup of the document in the ledger; nothing is posted, the options are keep, void or reverse', count: 2 },
   { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: '{Lookup} and either keep it', verdict: 'CHECKS_FIRST', why: 'opens with the lookup in the ledger' },
-  { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: 'THIS OPERATION RETURNS NO IDENTIFIER', verdict: 'DESCRIPTION', why: 'states why the document cannot be recorded' },
   { file: 'lib/domain/sales/allocation-service.ts', prefix: 'Group A2 will not re-post this order', verdict: 'DESCRIPTION', why: 'states IMS behaviour' },
   { file: 'lib/domain/sales/refund-posted-tax-identity.ts', prefix: '{} carries no VAT rate of its own', verdict: 'DESCRIPTION', why: 'states why no identity exists (credit note "posts under")' },
   { file: 'lib/domain/sales/refund-posted-tax-identity.ts', prefix: '{} has no accounting tax code', verdict: 'DESCRIPTION', why: 'states why no identity exists' },
@@ -598,6 +597,11 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/domain/sales/refund-delete-service.ts', prefix: 'The credit note is already voided in Xero; the refund is unwound in IMS on the next attempt', verdict: 'DESCRIPTION', why: 'o3d-0syfq: states the state read from Xero and what the retry does' },
   { file: 'lib/domain/sales/refund-delete-service.ts', prefix: 'The credit note is voided in Xero, but the IMS refund still stands', verdict: 'DESCRIPTION', why: 'o3d-0syfq: states the state read from Xero; the operator task carries the remedy' },
   { file: 'lib/domain/wms/operator-tasks.ts', prefix: 'Credit note voided in Xero for a refund being deleted, but the IMS refund still stands', verdict: 'DESCRIPTION', why: 'o3d-0syfq: operator-task title stating what Xero and IMS each hold' },
+  { file: 'lib/domain/wms/operator-tasks.ts', prefix: 'Credit note void in Xero gave up after repeated failures for a refund being deleted, the IMS refund still stands', verdict: 'DESCRIPTION', why: '#1132 R2-MED-2: operator-task title stating what IMS holds after the void entry used up its retries' },
+  { file: 'lib/domain/wms/operator-task-done.ts', prefix: 'credit note voided in Xero, IMS refund standing', verdict: 'DESCRIPTION', why: '#1132 R2-LOW-6: names the task in the done audit row; Done changes nothing' },
+  { file: 'lib/domain/sales/refund-delete-service.ts', prefix: 'The deletion of refund {} stopped: IMS tried to void its credit note in Xero and gave up after repeated failures ({}).', verdict: 'DESCRIPTION', why: '#1132 R2-MED-2: states what IMS tried and that it gave up; the remedy follows and reads Xero first' },
+  { file: 'lib/domain/sales/refund-delete-service.ts', prefix: 'Open the credit note in Xero: if it is voided there, clear the cause and retry the Credit note void entry on the sync page (IMS then deletes', verdict: 'CHECKS_FIRST', why: '#1132 R2-MED-2: the remedy IS the ledger check (open the credit note in Xero) and branches on what Xero shows; nothing is hand-posted' },
+  { file: 'lib/domain/sales/refund-delete-service.ts', prefix: 'Clear the cause and delete the refund again from the order page.', verdict: 'NON_ACCOUNTING', why: '#1132 MED-3: nothing was sent to Xero (proven); asking IMS for the delete again queues the void through the normal outbox, no hand posting' },
   { file: 'lib/connectors/xero/credit-notes.ts', prefix: 'Credit note not found in Xero for allocation', verdict: 'DESCRIPTION', why: 'error label', count: 2 },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'VOIDED a sales credit note in Xero', verdict: 'DESCRIPTION', why: 'states what the void posting did (the effect label of the post-effect table)' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'the activity row for the lost claim could not be written', verdict: 'DESCRIPTION', why: 'states where the only record is', count: 1 },
@@ -609,7 +613,6 @@ const UNGUARDED_SITES: Array<{ file: string; prefix: string; verdict: SiteVerdic
   { file: 'lib/domain/accounting/credit-note-allocation.ts', prefix: 'the refund was issued as store credit, so its credit note stays open in Xero', verdict: 'DESCRIPTION', why: 'o3d-k26m.17: states why a store-credit refund\'s credit note is never settled (the liability true-up nets it off 813); instructs nothing' },
   { file: 'lib/connectors/xero/sync-processor.ts', prefix: 'SETTLED an existing sales credit note in Xero', verdict: 'DESCRIPTION', why: 'states what the settlement posting did (the effect label of the post-effect table)', count: 1 },
   { file: 'lib/domain/accounting/ledger-settlement-evidence.ts', prefix: 'this row does not record the amount and date', verdict: 'DESCRIPTION', why: 'states why evidence cannot be matched' },
-  { file: 'lib/domain/accounting/posting-refusal-kinds.ts', prefix: 'The FX revaluation raises this journal only', verdict: 'DESCRIPTION', why: 'describes what the Retry button does for this kind' },
   { file: 'lib/domain/accounting/unrecorded-posted-document.ts', prefix: '{} are NOT accounting documents', verdict: 'DESCRIPTION', why: 'states what the listed items are' },
   { file: 'lib/domain/purchasing/supplier-credit-note.ts', prefix: 'IMS could not establish whether credit note', verdict: 'DESCRIPTION', why: 'states why IMS refused' },
   { file: 'lib/domain/purchasing/supplier-credit-note.ts', prefix: 'Check them in Xero first; once you have confirmed', verdict: 'CHECKS_FIRST', why: 'the refusal states the ledger HOLDS the duplicates, so the generic act-only-if-absent preamble would contradict the repair; the check comes first and the void is conditional on the duplicate being confirmed' },
@@ -657,7 +660,7 @@ test('[o3d-1e7sl Codex r17] every instruction site in the tree is guarded by con
   // Codex r19: the verdicts are VERIFIED against each declared sentence, never taken on trust.
   const ACT = /\b(post|re-?post|repost|re-?send|resend|retry|re-?save|raise|enter|register|record|book|apply|allocate|settle|reconcile|void|reverse|correct|link)\b/i
   const CHECK = /\b(check|confirm|open|look ?up|locate|inspect|compare)\b|{lookup}/i
-  const LEDGERISH = /ledger|accounting|Xero|QuickBooks|journal|credit note/i
+  const LEDGERISH = /ledger|accounting|Xero|journal|credit note/i
   const violations: string[] = []
   for (const site of unguarded) {
     const e = UNGUARDED_SITES.find((x) => x.file === site.file && site.sentence.startsWith(x.prefix))!
@@ -722,7 +725,7 @@ test('[o3d-1e7sl Codex r19] the xero allocation refusal directs the operator to 
 })
 
 test('[o3d-1e7sl Codex r19] the classifier: a descriptive phrase never exempts an imperative in the same sentence; DESCRIPTION entries have no imperative form', () => {
-  assert.equal(isInstructionSentence('IMS records the connector as quickbooks, which are recorded separately. Re-post the invoice from this order.'.split('. ')[0] + '; re-post the invoice from this order'), true, 'control: "are recorded" does not exempt a later re-post')
+  assert.equal(isInstructionSentence('IMS records the connector as retired-ledger, which are recorded separately. Re-post the invoice from this order.'.split('. ')[0] + '; re-post the invoice from this order'), true, 'control: "are recorded" does not exempt a later re-post')
   assert.equal(isInstructionSentence('The invoices are recorded in the ledger; re-post the invoice from this order to fix it.'), true)
   assert.equal(isInstructionSentence('Do not re-post it by hand.'), false, 'a prohibition clause is not an instruction')
   assert.equal(isInstructionSentence('This was posted by hand and the invoices are recorded in the ledger.'), false)

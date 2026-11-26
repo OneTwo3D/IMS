@@ -4,7 +4,7 @@
  * WooCommerce allocates cart-coupon money INTO the line items, and mapWcLineItems already carries it
  * as a per-line `discountAmount`. The pre-fix importer ALSO wrote the whole coupon total into the
  * ORDER-LEVEL `SalesOrder.discountAmount` slot — which means "a discount NOT already in the lines" —
- * so every consumer deducted the same coupon twice: the Xero/QuickBooks invoice (per-line
+ * so every consumer deducted the same coupon twice: the Xero invoice (per-line
  * `DiscountRate` AND a negative "Order discount" line), the chargeback credit note, and the SO detail
  * totals block. The importer is fixed going forward (`resolveWcOrderLevelDiscount`); this corrects the
  * rows written before that.
@@ -67,8 +67,7 @@
  *      `unearnedRevenueAmount` stamp. Reads outside its transaction, writes via
  *      `createPendingSyncLog`, which never touches the queue helpers. FENCED by
  *      `assertRevenueDeferralsUnchanged`; orders with a live batch are additionally DECLINED here.
- *   4. QuickBooks daily batch Group A1 — identical twin of (3), fenced identically.
- *   5. `raiseChargebackForReversedOrder` (app/actions/sales.ts) — mirrors the order-level discount
+ * *   5. `raiseChargebackForReversedOrder` (app/actions/sales.ts) — mirrors the order-level discount
  *      into a CREDIT_NOTE line. NOT a freshness fence, and that distinction is the whole of
  *      o3d-y14 r3 finding 1. An earlier round left this path alone on the argument that its job is
  *      to mirror WHAT THE INVOICE POSTED, so a drift check would report the same drift forever on
@@ -1445,7 +1444,7 @@ export function wcCouponCorrectionNeedsLedgerAdjustment(posted: WcCouponPostedEv
  * Correct ONE REVIEWED order, inside the caller's transaction, behind the sales-order row lock.
  *
  * THE FENCE (o3d-5ct). `lockSalesOrder` is a `SELECT ... FOR UPDATE` on the order row, and it is the
- * same lock `lockOrderForAccountingEnqueue` takes inside `queueXeroSync` / `queueQuickBooksSync`, and
+ * same lock `lockOrderForAccountingEnqueue` takes inside `queueXeroSync`, and
  * that `queueAccountingSyncTx` refuses to run without. Taking it here serialises this correction
  * against every path that can enqueue a SALES_INVOICE for the order. So an enqueue either commits
  * BEFORE us — and we see its row and decline — or AFTER us, and snapshots the corrected amount.

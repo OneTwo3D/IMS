@@ -127,11 +127,9 @@ export function isCompactedFollowUpEvidence(row: { backReferenceEvidenceCompacte
  * happened to be listed first. That is the property the issue asked for — an over-broad guard is
  * noise, an under-broad one loses a payment in silence.
  *
- * IT DESCRIBES THE UNION OF THE CONNECTORS, NOT ONE OF THEM. Xero's `enqueueFollowUps` is the
- * superset; QuickBooks enqueues a strict subset of it (no `PURCHASE_CREDIT_NOTE` branch at all) and
- * has no back-reference sweep bound to it by design. So a shared table stating Xero's answer can
- * only ever OVER-report for QuickBooks, which is the safe direction, and the two cannot drift into
- * under-reporting by being written down twice.
+ * IT DESCRIBES THE SUPERSET OF WHAT A CONNECTOR MAY ENQUEUE, NOT ONE CONNECTOR'S SUBSET. A shared
+ * table stating Xero's answer can only ever OVER-report for a connector that enqueues less, which is
+ * the safe direction, and the two cannot drift into under-reporting by being written down twice.
  */
 export type CompactedFollowUpLossVerdict = {
   /** Follow-ups built from the payload BODY. Gone once it is `{}`, and the reason to warn. */

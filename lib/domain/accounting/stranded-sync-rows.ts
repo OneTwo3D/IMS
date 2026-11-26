@@ -9,8 +9,8 @@ import {
  * o3d-osl8 item 1 — the STRANDED-ROW read model.
  *
  * THE PROBLEM. Every accounting log view in the product is scoped to the ACTIVE connector:
- * getAccountingSyncLogs resolves the active connector before reading, and getXeroSyncLogs /
- * getQuickBooksSyncLogs hard-filter `connector: 'xero' | 'quickbooks'`. An unresolved
+ * getAccountingSyncLogs resolves the active connector before reading, and getXeroSyncLogs
+ * hard-filters `connector: 'xero'`. An unresolved
  * AccountingSyncLog row left behind on a RETIRED connector therefore appears in NO log view at
  * all — its only trace is the integer in the connector-orphan banner.
  *
@@ -108,8 +108,8 @@ export type StrandedSyncRow = {
   /**
    * o3d-e2mz: the attempt this row is currently on. Carried to the UI because a settlement must name
    * the attempt it was made about, and the operator cannot name what they were never shown. 0 means
-   * no fence-aware processor has ever claimed it, which is every QuickBooks row and every row
-   * predating the fence.
+   * no fence-aware processor has ever claimed it, which is every row on a connector with no
+   * fence-aware processor and every row predating the fence.
    */
   attemptRevision: number
   /** o3d-1e7sl: carried so the banner can show the row's STANDING (see `describeLedgerStanding`). */
@@ -179,11 +179,11 @@ export function describeStrandedSyncRow(
     // the argument went — nothing that participates in the attempt fence can claim anything here.
     //
     // The rows this list exists for are precisely the counter-example. The active connector comes
-    // from the PLUGIN flags, Xero-first; `triggerQuickBooksSync` gates on `quickbooks_sync_enabled`
-    // and NOTHING ELSE, so with Xero enabled beside a still-enabled QuickBooks — the exact state the
-    // QuickBooks unrecorded-post record tells an operator to create — every QuickBooks row is listed
-    // here as unclaimable while any `sync` holder can press the QuickBooks Sync button and have the
-    // stale-claim sweep reclaim it, replaying the operation over the settlement.
+    // from the PLUGIN flags; a registered connector's manual Sync action gates on its own
+    // `<connector>_sync_enabled` toggle and NOTHING ELSE, so a row on a registered connector that is
+    // not the active one would be listed here as unclaimable while any `sync` holder can press that
+    // connector's Sync button and have the stale-claim sweep reclaim it, replaying the operation over
+    // the settlement.
     //
     // So the real precondition is asked instead, and when it does not hold the row is refused WITH
     // THE REASON AND THE LEVER (describeStillClaimableStrandedRow) rather than silently losing the

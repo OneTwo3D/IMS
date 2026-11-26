@@ -64,10 +64,6 @@ test('[o3d-peh1 r4] every declared refusal reason is constructed somewhere', asy
 
   const constructors = [
     await source('lib/connectors/xero/sync-processor.ts'),
-    // o3d-remove-parked-connectors: the archived QuickBooks processor was a third source here, so a
-    // reason only IT constructed still counted as constructible. With it gone, a declared reason
-    // that only the archived connector ever built would now fail this test — which is the correct
-    // outcome and is why the declaration list was re-read when the connector went.
     await source('lib/domain/accounting/followup-revival.ts'),
   ].join('\n')
 
@@ -96,10 +92,10 @@ test('[o3d-peh1 r4] the lost-slot path throws rather than returning a refusal, w
  * argument that is only true on ONE connector, in a file that reads as connector-general.
  *
  * REVERT EVIDENCE: restoring the round-3 wording ("`attemptRevision` only ever moves UP … a claim
- * mints 1") without the QuickBooks paragraph fails "the revision-0 revival argument is marked
+ * mints 1") without the Xero-only scoping fails "the revision-0 revival argument is marked
  * Xero-only".
  */
-test('[o3d-peh1 r4] the revision-0 revival argument is marked Xero-only, and the QuickBooks gap is filed', async () => {
+test('[o3d-peh1 r4] the revision-0 revival argument is marked Xero-only', async () => {
   const xero = await source('lib/connectors/xero/sync-processor.ts')
   const paragraph = xero.slice(
     xero.indexOf('AND REVISION 0 IS FENCED BY THE REVISION ITSELF'),
@@ -107,15 +103,6 @@ test('[o3d-peh1 r4] the revision-0 revival argument is marked Xero-only, and the
   )
   assert.ok(paragraph.length > 0, 'the paragraph must be found, or this test asserts nothing')
   assert.match(paragraph, /XERO-ONLY|Xero-only|A XERO CLAIM MINTS 1/, 'the argument is scoped to this connector')
-  assert.match(paragraph, /o3d-rw0w/, 'and the QuickBooks gap is filed rather than left implicit')
-
-  // o3d-remove-parked-connectors — THE SECOND HALF OF THIS CASE IS GONE.
-  //
-  // It asserted the GAP against the QuickBooks code rather than against the comment: that connector's
-  // revival CAS carried no revision clause at all, which is the ABA the paragraph calls impossible.
-  // The file is archived, so the gap is closed by removal and there is nothing left to assert it
-  // against. What survives above is that the paragraph still scopes its argument to ONE connector and
-  // still files the gap (o3d-rw0w) — which is now a note about a connector this build does not ship.
 })
 
 /**

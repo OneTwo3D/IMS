@@ -142,7 +142,8 @@ const missing = (n: number, tail: string) => ({ key: `xero-rate|payment|${uuid(n
 
 // [mutation: the coupling between the R16 reasons and the buckets removed]
 test('a real R16 finding is written and read back, and the reasons are coupled to the buckets they describe', async () => {
-  const { ctx } = context({ invoices: [eurInvoice(1, 0.8), eurInvoice(2, 0.81), eurInvoice(3, 0.8, '2026-09-09')] })
+  // Xero's CurrencyRate is foreign per base, IMS's convention: the equal euro rate is 1.25 (it was the reciprocal 0.8, changed deliberately).
+  const { ctx } = context({ invoices: [eurInvoice(1, 1.25), eurInvoice(2, 0.81), eurInvoice(3, 1.25, '2026-09-09')] })
   const item = await runXeroRateItem('R16', ctx)
   assert.equal(item.outcome, 'fail')
   const built = buildReport(reportInput(put(defaultItems('P1'), item)), 1, null)

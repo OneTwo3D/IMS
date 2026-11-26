@@ -340,7 +340,7 @@ async function declaredRewrite(orderId: string, nextQty: number): Promise<void> 
   for (const row of rows) row.qty = nextQty
 }
 
-async function prove(orderId: string, activeConnector: 'xero' | 'quickbooks' = 'xero') {
+async function prove(orderId: string, activeConnector: 'xero' | 'retired-ledger' = 'xero') {
   const { proveAllocationDebitPosting } = await import('@/lib/domain/accounting/allocation-debit-posting-proof')
   const order = state.orders.find((row) => row.id === orderId)!
   return proveAllocationDebitPosting(tx as never, order, {
@@ -402,14 +402,14 @@ test('o3d-i0o6 r3: a FAILED first pass is not proved by the SYNCED batch the inc
 test('o3d-i0o6 r3: a first pass raised on ANOTHER LEDGER is not proved by the increment either', async () => {
   await twoPassIncrement()
   state.syncLogs.find((log) => log.id === 'a2-log-1')!.status = 'SYNCED'
-  state.syncLogs.find((log) => log.id === 'a2-log-1')!.connector = 'quickbooks'
+  state.syncLogs.find((log) => log.id === 'a2-log-1')!.connector = 'retired-ledger'
   state.syncLogs.find((log) => log.id === 'a2-log-2')!.status = 'SYNCED'
 
   const proof = await prove('order-1')
 
   assert.notEqual(proof.kind, 'posted', 'the £50 stands in another set of books, and a credit here would not touch it')
   assert.equal(proof.kind, 'refused')
-  assert.match(proof.reason, /was raised on quickbooks/)
+  assert.match(proof.reason, /was raised on retired-ledger/)
 })
 
 test('o3d-i0o6 r3: THE CONTROL — both passes SYNCED proves the whole £55, naming BOTH journals', async () => {
@@ -614,12 +614,12 @@ test('o3d-i0o6 r6: a proved A2 debit is only ever proved on the connector it was
   assert.equal(onXero.kind === 'posted' && onXero.provedOnConnector, 'xero', 'and names that ledger — never another')
 
   // The books are switched. The SAME evidence is now evidence about somebody else's ledger, and the
-  // one thing it must not do is come back `posted` naming Xero: that verdict would pin a QuickBooks
+  // one thing it must not do is come back `posted` naming Xero: that verdict would pin another connector's
   // refund's journal — unearned-revenue lines and all — to books it is no longer posting to.
-  const onQuickBooks = await prove('order-1', 'quickbooks')
-  assert.notEqual(onQuickBooks.kind, 'posted', 'asked about a ledger it was NOT posted in, it proves nothing')
-  assert.equal(onQuickBooks.kind, 'refused')
-  assert.match(onQuickBooks.reason, /xero/, 'and says which ledger actually holds the pounds')
+  const onOtherLedger = await prove('order-1', 'retired-ledger')
+  assert.notEqual(onOtherLedger.kind, 'posted', 'asked about a ledger it was NOT posted in, it proves nothing')
+  assert.equal(onOtherLedger.kind, 'refused')
+  assert.match(onOtherLedger.reason, /xero/, 'and says which ledger actually holds the pounds')
 })
 
 // o3d-2xdo — the A2 writer's own eligibility predicates, status and refundStatus, are each load-bearing.

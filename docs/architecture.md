@@ -99,7 +99,7 @@ Client --> nginx --> Next.js Route Handler (/api/...)
 - `*Base` fields: value in the organisation base currency at the time of transaction
 - `fxRateToBase`: the exchange rate used. Convention: 1 base = X document-currency (matches frankfurter/ECB output direction).
 - Every rate is read through one helper, `lib/currencies/fx-lookup.ts` (`getFxRateToBase`): latest `fx_rates` row on or before an explicit `asOf`, a business date meaning the end of that day UTC, ties with different rates and missing/non-positive rates refuse. See `docs/xero-sync.md` § Multi-Currency FX Rates.
-- The same rate is pushed downstream to Xero on every invoice/bill/credit note (as `CurrencyRate`, inverted) so the accounting platform never substitutes its own daily rate. See `docs/xero-sync.md` § Multi-Currency FX Rates.
+- The same rate is pushed downstream to Xero on every invoice/bill/credit note (as `CurrencyRate`, the same number to 6 dp: Xero's convention is IMS's) so the accounting platform never substitutes its own daily rate. See `docs/xero-sync.md` § Multi-Currency FX Rates.
 
 **Landed costs** — A freight PO (`type = FREIGHT`) is linked to a goods PO via `LandedCostLink`. When the goods PO is received, landed costs are distributed across cost layers. Distribution methods: by value, by weight, by quantity, or equal split.
 
@@ -293,7 +293,7 @@ Transform rules:
 
 ### Multi-currency model
 
-Every monetary row that can hold a foreign-currency amount also stores `fxRateToBase` at the time of the row's creation. The convention is **1 unit of base currency = `fxRateToBase` units of foreign currency**. Xero's `CurrencyRate` uses the inverse convention, so the connector inverts on the boundary — never mid-domain.
+Every monetary row that can hold a foreign-currency amount also stores `fxRateToBase` at the time of the row's creation. The convention is **1 unit of base currency = `fxRateToBase` units of foreign currency**. Xero's `CurrencyRate` uses the SAME convention (units of foreign per one unit of base), so the connector sends the rate as is, rounded to 6 dp, and never inverts it (`lib/connectors/xero/fx.ts`; verified against the live organisation's own documents, pinned by `tests/connectors/xero-currency-rate-direction.test.ts`).
 
 `fxRateToBase` is stamped on:
 - `PurchaseOrder` and `PurchaseOrderLine` (locked at PO issue)

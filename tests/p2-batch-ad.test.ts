@@ -84,7 +84,7 @@ test('o3d-89mc: a SALES document whose total cannot be read is WITHHELD, not adm
   }
   const fence = databaseLedgerFence(new Date('2026-08-20T12:00:00.000Z'))
   const binding = { accountingInvoiceId: 'inv_1', unregisteredPaidAt: new Date('2026-08-20T10:00:00.000Z') }
-  // QuickBooks shape: the listing is hard-null. Before the fix this was LEDGER_DID_NOT_LIST_PAYMENTS, which is ADMITTED.
+  // A ledger that cannot list payments: the listing is hard-null. Before the fix this was LEDGER_DID_NOT_LIST_PAYMENTS, which is ADMITTED.
   const before = classifyRegisteredPaymentAgainstListing(null, [row], fence, [], true, binding, null)
   assert.equal(zeroPaidIsProvenReversal(before), true, 'precondition: "not asking" keeps the round-6 answer')
   const verdict = classifyRegisteredPaymentAgainstListing(null, [row], fence, [], true, binding, null, true)

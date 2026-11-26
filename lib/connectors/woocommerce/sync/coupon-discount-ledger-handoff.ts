@@ -169,7 +169,7 @@ import {
  * THE REVENUE-DEFERRAL JOURNAL IS A SEPARATE DOCUMENT WITH A SEPARATE — AND EMPTY — REMEDY.
  * Group A1 posts a manual journal deferring `subtotalBase + shippingBase − discountBase`, stamps the
  * result on `SalesOrder.unearnedRevenueAmount`, and the daily batch later RECOGNISES that same
- * stamped figure back out (`deferredBase = order.unearnedRevenueAmount`, xero/quickbooks
+ * stamped figure back out (`deferredBase = order.unearnedRevenueAmount`, xero
  * daily-sync). Deferral and recognition are one timing pair keyed on one number. Adjusting the
  * journal by hand while IMS goes on reversing what it originally deferred would strand the
  * difference in the unearned-revenue account permanently — so the honest instruction is to leave it
@@ -184,8 +184,6 @@ import {
  *     and is the only instrument that moves a receivable UP.
  *   • Invoice ▸ Options ▸ Add Credit Note raises an ACCRECCREDIT pre-filled against that invoice and
  *     allocates it, which is the instrument that moves one DOWN.
- *   • QuickBooks Online allows a posted invoice to be edited directly (unlink the payment on the
- *     Receive Payment screen first), and a credit memo applied to the invoice for the reverse.
  * Nothing here asks for an operation the UI does not have, and nothing here asks for one whose
  * direction contradicts the discrepancy it is meant to settle.
  */
@@ -586,8 +584,8 @@ export function describeWcCouponDocumentPosition(position: WcCouponDocumentPosit
  *   THE LEDGER (r9 finding 1). Both figures have to be balances in the SAME set of books. The
  *   active accounting connector can be SWITCHED (see `connector-orphans.ts`, which exists for that
  *   event), and IMS keeps every historical document under the connector that posted it — so an order
- *   invoiced in Xero and credited in QuickBooks has an ACCREC invoice standing at full value that
- *   the credit memo reduces by nothing. `wcCouponLedgerMembership` requires the invoice's
+ *   invoiced under one connector and credited under another has an ACCREC invoice standing at full value that
+ *   the credit note reduces by nothing. `wcCouponLedgerMembership` requires the invoice's
  *   `externalSystem` and the credit notes' to be the SAME non-null value, and withdraws the net
  *   otherwise.
  *
@@ -947,9 +945,9 @@ export function wcCouponNettingBasis(document: Extract<PostedInvoiceOrderDiscoun
  * `wcCouponNettingBasis` above asks whether the invoice figure is the right KIND of number. This
  * asks the question that needs BOTH documents, and it is the one the netting was missing entirely:
  * `postedDiscount - reversal.amount` was subtracting a figure off a Xero invoice from a figure off a
- * QuickBooks credit memo whenever the accounting connector had been switched between the two
- * postings — an event this codebase already has a module for (`connector-orphans.ts`: "when the
- * active accounting connector is switched (e.g. Xero → QuickBooks) ... rows for the OUTGOING
+ * credit note posted under a different accounting connector, whenever the active connector had been
+ * switched between the two postings — an event this codebase already has a module for (`connector-orphans.ts`: "when the
+ * active accounting connector is switched (e.g. Xero → another connector) ... rows for the OUTGOING
  * connector become invisible to both processors"). The Xero invoice in that position is outstanding
  * at its full posted value, and a net of 0 declares the customer square against it.
  *
@@ -957,9 +955,9 @@ export function wcCouponNettingBasis(document: Extract<PostedInvoiceOrderDiscoun
  * invoice case is a true statement about the invoice whatever the answer here, and only the
  * SUBTRACTION depends on it.
  *
- * WHAT IT CANNOT ESTABLISH — the organisation/realm inside one connector. Nothing IMS stores records
+ * WHAT IT CANNOT ESTABLISH — the organisation inside one connector. Nothing IMS stores records
  * it per document: `AccountingToken` is one row per connector, overwritten on reconnect, and the
- * per-realm provenance column on `AccountingSyncLog` was tried and reverted (o3d-gt8r/o3d-s36z).
+ * per-organisation provenance column on `AccountingSyncLog` was tried and reverted (o3d-gt8r/o3d-s36z).
  * That residual travels in the netted precondition rather than being assumed away.
  */
 export function wcCouponLedgerMembership(
@@ -1122,10 +1120,9 @@ export function classifyWcCouponInvoiceHandoff(input: {
   return { case: 'NO_INVOICE_IN_LEDGER' }
 }
 
-/** Xero's UI, or QuickBooks', or neither when the derivation never named a system. */
+/** Xero's UI, or neither when the derivation never named a system (or named one this build does not know). */
 function systemName(externalSystem: string | null): string {
   if (externalSystem === 'xero') return 'Xero'
-  if (externalSystem === 'quickbooks') return 'QuickBooks Online'
   return 'the accounting system'
 }
 
@@ -1169,7 +1166,7 @@ export type WcCouponRemedy = {
   /**
    * ONLY the further-instrument option, never "edit the existing document" (r7 finding 3). Set on a
    * netted refunded position: that invoice has a credit note allocated to it, so Xero will not let
-   * it be edited and QuickBooks' edit would silently unbalance the allocation.
+   * it be edited and an edit there could silently unbalance the allocation.
    */
   documentIsAllocated: boolean
   /**
@@ -1178,7 +1175,7 @@ export type WcCouponRemedy = {
    * A netted remedy is not a statement about one document; it is the DIFFERENCE between an invoice
    * and these credit notes. IMS can see a credit note it never posted, one it re-posted and one it
    * retired — all of those refuse upstream — but it CANNOT see one voided or edited by hand in Xero
-   * or QuickBooks: nothing writes that back, and the payment poller reads ACCREC invoice statuses,
+   * or any other ledger: nothing writes that back, and the payment poller reads ACCREC invoice statuses,
    * never ACCRECCREDIT. So the documents the figure rests on are named in the instruction itself,
    * and the operator is told to confirm they still stand. Empty for every non-netted remedy, whose
    * figure depends on no credit note at all.
@@ -1220,10 +1217,10 @@ function editTarget(kept: number, currency: string, lineName: string): string {
 }
 
 function editInvoiceStep(externalSystem: string | null, documentRef: string, kept: number, currency: string): string {
-  if (externalSystem === 'quickbooks') {
+  if (externalSystem !== 'xero') {
     return (
-      `• Edit ${documentRef} — ${editTarget(kept, currency, 'discount')} — and save. Unlink any payment ` +
-      'on the Receive Payment screen first.'
+      `• If ${documentRef} can still be edited — nothing allocated to it, and its date outside any locked ` +
+      `period — edit it, ${editTarget(kept, currency, '"Order discount"')} and save.`
     )
   }
   return (
@@ -1233,23 +1230,19 @@ function editInvoiceStep(externalSystem: string | null, documentRef: string, kep
   )
 }
 
-function extraInvoiceStep(externalSystem: string | null, amount: number, currency: string, first: boolean): string {
-  const coding =
-    externalSystem === 'quickbooks'
-      ? 'the income account and tax code the original used'
-      : 'the revenue account and tax rate the original used'
+function extraInvoiceStep(amount: number, currency: string, first: boolean): string {
   return (
     `• ${first ? 'Raise' : 'Otherwise raise'} a further invoice to the same contact for ${amount} ` +
-    `${currency}, on ${coding}, dated in an open period.`
+    `${currency}, on the revenue account and tax rate the original used, dated in an open period.`
   )
 }
 
 function creditNoteStep(externalSystem: string | null, documentRef: string | null, amount: number, currency: string): string {
-  const against = documentRef ? ` and apply it to ${documentRef}` : ''
-  if (externalSystem === 'quickbooks') {
+  if (externalSystem !== 'xero') {
+    const against = documentRef ? ` and allocate it to ${documentRef}` : ''
     return (
-      `• Raise a credit memo for ${amount} ${currency} on the income account and tax code that ` +
-      `invoice used${against}.`
+      `• Raise a credit note for ${amount} ${currency} on the revenue account and tax rate that invoice ` +
+      `used${against}.`
     )
   }
   return documentRef
@@ -1333,7 +1326,7 @@ export function wcCouponPreconditionSteps(input: {
     // watch NEITHER of the two things that would invalidate it: a credit note voided or edited by
     // hand writes nothing back (the payment poller reads ACCREC invoice statuses, never ACCRECCREDIT),
     // and no row IMS keeps records WHICH ORGANISATION inside the connector a document was posted to
-    // (AccountingToken is one row per connector, overwritten on reconnect; the per-realm provenance
+    // (AccountingToken is one row per connector, overwritten on reconnect; the per-organisation provenance
     // column was tried and reverted, o3d-gt8r/o3d-s36z). Both are one glance for the operator, who is
     // being sent to open both documents anyway.
     steps.push(
@@ -1370,7 +1363,7 @@ export function wcCouponRemedySteps(remedy: WcCouponRemedy): string[] {
       if (!remedy.documentIsAllocated && remedy.documentRef) {
         steps.push(editInvoiceStep(remedy.externalSystem, remedy.documentRef, kept, currency))
       }
-      steps.push(extraInvoiceStep(remedy.externalSystem, amount ?? 0, currency, remedy.documentIsAllocated))
+      steps.push(extraInvoiceStep(amount ?? 0, currency, remedy.documentIsAllocated))
       return steps
 
     case 'DECREASE_RECEIVABLE':
@@ -1489,7 +1482,7 @@ export function wcCouponNetClaimSteps(position: WcCouponNetPosition): string[] {
     // r9 finding 2 — A ZERO NET CARRIES THE SAME PRECONDITION AS A NON-ZERO ONE, AND NEEDS IT MORE.
     //
     // r8 gave the netted REMEDY a precondition naming the credit notes it rests on, because IMS
-    // cannot see one voided or edited by hand in Xero or QuickBooks — the pollers read ACCREC
+    // cannot see one voided or edited by hand in the ledger — the pollers read ACCREC
     // invoice statuses, never ACCRECCREDIT. A hand-voided credit note does not merely change this
     // figure: it means the reversal never happened, the invoice stands at its full posted value and
     // the customer still owes it — while this order is the ONE outcome that tells the operator there

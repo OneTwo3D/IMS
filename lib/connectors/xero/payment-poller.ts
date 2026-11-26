@@ -86,7 +86,7 @@ import type { ActivityEntityType } from '@/app/generated/prisma/client'
 const XERO_CONNECTOR = 'xero'
 
 // o3d-psrx r3: `readDatabaseLedgerFence` moved to lib/domain/accounting/payment-reversal.ts beside the
-// classifier it fences, so the QuickBooks poller mints the SAME database-clock fence rather than a
+// classifier it fences, so every poller mints the SAME database-clock fence rather than a
 // `new Date()` that only looks like one. Its reasoning travelled with it.
 
 // A detected payment reversal / chargeback needs a human to reconcile (dispute the
@@ -284,9 +284,9 @@ function registrationText(verdict: RegisteredPaymentVerdict, reason: WithheldAmo
     // Xero establishes it BEFORE any registration is weighed: `partitionPaymentReversals` reads
     // `AmountPaid` and only the `zeroPaid` bucket is asked the registration question at all, while
     // `partPaid` and `unverifiable` get their own withheld reasons above (`WithheldAmountReason`).
-    // The QuickBooks poller had no such split, which is where the verdict came from. Stated rather
-    // than defaulted so that a change making this reachable here is a sentence somebody has to write,
-    // not a generic one somebody gets.
+    // A reader that selects candidates on `Balance > 0` has no such split, which is where the verdict
+    // comes from. Stated rather than defaulted so that a change making this reachable here is a
+    // sentence somebody has to write, not a generic one somebody gets.
     case 'LEDGER_NOT_PROVEN_ZERO_PAID':
       return ` The ledger has not been shown to hold nothing on this document, so the figure it reports `
         + `is not evidence that a payment was removed.`
@@ -294,9 +294,9 @@ function registrationText(verdict: RegisteredPaymentVerdict, reason: WithheldAmo
     // structural route as its parent verdict above. A part-paid Xero invoice never reaches the
     // registration question at all — `partitionPaymentReversals` puts it in `partPaid`, which gets the
     // `part-payment` `WithheldAmountReason` and this function's `reason` argument, not a verdict.
-    // Where QuickBooks has to DERIVE the split from `TotalAmt - Balance`, Xero is handed it, so the
-    // two connectors arrive at the same withholding by different doors. Stated rather than defaulted
-    // so that a change making this reachable here is a sentence somebody has to write.
+    // Xero is handed the split rather than having to derive it from a total less a balance. Stated
+    // rather than defaulted so that a change making this reachable here is a sentence somebody has
+    // to write.
     //
     // WHAT XERO DOES WITH A PART-PAID INVOICE (o3d-cdhl): a measured removal is recorded on the order and reported once
     // (`reconcilePartialRemovals`); what cannot be measured stays withheld with the `part-payment` reason.
@@ -485,9 +485,9 @@ async function readResidualVerdicts<T extends {
   // o3d-psrx r3 (Codex HIGH) — THE EVIDENCE READ IS NOT WRITTEN HERE ANY MORE.
   //
   // Registrations, local receipts and the recorded provenance are read by
-  // `readPaidProvenanceVerdicts`, which the QuickBooks poller now calls with the same arguments and
+  // `readPaidProvenanceVerdicts`, which any poller calls with the same arguments and
   // the same fence. It used to be sixty lines of this file, and being sixty lines of THIS file is how
-  // the sibling connector came to have no version of it at all. What stays here is the part that is
+  // a sibling connector could come to have no version of it at all. What stays here is the part that is
   // genuinely Xero's: which invoices the delta put in which bucket, and what to say about a withheld
   // one.
   const verdicts = await readPaidProvenanceVerdicts(docs, {
@@ -497,7 +497,7 @@ async function readResidualVerdicts<T extends {
     ledgerObservedBefore,
     // Xero DOES enumerate the payments on an invoice, so absence in that list is evidence. Passing
     // the payload's own listing (null when it withheld `Payments[]`) is the whole of the difference
-    // between this caller and QuickBooks'.
+    // between this caller and a ledger that does not enumerate them.
     ledgerListedPaymentIds: (doc) => {
       const invoice = doc.accountingInvoiceId ? candidateInvoices.get(doc.accountingInvoiceId) : undefined
       return invoice ? listedLedgerPaymentIds(invoice) : null
@@ -633,8 +633,8 @@ async function signalWithheldBillReversals(
         level: 'WARNING',
         description,
         metadata: {
-          // o3d-psrx r4: WHOSE marker this is. Both pollers write `bill_payment_reversal_withheld`,
-          // and a recheck that claimed the other connector's rows would ask Xero about QuickBooks ids.
+          // o3d-psrx r4: WHOSE marker this is. The marker kind is connector-neutral,
+          // and a recheck that claimed another connector's rows would ask Xero about foreign ids.
           connector: XERO_MARKER_SCOPE.connector,
           reason,
           registrationVerdict: verdict.verdict,
@@ -1754,8 +1754,8 @@ async function processDeltaChunk(
 // The lifecycle this poll drives — the markers, the round robin, the timer, the closures — MOVED to
 // lib/domain/accounting/withheld-reversal-markers.ts in o3d-psrx r4 (Codex HIGH / o3d-a6i2). It was
 // never Xero-shaped: the work item is an activity row and the only Xero-specific part is the read-by-id
-// below. QuickBooks had no equivalent, so a reversal it withheld while a registration was merely in
-// flight was checkpointed past and never asked again. Everything the round-4 through round-6 notes
+// below. A poller with no equivalent checkpoints past a reversal it withheld while a registration
+// was merely in flight and never asks again. Everything the round-4 through round-6 notes
 // argue for is in that module, unchanged; what is left here is Xero's read.
 // ---------------------------------------------------------------------------
 

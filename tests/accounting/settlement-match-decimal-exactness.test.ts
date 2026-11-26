@@ -592,7 +592,7 @@ test('[o3d-r948] a KWD invoice ONE FIL short of its stated settlement does not r
 
 test('[o3d-r948] the ordinary two-decimal document is unmoved, and an UNSTATED currency is stricter', async () => {
   // The band is HALF one minor unit, which is 0.005 exactly in every two-decimal currency — so the
-  // ordinary Xero and QuickBooks document reads exactly as it always has. It is not "strictly below
+  // ordinary Xero document reads exactly as it always has. It is not "strictly below
   // one minor unit" taken as loosely as possible: a shortfall of four thousandths of a pound is still
   // inside the band, and six thousandths is still outside it.
   //

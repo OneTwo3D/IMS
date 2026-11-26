@@ -27,13 +27,12 @@ import { ACCOUNTING_CONNECTORS, isRegisteredAccountingConnector } from '@/lib/co
  */
 
 test('the toggle each connector actually gates on is the one this module names', () => {
-  // o3d-remove-parked-connectors round 2 (Codex MEDIUM): `quickbooks_sync_enabled` WAS here, and its
-  // presence was the defect — a key for a connector whose gates no longer exist reads a surviving
+  // Round 2 (Codex MEDIUM): a key for a connector whose gates no longer exist would read a surviving
   // `settings` row as proof of a claim path. The map is now total over the REGISTERED roster and
   // holds nothing else.
   assert.deepEqual(ACCOUNTING_SYNC_ENABLED_SETTING_KEYS, { xero: 'xero_sync_enabled' })
   assert.equal(accountingSyncEnabledSettingKey('xero'), 'xero_sync_enabled')
-  assert.equal(accountingSyncEnabledSettingKey('quickbooks'), null, 'archived: this build has no gate to name')
+  assert.equal(accountingSyncEnabledSettingKey('retired-ledger'), null, 'retired: this build has no gate to name')
 })
 
 test('a connector this build does not service is QUIESCED — nothing can claim what nothing implements', () => {
@@ -112,7 +111,7 @@ test('only the toggles a page actually needs are collected, and duplicates colla
   assert.deepEqual(accountingSyncEnabledSettingKeysFor([]), [])
   assert.deepEqual(accountingSyncEnabledSettingKeysFor(['xero', 'xero']), ['xero_sync_enabled'])
   assert.deepEqual(
-    accountingSyncEnabledSettingKeysFor(['quickbooks', 'xero', 'shipstation']).sort(),
+    accountingSyncEnabledSettingKeysFor(['retired-ledger', 'xero', 'shipstation']).sort(),
     ['xero_sync_enabled'],
     'an archived or unknown connector needs no toggle read — there is no gate behind it',
   )
@@ -131,7 +130,6 @@ test('only the toggles a page actually needs are collected, and duplicates colla
 test('the manual Sync action gates on the toggle ALONE — the premise, read off the action', async () => {
   const read = async (rel: string) => await readFile(path.join(process.cwd(), rel), 'utf8')
 
-  // o3d-remove-parked-connectors: the archived QuickBooks file was the second entry here, so this rule was checked against TWO independently-written implementations. One now.
   for (const [file, fn, key] of [
     ['app/actions/xero-sync.ts', 'export async function triggerXeroSync', 'xero_sync_enabled'],
   ] as const) {
@@ -162,13 +160,13 @@ test('the manual Sync action gates on the toggle ALONE — the premise, read off
 
 test('[archived] a stranded revision-0 row on an ARCHIVED connector is settleable even with its stored toggle ON', () => {
   assert.equal(
-    isRegisteredAccountingConnector('quickbooks'),
+    isRegisteredAccountingConnector('retired-ledger'),
     false,
-    'precondition: this build archives QuickBooks — if it is registered again this test asserts nothing',
+    'precondition: this id is not registered — if it is registered this test asserts nothing',
   )
-  assert.equal(isAccountingConnectorQuiesced('quickbooks', 'true'), true)
+  assert.equal(isAccountingConnectorQuiesced('retired-ledger', 'true'), true)
   assert.equal(
-    isStrandedRowUnclaimable({ connector: 'quickbooks', activeConnector: 'xero', syncEnabledValue: 'true' }),
+    isStrandedRowUnclaimable({ connector: 'retired-ledger', activeConnector: 'xero', syncEnabledValue: 'true' }),
     true,
     'no processor, no cron branch and no Sync action exist for it, so the row can never be claimed again',
   )
@@ -193,7 +191,7 @@ test('[archived] and a LIVE connector with its sync enabled is STILL refused —
 })
 
 test('[archived] the refusal never names a control this build does not render', () => {
-  for (const connector of ['quickbooks', 'shopify', 'shiphero', 'shipstation']) {
+  for (const connector of ['retired-ledger', 'shopify', 'shiphero', 'shipstation']) {
     assert.equal(isRegisteredAccountingConnector(connector), false, `${connector} must be unregistered here`)
     assert.doesNotMatch(
       describeStillClaimableStrandedRow(connector),

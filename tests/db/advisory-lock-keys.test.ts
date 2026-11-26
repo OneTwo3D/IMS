@@ -4,8 +4,6 @@ import { join } from 'node:path'
 import test from 'node:test'
 import {
   ACCOUNTING_WRITE_LOCK_KEY,
-  PAYMENT_WRITE_LOCK_KEY,
-  QBO_DAILY_BATCH_LOCK_KEY,
   REFUND_ACCOUNTING_LOCK_KEY,
   SINGLE_KEY_ADVISORY_LOCKS,
   TWO_INT_ADVISORY_LOCK_NAMESPACES,
@@ -13,9 +11,9 @@ import {
 } from '../../lib/db/advisory-locks.ts'
 
 /**
- * o3d-4ajo: two pairs of features held the SAME advisory key, in unrelated
+ * o3d-4ajo: features held the SAME advisory key, in unrelated
  * commits, with nothing saying so — refund creation against the Xero daily
- * batch, and the Xero payment-write lock against the QuickBooks daily batch.
+ * batch.
  * Nothing failed; a job just waited, or a `try` lock reported "someone else
  * holds it" and skipped its run.
  *
@@ -121,14 +119,12 @@ test('[o3d-2k5r r26] the probe namespace the registry lists is the one the probe
 })
 
 test('[o3d-4ajo] the deliberately-shared domains still share, and say so', () => {
-  // These pairs serialize on purpose (each writes overlapping accounting state).
+  // This pair serializes on purpose (it writes overlapping accounting state).
   // Pinning it here means a later "cleanup" that splits them has to argue with a
   // test rather than silently remove the protection.
   assert.equal(REFUND_ACCOUNTING_LOCK_KEY, ACCOUNTING_WRITE_LOCK_KEY)
   assert.equal(XERO_DAILY_BATCH_LOCK_KEY, ACCOUNTING_WRITE_LOCK_KEY,
     'the Xero daily batch selects orders a refund can invalidate before it stamps them')
-  assert.equal(QBO_DAILY_BATCH_LOCK_KEY, PAYMENT_WRITE_LOCK_KEY,
-    'the QBO batch reads paidAt while the Xero payment jobs write it')
 })
 
 test('[o3d-4ajo] every two-int namespace is distinct', () => {
@@ -167,10 +163,9 @@ test('[o3d-4ajo] a lost pinned lock refuses further protected work', async () =>
   assert.throws(() => lock.assertHeld('phase two'), /phase two/)
 })
 
-test('[o3d-4ajo] both daily batches check the lock before every write phase', () => {
+test('[o3d-4ajo] the daily batch checks the lock before every write phase', () => {
   // The primitive is only useful if it is CALLED. A phase added later without a
   // check would silently reintroduce the window.
-  // o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
   for (const path of ['lib/connectors/xero/daily-sync.ts']) {
     const src = readFileSync(path, 'utf8')
     const marker = /^ {2}\/\/ --- Group [AB]\d?/gm

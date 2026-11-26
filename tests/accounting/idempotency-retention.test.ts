@@ -52,9 +52,9 @@ test('o3d-wahn: the caution is offered for Xero and WITHHELD where no window was
   assert.match(xero!, /SECOND document/, 'naming the actual consequence in the ledger')
   assert.match(xero!, /Check Xero/, 'and the check the operator has to make instead')
 
-  // QuickBooks' RequestId window is unverified. A caution quoting an invented number would be worse
-  // than none, because it would be believed.
-  assert.equal(accountingRetryDuplicateCaution('quickbooks'), null)
+  // A connector whose idempotency window is unverified gets none. A caution quoting an invented number
+  // would be worse than none, because it would be believed.
+  assert.equal(accountingRetryDuplicateCaution('retired-ledger'), null)
   assert.equal(accountingRetryDuplicateCaution(null), null)
   assert.equal(accountingRetryDuplicateCaution(undefined), null)
 })

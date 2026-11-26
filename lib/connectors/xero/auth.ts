@@ -129,6 +129,11 @@ const XERO_EXPECTED_TENANT_KEY = XERO_TENANT_PIN_SETTING_KEY
  */
 const XERO_PIN_RELEASE_WITNESS_KEY = XERO_PIN_RELEASE_WITNESS_SETTING_KEY
 const REFRESH_EARLY_MS = 2 * 60 * 1000
+/**
+ * #1132 R2-MED-1: a grant getAccessToken() returns stays valid for at least this long, so a caller that resolves it before a bounded window
+ * (the refund delete's locked transaction) can use it for the whole window without a refresh inside it. Pinned against that window by a test.
+ */
+export const XERO_TOKEN_MIN_VALIDITY_MS = REFRESH_EARLY_MS
 
 let refreshInFlight: Promise<XeroAccessGrant | null> | null = null
 
@@ -817,6 +822,12 @@ async function logStaleRefreshDiscarded(token: StoredAccountingToken): Promise<v
  */
 export type XeroAccessGrant = { accessToken: string; tenantId: string; connectionGeneration: string | null }
 
+/** #1132 LOW-7: the organisation the stored Xero connection is for, read from the token row alone (no decryption, no refresh), or null. */
+export async function getStoredXeroTenantId(): Promise<string | null> {
+  const row = await db.accountingToken.findUnique({ where: { connector: XERO_CONNECTOR }, select: { tenantId: true } })
+  return row?.tenantId ?? null
+}
+
 export async function getAccessToken(): Promise<XeroAccessGrant | null> {
   const token = await readStoredToken()
   if (!token) return null
@@ -1127,13 +1138,12 @@ export async function refreshToken(): Promise<XeroAccessGrant | null> {
  *
  * The accounting*Id columns are connector-agnostic: they hold ids belonging to whichever accounting
  * connector is connected. Left behind, a Xero ContactID/ItemID is read straight back by the
- * QuickBooks code path (or by a reconnect to a DIFFERENT Xero org) as if it were its own — the
- * lookups short-circuit on a stored id precisely so they never re-verify it. QuickBooks' disconnect
- * has always cleared contacts this way; Xero's did not, which was a live bug before the item column
- * gave it a second column to leak (o3d-3nc).
+ * different connector's code path (or by a reconnect to a DIFFERENT Xero org) as if it were its own —
+ * the lookups short-circuit on a stored id precisely so they never re-verify it. That was a live bug
+ * before the item column gave it a second column to leak (o3d-3nc).
  */
 /**
- * THE REALM/TENANT-SWITCH LIFECYCLE (o3d-9kek r3 finding 1), which this function defines.
+ * THE TENANT-SWITCH LIFECYCLE (o3d-9kek r3 finding 1), which this function defines.
  *
  * Disconnect deliberately does NOT clear the external ids on documents — purchase_invoices
  * .accounting_invoice_id, sales_orders.accounting_invoice_id and the rest. They are financial
@@ -1147,7 +1157,7 @@ export async function refreshToken(): Promise<XeroAccessGrant | null> {
  *
  *   1. DISCONNECT — token and pin go, ids stay. Nothing can be attributed: with no active
  *      provenance the repair sweep does nothing at all and the back-reference writers refuse.
- *   2. RECONNECT TO THE SAME tenant/realm — the provenance matches again and everything resumes
+ *   2. RECONNECT TO THE SAME tenant — the provenance matches again and everything resumes
  *      exactly where it was. Nothing was destroyed to make the switch possible.
  *   3. RECONNECT TO A DIFFERENT ONE — the new connection has a new provenance. Every old id is in
  *      a foreign namespace: it is not a uniqueness conflict, it is not "already linked" (a document
@@ -1158,11 +1168,10 @@ export async function refreshToken(): Promise<XeroAccessGrant | null> {
  * re-authorising to a different organisation while still connected is refused, and only an explicit
  * disconnect clears the pin.
  *
- * WHY XERO DOES NOT NEED QUICKBOOKS' REALM-SWITCH GUARD (o3d-9kek r4 finding 1, verified rather than
- * assumed). QuickBooks refuses a connect to a different realm outright, because a QuickBooks bill id
- * is a per-company INTEGER: realm B routinely issues id "42", so a retired realm-A bill holding "42"
- * is confused with it by every consumer that reads a naked accountingInvoiceId — and payment-poller
- * .ts, which selects on `accountingInvoiceId != null` alone, demonstrably does exactly that.
+ * WHY A TENANT SWITCH NEEDS NO FURTHER GUARD (o3d-9kek r4 finding 1, verified rather than assumed).
+ * A per-tenant INTEGER id would be unsafe here: tenant B routinely issues id "42", so a retired
+ * tenant-A bill holding "42" would be confused with it by every consumer that reads a naked
+ * accountingInvoiceId.
  *
  * Xero ids are GUIDs, and that is what removes the exposure, not the namespace column. The poller
  * here builds its match set FROM XERO (`invoiceById` keyed on InvoiceID, then
@@ -1186,17 +1195,15 @@ export async function refreshToken(): Promise<XeroAccessGrant | null> {
  * AND THE ORDER INSIDE IT IS NOT DECIDED HERE AT ALL (o3d-2w2j). It comes from
  * `orderedAccountingBindingWrites`, which is the one place the canonical order — pin, token row,
  * witness — is written down, and which every writer of more than one binding row now calls:
- * `bindXeroTenant` above, this function, `xeroPinEstablishmentStatements` for the raw-SQL writers, and
- * the QuickBooks disconnect. This function used to take the token row FIRST, which is a lock-ordering
+ * `bindXeroTenant` above, this function, `xeroPinEstablishmentStatements` for the raw-SQL writers. This function used to take the token row FIRST, which is a lock-ordering
  * inversion: a disconnect and a concurrent consent each held the row the other needed next, and
  * Postgres resolves that by killing one of them as a deadlock. Nothing about the pin/receipt/witness
  * logic depended on the old order — atomicity is what this transaction is for — but the auth path is
  * what an operator reaches for when they are already mid-incident, so it is the last place to leave a
  * liveness hazard.
  *
- * The FIRST fix reordered the statements and left a comment asking the next writer to remember. Two
- * writers had already failed to remember (this one, and QuickBooks', which took its token row before
- * its realm pin), which is why the order now lives in a function that returns the statements in it
+ * The FIRST fix reordered the statements and left a comment asking the next writer to remember. Writers had
+ * already failed to remember, which is why the order now lives in a function that returns the statements in it
  * rather than in prose beside them. `resetDatabase` is the one writer that stays hand-ordered, and
  * deliberately: it deletes whole TABLES rather than the named rows of one binding, so there is nothing
  * for this helper to key on — it has its own argument under o3d-9tbz r7 and its own test.

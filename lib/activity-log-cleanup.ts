@@ -1,7 +1,7 @@
 import { db } from '@/lib/db'
 import { expectedDisposableDatabaseMarker } from '@/lib/disposable-database-marker'
 import { DIRECT_CREATE_PENDING_ACTION } from '@/lib/fulfillment/pre-fulfilment-reallocation'
-import { UNRECORDED_POSTED_DOCUMENT_ACTIONS } from '@/lib/domain/accounting/unrecorded-posted-document'
+import { KEPT_UNRECORDED_POSTED_DOCUMENT_ACTIONS } from '@/lib/domain/accounting/unrecorded-posted-document'
 import { WC_REFUND_PARK_RECOVERED_ACTION } from '@/lib/domain/sales/refund-park-recovery'
 import { ERASURE_RETAINED_ACTIONS } from '@/lib/domain/erasure/erasure-record'
 import {
@@ -41,12 +41,9 @@ const DEFAULTS: Record<string, number> = {
  * for one reference was the accident. Ageing it out does not expire a log line, it converts a recorded
  * duplicate into an invisible one — the exact outcome the branch that writes it exists to prevent.
  *
- * The QuickBooks twin `quickbooks_posted_document_unrecorded` (o3d-peh1 r5) is the same kind for the
- * same reason, differing only in HOW the row came to name no document: there the id was returned and
- * could not be written down at all, rather than displaced by a competing worker. Both are named by
- * one value, `UNRECORDED_POSTED_DOCUMENT_ACTIONS`, and this list SPREADS it rather than listing its
- * members: an exemption written as a single constant name looks complete, compiles, passes its own
- * test, and is wrong only for the member of the pair the author was not thinking about.
+ * These are named by one value, `KEPT_UNRECORDED_POSTED_DOCUMENT_ACTIONS`, and this list SPREADS it
+ * rather than listing its members: an exemption written as a single constant name looks complete,
+ * compiles, passes its own test, and is wrong only for the member the author was not thinking about.
  *
  * (3) EVIDENCE A LATER WRITE TO THE ACCUSED ROW CANNOT REACH. `wc_refund_park_recovered` (o3d-xnwu
  * r14; Codex r14 HIGH) says: an operator moved or dismissed a parked WooCommerce refund on this
@@ -76,26 +73,23 @@ const DEFAULTS: Record<string, number> = {
  * action differs from AT LEAST ONE element, so `'a' <> 'b'` alone satisfies it and a row whose
  * action IS exempt gets deleted anyway. With one entry the two forms agree, which is exactly
  * what makes it a landmine: it would work until the day someone added a second action. THAT DAY
- * CAME — the array below now resolves to FOUR action names, and `<> ALL` is what makes all of them
- * hold. Count the STRINGS, not the entries: one of the three entries is a spread of a two-element
- * pair, so a reader who counts entries gets three and a reader who counts exemptions gets four.
+ * CAME — the array below now resolves to several action names, and `<> ALL` is what makes all of
+ * them hold. Count the STRINGS, not the entries: some entries are spreads of a list, so a reader who
+ * counts entries and a reader who counts exemptions get different numbers.
  */
 // THE THREE KINDS ARE INDEPENDENT, AND THE LIST IS THE UNION OF THEM (merge of o3d-peh1 into
-// o3d-xnwu). `action` is a single column, and these four strings are pairwise distinct, so no row
+// o3d-xnwu). `action` is a single column, and these strings are pairwise distinct, so no row
 // can satisfy two of these exemptions and no one of them can therefore shadow another. `<> ALL` is
 // also monotone in this array — every name added retains strictly more rows and deletes none that
 // were being retained before — so the two branches' exemptions COMPOSE rather than compete. That is
 // the property to preserve when a fourth kind arrives: append, never rewrite.
 const RETAINED_ACTIONS = [
   DIRECT_CREATE_PENDING_ACTION,
-  // o3d-peh1 r5 — BOTH connectors' unrecorded-document records, spread from the one place the pair
-  // is named. The QuickBooks twin is the same kind-(2) exemption arrived at the other way: the post
-  // was accepted and returned an id, and the transaction that would have made that id durable
-  // failed, so the row names no document and no later sync attempt can re-derive the identifier.
-  // Spreading the pair rather than listing its members is the point: this sweep got both because
-  // both were in front of the author, and the factory reset — writing the same exemption from
-  // memory — named only Xero, and so deleted every QuickBooks incident record (Codex HIGH).
-  ...UNRECORDED_POSTED_DOCUMENT_ACTIONS,
+  // o3d-peh1 r5 — the unrecorded-document records, spread from the one place they are named. Spreading
+  // rather than listing members is the point: the factory reset, writing the same exemption from
+  // memory, once named a single action and so deleted every incident record under another (Codex HIGH).
+  // The KEPT list includes the retired connector's action, so its stored records are never aged out.
+  ...KEPT_UNRECORDED_POSTED_DOCUMENT_ACTIONS,
   // o3d-xnwu r14 — the kind-(3) entry. Independent of the two above: it is written by
   // `recoverParkedWcRefund` about a `shopping_sync_logs` row, never by an accounting post, so it
   // cannot collide with either unrecorded-document name.

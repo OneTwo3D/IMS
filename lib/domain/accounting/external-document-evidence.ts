@@ -9,12 +9,12 @@ import { ASSERTED_POSTED_WHERE, CLAIMS_TO_HAVE_POSTED_WHERE } from '@/lib/domain
 // to the order, to its shipments, and to the daily batches the order was staged into. Retention
 // deletes those rows by age, so that answer has a shelf life — and the guard does not FAIL when its
 // evidence is gone, it returns the confident negative. No rows, no blocker, and the order is
-// HARD-DELETED, leaving a real invoice, COGS journal or batch entry in Xero/QuickBooks with no IMS
+// HARD-DELETED, leaving a real invoice, COGS journal or batch entry in Xero with no IMS
 // order behind it. The delete is irreversible and there is no sweep that ever notices. That is the
 // whole of o3d-v7sy.
 //
 // THE OTHER READER OF THE SAME TABLE IS ALREADY SAFE, AND SAYING SO IS PART OF THE RULE.
-// `dailyBatchRecreateVerdict` (lib/connectors/xero/daily-sync.ts, and the QuickBooks twin) reads its
+// `dailyBatchRecreateVerdict` (lib/connectors/xero/daily-sync.ts) reads its
 // `rows.length === 0` arm as "the journal never posted" and re-raises it — which a deleted SYNCED
 // batch row would turn into a DUPLICATE JOURNAL. It does not, because scjz.36 already bounded the
 // recreate sweep to the same retention window: `recreateRetentionWindow`

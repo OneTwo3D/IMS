@@ -36,18 +36,15 @@ import { toDecimal } from '@/lib/domain/math/decimal'
 import { resetAllocationAccountingIfStaged } from '@/lib/domain/sales/allocation-service'
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 /**
- * A LEDGER THIS BUILD NO LONGER SERVICES (o3d-remove-parked-connectors).
+ * A LEDGER THIS BUILD NO LONGER SERVICES.
  *
  * Three cases below are about a refund raised while the books are on one ledger against a debit that
- * stands in ANOTHER — the cross-ledger refusals of o3d-o97 r3/r4 and the pin-never-crosses rule. They
- * named 'quickbooks', the second REGISTERED connector; it is archived, so the id is no longer in the
- * union. They are kept rather than deleted, driving the retired id, because that is not a hypothetical
- * state: `AccountingSyncLog.connector` is a plain String column and development databases hold
- * `quickbooks` rows right now, so "a debit standing in a ledger this build cannot post to" is exactly
- * what an operator will meet. Weaker subject than two live ledgers, and recorded as such in
- * docs/archive/quickbooks-connector-removal.md.
+ * stands in ANOTHER — the cross-ledger refusals of o3d-o97 r3/r4 and the pin-never-crosses rule. With
+ * one registered connector they drive a retired id, because that is not a hypothetical state:
+ * `AccountingSyncLog.connector` is a plain String column, so "a debit standing in a ledger this build
+ * cannot post to" is exactly what an operator can meet. Weaker subject than two live ledgers.
  */
-const OTHER_LEDGER = 'quickbooks' as unknown as AccountingConnectorId
+const OTHER_LEDGER = 'retired-ledger' as unknown as AccountingConnectorId
 
 
 type Order = {
@@ -5791,26 +5788,25 @@ test('retrySalesOrderRefundAccounting replays persisted syncs after full refund 
 /**
  * o3d-r5uk — A PIN NAMING A RETIRED LEDGER REFUSES THE RETRY; IT IS NOT DROPPED.
  *
- * `SalesOrderRefund.accountingRetrySyncs` is JSON and archiving QuickBooks deleted no rows, so a
- * staged reversal can still carry `connector: 'quickbooks'`. An ABSENT `connector` means "resolve
+ * `SalesOrderRefund.accountingRetrySyncs` is JSON and retiring a connector deletes no rows, so a
+ * staged reversal can still carry `connector: 'retired-ledger'`. An ABSENT `connector` means "resolve
  * the active connector" (RefundAccountingSyncRequest's own doc), so narrowing the parser's pin check
- * to the registry turned a stored QuickBooks pin into an UNPINNED request — and the retry would have
- * re-queued a reversal proved against QuickBooks into Xero's books. Before the narrowing the literal
- * check kept the pin, `pinnedLedgerIsServiced` found the active connector was not it, and the
- * enqueue answered `refused`: the posting left owed and visible.
+ * to the registry turned a stored retired-connector pin into an UNPINNED request — and the retry would
+ * have re-queued a reversal proved against that connector into Xero's books. The correct answer is
+ * `refused`: the posting left owed and visible.
  *
  * The refusal has to happen HERE rather than by dropping the entry, because an entry that parses to
  * nothing empties `persistedSyncs`, and an empty persisted stage takes a different branch whose
  * success clears `accountingRetryRequired` and nulls `accountingRetrySyncs` — erasing the only
  * durable mark that the accounting was unfinished.
  */
-function quickbooksPinnedRetryFixture() {
+function retiredLedgerPinnedRetryFixture() {
   const persistedSyncs = [{
     type: 'COGS_REVERSAL' as const,
     referenceType: 'SalesOrderRefund',
     referenceId: 'refund-1',
     idempotencyKey: 'sales-order-refund:refund-1:cogs-reversal',
-    connector: 'quickbooks',
+    connector: 'retired-ledger',
     payload: {
       date: '2026-01-03',
       reference: 'COGS reversal: SO-1',
@@ -5863,8 +5859,8 @@ function quickbooksPinnedRetryFixture() {
   return { state, persistedSyncs }
 }
 
-test('a retry stage pinned to the RETIRED QuickBooks ledger is refused by name, not re-queued into Xero', async () => {
-  const { state, persistedSyncs } = quickbooksPinnedRetryFixture()
+test('a retry stage pinned to the RETIRED ledger is refused by name, not re-queued into Xero', async () => {
+  const { state, persistedSyncs } = retiredLedgerPinnedRetryFixture()
 
   const result = await retrySalesOrderRefundAccounting(createClient(state), {
     refundId: 'refund-1',
@@ -5874,7 +5870,7 @@ test('a retry stage pinned to the RETIRED QuickBooks ledger is refused by name, 
 
   assert.equal(result.success, false, 'an unroutable pin must refuse — dropping it posts to Xero')
   const error = result.success ? '' : String(result.error)
-  assert.match(error, /quickbooks/, 'the refusal must NAME the ledger that caused it')
+  assert.match(error, /retired-ledger/, 'the refusal must NAME the ledger that caused it')
   assert.match(error, /no longer ships/)
   // The staged reversals are still on the row and the flag is still set: nothing was consumed.
   assert.deepEqual(state.refunds[0].accountingRetrySyncs, persistedSyncs)
@@ -5884,7 +5880,7 @@ test('a retry stage pinned to the RETIRED QuickBooks ledger is refused by name, 
 
 test('the same fixture pinned to a SERVICED ledger still replays — the refusal is about the pin, not the shape', async () => {
   // The control. Without it, "refused" above could be any of the retry's other refusals.
-  const { state, persistedSyncs } = quickbooksPinnedRetryFixture()
+  const { state, persistedSyncs } = retiredLedgerPinnedRetryFixture()
   const xeroPinned = persistedSyncs.map((sync) => ({ ...sync, connector: 'xero' }))
   state.refunds[0].accountingRetrySyncs = xeroPinned
 
@@ -5907,12 +5903,12 @@ test('unserviceableRefundAccountingRetryPins reads the RAW stage, distinct and s
   assert.deepEqual(unserviceableRefundAccountingRetryPins([{}]), [], 'unpinned is not unserviceable')
   assert.deepEqual(
     unserviceableRefundAccountingRetryPins([
-      { connector: 'quickbooks' },
+      { connector: 'retired-ledger' },
       { connector: 'xero' },
-      { connector: 'quickbooks' },
+      { connector: 'retired-ledger' },
       { connector: 'sage' },
     ]),
-    ['quickbooks', 'sage'],
+    ['retired-ledger', 'sage'],
   )
 })
 
@@ -7246,7 +7242,7 @@ test("a SYNCED Group B journal on the recorded ledger nets its £20 exactly once
 
 test("Group B's relief raised in ANOTHER LEDGER is not netted against this reversal (o3d-o97 r4)", async () => {
   // The third of r3's own three reasons, applied to relief. The £20 was credited to Allocated
-  // Inventory on xero; this reversal would be raised on quickbooks. Netting them treats a credit in
+  // Inventory on xero; this reversal would be raised on retired-ledger. Netting them treats a credit in
   // one set of books as if it had happened in another.
   const state = a2StagedWithJournaledShipment()
   withRecordedA2Journal(state, { status: 'SYNCED', connector: OTHER_LEDGER })
@@ -7409,11 +7405,11 @@ test("a Group B journal ROW raised on another ledger is refused even when the st
   // r4 checked the connector RECORDED BESIDE THE AMOUNT — written by the same statement as the
   // amount, so only as right as that writer was. The journal row carries the ledger it was actually
   // raised into, and that is the ledger's own record of the fact. Here they disagree: the shipment
-  // says xero, the row says the £20 was raised on quickbooks, and this reversal goes to xero.
+  // says xero, the row says the £20 was raised on retired-ledger, and this reversal goes to xero.
   const state = a2StagedWithJournaledShipment()
   withRecordedA2Journal(state, { status: 'SYNCED' })
   withRecordedGroupBRelief(state, { amount: 20, status: 'SYNCED' })
-  state.accountingSyncLogs!.find((log) => log.id === 'gb-log-1')!.connector = 'quickbooks'
+  state.accountingSyncLogs!.find((log) => log.id === 'gb-log-1')!.connector = 'retired-ledger'
 
   const result = await createSalesOrderRefund(createClient(state), {
     orderId: 'order-1',
@@ -7424,7 +7420,7 @@ test("a Group B journal ROW raised on another ledger is refused even when the st
 
   assert.equal(result.success, true)
   assert.equal(findAllocatedInventoryCredit(result), null, 'not the £20 the stamp claimed for this ledger')
-  assert.match(String(state.refunds[0].allocationBasisUnresolved), /was raised on quickbooks, but this reversal would be raised on xero/)
+  assert.match(String(state.refunds[0].allocationBasisUnresolved), /was raised on retired-ledger, but this reversal would be raised on xero/)
 })
 
 test("a prior refund's relief is the pounds its journal CREDITED, not the pounds its column claims (o3d-o97 r5)", async () => {
@@ -9472,7 +9468,7 @@ test('o3d-i0o6 r6: a journal carrying BOTH reversals is ONE journal, pinned to t
 test('o3d-i0o6 r6: a refund staged against the connector A2 did NOT post on stages no pin and no credit', async () => {
   // The other half of the claim, from the refund's side: there is no path that produces a pin naming
   // a ledger other than `activeAccountingConnector`. A2's journal is on Xero; the books are now
-  // QuickBooks; the proof refuses rather than handing back a Xero pin, so the allocation credit is
+  // on another connector; the proof refuses rather than handing back a Xero pin, so the allocation credit is
   // withheld and the journal that goes out is pinned to nothing at all.
   const state = a2StagedAllocatedState()
 
@@ -9492,7 +9488,7 @@ test('o3d-i0o6 r6: a refund staged against the connector A2 did NOT post on stag
   assert.equal(findAllocatedInventoryCredit(result), null, 'and the allocation credit is withheld, not moved to another ledger')
   assert.match(
     String(state.refunds[0].allocationBasisUnresolved),
-    /debited Allocated Inventory on xero, but this reversal would be raised on quickbooks/,
+    /debited Allocated Inventory on xero, but this reversal would be raised on retired-ledger/,
     'with the cross-ledger refusal named for an operator',
   )
 })

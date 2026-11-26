@@ -270,7 +270,7 @@ test('[reconciliation pack] xeroPostings reads the P0 record and every row that 
     await insert(`${XP}-failed-with-doc`, 'xero', 'TAX_RATE_SYNC', 'FAILED', 'doc3', { createdAt: '2026-10-07 13:00:00' })
     await insert(`${XP}-pending`, 'xero', 'COGS_JOURNAL', 'PENDING', null)
     await insert(`${XP}-cancelled`, 'xero', 'COGS_JOURNAL', 'CANCELLED', null)
-    await insert(`${XP}-other-connector`, 'quickbooks', 'SALES_INVOICE', 'SYNCED', 'doc4', { syncedAt: '2026-10-05 10:00:00' })
+    await insert(`${XP}-other-connector`, 'retired-ledger', 'SALES_INVOICE', 'SYNCED', 'doc4', { syncedAt: '2026-10-05 10:00:00' })
 
     const none = await withClient((client) => readers.readImsSnapshot(client, { sections: ['xeroPostings'] }))
     assert.ok(none.ok && none.sections.xeroPostings!.ok, JSON.stringify(none))

@@ -191,7 +191,7 @@ test('maybeQueuePurchaseInvoiceUpdate logs unsupported connector without queuein
     },
   }
 
-  const result = await maybeQueuePurchaseInvoiceUpdate(baseParams(tx, deps, 'quickbooks'))
+  const result = await maybeQueuePurchaseInvoiceUpdate(baseParams(tx, deps, 'retired-ledger'))
 
   assert.equal(result, 'skipped-unsupported-connector')
   assert.equal(queueCalls.length, 0)
@@ -201,7 +201,7 @@ test('maybeQueuePurchaseInvoiceUpdate logs unsupported connector without queuein
   assert.deepEqual(activityLogCalls[0]?.data.metadata, {
     invoiceId: 'bill-1',
     accountingInvoiceId: 'xero-bill-1',
-    connector: 'quickbooks',
+    connector: 'retired-ledger',
     idempotencyKey: 'purchase-invoice-update:hash',
   })
 })
@@ -307,7 +307,7 @@ test('maybeQueuePurchaseInvoiceUpdate does not record a transit row when the upd
   }
 
   const result = await maybeQueuePurchaseInvoiceUpdate({
-    ...baseParams(tx, deps, 'quickbooks'),
+    ...baseParams(tx, deps, 'retired-ledger'),
     previousSubtotalBase: 100,
     newSubtotalBase: 130.5,
   })
@@ -347,7 +347,7 @@ test('[o3d-j625 r4] maybeQueuePurchaseInvoiceUpdate REFUSES when the chart’s c
   let enqueues = 0
   const asked: Array<[unknown, unknown]> = []
   // The race in the finding: the chart is Xero's, and by the time the gate asks, the active connector is a
-  // QuickBooks that does not post bill updates. `isAccountingSyncTypeEnabled` — the dependency this seam
+  // different one that does not post bill updates. `isAccountingSyncTypeEnabled` — the dependency this seam
   // used to take — answers `false` in that state, and it is supplied here too (by cast: it is no longer in
   // the type) so that the old code, run against this test, takes its `skipped-disabled` exit instead of
   // failing on a missing function.
@@ -355,7 +355,6 @@ test('[o3d-j625 r4] maybeQueuePurchaseInvoiceUpdate REFUSES when the chart’s c
     isAccountingSyncTypeEnabled: async () => false,
     postingVerdictForChart: async (chart: StoredAccountingConnector | null, type: 'PURCHASE_INVOICE_UPDATE') => {
       asked.push([chart, type])
-      // o3d-j625 r12 (merging o3d-remove-parked-connectors): this said `activeConnector: 'quickbooks'`.
       // With one registered connector "a DIFFERENT connector is active" cannot be expressed; `null` —
       // nothing switched on — is the retired-chart state that remains observable, and it is the one this
       // case is actually about (a retired chart is a REFUSAL, not `skipped-disabled`).
@@ -455,4 +454,25 @@ test('[o3d-j625 r6 H2/H3] bill B\'s update row does not clear bill A\'s refusal;
   const billAAgain = await enqueuedParamsFor('xero-bill-A', 'purchase-invoice-update:A:h2')
   await createAccountingSyncLogRow(client, rowFrom(billAAgain.enqueued))
   assert.equal(refusals.filter((row) => row.resolvedAt === null).length, 0, 'bill A\'s own update clears it')
+})
+
+test('#1132 MED-4: the producer asks the pending-delete fence IN its transaction before it queues; a refusal queues nothing and records no transit movement', async () => {
+  const tx = { activityLog: { create: async () => {} } }
+  const order: string[] = []
+  const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
+    recordTransitSubledgerMovement: async () => { order.push('transit') },
+    postingVerdictForChart: async (chart) => ({ verdict: 'post' as const, connector: chart as 'xero' }),
+    queueAccountingSyncTx: async () => { order.push('queue'); return true },
+    assertNoPendingDeletion: async (seenTx, invoiceId) => {
+      assert.equal(seenTx, tx, 'the caller\'s transaction, not a fresh read')
+      order.push(`fence:${invoiceId}`)
+    },
+  }
+  assert.equal(await maybeQueuePurchaseInvoiceUpdate({ ...baseParams(tx, deps), newSubtotalBase: 5 }), 'queued')
+  assert.deepEqual(order, ['fence:bill-1', 'queue', 'transit'])
+  order.length = 0
+  const { PendingDocumentDeletionError } = await import('@/lib/domain/accounting/document-delete-pending')
+  deps.assertNoPendingDeletion = async () => { throw new PendingDocumentDeletionError('This bill is being deleted in IMS and Xero') }
+  await assert.rejects(maybeQueuePurchaseInvoiceUpdate({ ...baseParams(tx, deps), newSubtotalBase: 5 }), PendingDocumentDeletionError)
+  assert.deepEqual(order, [], 'nothing queued, nothing recorded')
 })

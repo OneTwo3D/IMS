@@ -330,7 +330,7 @@ function syncedJournalLog(overrides: Partial<SyncLog> = {}): SyncLog {
 function syncedDocumentLog(overrides: Partial<SyncLog> = {}): SyncLog {
   return {
     id: 'sync-credit-note',
-    connector: 'quickbooks',
+    connector: 'xero',
     type: 'CREDIT_NOTE',
     status: 'SYNCED',
     referenceType: 'SalesOrderRefund',
@@ -610,7 +610,7 @@ test('accounting event backfill only suppresses candidates with matching mirrore
   const wrongConnectorEvent = {
     ...mirroredEventForLog(sourceLog),
     id: 'event-wrong-connector',
-    externalSystem: 'quickbooks',
+    externalSystem: 'retired-ledger',
   }
   const { client } = makeClient({
     syncLogs: [sourceLog],

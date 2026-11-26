@@ -13,10 +13,11 @@ import { resolveConnectorOrphanBannerState } from '@/lib/domain/accounting/stran
 import { observeServerRender } from '@/lib/domain/accounting/server-render-marker'
 import { SettleSyncRowControl } from './settle-sync-row-control'
 
-const CONNECTOR_LABELS: Record<string, string> = { xero: 'Xero', quickbooks: 'QuickBooks' }
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 
+// A historical row may name a connector this build no longer registers; it shows its raw id.
 function connectorLabel(connector: string): string {
-  return CONNECTOR_LABELS[connector] ?? connector
+  return ACCOUNTING_CONNECTORS.find((def) => def.id === connector)?.label ?? connector
 }
 
 /**

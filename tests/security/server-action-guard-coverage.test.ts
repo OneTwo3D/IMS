@@ -73,7 +73,7 @@ const ALLOWLIST: Record<string, string> = {
   //     guarded shopify/wc sync-log actions; no unguarded arm". True, as it
   //     happens — and now VERIFIED, by resolution, so the claim does not need to
   //     be taken on trust or re-checked by hand each round.
-  //   * 'quickbooks-daily-batch.ts:*' said "verified: both getters gate on
+  //   * a daily-batch module's wildcard said "verified: both getters gate on
   //     requirePermission(sync) and refresh delegates to one". Also true, also now
   //     machine-checked, so the exemption suppresses nothing and is gone. That the
   //     rule below FOUND it is the point: three of these six were only visible
@@ -93,32 +93,15 @@ const ALLOWLIST: Record<string, string> = {
 
   // o3d-1fel — THE WILDCARD IS GONE, AND WITH IT THE LAST NON-FACADE EXEMPTION.
   //
-  // o3d-512h narrowed this entry's REASON until it read as a bug report filed
-  // against itself: "six exports carry no guard; reachable via accounting-sync.ts
-  // only behind its dispatcher gate". The second half is true and irrelevant. A
-  // `'use server'` export is an endpoint in its OWN right — the dispatcher that
+  // A `'use server'` export is an endpoint in its OWN right — the dispatcher that
   // usually calls it is not on the wire between an attacker and it — so
   // "reachable only behind a gate" describes the app's call graph, not the
   // attack surface. That is the adjacent property: sound about routing, silent
   // about the thing the test exists to check.
   //
-  // The six are now guarded at their own boundary with `requirePermission('sync')`,
-  // which is what their Xero counterparts have carried all along:
-  //
-  //   getQuickBooksSettingsMasked   ↔ getXeroSettingsMasked
-  //   getQuickBooksConnectionStatus ↔ getXeroConnectionStatus
-  //   getQuickBooksAccounts         ↔ getAccountingAccounts   (xero-sync.ts)
-  //   fetchQuickBooksTaxCodes       ↔ fetchXeroTaxRates
-  //   getQuickBooksSyncLogs         ↔ getXeroSyncLogs
-  //   getQuickBooksSyncReadiness    ↔ getXeroSyncReadiness
-  //
-  // ONE RULE, TWO READERS, ONE FIXED — that was the whole defect. Both files are
-  // arms of the SAME `getAccountingConnector` switch
-  // (lib/connectors/accounting-registry.ts), reached from the same guarded
-  // dispatchers in accounting-sync.ts, so the two arms had no business being
-  // gated differently. Double-gating costs the legitimate caller nothing: every
-  // registry call site in accounting-sync.ts already holds `sync` (or more), so
-  // the second check can only ever pass for them.
+  // So every connector action module guards at its own boundary with
+  // `requirePermission('sync')` (or stricter), like its dispatcher, and a module-level
+  // wildcard exemption is not permitted.
 
   // o3d-512h round 7 left ONE RESIDUAL here, and o3d-1fel closed it by DELETING the
   // export rather than by describing it better.
@@ -187,11 +170,10 @@ test('every allowlist entry actually suppresses a live violation — no dead exe
 /**
  * o3d-1fel — A WILDCARD IS NOT AN EXEMPTION, IT IS A STANDING ONE.
  *
- * `'quickbooks-sync.ts:*'` is how six unguarded endpoints stayed invisible: the
- * entry was written when the module was believed to be a thin facade, and it
- * went on clearing whatever that file exported for as long as it stood. The
- * six were gated and the wildcard deleted — but two `file:*` entries survived
- * that round, and the same hole survived with them. Demonstrated, not assumed:
+ * A module-level `file:*` entry is how unguarded endpoints stay invisible: the
+ * entry is written when the module is believed to be a thin facade, and it
+ * goes on clearing whatever that file exports for as long as it stands. Two
+ * `file:*` entries survived one round, and the same hole survived with them. Demonstrated, not assumed:
  * appending
  *
  *   export async function exfiltrateEverything() {
@@ -233,7 +215,7 @@ test('the allowlist names EXACTLY the exports the tree leaves unguarded — no o
     Object.keys(ALLOWLIST).sort(),
     'The allowlist and the tree disagree. On the LEFT, an export with no guard that nothing '
     + 'names: gate it, or add it BY NAME with a reason — not by widening a module entry to `*`, '
-    + 'which is how six unguarded QuickBooks endpoints hid behind a reason written for a facade. '
+    + 'which is how unguarded endpoints hide behind a reason written for a facade. '
     + 'On the RIGHT, an entry naming an export that is now guarded or gone: delete it.',
   )
 })
@@ -625,13 +607,14 @@ export async function wipeEverything(id: string) {
  * own path in the message. Unrecognised fails; it does not pass.
  */
 const ARCHIVED_CONNECTOR_REASON =
-  'ARCHIVED, and unreachable by construction (o3d-remove-parked-connectors). Next mints a server '
+  'ARCHIVED, and unreachable by construction Next mints a server '
   + 'action when it COMPILES a module carrying the directive, and it compiles only what the module '
   + 'graph rooted at app/ reaches. Nothing under app/, lib/, components/ or scripts/ imports anything '
   + 'under archive/ — asserted below, by a walk, not by inspection — and archive/ is excluded from '
   + 'tsconfig and eslint besides. See archive/connectors/README.md.'
 
 const USE_SERVER_OUTSIDE_SCAN_ROOTS: Record<string, string> = {
+  // Sealed archive modules that still carry the directive; each must be listed while its file exists.
   'archive/connectors/quickbooks/app/actions/quickbooks-daily-batch.ts': ARCHIVED_CONNECTOR_REASON,
   'archive/connectors/quickbooks/app/actions/quickbooks-sync.ts': ARCHIVED_CONNECTOR_REASON,
   'scripts/check-server-action-auth-bypass.mjs':
@@ -660,7 +643,7 @@ test('every outside-the-roots exemption states a reason', () => {
 })
 
 /**
- * THE ARCHIVE EXEMPTION'S OWN PRECONDITION (o3d-remove-parked-connectors).
+ * THE ARCHIVE EXEMPTION'S OWN PRECONDITION.
  *
  * Two archived modules carry `'use server'`, and the reason they are exempt is that nothing compiles
  * them — which is a claim about the IMPORT GRAPH, not about a directory name. A single import of an

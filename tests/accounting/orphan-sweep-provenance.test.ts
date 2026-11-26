@@ -27,3 +27,20 @@ test('the orphan sweep stamps abandonedBeforeRemoteCall only on a revision-0 row
     assert.notEqual(abandoned(store.get(id)), true, `${id} is retired UNSTAMPED (UNKNOWN to ledgerStanding)`)
   }
 })
+
+test('o3d-g5t0y: a revision-0 row of a RETIRED connector is retired but never stamped pre-call', async () => {
+  // A connector this build does not register cannot be shown to bump `attemptRevision` on a claim, so
+  // revision 0 plus custody plus no attempt stamp is not proof nothing was sent. The registered
+  // connector's identical row is the control.
+  const base = { ...SCOPE, type: 'SALES_INVOICE', status: 'PENDING' as const, attemptRevision: 0, attemptStampingCustodyAt: AT }
+  const store = createSyncLogStore([
+    syncLogRow({ ...base, id: 'registered', connector: 'xero' }),
+    syncLogRow({ ...base, id: 'retired', connector: 'retired-ledger' }),
+  ])
+  const count = await cancelOrphanedPendingRows({ accountingSyncLog: store.delegate } as never, SCOPE, 'orphaned')
+  assert.equal(count, 2, 'both are retired')
+  assert.equal(store.get('retired')?.status, 'CANCELLED')
+  assert.equal(abandoned(store.get('registered')), true)
+  assert.notEqual(abandoned(store.get('retired')), true, 'the retired connector row is retired UNSTAMPED')
+  assert.equal(store.get('retired')?.attemptRevision, 0)
+})

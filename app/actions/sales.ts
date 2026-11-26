@@ -3,7 +3,7 @@
 import { businessDateYmd } from '@/lib/business-date'
 import { creditNoteDocumentDay, originalSalesInvoiceDay, readCreditNoteDocumentDay, salesInvoiceUpdateDateDecision } from '@/lib/domain/accounting/document-date'
 import { readPostedSalesInvoiceDate } from '@/lib/domain/accounting/posted-invoice-date'
-import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
+import { assertNoPendingDeletion, pendingDeletionError, PendingDocumentDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import type { InvoicingState } from '@/lib/domain/sales/invoicing-state-labels'
 import { appendShortfallCleared } from '@/lib/domain/accounting/payment-removal-reconciliation'
 import { markWcOrderDirtyForStockGuard } from '@/lib/connectors/woocommerce/sync/stock-dirty-orders'
@@ -1949,6 +1949,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
     if (e instanceof CustomerAnonymisedError) return { success: false, error: e.message }
     if (e instanceof EditedOrderAllocationError) return { success: false, error: `Stock could not be re-reserved for the edited order, so nothing was changed: ${e.message}` }
     if (e instanceof SalesInvoiceOriginalDateUnknownError) return { success: false, error: `The edit was refused, so nothing was changed: ${e.message}` }
+    if (e instanceof PendingDocumentDeletionError) return { success: false, error: e.message }
     if (e instanceof SalesInvoiceDoesNotReconcileError || e instanceof SalesInvoiceNotQueuedError) return { success: false, error: `The edit would leave the order's invoice out of step with its total, so nothing was changed: ${e.message}` }
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -2215,8 +2216,8 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     date: documentDay ?? today,
     ...(dateUnknown ? { dateUnknown: true } : {}),
     currency: so.currency,
-    // Stamp IMS's FX rate on the document so Xero/QuickBooks don't apply
-    // their own daily rate (which causes 1-3 % drift on multi-currency
+    // Stamp IMS's FX rate on the document so Xero doesn't apply
+    // its own daily rate (which causes 1-3 % drift on multi-currency
     // invoices). Connector adapter inverts to the platform's convention.
     // o3d-q0x56.3: the order's STORED booked rate, or absent. A foreign document without one is refused at the enqueue and again at the connector.
     currencyRateToBase: usableStoredFxRate(so.fxRateToBase)?.toNumber(),
@@ -2304,6 +2305,8 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     if (!options.client) throw new Error('queueSalesInvoiceForOrder: updateInTx needs the transaction')
     if (!so.accountingInvoiceId) throw new Error('queueSalesInvoiceForOrder: updateInTx is for an order that already has an accounting invoice')
     const tx = options.client as unknown as Prisma.TransactionClient
+    // #1132 MED-4: no update of an invoice whose delete is pending, read under the order lock the caller holds (the lock the delete request takes).
+    await assertNoPendingDeletion(so.id, tx)
     const updatePayload = { ...payload, accountingInvoiceId: so.accountingInvoiceId }
     const idempotencyKey = accountingPayloadKey(`sales-invoice-update:${so.id}:${so.accountingInvoiceId}`, updatePayload)
     const { getActiveAccountingConnectorInfo } = await import('@/lib/accounting')
@@ -4080,6 +4083,7 @@ export async function createRefund(
   } catch (e) {
     if (e instanceof CustomerAnonymisedError) return { success: false, error: e.message }
     if (e instanceof SalesInvoiceOriginalDateUnknownError) return { success: false, error: `The exchange was refused, so nothing was recorded: ${e.message}` }
+    if (e instanceof PendingDocumentDeletionError) return { success: false, error: e.message }
     if (e instanceof SalesInvoiceDoesNotReconcileError || e instanceof SalesInvoiceNotQueuedError) return { success: false, error: `The exchange would leave the order's invoice out of step with its total, so nothing was recorded: ${e.message}` }
     if (options?.externalRefundId && isExternalRefundIdUniqueConflict(e)) {
       // o3d-7yf: externalRefundId is globally unique, so this conflict may be a CROSS-ORDER race — the
@@ -4263,7 +4267,7 @@ export async function raiseChargebackForReversedOrder(
   // WHY A DISAGREEMENT IS A REFUSAL RATHER THAN "USE THE POSTED FIGURE". Because the backfill's own
   // output puts every one of these orders on an operator's must-fix list: the posted document
   // understates and needs a manual credit/adjustment in the accounting system. Whether that
-  // adjustment has been made is invisible from IMS — it happens in Xero/QuickBooks, and neither the
+  // adjustment has been made is invisible from IMS — it happens in Xero, and neither the
   // order nor the mirror records it. Before it, the ledger holds the posted figure and mirroring
   // that is right; after it, the ledger holds the corrected figure and mirroring the posted one
   // under-reverses by the same amount. Both candidate credit notes are wrong in one of the two
@@ -4352,9 +4356,9 @@ export async function raiseChargebackForReversedOrder(
       // "credit the full goods" precisely because the amount question is already answered. Its two
       // ordinary causes cannot reach this point: an order with no discount fails the guard above,
       // and a Xero invoice that omitted the line resolves to 0 above and fails it too. What is left
-      // is a genuine DISAGREEMENT between the two reads about one document — the QuickBooks shape,
-      // where the adapter posts the discount line on amount alone while this reader requires an
-      // account code, so the document carries a discount whose account nobody here can name. That is
+      // is a genuine DISAGREEMENT between the two reads about one document — a document whose
+      // discount line was posted on amount alone while this reader requires an account code, so the
+      // document carries a discount whose account nobody here can name. That is
       // the one case where crediting the full goods value would be a guess, so it goes to a human.
       await logActivity({
         entityType: 'SALES_ORDER',

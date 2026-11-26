@@ -53,6 +53,8 @@ const allReceipts = [payment, secondReceipt]
 
 function client() {
   return {
+    // #1132 MED-4: the pending-delete fence the enqueue reads under the order lock (no delete pending here).
+    accountingDocumentDeletion: { findFirst: async () => null },
     accountingSyncLog: { findMany: async () => [], findFirst: async () => null, updateMany: async () => ({ count: 0 }), count: async () => 0 },
     payment: {
       findUnique: async ({ where }: { where: { id: string } }) => allReceipts.find((row) => row.id === where.id) ?? null,
@@ -200,12 +202,12 @@ test('[o3d-j625 r3 HIGH 3] an invoice link with NO recorded connector is REFUSED
   assert.match(String(notice?.description), /cannot establish which accounting connector holds the invoice/)
 })
 
-test('[o3d-j625 r3 HIGH 3] an invoice recorded as the OTHER connector’s is REFUSED after a switch', async () => {
-  // The Xero invoice id survived the switch to QuickBooks. r2 routed by `connectorId` (quickbooks) and
-  // approved the payment.
-  state.active = 'quickbooks'
-  state.enqueueAnswer = { queued: true, connector: 'quickbooks' }
-  state.order.accountingInvoiceConnector = 'xero'
+test('[o3d-j625 r3 HIGH 3] an invoice recorded as a RETIRED connector’s is REFUSED', async () => {
+  // The order's invoice id survived a connector switch: it is recorded against a connector this build no
+  // longer registers, so it cannot be shown to belong to the active one.
+  state.active = 'xero'
+  state.enqueueAnswer = { queued: true, connector: 'xero' }
+  state.order.accountingInvoiceConnector = 'retired-ledger'
   await register()
   assert.equal(state.queued.length, 0)
   assert.deepEqual(refusals(), ['DOCUMENT_PROVENANCE_UNPROVEN'])

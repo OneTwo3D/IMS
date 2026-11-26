@@ -21,10 +21,9 @@ type AccountingConnectorUi = {
 //
 // TOTAL over the id union (`Record`, not `Partial<Record>`), so a registered accounting connector
 // with no panel is a `tsc` error rather than a blank screen under a header naming it — the
-// o3d-remove-shiphero round 6 lesson, applied here. One entry ships today: QuickBooks was the second
-// and is archived (o3d-remove-parked-connectors); it reused `XeroClient` wholesale, which is worth
-// knowing before the next connector assumes the panel is generic — it is the SLOT that is generic,
-// not the component.
+// o3d-remove-shiphero round 6 lesson, applied here. One entry ships today. `XeroClient` is the
+// component behind it, which is worth knowing before the next connector assumes the panel is
+// generic — it is the SLOT that is generic, not the component.
 const ACCOUNTING_CONNECTOR_UI: Record<AccountingConnectorUiId, AccountingConnectorUi> = {
   xero: {
     title: 'Xero Connector',
@@ -33,9 +32,8 @@ const ACCOUNTING_CONNECTOR_UI: Record<AccountingConnectorUiId, AccountingConnect
   },
 }
 
-// DERIVED from the panel map (o3d-remove-parked-connectors), which is itself total over the id union.
-// It was `id === 'xero' || id === 'quickbooks'` — a hand-written pair that could accept an id with no
-// panel, or reject one that had a panel, without either being a compile error.
+// DERIVED from the panel map, which is itself total over the id union, so it cannot accept an id with
+// no panel or reject one that has a panel.
 export function isAccountingConnectorUiId(id: string | null): id is AccountingConnectorUiId {
   return id !== null && Object.prototype.hasOwnProperty.call(ACCOUNTING_CONNECTOR_UI, id)
 }

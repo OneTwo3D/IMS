@@ -27,35 +27,46 @@ function fakeClient(rows: Row[] = [], opts: { failRead?: boolean; failWrite?: bo
         writes.push({ tenant: values[0] as string, remaining: values[1] as number, at: values[2] as Date })
         return 1
       },
-      $queryRaw: async <T,>(_q: TemplateStringsArray, ...values: unknown[]) => {
+      $queryRaw: async <T,>(q: TemplateStringsArray, ...values: unknown[]) => {
         if (opts.failRead) throw new Error('db down')
-        const since = (values[0] as Date).getTime()
-        const fresh = rows.filter((row) => row.at >= since).map((row) => row.remaining)
+        // #1132 LOW-7: the read is keyed by the tenant (asserted on the SQL itself, so a read across tenants fails here).
+        assert.match(q.join('?'), /"tenant_id" = \? AND "observed_at" >= \?/)
+        const tenant = values[0] as string
+        const since = (values[1] as Date).getTime()
+        const fresh = rows.filter((row) => row.tenant === tenant && row.at >= since).map((row) => row.remaining)
         return [{ remaining: fresh.length === 0 ? null : Math.min(...fresh) }] as T
       },
     },
   }
 }
 
-test('the shared figure is the LOWEST fresh observation; stale ones are ignored; none fresh is null', async () => {
+test('the shared figure is THIS tenant\'s fresh observation; other tenants and stale ones are ignored; none fresh is null (#1132 LOW-7)', async () => {
   const now = Date.now()
   const { client } = fakeClient([
     { tenant: 'a', remaining: 700, at: now - 60_000 },
     { tenant: 'b', remaining: 400, at: now - 5 * 60_000 },
     { tenant: 'c', remaining: 5, at: now - DAY_LIMIT_OBSERVATION_FRESH_MS - 1 },
   ])
-  assert.equal(await sharedDayCallsRemaining(now, client), 400)
-  assert.equal(await sharedDayCallsRemaining(now, fakeClient([{ tenant: 'c', remaining: 5, at: now - DAY_LIMIT_OBSERVATION_FRESH_MS - 1 }]).client), null)
+  assert.equal(await sharedDayCallsRemaining('a', now, client), 700, 'another organisation\'s lower figure is not this one\'s')
+  assert.equal(await sharedDayCallsRemaining('b', now, client), 400)
+  assert.equal(await sharedDayCallsRemaining('c', now, client), null, 'stale')
+  assert.equal(await sharedDayCallsRemaining('z', now, client), null)
+})
+
+test('#1132 LOW-7: an observation is fresh for 10 to 15 minutes, not an hour', () => {
+  assert.ok(DAY_LIMIT_OBSERVATION_FRESH_MS >= 10 * 60_000 && DAY_LIMIT_OBSERVATION_FRESH_MS <= 15 * 60_000, String(DAY_LIMIT_OBSERVATION_FRESH_MS))
 })
 
 test('a FRESH WORKER (no local figure) reads what the others saw; the lower of local and shared wins; nothing shared, or unreadable, is null (the caller waits)', async () => {
   const now = Date.now()
   const shared = fakeClient([{ tenant: 'a', remaining: 300, at: now - 1000 }]).client
-  assert.equal(await organisationDayCallsRemaining(null, now, shared), 300, 'the bug: this used to be null and read as "go ahead"')
-  assert.equal(await organisationDayCallsRemaining(800, now, shared), 300)
-  assert.equal(await organisationDayCallsRemaining(100, now, shared), 100)
-  assert.equal(await organisationDayCallsRemaining(800, now, fakeClient([]).client), null, 'a process\'s own figure alone is not taken as the organisation\'s')
-  assert.equal(await organisationDayCallsRemaining(800, now, fakeClient([], { failRead: true }).client), null)
+  assert.equal(await organisationDayCallsRemaining(null, 'a', now, shared), 300, 'the bug: this used to be null and read as "go ahead"')
+  assert.equal(await organisationDayCallsRemaining(800, 'a', now, shared), 300)
+  assert.equal(await organisationDayCallsRemaining(100, 'a', now, shared), 100)
+  assert.equal(await organisationDayCallsRemaining(800, 'a', now, fakeClient([]).client), null, 'a process\'s own figure alone is not taken as the organisation\'s')
+  assert.equal(await organisationDayCallsRemaining(800, 'a', now, fakeClient([], { failRead: true }).client), null)
+  assert.equal(await organisationDayCallsRemaining(800, 'b', now, shared), null, '#1132 LOW-7: another tenant\'s figure is not used')
+  assert.equal(await organisationDayCallsRemaining(800, null, now, shared), null, 'no connected organisation: unknown')
 })
 
 test('persisting is throttled per tenant, except when the figure is at the warning level; a failed write never throws', async () => {

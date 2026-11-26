@@ -55,7 +55,6 @@ test('a request to a known vendor host is governed as that vendor whatever the c
     ['x', 'https://eu.mintsoft.co.uk/api/Order', 'mintsoft'],
     ['WooCommerce', 'https://shop.example.com/', 'woocommerce'],
     ['Mintsoft', 'https://shop.example.com/', 'mintsoft'],
-    ['QuickBooks', 'https://quickbooks.api.intuit.com/', null],
     ['Example', 'https://example.test/', null],
     ['woocommerce', 'https://shop.example.com/', 'woocommerce'],
   ]
@@ -69,7 +68,7 @@ test('a request to a known vendor host is governed as that vendor whatever the c
   assert.equal(refusal?.connector, 'xero')
   assert.equal(refusal?.code, 'no_grant')
   // An unmanaged connector is not governed.
-  assert.equal(outboundWriteRefusal({ connectorName: 'QuickBooks', method: 'POST', url: 'https://example.test/', env: {} }), null)
+  assert.equal(outboundWriteRefusal({ connectorName: 'Example', method: 'POST', url: 'https://example.test/', env: {} }), null)
 })
 
 test('grant parsing: one readable shape each, everything else is absent or unreadable', () => {

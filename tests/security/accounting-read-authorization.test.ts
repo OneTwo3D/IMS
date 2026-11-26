@@ -103,8 +103,7 @@ test('MANAGER holds `sync` and is STILL refused by the Xero CREDENTIAL delegate 
   // answer to a denial — and seven of those reads route through this module. An ADMIN-only read
   // surface therefore does not narrow MANAGER's reach, it replaces the whole /sync page with the
   // generic error boundary, which is the opposite of round 3's stated reach change ("it keeps the
-  // whole connector branch"; QuickBooks was the branch it named, now archived —
-  // o3d-remove-parked-connectors). tests/accounting/dashboard-read-gates.test.ts
+  // whole connector branch"). tests/accounting/dashboard-read-gates.test.ts
   // measures that outcome directly, and the counter-guard below pins the reads that must keep working.
   currentRole = 'MANAGER'
   recorder.reset()
@@ -228,20 +227,11 @@ test('fetchXeroTaxRates refuses before making the outbound Xero call', async () 
 // ---------------------------------------------------------------------------
 
 /**
- * THE QUICKBOOKS ARM OF THIS FILE IS DELETED (o3d-remove-parked-connectors).
- *
- * Six reads (`getQuickBooksSettingsMasked`, `getQuickBooksConnectionStatus`, `getQuickBooksAccounts`,
- * `fetchQuickBooksTaxCodes`, `getQuickBooksSyncLogs`, `getQuickBooksSyncReadiness`) were driven
- * against four unprivileged roles, plus a case that `fetchQuickBooksTaxCodes` refuses BEFORE making
- * the outbound call, plus the MANAGER-keeps-every-read case. `app/actions/quickbooks-sync.ts` is
- * archived, so all of them go.
- *
- * WHAT THAT COST: the file asserted the SAME executed proof — the real RBAC decision through the real
- * `requirePermission`, with `recorder.assertNoReads` refusing to certify an empty touch list until it
- * has PROVED in-process that it can see a read — on TWO connectors. It now asserts it on one. The
- * reason the QuickBooks arm existed is in its own deleted comment: a scanner-satisfying shape ("a
- * server action calling a `requireSyncPermission` that had been redefined to return") leaks every row,
- * and one connector obeying the rule says nothing about the next one. A second accounting connector's
- * reads must be added here in the commit that writes them.
+ * THIS FILE DRIVES ONE CONNECTOR'S READS (Xero's) against the unprivileged roles, with the real RBAC
+ * decision through the real `requirePermission`, and `recorder.assertNoReads` refusing to certify an
+ * empty touch list until it has PROVED in-process that it can see a read. A scanner-satisfying shape
+ * ("a server action calling a `requireSyncPermission` that had been redefined to return") leaks every
+ * row, and one connector obeying the rule says nothing about the next one. A second accounting
+ * connector's reads must be added here in the commit that writes them.
  */
 

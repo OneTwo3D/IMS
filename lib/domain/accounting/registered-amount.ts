@@ -247,7 +247,7 @@ export function readPayloadExactAmount(payload: unknown): ExactAmountReading {
 /**
  * MAY THIS AMOUNT BE ENQUEUED AT ALL? (o3d-1xq8, Codex HIGH — the writer's backstop.)
  *
- * The payload's `amount` is a JSON number because the connectors need one: a Xero or QuickBooks
+ * The payload's `amount` is a JSON number because the connectors need one: a Xero
  * payment body states its amount as a JSON number, and every consumer of this payload that is not the
  * coverage reader — the capacity arithmetic, the retry guard's body test, the operator screens —
  * reads that number. The decimal string added above makes the COVERAGE route exact; it does nothing

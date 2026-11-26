@@ -164,7 +164,7 @@ The card shows only categories your role may act on, and its counts are cached f
 - Someone edited a rate in Xero (or IMS) so the two no longer match. The next invoice would post with the IMS-side numbers, so fix it before then: click **Review VAT rates**, see the **Xero drift** chip on the rate, and correct whichever side is wrong. **Compare VAT rates** (Settings > Accounting > Tax) also compares IMS, Xero and WooCommerce and explains each difference.
 
 ### Xero invoice CurrencyRate looks wrong
-- IMS stores `1 base = X foreign`; Xero expects `1 foreign = X base`. The connector inverts and rounds to 6dp. If you see a substantially wrong rate, check `SalesOrder.fxRateToBase` on the source order.
+- IMS stores `1 base = X foreign`, and Xero's `CurrencyRate` uses the same convention. The connector sends the rate as is, rounded to 6dp (for a GBP organisation a USD document carries about 1.3, never about 0.76). If you see a substantially wrong rate, check `SalesOrder.fxRateToBase` on the source order.
 - A foreign invoice, bill, refund or credit note whose stored exchange rate is missing, zero or unusable is **not sent**: IMS will not let Xero apply its own daily rate. The posting stays owed and appears in the exception inbox (Integrations > Exceptions) with the reason `foreign_document_missing_rate`; nothing is created at 1. Correct the document's exchange rate (a positive rate), then raise the posting again. A payment, or a month-end revaluation, with no `fx_rates` row for its date is refused or skipped by name: get the rate with **Update Now** (Settings > Accounting > Currencies) or pin one on **Settings > Accounting > FX Rates**.
 
 ### Mintsoft webhook signature mismatch

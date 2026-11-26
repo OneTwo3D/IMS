@@ -93,7 +93,7 @@ export type InvoicePaymentRegistrationRefusal =
    * CONNECTOR THIS REGISTRATION IS BEING BUILT FOR.
    *
    * The id is a primary key in the accounting system's own database and it DELIBERATELY SURVIVES a
-   * connector switch — nothing clears it when the operator moves from Xero to QuickBooks, because the
+   * connector switch — nothing clears it when the operator moves to another accounting connector, because the
    * Xero invoice it names still exists. So "the connector is on and posts payments" says nothing about
    * whose document this is, and a payment queued for the new connector naming the old one's invoice id
    * either fails or settles an unrelated document.
@@ -318,7 +318,7 @@ export function unresolvedInvoicePaymentAttempts(
  * catch it, and a SECOND payment posts for the same receipt.
  *
  * THE SAFETY ARGUMENT WAS AN ASSUMPTION ABOUT THE LEDGER THIS CODE NEVER CHECKS — "the old document
- * has been deleted, so its payment is gone with it". IMS never read that document. On QuickBooks a
+ * has been deleted, so its payment is gone with it". IMS never read that document. On some ledgers a
  * deleted invoice leaves its payment behind as an UNAPPLIED CREDIT, so the customer is credited
  * twice. And it inverts this module's own stated rule: for money, unknown must read as "possibly
  * this one".
@@ -615,20 +615,19 @@ export function decideInvoicePaymentRegistration(input: {
       // but FACTS NOTHING IN THIS SYSTEM RECORDS:
       //
       //   • `row.origin` is stamped at ENQUEUE and `externalTransactionId` is minted at POST. A
-      //     reconnect between them detaches one from the other, and on QuickBooks nothing stops
-      //     it: that connector has no post-time realm enforcement at all (o3d-8prh, OPEN), and
-      //     `QboResponse` discards the `realmId` its own request resolved, so there is no issuer
-      //     to record even if this branch wanted to.
+      //     reconnect between them detaches one from the other, and nothing in this
+      //     system records which tenant issued the id, so there is no issuer to compare even if this
+      //     branch wanted to.
       //   • The probe's organisation was read from two token snapshots either side of the fetch,
       //     which cannot see an A→B→A reconnect across it.
       //
-      // AND A THIRD, FOUND WHILE WEIGHING THOSE TWO, WHICH SHOWS THE SHAPE IS NOT QUICKBOOKS-ONLY:
+      // AND A THIRD, FOUND WHILE WEIGHING THOSE TWO, WHICH SHOWS THE SHAPE IS NOT CONNECTOR-SPECIFIC:
       // `buildAssertedReversalData` (payment-ledger-hold.ts, called from app/actions/sales.ts)
       // writes an operator-supplied `externalTransactionId` onto an undecided row and leaves
       // `settlementBasis` NULL — so r4's `isOperatorAssertedSettlement` filter reads it as
       // connector-backed. That id IS verified against the ledger by a live read, but against
       // whatever tenant is connected at VERIFICATION time, while the row's origin still names
-      // enqueue time. Same detachment, a Xero door, and one that landing o3d-8prh would not shut.
+      // enqueue time. Same detachment, a Xero door.
       //
       // SO THE ROUND-2 BEHAVIOUR IS RESTORED: AN UNMEASURABLE SETTLEMENT WITHHOLDS, WHATEVER ID
       // ANY ROW OF OURS RECORDS. The trade is the one `classifyLedgerSettlement` has always stated:

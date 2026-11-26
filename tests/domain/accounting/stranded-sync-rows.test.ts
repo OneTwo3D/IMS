@@ -33,9 +33,9 @@ test('the stranded where is NOT scoped to the active connector — that is the w
     status: { in: ['PENDING', 'PROCESSING', 'FAILED'] },
     connector: { not: 'xero' },
   })
-  assert.deepEqual(buildStrandedSyncRowWhere('quickbooks'), {
+  assert.deepEqual(buildStrandedSyncRowWhere('retired-ledger'), {
     status: { in: ['PENDING', 'PROCESSING', 'FAILED'] },
-    connector: { not: 'quickbooks' },
+    connector: { not: 'retired-ledger' },
   })
   // No connector enabled: nothing will process ANY unresolved row, so all of them are stranded
   // and there is no connector predicate at all.
@@ -60,7 +60,7 @@ test('the order is total — createdAt alone is not deterministic within a trans
 function sourceRow(over: Partial<Parameters<typeof describeStrandedSyncRow>[0]> = {}) {
   return {
     id: 'log-1',
-    connector: 'quickbooks',
+    connector: 'retired-ledger',
     type: 'INVOICE_PAYMENT',
     status: 'FAILED',
     referenceType: 'SalesOrder',
@@ -117,13 +117,13 @@ function stranded(
   return describeStrandedSyncRow(
     {
       id: 'log-1',
-      connector: 'quickbooks',
+      connector: 'retired-ledger',
       type: 'INVOICE_PAYMENT',
       status: 'FAILED',
       referenceType: 'SalesOrder',
       referenceId: 'order-7',
       externalTransactionId: null,
-      errorMessage: 'HTTP 500 from QuickBooks',
+      errorMessage: 'HTTP 500 from the ledger',
       createdAt: new Date('2026-08-04T10:00:00.000Z'),
       attemptRevision: 3,
       settlementBasis: null,
@@ -140,12 +140,12 @@ test('a stranded row is described with identifying detail, not counted (o3d-osl8
   // and look the document up in the connector it was queued for.
   const row = stranded()
   assert.equal(row.id, 'log-1')
-  assert.equal(row.connector, 'quickbooks')
+  assert.equal(row.connector, 'retired-ledger')
   assert.equal(row.type, 'INVOICE_PAYMENT')
   assert.equal(row.referenceType, 'SalesOrder')
   assert.equal(row.referenceId, 'order-7')
   assert.equal(row.status, 'FAILED')
-  assert.equal(row.errorMessage, 'HTTP 500 from QuickBooks')
+  assert.equal(row.errorMessage, 'HTTP 500 from the ledger')
   assert.equal(row.externalTransactionId, null)
   assert.equal(row.createdAt, '2026-08-04T10:00:00.000Z')
 })
@@ -246,10 +246,10 @@ test('a STRANDED row at revision 0 reaches the remedy by adoption — this list 
 //
 // The test directly above encodes the round-3/round-4 argument: `buildStrandedSyncRowWhere` selects
 // rows off the active connector, therefore nothing in the attempt fence can claim them, therefore
-// every row here is adoptable. The second step is false, and QuickBooks rows are the counter-example
-// the whole feature was built for — `triggerQuickBooksSync` gates on `quickbooks_sync_enabled` and
-// never resolves the active connector, so with Xero enabled beside it every QuickBooks row is listed
-// here while any holder of `sync` can press the button and have the stale-claim sweep reclaim one.
+// every row here is adoptable. The second step is false: a registered connector's manual Sync action
+// gates on its own `<connector>_sync_enabled` toggle and never resolves the active connector, so a row
+// can be listed here while any holder of `sync` can press the button and have the stale-claim sweep
+// reclaim it.
 //
 // These are about what the read model DOES with that answer, not about how it is computed; the rule
 // itself is pinned in tests/domain/accounting/sync-row-claimability.test.ts.
@@ -263,9 +263,9 @@ test('[round 5] a revision-0 row whose connector can STILL claim it is refused, 
 })
 
 test('[round 5] and it says WHY, naming the toggle — not the generic active-connector sentence', () => {
-  // o3d-remove-parked-connectors round 2 (Codex MEDIUM): asked of a LIVE connector. A still-claimable
-  // ARCHIVED connector no longer exists as a state — nothing services it, so it is quiesced — and the
-  // message must not name a Sync-settings key that was archived with the code behind it.
+  // Round 2 (Codex MEDIUM): asked of a LIVE connector. A still-claimable
+  // RETIRED connector does not exist as a state — nothing services it, so it is quiesced — and the
+  // message must not name a Sync-settings key that has no code behind it.
   const row = stranded({ connector: 'xero', status: 'PROCESSING', attemptRevision: 0 }, STILL_CLAIMABLE)
   const reason = row.notSettleableReason ?? ''
   // The lever, by its settings key: an operator cannot act on "it is claimable".
@@ -284,11 +284,11 @@ test('[round 5] the question is asked PER CONNECTOR, so one quiesced connector d
   // Round 2: the pairing is now archived-vs-live, which is the only shape the real rule can produce —
   // `isAccountingConnectorQuiesced` answers `true` for an archived connector unconditionally, and the
   // live one's answer still depends on its toggle.
-  const onlyArchivedQuiesced = (connector: string) => connector === 'quickbooks'
+  const onlyArchivedQuiesced = (connector: string) => connector === 'retired-ledger'
   const page = pageStrandedSyncRows(
     [
       { ...sourceRow({ id: 'log-x', connector: 'xero', attemptRevision: 0 }) },
-      { ...sourceRow({ id: 'log-q', connector: 'quickbooks', attemptRevision: 0 }) },
+      { ...sourceRow({ id: 'log-q', connector: 'retired-ledger', attemptRevision: 0 }) },
     ],
     10,
     NOW,

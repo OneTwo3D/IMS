@@ -130,43 +130,8 @@ test('xero dates are read in BOTH serialisations, and anything else is unreadabl
   assert.equal(normaliseXeroSettlementDate(undefined), null)
 })
 
-// o3d-remove-parked-connectors: the QuickBooks arm of this file is DELETED with the connector.
-// `probeQuickBooksSettlement` and its fixtures are archived; the cases that drove them were the
-// twin of every Xero case here, and several of them ("all THREE arms read a string figure", "the rule
-// is ONE function, and all three arms reach it") were the ONLY assertions that the rule was reached
-// by more than one arm. That evidence is gone. What the rules themselves protect — string-typed money
-// (o3d-obyd), the difference magnitude bound (o3d-mm51), the completeness band (o3d-r948) — is still
-// asserted through the Xero arms. Recoverable with the connector:
-// `git show archive/quickbooks-connector:<this path>`.
-
-/**
- * o3d-0m56 round 4, Codex CRITICAL #1 — THE LINK TYPE QUICKBOOKS ACTUALLY WRITES.
- *
- * The entity is `BillPayment`; the link recorded on the Bill is named after the PayType, so IMS's
- * own `PayType: 'Check'` posts land as `BillPaymentCheck`. The probe matched `BillPayment` and
- * therefore matched NONE of the bill payments this system has ever made — it returned an empty
- * record list, which the classifier reads as `clear`, which the fence reads as permission to pay
- * the bill again. The fixture below used the wrong spelling too, so the test passed on a shape
- * QuickBooks does not produce.
- */
-/**
- * o3d-0m56 round 5, Codex HIGH #3 — RECOGNISED IS NOT ACCOUNTED FOR.
- *
- * Round 4 ignored credit memos, vendor credits, deposits and journal entries because they are not
- * the shape IMS posts, and returned `records: []` — which the classifier reads as `clear` and the
- * fence acts on. But those links SETTLE the document: an operator who clears a bill with a
- * journal entry has paid it, and a probe that answers "clear" to that is not out of scope, it is
- * wrong. An unrecognised type already fails closed; a recognised-but-uncovered one now fails
- * closed too, whenever the document's own numbers say money has actually come off it.
- */
-/**
- * o3d-0m56 round 5, Codex HIGH #4 — THE TWO WAYS ROUND THE FAIL-CLOSED.
- *
- * The rule "an unclassified link fails the probe" had two silent exits, and both end in the same
- * place: a settlement the probe knows about is dropped from a list it then reports as complete.
- */
 test('xero: a Payments collection short of AmountPaid fails the probe (o3d-0m56)', async () => {
-  // The same class of bug on the other connector, checked with data rather than an assumption:
+  // A completeness check, made with data rather than an assumption:
   // AmountPaid is Xero's own total of the very collection being read, so the two must agree. An
   // omitted or truncated collection is indistinguishable from "no payments" without it.
   const { get } = xeroDouble({
@@ -397,9 +362,9 @@ test('the probe key is not split by an anchor the TYPE does not have (o3d-0m56 r
  *
  * The exclusion those labels fed is gone (see `classifyLedgerSettlement`), so the unsound label goes
  * with it rather than sitting on the probe result inviting reuse. A sound version is REQUEST-BOUND:
- * `XeroResponse` already carries the `tenantId` its request went out under, and `qboFetch` resolves
- * a `realmId` per request that `QboResponse` discards — and a QuickBooks probe makes 1 + N fetches,
- * so every one of those responses would have to be proven to belong to one realm. bd o3d-llyw.
+ * `XeroResponse` already carries the `tenantId` its request went out under, and a probe that makes
+ * several fetches would have to prove every one of those responses belongs to one organisation.
+ * bd o3d-llyw.
  * ------------------------------------------------------------------------------------------- */
 
 /** Counts reads of the local `accounting_tokens` row, so "it does not read it" can be asserted. */

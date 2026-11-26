@@ -142,9 +142,8 @@ export function OnboardingClient({
   const wcConnected = integrationConnectedOverride.wc ?? (!!wcCredentials.url && !!wcCredentials.key && !!wcCredentials.secretMasked)
   const accountingConnected = integrationConnectedOverride.accounting ?? accountingStatus.connected
   const wmsEnabled = WMS_CONNECTOR_IDS.some((id) => plugins[id])
-  // DERIVED from the registry, like `wmsEnabled` (o3d-remove-parked-connectors). It was
-  // `plugins.xero || plugins.quickbooks`, and the label below was `plugins.quickbooks ? … : 'Xero'`,
-  // which named Xero for every connector that was not QuickBooks.
+  // DERIVED from the registry, like `wmsEnabled`, so the label always names the connector that is
+  // actually enabled rather than a hard-coded default.
   const enabledAccountingConnector = ACCOUNTING_CONNECTORS.find((connector) => plugins[connector.id])
   const accountingEnabled = !!enabledAccountingConnector
   const activeAccountingLabel = enabledAccountingConnector?.label ?? 'accounting'

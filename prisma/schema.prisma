@@ -523,7 +523,7 @@ model DocumentTemplate {
 
 /// Configurable reasons for stock adjustments, each optionally linked to an accounting account.
 /// accountCode is connector-agnostic: it is the account code in whichever accounting system
-/// (Xero, QuickBooks, etc.) is currently active.
+/// (Xero today) is currently active.
 model AdjustmentReason {
   id              String   @id @default(cuid())
   name            String
@@ -792,8 +792,8 @@ model Product {
   // Customer/Supplier.accountingContactId: resolved once, then persisted so the
   // per-invoice "does this item exist?" lookup costs nothing (o3d-3nc).
   // Connector-agnostic by design: it holds an id belonging to whichever accounting
-  // connector is currently connected, so BOTH connectors clear it on disconnect —
-  // a Xero ItemID handed to QuickBooks is meaningless.
+  // connector is currently connected, so a connector clears it on disconnect —
+  // a Xero ItemID handed to any other connector or organisation is meaningless.
   accountingItemId String?
   // "<connector>:<tenantId>" of the connection that issued accountingItemId (o3d-6nd). A reader ignores
   // an id whose provenance does not match the active connection and re-resolves it, so a connector/org
@@ -1764,8 +1764,8 @@ model PurchaseInvoice {
   // write, which no protocol can make atomic and a future writer can forget.
   //
   // GLOBAL, on the VALUE alone, and that is a deliberate trade rather than an oversight. Making it
-  // per-connection — (id, provenance), which was tried and reverted — would let a QuickBooks realm
-  // switch store the same integer twice, once per company. The write would then succeed and the
+  // per-connection — (id, provenance), which was tried and reverted — would let a switch between
+  // companies whose ids repeat store the same id twice, once per company. The write would then succeed and the
   // collision would move to the ~190 call sites that read a naked accountingInvoiceId, on models
   // (SalesOrder, SalesOrderRefund, SupplierCreditNote) that have no provenance column to consult
   // even in principle. Globally unique, the same situation is a BLOCKED WRITE with a loud error
@@ -1779,8 +1779,8 @@ model PurchaseInvoice {
   /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
   ///
   /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
-  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves from Xero to
-  /// QuickBooks, because the document it names still exists in the books it was posted to. So knowing
+  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves to another
+  /// connector, because the document it names still exists in the books it was posted to. So knowing
   /// which chart of accounts a payload's CODES came from (o3d-j625's `chartConnector`) says nothing
   /// about whose primary key this is — the r2 round proved the provenance of the codes and then reused
   /// that proof for the ids, which is a proof of an adjacent property. A payment queued against the
@@ -1925,8 +1925,8 @@ model SupplierCreditNote {
   /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
   ///
   /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
-  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves from Xero to
-  /// QuickBooks, because the document it names still exists in the books it was posted to. So knowing
+  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves to another
+  /// connector, because the document it names still exists in the books it was posted to. So knowing
   /// which chart of accounts a payload's CODES came from (o3d-j625's `chartConnector`) says nothing
   /// about whose primary key this is — the r2 round proved the provenance of the codes and then reused
   /// that proof for the ids, which is a proof of an adjacent property. A payment queued against the
@@ -2260,8 +2260,8 @@ model SalesOrder {
   /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
   ///
   /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
-  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves from Xero to
-  /// QuickBooks, because the document it names still exists in the books it was posted to. So knowing
+  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves to another
+  /// connector, because the document it names still exists in the books it was posted to. So knowing
   /// which chart of accounts a payload's CODES came from (o3d-j625's `chartConnector`) says nothing
   /// about whose primary key this is — the r2 round proved the provenance of the codes and then reused
   /// that proof for the ids, which is a proof of an adjacent property. A payment queued against the
@@ -2290,7 +2290,7 @@ model SalesOrder {
   /// `paidAt` records THAT this order is held as paid. It does not record WHERE that belief came
   /// from, and the payment poller's reversal pass turns on exactly that distinction:
   ///
-  ///   the LEDGER said so       the Xero/QuickBooks forward pass and the backlog reconcile stamp
+  ///   the LEDGER said so       the Xero forward pass and the backlog reconcile stamp
   ///                            `paidAt` from an invoice the ledger itself reported PAID. If the
   ///                            ledger later reports zero, the payment really has been taken away
   ///                            and clearing `paidAt` is the whole point of the pass.
@@ -2574,8 +2574,8 @@ model SalesOrderRefund {
   /// o3d-j625 r3 (Codex HIGH 2/HIGH 3) — WHICH CONNECTOR'S DOCUMENT THE ID BESIDE THIS IS.
   ///
   /// A connector-native document id is a PRIMARY KEY IN SOMEBODY ELSE'S DATABASE, and this one
-  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves from Xero to
-  /// QuickBooks, because the document it names still exists in the books it was posted to. So knowing
+  /// deliberately SURVIVES a connector switch: nothing clears it when the operator moves to another
+  /// connector, because the document it names still exists in the books it was posted to. So knowing
   /// which chart of accounts a payload's CODES came from (o3d-j625's `chartConnector`) says nothing
   /// about whose primary key this is — the r2 round proved the provenance of the codes and then reused
   /// that proof for the ids, which is a proof of an adjacent property. A payment queued against the
@@ -2804,6 +2804,8 @@ model SalesOrderRefundDeletion {
   voidSyncLogId           String?  @map("void_sync_log_id")
   /// What was reversed, from the recorded movements: stock out, layers removed, the COGS journal reversed, syncs retired. Amounts and ids only.
   reversal                Json     @default("{}")
+  /// #1132 MED-2: when the post-commit follow-ups (re-reserving the order, the storefront stock push) ran. Null: still owed; the void worker's retry runs them.
+  followUpsDoneAt         DateTime? @map("follow_ups_done_at")
 
   @@index([orderId])
   @@map("sales_order_refund_deletions")
@@ -3570,7 +3572,7 @@ model AccountingSyncLog {
   // backReferenceCheckedAt, permanently discarding the payment or PDF. A transient failure is not a
   // verdict; this column is what keeps it from becoming one.
   //
-  // Flipping such a row to FAILED instead was rejected: queueXeroSync/queueQuickBooksSync dedupe new
+  // Flipping such a row to FAILED instead was rejected: queueXeroSync dedupes new
   // enqueues on `status in (PENDING, PROCESSING, SYNCED)`, so a row moved out of SYNCED stops
   // suppressing its own re-enqueue and the document posts to the ledger a SECOND time.
   //
@@ -3599,7 +3601,7 @@ model AccountingSyncLog {
   //
   // NOT stamped by the application also because the connectors' claim rides inside the transaction
   // that records the invoice's external id: an extra statement there is an extra way to abort it,
-  // and a rolled-back SYNCED write means the invoice is posted to QuickBooks a second time.
+  // and a rolled-back SYNCED write means the invoice is posted to the ledger a second time.
   //
   // NULL is a real state, not a missing value: a marker minted by a build that predates this column,
   // or one whose stamp statement failed after the CAS committed. Such a row CANNOT be aged against
@@ -4845,6 +4847,8 @@ enum WmsOperatorTaskReason {
   MERGE_HOLD_OVERDUE
   /// A withdrawal (or an IMS cancel) reached an order that is on merge hold: IMS did not cancel or release it, a person decides in the warehouse.
   MERGE_HOLD_WITHDRAWAL
+  /// #1132 R2-MED-2: a refund delete's credit-note void entry used up its retries: the refund still stands in IMS and a person decides. Not a warehouse query: raised with connector 'xero'.
+  REFUND_DELETE_VOID_STUCK
 }
 
 enum WmsOperatorTaskStatus {

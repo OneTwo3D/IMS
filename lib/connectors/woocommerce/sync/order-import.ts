@@ -31,6 +31,7 @@ import {
 } from '@/lib/domain/accounting/receipt-registration-sweep'
 import { usableStoredFxRate } from '@/lib/currencies/stored-document-rate'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
+import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import { activeAccountingConnectorForReport, postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { recordAccountingPostingRefusal, type PostingRefusalClient } from '@/lib/domain/accounting/posting-refusal-inbox'
 import { accountingPostingKey } from '@/lib/accounting/posting-key'
@@ -192,7 +193,7 @@ export type PendingFxOrderPayload = {
    * Set when the row holds the obligation of a PAID order whose receipt could not be recorded because the payload and IMS disagree (the total or the currency): the retry replays
    * this snapshot, so the receipt is recorded as soon as IMS agrees, with no further WooCommerce delivery. `attempts` bounds it.
    */
-  paidBlock?: { kind: 'total' | 'currency'; attempts: number; firstAt: string }
+  paidBlock?: { kind: 'total' | 'currency' | 'delete-pending'; attempts: number; firstAt: string }
 }
 
 /** The version of a pending row's stored snapshot: a digest of the payload as the database returns it. A newer delivery that rewrites the row changes it. */
@@ -1210,7 +1211,7 @@ type PaidBlockOutcome = { blocked: false } | { blocked: true; gaveUp: boolean }
  * it is retired only when the receipt is recorded or the order is paid by another route, and after WC_PAID_BLOCK_MAX_ATTEMPTS retries it is retired FAILED (`gaveUp`), when the
  * ERROR finding is the operator's record.
  */
-async function writePaidBlockObligation(tx: Prisma.TransactionClient, orderId: string, wcOrder: WcFullOrder, currency: string, kind: 'total' | 'currency', retryLogId: string | undefined, message: string): Promise<{ gaveUp: boolean }> {
+async function writePaidBlockObligation(tx: Prisma.TransactionClient, orderId: string, wcOrder: WcFullOrder, currency: string, kind: 'total' | 'currency' | 'delete-pending', retryLogId: string | undefined, message: string): Promise<{ gaveUp: boolean }> {
   const existing = retryLogId
     ? await tx.shoppingSyncLog.findUnique({ where: { id: retryLogId }, select: { id: true, payload: true } })
     : await tx.shoppingSyncLog.findFirst({ where: pendingFxQueueWhere(String(wcOrder.id)), orderBy: { createdAt: 'desc' }, select: { id: true, payload: true } })
@@ -1252,6 +1253,13 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
     // below, or an earlier one completing after this fence, discharges it.
     const order = await tx.salesOrder.findUniqueOrThrow({ where: { id: orderId }, select: { totalForeign: true, currency: true, orderNumber: true, externalOrderNumber: true, paidAt: true, erasedAt: true } })
     if (order.paidAt !== null) return null
+    // #1132 MED-4: NOT WHILE THE ORDER'S INVOICE IS BEING DELETED. Read under the order lock the delete request takes: the paid flag and the receipt
+    // would land on a document Xero is removing. Nothing is recorded; the paid-block obligation retries the delivery once the delete has finished.
+    const deletePending = await pendingDeletionError(orderId, tx)
+    if (deletePending) {
+      const { gaveUp } = await writePaidBlockObligation(tx, orderId, wcOrder, order.currency, 'delete-pending', retryLogId, `The order's invoice is being deleted, so the payment is not recorded yet; it is retried once the delete has finished`)
+      return { deletePending: { message: deletePending, reference: order.externalOrderNumber ?? order.orderNumber ?? orderId }, gaveUp } as const
+    }
     // THE PAID TOTAL MUST BE THE TOTAL IMS HOLDS. An update delivery refreshes addresses and notes but NOT the lines or the total (updateExistingWcOrderCore), so an order edited in
     // WooCommerce between the import and the payment still carries the old total here. Compared to the minor unit of the order currency, under the lock: if they differ nothing is
     // recorded (no paidAt, no Payment) and a review notice is written; a later delivery after the totals agree records it.
@@ -1316,6 +1324,24 @@ async function recordWcPaidTransition(orderId: string, wcOrder: WcFullOrder, set
   })
   if (!claimed) return { blocked: false }
   if ('stale' in claimed) return { blocked: true, gaveUp: false }
+  if ('deletePending' in claimed && claimed.deletePending) {
+    const d = claimed.deletePending
+    // once per order while the block stands: the same refusal is written once however often it is delivered
+    const already = await db.activityLog.count({ where: { entityType: 'SALES_ORDER', entityId: orderId, action: 'wc_paid_while_invoice_delete_pending', createdAt: { gte: new Date(Date.now() - 24 * 3_600_000) } } })
+    if (already === 0) {
+      await logActivity({
+        entityType: 'SALES_ORDER',
+        entityId: orderId,
+        action: 'wc_paid_while_invoice_delete_pending',
+        tag: 'sync',
+        level: 'WARNING',
+        description: `WooCommerce reports order ${d.reference} paid, but its invoice is being deleted: ${d.message} The payment was NOT recorded yet and the order is not marked paid; IMS records it on a later delivery once the delete has finished.`,
+        metadata: { connector: 'woocommerce', externalOrderId: String(wcOrder.id) },
+      })
+    }
+    await announcePaidBlockGaveUp(orderId, String(wcOrder.id), d.reference, claimed.gaveUp)
+    return { blocked: true, gaveUp: claimed.gaveUp }
+  }
   if ('currencyMismatch' in claimed && claimed.currencyMismatch) {
     const m = claimed.currencyMismatch
     // idempotent per order and currency pair: the same disagreement is written once however often it is delivered
@@ -2156,8 +2182,8 @@ function buildWcInvoiceCore(p: {
     // Bound (plain: shipping is never reverse-charge swapped) only to the rate whose own code is the one sent.
     ...(((shippingRateNow ?? defaultRateNow)?.accountingTaxType ?? undefined) === shippingTypeNow ? rateBinding((shippingRateNow ?? defaultRateNow)?.id, 'plain', 'shipping') : {}),
     // Only the residual — the coupon itself is already on the lines above as a per-line
-    // discountAmount, which the connector sends as a Xero DiscountRate / QuickBooks
-    // discount line. Sending both deducted it twice (o3d-y14).
+    // discountAmount, which the connector sends as a Xero DiscountRate.
+    // Sending both deducted it twice (o3d-y14).
     discountAmount: orderLevelDiscountAmount,
     discountAccountCode: settings.discountAccount || undefined,
     discountTaxType: invoiceTaxTypes.discount.type ?? undefined,
@@ -3529,7 +3555,7 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     // `subtotal` minus that line's share), and mapWcLineItems turns that difference into a per-line
     // discountAmount. IMS's ORDER-LEVEL discountAmount slot means the opposite — a discount that is
     // NOT in the lines — so it must carry only the residual, normally zero. Storing the coupon in
-    // both places made every consumer deduct it twice (o3d-y14): the Xero/QuickBooks builders send
+    // both places made every consumer deduct it twice (o3d-y14): the Xero builder sends
     // the per-line figure as a DiscountRate AND append the order-level figure as a negative line.
     //
     // STORE CREDIT IS A PAYMENT, NOT A DISCOUNT. Smart Coupons store credit reaches `coupon_lines[]`

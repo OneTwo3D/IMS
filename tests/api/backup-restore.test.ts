@@ -1825,7 +1825,7 @@ async function captureRestore(
 }
 
 test('the selection lock is held, by a session of its own, for the WHOLE restore', async () => {
-  const dump = "UPDATE settings SET value = 'true' WHERE key = 'plugin_quickbooks_enabled';\n"
+  const dump = "UPDATE settings SET value = 'true' WHERE key = 'plugin_woocommerce_enabled';\n"
   const { events, written, args, env } = await captureRestore(dump)
 
   assert.deepEqual(
@@ -1875,7 +1875,7 @@ test('a dump that COMMITS mid-stream is REFUSED, before anything is spawned or l
     "UPDATE settings SET value = 'false' WHERE key = 'plugin_xero_enabled';",
     'COMMIT;',
     'BEGIN;',
-    "UPDATE settings SET value = 'true' WHERE key = 'plugin_quickbooks_enabled';",
+    "UPDATE settings SET value = 'true' WHERE key = 'plugin_woocommerce_enabled';",
     '',
   ].join('\n'))
 

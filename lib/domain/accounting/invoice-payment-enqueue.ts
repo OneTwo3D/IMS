@@ -14,6 +14,7 @@ import { db } from '@/lib/db'
 import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
+import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import {
   accountingBankAccountBelongsTo,
   getActiveAccountingConnectorInfo,
@@ -183,8 +184,7 @@ export async function loadInvoicePaymentSyncRows(
       // ...and the mark it would have written, which identifies the attempt even if its amount or
       // date has since been corrected in the ledger.
       // REGISTRY-CHECKED, not a literal pair (o3d-remove-parked-connectors). `connector` here comes
-      // from a stored row, so it can name a connector this build no longer ships (rows stamped
-      // `quickbooks` still exist in development databases). Such a row gets a null marker, which the
+      // from a stored row, so it can name a connector this build no longer ships. Such a row gets a null marker, which the
       // caller reads as "no identifying mark" rather than inventing one.
       settlementMarker: isRegisteredAccountingConnector(connector)
         ? settlementMarkerFor(effectiveTokenFor(connector, { id: r.id, payload: r.payload }))
@@ -683,7 +683,7 @@ export type InvoicePaymentRedrive =
  * On the deferred path the recovery half is `followUpObligationRecoveryNote` over the REGISTRY's
  * declaration for the pinned connector, exactly as `releaseFollowUpObligation`, the Xero processor
  * and the sweep already do. Nothing about what re-drives a retained obligation is written as prose
- * here, on any connector: Xero's bound sweep and QuickBooks' "nothing does, READ AND ESCALATE" are
+ * here, on any connector: Xero's bound sweep and a retired connector's "nothing does, READ AND ESCALATE" are
  * both the registry's answers, not this module's guesses.
  */
 export function invoicePaymentRemedyNote(redrive: InvoicePaymentRedrive): string {
@@ -1517,7 +1517,7 @@ export async function registerInvoicePaymentWithLedger(params: {
     // Conditional on purpose: this is a network read, and the ordinary receipt has no history to check.
     const probeConnector = connectorId
     // o3d-r948 r6: the records, and nothing beside them. r5 carried the probe's organisation here
-    // too, so the decision's exclusion set could be scoped to the realm that answered; that
+    // too, so the decision's exclusion set could be scoped to the tenant that answered; that
     // exclusion is gone (see invoice-payment-registration.ts), and the provenance it needed was
     // itself unsound — two token snapshots either side of the fetch cannot see a reconnect across
     // it.
@@ -1788,6 +1788,10 @@ export async function registerInvoicePaymentWithLedger(params: {
       }
       const stillRecorded = await tx.payment.findUnique({ where: { id: params.paymentId }, select: { id: true } })
       if (!stillRecorded) return 'receipt-deleted' as const
+      // #1132 MED-4: no payment is registered against an invoice whose delete is pending (or waiting for review), read under the order lock the
+      // delete request takes. The receipt stays recorded in IMS; the delete's own late-activity check stops its unwind over it.
+      const deletePending = await pendingDeletionError(params.orderId, tx)
+      if (deletePending) return { deletePending } as const
       // o3d-ekn8 r2: and the order still points at the document this post returned. The check above ran
       // before the lock; the delete-and-re-post that moves it takes the same order lock, so this is the
       // read that actually decides. Without it the pin is only ever tested in a window that has since
@@ -1918,6 +1922,12 @@ export async function registerInvoicePaymentWithLedger(params: {
     // The capacity re-check under the lock refused it. A concurrent receipt for the same order took the
     // room this one was measured against, so it is reported exactly as if it had been refused up front
     // — the operator sees one message naming the reason, not a silent no-op.
+    if (typeof outcome === 'object' && 'deletePending' in outcome) {
+      await warn('invoice_payment_not_registered',
+        `The payment for order ${params.orderReference} is recorded in IMS but was NOT registered in the accounting system: ${outcome.deletePending}`,
+        { amount: amountNumber, currency: params.currency, refusal: 'DOCUMENT_DELETE_PENDING' })
+      return registeredFor.connector
+    }
     if (typeof outcome === 'object' && 'refused' in outcome) {
       await reportRefusal(outcome.refused)
       return registeredFor.connector
@@ -2092,7 +2102,7 @@ export async function registerDeferredOrderReceipts(
     // where nothing has been decided about them, so nothing may be discharged on their behalf.
     if (paymentsPost === null) return { settled: false, reason: 'posting-context-unknown', release: 'retained' }
 
-    // THE LINK NEVER LANDED (o3d-ekn8 r5, Codex HIGH). QuickBooks' `updateBackReference` catches its
+    // THE LINK NEVER LANDED (o3d-ekn8 r5, Codex HIGH). A connector's `updateBackReference` can swallow its
     // own failure, so the invoice can post while the order is left with no accountingInvoiceId at
     // all — and this function's old first line treated that exactly like "no receipts to register"
     // and returned in silence. Every receipt on this order then stayed unregistered, nothing said

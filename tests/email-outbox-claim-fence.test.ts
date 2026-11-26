@@ -3337,8 +3337,7 @@ test('r31: the enqueue contract says a delivery is QUEUED, not that one will hap
   // Codex r30 MEDIUM 1. `already_queued` establishes only that a matching PENDING or PROCESSING row
   // exists. That row may already be on the wire, and it may still end FAILED — the recipient is
   // suppressed, the send fails permanently, or the attempt budget is spent. "WILL be delivered" was
-  // therefore the same overclaim this branch removed from the operator-facing incident records
-  // (tests/accounting/qbo-invoice-email-queued-not-sent.test.ts asserts its absence there), left
+  // therefore the same overclaim this branch removed from the operator-facing incident records, left
   // standing in the enqueue contract and in the action comment that quotes it.
   const sites = [
     {

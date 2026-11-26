@@ -16,8 +16,8 @@
  *
  * WHY A HELPER RATHER THAN A COMMENT. The first fix reordered the statements and wrote down the rule
  * beside them. That works exactly as long as every future writer reads the comment — and this rule has
- * already been broken twice by writers who did not know it existed (the disconnect above, and the
- * QuickBooks disconnect that took its token row before its realm pin). A comment cannot be called; a
+ * already been broken twice by writers who did not know it existed (the disconnect above, and a
+ * second connector's disconnect that took its token row before its pin). A comment cannot be called; a
  * function can, and a function that RETURNS the statements in order cannot be called and then ignored.
  *
  * THE ORDER IS THE PIN WRITERS', AND IT IS NOT ARBITRARY. `settings.key` is a PRIMARY KEY, so of two
@@ -60,15 +60,9 @@
  */
 export const ACCOUNTING_BINDING_PIN_SETTING_KEYS = [
   'xero_expected_tenant_id',
-  // o3d-remove-parked-connectors: QuickBooks is archived and no code writes this row any more — but a
-  // development database that ran QuickBooks still HOLDS it, and this list is what a wholesale
-  // settings delete excludes so it cannot take the row in scan order and deadlock against the pin
-  // trigger. A retired key in an exclusion list costs nothing and removing it reopens exactly the
-  // cycle this module exists to close, on the one install where the row is present.
-  'quickbooks_expected_realm_id',
 ] as const
 
-/** The Xero release witness. The archived QuickBooks connector had no release receipt, so no witness row. */
+/** The Xero release witness. */
 export const ACCOUNTING_BINDING_WITNESS_SETTING_KEYS = ['xero_pin_release_witness'] as const
 
 /** Every binding row that lives in `settings`, for a bulk delete's exclusion list. */

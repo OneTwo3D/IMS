@@ -141,7 +141,7 @@ function isIpLiteral(host) {
  * cannot see it.
  *
  * WHY AN EXEMPTION IS RIGHT, AND NOT A WEAKENING. The trap's subject is a THIRD-PARTY VENDOR: Mintsoft
- * fulfils what it is sent, Xero and QuickBooks record what they are told. The database is not that. It is
+ * fulfils what it is sent, Xero records what it is told. The database is not that. It is
  * a dependency the run is HANDED, in its own environment variables, by whoever started it — and a test
  * that cannot reach it does not silently do something to somebody else's system, it fails.
  *

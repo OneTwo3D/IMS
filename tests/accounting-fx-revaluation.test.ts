@@ -22,17 +22,17 @@ function reversal(id: string, sourceEntryId: string, connector = 'xero') {
 }
 
 test('o3d-j625: the selection carries each prior revaluation\u2019s OWN connector', () => {
-  // The whole point of the MEDIUM 1 fix: a revaluation posted under QuickBooks, read back after a
-  // switch to Xero, must still say QuickBooks — its AR/AP control and unrealised-FX codes are
-  // QuickBooks's, and a reversal of them cannot be posted to Xero.
+  // The whole point of the MEDIUM 1 fix: a revaluation posted under another connector, read back
+  // while a different one is active, must still say so — its AR/AP control and unrealised-FX codes
+  // are that connector's, and a reversal of them cannot be posted to the active one.
   const result = selectPriorRevaluationsToReverse(
-    [revaluation('reval-qbo', '2026-06-01', 'receivable', 'quickbooks')],
+    [revaluation('reval-retired', '2026-06-01', 'receivable', 'retired-ledger')],
     '2026-06-02',
   )
   assert.equal(result.length, 1, 'precondition: the prior was selected at all')
   assert.equal(
     result[0].connector,
-    'quickbooks',
+    'retired-ledger',
     'the reversal must be attributable to the connector the SOURCE ROW was written under, not to '
     + 'whichever chart the caller happens to hold',
   )

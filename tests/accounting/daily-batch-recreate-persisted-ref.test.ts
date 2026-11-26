@@ -509,30 +509,20 @@ test('Xero: rows of one split batch stay one journal, and a second batch keeps i
 })
 
 // ---------------------------------------------------------------------------
-// THE QUICKBOOKS HALF OF THIS FILE IS DELETED (o3d-remove-parked-connectors)
+// ONE SWEEP TODAY
 // ---------------------------------------------------------------------------
 //
-// Fourteen `QuickBooks: …` cases ran the archived `lib/connectors/quickbooks/daily-sync.ts` sweep.
-// They were the twin of every Xero case above, and the reason they existed is stated in one of their
-// own comments: "a refusal that exists on one connector and not the other is how the two sweeps drift
-// back apart." There is no second sweep to drift from any more.
-//
-// One detail worth keeping in view for the next connector: QuickBooks' writer stamped the BARE
-// `<group>-<date>` reference with no entity digest, so two same-date batches shared one referenceId
-// and a digest split could not arise on it — while Xero's suffixes a digest. The o3d-0qoo defect
-// (a persisted `A1-2026-07-20` bucket also probing the derived `A1-2026-07-21` and being vouched for
-// by the NEXT day's live log) appeared on BOTH despite that difference, which is what made it a rule
-// about the probe rather than about a reference format. A connector that invents its own reference
-// format must be re-tested against it.
-//
-// Recoverable with the connector:
-// `git show archive/quickbooks-connector:tests/accounting/daily-batch-recreate-persisted-ref.test.ts`.
+// Every case above runs the one registered connector's sweep. A connector that invents its own
+// reference format (for example a bare `<group>-<date>` with no entity digest, where two same-date
+// batches would share one referenceId) must be re-tested against the o3d-0qoo defect — a persisted
+// `A1-2026-07-20` bucket also probing the derived `A1-2026-07-21` and being vouched for by the NEXT
+// day's live log — which is a rule about the probe, not about a reference format.
 
 // ---------------------------------------------------------------------------
 // o3d-o97 r3 — a debit nothing will ever relieve must not be rebuilt.
 // ---------------------------------------------------------------------------
 
-test('o3d-o97 r3: a FULLY REFUNDED order never has its A2 journal recreated (o3d-remove-parked-connectors: was "on either connector")', async () => {
+test('o3d-o97 r3: a FULLY REFUNDED order never has its A2 journal recreated', async () => {
   // Group A2 and Group B both exclude `refundStatus: FULL` for ever, so an A2 debit posted under
   // a fully-refunded order has nothing left in IMS that can relieve it. That used to be
   // unreachable here because the refund path always cleared the A2 stamp; it is reachable now,
@@ -544,7 +534,7 @@ test('o3d-o97 r3: a FULLY REFUNDED order never has its A2 journal recreated (o3d
   // rebuild it. Without the refundStatus exclusion the sweep would answer the refund's refusal by
   // posting a brand-new, permanently unrelievable debit under the very order being held open for
   // someone to resolve.
-  // ONE CONNECTOR TODAY (o3d-remove-parked-connectors); the loop is kept so a second sweep inherits
+  // ONE CONNECTOR TODAY; the loop is kept so a second sweep inherits
   // the case, and the per-`label` assertion messages still name which one failed.
   for (const [label, ref, run] of [
     ['xero', XERO_A2_REF, runXeroSweep],
@@ -782,12 +772,10 @@ test('o3d-i0o6 r4: an A2 batch worth less than a PENNY is not rebuilt as a £0.0
   // `totalAllocatedValueNumber`) and raise no log at all in that case, so the rebuild now asks the
   // same question the same way.
   //
-  // This was reachable on the archived QuickBooks writer in particular: its A2 pass rounded the
-  // per-order figure to 2dp only on the unshipped branch, so an order valued from shipment snapshots
-  // could contribute a sub-penny tail. Xero rounds unconditionally, so on Xero alone the case is a
-  // guard against a state Xero's own writer does not produce — kept because the RULE is about the
-  // rebuild, and the next connector may round like the archived one did.
-  // ONE CONNECTOR TODAY (o3d-remove-parked-connectors); the loop is kept so a second sweep inherits
+  // Xero rounds unconditionally, so on Xero alone the case is a guard against a state Xero's own
+  // writer does not produce — kept because the RULE is about the rebuild, and a later connector may
+  // round differently.
+  // ONE CONNECTOR TODAY; the loop is kept so a second sweep inherits
   // the case, and the per-`label` assertion messages still name which one failed.
   for (const [label, ref, run] of [
     ['xero', XERO_A2_REF, runXeroSweep],

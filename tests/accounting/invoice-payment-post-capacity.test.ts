@@ -193,9 +193,9 @@ test('a FAILED registration whose stored body was INCOMPLETE frees the capacity 
 // ---------------------------------------------------------------------------
 // CODEX ROUND 2, HIGH — THE ROW'S OWN RECORD IS THE SECOND PROOF THAT NOTHING WAS SENT.
 //
-// The body test can only clear failures a connector detects by READING the payload. Both connectors
-// also fail after that and before the send — QuickBooks on a customer reference or a bank account it
-// resolves from the database, Xero on a lost write lease or a refused money fence — and those rows
+// The body test can only clear failures a connector detects by READING the payload. A connector
+// can also fail after that and before the send — Xero on a lost write lease or a refused money
+// fence — and those rows
 // have complete payloads. Read as ambiguous, they terminally refuse every later receipt on the
 // invoice.
 // ---------------------------------------------------------------------------
@@ -307,7 +307,7 @@ test('ANOTHER receipt s registration against a DIFFERENT document consumes none 
 // the same receipt.
 //
 // The safety argument — "the old document has been deleted, so its payment went with it" — is an
-// assumption about a ledger this code never reads. On QuickBooks a deleted invoice leaves its
+// assumption about a ledger this code never reads. On some ledgers a deleted invoice leaves its
 // payment as an UNAPPLIED CREDIT: the customer is credited twice.
 //
 // This guard is the backstop, because it is the one gate no enqueue path can skip.
@@ -572,7 +572,7 @@ test('the guard SELECTS the attempt-provenance pair, and a pre-call row read fro
     logs: [
       { id: ENTRY, status: 'PROCESSING', payload: { amount: 100, accountingInvoiceId: 'INV-1', bankAccountId: 'bank-1' } },
       {
-        // The QuickBooks shape: complete body, refused on a customer reference before any call left.
+        // The pre-call shape: complete body, refused before any call left.
         id: 'receipt-a',
         status: 'FAILED',
         payload: { amount: 100, accountingInvoiceId: 'INV-1', bankAccountId: 'bank-1' },

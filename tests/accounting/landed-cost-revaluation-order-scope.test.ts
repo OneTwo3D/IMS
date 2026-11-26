@@ -142,9 +142,6 @@ test('o3d-zpa7: the chain that makes the race unreachable is pinned in every reg
     'the COGS-on-shipment shape of DAILY_BATCH_GROUP_B_SHIPMENT_WHERE must require accountingInvoiceId (ACC-H12 / o3d-zpa7)',
   )
 
-  // o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was
-  // checked against TWO independently-written implementations. It is now checked against one — and the
-  // shared-clause assertion above is what the second implementation used to corroborate.
   //
   // The roster is DERIVED from the accounting registry, not typed: a connector registered without a
   // `lib/connectors/<id>/daily-sync.ts` carrying these clauses fails here, and an empty registry fails
@@ -207,7 +204,6 @@ test('o3d-zpa7: only Group B writes shipmentJournalDate, so the chain has no sid
 
   assert.deepEqual(
     [...writers].sort(),
-    // o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
     ['lib/connectors/xero/daily-sync.ts'],
     'a writer of shipmentJournalDate outside daily-batch Group B would bypass Group A1 and break the '
     + 'o3d-zpa7 unreachability argument — the landed-cost enqueue would then be racing a real hard delete',

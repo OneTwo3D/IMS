@@ -689,7 +689,7 @@ test('r4: the warning for an unestablishable origin names a remedy that can actu
 // o3d-j625 r4 (SWEEP 2) — the sweep carries two document ids it reads off the tables into a XERO
 // allocation, so both must be recorded as Xero's. Fail closed on an unrecorded connector.
 for (const [label, cn, bill] of [
-  ['the BILL is recorded as QuickBooks\'', 'xero', 'quickbooks'],
+  ['the BILL is recorded against a retired connector', 'xero', 'retired-ledger'],
   ['the bill has NO recorded connector', 'xero', null],
   ['the CREDIT NOTE has no recorded connector', null, 'xero'],
 ] as const) {
@@ -733,7 +733,7 @@ test('o3d-j625 r6 H3: a refused allocation leaves the inbox when a later sweep q
     accountingCreditNoteId: 'XCN-H3',
     accountingCreditNoteConnector: 'xero',
     amountForeign: 40,
-    purchaseInvoice: { accountingInvoiceId: 'BILL-H3', accountingInvoiceConnector: 'quickbooks' },
+    purchaseInvoice: { accountingInvoiceId: 'BILL-H3', accountingInvoiceConnector: 'retired-ledger' },
   }]
   state.creditNotePosts = [{
     referenceId: 'cn-h3', externalTransactionId: 'XCN-H3', status: 'SYNCED',

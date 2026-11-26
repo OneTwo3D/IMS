@@ -110,13 +110,10 @@ const probeId = (label: string) => `I0O6R8-${label}-${process.pid}-${randomUUID(
  * round 7's HIGH was that passing it is not licence to write. Left on here so a refusal below can
  * only have come from the fence, never from `xero_sync_enabled`.
  *
- * ALLOCATION_REVERSAL and UNEARNED_REV_REVERSAL are in neither connector's per-type setting map, so
+ * ALLOCATION_REVERSAL and UNEARNED_REV_REVERSAL are in no connector's per-type setting map, so
  * their posting mode is the unconditional 'submitted' — nothing else to switch on.
  */
 async function startFromXeroActive(db: Db): Promise<void> {
-  // o3d-remove-parked-connectors: `plugin_quickbooks_enabled` and `quickbooks_sync_enabled` were
-  // seeded here too. QuickBooks is archived; the rows are no longer read by anything, so seeding them
-  // would be theatre.
   for (const [key, value] of [
     [INTEGRATION_PLUGIN_SETTING_KEYS.xero, 'true'],
     ['xero_sync_enabled', 'true'],
@@ -133,17 +130,12 @@ async function startFromXeroActive(db: Db): Promise<void> {
  * when COMMIT completed, which is what the order assertions are taken against.
  */
 /**
- * o3d-remove-parked-connectors — WHAT THE SWITCH IS NOW.
- *
- * This was `switchToQuickBooks`: it turned Xero's plugin off and QuickBooks' on, under the selection
- * lock, exactly as `saveIntegrationPluginState` does. QuickBooks is archived, so the switch is now
- * "turn the pinned ledger OFF" — which produces the SAME state the fence has to refuse on (the locked
+ * THE SWITCH is "turn the pinned ledger OFF", under the selection lock, exactly as
+ * `saveIntegrationPluginState` does. It produces the state the fence has to refuse on (the locked
  * read no longer resolves to the pinned connector) through the same writer and the same lock, and is
- * the state a real install reaches by disabling its accounting plugin.
- *
- * What is no longer raced is a switch BETWEEN two live ledgers. Every timing property this file
- * measures — that the fence's read WAITS on the switcher's lock, and that the verdict is taken after
- * it commits — is unchanged, because those are properties of the lock, not of the number of ids.
+ * the state a real install reaches by disabling its accounting plugin. Every timing property this
+ * file measures — that the fence's read WAITS on the switcher's lock, and that the verdict is taken
+ * after it commits — is a property of the lock, not of the number of connector ids.
  */
 type SwitchResult = {
   /** Wall-clock of the whole switch transaction (diagnostic). */

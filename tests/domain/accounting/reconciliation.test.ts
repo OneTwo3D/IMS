@@ -1018,7 +1018,7 @@ test('o3d-0qoo: persisted batch refs match the event a midnight-crossing batch m
 
 test('o3d-0qoo: legacy rows without a persisted ref still derive the source key from the stamp', () => {
   const rows = cleanRows()
-  // Pre-migration shape: stamps only. Bare QuickBooks-style references on both
+  // Pre-migration shape: stamps only. Bare (digest-less) references on both
   // sides, so the derived key still ties the source to its event exactly as before.
   rows.salesOrders[0] = {
     ...rows.salesOrders[0],

@@ -430,9 +430,9 @@ test('a lookup failure refuses rather than falling through to the delete', () =>
 })
 
 test('a connector this check cannot ask is refused rather than trusted', () => {
-  const refusal = refuseUnverifiableConnector('quickbooks')
+  const refusal = refuseUnverifiableConnector('retired-ledger')
   assert.equal(refusal.code, 'connector_not_supported')
-  assert.match(refusal.message, /quickbooks/)
+  assert.match(refusal.message, /retired-ledger/)
   assert.match(refusal.message, /unchecked claim/)
 })
 

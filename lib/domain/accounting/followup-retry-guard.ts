@@ -89,10 +89,10 @@ export type RetryCandidateRow = {
  * re-posts under ITS OWN token which the remote would deduplicate. THE SECOND HALF IS FALSE FOR
  * XERO: Xero retains an Idempotency-Key only for a short, documented window (minutes), after
  * which the same key is processed as a brand-new request. A MANUAL retry is by nature minutes
- * to days after the failure, so it is essentially never inside that window. QuickBooks does
- * replay by `requestid`, so the same-token case is better protected there -- but the guard cannot
- * be correct on one connector only, and the cross-token case (A never landed, replacement B is
- * SYNCED, retrying A posts a second payment beside B) is unprotected on BOTH.
+ * to days after the failure, so it is essentially never inside that window. A connector that does
+ * replay by request id would protect the same-token case better -- but the guard cannot be
+ * correct on one connector only, and the cross-token case (A never landed, replacement B is
+ * SYNCED, retrying A posts a second payment beside B) is unprotected without it.
  *
  * I also excluded CANCELLED as "proven never attempted". It is not: a row whose remote call
  * COMMITTED but whose response was lost is returned to PENDING for retry, and deleting the
@@ -444,10 +444,9 @@ export function deferredRevivalReason(reference: string, kept: string): string {
 /**
  * The token a row actually posted under.
  *
- * Connector-specific ON PURPOSE. QuickBooks has always honoured the generic queue's
- * `_idempotencyKey`; Xero's payment branches have always ignored it and derived from the row
- * id. Folding them together here would misreport one connector's history and could refuse — or
- * worse, allow — the wrong retries.
+ * Connector-specific ON PURPOSE: Xero's payment branches ignore the generic queue's
+ * `_idempotencyKey` and derive from the row id, so the token is the stamped follow-up key when one
+ * is present and the row id otherwise.
  */
 export function effectiveTokenFor(
   connector: AccountingConnectorId,
@@ -455,23 +454,6 @@ export function effectiveTokenFor(
 ): string {
   const stamped = readFollowUpIdempotencyKey(row.payload)
   if (stamped) return stamped
-  // o3d-remove-parked-connectors: the generic-`_idempotencyKey` fallback below was the QUICKBOOKS
-  // branch, and it is archived with the connector. It is left here, unreachable while one connector
-  // is registered, because the rule it encodes is a per-connector one that must not be folded into
-  // Xero's: Xero's payment branches have always ignored `_idempotencyKey` and derived from the row
-  // id, so applying QuickBooks' reading to Xero would misreport one connector's history and could
-  // allow the wrong retry. `connector` is compared against a value the union no longer contains,
-  // which `tsc` reports as a no-overlap comparison — hence the explicit widening.
-  if ((connector as string) === 'quickbooks') {
-    const generic = asPayload(row.payload)?._idempotencyKey
-    // `typeof === 'string'`, NOT a truthiness or trim check — this must mirror
-    // getIdempotencySource EXACTLY. That accepts an empty string as the source, so two rows
-    // both carrying `_idempotencyKey: ''` post under the SAME token; requiring a non-blank
-    // value here gave them their row ids instead, two distinct tokens, and refused a retry
-    // that was safe. A guard that reasons about a token the connector will not actually send
-    // is worse than no guard, and it fails in the stranding direction.
-    if (typeof generic === 'string') return generic
-  }
   return row.id
 }
 

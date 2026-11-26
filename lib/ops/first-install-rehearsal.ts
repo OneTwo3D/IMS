@@ -460,6 +460,8 @@ export const FORBIDDEN_ENV_PATTERNS: readonly RegExp[] = [
   // wms-connector-boundary-ok: o3d-zjsb5.2: an env-name prefix this guard REFUSES; it names no connector flow
   /^MINTSOFT/,
   /^XERO/,
+  // The next four are retired connectors' credential prefixes: nothing reads them, but a
+  // host that still carries one is not the throwaway environment this guard is for.
   /^QB_/,
   /^QUICKBOOKS/,
   /^SHOPIFY/,

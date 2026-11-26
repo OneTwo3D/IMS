@@ -58,8 +58,8 @@ type PriorRevaluation = {
    * read back out of `AccountingSyncLog.payload`. r1 attributed that reversal to `settings.connector`
    * — this run's chart — which is a statement about a different read entirely: `getPriorRevaluations`
    * neither selected nor filtered the source row's connector, so a revaluation posted under
-   * QuickBooks before a switch to Xero would have had its reversal routed to XERO carrying
-   * QuickBooks's AR/AP control and unrealised-FX codes. That is the very mis-attribution o3d-j625 is
+   * a connector other than the active one (e.g. a retired connector id) would have had its reversal
+   * routed to the ACTIVE connector carrying the other connector's AR/AP control and unrealised-FX codes. That is the very mis-attribution o3d-j625 is
    * about, arrived at through the one site whose codes do not come from the settings object beside it.
    *
    * Carried off the row, therefore, and used as the reversal's `chartConnector`. Kept as a raw
@@ -335,10 +335,11 @@ export async function reportAssertedRevaluationRows(
  *
  * This decides whether to SKIP the fresh revaluation. r2 declared that out of scope and unproven on the
  * grounds that it "only decides whether to skip work" — which is the defect, not the defence: the work
- * it skips is the writing of a journal, so a wrong `true` here is a journal silently not written. Xero
- * revalues on the 9th; the operator switches to QuickBooks that afternoon; the run reads Xero's row,
- * answers `true`, and QuickBooks' revaluation — whose lines come from QuickBooks' own AR/AP control and
- * unrealised-FX accounts, and which no Xero row can stand in for — never happens. Nothing reports it,
+ * it skips is the writing of a journal, so a wrong `true` here is a journal silently not written. One
+ * connector revalues on the 9th; the active connector then changes to a different one that afternoon;
+ * the run reads the first connector's row, answers `true`, and the new connector's revaluation — whose
+ * lines come from its own AR/AP control and unrealised-FX accounts, and which no other connector's row
+ * can stand in for — never happens. Nothing reports it,
  * because skipping is the designed behaviour when the answer is `true`.
  *
  * Scoped to the connector whose chart this run is about, therefore. The idempotency keys the

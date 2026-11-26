@@ -79,12 +79,12 @@ let activeConnectorSwitchesAfterNextReadTo: { id: string } | null | undefined
  * type — so a connector switched away from is typically not in here, and a pinned enqueue to it
  * writes nothing rather than writing to the other ledger.
  */
-let accountingConnectorsThatPost = new Set(['xero', 'quickbooks'])
+let accountingConnectorsThatPost = new Set(['xero', 'retired-ledger'])
 
 /** Each connector's own chart of accounts. Two different charts, because that is the point. */
 const ACCOUNTING_ACCOUNTS: Record<string, { inventoryAccount: string; allocatedInventoryAccount: string }> = {
   xero: { inventoryAccount: '630', allocatedInventoryAccount: '631' },
-  quickbooks: { inventoryAccount: '730', allocatedInventoryAccount: '731' },
+  'retired-ledger': { inventoryAccount: '730', allocatedInventoryAccount: '731' },
 }
 
 function resetAccountingQueue(outcome: 'writes' | 'silent-no-op' | 'shadowed' | 'asserted-only' = 'writes'): void {
@@ -93,7 +93,7 @@ function resetAccountingQueue(outcome: 'writes' | 'silent-no-op' | 'shadowed' | 
   accountingEnqueueOutcome = outcome
   activeAccountingConnector = { id: 'xero' }
   activeConnectorSwitchesAfterNextReadTo = undefined
-  accountingConnectorsThatPost = new Set(['xero', 'quickbooks'])
+  accountingConnectorsThatPost = new Set(['xero', 'retired-ledger'])
   lockedAllocationRecords = null
 }
 
@@ -5586,18 +5586,18 @@ test('o3d-i0o6: NOTHING is credited when the A2 journal was CANCELLED', async ()
 })
 
 test('o3d-i0o6: NOTHING is credited on a connector that never held the debit', async () => {
-  // A2 debited Allocated Inventory on XERO. The connector has since been switched to QuickBooks, and
-  // `queueAccountingSyncTx` raises on whatever is active NOW. The old rule would credit QuickBooks
+  // A2 debited Allocated Inventory on XERO. The connector has since been switched to another connector, and
+  // `queueAccountingSyncTx` raises on whatever is active NOW. The old rule would credit the other connector
   // £16 for a debit that is sitting in Xero — TWO errors in one journal: £16 moved in books that
   // never held it, and the Xero £16 left standing for ever.
   const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED', connector: 'xero' })
   resetAccountingQueue()
-  activeAccountingConnector = { id: 'quickbooks' }
+  activeAccountingConnector = { id: 'retired-ledger' }
 
   await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
   assert.deepEqual(queuedAccountingSyncs.map((sync) => sync.type), [])
-  assert.match(String(reversalRefusals()[0]?.description), /A2 debited Allocated Inventory on xero, but this reversal would be raised on quickbooks/)
+  assert.match(String(reversalRefusals()[0]?.description), /A2 debited Allocated Inventory on xero, but this reversal would be raised on retired-ledger/)
 })
 
 test('o3d-i0o6: NOTHING is credited against an account A2 never debited', async () => {
@@ -5671,28 +5671,28 @@ test('o3d-i0o6: NOTHING is credited when the ledger this credit would land in is
 test('o3d-i0o6 r7: a connector that switches after the proof queues NOTHING — and claims no relief', async () => {
   // r2 WROTE THIS TEST THE OTHER WAY ROUND, and r7 (Codex round 6, HIGH 1) reverses its assertion.
   //
-  // r2's finding was real and is unchanged: an UNPINNED enqueue here writes a QuickBooks credit
+  // r2's finding was real and is unchanged: an UNPINNED enqueue here writes a credit on the other connector
   // against a Xero debit — money out of an account that never held it. The pin fixed that. What r2
   // then asserted was that the pinned row IS WRITTEN, to Xero, and that £16 of relief is recorded
   // against it. Both halves are the defect r7 closes:
   //
   //   `xero_sync_enabled` is a different setting from `plugin_xero_enabled`, and a switch moves only
   //   the second. So the pinned enqueue passed its own gate and wrote a PENDING Xero row, while
-  //   `app/api/cron/accounting-sync` had already taken the QuickBooks branch and returned. Nothing
+  //   `app/api/cron/accounting-sync` had already taken the other connector's branch and returned. Nothing
   //   SCHEDULED drains it. `assertAllocationReversalQueued` then asked the database for the row —
   //   the right question — found it, and the caller added £16 to `allocationReversalAmount`, which
   //   is what a later refund nets its open Allocated Inventory balance against. Unposted pounds read
   //   as relief; every later refund under-credits Allocated Inventory by that much.
   //
-  // The pin still does the job r2 gave it — it is what stops the credit landing in QuickBooks — but
+  // The pin still does the job r2 gave it — it is what stops the credit landing on the other connector — but
   // it may not also license a write to a ledger nothing scheduled is servicing. See
   // `pinnedLedgerIsServiced` in lib/accounting.ts for why this refuses rather than queueing and
   // declining to count it (the manual Sync button can still drain such a row, so not counting it
   // would create the symmetric double-credit).
   const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED' })
   resetAccountingQueue()
-  // The setting moves to quickbooks the instant the proof has read it — the window nothing closes.
-  activeConnectorSwitchesAfterNextReadTo = { id: 'quickbooks' }
+  // The setting moves to another connector the instant the proof has read it — the window nothing closes.
+  activeConnectorSwitchesAfterNextReadTo = { id: 'retired-ledger' }
 
   await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
@@ -5740,8 +5740,8 @@ test('o3d-i0o6 r2: a switch AWAY from the proved ledger queues nothing and claim
   // never to credit the ledger that happens to be switched on.
   const state = withA2Journal(shrunkState({ lineQty: 6, record: POSTED_TEN_AT_FOUR }), { status: 'SYNCED' })
   resetAccountingQueue()
-  activeConnectorSwitchesAfterNextReadTo = { id: 'quickbooks' }
-  accountingConnectorsThatPost = new Set(['quickbooks'])
+  activeConnectorSwitchesAfterNextReadTo = { id: 'retired-ledger' }
+  accountingConnectorsThatPost = new Set(['retired-ledger'])
 
   await allocateSalesOrder(createClient(state), { orderId: 'order-1' })
 
@@ -5750,7 +5750,7 @@ test('o3d-i0o6 r2: a switch AWAY from the proved ledger queues nothing and claim
   assert.equal(
     state.order.allocationReversalAmount ?? 0,
     0,
-    'so NO relief is claimed. Unpinned, £16 lands in quickbooks and is recorded as relief against a '
+    'so NO relief is claimed. Unpinned, £16 lands in retired-ledger and is recorded as relief against a '
     + 'xero debit — which then shrinks the refund\'s open balance and strands the real £16 for ever',
   )
   const dropped = activityLogWrites.filter((row) => row.action === 'allocation_reversal_unqueued')

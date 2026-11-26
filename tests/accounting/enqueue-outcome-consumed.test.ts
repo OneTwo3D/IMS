@@ -44,7 +44,7 @@ import { balancedFrom, blankNonCode, ownProperty, productionSources, aliasesOf }
  * existed for, escaping it by using a name it did not know. So the census now covers every function that
  * INSERTS an accounting sync row and can decline:
  *
- *   queueXeroSync / queueQuickBooksSync   the connector queues the facade delegates to
+ *   queueXeroSync                         the connector queue the facade delegates to
  *   enqueueFollowUpSyncLog                each connector's follow-up enqueuer (payments, PDFs, attachments,
  *                                         credit-note allocations)
  *
@@ -60,7 +60,6 @@ const CALLEES = [
   'queueAccountingSyncTx',
   'queueAccountingSync',
   'queueXeroSync',
-  'queueQuickBooksSync',
   'enqueueFollowUpSyncLog',
 ] as const
 
@@ -211,13 +210,9 @@ test('[o3d-j625 r3] every production accounting enqueue HANDS ITS ANSWER TO SOME
   // round 3 (plus the adapter's own call inside lib/accounting.ts). A floor, so a new site does not fail
   // this for the wrong reason; printed, so a shrinking sweep is visible.
   console.log(`[o3d-j625 r3] enqueue call sites examined: ${sites.length}`)
-  // o3d-j625 r4: 46 — the r3 27 facade calls plus the direct connector queue calls (`queueXeroSync`,
-  // `queueQuickBooksSync`, both processors' `enqueueFollowUpSyncLog`) the census now also covers.
-  //
-  // o3d-j625 r12 (merging o3d-remove-parked-connectors): 38. The eight sites that went are the ones in
-  // `lib/connectors/quickbooks/{sync-processor,queue,daily-sync}.ts`, which are archived — the floor
-  // follows the SUBJECTS, and it is lowered by exactly the number that left rather than to whatever the
-  // sweep happens to find. Every remaining site is still checked by the assertion below; the floor exists
+  // o3d-j625 r4: the r3 27 facade calls plus the direct connector queue calls (`queueXeroSync`,
+  // `enqueueFollowUpSyncLog`) the census also covers. The floor follows the SUBJECTS rather than
+  // whatever the sweep happens to find. Every remaining site is still checked by the assertion below; the floor exists
   // only so a sweep that stops seeing its subjects cannot pass by finding nothing.
   assert.ok(sites.length >= 38, `expected at least 38 enqueue call sites, found ${sites.length}: the detector is not seeing its subjects`)
 
@@ -250,10 +245,6 @@ test('[o3d-j625 r3] the census covers every file r3 enumerated', () => {
     // o3d-j625 r4: the direct connector queue callers.
     'lib/domain/sales/sales-invoice-update-sync.ts',
     'lib/connectors/xero/sync-processor.ts',
-    // o3d-j625 r12: `lib/connectors/quickbooks/sync-processor.ts` was here and is archived
-    // (o3d-remove-parked-connectors). Removed rather than left to fail — the census cannot examine a file
-    // outside the build — and the loss is recorded in o3d-5ktph: nothing now checks that a SECOND
-    // connector's processor consumes its enqueue answers.
   ]) {
     assert.ok(files.has(expected), `the census no longer examines ${expected}`)
   }
@@ -328,7 +319,7 @@ test('[o3d-j625 r4] FIRES on a discarded DIRECT connector queue call — the sal
     await deps.logActivity({ action: 'sales_invoice_update_queued' })
   `), ['DISCARDED'])
   assert.deepEqual(verdicts(`
-    await queueQuickBooksSync({ type: 'X', payload })
+    await queueXeroSync({ type: 'X', payload })
     const outcome = await enqueueFollowUpSyncLog('INVOICE_PDF', ref, id, payload, origin)
   `), ['DISCARDED', 'STORED-UNREAD'])
 })

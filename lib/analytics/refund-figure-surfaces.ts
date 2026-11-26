@@ -155,17 +155,16 @@ export const RETURNS_EXCHANGE_NOTICE =
 // ---------------------------------------------------------------------------------------------
 
 /**
- * o3d-remove-parked-connectors — FIVE ENTRIES WERE REMOVED WITH THE QUICKBOOKS CONNECTOR.
+ * o3d-remove-parked-connectors — FIVE ENTRIES WERE REMOVED WITH A RETIRED CONNECTOR.
  *
- * `app/actions/quickbooks-{sync,daily-batch}.ts` and `lib/connectors/quickbooks/{daily-sync,
- * payment-poller,settings}.ts`, all classified `not-refund-sensitive` ("ledger posting / out of scope
- * by owner instruction"). `tests/analytics/refund-figure-surface-coverage.test.ts` refuses a STALE
- * entry — one naming a file the tree no longer has — so they had to go in the same commit as the
- * archive.
+ * Five files of a retired connector, all classified `not-refund-sensitive` ("ledger posting / out of
+ * scope by owner instruction"), left the tree. `tests/analytics/refund-figure-surface-coverage.test.ts`
+ * refuses a STALE entry — one naming a file the tree no longer has — so they had to go in the same
+ * commit as the removal.
  *
  * THIS CENSUS IS NOT LEFT VACUOUS BY THAT: its population is every file in the tree that mentions a
  * refund-sensitive figure name, the sweep is re-run from the tree on every test run, and 80-odd
- * entries remain. What changed is only that the five QuickBooks files are no longer in the tree to
+ * entries remain. What changed is only that the five retired-connector files are no longer in the tree to
  * classify.
  */
 export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
@@ -443,11 +442,11 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'Unearned-revenue account setting key, named so the reconciliation pack basis can read the configured code. No revenue figure is computed.',
   },
   {
-    file: 'app/actions/xero-sync.ts',
+    file: 'lib/connectors/xero/readiness-accounts.ts',
     figures: ['xero_unearned_revenue_account'],
     treatment: 'not-refund-sensitive',
     reason:
-      'Unearned-revenue account setting key.',
+      'Unearned-revenue account setting key (the readiness list moved here from app/actions/xero-sync.ts, o3d-n2ci4).',
   },
   {
     file: 'app/api/export/analytics/route.ts',

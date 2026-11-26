@@ -269,12 +269,12 @@ export type AllocationDebitBatchRow = {
  * money defect:
  *
  *   * the recreate sweep probes for a live log with `connector` in the WHERE clause, so a batch that
- *     posted on QuickBooks is INVISIBLE to Xero's sweep — it reads as missing;
+ *     posted on another connector is INVISIBLE to Xero's sweep — it reads as missing;
  *   * the share it rebuilt was every pass that named the reference, on ANY ledger.
  *
  * Put together: after a connector switch, one sweep rebuilds the OTHER ledger's journal into its
- * own accounts. The QuickBooks debit stands, a duplicate Xero debit appears, and the pass history
- * still proves only the QuickBooks one — so no refund will ever reverse the duplicate.
+ * own accounts. The other connector's debit stands, a duplicate Xero debit appears, and the pass history
+ * still proves only the other connector's one — so no refund will ever reverse the duplicate.
  *
  * The passes have carried `connector` and `accountCode` since r3. Using them is the whole fix: a
  * sweep rebuilds THE POUNDS ITS OWN LEDGER'S PASSES PUT INTO THE BATCH, and nothing else. Each
@@ -580,10 +580,10 @@ export function allocationPassRaisedNoJournalByDesign(passesJson: unknown, batch
  *
  *   Day one, on Xero: batch R1, journal J1, £50.
  *   The declared rewrite un-stages the order; the £50 stands.
- *   Day two, after a switch to QuickBooks: batch R2, journal J2, £25. The order is re-stamped R2.
+ *   Day two, after a switch to another connector: batch R2, journal J2, £25. The order is re-stamped R2.
  *
  *   J1 now goes missing. NEITHER sweep does anything about it. Xero's builds no R1 bucket at all
- *   (the order's stamp says R2), so there is nothing to rebuild and nothing to report; QuickBooks'
+ *   (the order's stamp says R2), so there is nothing to rebuild and nothing to report; the other connector's
  *   builds only R2, and `allocationDebitShareOfBatch` filtered the passes to R2 as well, so the Xero
  *   pass was not in `foreign` either. Round 6 added "report on every run" for pounds nobody will
  *   rebuild, and it was blind in precisely the cumulative cross-ledger history the whole branch

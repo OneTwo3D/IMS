@@ -8,7 +8,7 @@ import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
  * o3d-5r8 made the hard delete lock the order, check for live accounting/WMS work, and only then
  * delete. That is only half a protocol: the side that WRITES never took part.
  *
- * `queueXeroSync` / `queueQuickBooksSync` create their `AccountingSyncLog` row in their own
+ * `queueXeroSync` creates its `AccountingSyncLog` row in its own
  * transaction, with no order lock and no existence check — and `AccountingSyncLog` has no foreign
  * key to `SalesOrder`, so nothing at the database level objects either. A poster can therefore
  * hold a payload snapshot taken before the delete, insert its PENDING row AFTER the delete guard
@@ -19,7 +19,7 @@ import { roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
  * creates the sync row, and re-read the order. Then the two serialise — whichever gets the lock
  * first wins, and the loser sees the other's committed outcome instead of a stale snapshot.
  *
- * SCOPE — this covers `queueXeroSync` / `queueQuickBooksSync`, which open their OWN transaction.
+ * SCOPE — this covers `queueXeroSync`, which opens its OWN transaction.
  * It does NOT cover `queueAccountingSyncTx`, which writes inside a CALLER's transaction and is
  * used for order-scoped documents too (`referenceType: 'Shipment'` from cost-layers.ts, and the
  * refund COGS reversal from app/actions/sales.ts). Guarding that variant is not a matter of

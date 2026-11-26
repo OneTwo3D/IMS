@@ -4,8 +4,8 @@ import test, { mock } from 'node:test'
 // ---------------------------------------------------------------------------
 // ROUND 8 (Codex HIGH) — "A FAILED ROW NEVER WENT AT ALL" WAS AN ABSENCE READ AS A NEGATIVE ANSWER.
 //
-// The QuickBooks no-identifier record tells an operator how to read the email outbox after a
-// replay. Round 7 ended that instruction with "a FAILED row never went at all", which is a claim
+// The no-identifier incident record tells an operator how to read the email outbox after an
+// invoice-email incident. Round 7 ended that instruction with "a FAILED row never went at all", which is a claim
 // about the WORLD made from a field that only records what IMS managed to write down.
 //
 // `processPendingEmailOutbox` stamps SENT only AFTER `sendEmail` has returned, and that stamp is
@@ -245,27 +245,25 @@ test('ROUND 9 (Codex HIGH): a delivered copy is not relabelled by a later suppre
 })
 
 // MUTATION THAT KILLS THIS (run): restore "a FAILED row never went at all", or round 8's "ONE
-// FAILED PATH IS CONCLUSIVE … that copy was never sent", to the INVOICE_EMAIL `check` in
+// FAILED PATH IS CONCLUSIVE … that copy was never sent", to the INVOICE_EMAIL remedy in
 // lib/domain/accounting/unrecorded-posted-document.ts — the first fails the first assertion, the
 // second fails the round-9 block.
 test('ROUND 9: the record describes FAILED as missing confirmation, and calls NO failed row conclusive', async () => {
-  const { describeUnpersistedQboPost } = await import('@/lib/domain/accounting/unrecorded-posted-document')
-  const description = describeUnpersistedQboPost(
-    { entry: { id: 'log-1', type: 'INVOICE_EMAIL', referenceType: 'SalesOrder', referenceId: 'order-1' }, postedExternalId: null },
-    new Error('write conflict'),
-  )
+  const { describeUnrecordablePostedDocument } = await import('@/lib/domain/accounting/unrecorded-posted-document')
+  const description = describeUnrecordablePostedDocument({
+    entry: { id: 'log-1', type: 'INVOICE_EMAIL', referenceType: 'SalesOrder', referenceId: 'order-1' },
+    postedExternalId: null,
+    reason: 'ROW_MISSING',
+    namedExternalId: null,
+  })
 
   assert.doesNotMatch(description, /never went at all/, 'FAILED is not proof of non-delivery')
   assert.match(description, /A FAILED ROW IS NOT PROOF THAT NOTHING WENT/)
-  assert.match(description, /HOLDS NO DURABLE CONFIRMATION OF DELIVERY/)
 
   // ROUND 9: the split round 8 added is gone, because the test above disproves it.
   assert.doesNotMatch(description, /ONE FAILED PATH IS CONCLUSIVE/)
   assert.doesNotMatch(description, /EVERY OTHER FAILED ROW IS AMBIGUOUS/)
   assert.doesNotMatch(description, /that copy was never sent/)
-  assert.match(description, /NO FAILED ROW PROVES A COPY WAS NEVER SENT/)
-  assert.match(description, /NOT EVEN "Suppressed recipient:"/, 'the prefix is named as NOT a discriminator')
-  assert.match(description, /speaks for the attempt that wrote it and for no attempt before it/)
   assert.match(description, /o3d-ch0h/, 'and the durable per-attempt outcome that would settle it is filed')
   assert.match(description, /lastError/, 'the operator still has to read the field the claim was made from')
 })

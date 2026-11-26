@@ -430,7 +430,7 @@ const SHAPES: Shape[] = [
   {
     label: 'a different CONNECTOR is a different document',
     event: {},
-    syncLogs: [{ status: 'PENDING', connector: 'quickbooks' }],
+    syncLogs: [{ status: 'PENDING', connector: 'retired-ledger' }],
     reported: false,
   },
   {

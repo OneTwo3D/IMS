@@ -43,6 +43,7 @@ mock.module('@/lib/domain/sales/refund-delete-service', {
   namedExports: {
     evaluateRefundDeletion: async (_c: unknown, id: string) => { state.evaluateCalls.push(id); return { eligible: id === 'r1', refusals: id === 'r1' ? [] : [{ code: 'stock_moved', message: 'moved' }], plan: null, alreadyDeleted: false } },
     deleteSalesOrderRefund: async (_c: unknown, input: Record<string, unknown>) => { state.serviceCalls.push(input); return state.serviceResult },
+    markRefundDeleteFollowUpsDone: async () => {},
   },
 })
 

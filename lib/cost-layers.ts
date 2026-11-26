@@ -384,7 +384,7 @@ async function queueShipmentCogsRevaluationSync(
   //
   //   this enqueue runs only for a shipment with shipmentJournalDate set (the caller's branch)
   //     -> shipmentJournalDate is written only by daily-batch Group B, whose selection requires
-  //        `order.revenueDeferredDate != null` (xero/daily-sync.ts, quickbooks/daily-sync.ts)
+  //        `order.revenueDeferredDate != null` (xero/daily-sync.ts)
   //     -> revenueDeferredDate is stamped only by Group A1, whose selection requires
   //        `accountingInvoiceId != null`
   //     -> deleteSalesOrder refuses UNCONDITIONALLY on a non-null accountingInvoiceId

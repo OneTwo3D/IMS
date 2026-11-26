@@ -6,10 +6,8 @@ import path from 'node:path'
 import type { AccountingSyncType } from '@/app/generated/prisma/client'
 import {
   OPERATION_SEMANTIC_BY_TYPE,
-  QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
   UNRECORDED_POSTED_DOCUMENT_ACTION,
   classifyUnrecordedIncident,
-  describeUnpersistedQboPost,
   describeUnrecordablePostedDocument,
   ledgerTargetIdFromPayload,
   remedyForStoredIncident,
@@ -25,7 +23,7 @@ import {
 //
 // THE HIGH. Round 11 closed the no-effect message with "IF YOU WANT THE REPLAY TO STAY A NO-OP,
 // LEAVE ATTACHMENT UPLOAD DISABLED … Leave it as it is until the write failure above is fixed."
-// `externalEffect: NONE` proves only that `quickbooks_sync_attach_pdf` read "false" WHEN THIS
+// `externalEffect: NONE` proves only that the attach-PDF setting read "false" WHEN THIS
 // ATTEMPT RAN. Nothing rereads it. This record is permanent — exempt from retention AND from the
 // factory reset — and the setting is not. On an install where somebody enabled uploads in between,
 // "leave it as it is" left them ON, and stale-claim recovery then uploaded an attachment on every
@@ -56,91 +54,6 @@ const RATE = {
   referenceType: 'TaxRate', referenceId: 'rate-3',
 }
 
-const QBO_MADE_NAMED_BILL =
-  'QuickBooks BILL_ATTACHMENT for PurchaseOrder po-1 SUCCEEDED — the external effect has '
-  + 'happened — but IMS could not record that it did: Error: write conflict. THIS OPERATION '
-  + 'RETURNS NO IDENTIFIER AND NO REQUEST ID PROTECTS IT: unlike a document post it is not sent '
-  + 'under a derived Intuit Request-Id, so there is nothing for QuickBooks or WooCommerce or a '
-  + 'mail server to deduplicate it against. Sync row log-1 was left holding this worker\'s claim, '
-  + 'with no mirrored accounting event written, so once that claim goes stale THE SWEEP WILL '
-  + 'RECLAIM THE ROW AND RUN THE OPERATION AGAIN OUTRIGHT — the supplier invoice PDF is uploaded '
-  + 'to QuickBooks bill QBO-BILL-77 AGAIN, once per sweep, unbounded, because no retry is '
-  + 'consumed while the row never leaves PROCESSING. WHAT TO DO ABOUT THE EFFECT: Find that bill '
-  + 'in QuickBooks by the ledger document id above and remove any duplicate attachment. HOW TO '
-  + 'STOP MORE OF IT: turn QuickBooks sync OFF. The control is the checkbox at the top of the '
-  + 'SYNC tab of the QuickBooks connector panel, and it writes the setting '
-  + 'quickbooks_sync_enabled. IT IS LABELLED "Enable Xero Sync" EVEN THERE, and its helper text '
-  + 'says Xero too: the QuickBooks panel renders the Xero client and those two strings are '
-  + 'hardcoded. The words are wrong; the checkbox is the right one. (Filed as o3d-m9wm.) The '
-  + 'stale-claim sweep and the manual Sync button both READ that setting before they call the '
-  + 'QuickBooks processor, so while it is off neither one STARTS another run. It stops EVERY '
-  + 'QuickBooks row, not this one, and it recalls nothing already queued or already done. THEN '
-  + 'LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE. Both of those call sites read the '
-  + 'setting and then call the processor with nothing in between, so a run admitted a moment '
-  + 'before you flipped it keeps going: it can claim THIS row afterwards, run the operation '
-  + 'again, and then write over the row — the write that records a QuickBooks post updates the '
-  + 'row BY ID ALONE, with no claim token, no attempt revision and no status check, so it lands '
-  + 'on whatever the row says by then. That claim also leaves the row at attempt revision 0, '
-  + 'which is indistinguishable from the abandoned attempt in front of you. Nothing in IMS '
-  + 'reports whether such a run is still going, so there is no moment you can point at and call '
-  + 'this row quiet. SO DO NOT CLOSE THIS ROW YOURSELF, AND DO NOT TURN QUICKBOOKS SYNC BACK ON '
-  + 'TO FINISH THE JOB. Leave the toggle off and ESCALATE sync row log-1, with this record, to '
-  + 'whoever administers this installation: closing it safely needs someone who can read the '
-  + 'database directly, and the machinery that would make an operator remedy sound is filed as '
-  + 'o3d-4b5p (a quiescence fence the cron, the manual sync, the claim and the writeback all '
-  + 'honour) and o3d-3lhp (a per-row remediation, and a way to cancel a queued email). ONE THING '
-  + 'ON SCREEN IS ACTIVELY WRONG AND YOU WILL SEE IT: the accounting log renders a settle control '
-  + 'for every FAILED or PROCESSING row, and on this one it resolves to the words "not '
-  + 'settleable" with its reason as the tooltip. DO NOT FOLLOW THAT TOOLTIP. It is the generic '
-  + 'reason, written for a connector that stamps attempt revisions, and it tells you to retry the '
-  + 'row until it shows one: QuickBooks never stamps one, so no number of retries will ever make '
-  + 'an attempt appear — and every retry is another replay of the effect above. This is the known '
-  + 'hole o3d-qn21. Until the work above lands, this record is the only thing that says the '
-  + 'effect repeated.'
-
-const QBO_MADE_UNNAMED_BILL =
-  'QuickBooks BILL_ATTACHMENT for PurchaseOrder po-1 SUCCEEDED — the external effect has '
-  + 'happened — but IMS could not record that it did: Error: write conflict. THIS OPERATION '
-  + 'RETURNS NO IDENTIFIER AND NO REQUEST ID PROTECTS IT: unlike a document post it is not sent '
-  + 'under a derived Intuit Request-Id, so there is nothing for QuickBooks or WooCommerce or a '
-  + 'mail server to deduplicate it against. Sync row log-1 was left holding this worker\'s claim, '
-  + 'with no mirrored accounting event written, so once that claim goes stale THE SWEEP WILL '
-  + 'RECLAIM THE ROW AND RUN THE OPERATION AGAIN OUTRIGHT — the supplier invoice PDF is uploaded '
-  + 'to that bill in QuickBooks AGAIN, once per sweep, unbounded, because no retry is consumed '
-  + 'while the row never leaves PROCESSING. WHAT TO DO ABOUT THE EFFECT: THIS RECORD DOES NOT '
-  + 'NAME THE BILL THE PDF WENT ONTO, so it cannot send you to the duplicates and nothing kept '
-  + 'here derives the bill. Escalate this record to whoever administers this installation. HOW TO '
-  + 'STOP MORE OF IT: turn QuickBooks sync OFF. The control is the checkbox at the top of the '
-  + 'SYNC tab of the QuickBooks connector panel, and it writes the setting '
-  + 'quickbooks_sync_enabled. IT IS LABELLED "Enable Xero Sync" EVEN THERE, and its helper text '
-  + 'says Xero too: the QuickBooks panel renders the Xero client and those two strings are '
-  + 'hardcoded. The words are wrong; the checkbox is the right one. (Filed as o3d-m9wm.) The '
-  + 'stale-claim sweep and the manual Sync button both READ that setting before they call the '
-  + 'QuickBooks processor, so while it is off neither one STARTS another run. It stops EVERY '
-  + 'QuickBooks row, not this one, and it recalls nothing already queued or already done. THEN '
-  + 'LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE. Both of those call sites read the '
-  + 'setting and then call the processor with nothing in between, so a run admitted a moment '
-  + 'before you flipped it keeps going: it can claim THIS row afterwards, run the operation '
-  + 'again, and then write over the row — the write that records a QuickBooks post updates the '
-  + 'row BY ID ALONE, with no claim token, no attempt revision and no status check, so it lands '
-  + 'on whatever the row says by then. That claim also leaves the row at attempt revision 0, '
-  + 'which is indistinguishable from the abandoned attempt in front of you. Nothing in IMS '
-  + 'reports whether such a run is still going, so there is no moment you can point at and call '
-  + 'this row quiet. SO DO NOT CLOSE THIS ROW YOURSELF, AND DO NOT TURN QUICKBOOKS SYNC BACK ON '
-  + 'TO FINISH THE JOB. Leave the toggle off and ESCALATE sync row log-1, with this record, to '
-  + 'whoever administers this installation: closing it safely needs someone who can read the '
-  + 'database directly, and the machinery that would make an operator remedy sound is filed as '
-  + 'o3d-4b5p (a quiescence fence the cron, the manual sync, the claim and the writeback all '
-  + 'honour) and o3d-3lhp (a per-row remediation, and a way to cancel a queued email). ONE THING '
-  + 'ON SCREEN IS ACTIVELY WRONG AND YOU WILL SEE IT: the accounting log renders a settle control '
-  + 'for every FAILED or PROCESSING row, and on this one it resolves to the words "not '
-  + 'settleable" with its reason as the tooltip. DO NOT FOLLOW THAT TOOLTIP. It is the generic '
-  + 'reason, written for a connector that stamps attempt revisions, and it tells you to retry the '
-  + 'row until it shows one: QuickBooks never stamps one, so no number of retries will ever make '
-  + 'an attempt appear — and every retry is another replay of the effect above. This is the known '
-  + 'hole o3d-qn21. Until the work above lands, this record is the only thing that says the '
-  + 'effect repeated.'
-
 const XERO_MADE_NAMED_BILL =
   'Xero BILL_ATTACHMENT for PurchaseOrder po-1 SUCCEEDED — the external effect has happened — '
   + 'but IMS could not record that it did. WHAT THE OPERATION DID: it uploaded a supplier-invoice '
@@ -169,50 +82,6 @@ const XERO_MADE_UNNAMED_BILL =
   + 'HOLDS: the operation type, the IMS reference above, the sync row id, and the time this '
   + 'record was written — the write it describes was made in the same sync attempt. That is all '
   + 'of it.'
-
-const QBO_WC_NOTE =
-  'QuickBooks WC_INVOICE_NOTE for SalesOrder order-1 SUCCEEDED — the external effect has '
-  + 'happened — but IMS could not record that it did: Error: write conflict. THIS OPERATION '
-  + 'RETURNS NO IDENTIFIER AND NO REQUEST ID PROTECTS IT: unlike a document post it is not sent '
-  + 'under a derived Intuit Request-Id, so there is nothing for QuickBooks or WooCommerce or a '
-  + 'mail server to deduplicate it against. Sync row log-1 was left holding this worker\'s claim, '
-  + 'with no mirrored accounting event written, so once that claim goes stale THE SWEEP WILL '
-  + 'RECLAIM THE ROW AND RUN THE OPERATION AGAIN OUTRIGHT — a second invoice note is written onto '
-  + 'the WooCommerce order, once per sweep, unbounded, because no retry is consumed while the row '
-  + 'never leaves PROCESSING. WHAT TO DO ABOUT THE EFFECT: THIS RECORD DOES NOT NAME THE '
-  + 'WOOCOMMERCE ORDER — it holds the IMS reference above and nothing else, and the IMS record '
-  + 'that maps that reference to a WooCommerce order does not survive a database reset. Escalate '
-  + 'this record to whoever administers this installation rather than clearing notes off an order '
-  + 'picked out any other way. HOW TO STOP MORE OF IT: turn QuickBooks sync OFF. The control is '
-  + 'the checkbox at the top of the SYNC tab of the QuickBooks connector panel, and it writes the '
-  + 'setting quickbooks_sync_enabled. IT IS LABELLED "Enable Xero Sync" EVEN THERE, and its '
-  + 'helper text says Xero too: the QuickBooks panel renders the Xero client and those two '
-  + 'strings are hardcoded. The words are wrong; the checkbox is the right one. (Filed as '
-  + 'o3d-m9wm.) The stale-claim sweep and the manual Sync button both READ that setting before '
-  + 'they call the QuickBooks processor, so while it is off neither one STARTS another run. It '
-  + 'stops EVERY QuickBooks row, not this one, and it recalls nothing already queued or already '
-  + 'done. THEN LEAVE IT OFF, BECAUSE TURNING IT OFF IS NOT A FENCE. Both of those call sites '
-  + 'read the setting and then call the processor with nothing in between, so a run admitted a '
-  + 'moment before you flipped it keeps going: it can claim THIS row afterwards, run the '
-  + 'operation again, and then write over the row — the write that records a QuickBooks post '
-  + 'updates the row BY ID ALONE, with no claim token, no attempt revision and no status check, '
-  + 'so it lands on whatever the row says by then. That claim also leaves the row at attempt '
-  + 'revision 0, which is indistinguishable from the abandoned attempt in front of you. Nothing '
-  + 'in IMS reports whether such a run is still going, so there is no moment you can point at and '
-  + 'call this row quiet. SO DO NOT CLOSE THIS ROW YOURSELF, AND DO NOT TURN QUICKBOOKS SYNC BACK '
-  + 'ON TO FINISH THE JOB. Leave the toggle off and ESCALATE sync row log-1, with this record, to '
-  + 'whoever administers this installation: closing it safely needs someone who can read the '
-  + 'database directly, and the machinery that would make an operator remedy sound is filed as '
-  + 'o3d-4b5p (a quiescence fence the cron, the manual sync, the claim and the writeback all '
-  + 'honour) and o3d-3lhp (a per-row remediation, and a way to cancel a queued email). ONE THING '
-  + 'ON SCREEN IS ACTIVELY WRONG AND YOU WILL SEE IT: the accounting log renders a settle control '
-  + 'for every FAILED or PROCESSING row, and on this one it resolves to the words "not '
-  + 'settleable" with its reason as the tooltip. DO NOT FOLLOW THAT TOOLTIP. It is the generic '
-  + 'reason, written for a connector that stamps attempt revisions, and it tells you to retry the '
-  + 'row until it shows one: QuickBooks never stamps one, so no number of retries will ever make '
-  + 'an attempt appear — and every retry is another replay of the effect above. This is the known '
-  + 'hole o3d-qn21. Until the work above lands, this record is the only thing that says the '
-  + 'effect repeated.'
 
 const XERO_TAX_RATE =
   'Xero TAX_RATE_SYNC for TaxRate rate-3 SUCCEEDED — the external effect has happened — but IMS '
@@ -283,10 +152,6 @@ function everyIncidentMessage(): { label: string; text: string }[] {
       const o = JSON.stringify(outcome ?? null)
       for (const posted of [null, 'EXT-1']) {
         const entry = { id: 'log-1', type, referenceType: 'SalesOrder', referenceId: 'order-1' }
-        messages.push({
-          label: `qbo ${type} posted=${String(posted)} outcome=${o}`,
-          text: describeUnpersistedQboPost({ entry, postedExternalId: posted, outcome }, new Error('write conflict')),
-        })
         for (const reason of ['ROW_MISSING', 'ANOTHER_DOCUMENT_NAMED'] as const) {
           messages.push({
             label: `xero ${type} posted=${String(posted)} ${reason} outcome=${o}`,
@@ -301,11 +166,9 @@ function everyIncidentMessage(): { label: string; text: string }[] {
   return messages
 }
 
-// MUTATION THAT KILLS THIS (run): restore the round-11 NONE wording — put
-// `effect: 'NOTHING AT ALL — attachment upload is turned off for this connector, …'` back on
-// QBO_OPERATIONS_WITHOUT_REQUEST_ID.BILL_ATTACHMENT.NONE — and this test fails naming that message
-// and the claim `is turned off`. Restoring the non-document NONE `did` ("Attachment upload is
-// turned off for this connector") kills it the same way. Both were RUN. The bypass is also run
+// MUTATION THAT KILLS THIS (run): restore the round-11 NONE wording — "Attachment upload is
+// turned off for this connector" — to the non-document BILL_ATTACHMENT.NONE `did`, and this test
+// fails naming that message and the claim `is turned off`. It was RUN. The bypass is also run
 // inline below against the shipped checker, so weakening the checker fails this test rather than
 // quietly reopening the hole.
 //
@@ -338,52 +201,9 @@ test('ROUND 12 (Codex HIGH): no message asserts the CURRENT state of anything sw
   )
 })
 
-// MUTATION THAT KILLS THIS (run): restore "IF YOU WANT THE REPLAY TO STAY A NO-OP, LEAVE ATTACHMENT
-// UPLOAD DISABLED … Leave it as it is until the write failure above is fixed." to
-// `describeQboNoEffectIncident` — the first two doesNotMatch assertions fail. Deleting the
-// "GO AND READ … AS IT STANDS NOW" clause from the NONE `check` fails the third; deleting the
-// not-a-fence clause fails the fifth.
-//
-// ROUTE: the message is generated by the shipped QuickBooks formatter from the handler's own
-// recorded outcome. Nothing asserted here is computed from the module.
-test('ROUND 12 (Codex HIGH): the no-op remedy makes the operator READ the setting, not trust it', () => {
-  const message = describeUnpersistedQboPost(
-    { entry: ATTACH, postedExternalId: null, outcome: { externalEffect: 'NONE' } },
-    new Error('write conflict'),
-  )
-
-  // WHAT IT NO LONGER DOES: treat a value read at attempt time as the value in force now.
-  assert.doesNotMatch(message, /LEAVE ATTACHMENT UPLOAD DISABLED/)
-  assert.doesNotMatch(message, /Leave it as it is/)
-
-  // WHAT IT DOES INSTEAD, in three parts, all three of which Codex asked for by name.
-  assert.match(
-    message, /read "false" AT THE MOMENT THIS ATTEMPT RAN, which is the only reading it ever took/,
-    'the recorded value is described as HISTORICAL',
-  )
-  assert.match(
-    message, /THEN GO AND READ quickbooks_sync_attach_pdf AS IT STANDS NOW, because this record cannot/,
-    'the operator is required to verify the setting as it is',
-  )
-  assert.match(
-    message,
-    /if it is ON, the replay uploads to a bill THIS RECORD DOES NOT NAME, so there is no duplicate this record can send you to/,
-    'and told that a replay it cannot send anyone to is still a replay',
-  )
-  assert.match(
-    message,
-    /TURNING IT OFF IS NOT A FENCE EITHER: the handler reads that setting and then uploads, so a run already past the read still uploads/,
-    'and told that wording cannot prevent an already-admitted replay — only a real fence can',
-  )
-  assert.match(message, /Only closing the row stops the replay, and IMS cannot close it \(o3d-4b5p\)/)
-
-  // AND THE REPLAY CLAIM IS CONDITIONAL, which is the whole correction in one sentence.
-  assert.match(message, /NOTHING — PROVIDED ATTACHMENT UPLOAD IS STILL OFF WHEN THE SWEEP RUNS/)
-})
-
 // MUTATION THAT KILLS THIS (run): change any row-state sentence back to the present tense — e.g.
-// `sync row ${entry.id} still holds this worker's claim` in `describeQboNoEffectIncident` — and the
-// scan finds "still holds", naming the message.
+// `Sync row ${entry.id} already named …` to `already names …` in a formatter frame — and the scan
+// finds "already names", naming the message.
 //
 // ROUTE: the messages are generated by the shipped formatters; the phrases are the ones the round-11
 // code actually wrote.
@@ -405,23 +225,16 @@ test('ROUND 12: the record describes the sync row as it WAS, not as it stands', 
 // ---------------------------------------------------------------------------------------------
 // THE MEDIUM: THE COMPLETE REMEDY AN OPERATOR READS AFTER A RESET.
 // ---------------------------------------------------------------------------------------------
-// MUTATION THAT KILLS THIS (run): drop `ledgerTargetId` from either record builder's metadata
+// MUTATION THAT KILLS THIS (run): drop `ledgerTargetId` from the record builder's metadata
 // object and the retention assertion fails naming that builder; drop it from the `MADE` cell's
 // `lookup` and the declaration test in record-names-only-what-it-holds.test.ts fails instead; make
 // `outcomeWordingVariant` return 'MADE' regardless of the id and the UNNAMED equality fails with
 // `render` throwing on an absent slot. All three were RUN.
 //
-// ROUTE: the messages come from the shipped formatters on BOTH connectors; the retained keys are
-// parsed out of the two connector sources; the payload reader is the shipped export.
+// ROUTE: the messages come from the shipped formatter; the retained keys are
+// parsed out of the connector source; the payload reader is the shipped export.
 test('ROUND 12 (Codex MEDIUM): after a reset, the attachment remedy names the bill or sends nobody', async () => {
   // WITH the id — the state every record written from now on is in.
-  assert.equal(
-    describeUnpersistedQboPost(
-      { entry: ATTACH, postedExternalId: null, outcome: { externalEffect: 'MADE', ledgerTargetId: 'QBO-BILL-77' } },
-      new Error('write conflict'),
-    ),
-    QBO_MADE_NAMED_BILL,
-  )
   assert.equal(
     describeUnrecordablePostedDocument({
       entry: ATTACH, postedExternalId: null, namedExternalId: null, reason: 'ROW_MISSING',
@@ -433,13 +246,6 @@ test('ROUND 12 (Codex MEDIUM): after a reset, the attachment remedy names the bi
   // WITHOUT it — a record written before IMS kept it. This is the post-reset state Codex named: the
   // PurchaseOrder and the sync row are gone, and the record is all there is.
   assert.equal(
-    describeUnpersistedQboPost(
-      { entry: ATTACH, postedExternalId: null, outcome: { externalEffect: 'MADE' } },
-      new Error('write conflict'),
-    ),
-    QBO_MADE_UNNAMED_BILL,
-  )
-  assert.equal(
     describeUnrecordablePostedDocument({
       entry: ATTACH, postedExternalId: null, namedExternalId: null, reason: 'ROW_MISSING',
       outcome: { externalEffect: 'MADE' },
@@ -448,22 +254,17 @@ test('ROUND 12 (Codex MEDIUM): after a reset, the attachment remedy names the bi
   )
 
   // The claims the equalities above are protecting, said out loud.
-  assert.match(QBO_MADE_NAMED_BILL, /uploaded to QuickBooks bill QBO-BILL-77 AGAIN/)
-  assert.match(QBO_MADE_NAMED_BILL, /Find that bill in QuickBooks by the ledger document id above/)
   assert.match(XERO_MADE_NAMED_BILL, /THIS ATTEMPT UPLOADED AN ATTACHMENT ONTO XERO BILL XERO-BILL-77/)
-  for (const unnamed of [QBO_MADE_UNNAMED_BILL, XERO_MADE_UNNAMED_BILL]) {
+  for (const unnamed of [XERO_MADE_UNNAMED_BILL]) {
     assert.match(unnamed, /DOES NOT (?:NAME|carry the id of)/)
     assert.doesNotMatch(unnamed, /open that bill/i, 'it may not send anyone to a bill it cannot name')
     assert.match(unnamed, /Escalate this record to whoever administers this installation/)
   }
 
-  // AND THE ID IS ACTUALLY RETAINED, by BOTH builders — parsed from their sources, because a remedy
-  // that spends a field only one connector writes cannot be followed on the other.
+  // AND THE ID IS ACTUALLY RETAINED by the record builder — parsed from its source, because a
+  // remedy that spends a field the builder does not write cannot be followed.
   for (const [file, builder] of [
     ['lib/connectors/xero/sync-processor.ts', 'unrecordedPostedDocumentRecord'],
-    // o3d-remove-parked-connectors: the archived QuickBooks builder was the second source, so this
-    // rule was checked against TWO builders — which is what the finding above was about (dropping a
-    // field from ONE builder used to pass). One builder now.
   ] as [string, string][]) {
     const source = await readFile(path.join(process.cwd(), file), 'utf8')
     const start = source.indexOf(`function ${builder}`)
@@ -480,36 +281,32 @@ test('ROUND 12 (Codex MEDIUM): after a reset, the attachment remedy names the bi
   assert.equal(
     classifyUnrecordedIncident({
       type: 'BILL_ATTACHMENT', postedExternalId: null, externalEffect: 'MADE',
-      ledgerTargetId: 'QBO-BILL-77',
+      ledgerTargetId: 'XERO-BILL-77',
     }),
     'NO_IDENTIFIER_SIDE_EFFECT',
   )
 
   // The id comes off the row's own payload — the same handle the handler uploaded against.
-  assert.equal(ledgerTargetIdFromPayload({ accountingInvoiceId: 'QBO-BILL-77' }), 'QBO-BILL-77')
+  assert.equal(ledgerTargetIdFromPayload({ accountingInvoiceId: 'XERO-BILL-77' }), 'XERO-BILL-77')
   assert.equal(ledgerTargetIdFromPayload({ accountingInvoiceId: '' }), null)
   assert.equal(ledgerTargetIdFromPayload({}), null)
   assert.equal(ledgerTargetIdFromPayload(null), null)
 })
 
-// MUTATION THAT KILLS THIS (run): restore "open the order in WooCommerce and remove any duplicate
-// note" to QBO_OPERATIONS_WITHOUT_REQUEST_ID.WC_INVOICE_NOTE.check, or "Review the tax rates in
-// {ledger}, and correct or archive that rate there if this write was wrong" to
-// NON_DOCUMENT_INCIDENT_WORDING.TAX_RATE_SYNC.remedy — each equality fails on the whole message,
-// and the fence in record-names-only-what-it-holds.test.ts fails alongside it. Restoring the
-// NON_DOCUMENT WC_INVOICE_NOTE.remedy instead kills ONLY that fence, because the QuickBooks note
-// incident takes the replay frame and never renders that string — which is exactly why the fence
-// covers the tables and these equalities cover the frames.
+// MUTATION THAT KILLS THIS (run): restore "Review the tax rates in {ledger}, and correct or archive
+// that rate there if this write was wrong" to NON_DOCUMENT_INCIDENT_WORDING.TAX_RATE_SYNC.remedy —
+// the equality fails on the whole message, and the fence in record-names-only-what-it-holds.test.ts
+// fails alongside it. Restoring "open the order in WooCommerce" to
+// NON_DOCUMENT_INCIDENT_WORDING.WC_INVOICE_NOTE.remedy kills the assertion on the note message.
 //
-// ROUTE: both messages are generated by the shipped formatters; these are the two OTHER instances
+// ROUTE: both messages are generated by the shipped formatter; these are the two OTHER instances
 // the re-check of every shipped remedy turned up.
 test('ROUND 12 (Codex MEDIUM): the two other remedies that acted on an object the record cannot name', () => {
-  assert.equal(
-    describeUnpersistedQboPost({ entry: NOTE, postedExternalId: null }, new Error('write conflict')),
-    QBO_WC_NOTE,
-  )
-  assert.match(QBO_WC_NOTE, /THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER/)
-  assert.doesNotMatch(QBO_WC_NOTE, /open the order in WooCommerce/)
+  const xeroNote = describeUnrecordablePostedDocument({
+    entry: NOTE, postedExternalId: null, namedExternalId: null, reason: 'ROW_MISSING',
+  })
+  assert.match(xeroNote, /THIS RECORD DOES NOT NAME THE WOOCOMMERCE ORDER/)
+  assert.doesNotMatch(xeroNote, /open the order in WooCommerce/)
 
   assert.equal(
     describeUnrecordablePostedDocument({
@@ -535,13 +332,12 @@ test('ROUND 12 (Codex MEDIUM): the two other remedies that acted on an object th
 //
 // SO THERE ARE TWO PROPERTIES HERE, AND THEY ARE DIFFERENT PROPERTIES.
 //
-//   1. EVERY PATH THAT BUILDS ONE ROUTES A MISSING ID INTO THE SAFE CELL. There are three — the
-//      QuickBooks escalation, the Xero conflict transaction, and the Xero standalone re-attempt
-//      after that transaction could not commit — and they resolve to TWO constructions of a
-//      `PostedOperationOutcome`, because the third re-renders the incident the second built. Both
-//      read the id off the sync row's own PAYLOAD, so a row written before this branch existed
-//      (no `accountingInvoiceId` in its payload) yields `null` and lands in the safe cell from
-//      either one. That is asserted against the shipped sources, so a fourth path that forgets is
+//   1. EVERY PATH THAT BUILDS ONE ROUTES A MISSING ID INTO THE SAFE CELL. There are two — the Xero
+//      conflict transaction, and the Xero standalone re-attempt after that transaction could not
+//      commit — and they resolve to ONE construction of a `PostedOperationOutcome`, because the
+//      second re-renders the incident the first built. It reads the id off the sync row's own
+//      PAYLOAD, so a row written before this branch existed (no `accountingInvoiceId` in its
+//      payload) yields `null` and lands in the safe cell. That is asserted against the shipped sources, so a fourth path that forgets is
 //      a red build rather than a silent old remedy.
 //   2. A RECORD ALREADY IN THE DATABASE REACHES IT WHEN IT IS READ. `remedyForStoredIncident`
 //      rebuilds the remedy from the record's own metadata through the same reader the classifier
@@ -568,20 +364,11 @@ const PRE_ROUND_12_METADATA = Object.freeze({
 
 /** The remedy that record was GIVEN, which is the thing the operator is reading today. */
 const ROUND_11_STORED_REMEDY =
-  'QuickBooks BILL_ATTACHMENT for PurchaseOrder po-1 SUCCEEDED — the external effect has happened '
-  + '— but IMS could not record that it did. WHAT TO DO ABOUT THE EFFECT: open that bill in '
-  + 'QuickBooks and remove any duplicate attachment.'
+  'Xero BILL_ATTACHMENT for PurchaseOrder po-1 SUCCEEDED — the external effect has happened '
+  + '— but IMS could not record that it did. REMEDY: open that bill in '
+  + 'Xero and remove any duplicate attachment.'
 
-/**
- * The safe cell as each connector's own frame prints it. They are different sentences because the
- * frames are: on QuickBooks the effect REPEATS once per sweep, so its "what to do" lives in the
- * replay table, and handing a QuickBooks record the Xero sentence would be a fourth wording for one
- * incident. Both refuse to send anybody to a bill.
- */
-const QBO_SAFE_CELL_REMEDY =
-  'WHAT TO DO ABOUT THE EFFECT: THIS RECORD DOES NOT NAME THE BILL THE PDF WENT ONTO, so it cannot '
-  + 'send you to the duplicates and nothing kept here derives the bill. Escalate this record to '
-  + 'whoever administers this installation.'
+/** The safe cell as the frame prints it. It refuses to send anybody to a bill. */
 const XERO_SAFE_CELL_REMEDY =
   'REMEDY: DO NOT REMOVE AN ATTACHMENT FROM A BILL THIS RECORD CANNOT NAME. The upload happened, '
   + 'so a duplicate may exist, but nothing kept here says which bill it is on and nothing kept here '
@@ -600,40 +387,20 @@ test('ROUND 13 (Codex HIGH): a record written before the bill id was retained re
   // THE LOAD-BEARING CASE. A record built the way a pre-round-12 record was built — MADE, with no
   // `ledgerTargetId` key in its metadata at all — read back today.
   assert.equal(
-    remedyForStoredIncident(QBO_UNRECORDED_POSTED_DOCUMENT_ACTION, PRE_ROUND_12_METADATA),
-    QBO_SAFE_CELL_REMEDY,
-  )
-  assert.equal(
     remedyForStoredIncident(UNRECORDED_POSTED_DOCUMENT_ACTION, PRE_ROUND_12_METADATA),
     XERO_SAFE_CELL_REMEDY,
-    'the same record on the other connector reaches the safe cell through its OWN frame',
   )
-  for (const safe of [QBO_SAFE_CELL_REMEDY, XERO_SAFE_CELL_REMEDY]) {
+  for (const safe of [XERO_SAFE_CELL_REMEDY]) {
     assert.doesNotMatch(safe, /open that bill|remove the duplicate|remove any duplicate/i)
     assert.match(safe, /Escalate this record to whoever administers this installation/)
   }
 
-  // AND THE BLOB IS A SHAPE A RECORD REALLY HAD. Every key above except `ledgerTargetId` is one the
-  // shipped builder still writes; `ledgerTargetId` is the one round 12 added, and its ABSENCE is
-  // the whole case. A test whose fixture drifted into a shape no record ever carried would prove
-  // nothing about the records in the database.
-  // o3d-remove-parked-connectors: this read the ARCHIVED QuickBooks builder to prove the fixture is a
-  // shape a record really had. The builder is gone, so the fixture can no longer be checked against
-  // the code that produced it — it is now a shape taken from the archived builder and frozen here.
-  // That is a real weakening: a fixture that drifts from every real record proves nothing about the
-  // records in the database, and nothing now notices the drift. Recoverable for reference at
-  // `git show archive/quickbooks-connector:lib/connectors/quickbooks/sync-processor.ts`.
+  // The blob's keys are the ones the shipped builder writes, except `ledgerTargetId`: the one round 12
+  // added, whose ABSENCE is the whole case.
 
   // A RECORD WITH NO RECORDED OUTCOME AT ALL — written before round 10 — is safe by the same rule:
   // an absent key reads as "not recorded", never as a live upload.
   const { postingMode, externalEffect, ...preRound10 } = PRE_ROUND_12_METADATA
-  assert.equal(
-    remedyForStoredIncident(QBO_UNRECORDED_POSTED_DOCUMENT_ACTION, preRound10),
-    'WHAT TO DO ABOUT THE EFFECT: IMS DID NOT RECORD WHETHER THIS ATTEMPT UPLOADED ANYTHING, and it '
-    + 'does not name the bill either. READ quickbooks_sync_attach_pdf AS IT STANDS NOW to learn what '
-    + 'a replay would do, and escalate this record to whoever administers this installation rather '
-    + 'than clearing an attachment off a bill picked out any other way.',
-  )
   assert.equal(
     remedyForStoredIncident(UNRECORDED_POSTED_DOCUMENT_ACTION, preRound10),
     'REMEDY: DO NOT REMOVE AN ATTACHMENT ON THE STRENGTH OF THIS RECORD — this attempt may never '
@@ -645,24 +412,24 @@ test('ROUND 13 (Codex HIGH): a record written before the bill id was retained re
   // refuse".
   assert.equal(
     remedyForStoredIncident(
-      QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
-      { ...PRE_ROUND_12_METADATA, ledgerTargetId: 'QBO-BILL-77' },
+      UNRECORDED_POSTED_DOCUMENT_ACTION,
+      { ...PRE_ROUND_12_METADATA, ledgerTargetId: 'XERO-BILL-77' },
     ),
-    'WHAT TO DO ABOUT THE EFFECT: Find that bill in QuickBooks by the ledger document id above and '
-    + 'remove any duplicate attachment.',
+    'REMEDY: Find that bill in Xero by the ledger document id above and remove the duplicate '
+    + 'attachment. There is no document to void, and the bill itself was not created by this attempt.',
   )
 
   // WHAT IT REFUSES TO ANSWER FOR, rather than guessing: a document incident, whose remedy is
   // chosen by which OTHER document the row named at the moment of the conflict — a fact the
   // metadata does not carry.
   assert.equal(
-    remedyForStoredIncident(QBO_UNRECORDED_POSTED_DOCUMENT_ACTION, {
-      ...PRE_ROUND_12_METADATA, type: 'PURCHASE_INVOICE', postedExternalId: 'QBO-BILL-9',
+    remedyForStoredIncident(UNRECORDED_POSTED_DOCUMENT_ACTION, {
+      ...PRE_ROUND_12_METADATA, type: 'PURCHASE_INVOICE', postedExternalId: 'XERO-BILL-9',
     }),
     undefined,
   )
   assert.equal(remedyForStoredIncident('some_other_action', PRE_ROUND_12_METADATA), undefined)
-  assert.equal(remedyForStoredIncident(QBO_UNRECORDED_POSTED_DOCUMENT_ACTION, null), undefined)
+  assert.equal(remedyForStoredIncident(UNRECORDED_POSTED_DOCUMENT_ACTION, null), undefined)
 })
 
 // MUTATION THAT KILLS THIS (run): make `supersedingRemedyForStoredIncident` return the remedy
@@ -675,25 +442,25 @@ test('ROUND 13 (Codex HIGH): a record written before the bill id was retained re
 test('ROUND 13 (Codex HIGH): the current remedy is shown only where the stored one is not it', () => {
   assert.equal(
     supersedingRemedyForStoredIncident({
-      action: QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+      action: UNRECORDED_POSTED_DOCUMENT_ACTION,
       description: ROUND_11_STORED_REMEDY,
       metadata: PRE_ROUND_12_METADATA,
     }),
-    QBO_SAFE_CELL_REMEDY,
+    XERO_SAFE_CELL_REMEDY,
     'the stored sentence sends an operator to a bill nothing names — the current one must be shown',
   )
-  assert.match(ROUND_11_STORED_REMEDY, /open that bill in QuickBooks and remove any duplicate/,
+  assert.match(ROUND_11_STORED_REMEDY, /open that bill in Xero and remove any duplicate/,
     'not vacuous: the stored text really is the instruction this round refuses')
 
   // A record written by THIS version already contains it, and gets nothing added.
-  const current = describeUnpersistedQboPost(
-    { entry: ATTACH, postedExternalId: null, outcome: { externalEffect: 'MADE' } },
-    new Error('write conflict'),
-  )
-  assert.match(current, /THIS RECORD DOES NOT NAME THE BILL THE PDF WENT ONTO/)
+  const current = describeUnrecordablePostedDocument({
+    entry: ATTACH, postedExternalId: null, namedExternalId: null, reason: 'ROW_MISSING',
+    outcome: { externalEffect: 'MADE' },
+  })
+  assert.match(current, /THIS RECORD DOES NOT NAME THAT BILL/)
   assert.equal(
     supersedingRemedyForStoredIncident({
-      action: QBO_UNRECORDED_POSTED_DOCUMENT_ACTION,
+      action: UNRECORDED_POSTED_DOCUMENT_ACTION,
       description: current,
       metadata: { ...PRE_ROUND_12_METADATA },
     }),
@@ -702,15 +469,14 @@ test('ROUND 13 (Codex HIGH): the current remedy is shown only where the stored o
 })
 
 // MUTATION THAT KILLS THIS (run): drop `ledgerTargetId: ledgerTargetIdFromPayload(payload)` from
-// either connector's `PostedOperationOutcome` construction — or replace it with the row's external
-// id — and the assertion fails naming that file. RUN on both.
+// the processor's `PostedOperationOutcome` construction — or replace it with the row's external
+// id — and the assertion fails naming that file. RUN.
 //
-// ROUTE: the SHIPPED connector sources. Every construction of a `PostedOperationOutcome` in either
+// ROUTE: the SHIPPED connector source. Every construction of a `PostedOperationOutcome` in the
 // processor is found by the type annotation the compiler already requires, so a fourth path cannot
 // be added without appearing here.
 test('ROUND 13 (Codex HIGH): every path that builds one of these records reads the bill id off the payload', async () => {
   let constructions = 0
-  // o3d-remove-parked-connectors: the archived QuickBooks processor was the first file here.
   for (const file of [
     'lib/connectors/xero/sync-processor.ts',
   ]) {
@@ -726,13 +492,12 @@ test('ROUND 13 (Codex HIGH): every path that builds one of these records reads t
       )
     }
   }
-  // o3d-remove-parked-connectors: this was 2 — one construction per processor — and the archived
-  // QuickBooks processor was the second. The count is the VACUITY guard (a walk that found none must
-  // fail), not a claim about how many there ought to be.
+  // The count is the VACUITY guard (a walk that found none must fail), not a claim about how many
+  // there ought to be.
   assert.equal(constructions, 1, 'the processor builds exactly one, and it was checked')
 
   // A payload written before this branch existed carries no `accountingInvoiceId`, and that is what
-  // makes both of those constructions land in the safe cell.
+  // makes that construction land in the safe cell.
   assert.equal(ledgerTargetIdFromPayload({ supplierInvoicePath: 'uploads/bill-1.pdf' }), null)
 })
 
@@ -740,7 +505,7 @@ test('ROUND 13 (Codex HIGH): every path that builds one of these records reads t
 // {ledgerTargetId}, …'` to NON_DOCUMENT_INCIDENT_WORDING.BILL_ATTACHMENT.MADE and the scan finds
 // it, naming the message. RUN.
 //
-// ROUTE: the messages are generated by the shipped formatters over both connectors and every
+// ROUTE: the messages are generated by the shipped formatters over every type and
 // outcome; the phrase is the one the round-12 code actually wrote.
 test('ROUND 13 (Codex MEDIUM): the record says what the attempt DID to a remote object, not what stands on one now', () => {
   // Attachment or bill existence is MUTABLE and this record is not: an operator may remove the

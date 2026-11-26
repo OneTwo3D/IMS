@@ -2,7 +2,7 @@ import { db } from '@/lib/db'
 
 /**
  * Sync-log retention window shared by the daily-batch "recreate missing logs"
- * recovery (Xero + QuickBooks). Recreate rebuilds a daily-batch log that went
+ * recovery. Recreate rebuilds a daily-batch log that went
  * MISSING before it posted so the journal still reaches the ledger — but
  * data-retention (retention_sync_logs_months) HARD-DELETES old SYNCED daily-batch
  * logs while the shipment/order keeps its journaled-date marker. Beyond the

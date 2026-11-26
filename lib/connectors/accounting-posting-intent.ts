@@ -102,7 +102,7 @@ export function currentAccountingPostingIntent(): AccountingPostingIntent | null
 export function accountingPostingIntentRefusal(connector: string, tenantId: string | null | undefined): string | null {
   const intent = currentAccountingPostingIntent()
   if (!intent) return null
-  // A request made under a Xero auth cannot authorise a QuickBooks row and vice versa. Comparing the
+  // A request made under a Xero auth cannot authorise a row for a different connector. Comparing the
   // stamps would catch it anyway (the stamp carries the connector), but stopping here keeps the refusal
   // wording honest about which connector is speaking.
   if (intent.connector !== connector) return null

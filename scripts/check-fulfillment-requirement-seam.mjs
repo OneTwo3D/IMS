@@ -66,7 +66,7 @@ const OWNERS = [
  * call in an allowlisted file fails this check, and so does a removed one.
  *
  * EMPTY since o3d-4gw0. Its two entries (the external-fulfilment shortfall, a sales line and a refund
- * line) now go through the seam; the o3d-moc9 entry went with the archived QuickBooks daily-sync.
+ * line) now go through the seam; the o3d-moc9 entry went with an archived connector's daily-sync.
  * The mechanism stays so a future deferral is enumerated with a count and a ticket rather than waived
  * by a comment. Entry shape: `{ file, calls, issue, why }`.
  */

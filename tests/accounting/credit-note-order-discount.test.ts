@@ -466,18 +466,18 @@ test('the derived leg carries the LEDGER its credit note was posted to (o3d-y14 
 
 test('TWO credit notes in DIFFERENT accounting systems do not jointly reverse one invoice (r9 F1)', async () => {
   // The connector-switch shape. `connector-orphans.ts` exists because the active accounting
-  // connector CAN be switched (Xero → QuickBooks), and IMS keeps each historical document under the
+  // connector CAN be switched (Xero → another connector), and IMS keeps each historical document under the
   // connector that posted it — so these two credit notes reduce balances in two separate sets of
   // books and their totals do not add up to a reversal of anything.
   const rows = [mirroringChargeback(), secondChargeback()]
   const split = await read(rows, TWO_CREDIT_NOTES, [
     standingCreditNote(rows[0]),
-    { ...standingCreditNote(rows[1]), externalSystem: 'quickbooks' },
+    { ...standingCreditNote(rows[1]), externalSystem: 'retired-ledger' },
   ])
   const oneLedger = await read(rows, TWO_CREDIT_NOTES)
 
   assert.equal(split.ok, false)
-  assert.match(split.detail, /posted by DIFFERENT accounting systems \(quickbooks, xero\)/)
+  assert.match(split.detail, /posted by DIFFERENT accounting systems \(retired-ledger, xero\)/)
   // Both legs still DERIVED — this is a refusal of the SUBTRACTION, not of the facts.
   assert.deepEqual(
     split.legs.map((leg) => leg.amount),
@@ -515,7 +515,7 @@ test('the ledger check is PURE and reachable from plain legs, in every direction
   })
 
   assert.deepEqual(creditNoteLedger([leg({})]), { ok: true, externalSystem: 'xero' })
-  assert.equal(creditNoteLedger([leg({}), leg({ externalSystem: 'quickbooks' })]).ok, false)
+  assert.equal(creditNoteLedger([leg({}), leg({ externalSystem: 'retired-ledger' })]).ok, false)
   assert.equal(creditNoteLedger([leg({ externalSystem: null })]).ok, false)
   // A leg that REFUSED contributes no ledger, so a position made only of refusals establishes none.
   assert.equal(creditNoteLedger([leg({ amount: null })]).ok, false)

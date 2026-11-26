@@ -505,9 +505,8 @@ export type LedgerReversalRefusal = { code: LedgerReversalRefusalCode; message: 
 /**
  * The connectors this verification understands.
  *
- * QuickBooks is out of scope by owner instruction, and refusing it is not a regression: a QuickBooks
- * receipt cannot be deleted past its registration today either, and letting it through UNVERIFIED
- * would be strictly worse than refusing — it would destroy the local receipt on nobody's evidence.
+ * Any other connector is refused: letting its receipt through UNVERIFIED would be strictly worse
+ * than refusing — it would destroy the local receipt on nobody's evidence.
  */
 export const VERIFIABLE_REVERSAL_CONNECTORS = ['xero'] as const
 

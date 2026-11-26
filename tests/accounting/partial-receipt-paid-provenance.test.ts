@@ -323,10 +323,10 @@ test('[o3d-psrx r7] a ledger that still LISTS the part payment says so, rather t
   assert.equal(zeroPaidIsProvenReversal(verdict), false)
 })
 
-test('[o3d-psrx r7] the QuickBooks route — a withheld listing is not a licence to reverse the remainder', () => {
-  // QuickBooks' reversal read enumerates no payments, so `ledgerListedPaymentIds` is ALWAYS null and
-  // a document with a posted registration lands on LEDGER_DID_NOT_LIST_PAYMENTS — which
-  // `zeroPaidIsProvenReversal` ADMITS. The GBP 1-on-GBP 100 defect therefore existed on that connector
+test('[o3d-psrx r7] a connector that enumerates no payments — a withheld listing is not a licence to reverse the remainder', () => {
+  // A connector whose reversal read enumerates no payments leaves `ledgerListedPaymentIds` ALWAYS null,
+  // so a document with a posted registration lands on LEDGER_DID_NOT_LIST_PAYMENTS — which
+  // `zeroPaidIsProvenReversal` ADMITS. The GBP 1-on-GBP 100 defect therefore exists on such a connector
   // too, by a different route, and the guard has to dominate that answer as well as GONE.
   const partCovered = classifyRegisteredPaymentAgainstListing(
     null, [pennyRegistration], READ_AT, [], true, withMarker, toDecimal(ORDER_TOTAL),

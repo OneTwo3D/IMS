@@ -35,8 +35,8 @@
  *     an operator can mark a bill while paying part of it. The marker is an OPERATOR ASSERTION, and
  *     app/actions/purchase-orders.ts already says so in as many words: "paidAt says IMS was told
  *     the bill was paid" — it keeps a separate `settlement` verdict for whether the LEDGER agrees.
- *   * the Xero poller sets it from `FullyPaidOnDate`, which IS full settlement; the QuickBooks
- *     poller and the reversal path can clear it again.
+ *   * the Xero poller sets it from `FullyPaidOnDate`, which IS full settlement; the reversal
+ *     path can clear it again.
  *
  * -----------------------------------------------------------------------------------------------
  * ROUND 2, AND WHY THESE COLUMNS ARE NOT CALLED "SETTLED" AND "UNSETTLED"

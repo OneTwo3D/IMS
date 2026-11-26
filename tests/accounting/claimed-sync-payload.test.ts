@@ -99,13 +99,12 @@ test('a row that vanished after the claim THROWS rather than posting the snapsho
 // ---------------------------------------------------------------------------
 
 /**
- * Asserted against the source. Driving processPendingXeroSync / processPendingQuickBooksSync would
+ * Asserted against the source. Driving processPendingXeroSync would
  * need the whole connector stack — settings, auth, HTTP, the outbox — and would end up testing those
  * mocks rather than the one line that matters: which variable the posted payload comes from.
  */
 const PROCESSORS = [
   { path: 'lib/connectors/xero/sync-processor.ts', claimSites: 2 },
-  // o3d-remove-parked-connectors: the archived QuickBooks file was listed here too, so this rule was checked against TWO independently-written implementations. It is now checked against one.
 ]
 
 for (const processor of PROCESSORS) {
@@ -114,8 +113,7 @@ for (const processor of PROCESSORS) {
     const { join } = await import('node:path')
     const src = readFileSync(join(process.cwd(), processor.path), 'utf8')
 
-    // o3d-dzip: the Xero processor reads the origin record (payload + durable column) in one call;
-    // QuickBooks still reads the payload alone, because it has no connection guard to feed yet.
+    // o3d-dzip: the Xero processor reads the origin record (payload + durable column) in one call.
     const reReads = src.match(/await readClaimedSyncLog(Payload|OriginRecord)\(db, entry\.id\)/g) ?? []
     assert.equal(
       reReads.length,

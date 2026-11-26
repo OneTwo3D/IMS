@@ -117,22 +117,22 @@ export function ledgerMinorUnits(currency: string | null): number {
  * everywhere rather than only in GBP. In a two-decimal currency it is 0.005 exactly, so nothing about
  * the ordinary case moves.
  *
- * A NULL CURRENCY TAKES THE STRICTEST THRESHOLD, not the most convenient one. QuickBooks omits
- * `CurrencyRef` when multicurrency is off and Xero's fixtures predate `CurrencyCode`, and the
+ * A NULL CURRENCY TAKES THE STRICTEST THRESHOLD, not the most convenient one. A ledger can omit
+ * the currency on a document (multicurrency off, or fixtures that predate `CurrencyCode`), and the
  * fail-safe direction is unambiguous: too LARGE a threshold discards a real minor unit as zero and
  * lets a reversal through, while too small a one can only move a document from "holds nothing" into
  * a verdict that WITHHOLDS. So an unstated currency is given the finest precision this repository
  * supports.
  *
  * o3d-psrx r17 (Codex HIGH) — AND IT LIVES HERE, BESIDE `ledgerMinorUnits`, BECAUSE IT IS THE ANSWER
- * BOTH CONNECTORS GIVE. It was written in `lib/connectors/quickbooks/payment-poller.ts`, which is
- * DOWNSTREAM of Xero's `invoice-delta.ts` in the import graph, so Xero's `partitionPaymentReversals`
+ * EVERY READER GIVES. It was first written in a poller module DOWNSTREAM of Xero's
+ * `invoice-delta.ts` in the import graph, so Xero's `partitionPaymentReversals`
  * could not reach it and kept a fixed 0.005 of its own. Two rules with different ideas of "how small
  * is nothing" is precisely what r16's scale rule made reachable: it admits `0.001` in KWD and
  * `0.0001` in CLF — one whole minor unit, a payment the ledger genuinely holds — and Xero then
  * measured that against a constant sized for pennies and called it zero. There is now ONE function,
- * in the module both connectors already import their minor units from, and no import direction that
- * can put it out of either one's reach again.
+ * in the module every connector already imports its minor units from, and no import direction that
+ * can put it out of any reader's reach again.
  */
 export function ledgerAmountEpsilon(currency: string | null): Decimal {
   // r16: through the shared resolver, so this rule and the two magnitude rules cannot drift apart on
@@ -197,8 +197,8 @@ export function ledgerMatchEpsilon(currency: string | null): Decimal {
  *
  * A THREE-DECIMAL FIGURE ON A TWO-DECIMAL CURRENCY IS MALFORMED FOR THAT CURRENCY HOWEVER IT
  * ARRIVED. That sentence has no arm in it, so neither does the rule: it lives here, beside the
- * minor-unit table it derives from and upstream of both connectors — the same move r17 made for
- * `ledgerAmountEpsilon` when Xero and QuickBooks turned out to hold two answers to "how small is
+ * minor-unit table it derives from and upstream of every reader — the same move r17 made for
+ * `ledgerAmountEpsilon` when two readers turned out to hold two answers to "how small is
  * nothing".
  *
  * IT TAKES A `Decimal`, NOT A `DecimalInput`, and that is the whole guarantee. Each arm has to name

@@ -7,7 +7,13 @@ import { ConfirmDialog } from '@/components/ui/confirm-dialog'
 import { getFailedAccountingSyncSummary, retryFailedAccountingSync } from '@/app/actions/accounting-sync'
 import { accountingRetryDuplicateCaution } from '@/lib/domain/accounting/idempotency-retention'
 
-const CONNECTOR_LABELS: Record<string, string> = { xero: 'Xero', quickbooks: 'QuickBooks' }
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
+
+// Labels come from the registry; a historical row may name a connector this build no longer
+// registers, which falls back to the raw id.
+function registeredConnectorLabel(connector: string): string {
+  return ACCOUNTING_CONNECTORS.find((def) => def.id === connector)?.label ?? connector
+}
 
 /** Outcome sentence shared by every "Retry all failed" button, so a partial refusal never reads as success. */
 export function describeRetryAllOutcome(result: { reset: number; refused?: number }): string {
@@ -59,7 +65,7 @@ export function RetryAllFailedDialog({
     return () => { cancelled = true }
   }, [open])
 
-  const label = connector ? (CONNECTOR_LABELS[connector] ?? connector) : 'the accounting system'
+  const label = connector ? registeredConnectorLabel(connector) : 'the accounting system'
   const caution = accountingRetryDuplicateCaution(connector)
 
   async function confirm() {

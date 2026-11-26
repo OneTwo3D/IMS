@@ -358,7 +358,7 @@ test('[R4 HIGH] B gains a rate on the NEXT run: it is revalued normally, and the
 
 test('[R4 HIGH] a prior with a document record but an UNROUTABLE source connector cannot be carried: the side is withheld', async () => {
   const prior = priorJournal('prior-ar', 'receivable', [DOC('so-b', 'INV-B', 'CHF', 4)])
-  prior.connector = 'quickbooks'
+  prior.connector = 'retired-ledger'
   state.logs = [prior]
   state.receivables = [order('so-b', 'INV-B', 'CHF')]
   const result = await run()

@@ -9,8 +9,7 @@ import test, { mock } from 'node:test'
  * status inside a transaction does not reach another process's memory — it only narrows the window.
  *
  * So the backfill does not touch the queue at all. It takes the sales-order row lock — the SAME
- * `SELECT ... FOR UPDATE` that `lockOrderForAccountingEnqueue` takes inside queueXeroSync /
- * queueQuickBooksSync, and that queueAccountingSyncTx refuses to run without — and DECLINES any order
+ * `SELECT ... FOR UPDATE` that `lockOrderForAccountingEnqueue` takes inside queueXeroSync, and that queueAccountingSyncTx refuses to run without — and DECLINES any order
  * that has live invoice work, reporting it.
  *
  * The second half of that fence is NOT here: the lock serialises the INSERT of a queue row, not the
@@ -2016,7 +2015,7 @@ test('the netted position is recorded on the ActivityLog, so "nobody could tell"
   reset()
   const crossLedger = nettedToZeroStore()
   crossLedger.creditNoteEvents = [
-    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'POSTED', externalId: 'CN-501', externalSystem: 'quickbooks', postBasis: 'CONNECTOR' },
+    { sourceEntityId: 'refund-1', type: 'CREDIT_NOTE', status: 'POSTED', externalId: 'CN-501', externalSystem: 'retired-ledger', postBasis: 'CONNECTOR' },
   ]
   await applyWcCouponCorrection(makeTx(crossLedger), { ...invoicedEntry, refunds: NETTED_ZERO_REFUNDS })
 

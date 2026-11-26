@@ -1213,7 +1213,7 @@ test('a failed attempt appearing DURING the reversal aborts it rather than delet
 
 test('a connector this check cannot ask is refused rather than trusted', async () => {
   const { reverseLedgerPayment } = await loadActions()
-  state.syncRows = [syncRow({ connector: 'quickbooks' })]
+  state.syncRows = [syncRow({ connector: 'retired-ledger' })]
   const result = await reverseLedgerPayment('pay-1', 'order-1')
   assert.equal((result as { code?: string }).code, 'connector_not_supported')
   assert.equal(state.xeroCalls.length, 0)

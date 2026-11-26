@@ -38,10 +38,5 @@ export async function GET(request: Request) {
     return cronResultResponse(body, { outcomeClass: cronOutcome('accounting-payment-reconcile', body) })
   }
 
-  // o3d-remove-parked-connectors: the QuickBooks arm here answered a NAMED skip — "payment reconcile
-  // not yet implemented for QuickBooks" — rather than falling through to "no accounting plugin
-  // enabled", which would have read as a configuration problem. That distinction is the pattern a
-  // second ledger without a reconcile sweep should copy; the arm itself went with the connector.
-
   return cronSkippedResponse('No accounting plugin enabled')
 }
