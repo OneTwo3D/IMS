@@ -231,6 +231,20 @@ test('flags posted revenue whose payment was reversed with no compensating credi
   assert.equal(finding?.orderId, 'order-1')
 })
 
+// o3d-r2nkq: an order Group A1 deferred from its invoice while unpaid has revenue and no payment by design (an open receivable).
+test('does not flag an INVOICE-basis deferral with no payment as revenue posted without payment', () => {
+  const rows = cleanRows()
+  rows.salesOrders[0] = { ...rows.salesOrders[0], paidAt: null, refunds: [], revenueDeferralBasis: 'INVOICE' }
+  const codes = evaluateAccountingInvariantRows(rows).map((f) => f.code)
+  assert.ok(!codes.includes('revenue_posted_without_payment'))
+  // The PAID basis (and NULL, every deferral made with the switch off) is still checked.
+  for (const basis of ['PAID', null]) {
+    const paidBasis = cleanRows()
+    paidBasis.salesOrders[0] = { ...paidBasis.salesOrders[0], paidAt: null, refunds: [], revenueDeferralBasis: basis }
+    assert.ok(evaluateAccountingInvariantRows(paidBasis).some((f) => f.code === 'revenue_posted_without_payment'), String(basis))
+  }
+})
+
 test('does not flag reversed payment when a credit note fully covers the posted revenue', () => {
   const rows = cleanRows()
   const order = rows.salesOrders[0]

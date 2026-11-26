@@ -418,3 +418,20 @@ test('a WC-handled reversal clears paidAt last as well (o3d-w00 Codex r10 #1)', 
   assert.equal(result.outcome, 'reversal-incomplete')
   assert.match(result.error ?? '', /paidAt was NOT cleared/)
 })
+
+// o3d-r2nkq (owner ruling 2026-11-26): a payment removed from an order Group A1 deferred from its INVOICE while unpaid only reopens
+// the receivable. That deferral did not come from the payment, so no chargeback credit note is raised; paidAt is still cleared and finance still alerted.
+test('INVOICE-basis deferral: a removed payment raises NO chargeback, still clears paidAt and alerts', async () => {
+  const { effects, calls } = makeEffects({ recentWcRefund: false })
+  const result = await handleDetectedReversal(makeOrder({ revenueDeferralBasis: 'INVOICE' }), { invoiceVoided: false }, effects)
+  assert.equal(result.outcome, 'reversed')
+  assert.deepEqual(calls.chargeback, [], 'no automatic credit note')
+  assert.deepEqual(calls.clearPaidAt, ['so_1'])
+  assert.deepEqual(calls.notify, [{ id: 'so_1', wcHandled: false }])
+  // PAID (and absent, every deferral made with the switch off) is unchanged.
+  for (const basis of ['PAID', null, undefined]) {
+    const paid = makeEffects({ recentWcRefund: false })
+    await handleDetectedReversal(makeOrder({ revenueDeferralBasis: basis }), { invoiceVoided: false }, paid.effects)
+    assert.deepEqual(paid.calls.chargeback, ['so_1'], String(basis))
+  }
+})

@@ -1,0 +1,491 @@
+import './scratch-database-setup' // FIRST: refuses to load unless the scratch DB was verified (o3d-yvn8)
+import assert from 'node:assert/strict'
+import { randomUUID } from 'node:crypto'
+import test from 'node:test'
+import { config } from 'dotenv'
+
+/**
+ * o3d-r2nkq (FRS 102 s23.10): an UNPAID order whose AUTHORISED invoice IMS posted after the switch
+ * `xero_defer_unpaid_invoiced_revenue_enabled` went on has its unshipped revenue deferred by Group A1, dated on the
+ * invoice's document day, and released by Group B on each shipment's day — through the real daily batch and refund
+ * service against a real Postgres.
+ *
+ * Offline: the batch only writes PENDING sync-log rows and the refund service only RETURNS its syncs; nothing reaches
+ * Xero. Every test asserts that the journals it produced balance. Gated behind RUN_DB_CONCURRENCY_TESTS=1.
+ */
+
+const skip = process.env.RUN_DB_CONCURRENCY_TESTS !== '1'
+
+const SWITCH = 'xero_defer_unpaid_invoiced_revenue_enabled'
+const SWITCH_AT = 'xero_defer_unpaid_invoiced_revenue_enabled_at'
+const DAY = 24 * 60 * 60 * 1000
+
+async function openRig() {
+  config({ path: '.env.local', quiet: true })
+  config({ quiet: true })
+  const [{ Prisma, PrismaClient }, { PrismaPg }, { createSalesOrderRefund }, { runDailyBatchSync }, { db: appDb }, { businessDay }] = await Promise.all([
+    import('@/app/generated/prisma/client'),
+    import('@prisma/adapter-pg'),
+    import('@/lib/domain/sales/refund-service'),
+    import('@/lib/connectors/xero/daily-sync'),
+    import('@/lib/db'),
+    import('@/lib/domain/accounting/daily-batch-event-date'),
+  ])
+  const db = new PrismaClient({ adapter: new PrismaPg({ connectionString: process.env.DATABASE_URL!, max: 4 }) })
+  return { Prisma, db, appDb, createSalesOrderRefund, runDailyBatchSync, businessDay }
+}
+type Rig = Awaited<ReturnType<typeof openRig>>
+
+const SETTINGS: Array<[string, string]> = [
+  ['xero_sync_enabled', 'true'], ['xero_cogs_account', '5000'], ['xero_inventory_account', '1200'],
+  ['xero_allocated_inventory_account', '1210'], ['xero_unearned_revenue_account', '2100'], ['xero_sales_account', '4000'],
+]
+const accountingSettings = {
+  connector: 'xero', syncEnabled: true, salesAccount: '4000', shippingAccount: '4010', discountAccount: '', cogsAccount: '5000',
+  inventoryRevaluationAccount: '', inventoryAccount: '1200', allocatedInventoryAccount: '1210', unearnedRevenueAccount: '2100',
+  transitAccount: '', accountsReceivableAccount: '', accountsPayableAccount: '', realisedFxGainLossAccount: '',
+  unrealisedFxGainLossAccount: '', manufacturingOverheadAccount: '', euVatIossAccount: '', euVatDdpAccount: '', euFeeAccount: '',
+  roundingDifferenceAccount: '', paymentAccountMap: '{}', invoiceUrlTemplate: '', billUrlTemplate: '', reverseChargeSalesTaxType: '',
+} as never
+
+type Line = { accountCode: string; debit?: number; credit?: number }
+type Journal = { type: string; date: string; lines: Line[]; narration: string }
+
+const noonDaysAgo = (days: number) => {
+  const d = new Date(Date.now() - days * DAY)
+  d.setUTCHours(12, 0, 0, 0)
+  return d
+}
+const ymd = (d: Date) => d.toISOString().slice(0, 10)
+
+/**
+ * An order of 4 units at 100 each, allocated 4 from one warehouse, invoiced (`INV-<suffix>`). `invoice` writes the
+ * SALES_INVOICE sync row the proof reads: synced `syncedAgoMs` ago, sent in `mode`, with document date `docDay`.
+ */
+async function seed(rig: Rig, suffix: string, opts: {
+  paidAt?: Date
+  allocatedAt?: Date
+  invoice?: { mode: string; docDay: string; syncedAt: Date } | null
+}) {
+  const { Prisma, db } = rig
+  const D = (v: string | number) => new Prisma.Decimal(String(v))
+  const product = await db.product.create({ data: { sku: `IB-${suffix}`, name: `ib ${suffix}`, type: 'SIMPLE' }, select: { id: true } })
+  const main = await db.warehouse.create({ data: { code: `IM${suffix.slice(0, 8)}`, name: `ib main ${suffix}` }, select: { id: true } })
+  const layer = await db.costLayer.create({
+    data: { productId: product.id, warehouseId: main.id, receivedQty: D(4), remainingQty: D(4), unitCostBase: D('10') },
+    select: { id: true },
+  })
+  const order = await db.salesOrder.create({
+    data: {
+      orderNumber: `IB-${suffix.slice(0, 8)}`, status: 'ALLOCATED', currency: 'GBP', fxRateToBase: D('1'),
+      subtotalForeign: D(400), totalForeign: D(400), subtotalBase: D(400), taxBase: D('0'), totalBase: D(400),
+      accountingInvoiceId: `INV-${suffix}`,
+      ...(opts.paidAt ? { paidAt: opts.paidAt } : {}),
+      lines: { create: [{ productId: product.id, description: 'ib', qty: D(4), unitPriceForeign: D('100'), unitPriceBase: D('100'), taxForeign: D('0'), taxBase: D('0'), totalForeign: D(400), totalBase: D(400) }] },
+    },
+    select: { id: true, lines: { select: { id: true } } },
+  })
+  const lineId = order.lines[0].id
+  await db.orderAllocation.create({ data: { orderId: order.id, lineId, productId: product.id, warehouseId: main.id, qty: D(4), ...(opts.allocatedAt ? { createdAt: opts.allocatedAt } : {}) } })
+  await db.stockLevel.create({ data: { productId: product.id, warehouseId: main.id, quantity: D('0'), reservedQty: D('0') } })
+  if (opts.invoice) {
+    await db.accountingSyncLog.create({
+      data: {
+        type: 'SALES_INVOICE', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: order.id,
+        externalTransactionId: `INV-${suffix}`, syncedAt: opts.invoice.syncedAt,
+        payload: { _postingMode: opts.invoice.mode, date: opts.invoice.docDay, invoiceNumber: `INV-${suffix}` },
+      },
+    })
+  }
+  const ids = { productId: product.id, mainId: main.id, orderId: order.id, lineId, layerId: layer.id, shipmentIds: [] as string[] }
+  const ship = async (units: number, shippedAt: Date = new Date()) => {
+    const shipment = await db.shipment.create({
+      data: {
+        orderId: order.id, warehouseId: main.id, status: 'SHIPPED', shippedAt, createdAt: new Date(Date.now() - 60_000 + ids.shipmentIds.length * 1000),
+        lines: { create: [{ lineId, productId: product.id, qty: D(units), costLayerSnapshot: [{ costLayerId: layer.id, qty: String(units), unitCostBase: '10' }] }] },
+      },
+      select: { id: true },
+    })
+    await db.costLayer.update({ where: { id: layer.id }, data: { remainingQty: { decrement: D(units) } } })
+    ids.shipmentIds.push(shipment.id)
+    return shipment.id
+  }
+  return { ...ids, ship }
+}
+type Fixture = Awaited<ReturnType<typeof seed>>
+
+const BATCH_TYPES = ['DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B', 'DAILY_BATCH_INVENTORY_RECONCILIATION', 'DAILY_BATCH_COGS_RECONCILIATION', 'DAILY_BATCH_TRANSIT_RECONCILIATION'] as const
+
+async function clean(rig: Rig, fixtures: Fixture[]) {
+  const { db } = rig
+  await db.accountingSyncLog.deleteMany({ where: { type: { in: [...BATCH_TYPES] } } }).catch(() => {})
+  await db.cogsSubledgerMovement.deleteMany({ where: { OR: [{ idempotencyKey: { startsWith: 'dispatch:' } }, { idempotencyKey: { startsWith: 'refund-unjournaled-return:' } }] } }).catch(() => {})
+  await db.setting.deleteMany({ where: { key: { in: [SWITCH, SWITCH_AT] } } }).catch(() => {})
+  for (const fx of fixtures) {
+    await db.accountingSyncLog.deleteMany({ where: { referenceType: 'SalesOrder', referenceId: fx.orderId } }).catch(() => {})
+    await db.activityLog.deleteMany({ where: { entityId: fx.orderId } }).catch(() => {})
+    await db.integrationOutbox.deleteMany({ where: { operation: 'refund.reservation-release', payloadJson: { path: ['orderId'], equals: fx.orderId } } }).catch(() => {})
+    await db.stockMovement.deleteMany({ where: { productId: fx.productId } }).catch(() => {})
+    await db.costLayerSourceLine.deleteMany({ where: { costLayer: { productId: fx.productId } } }).catch(() => {})
+    await db.salesOrderRefundLine.deleteMany({ where: { refund: { orderId: fx.orderId } } }).catch(() => {})
+    await db.salesOrderRefund.deleteMany({ where: { orderId: fx.orderId } }).catch(() => {})
+    await db.shipmentLine.deleteMany({ where: { shipment: { orderId: fx.orderId } } }).catch(() => {})
+    await db.shipment.deleteMany({ where: { orderId: fx.orderId } }).catch(() => {})
+    await db.orderAllocation.deleteMany({ where: { orderId: fx.orderId } }).catch(() => {})
+    await db.salesOrderLine.deleteMany({ where: { orderId: fx.orderId } }).catch(() => {})
+    await db.salesOrder.delete({ where: { id: fx.orderId } }).catch(() => {})
+    await db.costLayer.deleteMany({ where: { productId: fx.productId } }).catch(() => {})
+    await db.stockLevel.deleteMany({ where: { productId: fx.productId } }).catch(() => {})
+    await db.warehouse.deleteMany({ where: { id: fx.mainId } }).catch(() => {})
+    await db.product.delete({ where: { id: fx.productId } }).catch(() => {})
+  }
+}
+
+async function close(rig: Rig) {
+  await rig.db.$disconnect()
+  await rig.appDb.$disconnect()
+}
+
+async function journals(rig: Rig): Promise<Journal[]> {
+  const rows = await rig.db.accountingSyncLog.findMany({
+    where: { type: { in: ['DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B'] } },
+    select: { type: true, payload: true },
+    orderBy: { createdAt: 'asc' },
+  })
+  return rows.map((row) => {
+    const payload = row.payload as { lines: Line[]; date: string; narration: string }
+    return { type: row.type as string, date: payload.date, lines: payload.lines, narration: payload.narration }
+  })
+}
+const cents = (n: number) => Math.round(n * 100)
+function assertBalanced(list: Journal[], label: string) {
+  for (const journal of list) {
+    const debit = journal.lines.reduce((s, l) => s + (l.debit ?? 0), 0)
+    const credit = journal.lines.reduce((s, l) => s + (l.credit ?? 0), 0)
+    assert.equal(cents(debit), cents(credit), `${label}: ${journal.type} journal balances (DR ${debit} / CR ${credit})`)
+  }
+}
+function net(list: Journal[], account: string, type?: string): number {
+  return list.filter((j) => !type || j.type === type).flatMap((j) => j.lines).filter((l) => l.accountCode === account).reduce((s, l) => s + (l.debit ?? 0) - (l.credit ?? 0), 0)
+}
+
+async function setup(rig: Rig, switchOn: { since: Date } | 'off' | 'value-only') {
+  for (const [key, value] of SETTINGS) await rig.db.setting.upsert({ where: { key }, create: { key, value }, update: { value } })
+  if (switchOn === 'off') return
+  await rig.db.setting.upsert({ where: { key: SWITCH }, create: { key: SWITCH, value: 'true' }, update: { value: 'true' } })
+  if (switchOn === 'value-only') return
+  const at = switchOn.since.toISOString()
+  await rig.db.setting.upsert({ where: { key: SWITCH_AT }, create: { key: SWITCH_AT, value: at }, update: { value: at } })
+}
+
+const suffixOf = () => randomUUID().replace(/-/g, '').slice(0, 12)
+
+test('o3d-r2nkq: unpaid, unshipped: A1 defers the whole order on the invoice day; each shipment releases its part on the day it ships', { skip }, async () => {
+  const rig = await openRig()
+  const fixtures: Fixture[] = []
+  try {
+    await clean(rig, [])
+    await setup(rig, { since: new Date(Date.now() - 10 * DAY) })
+    const docDay = ymd(noonDaysAgo(5))
+    const fx = await seed(rig, suffixOf(), { invoice: { mode: 'submitted', docDay, syncedAt: new Date(Date.now() - 5 * DAY) } })
+    fixtures.push(fx)
+
+    const run1 = await rig.runDailyBatchSync()
+    assert.deepEqual(run1.errors, [])
+    assert.equal(run1.groupA1, 1)
+    const afterA1 = await journals(rig)
+    assertBalanced(afterA1, 'deferral')
+    const a1 = afterA1.filter((j) => j.type === 'DAILY_BATCH_REVENUE_DEFERRAL')
+    assert.equal(a1.length, 1)
+    assert.equal(a1[0].date, docDay, 'dated on the invoice document day, not today and not a payment day')
+    assert.equal(net(a1, '4000'), 400, 'DR Sales 400')
+    assert.equal(net(a1, '2100'), -400, 'CR Unearned Revenue 400 (the existing account)')
+    const order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+    assert.equal(order.revenueDeferralBasis, 'INVOICE')
+    assert.equal(order.revenueDeferralEventAt?.toISOString().slice(0, 10), docDay)
+    assert.equal(order.paidAt, null)
+    assert.equal(Number(order.unearnedRevenueAmount), 400)
+
+    // Idempotent: a rerun posts nothing more.
+    const rerun = await rig.runDailyBatchSync()
+    assert.deepEqual(rerun.errors, [])
+    assert.equal(rerun.groupA1, 0)
+    assert.equal((await journals(rig)).filter((j) => j.type === 'DAILY_BATCH_REVENUE_DEFERRAL').length, 1)
+
+    // First shipment (2 units) two days ago, still unpaid: released on its own day.
+    const ship1Day = noonDaysAgo(2)
+    await fx.ship(2, ship1Day)
+    const run2 = await rig.runDailyBatchSync()
+    assert.deepEqual(run2.errors, [])
+    const b1 = (await journals(rig)).filter((j) => j.type === 'DAILY_BATCH_GROUP_B')
+    assert.equal(b1.length, 1)
+    assert.equal(b1[0].date, rig.businessDay(ship1Day), 'released on the day the goods shipped')
+    assert.equal(net(b1, '2100'), 200, 'DR Unearned 200 (half the order)')
+    assert.equal(net(b1, '4000'), -200, 'CR Sales 200')
+    assert.equal(net(b1, '5000'), 20, 'DR COGS 20')
+    assert.equal(net(b1, '1210'), -20, 'CR Allocated Inventory 20 (A2 reclassified it)')
+
+    // The rest ships today; the order completes. Everything nets to zero.
+    await fx.ship(2)
+    await rig.db.salesOrder.update({ where: { id: fx.orderId }, data: { status: 'SHIPPED' } })
+    const run3 = await rig.runDailyBatchSync()
+    assert.deepEqual(run3.errors, [])
+    const all = await journals(rig)
+    assertBalanced(all, 'final')
+    assert.equal(net(all, '2100'), 0, 'Unearned Revenue nets to zero')
+    assert.equal(net(all, '4000'), 0, 'Sales back where the invoice put it')
+    assert.equal(net(all, '1210'), 0, 'Allocated Inventory nets to zero')
+    assert.equal(net(all, '5000'), 40, 'COGS once per unit')
+  } finally {
+    await clean(rig, fixtures)
+    await close(rig)
+  }
+})
+
+test('o3d-r2nkq: partially shipped before the first run: the shipped part is costed directly and stays in Sales; A1 defers only the unshipped part', { skip }, async () => {
+  const rig = await openRig()
+  const fixtures: Fixture[] = []
+  try {
+    await clean(rig, [])
+    await setup(rig, { since: new Date(Date.now() - 10 * DAY) })
+    const docDay = ymd(noonDaysAgo(4))
+    const fx = await seed(rig, suffixOf(), { invoice: { mode: 'submitted', docDay, syncedAt: new Date(Date.now() - 4 * DAY) } })
+    fixtures.push(fx)
+    await fx.ship(2, noonDaysAgo(3))
+
+    const run = await rig.runDailyBatchSync()
+    assert.deepEqual(run.errors, [])
+    const all = await journals(rig)
+    assertBalanced(all, 'partial')
+    const direct = all.filter((j) => j.type === 'DAILY_BATCH_GROUP_B')
+    assert.equal(direct.length, 1, 'the direct pass costed the shipment first')
+    assert.equal(net(direct, '5000'), 20)
+    assert.equal(net(direct, '1200'), -20, 'straight out of Inventory')
+    assert.equal(net(direct, '2100') + net(direct, '4000'), 0, 'no revenue leg for the costed shipment')
+    const a1 = all.filter((j) => j.type === 'DAILY_BATCH_REVENUE_DEFERRAL')
+    assert.equal(a1.length, 1)
+    assert.equal(a1[0].date, docDay)
+    assert.equal(net(a1, '2100'), -200, 'only the unshipped half is deferred')
+    const order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+    assert.equal(order.revenueDeferralBasis, 'INVOICE')
+    assert.equal(Number(order.unearnedRevenueAmount), 400, 'the order keeps the full figure, as for a paid order')
+    const a2 = all.filter((j) => j.type === 'DAILY_BATCH_INVENTORY_ALLOC')
+    assert.equal(net(a2, '1210'), 20, 'A2 reclassifies only the 2 units still to ship')
+
+    await fx.ship(2)
+    await rig.db.salesOrder.update({ where: { id: fx.orderId }, data: { status: 'SHIPPED' } })
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    const final = await journals(rig)
+    assertBalanced(final, 'final')
+    assert.equal(net(final, '2100'), 0, 'Unearned nets to zero: 200 deferred, 200 released')
+    assert.equal(net(final, '1210'), 0)
+    assert.equal(net(final, '5000'), 40)
+  } finally {
+    await clean(rig, fixtures)
+    await close(rig)
+  }
+})
+
+test('o3d-r2nkq: deferred from the invoice, shipped, THEN paid: the release is dated the ship day, not the later payment day', { skip }, async () => {
+  const rig = await openRig()
+  const fixtures: Fixture[] = []
+  try {
+    await clean(rig, [])
+    await setup(rig, { since: new Date(Date.now() - 10 * DAY) })
+    const docDay = ymd(noonDaysAgo(6))
+    const fx = await seed(rig, suffixOf(), { allocatedAt: noonDaysAgo(6), invoice: { mode: 'submitted', docDay, syncedAt: new Date(Date.now() - 6 * DAY) } })
+    fixtures.push(fx)
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    const shipDay = noonDaysAgo(3)
+    await fx.ship(4, shipDay)
+    await rig.db.salesOrder.update({ where: { id: fx.orderId }, data: { status: 'SHIPPED', paidAt: noonDaysAgo(1) } })
+    const run = await rig.runDailyBatchSync()
+    assert.deepEqual(run.errors, [])
+    const all = await journals(rig)
+    assertBalanced(all, 'shipped then paid')
+    const b = all.filter((j) => j.type === 'DAILY_BATCH_GROUP_B')
+    assert.equal(b.length, 1)
+    assert.equal(b[0].date, rig.businessDay(shipDay), 'released on the ship day; the later payment does not delay it')
+    const a2 = all.filter((j) => j.type === 'DAILY_BATCH_INVENTORY_ALLOC')
+    assert.equal(a2.length, 1)
+    assert.equal(a2[0].date, docDay, 'A2 is dated from the invoice deferral and the allocation day, not a payment')
+    assert.equal(net(all, '2100'), 0)
+    assert.equal(net(all, '1210'), 0)
+    const order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+    assert.equal(order.revenueDeferralBasis, 'INVOICE', 'payment does not change the basis')
+  } finally {
+    await clean(rig, fixtures)
+    await close(rig)
+  }
+})
+
+/** The journals of one paid-then-shipped order with every id-derived token removed, so two runs can be compared. */
+async function paidThenShippedShape(rig: Rig, switchSetting: { since: Date } | 'off') {
+  const fixtures: Fixture[] = []
+  try {
+    await clean(rig, [])
+    await setup(rig, switchSetting)
+    const paidAt = noonDaysAgo(4)
+    const fx = await seed(rig, suffixOf(), { paidAt, invoice: { mode: 'submitted', docDay: ymd(noonDaysAgo(6)), syncedAt: new Date(Date.now() - 6 * DAY) } })
+    fixtures.push(fx)
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    await fx.ship(4, noonDaysAgo(2))
+    await rig.db.salesOrder.update({ where: { id: fx.orderId }, data: { status: 'SHIPPED' } })
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    const all = await journals(rig)
+    assertBalanced(all, 'paid then shipped')
+    const order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+    return {
+      journals: all.map((j) => ({ type: j.type, date: j.date, lines: j.lines, narration: j.narration.replace(/[0-9a-f]{8}\b/g, '') })),
+      basis: order.revenueDeferralBasis,
+      eventAt: order.revenueDeferralEventAt,
+      unearned: Number(order.unearnedRevenueAmount),
+      paidDay: rig.businessDay(paidAt),
+    }
+  } finally {
+    await clean(rig, fixtures)
+  }
+}
+
+test('o3d-r2nkq: paid then shipped is unchanged by the switch: same journals, same dates (the payment day)', { skip }, async () => {
+  const rig = await openRig()
+  try {
+    const off = await paidThenShippedShape(rig, 'off')
+    const on = await paidThenShippedShape(rig, { since: new Date(Date.now() - 10 * DAY) })
+    assert.deepEqual(on.journals, off.journals, 'identical journals with the switch on and off')
+    const a1 = off.journals.find((j) => j.type === 'DAILY_BATCH_REVENUE_DEFERRAL')
+    assert.equal(a1?.date, off.paidDay, 'a paid order is still deferred on its payment day')
+    assert.equal(off.basis, null, 'switch off writes no basis')
+    assert.equal(on.basis, 'PAID')
+    assert.equal(on.eventAt, null)
+    assert.equal(on.unearned, off.unearned)
+  } finally {
+    await close(rig)
+  }
+})
+
+test('o3d-r2nkq: switch OFF (and the refusals with it on): an unpaid invoiced order is never deferred and the batch output is what it was', { skip }, async () => {
+  const rig = await openRig()
+  const fixtures: Fixture[] = []
+  try {
+    const cases: Array<{ label: string; switchSetting: { since: Date } | 'off' | 'value-only'; invoice: { mode: string; docDay: string; syncedAt: Date } | null }> = [
+      { label: 'switch off', switchSetting: 'off', invoice: { mode: 'submitted', docDay: ymd(noonDaysAgo(2)), syncedAt: new Date() } },
+      { label: 'switch on without its switch-on instant', switchSetting: 'value-only', invoice: { mode: 'submitted', docDay: ymd(noonDaysAgo(2)), syncedAt: new Date() } },
+      { label: 'invoice posted before switch-on (stays in Sales, no backfill)', switchSetting: { since: new Date() }, invoice: { mode: 'submitted', docDay: ymd(noonDaysAgo(2)), syncedAt: new Date(Date.now() - DAY) } },
+      { label: 'DRAFT-mode invoice', switchSetting: { since: new Date(Date.now() - 10 * DAY) }, invoice: { mode: 'draft', docDay: ymd(noonDaysAgo(2)), syncedAt: new Date() } },
+      { label: 'no proof row (Xeroom or hand-linked invoice)', switchSetting: { since: new Date(Date.now() - 10 * DAY) }, invoice: null },
+    ]
+    for (const c of cases) {
+      await clean(rig, fixtures.splice(0))
+      await setup(rig, c.switchSetting)
+      const fx = await seed(rig, suffixOf(), { invoice: c.invoice })
+      fixtures.push(fx)
+      const run = await rig.runDailyBatchSync()
+      assert.deepEqual(run.errors, [], c.label)
+      assert.equal(run.groupA1, 0, `${c.label}: nothing deferred`)
+      assert.equal((await journals(rig)).length, 0, `${c.label}: no journal`)
+      const order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+      assert.equal(order.revenueDeferredDate, null, c.label)
+      assert.equal(order.revenueDeferralBasis, null, c.label)
+      // Shipping it takes the existing ACC-H12 path: costed directly, no revenue leg.
+      await fx.ship(4)
+      assert.deepEqual((await rig.runDailyBatchSync()).errors, [], c.label)
+      const after = await journals(rig)
+      assert.equal(after.length, 1, `${c.label}: only the direct cost journal`)
+      assert.equal(after[0].type, 'DAILY_BATCH_GROUP_B')
+      assert.equal(net(after, '2100') + net(after, '4000'), 0, `${c.label}: no revenue leg`)
+    }
+  } finally {
+    await clean(rig, fixtures)
+    await close(rig)
+  }
+})
+
+test('o3d-r2nkq: refunds of an invoice-deferred unpaid order: a pre-batch refund is netted (dated from the invoice day), a later refund reverses Unearned, a full refund clears the basis', { skip }, async () => {
+  const rig = await openRig()
+  const fixtures: Fixture[] = []
+  try {
+    await clean(rig, [])
+    await setup(rig, { since: new Date(Date.now() - 10 * DAY) })
+    const docDay = ymd(noonDaysAgo(5))
+    const fx = await seed(rig, suffixOf(), { invoice: { mode: 'submitted', docDay, syncedAt: new Date(Date.now() - 5 * DAY) } })
+    fixtures.push(fx)
+
+    // 1. A refund of one unit entered BEFORE the first run (a cancelled line on an unpaid order).
+    const pre = await rig.createSalesOrderRefund(rig.db, {
+      orderId: fx.orderId,
+      lines: [{ lineId: fx.lineId, productId: fx.productId, description: 'ib', qty: 1, totalBase: 100 }],
+      reason: 'Cancelled line', creditNotePrefix: `IB${fx.orderId.slice(-6)}a-`,
+      accountingSettings, activeAccountingConnector: 'xero',
+    })
+    assert.equal(pre.success, true, `pre-batch refund (${pre.success ? '' : pre.error})`)
+    const run1 = await rig.runDailyBatchSync()
+    assert.deepEqual(run1.errors, [])
+    const a1 = (await journals(rig)).filter((j) => j.type === 'DAILY_BATCH_REVENUE_DEFERRAL')
+    assertBalanced(a1, 'deferral + adjustment')
+    const paidDay = a1.find((j) => !/adjustment/i.test(j.narration))
+    const adjustment = a1.find((j) => /adjustment/i.test(j.narration))
+    assert.ok(paidDay && adjustment, 'the invoice-day deferral and the refund adjustment')
+    assert.equal(paidDay!.date, docDay)
+    assert.equal(net([paidDay!], '2100'), -400, 'the deferral journal carries the gross 400')
+    assert.equal(net([adjustment!], '2100'), 100, 'the pre-batch refund comes back out of Unearned')
+    assert.ok(adjustment!.date >= docDay, 'never dated before the invoice deferral it adjusts')
+    let order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+    assert.equal(order.revenueDeferralBasis, 'INVOICE')
+    assert.equal(Number(order.unearnedRevenueAmount), 300)
+
+    // 2. A refund of another unit after the deferral: the refund service reverses Unearned for it.
+    await rig.db.accountingSyncLog.updateMany({
+      where: { type: { in: ['DAILY_BATCH_REVENUE_DEFERRAL', 'DAILY_BATCH_INVENTORY_ALLOC', 'DAILY_BATCH_GROUP_B'] } },
+      data: { status: 'SYNCED', syncedAt: new Date(), externalTransactionId: `JNL-${fx.orderId.slice(-6)}` },
+    })
+    const post = await rig.createSalesOrderRefund(rig.db, {
+      orderId: fx.orderId,
+      lines: [{ lineId: fx.lineId, productId: fx.productId, description: 'ib', qty: 3, totalBase: 300 }],
+      reason: 'Order cancelled', creditNotePrefix: `IB${fx.orderId.slice(-6)}b-`,
+      accountingSettings, activeAccountingConnector: 'xero',
+    })
+    assert.equal(post.success, true, `post-deferral refund (${post.success ? '' : post.error})`)
+    if (!post.success) return
+    const syncs = post.accountingSyncs as unknown as Array<{ type: string; payload: { lines: Line[] } }>
+    const reversal = syncs.find((s) => s.type === 'UNEARNED_REV_REVERSAL')
+    assert.ok(reversal, 'an invoice-basis deferral is unwound by the same refund reversal a paid one is')
+    const reversalJournal: Journal = { type: 'UNEARNED_REV_REVERSAL', date: '', narration: '', lines: reversal!.payload.lines }
+    assertBalanced([reversalJournal], 'reversal')
+    const lifetime = [...(await journals(rig)), reversalJournal]
+    assert.equal(net(lifetime, '2100'), 0, 'Unearned Revenue nets to zero across deferral, adjustment and reversal')
+    assert.equal(net(lifetime, '1210'), 0, 'Allocated Inventory nets to zero')
+
+    // 3. Fully refunded: the deferral stamp and its basis go together.
+    order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+    assert.equal(order.refundStatus, 'FULL')
+    assert.equal(order.revenueDeferredDate, null)
+    assert.equal(order.revenueDeferralBasis, null)
+    assert.equal(order.revenueDeferralEventAt, null)
+    // And a further run never re-defers it.
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    assert.equal((await journals(rig)).filter((j) => j.type === 'DAILY_BATCH_REVENUE_DEFERRAL').length, 2)
+  } finally {
+    await clean(rig, fixtures)
+    await close(rig)
+  }
+})
+
+test('o3d-r2nkq: a cancelled unpaid order is never deferred, even with a proved invoice', { skip }, async () => {
+  const rig = await openRig()
+  const fixtures: Fixture[] = []
+  try {
+    await clean(rig, [])
+    await setup(rig, { since: new Date(Date.now() - 10 * DAY) })
+    const fx = await seed(rig, suffixOf(), { invoice: { mode: 'submitted', docDay: ymd(noonDaysAgo(2)), syncedAt: new Date() } })
+    fixtures.push(fx)
+    await rig.db.salesOrder.update({ where: { id: fx.orderId }, data: { status: 'CANCELLED' } })
+    const run = await rig.runDailyBatchSync()
+    assert.deepEqual(run.errors, [])
+    assert.equal(run.groupA1, 0)
+    assert.equal((await journals(rig)).length, 0)
+  } finally {
+    await clean(rig, fixtures)
+    await close(rig)
+  }
+})
