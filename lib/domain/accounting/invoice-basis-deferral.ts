@@ -38,13 +38,10 @@ export type InvoiceBasisDeferralSwitch = { on: true; since: Date } | { on: false
  * restore) has no instant to anchor "posted after switch-on", and reads OFF rather than deferring every open invoice.
  */
 export async function readInvoiceBasisDeferralSwitch(client: SettingReader): Promise<InvoiceBasisDeferralSwitch> {
-  const rows = await client.setting.findMany({
-    where: { key: { in: [INVOICE_BASIS_DEFERRAL_SWITCH_KEY, INVOICE_BASIS_DEFERRAL_ENABLED_AT_KEY] } },
-    select: { key: true, value: true },
-  })
-  const value = rows.find((row) => row.key === INVOICE_BASIS_DEFERRAL_SWITCH_KEY)?.value
+  // The switch first, and the instant only when it is on: with it off this is ONE read of one row.
+  const value = (await client.setting.findUnique({ where: { key: INVOICE_BASIS_DEFERRAL_SWITCH_KEY }, select: { value: true } }))?.value
   if (value !== 'true') return { on: false }
-  const raw = rows.find((row) => row.key === INVOICE_BASIS_DEFERRAL_ENABLED_AT_KEY)?.value
+  const raw = (await client.setting.findUnique({ where: { key: INVOICE_BASIS_DEFERRAL_ENABLED_AT_KEY }, select: { value: true } }))?.value
   if (typeof raw !== 'string' || raw.trim() === '') return { on: false }
   const since = new Date(raw.trim())
   if (Number.isNaN(since.getTime())) return { on: false }

@@ -43,7 +43,7 @@ test('anything less is not proof: the order stays in Sales', () => {
 })
 
 test('the switch reads ON only for exactly "true" with a readable switch-on instant', async () => {
-  const reader = (rows: Record<string, string>) => ({ setting: { findMany: async () => Object.entries(rows).map(([key, value]) => ({ key, value })) } }) as never
+  const reader = (rows: Record<string, string>) => ({ setting: { findUnique: async ({ where }: { where: { key: string } }) => (where.key in rows ? { value: rows[where.key] } : null) } }) as never
   const KEY = 'xero_defer_unpaid_invoiced_revenue_enabled'
   const AT = 'xero_defer_unpaid_invoiced_revenue_enabled_at'
   assert.deepEqual(await readInvoiceBasisDeferralSwitch(reader({})), { on: false })
