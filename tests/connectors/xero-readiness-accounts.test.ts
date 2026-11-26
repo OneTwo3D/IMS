@@ -61,6 +61,6 @@ test('purchase FX switch ON: Realised FX and Purchase Price Variance block readi
   const off = xeroMissingAccountMappings(unmapped, { purchaseEventFxEnabled: false })
   assert.deepEqual(off.missingAccounts, [], 'off: neither blocks')
   assert.deepEqual(xeroMissingAccountMappings(unmapped), off, 'no option = off')
-  const mapped = xeroMissingAccountMappings(mappedExcept(), { purchaseEventFxEnabled: true })
-  assert.deepEqual(mapped.missingAccounts, [])
+  const everything = { ...mappedExcept(), xero_purchase_price_variance_account: '100' } as unknown as XeroSettings
+  assert.deepEqual(xeroMissingAccountMappings(everything, { purchaseEventFxEnabled: true }).missingAccounts, [])
 })
