@@ -76,7 +76,7 @@ The usual baseline before opening a PR is:
 npm run validate
 ```
 
-`npm run validate` runs linting, TypeScript type-checking, Prisma client generation, unit/security tests, workflow documentation checks, and the Prisma schema scope check against `origin/development`.
+`npm run validate` (`scripts/validate-local.sh`) runs every step even after a failure and prints a per-step summary: `prisma generate`, lint, type-check, the `check:*` guards (including `check:docs-required` and `check:server-action-guards`), unit/security tests, the workflow-docs check, the archive-sealed check and the Prisma schema scope check against `origin/development`.
 
 For schema, migration, Prisma, or database behavior changes, also run:
 

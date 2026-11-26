@@ -10,7 +10,7 @@ Before opening a PR, run:
 npm run validate
 ```
 
-`npm run validate` runs linting, TypeScript type-checking, Prisma client generation, unit/security tests, workflow documentation checks, and the Prisma schema scope check against `origin/development`.
+`npm run validate` (`scripts/validate-local.sh`) runs every step even after a failure and prints a per-step summary: `prisma generate`, lint, type-check, the `check:*` guards (decimal boundaries, connector fetch, migration conventions, changelog fragments, docs-required, documented env vars, WC sync row predicates, fulfillment requirement seam, ledger standing readers, producer census, shadow readers, WMS connector boundary, server-action guards, system-import capability), unit tests, the workflow-docs check, the archive-sealed check and the Prisma schema scope check against `origin/development`.
 
 For schema, migration, Prisma, or database behavior changes, also run:
 
@@ -905,7 +905,7 @@ The repo now enforces six rules:
 
 ## Auth Rate Limiting
 
-Login, TOTP verification, and supplier quote throttling use the shared rate-limit backend in `lib/security/rate-limit.ts`.
+TOTP verification and setup, step-up, password reset, passkey and supplier quote throttling use the shared rate-limit backend in `lib/security/rate-limit.ts`. Password sign-in is throttled separately by `lib/auth/login-throttle.ts`: per-account failure counters kept in the `one_time_tokens` table (so they are shared by every process and survive a restart), with no cooldown for the first 5 failures, then 1 s doubling to a 15 minute cap.
 
 Local and single-process installs default to the in-memory backend:
 
@@ -922,7 +922,7 @@ REDIS_URL=redis://localhost:6379/0
 
 When Redis is selected, `REDIS_URL` must be configured. The Redis backend uses a single atomic sorted-set script for check-and-record decisions and clears buckets on successful authentication just like the memory backend.
 
-If the configured backend fails, auth throttling fails open and writes a warning activity log. This keeps login and TOTP available during Redis outages while making the degraded protection visible to operators.
+If the configured backend fails, `checkRateLimit` fails open by default and writes a warning activity log. Callers that pass `failClosed: true` (TOTP verify and setup, step-up, password reset, passkey, profile) refuse instead, so a backend outage blocks those flows rather than removing their throttle. Fail-open callers stay available while the degraded protection is visible to operators.
 
 ## Allowlisted Unsupported Features
 
