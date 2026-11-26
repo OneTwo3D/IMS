@@ -251,7 +251,7 @@ test('stock adjustments: reason and unit cost required (switch on) and unchanged
     }
     await setSwitch(true)
     const refused = await run('cnt-none')
-    assert.match(refused.posted.message ?? '', /add an active adjustment reason called "Stock count"/)
+    assert.match(refused.posted.message ?? '', /create, activate and map an adjustment reason called "Stock count"/)
     assert.equal(await movementCount(refused.p.id), 0)
     assert.equal((await db.stockCount.findUniqueOrThrow({ where: { id: refused.countId } })).status === 'COMPLETED', false)
 

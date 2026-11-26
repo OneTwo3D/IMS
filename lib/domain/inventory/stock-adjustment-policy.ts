@@ -8,8 +8,9 @@ import { toDecimal, type Decimal } from '@/lib/domain/math/decimal'
  * refusals on a live operator flow, so it ships off and the owner turns it on at go-live. With it OFF every writer behaves exactly
  * as before: the switch is read and nothing else changes.
  *
- * With it ON, every stock adjustment (single, bulk line, CSV row, stock-count variance, in-place edit of a removal into an
- * addition, the WMS align-down):
+ * With it ON, every stock adjustment (single, bulk line, CSV row, stock-count variance, the WMS align-down). The in-place
+ * edit (updateAdjustmentMovement) is NOT re-judged for reason or account; it only values a removal edited into an addition at the
+ * latest costed layer, never an average, and refuses when there is none:
  *   1. must carry an adjustment reason that exists and is active;
  *   2. when the adjustment moves value and the accounting connector would post its journal (the same verdict that, with the
  *      switch off, raises the "post this journal by hand" exception), the reason must have an account and an inventory account

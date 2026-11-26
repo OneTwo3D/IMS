@@ -728,7 +728,7 @@ export async function postStockCount(input: unknown): Promise<StockCountResult> 
         const match = matchAdjustmentReason(STOCK_COUNT_REASON_NAME, candidates)
         if (!match.ok) {
           throw new Error(
-            `Choose a variance reason, or add an active adjustment reason called "${STOCK_COUNT_REASON_NAME}" (with its account) in Settings: `
+            `Choose a variance reason, or create, activate and map an adjustment reason called "${STOCK_COUNT_REASON_NAME}" (with its account) in Settings: `
             + `every stock count variance is a stock adjustment and needs a reason.${/matches/.test(match.message) ? ` (${match.message}.)` : ''} Nothing was posted.`,
           )
         }

@@ -48,6 +48,8 @@ export function StockAdjustmentForm({ productId, warehouses, reasons, reasonCost
     setPrevSuccess(undefined)
   }
 
+  // A primitive, not the `warehouses` array: every router.refresh() hands down a new array, which would re-run the effect below forever.
+  const defaultWarehouseId = warehouses[0]?.id ?? ''
   // Handle side effects (router refresh + delayed form reset)
   useEffect(() => {
     if (!state.success) return
@@ -57,12 +59,12 @@ export function StockAdjustmentForm({ productId, warehouses, reasons, reasonCost
       // token stays attached until now, but the submit button is disabled while the
       // success message shows, so it can't be reused).
       setIdempotencyToken(crypto.randomUUID())
-      setWarehouseId(warehouses[0]?.id ?? '')
+      setWarehouseId(defaultWarehouseId)
       setFormKey((k) => k + 1)
       setSuccessMsg('')
     }, 1500)
     return () => clearTimeout(t)
-  }, [state.success, router, warehouses])
+  }, [state.success, router, defaultWarehouseId])
 
   const hasReasons = reasons.length > 0
   // o3d-0ypv9 (switch on): show the unit cost a blank addition defaults to (the latest cost layer, never an average).
