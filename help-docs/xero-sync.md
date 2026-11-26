@@ -461,7 +461,7 @@ Disconnect) is ignored and re-resolved rather than used against a ledger that ne
 | Discounts Given | Revenue / Expense | Order-level discounts |
 | Stock in Transit | Asset | Every supplier bill line (product and cost lines alike) posts here; it also holds goods ordered but not yet received, and (when refund returns are held in transit) refunded goods not yet back. IMS has no separate Purchases account for bills |
 | GR/IR (goods received, not invoiced) | Liability / Current liability | Clearing account the daily batch moves goods received but not yet billed into, out of Stock in Transit. Used only while **GR/IR accrual posting** is switched on; must differ from Stock in Transit |
-| Purchase Price Variance | Profit and loss (cost of sales) | The difference between a supplier bill and the order price, posted on its own bill line while **per-event FX rates for purchasing** are switched on (off by default; not used yet). Leave blank otherwise; must differ from Stock in Transit, GR/IR and Inventory Asset |
+| Purchase Price Variance | Profit and loss (cost of sales) | Reserved for the difference between a supplier bill and the order price on its own bill line under **per-event FX rates for purchasing** (off by default). **Nothing posts to it yet**: that bill line is step 3, not built. Today it is only a prerequisite: the switch cannot be turned on, and receipts are refused while it is on, with Xero sync on and this account blank. Leave blank while the switch is off; must differ from Stock in Transit, GR/IR and Inventory Asset |
 | Inventory Asset | Asset | Stock on hand (available) |
 | Allocated Inventory | Asset | Stock reserved for paid orders awaiting dispatch (stock on an order that ships before it is paid goes straight from Inventory to COGS and never passes through here) |
 | Cost of Goods Sold | Direct Cost | COGS booked when goods ship |
@@ -501,8 +501,8 @@ The flowchart below shows every path an order can take through the Xero sub-ledg
               ▼                        ▼
     ┌──────────────────┐     ┌──────────────────┐
     │  WooCommerce     │     │  Manual Order    │
-    │  (pre-paid)      │     │  (DRAFT invoice) │
-    │                  │     │                  │
+    │  (pre-paid)      │     │  (invoice: see   │
+    │                  │     │  posting mode)   │
     │  • AUTHORISED    │     │  • Payment       │
     │    invoice       │     │    polling every  │
     │  • Payment auto- │     │    15 min detects │
@@ -633,11 +633,11 @@ The customer pays but the item is out of stock. Revenue is deferred immediately,
 
 ### Case 3: Manual Order (invoice-first)
 
-A manual order is created in the IMS. A DRAFT invoice is pushed to Xero. Payment is detected when the customer pays via bank transfer and the bank feed matches.
+A manual order is created in the IMS. An invoice is pushed to Xero: **AUTHORISED by default** (the *Sales invoices* posting mode `xero_sync_sales_invoice` defaults to `submitted`), or **DRAFT** only while that mode is set to `draft`. Payment is detected when the customer pays via bank transfer and the bank feed matches.
 
 | Step | What Happens | Xero Journal |
 |---|---|---|
-| Order created | DRAFT invoice in Xero | Invoice (DRAFT) |
+| Order created | Invoice in Xero (AUTHORISED by default; DRAFT only when `xero_sync_sales_invoice` is `draft`) | Invoice (AUTHORISED, or DRAFT) |
 | Customer pays | Bank feed matches in Xero | — |
 | Payment poll | IMS detects paid invoice, sets paidAt, advances status | — |
 | Daily batch A1 | Revenue deferred | DR Sales / CR Unearned Revenue |
@@ -925,7 +925,7 @@ CurrencyRate sent on Invoice / Bill / CreditNote API call
 
 **Connector-agnostic design:** the optional `currencyRateToBase` field is on the generic `InvoiceData` / `BillData` / `CreditNoteData` types (`lib/connectors/types.ts`). The Xero connector sends the same number as `CurrencyRate` (Xero's convention is IMS's), rounded to 6 dp.
 
-**Downstream push to WooCommerce (retired).** IMS no longer pushes exchange rates to the store: the onetwoInventory Helper plugin 1.3.0 refuses every rate push and no longer overrides Aelia's rate, so Aelia, the store's currency switcher, owns the storefront rates. A push attempt is recorded as a skipped row in the push log. IMS takes its rates from the daily ECB fetch; reading Aelia's rates into IMS (setting `fx_rate_source`, default ECB) is built but **not yet switched on**. See `docs/woocommerce.md` for the plugin.
+**Downstream push to WooCommerce (retired).** IMS no longer pushes exchange rates to the store: the onetwoInventory Helper plugin 1.3.0 refuses every rate push and no longer overrides Aelia's rate, so Aelia, the store's currency switcher, owns the storefront rates. A push attempt is recorded as a skipped row in the push log. The daily rate refresh fills `fx_rates` from the source the `fx_rate_source` setting selects: `ecb` (the default; frankfurter.dev) or `aelia` (IMS reads Aelia's pre-markup rates through the helper plugin; the exchange-rate master by owner ruling, but it only applies once the setting is switched to `aelia`, `lib/currencies/fx-source.ts`, `lib/currencies/aelia-ingest.ts`). While the source is `aelia` the push is disabled. See `docs/woocommerce.md` for the plugin.
 
 **A purchase order's rate is the table rate, never a typed one** (owner ruling 2026-10-25). `createPurchaseOrder`, the draft edit, the replenishment PO generator, the purchase-order CSV importer and the form all take the rate from the one lookup (`resolvePurchaseOrderFxRateToBase`, which calls `getFxRateToBase`); the former 2% override band (`PURCHASE_ORDER_FX_OVERRIDE_TOLERANCE`) is gone. A PO is priced at the moment it is saved (the first load prices its orders at the end of their created day). A bill pushed to Xero therefore carries a `CurrencyRate` that IS an `fx_rates` row. An admin who needs another rate pins a manual override row (below); a stored PO rate is never rewritten.
 
