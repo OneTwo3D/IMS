@@ -137,6 +137,7 @@ export const XERO_OBLIGATION_SOURCES: Readonly<Record<AccountingSyncType, XeroOb
   UNREALISED_FX_JOURNAL: { kind: 'not-applicable' },
   MANUFACTURING_JOURNAL: { kind: 'payload', field: 'date' },
   MANUFACTURING_RECLASS: { kind: 'payload', field: 'date' },
+  PURCHASE_FX_VARIANCE: { kind: 'payload', field: 'date' },
   TAX_RATE_SYNC: { kind: 'not-applicable' },
 }
 

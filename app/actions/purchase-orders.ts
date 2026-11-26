@@ -146,6 +146,10 @@ import {
   type OnDemandPrepaymentResult, type PrepaymentChecks,
 } from '@/lib/domain/purchasing/purchase-receipt-fx'
 import {
+  markPurchaseFxLockUsedByBill, purchasePriceVarianceAccount, reconcilePurchaseBillFx, reportPurchaseFxVarianceNotQueued, resolveBillFxRate, sameBillFxRate,
+  stockUnitsForeign, NO_BILL_FX_RECONCILE, type PurchaseBillFxReconcileResult,
+} from '@/lib/domain/purchasing/purchase-bill-fx'
+import {
   assertFreightTotalNotNegative,
   buildFreightCostLineRows,
   FREIGHT_COST_KINDS,
@@ -2938,7 +2942,8 @@ export async function receivePurchaseOrder(
       : null
     if (!alreadyCommitted) {
       try {
-        purchaseFxChecks = await preparePurchaseReceiptFx([id])
+        // MED-A: a manual receipt always asks Xero (an operator is waiting, and a prepayment may have been recorded a moment ago).
+        purchaseFxChecks = await preparePurchaseReceiptFx([id], { cache: 'manual' })
       } catch (refusal) {
         if (!isPurchaseFxRefusalError(refusal)) throw refusal
         await logActivity({
@@ -3351,6 +3356,11 @@ export async function receivePurchaseOrder(
         }
       }
 
+      // Per-event FX (step 3): a receipt that arrives after the order's bill settles that bill's FX difference against it (per receipt).
+      const billFx = fxValuation
+        ? await reconcilePurchaseBillFx(tx, { poId: id, connector: accountingSettings.connector, syncEnabled: accountingSettings.syncEnabled, at: receiptInstant })
+        : NO_BILL_FX_RECONCILE
+
       return {
         allReceived,
         newStatus,
@@ -3358,8 +3368,10 @@ export async function receivePurchaseOrder(
         totalReceiptValue: totalReceiptValue.toNumber(),
         creditFloorEntries: [...creditFloorByPoLine.values()],
         fxValuation,
+        billFx,
       }
     }, STOCK_TX_OPTIONS)
+    if ('billFx' in receiptResult && receiptResult.billFx) await reportPurchaseFxVarianceNotQueued(id, po.reference, receiptResult.billFx)
 
     // o3d-j625 r3 (Codex HIGH 1 family): the enqueue declined and the local state committed anyway.
     if (receiptPostingOutcome.outcome && postingIsOwed(receiptPostingOutcome.outcome)) {
@@ -4309,6 +4321,8 @@ export async function createInvoice(
             // What the order line recorded when it was priced: a new bill bills at the RECORDED rate, not the linked rate's current value.
             taxForeign: true,
             totalForeign: true,
+            // Per-event FX: the PO goods unit cost a bill's stock part is billed at (the rest of the line is price variance).
+            unitCostForeign: true,
             product: { select: { sku: true } },
             taxRate: {
               select: {
@@ -4366,13 +4380,29 @@ export async function createInvoice(
 
     const invoiceDate = new Date(input.invoiceDate)
     const baseCurrency = await getBaseCurrencyCode()
+    // Per-event FX (switch `purchase_event_fx_rates_enabled`, lib/domain/purchasing/purchase-bill-fx.ts): a foreign bill is valued and posted at the
+    // order's Xero prepayment lock rate, or with none at the exchange-rate table rate on the bill date (refused if missing), resolved PER BILL. The
+    // prepayment is asked for first, before the transaction (never inside it). Null (switch off, base currency): the PO rate, exactly as before.
+    let purchaseFxChecks: PrepaymentChecks = new Map()
+    let billFx: Awaited<ReturnType<typeof resolveBillFxRate>> = null
+    try {
+      purchaseFxChecks = await preparePurchaseReceiptFx([poId], { cache: 'manual' })
+      billFx = await resolveBillFxRate(db, { poId, invoiceDate: input.invoiceDate, checks: purchaseFxChecks })
+    } catch (refusal) {
+      if (!isPurchaseFxRefusalError(refusal)) throw refusal
+      return { success: false, error: refusal.message.replace('Nothing was received.', 'The bill was not saved.') }
+    }
     // FIFO layers are valued from the PO's booked base cost at receipt time.
     // Keep supplier bills on that same FX basis so AP, transit, and inventory
     // reconcile instead of letting invoice-date rates reprice the layer.
-    const fxRate = Number(po.fxRateToBase)
+    const fxRate = billFx ? billFx.rateToBase.toNumber() : Number(po.fxRateToBase)
     if (!Number.isFinite(fxRate) || fxRate <= 0) {
       return { success: false, error: `Invalid FX rate on PO ${po.reference}` }
     }
+    // Per-event FX: every goods line's stock part at the PO goods unit cost, the rest on its own price-variance line (PPV account).
+    const ppvSplit = billFx
+      ? { stockUnitForeignByPoLine: stockUnitsForeign(po), ppvAccount: await purchasePriceVarianceAccount(db) }
+      : undefined
     const [accountingSettings, supplierData] = await Promise.all([
       getAccountingSettings(),
       db.purchaseOrder.findUnique({
@@ -4414,6 +4444,7 @@ export async function createInvoice(
       reverseChargeTaxType: accountingSettings.reverseChargePurchaseTaxType || undefined,
       poLineById,
       costLineById,
+      ...(ppvSplit ? { ppvSplit } : {}),
     })
     } catch (error) {
       if (error instanceof PurchaseBillTaxRefusal) return { success: false, error: error.message }
@@ -4454,10 +4485,15 @@ export async function createInvoice(
     // unaffected, which is exactly what makes it dangerous: the guard still works and the types stop
     // being able to say so. A property of an object is re-widened by the intervening call.
     const billPostingOutcome: { outcome?: EnqueueOutcomeLike } = {}
+    const billFxReconcile: { result: PurchaseBillFxReconcileResult } = { result: NO_BILL_FX_RECONCILE }
     await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
       await tx.$queryRaw`SELECT id FROM purchase_order_lines WHERE "poId" = ${poId} FOR UPDATE`
       await tx.$queryRaw`SELECT id FROM freight_cost_lines WHERE "poId" = ${poId} FOR UPDATE`
+      // Per-event FX: the bill's rate again, under the order's row lock (the lock row is only written under it). A change since the pricing above
+      // (a lock stored or replaced, the switch flipped) refuses: the bill was priced at another rate.
+      const lockedBillFx = await resolveBillFxRate(tx, { poId, invoiceDate: input.invoiceDate, checks: purchaseFxChecks })
+      if (!sameBillFxRate(billFx, lockedBillFx)) throw new PurchaseInvoiceInputsChangedError()
 
       const existing = await tx.purchaseInvoiceLine.findMany({
         where: { invoice: { poId } },
@@ -4544,7 +4580,8 @@ export async function createInvoice(
           taxBase: invoiceCalculation.taxBase,
           totalForeign: invoiceCalculation.totalForeign,
           totalBase: invoiceCalculation.totalBase,
-          fxRateToBase: fxRate,
+          fxRateToBase: billFx ? billFx.storedRateToBase : fxRate,
+          ...(billFx ? { fxRateSource: billFx.source, fxEventRateToBase: billFx.rateToBase, ppvBase: invoiceCalculation.ppvBase } : {}),
           notes: input.notes || null,
           supplierInvoiceUrl: input.supplierInvoiceUrl || null,
           lines: {
@@ -4556,15 +4593,19 @@ export async function createInvoice(
               unitCostForeign: line.unitCostForeign,
               totalForeign: line.totalForeign,
               totalBase: line.totalBase,
+              ...(line.stockUnitForeign !== undefined ? { stockUnitForeign: line.stockUnitForeign } : {}),
               ...snapshotColumnsFor(invoiceCalculation.lineTaxRates[index], bookedAt),
             })),
           },
         },
       })
+      // Per-event FX: the bill now posts at the lock's rate, so the lock is final.
+      await markPurchaseFxLockUsedByBill(tx, billFx, new Date())
 
       // GR/IR accrual: the goods lines of this bill debit GR/IR at the PO goods unit cost; the price difference is its own movement. In this transaction,
-      // whether or not the Xero posting is on. A freight cost line has no order line and stays on the transit path.
-      await recordGrirBill(tx, {
+      // whether or not the Xero posting is on. A freight cost line has no order line and stays on the transit path. Per-event FX: a bill valued under
+      // the switch is accrued by `reconcilePurchaseBillFx` below instead (at the receipts' value, with its FX and price variance rows).
+      if (!billFx) await recordGrirBill(tx, {
         poId,
         invoiceId: createdInvoice.id,
         invoiceDate: input.invoiceDate,
@@ -4637,12 +4678,18 @@ export async function createInvoice(
             sourceType: 'PURCHASE_BILL',
             sourceRef: poId,
             idempotencyKey: billIdempotencyKey,
-            baseDelta: invoiceCalculation.subtotalBase,
+            // Per-event FX: only the part coded to transit (the PPV lines go to their own account).
+            baseDelta: billFx ? invoiceCalculation.transitBase : invoiceCalculation.subtotalBase,
             journalDate: input.invoiceDate,
           })
         }
       }
+      // Per-event FX: the bill's GR/IR rows and, where its rate differs from its receipts', the FX-difference journal (after the bill, in its transaction).
+      if (billFx) {
+        billFxReconcile.result = await reconcilePurchaseBillFx(tx, { poId, connector: accountingSettings.connector, syncEnabled: accountingSettings.syncEnabled, at: new Date() })
+      }
     }, STOCK_TX_OPTIONS)
+    await reportPurchaseFxVarianceNotQueued(poId, po.reference, billFxReconcile.result)
 
     // o3d-j625 r3 (Codex HIGH 1 family): the enqueue declined and the local state committed anyway.
     if (billPostingOutcome.outcome && postingIsOwed(billPostingOutcome.outcome)) {
@@ -4706,6 +4753,7 @@ export async function createInvoice(
       metadata: null,
     })
     if (e instanceof PurchaseInvoiceInputsChangedError) return { success: false, error: e.message }
+    if (isPurchaseFxRefusalError(e)) return { success: false, error: e.message }
     return { success: false, error: String(e) }
   }
 }
@@ -4734,6 +4782,9 @@ export async function updateInvoice(
         totalForeign: true,
         totalBase: true,
         fxRateToBase: true,
+        fxRateSource: true,
+        fxEventRateToBase: true,
+        ppvBase: true,
         notes: true,
         supplierInvoiceUrl: true,
         accountingInvoiceId: true,
@@ -4767,6 +4818,7 @@ export async function updateInvoice(
                 qtyReturned: true,
                 taxForeign: true,
                 totalForeign: true,
+                unitCostForeign: true,
                 product: { select: { sku: true } },
                 taxRate: {
                   select: {
@@ -4801,6 +4853,7 @@ export async function updateInvoice(
             unitCostForeign: true,
             totalForeign: true,
             totalBase: true,
+            stockUnitForeign: true,
             taxType: true,
             taxRateValue: true,
             taxRateId: true,
@@ -4837,9 +4890,19 @@ export async function updateInvoice(
 
     const invoiceDate = new Date(input.invoiceDate)
     const dueDate = input.dueDate ? new Date(input.dueDate) : null
-    const fxRate = Number(invoice.fxRateToBase)
+    // Per-event FX: a bill valued under the switch keeps ITS OWN exact rate and its price-variance split on every edit (the rate is the bill's, fixed
+    // when it was created); each line's stock part stays at the PO goods unit cost it was billed at. Its GR/IR rows and FX-difference journal are
+    // brought to the edited bill by `reconcilePurchaseBillFx` in the transaction below.
+    const billFxManaged = Boolean(invoice.fxRateSource && invoice.fxEventRateToBase)
+    const fxRate = billFxManaged ? Number(invoice.fxEventRateToBase) : Number(invoice.fxRateToBase)
     if (!Number.isFinite(fxRate) || fxRate <= 0) {
       return { success: false, error: `Invalid FX rate on bill ${invoice.invoiceNumber ?? invoice.id}` }
+    }
+    let editPpvSplit: { stockUnitForeignByPoLine: Map<string, Prisma.Decimal>; ppvAccount: string } | undefined
+    if (billFxManaged) {
+      const fromOrder = stockUnitsForeign(invoice.po)
+      for (const line of invoice.lines) if (line.poLineId && line.stockUnitForeign !== null) fromOrder.set(line.poLineId, new Prisma.Decimal(line.stockUnitForeign))
+      editPpvSplit = { stockUnitForeignByPoLine: fromOrder, ppvAccount: await purchasePriceVarianceAccount(db) }
     }
     const baseCurrency = await getBaseCurrencyCode()
     const poLineById = new Map(invoice.po.lines.map((line) => [line.id, line]))
@@ -4898,6 +4961,7 @@ export async function updateInvoice(
         reverseChargeTaxType: accountingSettings.reverseChargePurchaseTaxType || undefined,
         poLineById,
         costLineById,
+        ...(editPpvSplit ? { ppvSplit: editPpvSplit } : {}),
       })
     } catch (error) {
       return { success: false, error: String(error instanceof Error ? error.message : error) }
@@ -4975,6 +5039,7 @@ export async function updateInvoice(
     // from the bill's own columns (`accountingInvoiceId && idempotencyKey`), which consults the enqueue
     // not at all — so a refused update was recorded as a queued one.
     const billUpdateSync: { outcome: Awaited<ReturnType<typeof maybeQueuePurchaseInvoiceUpdate>> } = { outcome: 'skipped-no-external-id' }
+    const billFxReconcile: { result: PurchaseBillFxReconcileResult } = { result: NO_BILL_FX_RECONCILE }
     // True when the edit was written into the bill's still-unsent first posting instead of being queued as an update.
     let firstPostingRefreshed = false
     await db.$transaction(async (tx) => {
@@ -4994,6 +5059,8 @@ export async function updateInvoice(
           paidAt: true,
           // 6oyu.4 (khdw): the pre-edit NET subtotal, to record the transit delta.
           subtotalBase: true,
+          // Per-event FX: the pre-edit price-variance total (the part of the subtotal NOT on transit).
+          ppvBase: true,
           // The bill as it stands under the lock, to refuse an edit made from a copy another edit has since replaced.
           invoiceNumber: true,
           invoiceDate: true,
@@ -5124,6 +5191,7 @@ export async function updateInvoice(
           taxBase: invoiceCalculation.taxBase,
           totalForeign: invoiceCalculation.totalForeign,
           totalBase: invoiceCalculation.totalBase,
+          ...(billFxManaged ? { ppvBase: invoiceCalculation.ppvBase } : {}),
           notes: normalizedHeader.notes,
           supplierInvoiceUrl: normalizedHeader.supplierInvoiceUrl,
         },
@@ -5141,6 +5209,7 @@ export async function updateInvoice(
             unitCostForeign: line.unitCostForeign,
             totalForeign: line.totalForeign,
             totalBase: line.totalBase,
+            ...(line.stockUnitForeign !== undefined ? { stockUnitForeign: line.stockUnitForeign } : {}),
             // Booked lines keep their snapshot (and its booking time); a legacy line is booked now.
             ...(booked && bookedTaxFromLine(booked) ? {} : snapshotColumnsFor(invoiceCalculation.lineTaxRates[index], bookedAt)),
           },
@@ -5148,7 +5217,8 @@ export async function updateInvoice(
       }
 
       // GR/IR accrual: the signed delta of each goods line against the bill as it stood under the lock (a freight cost line is the transit path's).
-      await recordGrirBillEdit(tx, {
+      // Per-event FX: a bill valued under the switch is re-accrued by `reconcilePurchaseBillFx` below instead.
+      if (!billFxManaged) await recordGrirBillEdit(tx, {
         poId: invoice.poId,
         invoiceId: invoice.id,
         editId: randomUUID(),
@@ -5188,7 +5258,10 @@ export async function updateInvoice(
             sourceType: 'PURCHASE_BILL_UPDATE',
             sourceRef: invoice.poId,
             idempotencyKey: `purchase-invoice-refresh:${invoice.id}:${randomUUID()}`,
-            baseDelta: Number(invoiceCalculation.subtotalBase) - Number(lockedInvoice.subtotalBase),
+            // Per-event FX: only the part coded to transit moves it (the PPV lines are on their own account).
+            baseDelta: billFxManaged
+              ? Number(invoiceCalculation.transitBase) - (Number(lockedInvoice.subtotalBase) - Number(lockedInvoice.ppvBase ?? 0))
+              : Number(invoiceCalculation.subtotalBase) - Number(lockedInvoice.subtotalBase),
             journalDate: String(accountingPayload.date),
           })
         }
@@ -5211,8 +5284,9 @@ export async function updateInvoice(
         // Xero-only verdict from this value instead of resolving the connector for itself.
         chartConnector: accountingSettings.connector,
         idempotencyKey,
-        previousSubtotalBase: Number(lockedInvoice.subtotalBase),
-        newSubtotalBase: Number(invoiceCalculation.subtotalBase),
+        // Per-event FX: the transit-coded part only (the PPV lines are on their own account); without the split this is the net subtotal.
+        previousSubtotalBase: billFxManaged ? Number(lockedInvoice.subtotalBase) - Number(lockedInvoice.ppvBase ?? 0) : Number(lockedInvoice.subtotalBase),
+        newSubtotalBase: billFxManaged ? Number(invoiceCalculation.transitBase) : Number(invoiceCalculation.subtotalBase),
         deps: {
           // o3d-j625 r4 (Codex HIGH 3): the chart-scoped verdict, not the active-connector boolean.
           postingVerdictForChart: accountingPostingVerdictForChart,
@@ -5222,7 +5296,12 @@ export async function updateInvoice(
           assertNoPendingDeletion: (tx, billId) => assertNoPendingDeletion(billId, tx),
         },
       })
+      // Per-event FX: the edited bill's GR/IR rows and FX-difference journal, adjusted to what the bill now is.
+      if (billFxManaged) {
+        billFxReconcile.result = await reconcilePurchaseBillFx(tx, { poId: invoice.poId, connector: accountingSettings.connector, syncEnabled: accountingSettings.syncEnabled, at: new Date() })
+      }
     }, STOCK_TX_OPTIONS)
+    await reportPurchaseFxVarianceNotQueued(invoice.poId, invoice.po.reference, billFxReconcile.result)
 
     revalidatePath('/purchase-orders')
     revalidatePath(`/purchase-orders/${invoice.poId}`)

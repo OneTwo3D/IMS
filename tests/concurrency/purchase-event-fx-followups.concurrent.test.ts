@@ -63,7 +63,6 @@ mock.module('@/lib/notifications', { namedExports: { notify: async () => {} } })
 const { loadEnv, enableStockReceiptPosting, uid, seedPo, addAsn, alignUp, receive } = fixtures
 
 const SWITCH = 'purchase_event_fx_rates_enabled'
-const TTL_KEY = 'purchase_fx_no_prepayment_ttl_hours'
 const PO_RATE = '1.25'
 const UNIT_FOREIGN = '6.25'
 const HOUR = 3_600_000
@@ -209,11 +208,13 @@ async function ageLock(po: { poId: string }, ms: number): Promise<void> {
 
 test.before(async () => {
   if (!RUN) return
+  // The switch reads off until the last step is installed (the interlock); these arms exercise the built steps with it on.
+  const { setPurchaseEventFxStepsCompleteForTests } = await import('@/lib/domain/purchasing/purchase-event-fx-settings')
+  setPurchaseEventFxStepsCompleteForTests(true)
   loadEnv()
   await enableStockReceiptPosting()
   await setSetting('xero_realised_fx_gain_loss_account', '4900')
   await setSetting('xero_purchase_price_variance_account', '5050')
-  await setSetting(TTL_KEY, null)
   await setSetting(SWITCH, 'false')
 })
 
@@ -230,7 +231,8 @@ test.beforeEach(async () => {
   contactLedger.calls = 0
   contactLedger.answer = () => ({ success: true, contactId: null })
   if (RUN) {
-    await setSetting(TTL_KEY, null)
+    const { clearPurchaseFxRefusalMemoryForTests } = await import('@/lib/domain/purchasing/purchase-receipt-fx')
+    clearPurchaseFxRefusalMemoryForTests()
     await setSetting('xero_sync_enabled', 'true')
   }
 })
@@ -394,33 +396,40 @@ test('RACE (LOW-1): with NO lock yet, the on-demand create and a receipt\'s lazy
 
 // ─── MED-2: "no prepayment" is cached; align pre-reads only candidates with capacity ────────────────────────────
 
-test('MED-2: a "no prepayment" answer is cached for the TTL: the second receipt asks Xero nothing; an expired stamp asks again; a found prepayment clears it; TTL 0 turns the cache off', SKIP, async () => {
-  const po = await seedForeignPo('med2', [12])
+test('MED-A: a manual receipt always asks Xero; an automatic one relies on a "no prepayment" answer only while it is at most 15 minutes old', SKIP, async () => {
+  const po = await seedForeignPo('meda', [12])
   await withSwitch(true, async () => {
     assert.equal((await receive(po, po.lines[0]!, 3)).success, true)
     assert.equal(ledger.calls.length, 1)
-    const stamp = await stampOf(po)
-    assert.ok(stamp, 'the order carries the "no prepayment" stamp')
+    assert.ok(await stampOf(po), 'the order carries the "no prepayment" stamp')
     assert.equal((await receive(po, po.lines[0]!, 3)).success, true)
-    assert.equal(ledger.calls.length, 1, 'inside the cache window: no second Xero read')
-    assert.deepEqual((await receiptsOf(po)).map((r) => r.source), ['FX_TABLE', 'FX_TABLE'])
-
-    // The stamp expires: asked again, and now Xero holds one.
+    assert.equal(ledger.calls.length, 2, 'a manual receipt asks again, whatever the stamp')
+    const { preparePurchaseReceiptFx } = await import('@/lib/domain/purchasing/purchase-receipt-fx')
+    const fresh = await preparePurchaseReceiptFx([po.poId], { collectRefusals: true })
+    assert.equal(ledger.calls.length, 2, 'an automatic receipt trusts a fresh stamp')
+    assert.equal(fresh.get(po.poId)?.kind, 'no_prepayment')
     const { db } = await import('@/lib/db')
-    await db.$executeRaw`UPDATE purchase_orders SET fx_no_prepayment_checked_at = ${new Date(Date.now() - 7 * HOUR)} WHERE id = ${po.poId}`
+    await db.$executeRaw`UPDATE purchase_orders SET fx_no_prepayment_checked_at = ${new Date(Date.now() - 16 * 60_000)} WHERE id = ${po.poId}`
     answerWith([[po, [prepaymentFor(po)]]])
-    assert.equal((await receive(po, po.lines[0]!, 3)).success, true)
-    assert.equal(ledger.calls.length, 2)
+    const stale = await preparePurchaseReceiptFx([po.poId], { collectRefusals: true })
+    assert.equal(ledger.calls.length, 3, 'a stamp older than 15 minutes is read again before a fallback receipt')
+    assert.equal(stale.get(po.poId)?.kind, 'locked', 'the prepayment recorded since is found')
     assert.equal(await stampOf(po), null, 'a found prepayment clears the stamp')
-    assert.deepEqual((await receiptsOf(po)).map((r) => r.source), ['FX_TABLE', 'FX_TABLE', 'XERO_PREPAYMENT'])
   })
-  const off = await seedForeignPo('med2-ttl0', [6])
-  await setSetting(TTL_KEY, '0')
+})
+
+test('MED-B: one sweep memo asks about an order once; a refused answer is remembered for automatic receipts and never for a manual one', SKIP, async () => {
+  const po = await seedForeignPo('medb', [6])
+  const { preparePurchaseReceiptFx, newPurchaseFxSweepMemo } = await import('@/lib/domain/purchasing/purchase-receipt-fx')
   await withSwitch(true, async () => {
-    ledger.calls = []
-    assert.equal((await receive(off, off.lines[0]!, 3)).success, true)
-    assert.equal((await receive(off, off.lines[0]!, 3)).success, true)
-    assert.equal(ledger.calls.length, 2, 'TTL 0: every receipt asks')
+    answerWith([[po, [prepaymentFor(po), prepaymentFor(po)]]])
+    const memo = newPurchaseFxSweepMemo()
+    for (let i = 0; i < 5; i += 1) assert.equal((await preparePurchaseReceiptFx([po.poId], { collectRefusals: true, memo })).get(po.poId)?.kind, 'refused')
+    assert.equal(ledger.calls.length, 1, 'five products in one sweep: one read')
+    assert.equal((await preparePurchaseReceiptFx([po.poId], { collectRefusals: true })).get(po.poId)?.kind, 'refused')
+    assert.equal(ledger.calls.length, 1, 'the next sweep remembers the refusal')
+    await assert.rejects(preparePurchaseReceiptFx([po.poId], { cache: 'manual' }))
+    assert.equal(ledger.calls.length, 2, 'a manual receipt always asks')
   })
 })
 
@@ -512,22 +521,46 @@ test('MED-4: a book-in refused only because Xero cannot be read (or a table rate
     assert.ok(row.nextRetryAt && row.nextRetryAt.getTime() > Date.now() + 20 * 60_000, 'waits about 30 minutes, like a login refusal')
     assert.match(row.lastError ?? '', /Could not read the Xero supplier prepayment/)
     assert.deepEqual(await layersOf(po), [])
-    // Xero answers: the same event books in.
+    // Xero answers: the same event books in (once the remembered refusal has lapsed).
+    const { clearPurchaseFxRefusalMemoryForTests } = await import('@/lib/domain/purchasing/purchase-receipt-fx')
+    clearPurchaseFxRefusalMemoryForTests()
     answerWith([[po, [prepaymentFor(po)]]])
     assert.equal((await event.run()).status, 'processed')
     assert.deepEqual((await layersOf(po)).map((l) => l.rate), ['1.6'])
   })
-  // A missing fx_rates rate waits the same way.
+  // MED-C: a currency the exchange-rate feed has NEVER held does not resolve by waiting: it counts.
   const noRate = await seedForeignPo('med4-norate', [5])
   const { db } = await import('@/lib/db')
   await db.fxRate.deleteMany({ where: { toCurrency: noRate.currency } })
   const asn2 = await addAsn(noRate, noRate.lines[0]!, { expectedQty: 5 })
   const event2 = await bookInEvent(asn2, noRate.lines[0]!, 5, 5)
   await withSwitch(true, async () => {
-    for (let i = 0; i < 9; i += 1) assert.equal((await event2.run()).status, 'failed')
+    for (let i = 0; i < 2; i += 1) assert.equal((await event2.run()).status, 'failed')
     const row = await event2.row()
-    assert.equal(row.processingAttempts, 0)
-    assert.equal(row.deadLetteredAt, null)
+    assert.equal(row.processingAttempts, 2, 'a currency the feed never carried is a counted failure')
+    assert.match(row.lastError ?? '', /never held/)
+  })
+})
+
+test('MED-C: an episode of waits on the purchase rate is capped: the 11th wait counts as a failure with a durable WARNING', SKIP, async () => {
+  const po = await seedForeignPo('medc', [5])
+  const asn = await addAsn(po, po.lines[0]!, { expectedQty: 5 })
+  const event = await bookInEvent(asn, po.lines[0]!, 5, 5)
+  const { clearPurchaseFxRefusalMemoryForTests } = await import('@/lib/domain/purchasing/purchase-receipt-fx')
+  await withSwitch(true, async () => {
+    ledger.answer = () => ({ ok: false, error: 'HTTP 503' })
+    for (let i = 0; i < 10; i += 1) {
+      clearPurchaseFxRefusalMemoryForTests()
+      assert.equal((await event.run()).status, 'failed')
+    }
+    assert.equal((await event.row()).processingAttempts, 0, 'ten waits are free')
+    clearPurchaseFxRefusalMemoryForTests()
+    assert.equal((await event.run()).status, 'failed')
+    assert.equal((await event.row()).processingAttempts, 1, 'the eleventh counts')
+    const { db } = await import('@/lib/db')
+    const warnings = await db.activityLog.findMany({ where: { action: 'mintsoft_booked_in_fx_wait_capped', entityId: event.eventId } })
+    assert.equal(warnings.length, 1)
+    assert.equal(warnings[0]!.level, 'WARNING')
   })
 })
 

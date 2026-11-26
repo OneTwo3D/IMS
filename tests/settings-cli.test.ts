@@ -282,7 +282,15 @@ test('purchase_event_fx_rates_enabled: off by default and ADMIN; its account key
   const reader = (value: string | null) => ({ setting: { findUnique: async () => (value === null ? null : { value }) } })
   assert.equal(await isPurchaseEventFxEnabled(reader(null)), false)
   for (const off of ['false', 'TRUE', '1', ' true']) assert.equal(await isPurchaseEventFxEnabled(reader(off)), false, off)
-  assert.equal(await isPurchaseEventFxEnabled(reader('true')), true)
+  // The interlock applies on READ too: while the last step is not installed the switch reads off even when stored 'true'.
+  assert.equal(await isPurchaseEventFxEnabled(reader('true')), false, 'interlock not complete: off')
+  const { setPurchaseEventFxStepsCompleteForTests } = await import('../lib/domain/purchasing/purchase-event-fx-settings')
+  setPurchaseEventFxStepsCompleteForTests(true)
+  try {
+    assert.equal(await isPurchaseEventFxEnabled(reader('true')), true)
+  } finally {
+    setPurchaseEventFxStepsCompleteForTests(null)
+  }
 })
 
 const FX_ON = ['--key', 'purchase_event_fx_rates_enabled', '--value', 'true', ...SET, '--yes', '--confirm-admin']
@@ -302,7 +310,7 @@ test('purchase_event_fx_rates_enabled: INTERLOCK (LOW-18): turning it on is refu
   for (const argv of [FX_ON.slice(0, -2), FX_ON]) {
     const r = await run('set', argv, mapped)
     assert.equal(r.code, 3, r.out)
-    assert.match(r.err, /cannot be turned on yet: step 3 of the per-event purchase FX work/)
+    assert.match(r.err, /cannot be turned on yet: the last part of step 3 of the per-event purchase FX work/)
   }
   assert.equal(mapped.settings.get('purchase_event_fx_rates_enabled'), undefined)
   assert.equal(mapped.audits.length, 0)

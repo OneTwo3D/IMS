@@ -483,16 +483,28 @@ export async function completeAccountingDocumentDeletion(externalDocumentId: str
           lines: bill.lines.map((line) => ({ poLineId: line.poLineId, costLineId: line.costLineId, qtyBilled: line.qtyBilled.toString(), totalForeign: line.totalForeign.toString() })),
         }
         // The bill DEBITED Stock in Transit by its net subtotal when it was pushed (and by each edit's delta since); the void takes that back.
+        // Per-event FX: a bill valued under the switch debited transit with its stock part only (its price-variance lines are on their own account).
+        const billFxManaged = Boolean(bill.fxRateSource && bill.fxEventRateToBase)
+        const transitBase = billFxManaged ? bill.subtotalBase.sub(bill.ppvBase ?? 0) : bill.subtotalBase
         await recordTransitSubledgerMovement(tx, {
           sourceType: 'PURCHASE_BILL_UPDATE',
           sourceRef: bill.poId,
           idempotencyKey: `document-delete:${deletion.id}`,
-          baseDelta: bill.subtotalBase.negated(),
+          baseDelta: transitBase.negated(),
           journalDate: bill.invoiceDate,
         })
-        unwound.transitMovementBase = bill.subtotalBase.negated().toString()
+        unwound.transitMovementBase = transitBase.negated().toString()
         await tx.purchaseInvoiceLine.deleteMany({ where: { invoiceId: bill.id } })
         await tx.purchaseInvoice.delete({ where: { id: bill.id } })
+        // Per-event FX: the deleted bill's GR/IR rows go back to zero and its FX-difference journal is reversed (and any later bill of the order
+        // re-matched to the receipts this one took), in this transaction, under the order's row lock taken above.
+        if (billFxManaged) {
+          const { reconcilePurchaseBillFx } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+          const syncEnabled = (await tx.setting.findUnique({ where: { key: 'xero_sync_enabled' }, select: { value: true } }))?.value === 'true'
+          const fx = await reconcilePurchaseBillFx(tx, { poId: bill.poId, connector: 'xero', syncEnabled, at: new Date() })
+          unwound.purchaseFxJournals = fx.journals
+          if (fx.notQueued.length > 0) unwound.purchaseFxJournalsNotQueued = fx.notQueued.map((entry) => entry.invoiceId)
+        }
         const remaining = await tx.purchaseInvoice.count({ where: { poId: bill.poId } })
         if (remaining === 0) await tx.purchaseOrder.update({ where: { id: bill.poId }, data: { invoicedAt: null } })
         unwound.billDeleted = true

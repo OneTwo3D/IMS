@@ -354,6 +354,7 @@ const MANUAL_PRODUCERS: Record<string, Record<string, number>> = {
   realised_fx_receipt: { 'app/actions/sales.ts': 1 },
   manufacturing_journal: { 'app/actions/manufacturing.ts': 1 },
   manufacturing_reclass: { 'app/actions/manufacturing.ts': 1 },
+  purchase_fx_variance: { 'lib/domain/purchasing/purchase-bill-fx.ts': 1 },
   allocation_reversal: { 'lib/domain/sales/allocation-service.ts': 1 },
 }
 

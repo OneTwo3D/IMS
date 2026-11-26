@@ -74,10 +74,11 @@ import {
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { recordGrirReceipt } from '@/lib/domain/accounting/grir-subledger-movement'
+import { reconcilePurchaseBillFx, reportPurchaseFxVarianceNotQueued, type PurchaseBillFxReconcileResult } from '@/lib/domain/purchasing/purchase-bill-fx'
 import {
   NO_PREPAYMENT_CHECKS, isPurchaseFxRefusalError, markPurchaseFxLockUsed, preparePurchaseReceiptFx, purchaseFxLayerFields, reportPurchaseFxFallback,
-  resolveReceiptFxValuation,
-  type PrepaymentChecks, type ReceiptFxValuation,
+  resolveReceiptFxValuation, newPurchaseFxSweepMemo,
+  type PrepaymentChecks, type PurchaseFxSweepMemo, type ReceiptFxValuation,
 } from '@/lib/domain/purchasing/purchase-receipt-fx'
 import { isPurchaseEventFxEnabled } from '@/lib/domain/purchasing/purchase-event-fx-settings'
 import { isMissingFxRateError } from '@/lib/currencies/fx-lookup'
@@ -1588,6 +1589,8 @@ export async function applyMintsoftAlignmentForProduct(params: {
    */
   imsQty: number
   dryRun: boolean
+  /** Per-event FX (MED-B): the sweep's memo of Xero prepayment answers, shared across its products. Absent = this call's own. */
+  purchaseFxMemo?: PurchaseFxSweepMemo
 }): Promise<{
   applied: boolean
   dryRun: boolean
@@ -1626,10 +1629,11 @@ export async function applyMintsoftAlignmentForProduct(params: {
   if (!params.dryRun && await isPurchaseEventFxEnabled(db)) {
     // MED-3: refusals are recorded PER ORDER (collectRefusals). One order's ambiguous prepayment or failed read refuses the alignment only if that order
     // is really a candidate the plan allocates to (the cost pass below throws it then); an order the plan never reaches costs the others nothing.
-    purchaseFxChecks = await preparePurchaseReceiptFx(await alignmentPurchaseOrderIds(params.binding, params.productId), { collectRefusals: true })
+    purchaseFxChecks = await preparePurchaseReceiptFx(await alignmentPurchaseOrderIds(params.binding, params.productId), { collectRefusals: true, memo: params.purchaseFxMemo })
   }
   // The valuations this alignment laid goods at, reported after the commit (MED-5).
   const purchaseFxValuations = new Map<string, ReceiptFxValuation>()
+  const purchaseBillFxResults: Array<{ poId: string; poReference: string; result: PurchaseBillFxReconcileResult }> = []
 
   const outcome = await db.$transaction(async (tx) => {
     // THE LOCKS, IN THE GLOBAL ORDER (6oyu.19, Codex round-9 HIGH-1).
@@ -2342,6 +2346,16 @@ export async function applyMintsoftAlignmentForProduct(params: {
       })
     }
 
+    // Per-event FX (step 3): goods that arrive after the order's bill settle that bill's FX difference against them (per receipt), here, under
+    // the order row locks this alignment holds.
+    for (const valuation of purchaseFxValuations.values()) {
+      purchaseBillFxResults.push({
+        poId: valuation.poId,
+        poReference: valuation.poReference,
+        result: await reconcilePurchaseBillFx(tx, { poId: valuation.poId, connector: accountingConnector, syncEnabled: accountingSettings.syncEnabled, at: now }),
+      })
+    }
+
     return {
       kind: 'applied' as const,
       creditFloorReports: [...creditFloorByPoLine.values()],
@@ -2378,6 +2392,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
   if (outcome.kind === 'applied') {
     // MED-5: an order whose goods were laid at the table rate while Xero sync is on and Xero holds no prepayment with its reference.
     for (const valuation of purchaseFxValuations.values()) await reportPurchaseFxFallback(valuation, 'Mintsoft alignment')
+    for (const entry of purchaseBillFxResults) await reportPurchaseFxVarianceNotQueued(entry.poId, entry.poReference, entry.result)
     // A negative landed cost larger than the goods cost was held at zero for some of these layers: the
     // durable WARNING is written now, AFTER the commit, one entry per purchase order.
     const floorReportsByPo = new Map<string, { poReference: string; entries: FlooredLandedCreditEntry[] }>()
@@ -2928,6 +2943,8 @@ export async function runStockSyncForBinding(
     })
 
     const logRows: Array<Prisma.WmsSyncLogCreateManyInput> = []
+    // Per-event FX (MED-B): one memo for the whole sweep, so an order is asked about its Xero prepayment at most once however many products it carries.
+    const purchaseFxMemo = newPurchaseFxSweepMemo()
 
     for (const line of stockLines) {
       await refreshLease()
@@ -3026,6 +3043,7 @@ export async function runStockSyncForBinding(
             // HIGH-1). Same pair the align-down call below passes.
             imsQty,
             dryRun: alignmentDryRun,
+            purchaseFxMemo,
           })
 
           if (alignment.stockEnqueue === 'failed') stockEnqueueFailures += 1

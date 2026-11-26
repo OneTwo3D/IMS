@@ -166,6 +166,7 @@ export const CREATE_REPLAY_POLICY: Record<AccountingSyncType, CreateReplayPolicy
   UNREALISED_FX_JOURNAL: 'no-remedy',
   MANUFACTURING_JOURNAL: 'no-remedy',
   MANUFACTURING_RECLASS: 'no-remedy',
+  PURCHASE_FX_VARIANCE: 'no-remedy',
 
   CREDIT_NOTE: 'natural-key-upsert',
   // o3d-ngmt.22: a status write to a credit note that already stands; it creates nothing, and the void reads the document first.
