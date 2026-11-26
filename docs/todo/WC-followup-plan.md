@@ -91,7 +91,7 @@ Implemented:
 - Playwright coverage now covers shipment tracking edit flow and live WooCommerce tracking push verification
 - route and admin coverage were expanded so the selector-driven E2E harness reaches more integration-facing surfaces
 
-### 5. Finish the shopping connector boundary for future shopping connectors
+### 5. Finish the shopping connector boundary for future Shopify support
 
 Status: open
 
@@ -107,7 +107,7 @@ Target architecture:
 - non-connector code should know only about a generic shopping connector interface and the currently active shopping connector
 - shopping-specific operations should be exposed through app-facing connector-agnostic facades
 - WooCommerce-specific settings keys, webhook topics, URLs, payloads, and helper imports should remain inside the WooCommerce connector
-- replacing WooCommerce with another storefront should require adding that connector's implementation and changing connector selection/configuration only, not editing core business logic, routes, or shared UI
+- replacing WooCommerce with Shopify should require adding a Shopify connector implementation and changing connector selection/configuration only, not editing core business logic, routes, or shared UI
 
 Current boundary leaks to remove:
 - some page/UI code still reads `wc_*` settings or `wc*` fields directly rather than consuming generic external-connector view models
