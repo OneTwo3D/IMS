@@ -51,7 +51,7 @@ type Props = {
   data: MintsoftDashboardData
   /**
    * WHETHER THE MINTSOFT CONNECTION IS SET UP — a PROP, not a field of `data`
-   * (o3d-remove-shiphero round 14, Codex HIGH 2).
+   * (wms-neutral-refactor round 14, Codex HIGH 2).
    *
    * It used to be `data.status.configured`, recomputed by the DTO builder from the raw stored base
    * URL. A malformed base URL is non-blank, so that copy said "Configured" and left Run Product

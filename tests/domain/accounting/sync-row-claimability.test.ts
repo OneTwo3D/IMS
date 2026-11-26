@@ -191,7 +191,7 @@ test('[archived] and a LIVE connector with its sync enabled is STILL refused —
 })
 
 test('[archived] the refusal never names a control this build does not render', () => {
-  for (const connector of ['retired-ledger', 'shopify', 'shiphero', 'shipstation']) {
+  for (const connector of ['retired-ledger', 'retired-store', 'retired-wms', 'other-wms']) {
     assert.equal(isRegisteredAccountingConnector(connector), false, `${connector} must be unregistered here`)
     assert.doesNotMatch(
       describeStillClaimableStrandedRow(connector),

@@ -5,13 +5,13 @@ import type { ShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 import { isEmptyShoppingWebhookBodyAllowed } from '@/lib/shopping'
 
 /**
- * AN ID THIS BUILD DOES NOT REGISTER (o3d-remove-parked-connectors). The default-deny case below
- * used to be proved with 'shopify', a real registered connector; Shopify is archived, so the only
+ * AN ID THIS BUILD DOES NOT REGISTER The default-deny case below
+ * used to be proved with a second registered storefront; that storefront is archived, so the only
  * way left to reach the default-deny is to hand the helper an id the union does not contain. The
  * cast is the point, not a workaround: what is being locked is that the helper ANSWERS FALSE for an
  * id it does not recognise instead of falling off the end of its switch and returning `undefined`.
- * That is a weaker subject than a second shipped connector, and the note in
- * docs/archive/shopify-connector-removal.md records it as such.
+ * That is a weaker subject than a second shipped connector, and the removal note
+ * under docs/archive/ records it as such.
  */
 const UNREGISTERED_CONNECTOR = 'not-a-registered-connector' as unknown as ShoppingConnectorId
 

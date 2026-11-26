@@ -588,16 +588,16 @@ export type RestoreLockContext = {
  *       `handleShoppingWebhook` dispatches on the connector and only `handleWcWebhook` checks it
  *       (first thing it does, before any write). So every delivery this build can accept IS fenced
  *       — but by the handler, not by the route, and the classification stays `woocommerce-only`
- *       rather than `yes` for exactly that reason. The second connector's delivery used to reach
- *       `lib/connectors/shopify` unfenced; o3d-remove-parked-connectors archived that connector, so
- *       the gap closed by REMOVAL, not by fencing. The next connector registered here is unfenced
+ *       rather than `yes` for exactly that reason. A second connector's delivery used to reach
+ *       its handler unfenced; that connector was archived, so the gap closed by REMOVAL, not by
+ *       fencing. The next connector registered here is unfenced
  *       by omission unless its own handler consults the flag — which is the fact this classification
  *       exists to keep visible.
  * wms-connector-boundary-ok: o3d-hl8l: naming which routes maintenance mode does and does not fence is the measured claim itself, not connector dispatch.
  *   app/api/webhooks/mintsoft/asn-booked-in            → FENCED as of o3d-hl8l. The route consults
  *       the flag as its FIRST statement, before the body is read and before the signature is
  *       verified, so nothing on the persist path runs during a held restore.
- *       (o3d-remove-shiphero: the ShipHero webhook route was the one WMS ingress that stayed
+ *       (wms-neutral-refactor: a second WMS's webhook route was the one WMS ingress that stayed
  *       UNFENCED — an owner-scoped gap in o3d-hl8l. Removing the connector removed the route, so
  *       every WMS webhook entry point this build has now consults the flag. That is a smaller
  *       claim than "the gap was fixed", and it is the only one the code supports.)

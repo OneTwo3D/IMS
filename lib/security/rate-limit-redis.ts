@@ -29,7 +29,7 @@ return {1, count + 1, 0}
 `
 
 function encodeRedisCommand(parts: string[]): Buffer {
-  // wms-connector-boundary-ok: o3d-remove-shiphero: joins RESP argument frames, not id fragments.
+  // wms-connector-boundary-ok: wms-neutral-refactor: joins RESP argument frames, not id fragments.
   return Buffer.from(`*${parts.length}\r\n${parts.map((part) => `$${Buffer.byteLength(part)}\r\n${part}\r\n`).join('')}`)
 }
 

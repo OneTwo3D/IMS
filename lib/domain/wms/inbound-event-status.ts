@@ -7,7 +7,7 @@
  * exception inbox's "dead" filter and the retention sweep's "resolved" definition all read these
  * values without caring who sent the event.
  *
- * o3d-remove-shiphero round 2 (Codex HIGH 3): it used to be `MINTSOFT_WEBHOOK_PROCESSING_STATUS`,
+ * wms-neutral-refactor round 2 (Codex HIGH 3): it used to be `MINTSOFT_WEBHOOK_PROCESSING_STATUS`,
  * exported from the Mintsoft booked-in processor, and the two genuinely generic modules that read it
  * — lib/domain/wms/exception-inbox.ts and lib/domain/wms/inbound-event-retention.ts — therefore
  * spelled a connector's name eleven times to ask a question that has nothing to do with that

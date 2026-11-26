@@ -118,7 +118,7 @@ export class MintsoftConnector implements WmsConnector {
    * Mintsoft compares `SinceLastUpdated` against `LastUpdated` in the tenant DATABASE'S timezone,
    * NOT UTC (verified live: the tenant runs Europe/London, so `LastUpdated` sits +1h under BST).
    *
-   * It lives HERE, on the connector, because it is a fact about this warehouse — o3d-remove-shiphero
+   * It lives HERE, on the connector, because it is a fact about this warehouse — wms-neutral-refactor
    * round 4 (Codex HIGH 1) moved it off `DISPATCH_DELTA_DEFAULT_TIMEZONE` in the generic sweep, where
    * it was the default EVERY connector's delta fell back to. A second connector whose cursor is
    * compared in UTC (or in any other tenant zone) would have had its window shifted by an hour and

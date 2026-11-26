@@ -128,7 +128,7 @@ export async function probeShoppingFxHelperPlugin() {
 /**
  * The connector-keyed sync-log reader.
  *
- * ONE CONNECTOR TODAY (o3d-remove-parked-connectors): Shopify was the other arm and is archived.
+ * ONE CONNECTOR TODAY: WooCommerce is the only registered shopping connector.
  * The parameter is kept rather than dropped because every caller passes the connector it resolved,
  * and a second connector adds an arm here instead of a new exported action at every call site.
  */

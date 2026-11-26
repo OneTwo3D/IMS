@@ -58,7 +58,7 @@ test('shopping invoice PDF requests parse only for matching connector and curren
   if (guestParsed.valid) {
     assert.equal(guestParsed.request.externalOrderKey, 'wc_order_key_123')
   }
-  // o3d-remove-parked-connectors: this used to name 'shopify', the second REGISTERED connector.
+  // This used to name a second REGISTERED storefront connector.
   // With one connector registered the only way left to prove the connector is actually CHECKED
   // (rather than the body's own field being trusted) is an id the union does not contain. The
   // property is the same one — a signed link minted for one connector must not open another's

@@ -4,7 +4,7 @@ import test from 'node:test'
 import { SHOPPING_CONNECTORS, parseShoppingConnectorId } from '@/lib/connectors/shopping-registry'
 
 /**
- * o3d-remove-parked-connectors: this file used to name 'woocommerce' and 'shopify'. Shopify is
+ * This file used to name 'woocommerce' and a second storefront id. That storefront is
  * archived, so the "known connectors resolve to themselves" case is driven off the registry rather
  * than a second literal — a connector registered tomorrow is covered without an edit here, and the
  * case cannot silently shrink to nothing (the count is asserted).
@@ -25,8 +25,8 @@ test('parseShoppingConnectorId: empty/absent value falls back to WooCommerce (ba
   assert.equal(parseShoppingConnectorId(''), 'woocommerce')
 })
 
-// NO LONGER DISTINGUISHING, and said so rather than deleted (o3d-remove-parked-connectors). The
-// explicit fallback used to be proved with 'shopify', the one registered id that was not the
+// NO LONGER DISTINGUISHING, and said so rather than deleted The
+// explicit fallback used to be proved with the second storefront, the one registered id that was not the
 // default. With one connector registered, the only legal argument IS the default, so this case
 // cannot tell "the fallback was honoured" from "the default was used". It is kept as the shape a
 // second connector restores meaning to; do not read it as coverage.

@@ -1,5 +1,5 @@
 /**
- * PROOF THAT THE WMS CONNECTOR-BOUNDARY GUARD CAN FAIL (o3d-remove-shiphero round 4, Codex HIGH 3 + 4).
+ * PROOF THAT THE WMS CONNECTOR-BOUNDARY GUARD CAN FAIL (wms-neutral-refactor round 4, Codex HIGH 3 + 4).
  *
  * WHY THIS FILE EXISTS. `scripts/check-wms-connector-boundary.mjs` is believed: `npm run check:all`
  * runs it, it prints "clean", and nobody re-reads it. Rounds 2 and 3 shipped a version that COULD
@@ -454,7 +454,7 @@ test('guard: an allowlisted file may still assemble its own id', (t) => {
 })
 
 // ---------------------------------------------------------------------------------------------
-// o3d-lhjh / o3d-remove-shiphero round 8 (Codex HIGH 3) — THE FOUR SPELLINGS THE ROUND-6 FOLD
+// o3d-lhjh / wms-neutral-refactor round 8 (Codex HIGH 3) — THE FOUR SPELLINGS THE ROUND-6 FOLD
 // EXITED 0 ON, and the negatives that keep the new rules usable.
 //
 // Each of the first four was run against the shipped guard before the fix and printed "clean".
@@ -620,7 +620,7 @@ test('guard: a Buffer.from of a constant in an encoding it cannot evaluate is RE
 })
 
 test('guard: a Buffer constant EXPORTED from one module and decoded in another fails', (t) => {
-  // o3d-remove-shiphero round 10, Codex HIGH 3. `foldImported` copied `exact`, `opaque` and
+  // wms-neutral-refactor round 10, Codex HIGH 3. `foldImported` copied `exact`, `opaque` and
   // `numeric` out of the remote fold by NAME and dropped `binary` — the flag that says "these
   // pieces are BYTES in latin1, re-encode them before reading them as a string". So the importing
   // file's `.toString('utf16le')` took the latin1 spelling at face value, kept the interleaved
