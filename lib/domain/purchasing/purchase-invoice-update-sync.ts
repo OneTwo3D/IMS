@@ -98,6 +98,11 @@ export type PurchaseInvoiceUpdateSyncDeps<Tx extends PurchaseInvoiceUpdateSyncTx
   ) => Promise<PurchaseInvoiceUpdatePostingVerdict>
   queueAccountingSyncTx: (tx: Tx, params: QueueAccountingSyncTxParams) => Promise<boolean>
   recordTransitSubledgerMovement: (tx: Tx, input: TransitSubledgerUpdateInput) => Promise<void>
+  /**
+   * #1132 MED-4: the pending-delete fence of the bill, asked IN `tx` immediately before the update is queued (the caller holds the purchase
+   * order and bill locks the delete request takes). Throws PendingDocumentDeletionError to roll the edit back.
+   */
+  assertNoPendingDeletion?: (tx: Tx, invoiceId: string) => Promise<void>
 }
 
 /**
@@ -232,6 +237,7 @@ export async function maybeQueuePurchaseInvoiceUpdate<Tx extends PurchaseInvoice
   if (verdict.verdict === 'chart-retired') return 'refused-chart-retired'
   if (verdict.verdict !== 'post') return 'skipped-disabled'
 
+  if (params.deps.assertNoPendingDeletion) await params.deps.assertNoPendingDeletion(params.tx, params.invoiceId)
   const enqueued: { reason?: string } = {}
   const queued = await params.deps.queueAccountingSyncTx(params.tx, {
     ...purchaseInvoiceUpdateEnqueueIdentity({

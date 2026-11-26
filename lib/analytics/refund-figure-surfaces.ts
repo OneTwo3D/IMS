@@ -442,11 +442,11 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
       'Unearned-revenue account setting key, named so the reconciliation pack basis can read the configured code. No revenue figure is computed.',
   },
   {
-    file: 'app/actions/xero-sync.ts',
+    file: 'lib/connectors/xero/readiness-accounts.ts',
     figures: ['xero_unearned_revenue_account'],
     treatment: 'not-refund-sensitive',
     reason:
-      'Unearned-revenue account setting key.',
+      'Unearned-revenue account setting key (the readiness list moved here from app/actions/xero-sync.ts, o3d-n2ci4).',
   },
   {
     file: 'app/api/export/analytics/route.ts',

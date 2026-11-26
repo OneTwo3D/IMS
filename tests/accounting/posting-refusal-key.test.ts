@@ -269,7 +269,8 @@ function keyExpressionIsDerived(key: string): boolean {
 }
 
 /** The refusal writers in app/ and lib/ — the count, not a margin below it (review L2). */
-const REFUSAL_WRITE_SITES = 9
+// o3d-n2ci4: 10, was 9 - the retired reversal of a revaluation that already posted (retireFxJournalRow) records a standing row.
+const REFUSAL_WRITE_SITES = 10
 
 /**
  * o3d-j625 r6 (review M1) — THE FORM CHECK WAS NOT A MATCH CHECK. Two shapes passed it:

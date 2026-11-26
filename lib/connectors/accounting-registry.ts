@@ -95,6 +95,8 @@ export type AccountingSyncReadiness = {
   /** o3d-6thk1: whose the stored account mapping is; anything but 'owned' blocks `ready`. */
   mappingOwnership: { state: 'owned' | 'unconfirmed' | 'other-organisation'; boundTenantId: string | null; boundTenantName: string | null }
   missingAccounts: Array<{ key: string; label: string }>
+  /** o3d-n2ci4: unmapped accounts that are only reported (never part of `ready`). Absent = the connector reports none. */
+  reportOnlyMissingAccounts?: Array<{ key: string; label: string }>
   missingTaxTypes: Array<{ id: string; name: string }>
   /**
    * Scopes the connector asked for at consent but was NOT granted (o3d-g2i). Empty when the grant is

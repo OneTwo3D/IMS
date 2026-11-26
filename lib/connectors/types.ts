@@ -197,7 +197,7 @@ export type InvoiceLine = {
  *   ⇒ `currencyRateToBase = 1.18`. This matches IMS's stored `fxRateToBase`.
  *
  * Each adapter inverts/translates as needed:
- *   - Xero `CurrencyRate` is `1 doc-ccy = X base` → `1 / currencyRateToBase`.
+ *   - Xero `CurrencyRate` is ALSO `1 base = X doc-ccy` → `currencyRateToBase` as is (6 dp), never inverted.
  */
 export type InvoiceData = {
   invoiceNumber: string

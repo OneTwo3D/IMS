@@ -14,6 +14,7 @@ import { db } from '@/lib/db'
 import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { logActivity } from '@/lib/activity-log'
+import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import {
   accountingBankAccountBelongsTo,
   getActiveAccountingConnectorInfo,
@@ -1787,6 +1788,10 @@ export async function registerInvoicePaymentWithLedger(params: {
       }
       const stillRecorded = await tx.payment.findUnique({ where: { id: params.paymentId }, select: { id: true } })
       if (!stillRecorded) return 'receipt-deleted' as const
+      // #1132 MED-4: no payment is registered against an invoice whose delete is pending (or waiting for review), read under the order lock the
+      // delete request takes. The receipt stays recorded in IMS; the delete's own late-activity check stops its unwind over it.
+      const deletePending = await pendingDeletionError(params.orderId, tx)
+      if (deletePending) return { deletePending } as const
       // o3d-ekn8 r2: and the order still points at the document this post returned. The check above ran
       // before the lock; the delete-and-re-post that moves it takes the same order lock, so this is the
       // read that actually decides. Without it the pin is only ever tested in a window that has since
@@ -1917,6 +1922,12 @@ export async function registerInvoicePaymentWithLedger(params: {
     // The capacity re-check under the lock refused it. A concurrent receipt for the same order took the
     // room this one was measured against, so it is reported exactly as if it had been refused up front
     // — the operator sees one message naming the reason, not a silent no-op.
+    if (typeof outcome === 'object' && 'deletePending' in outcome) {
+      await warn('invoice_payment_not_registered',
+        `The payment for order ${params.orderReference} is recorded in IMS but was NOT registered in the accounting system: ${outcome.deletePending}`,
+        { amount: amountNumber, currency: params.currency, refusal: 'DOCUMENT_DELETE_PENDING' })
+      return registeredFor.connector
+    }
     if (typeof outcome === 'object' && 'refused' in outcome) {
       await reportRefusal(outcome.refused)
       return registeredFor.connector

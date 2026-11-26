@@ -1006,6 +1006,16 @@ export function XeroClient({ settings: init, connected: initConnected, tenantNam
           )}
 
           {/*
+            o3d-n2ci4: accounts only the IMS FX gain/loss report reads. Listed so the report's gap is visible; they never stop sync.
+          */}
+          {(readiness.reportOnlyMissingAccounts?.length ?? 0) > 0 && (
+            <p className="text-xs text-muted-foreground">
+              Not mapped (report only, does not block sync): {readiness.reportOnlyMissingAccounts!.map(a => a.label).join(', ')}. IMS posts no
+              FX journal to these; they label the control and gain/loss sides on the FX Gain/Loss report.
+            </p>
+          )}
+
+          {/*
             A missing SCOPE is separate from readiness on purpose: it does not stop the connector, it
             stops the particular syncs that need it (payments, journals, attachments) — and those fail
             one at a time with a 401 that names no cause. Reconnecting is the only fix, because a

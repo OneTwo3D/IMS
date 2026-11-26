@@ -64,8 +64,9 @@ export const SYNC_TYPE_TOGGLES: AccountFieldDef[] = [
   { suffix: 'sync_stock_receipt', label: 'Stock Receipts', description: 'Journal: DR Inventory / CR Stock in Transit on goods received' },
   { suffix: 'sync_cogs_reversal', label: 'COGS Reversals', description: 'Reverse COGS on stock returns' },
   { suffix: 'sync_inventory_adjustment', label: 'Inventory Adjustments', description: 'Journal for manual stock adjustments' },
-  { suffix: 'sync_realised_fx_journal', label: 'Realised FX Journals', description: 'Retired: nothing is posted. Xero books realised currency gains itself, at the settlement rate IMS sends on each payment' },
-  { suffix: 'sync_unrealised_fx_journal', label: 'Unrealised FX Revaluation', description: 'Retired: nothing is posted. Xero revalues open foreign-currency invoices, bills and bank balances itself' },
+  // o3d-n2ci4 (#1135 review LOW-3): the realised and unrealised FX journal switches are NOT offered. Both journals are retired (nothing is
+  // posted whichever way the switch is set), so a toggle would be a control that controls nothing. Their stored values are still saved back
+  // unchanged (SAVED_SETTING_SUFFIXES), so hiding them rewrites nothing.
 ]
 
 // Connector-prefixed setting suffixes persisted by the form alongside the

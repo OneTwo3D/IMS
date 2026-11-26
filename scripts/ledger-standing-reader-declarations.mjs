@@ -198,6 +198,8 @@ export const DECLARATIONS = [
 // because the CANCELLED / HELD_SHADOW sync row expires with retention while the record does not, and a shadow is NOT proof the
 // document is absent (its real owner may have posted it).
 export const SHADOW_READER_DECLARATIONS = [
+  { key: "lib/domain/accounting/document-delete-service.ts::lateActivityOn::MAY_HAVE_REACHED_LEDGER_WHERE", class: "EXEMPT",
+    reason: "#1132 MED-4: row-scoped and only ever stricter: an invoice or bill UPDATE row queued after the delete was requested stops the unwind (NEEDS_REVIEW). A shadow recorded instead of an UPDATE sent nothing to the document, so missing it once its sync row has expired can only let an unwind proceed that no IMS write touched; it never unwinds over a write IMS made." },
   { key: "lib/domain/sales/order-delete-guard.ts::findSalesOrderDeleteBlocker::MAY_HAVE_REACHED_LEDGER_WHERE", class: "DURABLE_SHADOW",
     reason: "Order hard-delete is irreversible. After retention deletes a shadow's sync row, the guard asks outbound_shadow_writes for the order, its shipments and its staged batch references and blocks (accounting_shadow_recorded) on an UNPROVEN, conditional sentence." },
   { key: "lib/domain/inventory/stock-adjustment-edit.ts::adjustmentJournalMayHaveReachedLedger::MAY_HAVE_REACHED_LEDGER_WHERE", class: "DURABLE_SHADOW",

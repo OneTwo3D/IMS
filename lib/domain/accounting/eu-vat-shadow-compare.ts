@@ -34,7 +34,7 @@ export type ComparableInvoice = {
   currency: string
   /** True when the currency is not the organisation's base currency: then the exchange rate is part of the comparison. */
   foreignCurrency: boolean
-  /** The `CurrencyRate` the document carries (Xero's direction: base units per one document-currency unit), or null when it carries none. */
+  /** The `CurrencyRate` the document carries (Xero's direction, the same as fxRateToBase: document-currency units per one base unit), or null when it carries none. */
   currencyRate: number | null
   lineAmountsIncludeTax: boolean
   lines: ComparableLine[]
@@ -224,7 +224,7 @@ export function compareComparableInvoices(ims: ComparableInvoice, xero: Comparab
   const totalMatch = !totalCompared || toDecimal(ims.total!).minus(toDecimal(xero.total!)).abs().lte(tolerance.times(taxedLines))
   const currencyMatch = ims.currency === xero.currency
 
-  // THE EXCHANGE RATE, for a foreign-currency invoice only. IMS stamps 1/rate (full precision); Xero stores the rate to 6 decimal places, so IMS's is rounded to 6 places and the two must agree within one unit of the
+  // THE EXCHANGE RATE, for a foreign-currency invoice only. IMS stamps its rate (the same direction as Xero's); Xero stores the rate to 6 decimal places, so IMS's is rounded to 6 places and the two must agree within one unit of the
   // 6th place (1e-6 absolute). A missing rate on either side is not a match: the order is not comparable (`currency_rate_unavailable`).
   const rateUnavailable = ims.foreignCurrency && (ims.currencyRate === null || xero.currencyRate === null)
   const rateDiffers = ims.foreignCurrency && ims.currencyRate !== null && xero.currencyRate !== null

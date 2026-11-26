@@ -455,3 +455,24 @@ test('[o3d-j625 r6 H2/H3] bill B\'s update row does not clear bill A\'s refusal;
   await createAccountingSyncLogRow(client, rowFrom(billAAgain.enqueued))
   assert.equal(refusals.filter((row) => row.resolvedAt === null).length, 0, 'bill A\'s own update clears it')
 })
+
+test('#1132 MED-4: the producer asks the pending-delete fence IN its transaction before it queues; a refusal queues nothing and records no transit movement', async () => {
+  const tx = { activityLog: { create: async () => {} } }
+  const order: string[] = []
+  const deps: PurchaseInvoiceUpdateSyncDeps<typeof tx> = {
+    recordTransitSubledgerMovement: async () => { order.push('transit') },
+    postingVerdictForChart: async (chart) => ({ verdict: 'post' as const, connector: chart as 'xero' }),
+    queueAccountingSyncTx: async () => { order.push('queue'); return true },
+    assertNoPendingDeletion: async (seenTx, invoiceId) => {
+      assert.equal(seenTx, tx, 'the caller\'s transaction, not a fresh read')
+      order.push(`fence:${invoiceId}`)
+    },
+  }
+  assert.equal(await maybeQueuePurchaseInvoiceUpdate({ ...baseParams(tx, deps), newSubtotalBase: 5 }), 'queued')
+  assert.deepEqual(order, ['fence:bill-1', 'queue', 'transit'])
+  order.length = 0
+  const { PendingDocumentDeletionError } = await import('@/lib/domain/accounting/document-delete-pending')
+  deps.assertNoPendingDeletion = async () => { throw new PendingDocumentDeletionError('This bill is being deleted in IMS and Xero') }
+  await assert.rejects(maybeQueuePurchaseInvoiceUpdate({ ...baseParams(tx, deps), newSubtotalBase: 5 }), PendingDocumentDeletionError)
+  assert.deepEqual(order, [], 'nothing queued, nothing recorded')
+})

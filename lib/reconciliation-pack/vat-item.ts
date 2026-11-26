@@ -39,7 +39,7 @@
  *   the sum of line taxBase (its recorded base amount) of orders by invoice instant, not CANCELLED, not archived (the IMS VAT report's
  *   own population), less, on an order booked under the per-rate discount split (SalesOrder.discountTaxSplit), each rate's share of the
  *   discount VAT on that rate (an order without the split is read as before: no discount VAT on the IMS side); Xero = the sum of line TaxAmount of AUTHORISED and PAID sales invoices by invoice date, lines on the configured
- *   shipping account left out, a foreign invoice multiplied by Xero's own CurrencyRate (1 document-currency = X base: connectors/xero/fx.ts); WooCommerce = the sum of tax-line totals of
+ *   shipping account left out, a foreign invoice DIVIDED by Xero's own CurrencyRate (1 base = X document-currency, the same convention as fxRateToBase: connectors/xero/fx.ts); WooCommerce = the sum of tax-line totals of
  *   orders in processing, completed and refunded by GMT creation date, a non-GBP order divided by the fxRateToBase (1 base = X foreign) IMS recorded on the
  *   linked order (the storefront records none). Each key is rounded to the penny, half up; a key whose total is zero in a system is not
  *   a key of that system (a key on one side only with a non-zero value is a finding; a zero is provably nothing because every read is

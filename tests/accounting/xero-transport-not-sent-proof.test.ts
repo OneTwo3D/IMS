@@ -198,17 +198,18 @@ test('o3d-gvzu: every rate-budget refusal is tagged, and each returns BEFORE `no
   // two `waitForBudget` arms. Each is built through `markNotSent`, which is what applies the
   // per-call guard — none of them may hand back a bare object.
   const tagged = perform.match(/markNotSent\('rate-budget-refused'/g) ?? []
-  assert.equal(tagged.length, 3,
-    'the two budget-response builders and the day-cap return are all tagged; the two builders cover '
-    + 'both bounds, so three sites cover all four refusals')
+  // #1132 R2-LOW-8: a FOURTH site, the bounded call's own minute-budget refusal (worded for a call that never waits), tagged like the rest.
+  assert.equal(tagged.length, 4,
+    'the two budget-response builders, the bounded minute refusal and the day-cap return are all tagged; the two builders cover '
+    + 'both bounds, so four sites cover all five refusals')
   // ...and every 429 that can be produced ABOVE the socket is one of them. Counted rather than
   // pattern-matched: a new untagged pre-egress 429 raises the first number without the second, and a
   // tag applied to one of the POST-egress 429s (which is the widening this must not permit) raises
   // the second without the first.
   const aboveSocket = perform.slice(0, perform.indexOf('noteRequest(auth.tenantId)'))
-  assert.equal((aboveSocket.match(/status: 429/g) ?? []).length, 3,
-    'exactly three 429-producing sites sit above the socket')
-  assert.equal((aboveSocket.match(/markNotSent\('rate-budget-refused'/g) ?? []).length, 3,
+  assert.equal((aboveSocket.match(/status: 429/g) ?? []).length, 4,
+    'exactly four 429-producing sites sit above the socket')
+  assert.equal((aboveSocket.match(/markNotSent\('rate-budget-refused'/g) ?? []).length, 4,
     'and every one of them is tagged')
 
   // AND THEY ARE ALL ABOVE `noteRequest`, which is what makes them provable. Every budget refusal is
@@ -536,7 +537,14 @@ test('o3d-gvzu: the tag is written at the refusal sites and never inferred downs
     // a write whose caller required the connection an earlier read was served by, when this request's
     // own auth names another. Pinned below to that one site and that position.
     "'connection-changed'",
+    // #1132 R2-MED-1 — the TWELFTH, argued: written at exactly ONE return in `performRequest`, after the egress authorisation (the last
+    // await) and before `noteRequest`: a bounded call whose caller's deadline has too little left. Pinned below to that site and position.
+    "'bounded-deadline'",
   ])
+  const performFn = api.slice(api.indexOf('async function performRequest('))
+  assert.equal((api.match(/markNotSent\('bounded-deadline'/g) ?? []).length, 1, 'bounded-deadline is written at ONE site')
+  assert.ok(performFn.indexOf("markNotSent('bounded-deadline'") > performFn.indexOf('egressRefusal = await accountingEgressRefusal('), 'after the last await')
+  assert.ok(performFn.indexOf("markNotSent('bounded-deadline'") < performFn.indexOf('noteRequest(auth.tenantId)'), 'and before the attempt is counted')
   const fetchFn = api.slice(api.indexOf('async function xeroFetch<'), api.indexOf('async function xeroFetchWithAuth<'))
   assert.equal((api.match(/notSent: 'connection-changed'/g) ?? []).length, 1, 'connection-changed is written at ONE site')
   assert.ok(fetchFn.indexOf("notSent: 'connection-changed'") > fetchFn.indexOf('auth = await getAccessToken()'),

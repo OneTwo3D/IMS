@@ -83,8 +83,8 @@ const SCOPE_BY_SYNC_TYPE: Record<string, string> = {
   DAILY_BATCH_GRIR_RECLASS: JOURNALS,
   UNEARNED_REV_REVERSAL: JOURNALS,
   ALLOCATION_REVERSAL: JOURNALS,
-  REALISED_FX_JOURNAL: JOURNALS,
-  UNREALISED_FX_JOURNAL: JOURNALS,
+  // REALISED_FX_JOURNAL / UNREALISED_FX_JOURNAL are deliberately ABSENT (o3d-n2ci4, #1135 review LOW-2): both are retired, and the
+  // processor's arm for them sends nothing in any branch, so a missing journals scope must not stop a queued row being retired.
   MANUFACTURING_JOURNAL: JOURNALS,
   MANUFACTURING_RECLASS: JOURNALS,
 }

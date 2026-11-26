@@ -25,7 +25,7 @@ const ref = { referenceType: 'X', referenceId: 'x-1', baseCurrency: 'GBP' }
 
 for (const type of [...FOREIGN_RATE_DOCUMENT_TYPES]) {
   test(`${type}: foreign without a usable rate is refused by name; with one, and in base, it is not`, () => {
-    for (const rate of [undefined, null, 0, -2, Number.NaN, Number.POSITIVE_INFINITY, '', 'abc', true, {}, [], 1e12]) {
+    for (const rate of [undefined, null, 0, -2, Number.NaN, Number.POSITIVE_INFINITY, '', 'abc', true, {}, [], 1e12, 1e-7]) {
       const refusal = foreignCurrencyRateRefusal({ type, ...ref, payload: { currency: 'EUR', currencyRateToBase: rate } })
       assert.ok(refusal, `${String(rate)} must refuse`)
       assert.equal(refusal!.reason, 'foreign_document_missing_rate')
@@ -63,17 +63,24 @@ test('a payload with no currency is not foreign (Xero books it in the base curre
   assert.equal(isForeignCurrency('gbp', ' GBP'), false)
 })
 
-test('isUsableImsRate and the 1/rate conversion agree', () => {
+// GOLDEN VALUES CHANGED DELIBERATELY: this arm pinned the inverted rate (1 / 1.17 = 0.854701). Xero's CurrencyRate is the same
+// convention as fxRateToBase (lib/connectors/xero/fx.ts), so the rate is sent as is; the unusable ends are now a rate that rounds to
+// zero at 6 dp (tiny) and one too large for Xero's Decimal(18,6).
+test('isUsableImsRate and the 6 dp, never-inverted conversion agree', () => {
   assert.equal(isUsableImsRate(1.17), true)
   assert.equal(isUsableImsRate('1.17'), true)
-  assert.equal(isUsableImsRate(1e12), false, 'a rate whose inverse rounds to zero at 6 dp cannot be sent')
-  assert.equal(imsRateToXeroCurrencyRate(1.17), 0.854701)
-  assert.equal(imsRateToXeroCurrencyRate(1e12), 0)
+  assert.equal(isUsableImsRate(1e-7), false, 'a rate that rounds to zero at 6 dp cannot be sent')
+  assert.equal(isUsableImsRate(1e12), false, 'a rate too large for Decimal(18,6) cannot be sent')
+  assert.equal(isUsableImsRate(999_999_999_999), true)
+  assert.equal(imsRateToXeroCurrencyRate(1.17), 1.17)
+  assert.equal(imsRateToXeroCurrencyRate(1e-7), 0)
+  assert.equal(imsRateToXeroCurrencyRate(1e12), undefined)
 })
 
 test('xeroCurrencyRateOrRefuse: usable converts; base-without-rate is undefined; foreign-without-rate throws', () => {
   const ok = (rateToBase: number | undefined, currency = 'EUR') => xeroCurrencyRateOrRefuse({ currency, baseCurrency: 'GBP', rateToBase, what: 'doc' })
-  assert.equal(ok(1.25), 0.8)
+  assert.equal(ok(1.25), 1.25)
+  assert.equal(ok(1.3125), 1.3125)
   assert.equal(ok(undefined, 'GBP'), undefined)
   assert.equal(ok(undefined, ''), undefined)
   assert.equal(ok(1, 'GBP'), 1)
