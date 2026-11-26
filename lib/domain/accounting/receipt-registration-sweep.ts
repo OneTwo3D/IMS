@@ -7,7 +7,8 @@
  *
  *   - `receiptObligationIsOnRecord`: the evidence that a receipt's registration is on record. (a) nothing is owed yet (no invoice posted, whose post registers the receipts then; or no
  *     connector posts INVOICE_PAYMENT), (b) an INVOICE_PAYMENT sync row for THIS receipt, in any status (a refusal is recorded as an outstanding row), or (c) a decided-refusal notice
- *     (`invoice_payment_not_registered`). The swallowed-failure case (`invoice_payment_not_queued`) is none of these.
+ *     (`invoice_payment_not_registered`), or, for the inline callers only, a hold behind a pending document delete (`invoice_payment_held_document_delete`, o3d-2gv2g LOW-6; the sweep
+ *     retries those). The swallowed-failure case (`invoice_payment_not_queued`) is none of these.
  *   - `registerReceiptAndProveObligation`: register, then prove; a failure of either throws `ReceiptRegistrationNotRecorded` carrying the payment id (WooCommerce keeps a pending-FX row for it).
  *   - `sweepUnregisteredReceipts`: the scheduled sweep (run by the fx-rates cron every run) over every non-refund Payment on an order whose invoice has posted that has NO INVOICE_PAYMENT
  *     row and NO refusal notice. The filter is in the query, BEFORE the limit (registered receipts can never take a slot); the batch is oldest first with recently failed receipts
@@ -19,6 +20,7 @@ import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
+import { INVOICE_PAYMENT_HELD_DOCUMENT_DELETE_ACTION } from '@/lib/domain/accounting/invoice-payment-hold-action'
 
 export class ReceiptRegistrationNotRecorded extends Error {
   constructor(readonly orderId: string, readonly paymentId: string | null, readonly currency: string, readonly causeText?: string) {
@@ -27,7 +29,7 @@ export class ReceiptRegistrationNotRecorded extends Error {
   }
 }
 
-export async function receiptObligationIsOnRecord(orderId: string, paymentId: string): Promise<boolean> {
+export async function receiptObligationIsOnRecord(orderId: string, paymentId: string, options: { heldCountsAsRecorded?: boolean } = {}): Promise<boolean> {
   const order = await db.salesOrder.findUnique({ where: { id: orderId }, select: { accountingInvoiceId: true, currency: true } })
   if (!order || !order.accountingInvoiceId) return true
   const { getActiveAccountingConnectorInfo, isAccountingSyncTypeEnabledFor } = await import('@/lib/accounting')
@@ -36,7 +38,8 @@ export async function receiptObligationIsOnRecord(orderId: string, paymentId: st
   if (!(await isAccountingSyncTypeEnabledFor(connector.id, 'INVOICE_PAYMENT').catch(() => true))) return true
   const { loadInvoicePaymentSyncRows } = await import('@/lib/domain/accounting/invoice-payment-enqueue')
   if ((await loadInvoicePaymentSyncRows(orderId, connector.id, order.currency)).some((row) => row.paymentId === paymentId)) return true
-  return (await db.activityLog.count({ where: { entityType: 'SALES_ORDER', entityId: orderId, action: 'invoice_payment_not_registered', metadata: { path: ['paymentId'], equals: paymentId } } })) > 0
+  const actions = options.heldCountsAsRecorded === false ? ['invoice_payment_not_registered'] : ['invoice_payment_not_registered', INVOICE_PAYMENT_HELD_DOCUMENT_DELETE_ACTION]
+  return (await db.activityLog.count({ where: { entityType: 'SALES_ORDER', entityId: orderId, action: { in: actions }, metadata: { path: ['paymentId'], equals: paymentId } } })) > 0
 }
 
 async function defaultRegistrationsAreOwed(): Promise<boolean> {
@@ -47,7 +50,7 @@ async function defaultRegistrationsAreOwed(): Promise<boolean> {
 
 /** Seams so a test can state "the registration did not reach the record" or hold a step without a live accounting connector. The last three are the WooCommerce paid transition's hooks. */
 export const receiptRegistrationSeams: {
-  obligationIsOnRecord: (orderId: string, paymentId: string) => Promise<boolean>
+  obligationIsOnRecord: (orderId: string, paymentId: string, options?: { heldCountsAsRecorded?: boolean }) => Promise<boolean>
   registrationsAreOwed?: () => Promise<boolean>
   /** Runs after the sweep selected a receipt and before it registers it (a race test holds the inline call here). */
   beforeSweepRegisters?: (paymentId: string) => Promise<void>
@@ -138,7 +141,8 @@ export async function sweepUnregisteredReceipts(limit = 50): Promise<{ examined:
     try {
       await receiptRegistrationSeams.beforeSweepRegisters?.(r.id)
       // the up-front query is the filter; the probe is the final word for what the query cannot see (a connector moved, or an inline call that landed since)
-      if (await receiptRegistrationSeams.obligationIsOnRecord(r.orderId, r.id)) continue
+      // o3d-2gv2g LOW-6: a receipt held behind a document delete is not settled here: the sweep tries it again (it is held again while the delete runs).
+      if (await receiptRegistrationSeams.obligationIsOnRecord(r.orderId, r.id, { heldCountsAsRecorded: false })) continue
       await registerReceiptAndProveObligation(r.orderId, getSalesOrderReference(r.order), r)
       result.registered++
     } catch {
