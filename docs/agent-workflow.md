@@ -47,7 +47,7 @@ High-risk domains need extra care:
 - landed cost
 - refunds
 - purchase orders
-- Xero and QuickBooks accounting
+- Xero accounting
 - WooCommerce sync
 - auth and authorization
 - cron jobs

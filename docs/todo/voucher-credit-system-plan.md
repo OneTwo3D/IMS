@@ -24,7 +24,6 @@ The current codebase already has the right top-level connector structure:
 - WooCommerce connector: `lib/connectors/woocommerce/index.ts`
 - Shopify connector: `lib/connectors/shopify/index.ts`
 - Xero connector: `lib/connectors/xero/index.ts`
-- QuickBooks connector: `lib/connectors/quickbooks/index.ts`
 
 This module should extend those abstractions, not bypass them.
 
@@ -37,7 +36,6 @@ These official references should be treated as the starting point for connector 
 - Shopify Gift Card API surface: <https://shopify.dev/docs/api/admin-graphql/latest/objects/GiftCard>
 - Shopify Store Credit Account API surface: <https://shopify.dev/docs/api/admin-graphql/2025-07/objects/storecreditaccount>
 - Xero Accounting API overview: <https://developer.xero.com/documentation/api/accounting/overview>
-- QuickBooks Online Accounting API overview: <https://developer.intuit.com/app/developer/qbo/docs/learn/explore-the-quickbooks-online-api>
 
 Useful WooCommerce extension references for likely first adapters:
 
@@ -349,9 +347,9 @@ Accounting policy for functional currency must also be explicit:
 - the functional-currency base amount for accounting posts defaults to current posting FX
 - any delta between original redemption functional amount and refund restoration functional amount must be posted to an explicit FX variance account
 
-This policy is the default for both Xero and QuickBooks mappers and avoids silent connector divergence.
+This policy is the default for accounting connector mappers and avoids silent connector divergence.
 
-Connector mappers should post in IMS functional currency by default and only rely on native Xero or QuickBooks multi-currency posting behavior when that is explicitly configured and tested for the tenant.
+Connector mappers should post in IMS functional currency by default and only rely on native Xero multi-currency posting behavior when that is explicitly configured and tested for the tenant.
 
 ### Display values
 
@@ -399,7 +397,7 @@ Loyalty expiry tranches are best-effort. Some sources will only support coarse e
 
 Business logic must emit connector-agnostic accounting events first.
 
-Connector logic then maps those normalized events into Xero and QuickBooks calls.
+Connector logic then maps those normalized events into Xero calls.
 
 Typical event coverage:
 
@@ -488,17 +486,6 @@ Xero should consume normalized IMS accounting events and map them into:
 - reversals and sync-state updates
 
 Xero-specific behavior must stay behind the existing accounting connector boundary.
-
-### QuickBooks
-
-QuickBooks should implement the same normalized accounting event contract used by Xero, mapped into:
-
-- journal entries
-- invoices where relevant
-- credit memos where relevant
-- reversals and sync-state updates
-
-QuickBooks-specific behavior must also stay behind the accounting connector boundary.
 
 ## Implementation Workstreams
 
@@ -620,7 +607,6 @@ Build:
 - normalized accounting event persistence
 - account routing profiles
 - Xero event mapper
-- QuickBooks event mapper
 - retry and dead-letter flows
 - external sync status tracking
 - explicit FX variance posting
@@ -657,7 +643,7 @@ Recommended milestone order:
 4. Shopify native gift card and store credit ingestion
 5. WooCommerce extension adapters for Smart Coupons, gift card, and points plugins
 6. loyalty mirror and points-to-voucher bridge across both channels
-7. Xero and QuickBooks accounting adapters
+7. Xero accounting adapter
 8. finance UI, reconciliation screens, admin controls, and backfill tooling
 
 ## UI Plan
@@ -771,7 +757,7 @@ The implementation is complete when IMS can:
 - detect and link points-to-voucher conversions
 - classify vouchers as SPV, MPV, or discount
 - generate connector-agnostic accounting events
-- sync those accounting events to Xero and QuickBooks through the existing accounting seam
+- sync those accounting events to Xero through the existing accounting seam
 - expose voucher, loyalty, and reconciliation views in the IMS UI
 - prevent double-spend through reservation on stored-value instruments
 - keep per-platform loyalty balances separate unless explicitly linked by finance action
