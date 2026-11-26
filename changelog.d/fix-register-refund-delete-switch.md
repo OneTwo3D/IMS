@@ -1,0 +1,2 @@
+### Refund delete: the switch can now be turned on (still off by default)
+- `refund_delete_enabled` is now a registered ADMIN system switch: an administrator can set it with `npm run settings:set -- --key refund_delete_enabled --value true ... --yes --confirm-admin`, with the usual audit entry. Before, nothing supported turning it on. Default off; turning it off is never refused. No other behaviour changes: with it off, nothing changes. Each refund delete is still checked when asked for.
