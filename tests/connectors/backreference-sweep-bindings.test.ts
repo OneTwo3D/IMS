@@ -2,8 +2,7 @@ import assert from 'node:assert/strict'
 import test, { mock } from 'node:test'
 
 // ---------------------------------------------------------------------------
-// o3d-9kek — the sweep's two anti-starvation dependencies are WIRED in the Xero binding, and there
-// is NO QuickBooks binding at all.
+// o3d-9kek — the sweep's two anti-starvation dependencies are WIRED in the Xero binding.
 //
 // repairAccountingBackReferences takes them as optional deps, and every test of the sweep itself
 // injects its own. So a binding that quietly stopped passing one would leave every sweep test green
@@ -17,25 +16,11 @@ import test, { mock } from 'node:test'
 //
 // Both are invisible to the sweep's own tests by construction. This asserts them at the seam.
 //
-// THE SECOND TEST ASSERTS AN ABSENCE, which is the r6 correction. A QuickBooks binding briefly
-// existed on this branch and was removed: the candidate query is scoped by `connector` alone, and a
-// QuickBooks external id is only meaningful inside ONE realm, so after a reconnect to a different
-// company the sweep could write a retired realm's id onto a live document — and the global unique
-// index does not stop it, because when no local row holds the orphaned id the write succeeds.
-// Re-adding it is a one-line change that no other test would notice, so the absence is asserted
-// here.
-//
-// THE PRECONDITION IT NAMED HAS BEEN MET AND WAS THE WRONG ONE (o3d-0bfh r5, Codex HIGH). This said
-// "Precondition for re-adding: o3d-s36z". o3d-s36z CLOSED on 2026-08-21, and a row's realm is now
-// durably recorded (`AccountingSyncLog.connectionProvenance`, o3d-dzip) — so the CANDIDATE FENCE is
-// derivable today. The SELECT side was never the whole problem: QuickBooks does not enforce the
-// connection verdict at POST time (o3d-8prh, open — `accounting-posting-intent` and
-// `accounting-egress-authorization` are imported by the Xero connector and by nothing under
-// lib/connectors/quickbooks/), and this connector's own `enqueueFollowUpSyncLog` mints no
-// `connectionProvenance`, so every row a sweep created would be born `no-origin-recorded` and posted
-// unchecked. A stale precondition on a money path is an invitation: whoever read the old line would
-// find it satisfied and wire the binding. The real order of work is in the block at the end of
-// lib/connectors/quickbooks/sync-processor.ts.
+// A sweep binding is only safe for a connector whose external ids cannot collide across tenants: the
+// candidate query is scoped by `connector` alone, so a connector whose ids are small per-tenant
+// integers could, after a reconnect to a different tenant, write a retired tenant's id onto a live
+// document — and the global unique index does not stop it, because when no local row holds the
+// orphaned id the write succeeds. Xero's ids are GUIDs.
 // ---------------------------------------------------------------------------
 
 const CURSOR_STORE = { load: async () => null, save: async () => {} }

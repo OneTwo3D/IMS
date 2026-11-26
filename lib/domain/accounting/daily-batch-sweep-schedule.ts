@@ -10,9 +10,9 @@ import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
  * runs at all. That is not a detail of the route — it is the fact that decides whether pounds
  * standing in another ledger have anybody coming for them:
  *
- *   a Group A2 pass on QuickBooks, whose journal went missing, is only "somebody else's problem"
+ *   a Group A2 pass on another connector, whose journal went missing, is only "somebody else's problem"
  *   while somebody else's sweep runs. After a switch to Xero it does not, and the Xero sweep — which
- *   must not rebuild QuickBooks pounds into Xero accounts — is the last reader those pounds will
+ *   must not rebuild another ledger's pounds into Xero accounts — is the last reader those pounds will
  *   ever have.
  *
  * So the schedule is resolved from ONE definition, read by the route that does the running and by

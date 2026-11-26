@@ -32,7 +32,7 @@ const activity: Array<{ action: string; level?: string }> = []
 /** o3d-j625 r6: every enqueue's params. */
 const asked: Array<Record<string, unknown>> = []
 let enqueueAnswer: { queued: boolean; reason?: string; connector: string | null; activeConnector?: string | null; refusalRecorded?: boolean } = { queued: true, connector: 'xero' }
-let activeConnector: string | null = 'quickbooks'
+let activeConnector: string | null = 'retired-ledger'
 
 mock.module('@/lib/db', {
   namedExports: {
@@ -91,10 +91,10 @@ test.beforeEach(() => {
 test('[o3d-j625 r4] a site that keeps its local change and reports an ERROR also records OUTSTANDING work', async () => {
   // review M-4: the columns can only pass by carrying their own facts. The chart the payload was built from
   // is xero (the site resolves it — the active connector at its top, which this double answers 'xero'); the
-  // connector active when the enqueue REFUSED is quickbooks, which the facade reports. A report-time read
+  // connector active when the enqueue REFUSED is another connector, which the facade reports. A report-time read
   // would say 'xero' again. r4 had every value equal to 'xero', so writing the chart into
   // `activeConnector` passed.
-  enqueueAnswer = { queued: false, reason: 'refused', connector: 'xero', activeConnector: 'quickbooks' }
+  enqueueAnswer = { queued: false, reason: 'refused', connector: 'xero', activeConnector: 'retired-ledger' }
 
   await pushTaxRate()
 
@@ -104,7 +104,7 @@ test('[o3d-j625 r4] a site that keeps its local change and reports an ERROR also
   assert.equal(rows[0].type, 'TAX_RATE_SYNC')
   assert.equal(rows[0].referenceType, 'TaxRate')
   assert.equal(rows[0].referenceId, 'rate-1')
-  assert.equal(rows[0].activeConnector, 'quickbooks',
+  assert.equal(rows[0].activeConnector, 'retired-ledger',
     'the ACTIVE connector is on the row — round 2 omitted it — and it is the one the REFUSAL saw (review L-7), '
     + 'not the chart\'s and not a report-time read (both of which are xero here)')
   assert.equal(rows[0].chartConnector, 'xero', 'and the chart the payload was built from, as its own column')
@@ -214,7 +214,7 @@ test('[o3d-j625 r5 L-1] a refusal that cannot be recorded is itself reported, an
   const key = accountingPostingKey({ type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-9' })
 
   await recordAccountingPostingRefusal(broken, key, {
-    kind: 'sales_invoice_order', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'x', remedy: 'y',
+    kind: 'sales_invoice_order', chartConnector: 'xero', activeConnector: 'retired-ledger', reason: 'retired_chart', committed: 'x', remedy: 'y',
   })
   await clearAccountingPostingRefusal(broken, key)
 
@@ -240,7 +240,7 @@ test('[o3d-j625 r10] a record whose write threw answers `failed`, so a caller th
   const outcome = await recordAccountingPostingRefusal(broken, accountingPostingKey({
     type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-10',
   }), {
-    kind: 'sales_invoice_order', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'x', remedy: 'y',
+    kind: 'sales_invoice_order', chartConnector: 'xero', activeConnector: 'retired-ledger', reason: 'retired_chart', committed: 'x', remedy: 'y',
   })
   assert.deepEqual(outcome, { recorded: false, because: 'failed' })
 
@@ -251,7 +251,7 @@ test('[o3d-j625 r10] a record whose write threw answers `failed`, so a caller th
   }
   assert.deepEqual(
     await recordAccountingPostingRefusal(working, accountingPostingKey({ type: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: 'so-11' }), {
-      kind: 'sales_invoice_order', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'x', remedy: 'y',
+      kind: 'sales_invoice_order', chartConnector: 'xero', activeConnector: 'retired-ledger', reason: 'retired_chart', committed: 'x', remedy: 'y',
     }),
     { recorded: true },
   )

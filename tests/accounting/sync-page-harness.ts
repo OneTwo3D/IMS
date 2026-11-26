@@ -22,13 +22,13 @@ export const OK_STRANDED: StrandedSyncRowsResult = { rows: [], hasMore: false, t
 export function strandedRow(over: Partial<StrandedSyncRowsResult['rows'][number]> = {}) {
   return {
     id: 'log-1',
-    connector: 'quickbooks',
+    connector: 'retired-ledger',
     type: 'SALES_INVOICE',
     status: 'FAILED',
     referenceType: 'SalesOrder',
     referenceId: 'order-7',
     externalTransactionId: null,
-    errorMessage: 'HTTP 500 from QuickBooks',
+    errorMessage: 'HTTP 500 from the ledger',
     createdAt: new Date('2026-01-01T00:00:00.000Z').toISOString(),
     ageDays: 12,
     ...over,

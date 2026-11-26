@@ -19,12 +19,11 @@ import { SETTING_ENV_FALLBACKS } from '@/lib/settings-store'
 // RESULTING state: current state, overlaid with the keys being written. Correct in shape, and
 // worthless in practice, because "current state" was read through the ordinary pooled client
 // BEFORE the locked transaction opened. Two concurrent partial requests each observed both
-// accounting connectors disabled, one enabled Xero and the other QuickBooks, their writes
+// accounting connectors disabled, each enabling a different one, their writes
 // serialized behind the lock — and the committed result was BOTH ENABLED. Nothing revisits that
 // state afterwards, and getActiveConnector resolves Xero-first, so the invalid state is silent:
 // the operator sees the connector they did not choose, and the orphan-cancel sweep decides what to
-// discard from it. The shopping pair had the identical race before Shopify was archived
-// (o3d-remove-parked-connectors) -- see the deleted commerce-pair case below.
+// discard from it.
 //
 // THE FIX. lockIntegrationPluginSelection: acquire the advisory lock, materialise the plugin rows,
 // row-lock them FOR UPDATE, and read the state THROUGH the transaction client — then validate, then
@@ -230,12 +229,11 @@ test.beforeEach(reset)
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// THE EXCLUSIVITY-REFUSAL CASES WERE HERE, AND MOVED RATHER THAN WEAKENED
-// (o3d-remove-parked-connectors).
+// THE EXCLUSIVITY-REFUSAL CASES MOVED RATHER THAN WEAKENED.
 // ---------------------------------------------------------------------------
 //
-// Four cases in this file produced a REFUSED save, and every one of them produced it from the
-// `accounting` exclusivity group (Xero vs QuickBooks):
+// Cases in this file used to produce a REFUSED save from an `accounting` exclusivity group (two
+// accounting connectors):
 //
 //   * 'two concurrent PARTIAL enables cannot leave BOTH accounting connectors on'
 //   * 'a partial write racing the ONBOARDING step cannot produce both either'
@@ -243,9 +241,9 @@ test.beforeEach(reset)
 //   * 'a refused write commits NOTHING — not even the keys that were individually legal'
 //   * 'a REFUSAL still commits nothing and revalidates nothing'
 //
-// QuickBooks is archived and the `accounting` group is deleted with it (a one-member group can never
-// conflict, so it reads as an enforced rule and enforces nothing). Shopify's removal had already taken
-// the `shopping` group. The one group left is `wms`, whose ids are DERIVED from the registry — and
+// With one accounting connector registered there is no `accounting` group (a one-member group can never
+// conflict, so it reads as an enforced rule and enforces nothing), and no `shopping` group either. The
+// one group is `wms`, whose ids are DERIVED from the registry — and
 // this file registers only Mintsoft, so no conflict is reachable here at all.
 //
 // THEY ARE NOT LOST. Every one of those properties is asserted in
@@ -257,8 +255,7 @@ test.beforeEach(reset)
 // were reaching for.
 //
 // WHAT IS GENUINELY GONE: coverage of a HAND-WRITTEN group (the two that remained were both
-// hand-written), and coverage of the accounting pair specifically. Recorded in
-// docs/archive/quickbooks-connector-removal.md.
+// hand-written), and coverage of an accounting pair specifically.
 
 test('the validation reads through the TRANSACTION, not the pooled client', async () => {
   // The structural half of finding 1: a pooled read is unlocked by construction, so if one is used
@@ -504,13 +501,12 @@ test('the plugin keys have NO environment fallback — the locked row is the who
 })
 
 test('the accounting resolution rule is one rule, and it walks the registry', () => {
-  // o3d-remove-parked-connectors — WHAT THIS CAN AND CANNOT STILL SHOW.
+  // WHAT THIS CAN AND CANNOT SHOW.
   //
-  // It used to enumerate the four states of two registered connectors and pin the PRECEDENCE
-  // ('xero wins'). With one registered connector, precedence is unobservable: `{xero: true}` and
+  // With two registered connectors it could enumerate the four states and pin the PRECEDENCE. With one
+  // registered connector, precedence is unobservable: `{xero: true}` and
   // `{xero: false}` are the whole state space, and any rule that answers them correctly — including a
-  // hardcoded `state.xero ? 'xero' : null` — passes. That is a real loss, recorded in
-  // docs/archive/quickbooks-connector-removal.md.
+  // hardcoded `state.xero ? 'xero' : null` — passes. That is a real limit.
   //
   // What is still worth asserting, and is asserted: the rule is TOTAL over the registry and answers
   // `null` for a state with nothing enabled, and it does so by walking `ACCOUNTING_CONNECTORS` rather
@@ -1405,6 +1401,15 @@ test('the inventory opens the file types a migration runner and a shell path act
   )
 })
 
+const CURRENT_PLUGIN_SETTING_KEYS = new Set<string>(Object.values(INTEGRATION_PLUGIN_SETTING_KEYS))
+
+/** Migrations that name ONLY plugin keys no current plugin uses, and why each is safe. */
+const MIGRATIONS_THAT_DELETE_RETIRED_PLUGIN_KEYS: Record<string, string> = {
+  '20261122140000_purge_retired_accounting_settings':
+    'Deletes the plugin flag of a retired accounting connector. No current plugin reads or writes that key, '
+    + 'so the active connector cannot change and there is nothing for the selection lock to serialize.',
+}
+
 test('no repo migration writes a plugin selection key', () => {
   // The one thing that makes 'migration-runner' safe. Migrations run outside every lock this
   // application takes — `prisma migrate deploy` is a separate process against a database the app
@@ -1413,6 +1418,7 @@ test('no repo migration writes a plugin selection key', () => {
   // migrations here already write `settings`; none may write these keys.
   const migrationsDir = join(REPO, 'prisma', 'migrations')
   const offenders: string[] = []
+  const retiredOnly: string[] = []
   let scanned = 0
   for (const entry of readdirSync(migrationsDir)) {
     const file = join(migrationsDir, entry, 'migration.sql')
@@ -1423,7 +1429,12 @@ test('no repo migration writes a plugin selection key', () => {
       continue
     }
     scanned += 1
-    if (/plugin_\w+_enabled/.test(src)) offenders.push(relative(REPO, file))
+    const named = [...src.matchAll(/plugin_\w+_enabled/g)].map((match) => match[0])
+    // A key no current plugin uses selects nothing, so a migration that DELETES it cannot change
+    // the active connector. Such a migration must still be reviewed and recorded below.
+    const live = named.filter((key) => CURRENT_PLUGIN_SETTING_KEYS.has(key))
+    if (live.length > 0) offenders.push(relative(REPO, file))
+    else if (named.length > 0) retiredOnly.push(entry)
   }
 
   assert.ok(scanned > 0, 'the migration directory was actually read — an empty scan proves nothing')
@@ -1431,6 +1442,12 @@ test('no repo migration writes a plugin selection key', () => {
     offenders,
     [],
     'a migration cannot take the selection lock; move a plugin-key change into the application',
+  )
+  assert.deepEqual(
+    retiredOnly.sort(),
+    Object.keys(MIGRATIONS_THAT_DELETE_RETIRED_PLUGIN_KEYS).sort(),
+    'a migration naming a plugin key no current plugin uses must be recorded, with why it is safe, in '
+      + 'MIGRATIONS_THAT_DELETE_RETIRED_PLUGIN_KEYS',
   )
 })
 
@@ -1534,6 +1551,10 @@ const MIGRATIONS_THAT_MUTATE_SETTINGS: Record<string, string> = {
     'Deletes ONE key by exact literal match (accounting.money-attempt-stamping-since), the round-9 '
     + 'money-attempt epoch that `attemptStampingCustodyAt` replaces. Nothing reads it after this '
     + 'migration, so the delete cannot race a reader; it touches no plugin key and no other row.',
+  '20261122140000_purge_retired_accounting_settings':
+    'Deletes the plugin flag and the prefixed settings rows of a retired accounting connector, by one exact '
+    + 'key and one escaped LIKE prefix. No current plugin key matches either, and nothing in the build reads '
+    + 'those rows, so it cannot change the active connector or race the orphan-cancel sweep.',
   '20260819210000_xero_pin_write_consumes_release':
     'Deletes ONE key by exact literal match (xero_pin_release_witness), in two places: the backfill, '
     + 'and the body of the trigger it installs. Neither can reach a plugin key — the literal is the '

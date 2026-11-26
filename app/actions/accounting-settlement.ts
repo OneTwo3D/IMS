@@ -88,9 +88,8 @@ import type { FreshAuthFailureResult } from '@/lib/auth/session-gates'
 // rows stranded RIGHT NOW cannot be settled until o3d-e2mz merges, which is exactly what the fence's
 // author documented.
 //
-// QUICKBOOKS ROWS ARE REFUSED PERMANENTLY, for the same reason and by the same mechanism: that
-// processor stamps no attempt revision, so its rows stay at 0. Out of scope by owner instruction,
-// and not a regression — a QuickBooks row cannot be settled today either.
+// ROWS OF A CONNECTOR WHOSE PROCESSOR STAMPS NO ATTEMPT REVISION ARE REFUSED PERMANENTLY, for the
+// same reason and by the same mechanism: their rows stay at 0.
 //
 // The decision content lives in lib/domain/accounting/sync-row-settlement.ts as pure functions; this
 // file is the guard, the transaction, the audit and the I/O.
@@ -239,7 +238,7 @@ async function resolveActiveAccountingConnector(): Promise<string | null> {
  * The connector's sync toggle, read exactly as its own gates read it (round 5, Codex HIGH #1).
  *
  * This is the OTHER half of the adoption precondition, and it is the half neither round 3 nor round
- * 4 asked for. `triggerXeroSync` and `triggerQuickBooksSync` do `enabled?.value !== 'true'` on this
+ * 4 asked for. `triggerXeroSync` does `enabled?.value !== 'true'` on this
  * key and then run the processor — no plugin flag, no active-connector resolution — so a row whose
  * toggle is on is claimable however retired its connector looks.
  *
@@ -447,12 +446,11 @@ export async function settleAccountingSyncRow(
     // that keeps PENDING unsettleable.
     //
     // AND "NOT THE ACTIVE CONNECTOR" IS NOT THAT PRECONDITION (round 5, Codex HIGH #1). The active
-    // connector is resolved from the PLUGIN flags, Xero-first; `triggerQuickBooksSync` and
-    // `triggerXeroSync` — the manual Sync buttons, reachable by any holder of `sync` — gate on
-    // `<connector>_sync_enabled` and never resolve the active connector at all. With Xero enabled
-    // beside a still-enabled QuickBooks, this test alone would adopt a QuickBooks row that the very
-    // next press of the QuickBooks Sync button reclaims: the operation replays and the worker's
-    // write lands on top of the settlement. `isStrandedRowUnclaimable` is the whole rule, shared
+    // connector is resolved from the PLUGIN flags, Xero-first; `triggerXeroSync` — the
+    // manual Sync button, reachable by any holder of `sync` — gates on `<connector>_sync_enabled`
+    // and never resolves the active connector at all. With another connector's toggle still on, this
+    // test alone would adopt a row that the very next press of that connector's Sync button
+    // reclaims: the operation replays and the worker's write lands on top of the settlement. `isStrandedRowUnclaimable` is the whole rule, shared
     // verbatim with the read model that decides whether to OFFER the control.
     const activeConnector = await resolveActiveAccountingConnector()
     const wantsAdoption = !isFencedAttemptRevision(row.attemptRevision) && input.observedAttemptRevision === 0

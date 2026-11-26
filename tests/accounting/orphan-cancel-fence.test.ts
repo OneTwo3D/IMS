@@ -12,9 +12,9 @@ import { hasPermission, type Permission } from '@/lib/permissions'
 // landing underneath it.
 //
 // THE BUG. The action sampled the active connector, derived a cancellation scope from that sample,
-// and then ran an unfenced updateMany. If another administrator switched Xero → QuickBooks in
-// between, the QuickBooks-scoped (or unscoped) update marked QuickBooks PENDING rows CANCELLED
-// AFTER QuickBooks had become the active connector — discarding the live queue of the connector
+// and then ran an unfenced updateMany. If another administrator changed the active accounting
+// connector in between, the scoped (or unscoped) update marked PENDING rows CANCELLED
+// AFTER their connector had become the active one — discarding the live queue of the connector
 // now in use. The re-read that followed only adjusted the survivor COUNT: nothing un-cancels a
 // row, and the permanent activity log would have described healthy work as abandoned.
 //
@@ -123,7 +123,6 @@ function commitBypassingWrite(to: string | null): Promise<void> {
 function pluginRows() {
   return [
     { key: 'plugin_mintsoft_enabled', value: 'false' },
-    { key: 'plugin_quickbooks_enabled', value: String(state.activeConnector === 'quickbooks') },
     { key: 'plugin_shopify_enabled', value: 'false' },
     { key: 'plugin_woocommerce_enabled', value: 'false' },
     { key: 'plugin_xero_enabled', value: String(state.activeConnector === 'xero') },
@@ -264,7 +263,7 @@ test.beforeEach(reset)
 test('the whole decision runs in ONE transaction, and BOTH locks are taken before anything is read', async () => {
   state.activeConnector = 'xero'
 
-  await cancel('quickbooks')
+  await cancel('retired-ledger')
 
   assert.deepEqual(state.transactions, ['committed'], 'exactly one transaction, and it committed')
 
@@ -297,7 +296,7 @@ test('the whole decision runs in ONE transaction, and BOTH locks are taken befor
   assert.match(state.raw[2], /FOR UPDATE/i, 'the selection is read under a row lock, not a bare SELECT')
   assert.match(state.raw[2], /plugin_xero_enabled|ANY\(/, 'and it is the plugin rows that are locked')
   // Materialised first, because FOR UPDATE locks only rows that EXIST — an absent
-  // plugin_quickbooks_enabled would otherwise be INSERTable by a bypassing writer mid-transaction.
+  // plugin_xero_enabled would otherwise be INSERTable by a bypassing writer mid-transaction.
   assert.match(state.raw[1], /INSERT INTO settings/i)
   assert.match(state.raw[1], /ON CONFLICT \(key\) DO NOTHING/i, 'idempotent: it writes the value an absent row already means')
 
@@ -312,7 +311,7 @@ test('the selection is read THROUGH the transaction, never through the pooled cl
   state.activeConnector = 'xero'
   state.pluginReadsOutsideTx = 0
 
-  await cancel('quickbooks')
+  await cancel('retired-ledger')
 
   assert.equal(state.pluginReadsOutsideTx, 0, 'no unlocked read decided anything')
   assert.equal(
@@ -335,9 +334,9 @@ test('a writer that skips the advisory lock cannot land in the post-check/pre-co
   // that could catch it. Only the row lock can.
   state.activeConnector = 'xero'
   let bypass: Promise<void> = Promise.resolve()
-  state.onCount = () => { bypass = commitBypassingWrite('quickbooks') }
+  state.onCount = () => { bypass = commitBypassingWrite(null) }
 
-  const result = await cancel('quickbooks')
+  const result = await cancel('retired-ledger')
   await bypass
 
   assert.equal(result.success, true, 'the cancel was correct when it started and is allowed to finish')
@@ -348,19 +347,19 @@ test('a writer that skips the advisory lock cannot land in the post-check/pre-co
     'tx-end',
     'the bypassing switch landed only AFTER the transaction ended — it was held off by the row lock, '
       + 'not merely un-noticed. Without the FOR UPDATE it lands during the count, which is PAST the '
-      + 'generation check: QuickBooks becomes active while its own queue is being retired, and '
+      + 'generation check: the selection changes while the queue is being retired, and '
       + 'nothing left in the transaction can notice.',
   )
   assert.equal(state.bypassLandedAfterOps, state.ops.length, 'and it was the last thing to happen')
 })
 
-test('a switch landing between scope resolution and the update ABORTS — the new active queue survives', async () => {
-  // Xero is active; the operator cancels the QuickBooks orphans. Mid-update another administrator
-  // switches to QuickBooks. Those rows are now the LIVE queue.
+test('a selection change landing between scope resolution and the update ABORTS', async () => {
+  // Xero is active; the operator cancels a retired connector's orphans. Mid-update another administrator
+  // changes the selection (here: the accounting plugin is turned off).
   state.activeConnector = 'xero'
-  state.onUpdate = () => { state.activeConnector = 'quickbooks' }
+  state.onUpdate = () => { state.activeConnector = null }
 
-  const result = await cancel('quickbooks')
+  const result = await cancel('retired-ledger')
 
   assert.equal(result.success, false)
   assert.equal(result.cancelled, 0, 'and it reports discarding nothing, because it discarded nothing')
@@ -375,10 +374,10 @@ test('a switch landing between scope resolution and the update ABORTS — the ne
 })
 
 test('the UNSCOPED cancel is fenced too — it is the one that can wipe every connector at once', async () => {
-  // With Xero active, `cancel()` scopes to "not xero". If QuickBooks becomes active mid-flight the
-  // same update has just retired the incoming connector's queue.
+  // With Xero active, `cancel()` scopes to "not xero". If the selection moves mid-flight the same
+  // update has been applied under a rule the current state no longer holds.
   state.activeConnector = 'xero'
-  state.onUpdate = () => { state.activeConnector = 'quickbooks' }
+  state.onUpdate = () => { state.activeConnector = null }
 
   const result = await cancel()
 
@@ -406,7 +405,7 @@ test('an undisturbed cancel still commits, cancels, and logs exactly as before',
   state.pending = 4
   state.processing = 2
 
-  const result = await cancel('quickbooks')
+  const result = await cancel('retired-ledger')
 
   assert.deepEqual(result, { success: true, cancelled: 4, inFlightNotCancelled: 2 })
   assert.deepEqual(state.transactions, ['committed'])
@@ -443,13 +442,8 @@ test('the LOCKED resolution and the POOLED one answer identically for every comb
   const { getAccountingIntegrationConnector } = await import('@/app/actions/accounting-sync')
   const { resolveActiveAccountingConnector } = await import('@/lib/integration-plugin-selection-lock')
 
-  // o3d-remove-parked-connectors — THE TABLE HAS COLLAPSED FROM FOUR ROWS TO TWO, AND THAT IS A LOSS.
-  //
-  // It enumerated `[xero, quickbooks]` over all four combinations, and the row that mattered most was
-  // BOTH ON: the invalid state finding 1 could produce, where the two resolvers could silently pick
-  // different winners. With one registered accounting connector there is no both-on state and no
-  // precedence to disagree about, so what is left is the agreement of the two resolvers on the only
-  // two states that exist. Recorded in docs/archive/quickbooks-connector-removal.md.
+  // With one registered accounting connector there is no both-on state and no precedence to disagree
+  // about, so the table is the agreement of the two resolvers on the only two states that exist.
   for (const xero of [false, true] as const) {
     state.activeConnector = xero ? 'xero' : null
     const pooled = await getAccountingIntegrationConnector()
@@ -485,10 +479,6 @@ test('the generic key-value writer is still not a way around the lock', async ()
   // here until the allowlist landed, and it is now refused in its own right, which would have made
   // this assertion pass without the plugin key ever being looked at.
   await assert.rejects(
-    // o3d-remove-parked-connectors: this used `plugin_quickbooks_enabled`, a plugin key the generic
-    // writer must refuse. QuickBooks is archived, so the key is no longer a plugin key at all and the
-    // writer refuses it for a DIFFERENT reason (not a writable preference) — which would have made
-    // this case pass for the wrong reason. It now names a key that IS still a plugin key.
     () => setSettings({ financial_year_start: '04-01', plugin_xero_enabled: 'true' }),
     /must be written atomically and under the connector-selection lock/,
   )
@@ -530,7 +520,7 @@ test('the cancel RECORDS that no remote call was made, on the same update as the
   state.pending = 4
   state.processing = 0
 
-  const result = await cancel('quickbooks')
+  const result = await cancel('retired-ledger')
 
   assert.equal(result.success, true)
   // Round 2 (#724 Codex HIGH 1): `status = PENDING` alone is NOT the proof - a CLAIMED row returned to

@@ -35,7 +35,7 @@ import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import {
   ACCOUNTING_FOLLOW_UP_RECOVERY,
-  CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER,
+  CONNECTORS_WITH_FOLLOW_UP_SWEEP,
   FOLLOW_UP_OBLIGATION_AGE_COLUMNS,
   FOLLOW_UP_OBLIGATION_OUTCOME_IS_UNKNOWN,
   buildFollowUpObligationBacklogWhere,
@@ -52,7 +52,7 @@ import {
 // that landed it called the defect unrepresentable. It is not. The declaration was a copyable object
 // with no relationship to a registered sweep, an exported binding or a cron invocation: a new
 // connector could paste Xero's `{ consumer: 'sweep' }`, have no consumer whatsoever, and compile —
-// which is exactly the state QuickBooks was in for three rounds while its log lines promised a sweep.
+// which is exactly the state a connector with no sweep could be in while its log lines promised one.
 //
 // THE DECLARATION IS NOW A REGISTRY ENTRY, AND THIS IS WHAT MAKES THAT WORTH ANYTHING. Every
 // `consumer: 'sweep'` entry must have BOTH:
@@ -123,19 +123,13 @@ const CONNECTOR_MODULES: Record<string, string> = {
 }
 
 /**
- * Connectors the registry declares for HISTORICAL ROWS ONLY (o3d-remove-parked-connectors).
- *
- * An archived connector keeps its registry entry because `CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER` is
- * what the /sync/exceptions backlog selects on, and rows it wrote still exist in development
- * databases. It has no module in the tree, so the checks below that read a connector's SOURCE cannot
+ * A connector id this build does not register, standing for the historical rows a retired connector
+ * left behind. The backlog lists them and they get `followUpObligationRecoveryFor`'s fail-safe
+ * remedy; it has no module in the tree, so the checks below that read a connector's SOURCE cannot
  * apply to it — and the absence of the module is itself the strongest possible form of the thing
  * those checks assert (no sweep binding can be exported by a file that does not exist).
- *
- * Listed rather than skipped by name-matching: an unlisted connector with no module still fails.
  */
-const ARCHIVED_CONNECTORS: Record<string, string> = {
-  quickbooks: 'archived (o3d-remove-parked-connectors) — see docs/archive/quickbooks-connector-removal.md.',
-}
+const RETIRED_CONNECTOR = 'retired-ledger'
 
 /**
  * The BEHAVIOURAL test that actually drives each sweep connector's entry point. Held here, like
@@ -408,14 +402,9 @@ test('[o3d-0bfh r6] every connector that claims a follow-up obligation is declar
   // registry key, every assertion about that key would silently be skipped.
   for (const connector of Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY)) {
     assert.ok(
-      CONNECTOR_MODULES[connector] || ARCHIVED_CONNECTORS[connector],
+      CONNECTOR_MODULES[connector],
       `${connector} is declared in ACCOUNTING_FOLLOW_UP_RECOVERY but this test does not know where its module `
-        + 'is, so nothing below checks it. Add it to CONNECTOR_MODULES — or, if the connector has been '
-        + 'archived and has no module in the tree, list it in ARCHIVED_CONNECTORS with a reason.',
-    )
-    assert.ok(
-      !(CONNECTOR_MODULES[connector] && ARCHIVED_CONNECTORS[connector]),
-      `${connector} is listed BOTH as having a module and as archived — one of the two is stale`,
+        + 'is, so nothing below checks it. Add it to CONNECTOR_MODULES.',
     )
   }
   assert.ok(INVOCATION_SOURCES.length > 0, 'the invocation scan must actually reach some sources')
@@ -537,7 +526,7 @@ test('[o3d-0bfh r8] CONTROL: the invocation check resolves the SYMBOL, so the tw
     {
       what: 'an import of the binding from a DIFFERENT module',
       code: [
-        "import { repairXeroBackReferences } from '@/lib/connectors/quickbooks/sync-processor'",
+        "import { repairXeroBackReferences } from '@/lib/connectors/retired-ledger/sync-processor'",
         'export async function GET() { await repairXeroBackReferences(); return new Response() }',
       ].join('\n'),
     },
@@ -594,11 +583,16 @@ test('[o3d-0bfh r8] CONTROL: the invocation check resolves the SYMBOL, so the tw
 
 test("[o3d-0bfh r6] a consumer: 'none' declaration has neither, and says why and what to do instead", async () => {
   assert.deepEqual(
-    [...CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER],
-    ['quickbooks'],
-    'the backlog population is derived from the registry — if this changes, the exception inbox changes with it',
+    [...CONNECTORS_WITH_FOLLOW_UP_SWEEP],
+    ['xero'],
+    'the sweep list is derived from the registry — the backlog lists every connector NOT on it, so if this changes, the exception inbox changes with it',
   )
-  for (const connector of CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER) {
+  // Connectors the registry explicitly declares as having no consumer (none today), plus a retired id the
+  // registry does not know — which the backlog lists and the fail-safe fallback answers for.
+  const declaredWithoutConsumer = Object.entries(ACCOUNTING_FOLLOW_UP_RECOVERY)
+    .filter(([, declared]) => declared.consumer === 'none')
+    .map(([name]) => name)
+  for (const connector of [...declaredWithoutConsumer, RETIRED_CONNECTOR]) {
     const recovery = followUpObligationRecoveryFor(connector)
     assert.equal(recovery.consumer, 'none')
     if (recovery.consumer !== 'none') return
@@ -611,19 +605,15 @@ test("[o3d-0bfh r6] a consumer: 'none' declaration has neither, and says why and
       /exception inbox|\/sync\/exceptions/i,
       'the remedy must name the operational backlog, not a column an operator cannot query',
     )
-    assert.match(recovery.blockedBy, /o3d-8prh/, 'and name the REAL blocker, not the closed realm-isolation issue')
+    assert.match(recovery.blockedBy, /nothing/i, 'and name the blocker')
 
-    if (ARCHIVED_CONNECTORS[connector]) {
-      // An archived connector has no module, which is a STRONGER statement than "its module exports
+    if (connector === RETIRED_CONNECTOR) {
+      // A retired connector has no module, which is a STRONGER statement than "its module exports
       // no sweep binding": there is nothing to export one from, and nothing to invoke one. The source
-      // checks below have no subject, so they are replaced by the two facts that remain checkable.
-      assert.ok(
-        ARCHIVED_CONNECTORS[connector].trim().length > 20,
-        connector + ' needs a stated reason for being listed as archived',
-      )
+      // checks below have no subject.
       assert.equal(
         CONNECTOR_MODULES[connector], undefined,
-        connector + ' is listed as archived but still has a module in CONNECTOR_MODULES — one of the two is wrong',
+        connector + ' is a retired id but has a module in CONNECTOR_MODULES — one of the two is wrong',
       )
       continue
     }
@@ -697,7 +687,7 @@ test('[o3d-0bfh r6] an UNDECLARED connector fails safe — it never inherits the
 })
 
 type BacklogWhere = {
-  connector: { in: string[] }
+  connector: { in?: string[]; notIn?: string[] }
   status: { in: string[] }
   backReferenceFollowUpsPendingAt: Record<string, unknown>
   OR?: Array<Record<string, unknown>>
@@ -706,10 +696,11 @@ type BacklogWhere = {
 /** A stand-in for `readFollowUpObligationDatabaseNow`'s reading — never this host's clock. */
 const DATABASE_NOW = new Date('2026-08-27T12:00:00.000Z')
 
-test('[o3d-0bfh r6] the backlog query selects exactly the connectors with no consumer', () => {
+test('[o3d-0bfh r6] the backlog query selects every connector that is NOT declared with a sweep', () => {
   const where = buildFollowUpObligationBacklogWhere({ databaseNow: DATABASE_NOW }) as BacklogWhere
-  assert.deepEqual(where.connector.in, ['quickbooks'], 'derived from the registry, not restated')
-  assert.ok(!where.connector.in.includes('xero'), 'a connector WITH a sweep must not be listed as unrecoverable')
+  assert.deepEqual(where.connector.notIn, ['xero'], 'derived from the registry, not restated')
+  assert.equal(where.connector.in, undefined, 'a population is the COMPLEMENT of the sweeping connectors, so a retired connector id stays visible')
+  assert.ok(where.connector.notIn?.includes('xero'), 'a connector WITH a sweep must not be listed as unrecoverable')
   // SYNCED and FAILED only: a PENDING or stale PROCESSING row is still on the processor's own ladder,
   // and listing it would be self-resolving noise that trains an operator to ignore the section.
   assert.deepEqual(where.status.in, ['SYNCED', 'FAILED'])
@@ -1575,10 +1566,10 @@ test('[o3d-0bfh r7] the remedy never asserts the follow-ups were never enqueued'
   // failed. Telling an operator to re-drive a payment that may already be queued is worse on a money
   // path than the stall being reported.
   const surfaces: Array<{ what: string; prose: string }> = [
-    ...CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER.map((connector) => {
-      const recovery = followUpObligationRecoveryFor(connector)
-      return { what: `${connector} registry remedy`, prose: recovery.consumer === 'none' ? recovery.operatorRemedy : '' }
-    }),
+    { what: 'retired-connector registry remedy', prose: (() => {
+      const retired = followUpObligationRecoveryFor(RETIRED_CONNECTOR)
+      return retired.consumer === 'none' ? retired.operatorRemedy : ''
+    })() },
     { what: 'undeclared-connector remedy', prose: (() => {
       const unknown = followUpObligationRecoveryFor('sage')
       return unknown.consumer === 'none' ? unknown.operatorRemedy : ''
@@ -1666,7 +1657,7 @@ test('[o3d-0bfh r8] an unreadable database clock lists EVERY marked row rather t
   const where = buildFollowUpObligationBacklogWhere({ databaseNow: null }) as BacklogWhere
   assert.equal(where.OR, undefined, 'no database clock, no age filter')
   assert.deepEqual(where.backReferenceFollowUpsPendingAt, { not: null }, 'but still only MARKED rows')
-  assert.deepEqual(where.connector.in, ['quickbooks'], 'and still only connectors with no consumer')
+  assert.deepEqual(where.connector.notIn, ['xero'], 'and still only connectors with no sweep consumer')
 })
 
 test('[o3d-0bfh r8] readFollowUpObligationDatabaseNow asks the DATABASE, and fails to null rather than to this host', async () => {
@@ -1709,7 +1700,7 @@ test('[o3d-0bfh r8] the migration stamps the claim clock from the database and l
   // The stamp is a TRIGGER rather than an extra statement in claimFollowUpObligation, and that is a
   // decision with a reason: the connectors' claim rides inside the transaction that records the
   // invoice's external id, so one more statement that can fail there is one more way to roll that
-  // transaction back — and a rolled-back SYNCED write re-posts the invoice to QuickBooks.
+  // transaction back — and a rolled-back SYNCED write re-posts the invoice to the ledger.
   //
   // Route: prisma/migrations/20260827120000_.../migration.sql (applied to no database).
   //
@@ -1741,13 +1732,13 @@ test('[o3d-0bfh r8] the migration stamps the claim clock from the database and l
 // ---------------------------------------------------------------------------
 // o3d-0bfh r8 (Codex HIGH) — REMOTE ABSENCE IS NOT PROOF THAT CREATION IS SAFE.
 //
-// r7's remedy told an operator to read QuickBooks and "create ONLY what is verifiably absent".
+// r7's remedy told an operator to read the ledger and "create ONLY what is verifiably absent".
 // `enqueueFollowUps` writes each follow-up as its own local sync-log row and enqueues
 // INVOICE_PAYMENT BEFORE INVOICE_PDF, so the ordinary way this marker is retained — the PDF enqueue
 // failing — leaves a payment already PENDING and simply not executed yet. An operator reading
-// QuickBooks in that window finds no payment, creates one, and the queued row posts its own
-// afterwards. The connector's request id cannot deduplicate a payment a human made in the QuickBooks
-// UI, and a second payment against an invoice is not undoable.
+// the ledger in that window finds no payment, creates one, and the queued row posts its own
+// afterwards. The connector's request id cannot deduplicate a payment a human made in the accounting
+// package's UI, and a second payment against an invoice is not undoable.
 //
 // The serialized recovery workflow that would make creation safe — hold or cancel every local
 // follow-up row for the document under one lock, then reconcile the remote — does not exist and is
@@ -1783,7 +1774,7 @@ const BANNED_OPERATOR_INSTRUCTIONS: Array<{ pattern: RegExp; why: string }> = [
   {
     // NOT pinned to one accounting package (o3d-0bfh r11, Codex HIGH). The Xero processor shipped
     // "register the receipt in Xero by hand" through the round that grew this list to eleven, and a
-    // pattern naming QuickBooks could not see it. The instruction is the danger, not the vendor.
+    // pattern naming one vendor could not see it. The instruction is the danger, not the vendor.
     pattern: /register the (receipt|payment) in \w+ by hand/i,
     why: 'a payment created in the accounting package\'s UI cannot be deduplicated against the queued row',
   },
@@ -1818,9 +1809,8 @@ const UNDECLARED_CONNECTOR = 'sage'
  */
 function remedySurfaces(): Array<{ what: string; text: string; mustEscalate: boolean }> {
   const connectors = [...Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY), UNDECLARED_CONNECTOR]
-  // Non-vacuity: the walk must cover the connector the finding is about AND the fallback branch.
-  assert.ok(connectors.includes('quickbooks'), 'the registry must still declare quickbooks')
-  assert.ok(connectors.includes('xero'), 'and xero, whose consumer branch produces its own strings')
+  // Non-vacuity: the walk must cover the registered connector AND the fallback branch.
+  assert.ok(connectors.includes('xero'), 'the registry must declare xero, whose consumer branch produces its own strings')
   assert.equal(ACCOUNTING_FOLLOW_UP_RECOVERY[UNDECLARED_CONNECTOR], undefined,
     `${UNDECLARED_CONNECTOR} must stay undeclared, or this stops exercising the fallback`)
 
@@ -1874,7 +1864,7 @@ test('[o3d-0bfh r8/r10] no runtime remedy string authorises creating a payment, 
   // one; the inline copy is gone.
   //
   // Mutation: put r7's "create ONLY what is verifiably absent" into any remedy, or append
-  // "this still has to be re-driven by hand" to QUICKBOOKS_RECOVERY.operatorRemedy, and this fails
+  // "this still has to be re-driven by hand" to any registry remedy, and this fails
   // naming the surface. Drop "escalate" and the escalation assertion fails, which is what stops the
   // fix being "delete the sentence and say nothing". See the dedicated control below.
   const surfaces = remedySurfaces()
@@ -1889,36 +1879,36 @@ test('[o3d-0bfh r8/r10] no runtime remedy string authorises creating a payment, 
     if (mustEscalate) assert.match(text, /escalat/i, `${what} must say what to do instead of creating: escalate`)
   }
 
-  // And the QuickBooks remedy has to explain WHY reading first is not enough, or the next round
-  // reinstates it as an obvious improvement.
-  const quickbooks = surfaces.find((surface) => surface.what.startsWith('the quickbooks remedy'))
-  assert.ok(quickbooks, 'the QuickBooks remedy must be one of the surfaces walked')
-  assert.match(quickbooks.text, /PENDING/, 'it names the state the queued payment is actually in')
-  assert.match(quickbooks.text, /INVOICE_PAYMENT[\s\S]*INVOICE_PDF/, 'and the enqueue ORDER that creates the window')
-  assert.match(quickbooks.text, /DO NOT CREATE/, 'and it refuses in as many words')
+  // And the no-consumer remedy (the one a retired connector's stranded rows get) has to explain WHY
+  // reading first is not enough, or the next round reinstates it as an obvious improvement.
+  const fallback = surfaces.find((surface) => surface.what.startsWith(`the ${UNDECLARED_CONNECTOR} remedy`))
+  assert.ok(fallback, 'the no-consumer remedy must be one of the surfaces walked')
+  assert.match(fallback.text, /PENDING/, 'it names the state the queued payment is actually in')
+  assert.match(fallback.text, /INVOICE_PAYMENT[\s\S]*INVOICE_PDF/, 'and the enqueue ORDER that creates the window')
+  assert.match(fallback.text, /DO NOT CREATE/, 'and it refuses in as many words')
 })
 
 test('[o3d-0bfh r10] CONTROL: the shipped registry remedy with `re-driven by hand` appended is REFUSED', () => {
   // THE CODEX MEDIUM, AS A CONTROL. The claim "one list covers the rendered strings" is worth
   // nothing unless the list can be shown to reject the exact instruction it says it bans, ON THE
   // EXACT STRING the finding named. r9's registry check could not: its inline list had no
-  // `re-driven by hand` pattern, so appending that sentence to QUICKBOOKS_RECOVERY.operatorRemedy
+  // `re-driven by hand` pattern, so appending that sentence to the no-consumer remedy
   // while keeping all the unknown/escalate prose passed every test in this file and was rendered in
   // the inbox and in every activity message.
   //
   // Route: the SHIPPED string, mutated here rather than in the registry, so the control cannot rot
   // into a test of a hardcoded sentence. If the registry remedy is rewritten, this mutates whatever
   // it has become.
-  const shipped = followUpObligationRecoveryFor('quickbooks')
+  const shipped = followUpObligationRecoveryFor(UNDECLARED_CONNECTOR)
   assert.equal(shipped.consumer, 'none')
   if (shipped.consumer !== 'none') return
   // The shipped string passes — the precondition, so a list that rejected everything would not
   // satisfy this control either.
-  assertNoBannedInstruction('the shipped QuickBooks remedy', shipped.operatorRemedy)
+  assertNoBannedInstruction('the shipped no-consumer remedy', shipped.operatorRemedy)
 
   const mutated = `${shipped.operatorRemedy}. Note that this still has to be re-driven by hand`
   assert.throws(
-    () => assertNoBannedInstruction('the mutated QuickBooks remedy', mutated),
+    () => assertNoBannedInstruction('the mutated no-consumer remedy', mutated),
     /banned operator instruction/,
     'THE ONE LIST must reject `re-driven by hand` in the registry remedy — this is the surface the '
       + 'exception inbox and every retained-obligation log line interpolate, and it is where r9 let it through',
@@ -1928,39 +1918,29 @@ test('[o3d-0bfh r10] CONTROL: the shipped registry remedy with `re-driven by han
   // control covers the list rather than one entry of it.
   for (const phrase of [
     ' Read the ledger and create ONLY what is verifiably absent',
-    ' If it is missing, register the receipt in QuickBooks by hand',
+    ' If it is missing, register the receipt in Xero by hand',
     ' Otherwise re-run the invoice sync for this reference',
   ]) {
     assert.throws(
-      () => assertNoBannedInstruction('the mutated QuickBooks remedy', shipped.operatorRemedy + phrase),
+      () => assertNoBannedInstruction('the mutated no-consumer remedy', shipped.operatorRemedy + phrase),
       /banned operator instruction/,
       `THE ONE LIST must reject "${phrase.trim()}" in the registry remedy`,
     )
   }
 })
 
-// DELETED WITH ITS SUBJECT (o3d-remove-parked-connectors): '[o3d-0bfh r8] the QuickBooks processor no
-// longer asserts that follow-up work was not enqueued'. It scanned
-// `lib/connectors/quickbooks/sync-processor.ts` for four banned instructions — "work was NOT
-// enqueued", "need to be re-driven manually", "register the receipt in QuickBooks by hand",
-// "re-run the invoice sync for this reference" — each of which tells an operator to act on a row
-// whose outcome is unknown, and each of which can double a payment. The file is archived, so the
-// banned strings are out of the live tree by removal.
-//
-// THE BANNED LIST ITSELF IS NOT LOST: `assertNoBannedInstruction` is shared, and the case below still
-// applies it to `lib/domain/accounting/back-reference.ts`, the one definition every message on this
-// path composes from. What is lost is its application to a CONNECTOR's own strings, which is where
-// the r7 defect actually lived — a second connector's processor must be added to that scan.
-
+// THE BANNED LIST is shared: `assertNoBannedInstruction` is applied below to
+// `lib/domain/accounting/back-reference.ts`, the one definition every message on this path composes
+// from. A connector's processor must be added to that scan in the commit that writes it.
 
 // ---------------------------------------------------------------------------
 // o3d-0bfh r9 (Codex HIGH) — THE REGISTRY IS NOT THE SURFACE. THE SURFACE IS.
 //
-// r8 corrected the registry's remedy and the QuickBooks processor's log lines, and the test above
+// r8 corrected the registry's remedy and a processor's log lines, and the test above
 // asserted both. It protected nobody: the exception inbox's own SectionHeading held an INDEPENDENT
 // copy of the sentence being removed — "create only what is verifiably absent" — and that is the
 // sentence an operator actually reads. One rule, two authors, one of them fixed. The same round
-// left a third copy in help-docs/xero-sync.md ("a QuickBooks follow-up that fails still has to be
+// left a third copy in help-docs/xero-sync.md ("a follow-up that fails still has to be
 // re-driven by hand") and a fourth in a code comment that justified the row as "the remedy is a
 // human act in the accounting package (register the payment, ...)" — which is where UI prose comes
 // from.
@@ -2080,21 +2060,28 @@ test('[o3d-0bfh r9] the exception inbox renders the registry remedy and authors 
 
 test('[o3d-0bfh r9] the operator documentation for these rows authorises no hand settlement either', () => {
   // THE THIRD COPY. help-docs/xero-sync.md is what an operator is pointed at, and it said "a
-  // QuickBooks follow-up that fails still has to be re-driven by hand" for the whole of r8.
+  // follow-up that fails still has to be re-driven by hand" for the whole of r8.
   //
-  // Route: help-docs/xero-sync.md, every paragraph that talks about QuickBooks AND follow-ups —
-  // i.e. about the connector this backlog exists for. Paragraphs about Xero's sweep are a different
-  // mechanism (it has a consumer) and are deliberately out of scope, so the scan is not silently
-  // wider than the finding.
+  // Route: help-docs/xero-sync.md, every paragraph that describes the backlog of stranded follow-up
+  // obligations (it names the inbox section or the do-not-settle rule). Paragraphs about Xero's sweep
+  // are a different mechanism (it has a consumer) and are deliberately out of scope, so the scan is
+  // not silently wider than the finding. It requires no connector's name.
   //
-  // Mutation: restore "a QuickBooks follow-up that fails still has to be re-driven by hand" and
+  // Mutation: restore "a follow-up that fails still has to be re-driven by hand" and
   // this fails naming the paragraph; delete the paragraphs entirely and the non-vacuity control
   // below fails instead of the test passing on an empty set.
   const doc = readFileSync(path.join(REPO_ROOT, 'help-docs', 'xero-sync.md'), 'utf8')
   const paragraphs = doc.split(/\n\s*\n/)
-  const scoped = paragraphs.filter((p) => /quickbooks/i.test(p) && /follow-?ups?\b/i.test(p))
+  const scoped = paragraphs.filter((p) => /nothing to re-drive them|settle one of these rows by hand/i.test(p))
 
-  assert.equal(scoped.length > 0, true, 'the documentation must still describe the QuickBooks follow-up backlog')
+  assert.equal(scoped.length > 0, true, 'the documentation must still describe the stranded follow-up backlog')
+  // NOT VACUOUS: the doc must name the inbox section an operator is sent to, by its exact title, so
+  // deleting that paragraph (and leaving only an unrelated "by hand" sentence elsewhere) fails here
+  // rather than passing on whatever else matched the scope above.
+  assert.ok(
+    paragraphs.some((p) => p.includes('Accounting follow-ups owed, with nothing to re-drive them')),
+    'the documentation must name the "Accounting follow-ups owed, with nothing to re-drive them" section',
+  )
   for (const paragraph of scoped) {
     assertNoBannedInstruction(`help-docs/xero-sync.md (${paragraph.slice(0, 80).replace(/\s+/g, ' ')}…)`, paragraph)
   }
@@ -2110,16 +2097,14 @@ test('[o3d-0bfh r9] the activity messages and the shared recovery note carry the
   // banned list rather than a second list that can drift from it — two lists is the r8 failure in
   // miniature.
   //
-  // Route: lib/connectors/quickbooks/sync-processor.ts (activity-log descriptions and warnings) and
-  // lib/domain/accounting/back-reference.ts (`followUpObligationRecoveryNote`, the one definition
+  // Route: lib/domain/accounting/back-reference.ts (`followUpObligationRecoveryNote`, the one definition
   // every `console.error` on this path composes its message from).
   //
   // Mutation: restore any r7 instruction to either file and the scan fails naming it; make
   // followUpObligationRecoveryNote restate a remedy instead of interpolating
   // `recovery.operatorRemedy` and the composition assertion fails.
-  // o3d-remove-parked-connectors: `lib/connectors/quickbooks/sync-processor.ts` was the first source
-  // here. Archived — so the shared banned list is now applied to the composition point only, and not
-  // to any connector's own strings. Add a connector's processor here when one is written.
+  // The shared banned list is applied to the composition point; add a connector's processor here when
+  // one is written.
   const backReference = readSource(path.join(REPO_ROOT, 'lib', 'domain', 'accounting', 'back-reference.ts'))
 
   for (const source of [backReference]) assertNoBannedInstruction(source.rel, source.code)
@@ -2409,7 +2394,7 @@ test('[o3d-0bfh r9] the marker scan REFUSES the shapes it cannot read, instead o
 // o3d-0bfh r11 (Codex HIGH) — THE CONTRACT COVERS THE STRINGS IT IS POINTED AT.
 //
 // r10 grew THE ONE LIST from three patterns to eleven and ran it over the registry strings, the
-// exception inbox, help-docs/xero-sync.md, lib/connectors/quickbooks/sync-processor.ts and
+// exception inbox, help-docs/xero-sync.md and
 // lib/domain/accounting/back-reference.ts. Through that same round the XERO processor shipped
 //
 //     "Re-run the invoice sync for this reference, or register the receipt in Xero by hand."
@@ -2514,8 +2499,8 @@ function activityProducers(): Array<{ what: string; text: string; mustEscalate: 
   //    BOTH CLAUSE FORMS are walked for EVERY connector, because the producer takes its recovery
   //    half as an ARGUMENT — which is exactly how r6 came to pass a clause that is true of the
   //    retained-marker sweep at a call site where it is false. The registry form is what Xero
-  //    passes (two drivers, so it must stay driver-agnostic); the retry form is what QuickBooks
-  //    passes (one driver, the processor's own retry of the posted parent).
+  //    passes (two drivers, so it must stay driver-agnostic); the retry form is what a connector with
+  //    one driver passes (the processor's own retry of the posted parent).
   for (const connector of [...Object.keys(ACCOUNTING_FOLLOW_UP_RECOVERY), UNDECLARED_CONNECTOR]) {
     const atRest = followUpObligationRecoveryNote(followUpObligationRecoveryFor(connector))
     const refusal = (recovery: string) => paymentAccountRefusalMessage({
@@ -2746,9 +2731,8 @@ test('[o3d-0bfh r11/r12] every FILE that writes about a retained obligation is s
   // clear." back into the sweep, and this fails naming the file.
   const sources = [
     readSource(path.join(REPO_ROOT, 'lib', 'connectors', 'xero', 'sync-processor.ts')),
-    // o3d-remove-parked-connectors: the archived QuickBooks processor was scanned here too, so this
-    // rule was checked against TWO connectors' own strings. One now — and a second connector's
-    // processor must be added here in the commit that writes it, or its sentences are unscanned.
+    // A further connector's processor must be added here in the commit that writes it, or its
+    // sentences are unscanned.
     readSource(path.join(REPO_ROOT, 'lib', 'domain', 'accounting', 'back-reference-sweep.ts')),
     readSource(path.join(REPO_ROOT, 'lib', 'domain', 'accounting', 'compacted-followup-loss.ts')),
     // The LOADER the inbox renders from. It authors no sentence — it spreads the describer's output
@@ -2772,9 +2756,6 @@ test('[o3d-0bfh r11/r12] every FILE that writes about a retained obligation is s
     sources[0]!.code, /followUpObligationRecoveryNote\(followUpObligationRecoveryFor\(XERO_CONNECTOR\)\)/,
     'and its recovery guidance must come from the registry',
   )
-  // o3d-remove-parked-connectors: `sources[1]` was the archived QuickBooks processor and this was its
-  // replacement-wording control. The index shift below is deliberate rather than a renumbering
-  // accident: every remaining control is re-pointed at the file it names.
   // And the r12 files carry their REPLACEMENTS rather than merely having lost the sentence.
   assert.match(
     sources[1]!.code, /sweepRetainedFollowUpObligationDescription\(\{ connector, connectorLabel, row \}\)/,
@@ -2987,10 +2968,6 @@ test('[o3d-0bfh r13] every enqueue string written while an obligation is outstan
   // both sides of the declaration — not a sentence written in the enqueue module.
   assert.match(shipped, /a later sweep re-reads the marker and re-enqueues them idempotently/)
   assert.match(
-    invoicePaymentRemedyNote({ redrive: 'deferred', connector: 'quickbooks' }),
-    /NOTHING re-enqueues them on this connector/,
-  )
-  assert.match(
     invoicePaymentRemedyNote({ redrive: 'deferred', connector: UNDECLARED_CONNECTOR }),
     /NOTHING re-enqueues them on this connector/,
     'an undeclared connector must not inherit the sweep answer here either',
@@ -3187,8 +3164,8 @@ test('[o3d-0bfh r14] an UNPINNED call for a receipt that already has a deferred 
   // AND A CONNECTOR THE ACTIVE ONE IS NOT. The obligation belongs to whichever connector claimed it;
   // a re-drive pinned to that one selects this receipt just the same, because it has no sync row on
   // any ledger. The remedy must therefore be that connector's registry answer, not the active one's.
-  const elsewhere = await readDeferredReceiptRecovery('order-1', 'xero', obligationClient([{ connector: 'quickbooks' }], seen))
-  assert.deepEqual(elsewhere, { state: 'held', connector: 'quickbooks' })
+  const elsewhere = await readDeferredReceiptRecovery('order-1', 'xero', obligationClient([{ connector: RETIRED_CONNECTOR }], seen))
+  assert.deepEqual(elsewhere, { state: 'held', connector: RETIRED_CONNECTOR })
   assert.match(
     refusalNotice(invoicePaymentRedriveFor(null, SHARED_REFUSAL, elsewhere)),
     /NOTHING re-enqueues them on this connector/,
@@ -3218,7 +3195,7 @@ test('[o3d-0bfh r14] a durable state that cannot be READ fails toward assuming a
 
   // The unknown state promises nothing about what WILL come back — it cannot — but it still has to
   // pass THE ONE LIST and still has to say what a human should do instead.
-  for (const connector of ['xero', 'quickbooks', UNDECLARED_CONNECTOR, null]) {
+  for (const connector of ['xero', RETIRED_CONNECTOR, UNDECLARED_CONNECTOR, null]) {
     const text = invoicePaymentRemedyNote({ redrive: 'recovery-unknown', connector })
     assertNoBannedInstruction(`the unreadable-state remedy (${connector ?? 'no connector'})`, text)
     assert.match(text, /ESCALATE/)

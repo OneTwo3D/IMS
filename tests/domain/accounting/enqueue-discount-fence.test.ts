@@ -263,7 +263,6 @@ mock.module('@/lib/connectors/xero/settings', {
     }),
   },
 })
-// o3d-remove-parked-connectors: a `mock.module` for an archived QuickBooks module was here.
 
 const ENTRY = {
   orderId: 'order-1',

@@ -46,14 +46,9 @@ test('[o3d-anu8] both connectors CARRY the basis out of their sync-log read', as
   assert.notEqual(xeroAt, -1)
   assert.match(xero.slice(xeroAt, xeroAt + 1200), /settlementBasis: r\.settlementBasis/)
 
-  // o3d-remove-parked-connectors: the QuickBooks half was here, and it was the point of the case —
-  // "the settlement action is connector-agnostic, so a marker that only ever appeared on Xero rows
-  // would silently mean Xero only". Its reader is archived. The registry adapter below still carries
-  // the field explicitly, which is the remaining evidence that the CONTRACT (not just one reader)
-  // exposes it.
-
-  // o3d-remove-parked-connectors: this skipped the FIRST `getSyncLogs` (the QuickBooks adapter's) and
-  // checked the SECOND (Xero's). With one adapter left there is only one, so it takes the first.
+  // The settlement action is connector-agnostic, so a marker that only ever appeared on Xero rows
+  // would silently mean Xero only. The registry adapter below carries the field explicitly, which is
+  // the evidence that the CONTRACT (not just one reader) exposes it.
   const registry = await source('lib/connectors/accounting-registry.ts')
   const getAt = registry.indexOf('async getSyncLogs(limit = 50) {')
   assert.notEqual(getAt, -1, 'the Xero adapter maps the row shape explicitly and must carry it')

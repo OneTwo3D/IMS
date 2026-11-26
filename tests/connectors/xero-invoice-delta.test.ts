@@ -25,19 +25,14 @@ import {
 } from '@/lib/connectors/xero/invoice-delta'
 import type { LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 /**
- * o3d-remove-parked-connectors — THE ROUTE THE TWO r16 CASES USED IS ARCHIVED.
+ * The settled figure of a ledger that states a total and a balance: two production functions in a
+ * fixed order — refuse either operand the SCALE rule cannot read (`parseLedgerAmount`), then take the
+ * DIFFERENCE under its own magnitude bound (`readLedgerDifferenceAsNumber`). The composition is
+ * spelled out here, once, from the shipped pieces.
  *
- * They drove `qboLedgerAmount`, the QuickBooks poller's `TotalAmt - Balance` reader: the production
- * caller that turned a pair of decoded doubles into a settled figure. Its rule was two production
- * functions in a fixed order — refuse either operand the SCALE rule cannot read (`parseLedgerAmount`),
- * then take the DIFFERENCE under its own magnitude bound (`readLedgerDifferenceAsNumber`) — and both
- * of those still ship. So the composition is spelled out here, once, from the shipped pieces.
- *
- * WHAT IS LOST, stated plainly: the cases no longer show that a real connector's reader performs that
- * composition. This helper is the test's own arrangement of two production rules, which is a weaker
- * subject than a production caller, and a connector that composed them differently (or forgot one)
- * would not be caught here. The next accounting connector's own reader should be driven through these
- * same figures.
+ * This helper is the test's own arrangement of two production rules, which is a weaker subject than a
+ * production caller, and a connector that composed them differently (or forgot one) would not be
+ * caught here. An accounting connector's own reader should be driven through these same figures.
  */
 function settledFigureUnderBothRules(total: number, balance: number, currency: string): number | null {
   if (parseLedgerAmount(total, currency) === null) return null
@@ -579,7 +574,7 @@ test('rounding dust is not a payment, but a penny is', () => {
 // o3d-psrx r17 (Codex HIGH) — TWO RULES WITH DIFFERENT IDEAS OF "HOW SMALL IS NOTHING", AND A THIRD
 // CHANGE THAT MADE THE DISAGREEMENT REACHABLE.
 //
-// r10 gave QuickBooks a per-currency threshold. Xero kept a fixed `PAYMENT_PRESENT_EPSILON` of 0.005,
+// r10 gave one reader a per-currency threshold. Xero kept a fixed `PAYMENT_PRESENT_EPSILON` of 0.005,
 // and r15 recorded on this branch that it was "not wrong today" because Xero rounds to 2dp. Then r16
 // added the scale rule, which admits a numeric token whose decimals fit its currency's minor unit —
 // so `0.001` in KWD and `0.0001` in CLF, each exactly ONE MINOR UNIT and the smallest payment those
@@ -702,17 +697,17 @@ test('[o3d-77sj] a STATED ZERO is READABLE in every currency and in none — the
   //
   // ZERO ANSWERS TO NEITHER PREMISE. It is below every magnitude bound there is, and it is a whole
   // multiple of every minor unit there is, so no currency knowledge is needed to read it and none can
-  // withdraw it. That is not a nicety: a VOIDED QuickBooks document is `TotalAmt = 0`, and
-  // `payment-poller.ts`'s void test is `parsed.total !== null && parsed.total === 0`. Refuse the zero
-  // and `isVoided` is false, the row joins `unreadable`, and a voided document STOPS REVERSING while
-  // QuickBooks has already unwound the AR — the refusal spent as a settlement, in the one case that
+  // withdraw it. That is not a nicety: a voided document can state a total of 0, and
+  // a void test of the form `parsed.total !== null && parsed.total === 0` depends on reading it.
+  // Refuse the zero and `isVoided` is false, the row joins `unreadable`, and a voided document STOPS
+  // REVERSING while the ledger has already unwound the AR — the refusal spent as a settlement, in the one case that
   // needs no arithmetic at all.
   //
   // Every supported precision, and the UNSTATED currency that takes the finest of them.
   const currencies: Array<string | null> = [
     null, 'GBP', 'USD', 'JPY', 'KRW', 'ISK', 'KWD', 'BHD', 'JOD', 'CLF', 'UYW',
   ]
-  // Both arms: the JSON numeric token QuickBooks sends with multicurrency off, and the decimal string
+  // Both arms: the JSON numeric token a ledger sends with multicurrency off, and the decimal string
   // it sends otherwise — written out to more places than the currency has, because trailing zeros are
   // not a scale (`decimalPlaces()` reads the VALUE, and the value is zero everywhere).
   const statedZeros: Array<number | string> = [0, '0', '0.0', '0.00', '0.000', '0.0000', ' 0.00 ']
@@ -752,7 +747,7 @@ test('parseLedgerAmount refuses to turn an empty field into zero', () => {
 // The string branch of parseLedgerAmount used to be `Number(trimmed)`, which accepts a great deal
 // that no ledger ever calls an amount: radix-prefixed literals, exponent notation, and Infinity.
 // It does not throw on any of them — it returns a NUMBER, and that number then steers a reversal.
-// The worked example is the finding's own: a `Balance` of "0x64" against a `TotalAmt` of 100 makes
+// The worked example is the finding's own: a `balance` of "0x64" against a `total` of 100 makes
 // paid = 0, which is the proof the reversal gate is waiting for.
 //
 // The table is the test. A blocklist of these shapes would be a list of what somebody remembered;
@@ -784,7 +779,7 @@ test('[o3d-psrx r11] a string that is not decimal money is UNREADABLE, never a n
 
 test('[o3d-psrx r11] ordinary decimal money still reads exactly as it always did', () => {
   // The other half of the grammar: refusing everything would satisfy the test above and destroy the
-  // reader. Every one of these is a figure Xero or QuickBooks actually serialises.
+  // reader. Every one of these is a figure a ledger actually serialises.
   const accepted: [string, number][] = [
     ['0', 0],
     ['0.00', 0],
@@ -809,7 +804,7 @@ test('[o3d-psrx r11] ordinary decimal money still reads exactly as it always did
     'THE r18 FINDING: the same text in GBP is a figure that currency cannot hold, and the string arm '
     + 'used to read it while the identical double was refused')
   assert.equal(parseLedgerAmount('0.001', 'GBP'), null)
-  // And the number branch is untouched: QuickBooks and Xero both serialise money as JSON numbers in
+  // And the number branch is untouched: Xero serialises money as JSON numbers in
   // normal operation, so this is the path production actually takes.
   assert.equal(parseLedgerAmount(0, 'GBP'), 0)
   assert.equal(parseLedgerAmount(50.25, 'GBP'), 50.25)
@@ -1543,31 +1538,31 @@ test('[o3d-psrx r14] the bound is the exact magnitude where a minor unit stops s
 })
 
 test('[o3d-psrx r14] an amount above the bound is UNREADABLE — 4-decimal, decoded from the wire', async () => {
-  // The finding's own pair, as QuickBooks would put it on the wire.
-  const decoded = await decodeJsonAmounts('{"TotalAmt":1649267441664,"Balance":1649267441663.9999}')
+  // The finding's own pair, as a ledger would put it on the wire.
+  const decoded = await decodeJsonAmounts('{"total":1649267441664,"balance":1649267441663.9999}')
   // THE PRECONDITION, ASSERTED. These are two different CLF amounts one minor unit apart, and if the
   // decode ever stopped collapsing them this test would pass while proving nothing.
-  assert.equal(decoded.TotalAmt, decoded.Balance,
+  assert.equal(decoded.total, decoded.balance,
     'precondition: Response.json() must have collapsed a one-minor-unit difference into one double')
-  assert.ok(decoded.Balance > ledgerAmountMagnitudeBound('CLF'),
+  assert.ok(decoded.balance > ledgerAmountMagnitudeBound('CLF'),
     'precondition: and the pair must sit above the CLF bound, which is why it collapsed')
 
-  for (const value of [decoded.TotalAmt, decoded.Balance]) {
+  for (const value of [decoded.total, decoded.balance]) {
     assert.equal(parseLedgerAmount(value, 'CLF'), null,
       'a CLF figure this large cannot carry its own minor unit, so it is not an amount IMS can read')
   }
   // REFUSAL, NOT CLAMPING: null is the answer that withholds. Nothing here becomes a number.
-  assert.equal(parseLedgerAmount(decoded.Balance, 'CLF'), null)
+  assert.equal(parseLedgerAmount(decoded.balance, 'CLF'), null)
 })
 
 test('[o3d-psrx r14] an amount above the bound is UNREADABLE — 3-decimal, decoded from the wire', async () => {
-  const decoded = await decodeJsonAmounts('{"TotalAmt":8796093022208.002,"Balance":8796093022208.001}')
-  assert.equal(decoded.TotalAmt, decoded.Balance,
+  const decoded = await decodeJsonAmounts('{"total":8796093022208.002,"balance":8796093022208.001}')
+  assert.equal(decoded.total, decoded.balance,
     'precondition: one Gulf-dinar fils separates these two figures and the decode lost it')
-  assert.ok(decoded.Balance > ledgerAmountMagnitudeBound('KWD'),
+  assert.ok(decoded.balance > ledgerAmountMagnitudeBound('KWD'),
     'precondition: and the pair must sit above the 3-decimal bound')
 
-  for (const value of [decoded.TotalAmt, decoded.Balance]) {
+  for (const value of [decoded.total, decoded.balance]) {
     assert.equal(parseLedgerAmount(value, 'KWD'), null,
       'a KWD figure this large cannot carry its own fils, so it is not an amount IMS can read')
   }
@@ -1675,37 +1670,37 @@ test('[o3d-psrx r16] the r15 residual — a payload FINER than its minor unit �
   //
   // GBP, THREE decimals, at 2^44 — BELOW every candidate bound, so the magnitude rule admits it and
   // only the scale rule can refuse it.
-  const three = await decodeJsonAmounts('{"TotalAmt":17592186044416.008,"Balance":17592186044416.002}')
-  assert.ok(Math.abs(three.TotalAmt) < ledgerAmountMagnitudeBound('GBP')
-    && Math.abs(three.Balance) < ledgerAmountMagnitudeBound('GBP'),
+  const three = await decodeJsonAmounts('{"total":17592186044416.008,"balance":17592186044416.002}')
+  assert.ok(Math.abs(three.total) < ledgerAmountMagnitudeBound('GBP')
+    && Math.abs(three.balance) < ledgerAmountMagnitudeBound('GBP'),
     'precondition: the MAGNITUDE rule admits both of these, so a refusal below can only be the scale')
-  assert.equal(parseLedgerAmount(three.TotalAmt, 'GBP'), null,
+  assert.equal(parseLedgerAmount(three.total, 'GBP'), null,
     'the decoded double reads back as 17592186044416.008 — three decimals of a two-decimal currency, '
     + 'which is not a figure that can be shown to be quantized')
-  assert.equal(parseLedgerAmount(three.Balance, 'GBP'), null)
+  assert.equal(parseLedgerAmount(three.balance, 'GBP'), null)
   // r15 measured this pair's decoded settlement at 0.004 against a true 0.006, so it crossed the
   // threshold. It can no longer be computed at all, which is the point: the operands never arrive.
-  assert.equal(settledFigureUnderBothRules(three.TotalAmt, three.Balance, 'GBP'), null,
+  assert.equal(settledFigureUnderBothRules(three.total, three.balance, 'GBP'), null,
     'THE ROUTE: the settled figure r15 could only watch go wrong is now UNREADABLE, and null withholds')
 
   // FOUR decimals at 2^40, the second figure r15 measured (true 0.0051, read 0.0048). Same answer.
-  const four = await decodeJsonAmounts('{"TotalAmt":1099511627776.0062,"Balance":1099511627776.0011}')
-  assert.equal(parseLedgerAmount(four.TotalAmt, 'GBP'), null)
-  assert.equal(parseLedgerAmount(four.Balance, 'GBP'), null)
-  assert.equal(settledFigureUnderBothRules(four.TotalAmt, four.Balance, 'GBP'), null)
+  const four = await decodeJsonAmounts('{"total":1099511627776.0062,"balance":1099511627776.0011}')
+  assert.equal(parseLedgerAmount(four.total, 'GBP'), null)
+  assert.equal(parseLedgerAmount(four.balance, 'GBP'), null)
+  assert.equal(settledFigureUnderBothRules(four.total, four.balance, 'GBP'), null)
 
   // AND CODEX'S OWN PAIR, which is the one case where the scale rule alone is not the reason. A token
   // of `35184372088832.003` decodes to a double whose shortest reading is `35184372088832` — scale 0,
   // so the scale rule ADMITS it, and admitting it is correct: the reading is within half a penny of
   // the token, and every admitted reading is a whole penny from the next. The pair is refused because
   // its OTHER half reads back at three decimals.
-  const codex = await decodeJsonAmounts('{"TotalAmt":35184372088832.003,"Balance":35184372088831.997}')
-  assert.equal(parseLedgerAmount(codex.TotalAmt, 'GBP'), 35184372088832,
+  const codex = await decodeJsonAmounts('{"total":35184372088832.003,"balance":35184372088831.997}')
+  assert.equal(parseLedgerAmount(codex.total, 'GBP'), 35184372088832,
     'the shortest reading of a decoded double may be SHORTER than the token — this one is a whole '
     + 'number, and a whole number of pounds is quantized')
-  assert.equal(parseLedgerAmount(codex.Balance, 'GBP'), null,
+  assert.equal(parseLedgerAmount(codex.balance, 'GBP'), null,
     'while its partner reads back at three decimals and is refused, so the pair never subtracts')
-  assert.equal(settledFigureUnderBothRules(codex.TotalAmt, codex.Balance, 'GBP'), null,
+  assert.equal(settledFigureUnderBothRules(codex.total, codex.balance, 'GBP'), null,
     'THE ROUTE for the finding\'s own reproduction: 0.006 true, 0.004 decoded, and now UNREADABLE')
 
   // THE STRING ARM IS UNCHANGED AND IS STILL THE CONTROL: the same figures as text are refused by the
@@ -1723,29 +1718,29 @@ test('[o3d-psrx r16] scale alone does NOT close the class for a DIFFERENCE, and 
   //
   // GBP at 2^45: the interval around `35184372088832.01` is 0.0078125 wide, which is WIDER than the
   // 0.005 threshold the decision uses. Both tokens below fall in it.
-  const hidden = await decodeJsonAmounts('{"TotalAmt":35184372088832.0117,"Balance":35184372088832.0040}')
-  assert.equal(hidden.TotalAmt, hidden.Balance,
+  const hidden = await decodeJsonAmounts('{"total":35184372088832.0117,"balance":35184372088832.0040}')
+  assert.equal(hidden.total, hidden.balance,
     'precondition: two tokens 0.0077 apart — ABOVE the threshold — decode to ONE double')
-  assert.equal(String(hidden.TotalAmt), '35184372088832.01',
+  assert.equal(String(hidden.total), '35184372088832.01',
     'whose own decimal reading is two decimals, so the SCALE rule admits it and cannot help here')
-  assert.ok(Math.abs(hidden.TotalAmt) < ledgerAmountMagnitudeBound('GBP'),
+  assert.ok(Math.abs(hidden.total) < ledgerAmountMagnitudeBound('GBP'),
     'and it is below the single-value magnitude bound, so that rule admits it too')
   // Each figure on its own is still READ — the guarantee for a single value is intact, and narrowing
   // that would refuse money r15 measured as provably readable.
-  assert.equal(parseLedgerAmount(hidden.TotalAmt, 'GBP'), 35184372088832.01)
+  assert.equal(parseLedgerAmount(hidden.total, 'GBP'), 35184372088832.01)
   // THE ROUTE: the DIFFERENCE is refused, because at this magnitude the decode spacing is wider than
   // the threshold the difference is about to be compared against.
-  assert.ok(Math.abs(hidden.TotalAmt) >= ledgerDifferenceMagnitudeBound('GBP'),
+  assert.ok(Math.abs(hidden.total) >= ledgerDifferenceMagnitudeBound('GBP'),
     'precondition: this is the one binade where spacing exceeds the epsilon')
-  assert.equal(settledFigureUnderBothRules(hidden.TotalAmt, hidden.Balance, 'GBP'), null,
+  assert.equal(settledFigureUnderBothRules(hidden.total, hidden.balance, 'GBP'), null,
     'so the settled figure is UNREADABLE rather than a zero — without this bound it is exactly 0, '
     + 'which is HOLDS_NOTHING, which clears paidAt over a payment the ledger is still holding')
 
   // THE CONTROL, ONE BINADE DOWN, where the spacing is no wider than the threshold: the difference is
   // read, so this is a bound and not a blanket refusal of large figures.
-  const readable = await decodeJsonAmounts('{"TotalAmt":17592186044416.02,"Balance":17592186044416.01}')
-  assert.ok(Math.abs(readable.TotalAmt) < ledgerDifferenceMagnitudeBound('GBP'))
-  assert.equal(settledFigureUnderBothRules(readable.TotalAmt, readable.Balance, 'GBP'), 0.01,
+  const readable = await decodeJsonAmounts('{"total":17592186044416.02,"balance":17592186044416.01}')
+  assert.ok(Math.abs(readable.total) < ledgerDifferenceMagnitudeBound('GBP'))
+  assert.equal(settledFigureUnderBothRules(readable.total, readable.balance, 'GBP'), 0.01,
     'a whole penny still survives a subtraction here, exactly as r15 measured')
 
   // AND THE RULE, STATED RATHER THAN SAMPLED: in every supported precision the difference bound is

@@ -183,8 +183,6 @@ mock.module('@/lib/connectors/xero/settings', {
     }),
   },
 })
-// o3d-remove-parked-connectors: a `@/lib/connectors/quickbooks/settings` mock was here, supplying that
-// writer's account codes. It went with the connector.
 
 mock.module('@/lib/base-currency', { namedExports: { getBaseCurrencyCode: async () => 'GBP' } })
 mock.module('@/lib/activity-log', {
@@ -232,16 +230,11 @@ mock.module('@/lib/domain/accounting/cogs-subledger-movement', {
 })
 
 /**
- * ONE WRITER TODAY (o3d-remove-parked-connectors).
+ * ONE WRITER TODAY.
  *
- * This list had two entries and the loop below ran every case against BOTH daily-batch writers — that
- * cross-port was the point: the A1 staleness fence is a rule about the batch, and a fence present in
- * one writer and missing from the other is not a fence. `lib/connectors/quickbooks/daily-sync.ts` is
- * archived, so the loop now runs once.
- *
- * WHAT IS LOST: the evidence that the fence holds in a SECOND, independently-written batch writer.
- * The loop shape is kept deliberately — a second writer joins this array and inherits every case.
- * Recorded in docs/archive/quickbooks-connector-removal.md.
+ * The A1 staleness fence is a rule about the batch, and a fence present in one writer and missing from
+ * another is not a fence. With one daily-batch writer the loop below runs once; the loop shape is kept
+ * deliberately — a second writer joins this array and inherits every case.
  */
 const CONNECTORS = [
   { name: 'xero', load: () => import('@/lib/connectors/xero/daily-sync') },

@@ -17,7 +17,7 @@ const asked: { forChart: Array<string | null>; active: number; verdicts: Array<[
 
 mock.module('@/lib/accounting', {
   namedExports: {
-    getAccountingSettings: async () => { asked.settingsReads++; return { inventoryAccount: '120', cogsAccount: '500', connector: 'quickbooks' } },
+    getAccountingSettings: async () => { asked.settingsReads++; return { inventoryAccount: '120', cogsAccount: '500', connector: 'retired-ledger' } },
     isDailyBatchPostingEnabled: async () => { asked.active++; return true },
     isDailyBatchPostingEnabledForChart: async (connector: string | null) => { asked.forChart.push(connector); return false },
     accountingPostingVerdictForChart: async (connector: string | null, type: string) => {
@@ -107,6 +107,6 @@ test('[o3d-j625 r4] with no injected chart, the refresh reads ONE chart for the 
   const { refreshShipmentCogsForCostLayerChange } = await import('@/lib/cost-layers')
   await refreshShipmentCogsForCostLayerChange(tx(true) as never, 'layer-1', {})
   assert.equal(asked.settingsReads, 1, 'one chart read for two journaled shipments, not one per shipment')
-  assert.deepEqual(asked.verdicts, [['quickbooks', 'COGS_REVERSAL'], ['quickbooks', 'COGS_REVERSAL']], 'each reversal verdict is asked of that chart')
+  assert.deepEqual(asked.verdicts, [['retired-ledger', 'COGS_REVERSAL'], ['retired-ledger', 'COGS_REVERSAL']], 'each reversal verdict is asked of that chart')
   assert.equal(asked.active, 0)
 })

@@ -227,8 +227,7 @@ test('[o3d-1xq8] a present but unreadable decimal string refuses, it does not fa
 })
 
 test('[o3d-1xq8] the writer refuses an amount it cannot state as the JSON number the wire takes', () => {
-  // The connectors' payment bodies state the amount as a JSON number (`Amount` on Xero, `TotalAmt` /
-  // `Line[0].Amount` on QuickBooks). The decimal string makes the COVERAGE route exact; it does
+  // The connectors' payment bodies state the amount as a JSON number (`Amount` on Xero). The decimal string makes the COVERAGE route exact; it does
   // nothing for the figure that is actually SENT. So the writer — the one place that holds the stored
   // `Decimal` — refuses what it cannot state in both forms.
   assert.equal(invoicePaymentAmountRoundTrips(toDecimal(UP_RECEIPT)), false,

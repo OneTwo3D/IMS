@@ -31,9 +31,8 @@ import { resolveSettingSaveView } from '@/lib/domain/settings/setting-save-outco
 // switches they apply the answer to.
 // ---------------------------------------------------------------------------
 
-// o3d-remove-parked-connectors: `quickbooks` was a member here and was the plugin the fixtures
-// switched ON to make `requested` differ from `previous`. It is archived, so the second plugin is now
-// `mintsoft` — a registered plugin that is off by default. What this file tests is the RESOLVER
+// The fixtures switch `mintsoft` ON — a registered plugin that is off by default — to make `requested`
+// differ from `previous`. What this file tests is the RESOLVER
 // (which of requested / committed / previous a given outcome should render), and that is indifferent
 // to which plugin moved, as long as two distinguishable states exist.
 function pluginState(over: Partial<IntegrationPluginState> = {}): IntegrationPluginState {
@@ -50,14 +49,14 @@ const requested = pluginState({ woocommerce: true, mintsoft: true })
 
 test('a REFUSAL restores the previous selection — the one outcome that committed nothing', () => {
   const view = resolvePluginSelectionSaveView({
-    attempt: { kind: 'result', result: { status: 'refused', error: 'Choose either Xero or QuickBooks, not both.' } },
+    attempt: { kind: 'result', result: { status: 'refused', error: 'Choose one connector, not both.' } },
     requested,
     previous,
   })
 
   assert.deepEqual(view.plugins, previous, 'the switches go back, because the database never moved')
   assert.equal(view.committed, false)
-  assert.equal(view.error, 'Choose either Xero or QuickBooks, not both.')
+  assert.equal(view.error, 'Choose one connector, not both.')
   assert.equal(view.schedulerWarning, '')
 })
 

@@ -180,7 +180,7 @@ function makeClient() {
       },
     },
     // Round 5: `readAccountingSyncEnabledValue` reads the connector's own sync toggle, exactly as
-    // triggerXeroSync / triggerQuickBooksSync do (`enabled?.value !== 'true'`), so an absent row is
+    // triggerXeroSync does (`enabled?.value !== 'true'`), so an absent row is
     // OFF rather than unknown.
     setting: {
       findUnique: async ({ where }: { where: { key: string } }) => {
@@ -379,8 +379,8 @@ test('a stale session is returned as a step-up failure, not a crash — and writ
 // ---------------------------------------------------------------------------
 
 test('a row that has never been fence-claimed is refused as UNFENCED_ATTEMPT, not settled', async () => {
-  // This is the state of EVERY row today, and permanently of every QuickBooks row: that processor
-  // stamps no attempt revision. A decision that cannot be tied to an attempt cannot be shown to be
+  // This is the state of EVERY row today, and permanently of every row of a connector whose
+  // processor stamps no attempt revision. A decision that cannot be tied to an attempt cannot be shown to be
   // about the attempt it will hit, so it is refused rather than run unfenced.
   const settle = await loadAction()
   state.rows = [syncRow({ attemptRevision: 0 })]
@@ -473,7 +473,7 @@ test('a PROCESSING row on a retired connector CAN be settled (o3d-osl8 item 2)',
   // AND the Xero processor records a document id even after losing that fence — so a wrong guess is
   // contradicted by evidence, not silently believed.
   const settle = await loadAction()
-  state.rows = [syncRow({ status: 'PROCESSING', connector: 'quickbooks', attemptRevision: 2, processingStartedAt: new Date() })]
+  state.rows = [syncRow({ status: 'PROCESSING', connector: 'retired-ledger', attemptRevision: 2, processingStartedAt: new Date() })]
   const result = await settle('log-1', notPosted({ observedStatus: 'PROCESSING', observedAttemptRevision: 2 }))
   assert.equal(result.success, true)
   const row = stored()
@@ -1068,9 +1068,9 @@ test('a CREDIT_NOTE row on a cancelled order is NOT retired — the credit is th
 test('a revision-0 row on a RETIRED connector is settled by ADOPTION, minting attempt 1', async () => {
   const settle = await loadAction()
   // The state under test is reachable and is the ordinary one: xero is active, this row is a
-  // leftover on quickbooks, so nothing participating in the fence will ever claim it.
+  // leftover on a retired connector, so nothing participating in the fence will ever claim it.
   state.activeConnector = 'xero'
-  state.rows = [syncRow({ connector: 'quickbooks', attemptRevision: 0 })]
+  state.rows = [syncRow({ connector: 'retired-ledger', attemptRevision: 0 })]
   const result = await settle('log-1', notPosted({ observedAttemptRevision: 0 }))
   assert.equal(result.success, true)
   assert.equal(stored().status, 'CANCELLED')
@@ -1087,7 +1087,7 @@ test('adoption is a compare-and-swap too — a row whose STATUS moved first is r
   // the row can never be settled when the truth is that it moved.
   const settle = await loadAction()
   state.activeConnector = 'xero'
-  state.rows = [syncRow({ connector: 'quickbooks', attemptRevision: 0, status: 'PROCESSING' })]
+  state.rows = [syncRow({ connector: 'retired-ledger', attemptRevision: 0, status: 'PROCESSING' })]
   const result = await settle('log-1', notPosted({ observedStatus: 'FAILED', observedAttemptRevision: 0 }))
   assert.equal(result.success, false)
   assert.equal('code' in result ? result.code : null, 'STATUS_MOVED')
@@ -1127,11 +1127,9 @@ test('with NO connector active, every unresolved row is adoptable — nothing is
 // an Xero row is "stranded" and still claimable by anyone holding `sync`. Adopting there settles a row
 // the next press reclaims.
 //
-// o3d-remove-parked-connectors round 2 (Codex MEDIUM): these two were written against QuickBooks, and
-// that is no longer the state they describe. Archiving QuickBooks removed the gate, so its toggle is
-// a dead `settings` row rather than an open claim path, and the rule now says so — see the [archived]
-// block at the end of this file. They are asked of the LIVE connector, which is where the round-5
-// fact still holds.
+// These two are asked of the LIVE connector, which is where the round-5 fact holds. A retired
+// connector's left-behind toggle is a dead `settings` row rather than an open claim path — see the
+// [archived] block at the end of this file.
 // ---------------------------------------------------------------------------
 
 test('[round 5] a stranded row is NOT adopted while its own connector’s sync toggle is on', async () => {
@@ -1169,8 +1167,8 @@ test('[round 5] a FENCED row on a still-enabled retired connector settles as bef
   // fenced on that attempt, and a concurrent claim loses the CAS — this must not gate it.
   const settle = await loadAction()
   state.activeConnector = 'xero'
-  state.syncEnabled = new Set(['quickbooks'])
-  state.rows = [syncRow({ connector: 'quickbooks', attemptRevision: 3 })]
+  state.syncEnabled = new Set(['retired-ledger'])
+  state.rows = [syncRow({ connector: 'retired-ledger', attemptRevision: 3 })]
 
   const result = await settle('log-1', notPosted({ observedAttemptRevision: 3 }))
 
@@ -1294,12 +1292,11 @@ test('a second key naming the SAME document is not a contradiction', async () =>
 })
 
 // ---------------------------------------------------------------------------
-// o3d-remove-parked-connectors ROUND 2 (Codex MEDIUM) — THE ARCHIVED CONNECTOR'S LEFT-BEHIND
-// TOGGLE MUST NOT BLOCK SETTLEMENT OF A STRANDED FINANCIAL ROW.
+// A RETIRED CONNECTOR'S LEFT-BEHIND TOGGLE MUST NOT BLOCK SETTLEMENT OF A STRANDED FINANCIAL ROW.
 //
-// Archiving QuickBooks deleted no `quickbooks_sync_enabled` Setting row, and there is no Sync
-// control left that writes one. The round-5 rule read that stored value as proof a claim path was
-// open, so a stranded revision-0 QuickBooks row was refused with an instruction to turn off a
+// Retiring a connector deletes no `<id>_sync_enabled` Setting row, and there is no Sync control left
+// that writes one. The round-5 rule read that stored value as proof a claim path was open, so a
+// stranded revision-0 row of a retired connector would be refused with an instruction to turn off a
 // checkbox the Sync page no longer renders: a financial row with no claim path and no exit.
 //
 // BOTH DIRECTIONS ARE ASSERTED. The archived connector is settleable WITH the toggle on; the LIVE
@@ -1310,12 +1307,12 @@ test('[archived] a revision-0 row on an ARCHIVED connector is adopted even with 
   const settle = await loadAction()
   state.activeConnector = 'xero'
   // The exact state the finding describes: the Setting row survives the archive.
-  state.syncEnabled = new Set(['quickbooks'])
-  state.rows = [syncRow({ connector: 'quickbooks', attemptRevision: 0 })]
+  state.syncEnabled = new Set(['retired-ledger'])
+  state.rows = [syncRow({ connector: 'retired-ledger', attemptRevision: 0 })]
 
   const result = await settle('log-1', notPosted({ observedAttemptRevision: 0 }))
 
-  assert.equal(result.success, true, 'nothing in this build can claim a quickbooks row, so adoption is sound')
+  assert.equal(result.success, true, 'nothing in this build can claim a retired-ledger row, so adoption is sound')
   assert.equal(stored().status, 'CANCELLED')
   assert.equal(stored().attemptRevision, 1)
   assert.equal('adoptedAttempt' in result ? result.adoptedAttempt : null, true)
@@ -1332,8 +1329,8 @@ test('[archived] and the ONLY difference is whether THIS BUILD services the conn
   const settle = await loadAction()
   state.activeConnector = null
 
-  state.syncEnabled = new Set(['quickbooks'])
-  state.rows = [syncRow({ connector: 'quickbooks', attemptRevision: 0 })]
+  state.syncEnabled = new Set(['retired-ledger'])
+  state.rows = [syncRow({ connector: 'retired-ledger', attemptRevision: 0 })]
   const archived = await settle('log-1', notPosted({ observedAttemptRevision: 0 }))
   assert.equal(archived.success, true, 'archived: no worker in this deployment can claim it')
   assert.equal(stored().attemptRevision, 1)

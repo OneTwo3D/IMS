@@ -102,8 +102,8 @@ export type FollowUpPreEnqueueRefusalReason =
    * `FOLLOW_UPS_ENQUEUED` and these two branches only wrote a WARNING to the activity log, so the
    * aggregate verdict said `enqueued: true`, `obligationReleasePrerequisite` handed the fence no
    * prerequisite, and the fence CLEARED the obligation generation over a payment that had been
-   * requested and never queued. On Xero the sweep could no longer find the row; on QuickBooks, whose
-   * registry entry declares no consumer at all, the money was lost permanently. Repairing the
+   * requested and never queued. On Xero the sweep could no longer find the row; on a connector whose
+   * registry entry declares no consumer at all, the money would have been lost permanently. Repairing the
    * mapping afterwards could not re-drive a marker that no longer existed.
    */
   | 'payment_account_unmapped'
@@ -172,13 +172,13 @@ export function refusedFollowUpEnqueue(...refusals: FollowUpEnqueueRefusal[]): R
 }
 
 /**
- * THE ONE SENTENCE BOTH CONNECTORS SAY WHEN A REQUESTED PAYMENT CANNOT BE QUEUED (o3d-batch-ret r6,
+ * THE ONE SENTENCE EVERY CONNECTOR SAYS WHEN A REQUESTED PAYMENT CANNOT BE QUEUED (o3d-batch-ret r6,
  * Codex HIGH).
  *
- * Written here rather than twice, because the two connectors had the identical defect and the r7/r8
+ * Written here rather than once per connector, because connectors share the identical defect and the r7/r8
  * lesson is that a message duplicated across surfaces drifts until one of the copies authorises
  * something the other forbids. What CANNOT be shared is what happens next: on Xero the marker is
- * re-read by a sweep, on QuickBooks nothing re-reads it at all. That difference is a declared fact
+ * re-read by a sweep, on a connector with no declared sweep nothing re-reads it at all. That difference is a declared fact
  * about the connector, so `recovery` comes in from
  * `followUpObligationRecoveryNote(followUpObligationRecoveryFor(...))` and is never written here —
  * the same rule `xeroRetainedFollowUpObligationDescription` follows.
@@ -189,7 +189,7 @@ export function refusedFollowUpEnqueue(...refusals: FollowUpEnqueueRefusal[]): R
  * defect on a new surface — no request id can deduplicate a payment a human entered by hand.
  */
 export function paymentAccountRefusalMessage(input: {
-  /** Display name of the accounting package, for the operator: `Xero`, `QuickBooks`. */
+  /** Display name of the accounting package, for the operator: `Xero`. */
   connector: string
   referenceType: string
   referenceId: string
@@ -209,18 +209,17 @@ export function paymentAccountRefusalMessage(input: {
 
 /**
  * WHAT A POSTED INVOICE'S PAYLOAD IS ASKING TO SETTLE — AND "UNKNOWN" IS NOT ONE OF THE ANSWERS
- * "NOTHING" IS (o3d-batch-ret r8, Codex HIGH). RESOLVED BEFORE ANY CONFIGURATION IS CONSULTED, AND
- * ON BOTH CONNECTORS.
+ * "NOTHING" IS (o3d-batch-ret r8, Codex HIGH). RESOLVED BEFORE ANY CONFIGURATION IS CONSULTED.
  *
  * ROUND 7 MOVED THE DEFECT ONE LEVEL DOWN INSTEAD OF REMOVING IT. Round 6's defect was a `let`
  * seeded with a value that MEANS SUCCESS, inherited by every branch that failed to overwrite it.
  * Round 7 replaced it with a resolver — and the resolver returned `number | undefined`, where
  * `undefined` meant "this declaration cannot be read" and a derived `0` meant "nothing is owed".
- * Both connectors then wrote `if (amount === undefined || !(amount > 0)) return FOLLOW_UPS_ENQUEUED`,
+ * Each connector then wrote `if (amount === undefined || !(amount > 0)) return FOLLOW_UPS_ENQUEUED`,
  * so the two collapsed back into the one value that discharges money work. A `_paymentAmount` of
  * `"abc"`, a `lines` key that is absent, a `lines` that is an object, a line with no `quantity` —
- * every one of them settled a row whose payment was requested and never queued, on a connector
- * (QuickBooks) where the marker is the ONLY record that the money is owed.
+ * every one of them settled a row whose payment was requested and never queued, on any connector
+ * where the marker is the ONLY record that the money is owed.
  *
  * FOUR DIFFERENT FACTS, AND EXACTLY ONE OF THEM MEANS NO PAYMENT IS OWED. A missing `lines`, a
  * non-array `lines`, a malformed amount and an explicit zero are not the same state, and the
@@ -490,7 +489,7 @@ function unreadableField(field: string, value: unknown, expectation: string): { 
  *
  * EVERY OTHER PRESENT VALUE IS UNREADABLE, IN BOTH DIRECTIONS. `null`, `0`, `''` and an explicit
  * `undefined` are values something WROTE, and the truthiness test spent all four as "nobody asked" —
- * which on QuickBooks (`consumer: 'none'`) clears the only evidence the money is owed. `'false'`,
+ * which on a connector declaring `consumer: 'none'` clears the only evidence the money is owed. `'false'`,
  * `'0'`, `1` and `{}` are the mirror: they are not a request either, and truthiness let them enter
  * payment registration and queue a receipt against an invoice on the strength of a corrupt byte.
  * Neither direction is safe to guess, so both refuse.
@@ -541,12 +540,11 @@ function payloadPaymentMethod(payload: Record<string, unknown>): PayloadField<st
  * its own mapping table does with `''`. This one was a fact about A REMOTE LEDGER, and that is the
  * difference round 11 did not price in.
  *
- * The clause it read has the same shape in both connectors — `connectXero`'s
- * `if (organisation.baseCurrency && organisation.baseCurrency !== imsBaseCurrency)` and
- * `connectQuickBooks`' `if (qboCurrency && qboCurrency !== imsBaseCurrency)`. Each is a TRUTHY-only
- * comparison, and `fetchOrganisationFacts`/`fetchCompanyInfo` both
- * answer `null` for a base currency they could not obtain — a non-OK response, a body with no
- * organisation in it, a `BaseCurrency`/`HomeCurrency` that is not a currency string. On that path
+ * The clause it read is `connectXero`'s
+ * `if (organisation.baseCurrency && organisation.baseCurrency !== imsBaseCurrency)`. It is a
+ * TRUTHY-only comparison, and `fetchOrganisationFacts`
+ * answers `null` for a base currency they could not obtain — a non-OK response, a body with no
+ * organisation in it, a `BaseCurrency` that is not a currency string. On that path
  * the guard has nothing to compare, so it does not fire, and the binding is stored regardless. A
  * transient failure at the moment an operator clicks Connect is enough to bind a USD ledger to a
  * EUR installation.
@@ -916,7 +914,7 @@ const UNREADABLE_PAYMENT_CLAUSES: Record<UnreadablePaymentFact, { asked: string;
 }
 
 export function unreadablePaymentPayloadRefusalMessage(input: {
-  /** Display name of the accounting package, for the operator: `Xero`, `QuickBooks`. */
+  /** Display name of the accounting package, for the operator: `Xero`. */
   connector: string
   referenceType: string
   referenceId: string
@@ -949,7 +947,7 @@ export function unreadablePaymentPayloadRefusalMessage(input: {
  * WHERE IT IS FALSE. `paymentAccountRefusalMessage` deliberately refuses to write the "what happens
  * next" half itself, because that half differs by connector — and round 6 filled it in from the
  * REGISTRY at both call sites. The registry answers a question about a RETAINED MARKER on a row at
- * rest: on QuickBooks `consumer: 'none'`, i.e. nothing re-reads it, escalate. That is true of the
+ * rest: on a connector declaring `consumer: 'none'`, i.e. nothing re-reads it, escalate. That is true of the
  * retained-marker sweep and FALSE of this refusal, which does not leave the row at rest at all:
  * `requireFollowUpsEnqueued` throws, the connector catches it and `markSyncLogForFollowUpRetry` puts
  * the POSTED parent back to PENDING with its external id and its marker intact, and the next
@@ -964,11 +962,11 @@ export function unreadablePaymentPayloadRefusalMessage(input: {
  * processor's post path AND from `repairXeroBackReferences`, which hands the connector's
  * `enqueueFollowUps` over by identity; on the sweep's pass the row is at rest and no processor retry
  * is coming, so this clause would be false there. That call site therefore keeps the
- * driver-agnostic registry note, which is true on both of its drivers. QuickBooks binds no sweep
- * (its registry entry is the declaration of that), so its refusal has exactly one driver.
+ * driver-agnostic registry note, which is true on both of its drivers. A connector that binds no sweep
+ * (its registry entry is the declaration of that) has exactly one driver.
  */
 export function postedRowFollowUpRetryNote(input: {
-  /** Display name of the accounting package, for the operator: `QuickBooks`. */
+  /** Display name of the accounting package, for the operator, e.g. `Xero`. */
   connector: string
   /** The processor's own retry bound, read from the connector rather than restated as a number. */
   maxRetries: number

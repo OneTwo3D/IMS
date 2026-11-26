@@ -148,35 +148,27 @@ import {
 // XERO ONLY (r6 finding 1).
 //
 // This module is connector-agnostic, but its candidate query is scoped by `connector` and nothing
-// else. External ids are TENANT-owned, so what that scope means differs sharply by connector:
+// else. External ids are TENANT-owned, so what that scope means depends on the connector's id space:
 //
 //   • XERO: organisation and document ids are GUIDs. An id issued by a previously connected
 //     organisation cannot collide with one of the current organisation's documents — it resolves to
 //     nothing, loudly. There is no cross-tenant attribution to make.
-//   • QUICKBOOKS: document ids are small per-company integers, and company B routinely reissues an
-//     integer company A used. Disconnecting clears the expected-realm pin, so after reconnecting to
-//     company B an unresolved company-A row is still a candidate and this sweep would write company
-//     A's integer onto a live document; payment polling then acts on it as current.
+//   • A connector whose document ids are small per-tenant integers would be unsafe to bind here:
+//     tenant B routinely reissues an integer tenant A used, so after a reconnect an unresolved
+//     tenant-A row is still a candidate and this sweep would write tenant A's integer onto a live
+//     document; payment polling then acts on it as current.
 //
 // The global unique index on purchase_invoices.accounting_invoice_id does NOT close that: it only
-// stops a SECOND local row taking an id another row already holds. After a realm switch no local
+// stops a SECOND local row taking an id another row already holds. After a tenant switch no local
 // row holds the orphaned id, so the write succeeds and the wrong-document link is created rather
 // than refused. (Where a local row DOES hold it, the index is what turns the collision into a
 // refused repair with a loud error, which is the acceptable failure.)
 //
-// So there is no QuickBooks binding, on purpose — failing to repair is acceptable, repairing onto
-// the wrong document is not. Namespacing the id per connection was tried and reverted: it lets both
-// bills exist, which moves the problem to ~190 call sites that read a naked external id, on models
-// that have no provenance column at all. o3d-gt8r carries that design and its findings.
-//
-// WHAT A QUICKBOOKS BINDING IS WAITING ON HAS CHANGED (o3d-0bfh r5, Codex HIGH). It was o3d-s36z,
-// the realm-isolation work; that CLOSED on 2026-08-21 and a row's realm is now durably recorded, so
-// this module's candidate query COULD be fenced on it. The remaining blocker is o3d-8prh, post-time
-// authorization, on the other side of the enqueue: QuickBooks checks no connection verdict there, so a row
-// this sweep correctly selected would still be posted against whatever is connected when the
-// processor gets to it. The full order of work is at the end of
-// lib/connectors/quickbooks/sync-processor.ts; do not infer from "o3d-s36z is closed" that a binding
-// is now safe.
+// So a binding is only added for a connector whose ids cannot collide across tenants — failing to
+// repair is acceptable, repairing onto the wrong document is not. Namespacing the id per connection
+// was tried and reverted: it lets both bills exist, which moves the problem to ~190 call sites that
+// read a naked external id, on models that have no provenance column at all. o3d-gt8r carries that
+// design and its findings.
 //
 // The sweep must keep refusing to guess: failing to repair is acceptable, repairing onto
 // the wrong bill is not.
@@ -222,8 +214,8 @@ export const BACK_REFERENCE_SWEEP_TYPES: readonly AccountingSyncType[] = BACK_RE
  *
  *   • a permanently ambiguous row is never stamped BY DESIGN (stamping it is the starvation bug);
  *   • rows of a connector that is later disconnected are never swept at all, so never stamped;
- *   • every QuickBooks row is unstamped forever, because no QuickBooks sweep runs — deliberately,
- *     see the tenant note below and lib/connectors/quickbooks/sync-processor.ts.
+ *   • every row of a connector with no bound sweep (including a retired connector's history) is
+ *     unstamped forever, because no sweep runs for it — see the tenant note below.
  *
  * Full payload rows — customer names, emails, addresses, financial lines — could therefore survive
  * a configured retention policy indefinitely, and a retention policy that silently fails to delete

@@ -31,8 +31,8 @@ const state = {
     accountingInvoiceConnector: 'xero' as string | null,
     po: { reference: 'PO-1', currency: 'GBP' },
   },
-  chart: 'quickbooks' as 'xero' | 'quickbooks',
-  enqueueAnswer: { queued: true, connector: 'quickbooks' } as { queued: boolean; reason?: 'refused' | 'not-configured'; connector: string | null },
+  chart: 'retired-ledger' as 'xero' | 'retired-ledger',
+  enqueueAnswer: { queued: true, connector: 'retired-ledger' } as { queued: boolean; reason?: 'refused' | 'not-configured'; connector: string | null },
   enqueued: [] as Array<{ type: string; chartConnector: unknown; documentConnector: unknown; payload: Record<string, unknown> }>,
   committedPaid: [] as unknown[],
   activity: [] as Array<{ action: string; metadata?: Record<string, unknown> }>,
@@ -62,7 +62,7 @@ mock.module('@/lib/accounting', {
     getAccountingSettingsFor: async (connector: string | null) => { state.settingsForReads.push(connector); return { syncEnabled: false, connector } },
     getActiveAccountingConnectorInfo: async () => ({ id: state.chart, name: state.chart }),
     isAccountingSyncTypeEnabled: async () => true,
-    asRoutableAccountingConnector: (value: string | null | undefined) => (value === 'xero' || value === 'quickbooks' ? value : null),
+    asRoutableAccountingConnector: (value: string | null | undefined) => (value === 'xero' || value === 'retired-ledger' ? value : null),
     queueAccountingSync: async () => ({ queued: true, connector: state.chart }),
     queueAccountingSyncTx: async (
       _tx: unknown,
@@ -113,8 +113,8 @@ async function pay() {
 
 test.beforeEach(() => {
   state.invoice.accountingInvoiceConnector = 'xero'
-  state.chart = 'quickbooks'
-  state.enqueueAnswer = { queued: true, connector: 'quickbooks' }
+  state.chart = 'retired-ledger'
+  state.enqueueAnswer = { queued: true, connector: 'retired-ledger' }
   state.enqueued = []
   state.committedPaid = []
   state.activity = []
@@ -135,23 +135,23 @@ test('[o3d-j625 r3 HIGH 2] PRECONDITION: an agreeing bill is paid, and the enque
 })
 
 test('[o3d-j625 r3 HIGH 2] after a switch the site hands the enqueue the INVOICE’s connector, not the bank account’s chart', async () => {
-  // The bank account list is QuickBooks' (the connector now active); the bill was linked under Xero.
-  state.enqueueAnswer = { queued: false, reason: 'refused', connector: 'quickbooks' }
+  // The bank account list is another connector's (the one now active); the bill was linked under Xero.
+  state.enqueueAnswer = { queued: false, reason: 'refused', connector: 'retired-ledger' }
   await pay()
   assert.equal(state.enqueued.length, 1, 'PRECONDITION: the enqueue was reached')
-  assert.equal(state.enqueued[0].chartConnector, 'quickbooks', 'the chart is the bank account’s')
+  assert.equal(state.enqueued[0].chartConnector, 'retired-ledger', 'the chart is the bank account’s')
   assert.equal(state.enqueued[0].documentConnector, 'xero', 'and the document provenance is the BILL’s — the two disagree, which is what the enqueue refuses')
 })
 
 test('[o3d-j625 r3 HIGH 2] an unrecorded provenance is handed over as null — fail closed, never the active connector', async () => {
   state.invoice.accountingInvoiceConnector = null
-  state.enqueueAnswer = { queued: false, reason: 'refused', connector: 'quickbooks' }
+  state.enqueueAnswer = { queued: false, reason: 'refused', connector: 'retired-ledger' }
   await pay()
   assert.equal(state.enqueued[0].documentConnector, null)
 })
 
 test('[o3d-j625 r3 HIGH 2] a REFUSED bill payment rolls the paid transition back and says REFUSED, not "switched off"', async () => {
-  state.enqueueAnswer = { queued: false, reason: 'refused', connector: 'quickbooks' }
+  state.enqueueAnswer = { queued: false, reason: 'refused', connector: 'retired-ledger' }
   const result = await pay()
   assert.equal(result.success, false)
   assert.equal(state.committedPaid.length, 0, 'the bill must NOT be committed PAID with a payment refused')
@@ -160,7 +160,7 @@ test('[o3d-j625 r3 HIGH 2] a REFUSED bill payment rolls the paid transition back
   const record = state.activity.find((a) => a.action === 'bill_payment_enqueue_declined')
   assert.equal(record?.metadata?.declineReason, 'refused')
   assert.equal(record?.metadata?.accountingInvoiceConnector, 'xero')
-  assert.equal(record?.metadata?.bankAccountChartConnector, 'quickbooks')
+  assert.equal(record?.metadata?.bankAccountChartConnector, 'retired-ledger')
 })
 
 test('[o3d-j625 r3 HIGH 2] a NOT-CONFIGURED decline still gets the settings wording — the two are told apart, not merged', async () => {

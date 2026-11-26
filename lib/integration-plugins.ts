@@ -40,10 +40,9 @@ export function isIntegrationModuleVisible(
   // when any backing connector is enabled. Kept data-driven so a new connector
   // (e.g. a 2nd WMS) is picked up by adding it to the registry list, with no
   // edit here.
-  // DERIVED from the accounting registry (o3d-remove-parked-connectors), for the same reason the
-  // WMS arm below is derived from WMS_CONNECTOR_IDS: it was `state.xero || state.quickbooks`, so a
-  // registered accounting connector nobody remembered here would have left the Accounting module
-  // hidden while its own switch was on.
+  // DERIVED from the accounting registry, for the same reason the WMS arm below is derived from
+  // WMS_CONNECTOR_IDS: a registered accounting connector nobody remembered here would otherwise
+  // leave the Accounting module hidden while its own switch was on.
   if (module === 'accounting') return ACCOUNTING_CONNECTORS.some((connector) => state[connector.id])
   if (module === 'wms') return WMS_CONNECTOR_IDS.some((id) => state[id])
 

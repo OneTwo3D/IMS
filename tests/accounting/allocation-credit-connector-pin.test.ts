@@ -21,9 +21,9 @@ import { INTEGRATION_PLUGIN_IDS, INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/i
  * r3 proved half of it: a pinned enqueue is answered BY the named connector rather than by whichever
  * is active. What neither enqueue then asked was whether the named connector is STILL THE ACTIVE
  * ONE. The active accounting connector comes from the PLUGIN flags; `<connector>_sync_enabled` is a
- * separate setting that a switch does not touch. So after Xero -> QuickBooks, a credit pinned to
+ * separate setting that a switch does not touch. So after a switch away from Xero, a credit pinned to
  * Xero passed `xero_sync_enabled === 'true'` and a PENDING Xero row was written, while the
- * accounting-sync cron had already taken the QuickBooks branch and returned. Nothing scheduled
+ * accounting-sync cron had already taken the other connector's branch and returned. Nothing scheduled
  * drains it, and `assertAllocationReversalQueued` — which asks the DATABASE for the row, because the
  * enqueue's boolean lies — found it and let the caller record those unposted pounds as relief.
  *
@@ -36,10 +36,9 @@ import { INTEGRATION_PLUGIN_IDS, INTEGRATION_PLUGIN_SETTING_KEYS } from '@/lib/i
  *      resolution by simply not passing the parameter, which is what makes the pin safe to add.
  */
 
-const queued: Array<{ queue: 'xero' | 'quickbooks'; type: string; referenceId: string }> = []
+const queued: Array<{ queue: 'xero'; type: string; referenceId: string }> = []
 let enabledPlugins: string[] = ['xero']
 let xeroSyncEnabled = 'true'
-let quickbooksSyncEnabled = 'true'
 
 mock.module('@/lib/integration-plugins', {
   namedExports: {
@@ -102,8 +101,6 @@ mock.module('@/lib/connectors/xero/settings', {
   },
 })
 
-// o3d-remove-parked-connectors: a `mock.module` for an archived QuickBooks module was here.
-
 const REQUEST = {
   type: 'UNEARNED_REV_REVERSAL' as const,
   referenceType: 'SalesOrderRefund',
@@ -115,7 +112,6 @@ function reset(): void {
   queued.length = 0
   enabledPlugins = ['xero']
   xeroSyncEnabled = 'true'
-  quickbooksSyncEnabled = 'true'
 }
 
 test('o3d-i0o6 r3: a PINNED facade enqueue is answered BY the named connector, not by the active one', async () => {
@@ -137,7 +133,7 @@ test('o3d-i0o6 r3: a PINNED facade enqueue is answered BY the named connector, n
 
 test('o3d-i0o6 r7: a pin to a ledger that is no longer the ACTIVE connector writes nothing', async () => {
   reset()
-  // The switch that happens between staging and the hand-off: QuickBooks is active now. Xero's own
+  // The switch that happens between staging and the hand-off: a different connector is active now. Xero's own
   // sync toggle is untouched by that switch and is still 'true' — which is precisely why the
   // enqueue's own gate said yes and a PENDING Xero row was written that nothing scheduled drains.
   enabledPlugins = []
@@ -182,17 +178,10 @@ test('o3d-i0o6 r3: a pinned enqueue whose connector does not post this type writ
 })
 
 test('o3d-i0o6 r3: an UNPINNED enqueue still resolves the active connector, exactly as before', async () => {
-  // o3d-remove-parked-connectors: this enabled ONLY the second connector and asserted the enqueue
-  // followed it — which showed the resolution was real rather than a constant. With one registered
-  // connector that distinction is unobservable here, so the case asserts what remains: an unpinned
-  // enqueue takes its connector from the resolution and reports it. Recorded in
-  // docs/archive/quickbooks-connector-removal.md.
-  //
-  // o3d-j625 r12 (merge): the branch's version of this case enabled `quickbooks` and asserted the row
-  // followed its CHART rather than a re-resolution. That assertion is now UNOBSERVABLE for the same
-  // reason, so development's version stands. What survives is the requirement itself — `chartConnector`
-  // is mandatory on the request (a tsc error to omit), which is what removed the second resolution.
-  // Filed as a follow-up rather than faked with one connector.
+  // With one registered connector, "the enqueue followed the active connector rather than a constant"
+  // is unobservable here, so the case asserts what remains: an unpinned enqueue takes its connector
+  // from the resolution and reports it. The requirement that removed the second resolution is
+  // `chartConnector` being mandatory on the request (a tsc error to omit).
   reset()
   enabledPlugins = ['xero']
 

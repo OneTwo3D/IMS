@@ -7,8 +7,8 @@
  * sync. So every caller-controlled accountingTaxType write (create + update) re-checks the selected
  * TaxType against a LIVE fetch of Xero's tax rates before persisting.
  *
- * This is scoped to Xero: it is the connector whose reference reads are cached (QuickBooks tax codes are
- * not cached), so it is the only connector where a stale display can drive a bad write.
+ * This is scoped to Xero: it is the connector whose reference reads are cached,
+ * so it is the connector where a stale display can drive a bad write.
  */
 
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
@@ -44,8 +44,8 @@ export function classifyXeroTaxType(
 
 /**
  * Validate a caller-supplied accountingTaxType before persisting it. Fetches Xero's rates LIVE (never
- * the reference cache). A no-op { ok: true } when the active connector is not Xero (QuickBooks codes are
- * not cached, so no stale-display risk) or when there is no active connector.
+ * the reference cache). A no-op { ok: true } when the active connector is not Xero (no cached reference
+ * reads, so no stale-display risk) or when there is no active connector.
  */
 /**
  * o3d-j625 r5 (review L-11) — THE CONNECTOR IS AN ARGUMENT, BECAUSE THIS GATES A WRITE.

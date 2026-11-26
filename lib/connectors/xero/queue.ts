@@ -83,7 +83,7 @@ export async function queueXeroSync(params: {
   // it writes is a Xero row. Refused rather than ignored, and refused rather than thrown: the posting
   // is owed somewhere this queue is not. Unreachable through the facade, which routes by the pin; it
   // exists so that a future caller reaching this queue directly cannot get a Xero row out of a
-  // QuickBooks pin.
+  // pin naming another ledger.
   if (params.pinnedLedger && params.pinnedLedger !== 'xero') return { queued: false, reason: 'refused' }
   const settings = await getXeroSettings()
   const settingKey = SYNC_TYPE_SETTING[params.type]
@@ -241,7 +241,7 @@ export async function queueXeroSync(params: {
           // o3d-dzip: the DURABLE half of the same origin record, minted from the stamp in the
           // payload this statement is writing. Retention compacts the payload to `{}` and keeps the
           // external id, so a stamp that lives only in the payload is missing from exactly the rows
-          // whose realm is least knowable. Minted here and nowhere else — see
+          // whose tenant is least knowable. Minted here and nowhere else — see
           // mintAccountingConnectionProvenanceColumn for why this is not a back-fill.
           connectionProvenance: mintAccountingConnectionProvenanceColumn(payload),
           // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival

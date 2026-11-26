@@ -81,9 +81,8 @@
  *   the ROW    a money row held in attempt-stamping custody for its whole life, carrying no
  *              `remoteAttemptedAt`, never made a call at all (`attemptProvenNeverMade`,
  *              money-attempt-provenance.ts). Added in Codex round 2 because the body test can only
- *              clear failures a connector detects by READING the payload, and the connectors also
- *              fail after that and before the send — QuickBooks on a customer reference or a bank
- *              account it resolves from the database, Xero on a lost write lease or a refused money
+ *              clear failures a connector detects by READING the payload, and a connector can
+ *              also fail after that and before the send — Xero on a lost write lease or a refused money
  *              fence. Those rows have perfect payloads and provably sent nothing, and reading them
  *              as ambiguous terminally refused the next good receipt on the invoice.
  *
@@ -287,7 +286,7 @@ export function decideInvoicePaymentPost(input: {
   // call. `againstThisInvoice` below drops the row for naming a different document, which is right
   // for capacity and wrong for evidence: the invoice was deleted and re-posted, and "the old
   // document's payment went away with it" is an assumption about a ledger nothing here has read. On
-  // QuickBooks a deleted invoice leaves its payment as an UNAPPLIED CREDIT and the customer is
+  // some ledgers a deleted invoice leaves its payment as an UNAPPLIED CREDIT and the customer is
   // credited twice.
   //
   // Scoped to THIS receipt — a different receipt's retired row is o3d-hbgo's case and stays out of
@@ -338,19 +337,17 @@ export function decideInvoicePaymentPost(input: {
   // outcome is unknown makes an unreadable amount on some OTHER row beside the point.
   // TWO INDEPENDENT PROOFS CLEAR A FAILED ROW, AND EITHER IS ENOUGH (Codex round 2, HIGH).
   //
-  // THE GAP THIS CLOSES was only VISIBLE on QuickBooks, but it was never a QuickBooks bug. The
+  // THE GAP THIS CLOSES. The
   // ambiguity rule above rests on "a FAILED money row might have posted", and its one exception was
   // the SHAPE of the stored request: a body missing a field the connector rejects before it builds a
   // request cannot have been sent. That test is about the payload, so it can only clear the failures
   // a connector detects by reading the payload.
   //
-  // QuickBooks fails LATER than that and EARLIER than Xero does. Its INVOICE_PAYMENT case resolves a
-  // customer reference and a bank account against the database after the payload validation and
-  // before this guard, and either can be missing — `Missing customer reference for INVOICE_PAYMENT`
-  // is a row with a complete, readable payload whose attempt provably never left the process. The
-  // guard read every one of those as "might have posted" and TERMINALLY REFUSED the next perfectly
-  // good receipt on the invoice. Xero has the same shape in its own post-guard, pre-send window (a
-  // lost write lease, a refused money fence), so the fix belongs to the shared guard, not to a port.
+  // A connector can fail LATER than that: after the payload validation and before the send, a row
+  // with a complete, readable payload can fail with an attempt that provably never left the process.
+  // The guard read every one of those as "might have posted" and TERMINALLY REFUSED the next perfectly
+  // good receipt on the invoice. Xero has that shape in its own post-guard, pre-send window (a
+  // lost write lease, a refused money fence), so the fix belongs to the shared guard.
   //
   // `attemptProvenNeverMade` is the proof, and it is the one the ROW carries: custody held for the
   // row's whole life plus no `remoteAttemptedAt` means no call left it, whatever its payload looks

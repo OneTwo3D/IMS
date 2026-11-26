@@ -1447,22 +1447,12 @@ export async function enqueueFollowUpSyncLog(
   //   one that ran.
   //
   //   o3d-peh1 — AND REVISION 0 IS FENCED BY THE REVISION ITSELF, WHICH IS WHY IT IS NO LONGER
-  //   REFUSED. ON THIS CONNECTOR. `attemptRevision` only ever moves UP here: every Xero writer sets
+  //   REFUSED. `attemptRevision` only ever moves UP here: every Xero writer sets
   //   it through `nextAttemptRevision`, and nothing anywhere resets it. So `(id, FAILED,
   //   attemptRevision: 0)` is a STRICTLY STRONGER predicate than the `(id, FAILED)` ABA — a row that
   //   has been claimed since the read is at 1 or more and matches nothing. The ABA that made
   //   revision 0 dangerous also cannot occur: getting from FAILED back to FAILED requires a claim,
   //   and A XERO CLAIM MINTS 1.
-  //
-  //   THAT ARGUMENT IS XERO-ONLY AND MUST NOT BE READ AS CONNECTOR-GENERAL (round 4, Codex LOW).
-  //   The QuickBooks processor mints NO attempt revision at all: `retryFailedQuickBooksSync` drives
-  //   FAILED -> PENDING and its claim leaves the row at 0, so a QuickBooks row goes
-  //   FAILED -> PENDING -> FAILED WITHOUT THE REVISION MOVING, and the twin of the revival below
-  //   (lib/connectors/quickbooks/sync-processor.ts, the `plan.action === 'reuse'` CAS) carries no
-  //   revision clause whatsoever — it is `{ id, status: 'FAILED' }`, the exact ABA this paragraph
-  //   declares impossible. That is PRE-EXISTING there, not something this change introduced, and
-  //   closing it needs the QuickBooks attempt fence that rounds 6 and 7 failed to build out of
-  //   claim-time markers. It is filed as o3d-rw0w; do not port this justification across.
   //
   //   Refusing it instead was a DEAD END, and that is the defect this replaces. The migration left
   //   every pre-existing FAILED Xero payment and allocation at revision 0; FAILED rows are not
@@ -1510,9 +1500,6 @@ export async function enqueueFollowUpSyncLog(
   // unrecallable duplicate a deliberate human act rather than something a sweep does on its own,
   // which is the most this can honestly offer while no evidence about the effect exists.
   //
-  // NOT PORTED TO QUICKBOOKS. That processor's reuse CAS carries no revision clause at all, so it has
-  // a different and larger hole; it is filed as o3d-rw0w and closing it needs the QuickBooks attempt
-  // fence, not this refusal.
   if (reuseAttempt
     && reuseAttempt.attemptRevision === UNCLAIMED_ATTEMPT_REVISION
     && !isMoneyMovingSyncType(type)) {
@@ -8646,7 +8633,7 @@ async function reenqueueMissingSupplierCreditNoteAllocations(limit = 200): Promi
     result.checked++
     try {
       // o3d-j625 r4 (SWEEP 2) — BOTH DOCUMENT IDS MUST BE RECORDED AS XERO'S BEFORE A XERO ALLOCATION
-      // CARRIES THEM. A bill linked under QuickBooks (or linked before the provenance column existed)
+      // CARRIES THEM. A bill linked under a different connector (or linked before the provenance column existed)
       // would otherwise be addressed to Xero by id. Fail closed: an unrecorded connector is refused,
       // counted as failed, and reported — never assumed to be the connector this sweep belongs to.
       const candidate = candidateById.get(item.supplierCreditNoteId)
@@ -8924,8 +8911,7 @@ export async function reenqueueMissingSalesCreditNoteSettlements(limit = 200): P
 }
 
 /**
- * WHAT THE FOLLOW-UP WORK LEFT OUTSTANDING (o3d-ekn8 r5, Codex HIGH — CROSS-PORTED FROM THE
- * QUICKBOOKS PATH, where the finding was raised).
+ * WHAT THE FOLLOW-UP WORK LEFT OUTSTANDING (o3d-ekn8 r5, Codex HIGH).
  *
  * `enqueueFollowUps` returned `void`, so "it did not throw" was the only signal the four release
  * sites below had — and the deferred-receipt re-drive is built NEVER to throw, because a receipt
@@ -8933,10 +8919,9 @@ export async function reenqueueMissingSalesCreditNoteSettlements(limit = 200): P
  * leave money unregistered therefore arrived at `releaseFollowUpObligation` as success, and the
  * marker that says this row still owes work was cleared over a receipt still sitting unsettled.
  *
- * The back-reference half of the QuickBooks finding does NOT apply here and is deliberately not
- * ported: this connector's `updateBackReference` propagates its failure (audit-H3), so a link that
+ * This connector's `updateBackReference` propagates its failure (audit-H3), so a link that
  * did not land reaches the catch, the row goes back to PENDING and the obligation is never released
- * in the first place. Only the receipt half was open on this side.
+ * in the first place. Only the receipt half was open.
  */
 type FollowUpOutcome = FollowUpEnqueueOutcome & {
   /** False when a receipt recorded before this invoice is still waiting to reach the ledger. */
@@ -8986,8 +8971,8 @@ async function settleFollowUpObligation(
       // o3d-0bfh r5: Xero is the connector where the "a later sweep will discharge it" reasoning is
       // actually TRUE — `repairXeroBackReferences` is bound below and the accounting-sync cron
       // invokes it, so a retained marker is re-read and its follow-ups re-enqueued idempotently.
-      // Stated rather than defaulted, because the sibling connector's answer is the opposite one and
-      // a default would have silently given QuickBooks this one.
+      // Stated rather than defaulted, because a connector without such a sweep must answer the opposite
+      // way, and a default would silently hand it this one.
       //
       // AND IT IS READ FROM THE REGISTRY, NOT WRITTEN AS A LITERAL HERE (o3d-0bfh r6, Codex MEDIUM).
       // `{ consumer: 'sweep' }` written inline is an ordinary copyable object with no relationship
@@ -9026,8 +9011,8 @@ async function settleFollowUpObligation(
  * on THIS connector precisely BECAUSE the marker is deliberately retained and
  * `repairXeroBackReferences` re-reads it on the accounting-sync cron. The operator's hand-made
  * receipt races the queued re-enqueue, and the connector's request id cannot deduplicate a payment a
- * human entered in the Xero UI. It is the r7/r8 QuickBooks finding, on the connector where the
- * automatic retry actually exists — which is what makes it worse here, not better.
+ * human entered in the Xero UI. The automatic retry that exists on this connector is what
+ * makes it worse here, not better.
  *
  * AND IT SHIPPED THROUGH A ROUND THAT EXPANDED THE BANNED-INSTRUCTION LIST FROM THREE STRINGS TO
  * ELEVEN, because that list was pointed at the registry strings and the two files somebody had
@@ -9085,7 +9070,7 @@ async function decideInvoicePaymentFollowUp(
   origin: AccountingOriginRecord,
 ): Promise<FollowUpEnqueueOutcome> {
   /**
-   * o3d-batch-ret r10 (Codex HIGH), CROSS-PORTED WITH THE QUICKBOOKS PATH — THIS FUNCTION NO LONGER
+   * o3d-batch-ret r10 (Codex HIGH): THIS FUNCTION NO LONGER
    * READS THE PAYLOAD AT ALL.
    *
    * It opened with `if (!payload._registerPayment) return FOLLOW_UPS_ENQUEUED` and then
@@ -9136,8 +9121,8 @@ async function decideInvoicePaymentFollowUp(
       missing,
       configure,
       // THE DRIVER-AGNOSTIC CLAUSE, AND IT IS AUDITED RATHER THAN COPIED (o3d-batch-ret r7, Codex
-      // MEDIUM). The QuickBooks twin of this refusal has ONE driver — the processor's post path —
-      // so it states what that pass actually does next (`postedRowFollowUpRetryNote`). THIS one has
+      // MEDIUM). A refusal with ONE driver — the processor's post path — can state what that pass
+      // actually does next (`postedRowFollowUpRetryNote`). THIS one has
       // TWO: `enqueueFollowUps` is handed to `repairXeroBackReferences` BY IDENTITY, so the same
       // sentence is composed on the sweep's pass, where the row is at rest and no processor retry is
       // coming. A "the processor retries the posted parent" clause would be false there, and the
@@ -9401,7 +9386,7 @@ async function enqueueSalesInvoiceFollowUps(
   // the declarations execute satisfies the text and receives `undefined` at runtime — and that was
   // its second escape. The parse was deleted rather than deepened: re-implementing the compiler to
   // check an ordering is worse than observing the ordering. tests/accounting/xero-payment-mapping-refusal.test.ts
-  // and tests/connectors/quickbooks-payment-mapping-refusal.test.ts drive the real connectors with a
+  // drives the real connector with a
   // refusable enqueue and read the obligation MARKER, which a fence that ran first would have cleared.
   const enqueueOutcome = combineFollowUpEnqueueOutcomes(paymentOutcome, pdfOutcome)
   // Both axes the caller of this function may release on, in ONE closure the fence consults between

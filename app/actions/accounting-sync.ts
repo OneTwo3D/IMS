@@ -260,8 +260,8 @@ class AccountingConnectorChangedError extends Error {
  *
  * Why it needed more than the re-read that was already here. The action sampled the active
  * connector, derived a cancellation scope from it, and then ran an unfenced updateMany. If
- * another administrator switched Xero→QuickBooks in that window, the QuickBooks-scoped (or
- * unscoped) update marked QuickBooks PENDING rows CANCELLED *after* QuickBooks became the active
+ * another administrator switched the active connector in that window, the old-connector-scoped (or
+ * unscoped) update marked the new connector's PENDING rows CANCELLED *after* it became the active
  * connector — discarding the live queue of the connector now in use. The later re-read only
  * corrected the survivor COUNT; nothing restores a cancelled row, and the activity log would
  * describe healthy work as abandoned.
@@ -476,8 +476,7 @@ export async function getAccountingIntegrationConnector() {
   if (!connector) return null
   return {
     id: connector,
-    // From the registry (o3d-remove-parked-connectors); `=== 'xero' ? 'Xero' : 'QuickBooks'` labelled
-    // every connector that was not Xero as QuickBooks.
+    // From the registry, so the label follows the connector rather than a ternary.
     name: getAccountingConnectorDefinition(connector).label,
     category: 'accounting' as const,
   }
@@ -496,41 +495,35 @@ export async function getAccountingIntegrationConnector() {
 //      told any authenticated principal whether an accounting integration is
 //      enabled, and reached `isIntegrationPluginEnabled` (a database read) to
 //      find out.
-//   2. Some connector-side implementations answer from a constant instead of
-//      calling a guarded action at all (getConnectionTestState, testConnection
-//      and syncAccountBalanceSnapshots on the QuickBooks branch each return a
-//      literal), so "the delegate is guarded" is not even true for every branch.
+//   2. Some connector-side implementations may answer from a constant instead of
+//      calling a guarded action at all, so "the delegate is guarded" is not a
+//      property a dispatcher can lean on.
 //
-// WHICH gate, and why not the delegate's own: a dispatcher serves BOTH branches,
-// and the two branches do not gate alike. The Xero delegates use
-// requireRole('ADMIN') — o3d-512h round 3: they DID NOT when this paragraph was
-// first written. xero-sync.ts's module-local `requireAdmin` was
-// `requirePermission('sync')`, the same gate as the dispatcher and as QuickBooks,
-// so "the stricter branch keeps enforcing its own" was false and MANAGER passed
+// WHICH gate, and why not the delegate's own: a dispatcher serves every
+// registered connector's delegate, and connectors need not gate alike. The Xero
+// delegates use requireRole('ADMIN') — o3d-512h round 3: they DID NOT when this
+// paragraph was first written. xero-sync.ts's module-local `requireAdmin` was
+// `requirePermission('sync')`, the same gate as the dispatcher, so "the
+// stricter branch keeps enforcing its own" was false and MANAGER passed
 // straight through. The sentence was not softened to match; xero-sync.ts:
 // requireAdmin now enforces 'sync' AND the ADMIN role, and
 // tests/security/accounting-dispatcher-authorization.test.ts asserts the
-// difference between the two frames. quickbooks-sync.ts declares a module-local
-// `requireAdmin` that is literally `requirePermission('sync')`, which also admits
-// MANAGER. So
-// there is no single "the delegate's gate" to copy, and copying Xero's stricter
-// one would lock MANAGER out of the QuickBooks branch that legitimately admits
-// it. Each dispatcher therefore takes the LOOSEST gate any branch's delegate
-// applies, and the stricter branch keeps enforcing its own on top:
+// difference between the two frames. A dispatcher therefore takes the LOOSEST
+// gate any connector's delegate applies, and a stricter delegate keeps
+// enforcing its own on top:
 //
-//   * 'sync' where the branches disagree (Xero ADMIN-only vs QuickBooks 'sync').
+//   * 'sync' where a delegate is stricter (Xero ADMIN-only vs the dispatcher's 'sync').
 //   * requireRole('ADMIN','FINANCE') on syncAccountingAccountBalanceSnapshots,
 //     which is what its delegate uses — gating it on 'sync' would lock FINANCE,
 //     which holds no 'sync' permission, out of its own balance snapshots.
-//   * 'settings.company' on the three tax-rate dispatchers, where BOTH branches'
+//   * 'settings.company' on the three tax-rate dispatchers, where the
 //     delegates agree on that permission (settings.ts:{autoLink,previewMissing,
-//     generateMissing}{Xero,QuickBooks}TaxRates).
+//     generateMissing}XeroTaxRates).
 //
 // Reach change per principal: ADMIN unchanged. MANAGER passed the unguarded
 // dispatcher before, and is now refused by the Xero delegate (round 3 — this is
-// the part that was claimed but not implemented) / still admitted by the
-// QuickBooks one; on the tax-rate dispatchers it was already
-// refused by both delegates and is now refused one frame earlier. FINANCE keeps
+// the part that was claimed but not implemented); on the tax-rate
+// dispatchers it was already refused by the delegates and is now refused one frame earlier. FINANCE keeps
 // balance snapshots and loses the rest. WAREHOUSE, READONLY and SUPPLIER lose the
 // early-return answer and the plugin-state read that produced it — which is the
 // whole point: none of them could ever reach a delegate.
@@ -540,12 +533,9 @@ export async function getAccountingIntegrationConnector() {
 // into a step-up re-auth result for the client, and hoisting it here would turn
 // that structured result into an unhandled throw.
 //
-// NOT claimed here: that the delegates themselves are all guarded. Six
-// quickbooks-sync.ts exports carry no guard at all (see the allowlist note in
-// tests/security/server-action-guard-coverage.test.ts). They are out of scope by
-// owner instruction, and the gate below is what stands between them and an
-// unauthorized caller *via this module* — it is not a gate on those exports,
-// which remain separately addressable endpoints of their own.
+// NOT claimed here: that every delegate export is guarded — the gate below is what stands between
+// a delegate and an unauthorized caller *via this module*, not a gate on the delegate's own exports
+// (see the allowlist note in tests/security/server-action-guard-coverage.test.ts).
 // ---------------------------------------------------------------------------
 
 export async function getAccountingSettingsMasked(): Promise<AccountingConnectorSettingsMasked> {
@@ -564,10 +554,9 @@ export async function saveAccountingSettings(
   // o3d-1fel: the delegate (saveXeroSettings) is guarded, but this body reads the
   // CURRENT account-mapping settings and can return a validation error BEFORE
   // ever reaching that delegate — so unguarded it is both a read of the mapping
-  // and an oracle for the validator. o3d-512h: 'sync' is the loosest gate the two
-  // branches' delegates apply (saveQuickBooksSettings → requirePermission('sync');
-  // saveXeroSettings → requireRole('ADMIN'), which still applies on its own path)
-  // — see the dispatcher note above.
+  // and an oracle for the validator. o3d-512h: 'sync' is the loosest gate the
+  // connectors' delegates apply (saveXeroSettings → requireRole('ADMIN'), which still applies on its
+  // own path) — see the dispatcher note above.
   await requirePermission('sync')
   const connector = await getActiveAccountingConnector()
   const resolved = connector ?? getAccountingConnector('xero')
@@ -794,9 +783,9 @@ export async function reconcileSettledAccountingSyncRow(
       where: { id: entryId },
       select: { id: true, connector: true, type: true, status: true, referenceType: true, referenceId: true, payload: true },
     })
-    // REGISTRY-CHECKED, not two literals (o3d-remove-parked-connectors). The stored value is a plain
+    // REGISTRY-CHECKED, not literals. The stored value is a plain
     // String column, so a row can name a connector this build does not ship — including rows stamped
-    // `quickbooks` before it was archived. Such a row is refused here, which is the correct answer:
+    // with a connector that has since been retired. Such a row is refused here, which is the correct answer:
     // this action reads that connector's ledger, and there is nothing to read it with.
     const storedConnector = ACCOUNTING_CONNECTORS.find((entry) => entry.id === row?.connector)?.id
     if (!row || !storedConnector) {

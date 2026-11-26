@@ -197,7 +197,7 @@ test('accounting off while the refund DID queue a transit debit: the arrival is 
 test('connector switch: the debit sits in another ledger than the active one, so the arrival is HELD', async () => {
   const { receiveReturnAgainstExpectationsTx } = await mod
   queued.length = 0
-  const { tx } = fakeTx(oneLine(), { transitJournalKey: 'k', syncRow: { status: 'SYNCED', connector: 'quickbooks' } })
+  const { tx } = fakeTx(oneLine(), { transitJournalKey: 'k', syncRow: { status: 'SYNCED', connector: 'retired-ledger' } })
   await assert.rejects(() => receiveReturnAgainstExpectationsTx(tx, params({ connector: 'xero', syncEnabled: true })), /awaiting_accounting/)
   assert.equal(queued.length, 0)
 })

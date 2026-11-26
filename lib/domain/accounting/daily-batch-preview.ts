@@ -19,12 +19,12 @@ import {
  * of which accounting connector will post the batch. This module is shared so a
  * connector's daily-batch preview surface can compute A1/A2 without duplicating
  * the FIFO cost-layer scan. (Xero keeps its own historical copy in
- * app/actions/xero-daily-batch.ts; QuickBooks consumes this shared version.)
+ * app/actions/xero-daily-batch.ts.)
  *
  * Group B (shipment revenue recognition + COGS) is intentionally NOT computed
  * here: it mirrors each connector's per-run batch window and reversal-aware
  * true-up, which differ between connectors (e.g. Xero windows shipments via
- * XERO_DAILY_BATCH_LIMIT, QuickBooks does not). A connector-specific B preview
+ * XERO_DAILY_BATCH_LIMIT). A connector-specific B preview
  * is tracked separately.
  */
 

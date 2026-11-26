@@ -70,22 +70,22 @@ let enabledPlugins: string[] = ['xero']
  * twice — and it is the only way to see the difference.
  */
 let selectionReads = 0
-let flipToQuickBooksAfterReads: number | null = null
+let switchOffAfterReads: number | null = null
 
 mock.module('@/lib/integration-plugins', {
   namedExports: {
     isIntegrationPluginEnabled: async (id: string) => {
       const answer = enabledPlugins.includes(id)
       selectionReads++
-      if (flipToQuickBooksAfterReads !== null && selectionReads >= flipToQuickBooksAfterReads) {
-        enabledPlugins = ['quickbooks']
+      if (switchOffAfterReads !== null && selectionReads >= switchOffAfterReads) {
+        enabledPlugins = []
       }
       return answer
     },
   },
 })
 
-/** Xero's chart. Every code is distinguishable from QuickBooks's, which is the whole point. */
+/** Xero's chart. Every code is distinguishable from any other chart's, which is the whole point. */
 mock.module('@/lib/connectors/xero/settings', {
   namedExports: {
     getXeroSettings: async () => ({
@@ -120,9 +120,9 @@ mock.module('@/lib/connectors/xero/settings', {
 // --------------------------------------------------------------------------------------------
 
 /** Rows the facade routed, with the queue they went to and the codes they carried. */
-const routed: Array<{ queue: 'xero' | 'quickbooks'; type: string; salesAccount: unknown }> = []
+const routed: Array<{ queue: 'xero'; type: string; salesAccount: unknown }> = []
 
-function recordRouted(queue: 'xero' | 'quickbooks') {
+function recordRouted(queue: 'xero') {
   return async (params: { type: string; payload: Record<string, unknown> }) => {
     const lines = params.payload.lines as Array<{ accountCode?: unknown }> | undefined
     routed.push({ queue, type: params.type, salesAccount: lines?.[0]?.accountCode })
@@ -221,7 +221,7 @@ mock.module('@/lib/db/savepoint', {
 function reset(selection: string[]): void {
   enabledPlugins = selection
   selectionReads = 0
-  flipToQuickBooksAfterReads = null
+  switchOffAfterReads = null
   routed.length = 0
   insertedInTx.length = 0
   activity.length = 0
@@ -244,8 +244,8 @@ function salesInvoiceRequest(salesAccount: string) {
 /**
  * o3d-j625 r12 (merging o3d-remove-parked-connectors) — WHAT THIS CONTROL IS NOW, AND WHAT IT LOST.
  *
- * It used to produce the mis-attributed row itself: a caller naming QuickBooks while the payload carried
- * Xero's `X-SALES`, so the row went to the QuickBooks queue with a Xero code on it. That demonstrated the
+ * It used to produce the mis-attributed row itself: a caller naming another connector while the payload carried
+ * Xero's `X-SALES`, so the row went to that connector's queue with a Xero code on it. That demonstrated the
  * thing this mechanism does NOT prove — every enqueue is ATTRIBUTED, never that the attribution is TRUE —
  * and it needed TWO ROUTABLE CONNECTORS to exist. With one registered connector, `chartConnector` cannot
  * name a queue other than the active one (it is typed to the registry), so that demonstration is gone.
@@ -283,7 +283,7 @@ test('[o3d-j625 r2] an UNCHARTERED enqueue — reachable only by a cast now — 
   const { getAccountingSettings, queueAccountingSync } = await import('@/lib/accounting')
   const settings = await getAccountingSettings()
   assert.equal(settings.connector, 'xero', 'precondition: the chart read resolved Xero')
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
 
   // THE r1 BEHAVIOUR, ASSERTED AWAY. r1 returned `null` from the chart guard for an absent chart and
   // carried on to `params.connector ?? params.chartConnector ?? await getActiveAccountingConnectorId()`
@@ -315,7 +315,7 @@ test('[o3d-j625] a CHARTERED enqueue writes nothing when the chart’s connector
 
   const settings = await getAccountingSettings()
   assert.equal(settings.connector, 'xero', 'precondition: the chart is Xero’s')
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
 
   const outcome = await queueAccountingSync({
     ...salesInvoiceRequest(settings.salesAccount),
@@ -351,7 +351,7 @@ test('[o3d-j625] it is not "always refuse": with the chart still active the row 
 
 // o3d-j625 r12 (merging o3d-remove-parked-connectors) — REMOVED, no subject.
 //
-// '[o3d-j625] the QuickBooks chart routes to the QuickBooks queue — the rule is about agreement, not about
+// '[o3d-j625] a second connector's chart routes to that connector's queue — the rule is about agreement, not about
 // Xero' asserted that the rule generalises: a SECOND connector's chart routes to that connector's queue,
 // so the mechanism is about chart-and-queue AGREEMENT and not about Xero specifically. One registered
 // connector cannot express it, and the case immediately above proves the agreement for the one there is.
@@ -472,10 +472,10 @@ test('[o3d-j625] the row follows the CHART even when the selection moves between
   const settings = await getAccountingSettings()
 
   // THE WINDOW BETWEEN THE FACADE'S TWO READS, which is where the unfixed code lost the row: the
-  // first read says Xero (so any "is the chart still serviced" check passes), and the switch to
-  // QuickBooks commits before the second. There is no second read to see it any more.
+  // first read says Xero (so any "is the chart still serviced" check passes), and the accounting
+  // plugin is switched off before the second. There is no second read to see it any more.
   selectionReads = 0
-  flipToQuickBooksAfterReads = 1
+  switchOffAfterReads = 1
 
   const outcome = await queueAccountingSync({
     ...salesInvoiceRequest(settings.salesAccount),
@@ -488,7 +488,7 @@ test('[o3d-j625] the row follows the CHART even when the selection moves between
     routed[0].queue,
     'xero',
     'the row is routed by the CHART, not by a resolution taken after it. Routing by a second read '
-    + 'would put this row in QuickBooks carrying X-SALES, which is the whole defect.',
+    + 'would put this row in another connector\'s books carrying X-SALES, which is the whole defect.',
   )
   assert.equal(routed[0].salesAccount, 'X-SALES')
   assert.equal(outcome.connector, 'xero', 'and the caller is told which books it went to')
@@ -531,7 +531,7 @@ test('[o3d-j625 r2] the in-transaction enqueue REFUSES an unchartered request as
   reset(['xero'])
   const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
   const settings = await getAccountingSettings()
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
 
   const answered: { outcome?: { queued: boolean; reason?: string; connector: string | null } } = {}
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
@@ -552,7 +552,7 @@ test('[o3d-j625] the in-transaction enqueue refuses a retired chart, and reports
   reset(['xero'])
   const { getAccountingSettings, queueAccountingSyncTx } = await import('@/lib/accounting')
   const settings = await getAccountingSettings()
-  enabledPlugins = ['quickbooks']
+  enabledPlugins = []
 
   const answered: { outcome?: { queued: boolean; reason?: string; connector: string | null } } = {}
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
@@ -589,7 +589,7 @@ test('[o3d-j625 r13] a selection that MOVES between the check and the insert is 
   const settings = await getAccountingSettings()
 
   selectionReads = 0
-  flipToQuickBooksAfterReads = 1
+  switchOffAfterReads = 1
 
   const queued = await queueAccountingSyncTx(transactionDouble() as never, {
     ...TX_REQUEST,

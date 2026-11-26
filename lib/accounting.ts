@@ -87,8 +87,8 @@ export type AccountingSettings = {
    * o3d-j625 — WHOSE CHART THIS IS. NOT A CONVENIENCE FIELD; IT IS WHAT MAKES THE ACCOUNT CODES
    * ABOVE ATTRIBUTABLE.
    *
-   * Every account code on this object is ONE CONNECTOR'S account code — `salesAccount` is Xero's or
-   * QuickBooks's, never "the business's" (`getAccountingSettingsFor` says so already). A caller that
+   * Every account code on this object is ONE CONNECTOR'S account code — `salesAccount` belongs to one
+   * connector (Xero's, say), never "the business's" (`getAccountingSettingsFor` says so already). A caller that
    * read these codes and then let an enqueue resolve "the active connector" for itself was building a
    * payload from one resolution and writing a row under a second, so a connector switch between the
    * two committed connector B's row carrying connector A's codes: the document posts to accounts that
@@ -108,10 +108,9 @@ export type AccountingSettings = {
   connector: AccountingConnectorInfo['id'] | null
 }
 
-// o3d-remove-parked-connectors: `id` and `name` were hand-written unions ('xero' | 'quickbooks' /
-// 'Xero' | 'QuickBooks') — a fourth copy of the accounting id union, and a second copy of a label the
-// registry already carries. Both now come from the registry, so registering a connector widens this
-// by construction and its label has ONE source.
+// `id` and `name` come from the registry rather than hand-written unions — a copy of the accounting
+// id union, and of a label the registry already carries, would drift. Registering a connector widens
+// this by construction and its label has ONE source.
 export type AccountingConnectorInfo = {
   id: AccountingConnectorId
   name: string
@@ -172,8 +171,7 @@ const DEFAULT_ACCOUNTING_SETTINGS: AccountingSettings = {
 /**
  * The first registered accounting connector whose plugin is enabled, or null.
  *
- * o3d-remove-parked-connectors: this was `if xero … if quickbooks …`, i.e. Xero-first by virtue of
- * being written first. It now walks `ACCOUNTING_CONNECTORS` in its declared order, so the precedence
+ * Walks `ACCOUNTING_CONNECTORS` in its declared order (not a hand-written `if` chain), so the precedence
  * lives in the registry — the same shape `resolveActiveAccountingConnector` (the LOCKED form, in
  * lib/integration-plugin-selection-lock.ts) uses, which is what keeps the two one rule over two
  * sources rather than two rules. With one connector registered they are indistinguishable.
@@ -193,10 +191,10 @@ export async function getActiveAccountingConnectorId(): Promise<AccountingConnec
  * enqueue then asked a THIRD question — is `<connector>_sync_enabled` on? — and treated a yes as
  * licence to write. Those are not the same fact. The active accounting connector is resolved from
  * the PLUGIN flags (`getActiveAccountingConnectorId`, Xero-first); the per-connector sync toggle is
- * a separate setting that a switch does not touch. So after Xero -> QuickBooks, a reversal pinned to
- * Xero — because that is where its debit was proved to stand — passed `xero_sync_enabled === 'true'`
- * and a PENDING Xero row was written, while `app/api/cron/accounting-sync` had already taken the
- * QuickBooks branch and returned. Nothing scheduled drains it.
+ * a separate setting that a switch does not touch. So after a switch of the active connector, a reversal pinned to
+ * the previous one — because that is where its debit was proved to stand — passed `xero_sync_enabled === 'true'`
+ * and a PENDING Xero row was written, while `app/api/cron/accounting-sync` had already moved on to
+ * the other connector's branch and returned. Nothing scheduled drains it.
  *
  * WHY THAT COSTS MONEY RATHER THAN JUST BEING UNTIDY. `assertAllocationReversalQueued` asks the
  * database for the row — the right question, because the enqueue's boolean lies — and the stranded
@@ -422,7 +420,7 @@ export {
  *
  * r4 matched `externalAccountId` only, over accounts filtered `active: true, type: 'BANK'`. Both posters
  * are wider than that: the Xero poster accepts the stored account's id OR its CODE and filters on neither
- * flag, and QuickBooks resolves by id then code (id first since r5 HIGH 6 — see resolveAccountRef). And the settings UI PRODUCES both forms — a free-text field
+ * flag. And the settings UI PRODUCES both forms — a free-text field
  * placeholdered "Account code" when nothing is synced, an `(unknown)` option that preserves an
  * unrecognised value, `storedKnown` accepting `a.code === row.accountCode`, and every account offered when
  * the chart holds no BANK-type at all. So a map holding a Xero account CODE, or a mapped non-BANK clearing
@@ -432,9 +430,7 @@ export {
  * So the question asked here is the question the poster asks: does this connector's stored chart contain an
  * account whose external id OR code is this value? Nothing is filtered on `active` or `type`, because the
  * Xero poster does not — an archived account is rejected remotely, visibly, which is a different failure
- * from a payment IMS refuses to send (review L-8 keeps that residual where it is, visible and remote). The
- * QuickBooks poster DOES filter `active`; an inactive mapped account there fails the post as a FAILED sync
- * row naming the unresolved account — loud, retried once corrected — rather than being silently refused.
+ * from a payment IMS refuses to send (review L-8 keeps that residual where it is, visible and remote).
  *
  * What a hit proves is exactly the property the payload needs: the value names an account IN THE BOOKS THE
  * ROW IS BEING ROUTED TO. It does not prove the value is unique across connectors, and does not need to.
@@ -968,8 +964,8 @@ export async function queueAccountingSync(params: {
   }
   // o3d-i0o6 r9 (Codex round 8, HIGH) — AND THIS ONE IS FENCED TOO, for the same reason as the
   // connector queues' sync gate. Xero never posts an FX journal, but "never" is a statement about
-  // XERO: if the pin has been retired, the ledger now being serviced is QuickBooks, which DOES post
-  // them — so this suppression rule may not settle an obligation on the retired ledger's behalf.
+  // XERO: if the pin has been retired, the ledger now being serviced is a different connector, which
+  // may post them — so this suppression rule may not settle an obligation on the retired ledger's behalf.
   // Unreachable for today's pinned callers (the refund hand-off pins ALLOCATION_REVERSAL and
   // UNEARNED_REV_REVERSAL, neither of which is an FX type), and fenced anyway: "not currently
   // reachable" is what round 7's check was, and it was reached. Unpinned callers are unchanged and
@@ -1006,8 +1002,7 @@ export async function queueAccountingSync(params: {
   // o3d-i0o6 r8: `pinnedLedger` is what makes the check above binding at the moment of the write. It
   // is `params.connector` verbatim — never `connector`, which is the resolved-or-pinned value and
   // would silently turn EVERY unpinned enqueue into a pinned one.
-  // ONE CONNECTOR QUEUE TODAY (o3d-remove-parked-connectors). The QuickBooks arm was archived; the
-  // switch is kept (rather than collapsed to a bare `queueXeroSync` call) because it is exhaustive
+  // ONE CONNECTOR QUEUE TODAY. The switch is kept (rather than collapsed to a bare `queueXeroSync` call) because it is exhaustive
   // over `AccountingConnectorId`, so registering a connector makes this a `tsc` error until its own
   // queue is wired. That error is the point.
   //
@@ -1092,17 +1087,14 @@ async function getAccountingPostingContextFor(connector: string, type: Accountin
   }
 
   // An id this build does not know is NOT "enabled by default" — it gets no posting context. This is
-  // the branch the doc comment above promises, and o3d-remove-parked-connectors left it in place
-  // after archiving the QuickBooks arm rather than letting the Xero `if` fall through to `null` by
-  // accident. `connector` is typed `string` on purpose: this is the pinned form, and a pin read back
+  // the branch the doc comment above promises, kept explicit rather than letting the Xero `if` fall
+  // through to `null` by accident. `connector` is typed `string` on purpose: this is the pinned form, and a pin read back
   // from a stored row can name a connector this build no longer ships.
   //
-  // o3d-j625 r5 (review L-12) — AND IT IS RECORDED RATHER THAN SILENT, which the archiving makes MORE
-  // load-bearing, not less. `null` is read by every caller as "this type does not post", i.e. nothing
+  // o3d-j625 r5 (review L-12) — AND IT IS RECORDED RATHER THAN SILENT, which matters. `null` is read by every caller as "this type does not post", i.e. nothing
   // is owed: the safe direction for the QUEUE (nothing is written) and the wrong one for a caller
-  // settling an obligation. Before the removal this was unreachable for the connectors the build
-  // shipped; now a stored `quickbooks` pin on an existing row reaches it, which is exactly the state an
-  // operator needs named. Kept because it is about an UNKNOWN id, not about QuickBooks.
+  // settling an obligation. A stored pin naming a connector this build does not register
+  // reaches it, which is exactly the state an operator needs named.
   void logUnknownAccountingConnector(connector, type)
   return null
 }
@@ -1435,7 +1427,7 @@ export async function queueAccountingSyncTx(
   // price worth paying for an answer the row-creating primitive gives anyway, under the lock: a posting
   // marked handled is refused there, and a refusal of it is not recorded (recordAccountingPostingRefusal).
   // o3d-3zgy: this is the enqueue path that writes inside a CALLER's transaction, so — unlike
-  // queueXeroSync / queueQuickBooksSync, which open their own — it cannot take the sales-order row
+  // queueXeroSync, which opens its own — it cannot take the sales-order row
   // lock itself. Taking it here would take it LATE, inside a transaction that may already hold
   // stock-level locks (cost-layers runs during shipment confirmation), inverting the
   // lockSalesOrder-then-lockStockLevels ordering allocation-service establishes and risking a
@@ -1607,7 +1599,7 @@ export async function queueAccountingSyncTx(
 
   // o3d-19gy: the CONNECTION this payload was composed for. Stamped for whichever connector is active,
   // because the defect is not Xero's — every connector resolves ids at enqueue and again at post — but
-  // only the Xero processor ENFORCES it today (the QuickBooks half is o3d-8prh). A stamp nothing reads
+  // only the Xero processor ENFORCES it today (a second connector's half is o3d-8prh). A stamp nothing reads
   // yet still costs nothing and means the evidence exists on the rows written from now on, rather than
   // starting from zero on the day the other half lands.
   const { activeAccountingIdProvenance } = await import('@/lib/connectors/accounting-id-provenance')
@@ -1759,7 +1751,7 @@ export async function queueAccountingSyncTx(
         // o3d-dzip: the DURABLE half of the same origin record, minted from the stamp in the
         // payload this statement is writing. Retention compacts the payload to `{}` and keeps the
         // external id, so a stamp that lives only in the payload is missing from exactly the rows
-        // whose realm is least knowable. Minted here and nowhere else — see
+        // whose connection is least knowable. Minted here and nowhere else — see
         // mintAccountingConnectionProvenanceColumn for why this is not a back-fill.
         connectionProvenance: mintAccountingConnectionProvenanceColumn(payload),
         // o3d-0m56 r10: created INSIDE attempt-stamping custody. That is what later lets a revival
@@ -1932,8 +1924,8 @@ export async function readStockReceiptAccountsTx(
 /**
  * THE SAME SETTINGS, FOR A CONNECTOR THE CALLER NAMES (o3d-i0o6).
  *
- * Every account code in here is a CONNECTOR'S account code — `allocatedInventoryAccount` is Xero's
- * or QuickBooks's, never "the business's". So a caller that has pinned a connector and then reads
+ * Every account code in here is a CONNECTOR'S account code — `allocatedInventoryAccount` belongs to
+ * one connector (Xero's, say), never "the business's". So a caller that has pinned a connector and then reads
  * {@link getAccountingSettings} is reading one connector's chart of accounts through a second,
  * independent resolution of "which connector is active", and a switch in between hands it an account
  * code from books it is not posting to. That is the same defect as resolving the connector twice
@@ -2078,7 +2070,7 @@ export async function listAccountCodes(): Promise<AccountCode[]> {
 }
 
 export type AccountingBankAccount = {
-  id: string       // connector-native account id (Xero AccountID, QuickBooks account id, ...)
+  id: string       // connector-native account id (e.g. Xero AccountID)
   code: string | null
   name: string
 }
@@ -2126,8 +2118,8 @@ export type AccountBalanceSnapshotSyncResult = { fetched: number; persisted: num
  * account-balance-snapshot cron and the on-demand GL reconciliation refresh). Connector
  * -agnostic: dispatches to the active connector's implementation. A connector with no
  * trial-balance/account-balance ingestion has no arm in the switch, which is a `tsc` error the day
- * it is registered — deliberately, because the alternative (a silent default) is what let the
- * archived QuickBooks connector report snapshot success it never achieved.
+ * it is registered — deliberately, because the alternative (a silent default) is what lets a
+ * connector report snapshot success it never achieved.
  */
 export async function syncAccountingAccountBalanceSnapshots(options?: {
   balanceDate?: Date | string

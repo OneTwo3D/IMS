@@ -89,7 +89,7 @@
  *
  *   - the repair converts "outside custody" into a permanent `remoteAttemptedAt`, and it runs
  *     BEFORE the claim, in the same function. That ordering is a property of this code —
- *     `processPendingXeroSync` and `processPendingQuickBooksSync` call it on their first line — not
+ *     `processPendingXeroSync` calls it on its first line — not
  *     of how anything is deployed, and it is pinned by a test.
  *   - and the CLAIM ITSELF REFUSES to restore custody to a money row that carries neither custody
  *     nor a stamp (o3d-anu8 round 3). The repair is a PASS-level statement; a deployment overlap is
@@ -99,6 +99,7 @@
  */
 
 import type { AccountingSyncType, Prisma } from '@/app/generated/prisma/client'
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 
 /**
  * The types `authoriseMoneyPost` stamps — `MONEY_MOVING_SYNC_TYPES` in followup-retry-guard.ts,
@@ -150,6 +151,25 @@ export function attemptProvenNeverMade(row: MoneyAttemptProvenance): boolean {
 export const ATTEMPT_PROVEN_NEVER_MADE_WHERE: Prisma.AccountingSyncLogWhereInput = {
   remoteAttemptedAt: null,
   attemptStampingCustodyAt: { not: null },
+}
+
+/**
+ * WHICH CONNECTORS' ROWS MAY BE STAMPED `abandonedBeforeRemoteCall` ON REVISION 0 ALONE (o3d-g5t0y).
+ *
+ * `attemptRevision` 0 reads "nothing that stamps an attempt has ever claimed this row" only for a
+ * connector whose processor bumps the revision on every claim, and `ATTEMPT_PROVEN_NEVER_MADE_WHERE`
+ * does not close the gap: a processor that claimed WITHOUT bumping the revision still re-asserted
+ * custody on its claim, and a non-money row (a sales invoice) carries no `remoteAttemptedAt` stamp at
+ * all, so such a row that failed and went back to PENDING reads revision 0, custody present and no
+ * attempt stamp, exactly like a row nobody ever claimed.
+ *
+ * A row written by a connector this build does not register (a retired connector's history) cannot be
+ * shown to have come from a revision-bumping processor, so the pre-call stamp is restricted to
+ * registered connectors. The writers still RETIRE such a row, unstamped: UNKNOWN to `ledgerStanding`,
+ * the safe direction. Derived from the registry so a new connector is covered by registering it.
+ */
+export const REVISION_BUMPING_CONNECTOR_WHERE: Prisma.AccountingSyncLogWhereInput = {
+  connector: { in: ACCOUNTING_CONNECTORS.map((connector) => connector.id) },
 }
 
 /**

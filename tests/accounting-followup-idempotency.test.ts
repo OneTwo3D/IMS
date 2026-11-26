@@ -19,9 +19,8 @@ import { attemptCouldBeTheSameDocument } from '@/lib/domain/accounting/followup-
  * o3d-h2wx: a follow-up's REMOTE idempotency key must survive regeneration of its
  * AccountingSyncLog row.
  *
- * Both connectors derive the remote dedup token from the sync entry's own row id
- * (QuickBooks Request-Id via buildQboRequestId(getIdempotencySource(entryId, ...)),
- * Xero's Idempotency-Key via buildXeroIdempotencyKey(entryId, ...)). hasExistingSyncLog
+ * The connector derives the remote dedup token from the sync entry's own row id
+ * (Xero's Idempotency-Key via buildXeroIdempotencyKey(entryId, ...)). hasExistingSyncLog
  * ignores FAILED rows, so re-enqueueing a follow-up — which the back-reference repair
  * sweeps do — creates a NEW row with a NEW id, and therefore a DIFFERENT token.
  *
@@ -31,7 +30,7 @@ import { attemptCouldBeTheSameDocument } from '@/lib/domain/accounting/followup-
  * idempotency is real, but it does not survive regenerating the entry.
  */
 
-const ORDER = { connector: 'quickbooks', type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: 'order-1' }
+const ORDER = { connector: 'retired-ledger', type: 'INVOICE_PAYMENT', referenceType: 'SalesOrder', referenceId: 'order-1' }
 
 /**
  * o3d-0m56 round 10 — WHAT HAS HANDLED a row is what its unstamped `remoteAttemptedAt` proves, so
@@ -570,7 +569,7 @@ test('a carried token that CONFLICTS with a surviving row refuses rather than pi
 
 test('ambiguity is counted in DISTINCT TOKENS, not rows (o3d-h2wx)', () => {
   // Codex r5 #3: refusing on row count stranded a case that is not ambiguous at all.
-  // Reruns of one QuickBooks receipt all carry `invoice-payment:payment:<id>`, and FAILED
+  // Reruns of one receipt all carry `invoice-payment:payment:<id>`, and FAILED
   // rows do not occupy the live slot, so several rows can share one effective token —
   // whichever committed, committed under that token, so pinning it is unambiguous.
   const sharedToken = planFollowUpEnqueue({

@@ -119,13 +119,13 @@ test('a payload queued for the connection now active is allowed', async () => {
 
 test('a CONNECTOR switch is refused too, not only an organisation switch', async () => {
   const { accountingPayloadConnectionRefusal } = await provenance()
-  // Xero → QuickBooks with rows still queued. The ids are a Xero GUID and a QuickBooks integer, so this
-  // one is normally a loud failure anyway — but it is refused for the right reason, before the call.
+  // Rows queued for a retired connector while another is active. The ids are one ledger's native ids, so
+  // this one is normally a loud failure anyway — but it is refused for the right reason, before the call.
   assert.match(accountingPayloadConnectionRefusal({
-    payload: { [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: 'xero:tenant-A' },
-    activeProvenance: 'quickbooks:tenant-A',
+    payload: { [ACCOUNTING_PAYLOAD_CONNECTION_KEY]: 'retired-ledger:tenant-A' },
+    activeProvenance: 'xero:tenant-A',
     ...REFERENCE,
-  }) ?? '', /queued for accounting connection xero:tenant-A/)
+  }) ?? '', /queued for accounting connection retired-ledger:tenant-A/)
 })
 
 test('an UNSTAMPED payload is REFUSED — as its own named decision, not folded into mismatch', async () => {

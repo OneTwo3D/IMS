@@ -1343,8 +1343,7 @@ test('a document Xero did not return is deferred rather than closed', async () =
 })
 
 test('the due set is oldest-reconsidered-first, latest marker wins, and it is bounded', async () => {
-  // o3d-psrx r4: the lifecycle moved out of the Xero poller — it was never Xero-shaped, and
-  // QuickBooks now drives the same one. See lib/domain/accounting/withheld-reversal-markers.ts.
+  // o3d-psrx r4: the lifecycle moved out of the Xero poller — it was never Xero-shaped. See lib/domain/accounting/withheld-reversal-markers.ts.
   const { dueWithheldMarkers, WITHHELD_RECHECK_INTERVAL_MS } =
     await import('@/lib/domain/accounting/withheld-reversal-markers')
   const old = (minutes: number) => new Date(Date.now() - WITHHELD_RECHECK_INTERVAL_MS - minutes * 60_000)

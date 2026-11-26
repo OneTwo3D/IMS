@@ -87,7 +87,7 @@ test('nesting asks BOTH when the outer one allows', async () => {
 test('an authorisation belonging to another connector is not consulted', async () => {
   const calls: string[] = []
   const refusal = await withAccountingEgressAuthorization(
-    { connector: 'quickbooks', name: 'other', authorize: async () => { calls.push('other'); return 'nope' } },
+    { connector: 'retired-ledger', name: 'other', authorize: async () => { calls.push('other'); return 'nope' } },
     async () => accountingEgressRefusal('xero', REQUEST),
   )
   assert.equal(refusal, null)

@@ -12,22 +12,23 @@ import { db } from '@/lib/db'
 // call that re-reads the documents — which is the caller's job, not this module's.
 //
 // Codex found the sibling half missing, exactly as it found the provenance gate missing one connector
-// over. The QuickBooks poller advances `LastUpdatedTime` after every successful query, INCLUDING for a
-// candidate the provenance gate withheld — and several withholding causes resolve with no QBO document
-// change at all: a PENDING/PROCESSING registration finishing or being cancelled, or a database fence
-// that failed once. QuickBooks selects candidates only where `LastUpdatedTime` exceeds the watermark,
-// so the unchanged invoice is never reconsidered and a genuine chargeback stays represented as paid.
+// over. A poller that advances its cursor after every successful query, INCLUDING for a
+// candidate the provenance gate withheld, meets several withholding causes that resolve with no
+// ledger document change at all: a PENDING/PROCESSING registration finishing or being cancelled, or
+// a database fence that failed once. A ledger that selects candidates only where the modification
+// time exceeds the watermark never reconsiders the unchanged invoice, and a genuine chargeback stays
+// represented as paid.
 //
 // HOLDING THE CURSOR IS NOT THE ANSWER and never was: a paid flag that by design is never registered
-// would freeze every later QuickBooks payment and reversal behind it. The cursor keeps moving AND the
+// would freeze every later payment and reversal behind it. The cursor keeps moving AND the
 // withheld documents are revisited BY KEY, which is what this module is.
 //
 // WRITTEN ONCE, HERE, FOR THE REASON THE SHARED CLASSIFIER WAS. A second lifecycle worded like this one
 // is the defect this branch has now been shown twice: one rule, several connectors, one fixed.
 //
-// SCOPED BY CONNECTOR, because the markers are activity rows and both pollers write the SAME action
-// names. A tenant that switched from Xero to QuickBooks leaves Xero markers behind, and a QuickBooks
-// recheck that picked them up would ask QuickBooks about Xero invoice ids for ever. The connector is
+// SCOPED BY CONNECTOR, because the markers are activity rows and every poller writes the SAME action
+// names. A tenant that switched from Xero to another connector leaves Xero markers behind, and that
+// connector's recheck that picked them up would ask it about Xero invoice ids for ever. The connector is
 // recorded in the marker's metadata; rows written before it existed carry none, and only the
 // connector that wrote them (`legacyOwner`) may claim those.
 

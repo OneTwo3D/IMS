@@ -341,7 +341,7 @@ export async function purgeExpiredData(): Promise<{
       // Those rows are COMPACTED instead (below), not exempted. An earlier revision of this branch
       // exempted them outright and called it bounded because "the sweep stamps every row it
       // settles". It is not bounded: a permanently ambiguous row is never stamped by design, a
-      // disconnected connector's rows are never swept at all, and no QuickBooks sweep existed, so
+      // disconnected or retired connector's rows are never swept at all, so
       // full payloads — customer names, emails, addresses, financial lines — could outlive the
       // configured retention period indefinitely. That is the same defect as the reverted
       // PROCESSING exemption above, and it is fixed the same way the o3d-nepa note prescribes: a

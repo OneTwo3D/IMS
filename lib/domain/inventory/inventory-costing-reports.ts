@@ -810,7 +810,7 @@ async function loadCogsGlMovementWithOnDemandSnapshotSync(lookup: CogsGlMovement
 
     // Connector-agnostic on-demand snapshot sync: dispatches to the active accounting
     // connector. Returns ok:false (with a notice) when the active connector can't
-    // produce the snapshot — including QuickBooks, whose ingestion isn't implemented yet.
+    // produce the snapshot.
     const syncResult = await syncAccountingAccountBalanceSnapshots({
       balanceDate: error.requiredBalanceDate,
       accountCodes: lookup.accountCode ? [lookup.accountCode] : undefined,

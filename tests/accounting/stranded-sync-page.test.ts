@@ -241,7 +241,7 @@ test('with every plugin disabled, stranded rows keep the page reachable and list
   assert.ok(names.includes('ConnectorOrphanBanner'), 'the banner must be in the tree')
   assert.match(html, /Showing all 1 stranded row\(s\), oldest first\./)
   assert.match(html, /SalesOrder:order-7/, 'the row is identified, not counted')
-  assert.match(html, /HTTP 500 from QuickBooks/)
+  assert.match(html, /HTTP 500 from the ledger/)
 })
 
 test('the stranded failure banner renders even when the neighbouring accounting-log read fails too', async () => {
@@ -311,7 +311,7 @@ test('a positive orphan summary renders the aggregate count AND the cancel contr
   assert.match(html, /3 accounting sync row\(s\) are queued for a connector that is no longer active/)
   assert.match(html, /\(no accounting connector is enabled\)/)
   // The per-connector breakdown, labelled rather than raw connector ids.
-  assert.match(html, /QuickBooks<\/span>: 2 row\(s\)/)
+  assert.match(html, /retired-ledger<\/span>: 2 row\(s\)/)
   assert.match(html, /Xero<\/span>: 1 row\(s\)/)
   // The controls: one per group, plus the cancel-all that only appears above a single group.
   assert.equal(html.match(/Cancel these/g)?.length, 2, 'one cancel control per orphaned connector')
@@ -351,7 +351,7 @@ test('a truncated list says how many of how many — never a bare count', async 
 function orphanSummary(): ConnectorOrphanSummary {
   return {
     activeConnector: null,
-    orphanGroups: [{ connector: 'quickbooks', count: 2 }, { connector: 'xero', count: 1 }],
+    orphanGroups: [{ connector: 'retired-ledger', count: 2 }, { connector: 'xero', count: 1 }],
     totalOrphans: 3,
   }
 }
@@ -379,13 +379,13 @@ test('each per-connector control cancels THAT connector — never the unscoped o
     'three controls, and every one of them has a handler',
   )
 
-  await banner.click(controls.find((c) => c.label === 'Cancel these' && c.scope.includes('QuickBooks')))
-  assert.deepEqual(state.cancel.calls, [['quickbooks']], 'the QuickBooks control is scoped to QuickBooks')
+  await banner.click(controls.find((c) => c.label === 'Cancel these' && c.scope.includes('retired-ledger')))
+  assert.deepEqual(state.cancel.calls, [['retired-ledger']], 'the retired-ledger control is scoped to that connector')
 
   await banner.click(controls.find((c) => c.label === 'Cancel these' && c.scope.includes('Xero')))
   assert.deepEqual(
     state.cancel.calls,
-    [['quickbooks'], ['xero']],
+    [['retired-ledger'], ['xero']],
     'and the Xero control to Xero — the connector is the argument, not the label',
   )
 })
@@ -521,10 +521,10 @@ test('the confirmation dialog states what a retry COSTS on Xero, counts nothing 
   assert.match(String(confirm!.props.acknowledgement), /I have checked Xero and none of these documents already exist there/, 'the operator must tick it')
   assert.equal(confirm!.props.destructive, true)
 
-  // QuickBooks' RequestId window is unestablished, so no caution is shown rather than a guessed one.
-  const quickbooks = mountClientComponent(RetryAllFailedDialog as never, { ...props, connector: 'quickbooks' } as never).render()
-  const qbBody = (await import('react-dom/server')).renderToStaticMarkup(findByTypeName(quickbooks.tree, 'ConfirmDialog')!.props.description as never)
-  assert.ok(!qbBody.includes('6 minutes'), 'a window nobody verified is not quoted at another connector')
+  // A connector with no established idempotency window gets no caution rather than a guessed one.
+  const retired = mountClientComponent(RetryAllFailedDialog as never, { ...props, connector: 'retired-ledger' } as never).render()
+  const retiredBody = (await import('react-dom/server')).renderToStaticMarkup(findByTypeName(retired.tree, 'ConfirmDialog')!.props.description as never)
+  assert.ok(!retiredBody.includes('6 minutes'), 'a window nobody verified is not quoted at another connector')
 })
 
 // ---------------------------------------------------------------------------

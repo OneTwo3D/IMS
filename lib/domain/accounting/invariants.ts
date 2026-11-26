@@ -345,7 +345,7 @@ function liveSyncLogIndexKey(type: string, referenceId: string, referenceType: s
 
 // Live Xero daily-batch logs carry a digest-suffixed referenceId
 // (buildDailyBatchReferenceId -> `<group>-<date>-<8 hex>`), while the invariant's
-// expected key and QBO logs are the bare `<group>-<date>`. Strip a trailing 8-hex
+// expected key, like any bare (digest-less) log, is the bare `<group>-<date>`. Strip a trailing 8-hex
 // digest so a digest-suffixed log still matches the bare expected key (scjz.37).
 function stripDailyBatchDigest(referenceId: string): string {
   return referenceId.replace(/-[0-9a-f]{8}$/, '')

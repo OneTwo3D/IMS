@@ -577,7 +577,7 @@ test('[o3d-j625 r7] a posting marked handled STAYS handled: refusing it again re
   await recordAccountingPostingRefusal(
     { accountingPostingRefusal: refusalTable },
     { type: 'STOCK_RECEIPT', referenceType: 'PurchaseOrder', referenceId: 'po-r10', scope: 'k-r10' },
-    { kind: 'stock_receipt_journal', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: 'r' },
+    { kind: 'stock_receipt_journal', chartConnector: 'xero', activeConnector: 'retired-ledger', reason: 'retired_chart', committed: 'c', remedy: 'r' },
   )
   assert.deepEqual(refusals[0], handled, 'the row is exactly as the mark left it')
   assert.ok(activity.some((entry) => entry.action === 'accounting_posting_refused_after_handled_by_hand'), 'and the refusal is logged')
@@ -650,7 +650,7 @@ test('[o3d-j625 r6 H4/r7] a row IMS cleared by QUEUEING the posting, refused aga
   await recordAccountingPostingRefusal(
     { accountingPostingRefusal: refusalTable },
     { type: 'STOCK_RECEIPT', referenceType: 'PurchaseOrder', referenceId: 'po-r13', scope: 'k-r13' },
-    { kind: 'stock_receipt_journal', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: 'r' },
+    { kind: 'stock_receipt_journal', chartConnector: 'xero', activeConnector: 'retired-ledger', reason: 'retired_chart', committed: 'c', remedy: 'r' },
   )
 
   assert.equal(refusals[0]!.suppressedAt, null, 'PRECONDITION: this row was never marked handled, so it DOES reopen')
@@ -1281,7 +1281,7 @@ test('[o3d-1e7sl Codex r12/r14] the deferred-edit (keepOutstanding) branch leave
 test('[o3d-1e7sl Codex r12/r14] after a real mark, a refused-again posting is listed again on a reused key and not on a one-posting key (server behaviour); no text predicts either', async () => {
   const { markHandledWarningFor } = await import('@/lib/domain/accounting/hand-post-instruction')
   const { recordAccountingPostingRefusal } = await import('@/lib/domain/accounting/posting-refusal-inbox')
-  const record = { chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: 'r' } as const
+  const record = { chartConnector: 'xero', activeConnector: 'retired-ledger', reason: 'retired_chart', committed: 'c', remedy: 'r' } as const
   for (const [type, kind, reused] of [['SALES_INVOICE_UPDATE', 'sales_invoice_update', true], ['STOCK_RECEIPT', 'stock_receipt_journal', false]] as const) {
     refusals.length = 0; syncRows.length = 0; activity.length = 0
     refusals.push(refusal(`r12b-${type}`, kind, { type, referenceType: 'Doc', referenceId: `d-${type}`, scope: '' }))
@@ -1364,7 +1364,7 @@ test('[o3d-1e7sl Codex r16] THE SINK GUARD ACTS: every refusing site\'s RAW reme
   for (const [i, r] of raw.entries()) {
     refusals.length = 0
     await recordAccountingPostingRefusal({ accountingPostingRefusal: refusalTable }, { type: 'SALES_INVOICE_UPDATE', referenceType: 'Doc', referenceId: `d-${i}`, scope: '' },
-      { kind: 'sales_invoice_update', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: r.text })
+      { kind: 'sales_invoice_update', chartConnector: 'xero', activeConnector: 'retired-ledger', reason: 'retired_chart', committed: 'c', remedy: r.text })
     const row = refusals[0] as unknown as { remedy?: string } | undefined
     if (!row) continue
     stored += 1
@@ -1377,7 +1377,7 @@ test('[o3d-1e7sl Codex r16] THE SINK GUARD ACTS: every refusing site\'s RAW reme
   for (const unsafe of ['Post it yourself in the ledger that holds that document, then mark this row handled.', 'Post the reversal by hand.', 'post the reclass by hand and mark this row handled']) {
     refusals.length = 0
     await recordAccountingPostingRefusal({ accountingPostingRefusal: refusalTable }, { type: 'STOCK_RECEIPT', referenceType: 'Doc', referenceId: 'd-unsafe', scope: '' },
-      { kind: 'stock_receipt_journal', chartConnector: 'xero', activeConnector: 'quickbooks', reason: 'retired_chart', committed: 'c', remedy: unsafe })
+      { kind: 'stock_receipt_journal', chartConnector: 'xero', activeConnector: 'retired-ledger', reason: 'retired_chart', committed: 'c', remedy: unsafe })
     assert.ok(String((refusals[0] as unknown as { remedy: string }).remedy).startsWith(HAND_POST_SAFETY), `stored with the preamble first: ${unsafe}`)
   }
 })

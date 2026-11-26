@@ -164,9 +164,7 @@ export function IntegrationsStep({
 
   function buildNextPlugins(current: IntegrationPluginState, key: keyof IntegrationPluginState, value: boolean): IntegrationPluginState {
     const next = { ...current, [key]: value }
-    // o3d-remove-parked-connectors: the two lines that turned the OTHER accounting connector off
-    // when one was switched on are gone with QuickBooks. This is the OPTIMISTIC local copy only —
-    // the binding rule is `INTEGRATION_PLUGIN_EXCLUSIVITY_GROUPS`, evaluated by both writers under
+    // This is the OPTIMISTIC local copy only — the binding rule is `INTEGRATION_PLUGIN_EXCLUSIVITY_GROUPS`, evaluated by both writers under
     // the selection lock against the state the write RESULTS in. With one accounting connector
     // registered there is no pair to mirror here; a second one restores a group entry, and this
     // function then has to mirror it again or the screen will optimistically show a state the
@@ -182,7 +180,7 @@ export function IntegrationsStep({
    * function restored `previousPlugins` for either — so a scheduler failure left the wizard showing
    * the OLD connector while the database, the runtime module gates and the next server render all
    * used the NEW one. During an accounting-connector switch that is the dangerous direction: the
-   * operator believes Xero is still selected while QuickBooks is what dispatches.
+   * operator believes one connector is still selected while another is what dispatches.
    *
    * The decision is now `resolvePluginSelectionSaveView`'s — pure, exhaustive over all four
    * outcomes (including the REJECTION, which is not a refusal), and testable on its own. This
@@ -323,10 +321,8 @@ export function IntegrationsStep({
   }
 
   const hasShoppingConnector = plugins.woocommerce
-  // DERIVED from the registry (o3d-remove-parked-connectors). `hasAccountingConnector` was
-  // `plugins.xero || plugins.quickbooks` and `accountingLabel` was `plugins.quickbooks ? … : 'Xero'`,
-  // so a third registered connector would have been invisible to the first and mislabelled by the
-  // second. `selectedAccountingDef` is the ONE value the two save handlers key off, so the connector
+  // DERIVED from the registry, so a newly registered connector is neither invisible to
+  // `hasAccountingConnector` nor mislabelled by `accountingLabel`. `selectedAccountingDef` is the ONE value the two save handlers key off, so the connector
   // they write to and the name they put in the operator's message cannot disagree.
   const enabledAccountingDef = ACCOUNTING_CONNECTORS.find((connector) => plugins[connector.id])
   const hasAccountingConnector = !!enabledAccountingDef

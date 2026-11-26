@@ -14,8 +14,8 @@ import {
  *
  * THE DEFECT WAS THE OTHER HALF OF r2's. r2 stated the paid-provenance invariant over the WRITERS —
  * every writer of `SalesOrder.paidAt` records where the belief came from — and proved it with a
- * census that walks `salesOrder` WRITES. Codex then found the same rule wide open at a READER: the
- * QuickBooks reversal candidate query selected neither `unregisteredPaidAt` nor any receipt or
+ * census that walks `salesOrder` WRITES. Codex then found the same rule wide open at a READER: a
+ * reversal candidate query selected neither `unregisteredPaidAt` nor any receipt or
  * registration evidence, so every recently modified balance-due invoice went straight into reversal
  * handling. The writer census could not have caught it. It walks writes; this was a read.
  *
@@ -27,19 +27,18 @@ import {
  *   `unregisteredPaidAt` in its `select`.
  *
  * WHY "DISCOVERED, NOT LISTED". A list of files passes for ever once written and says nothing about
- * the connector somebody adds next month, which is precisely the failure mode: Xero fixed, QuickBooks
- * not. The scope follows the reversal detector itself, so a third connector's poller is in scope the
+ * the connector somebody adds next month, which is precisely the failure mode: one connector fixed, the next not. The scope follows the reversal detector itself, so a third connector's poller is in scope the
  * moment it calls it — and if it never does, it is not deciding reversals through the shared path at
  * all, which the last test here is about.
  *
  * WHY NO EXCEPTIONS. Two of the reads this rule now covers do not consume the column today; they were
  * given the select rather than an exemption. A rule with an exception for "reads that do not need it"
  * is a rule the next reader walks through, and "this reader did not need the evidence" is exactly what
- * the QuickBooks poller would have claimed.
+ * a new poller would claim.
  *
  * WHAT THIS DOES NOT ESTABLISH, stated plainly so nobody reads it as more than it is: selecting a
  * column is not consulting it. That half is proved behaviourally, against a real database, in
- * tests/concurrency/qbo-paid-provenance-reversal.concurrent.test.ts and its Xero sibling.
+ * tests/concurrency/paid-provenance-reversal.concurrent.test.ts.
  */
 
 const REVERSAL_DETECTOR = /(?<!function\s)\bdetectPaymentReversals\s*\(/
@@ -107,11 +106,9 @@ test('[o3d-psrx r3] the walk actually reaches the files this rule is about', () 
   const files = reversalDecidingSources().map(([file]) => file)
   // THE CENSUS, by name — the whole finding was that a connector's poller was missing from the walk.
   //
-  // o3d-remove-parked-connectors: `lib/connectors/quickbooks/payment-poller.ts` was the second entry,
-  // and it was the one that had been missing. It is archived, so the census is down to one file. That
-  // makes the census weaker in exactly the direction the finding was about — a walk that reached only
-  // ONE reversal-deciding file is now indistinguishable from a complete one — so a second connector's
-  // poller must be added here in the commit that writes it.
+  // The census is one file. That is weak in exactly the direction the finding was about — a walk that
+  // reached only ONE reversal-deciding file is indistinguishable from a complete one — so a second
+  // connector's poller must be added here in the commit that writes it.
   for (const expected of [
     'lib/connectors/xero/payment-poller.ts',
   ]) {
@@ -151,7 +148,7 @@ test('[o3d-psrx r3] every reversal-deciding read of paid orders selects unregist
 /**
  * ONE DECISION, NOT TWO THAT AGREE TODAY.
  *
- * The finding was not only that QuickBooks lacked the gate — it was that the gate lived inside the
+ * The finding was not only that a connector lacked the gate — it was that the gate lived inside the
  * Xero poller, where no sibling could reach it. The structural answer is that `classifyRegisteredPayment`
  * is now a DELEGATION: it supplies the one connector-shaped argument (how a Xero invoice lists its
  * payments) and hands everything else to the shared core. If somebody re-inlines the decision here,
@@ -196,7 +193,7 @@ test('[o3d-psrx r3] every reversal-deciding file reaches its verdict through the
 // ---------------------------------------------------------------------------
 
 const BLIND_READS: Array<[string, string]> = [
-  ['the exact pre-fix QuickBooks reversal candidate query',
+  ['the exact pre-fix reversal candidate query',
     `const paidOrders = await db.salesOrder.findMany({\n`
     + `  where: { accountingInvoiceId: { not: null }, paidAt: { not: null }, shoppingLinks: { none: {} } },\n`
     + `  select: { id: true, accountingInvoiceId: true, orderNumber: true, status: true, revenueDeferredDate: true },\n`

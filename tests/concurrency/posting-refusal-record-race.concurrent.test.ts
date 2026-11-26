@@ -109,7 +109,7 @@ const keyFor = (referenceId: string) => ({ type: TYPE, referenceType: REFERENCE_
 const refusalRecord = (reason: string) => ({
   kind: KIND as never,
   chartConnector: 'xero',
-  activeConnector: 'quickbooks',
+  activeConnector: 'retired-ledger',
   reason,
   committed: 'the production order is completed in IMS and its stock movements are posted',
   remedy:
@@ -123,7 +123,7 @@ async function seedOutstandingRefusal(db: Db, referenceId: string): Promise<stri
       ...keyFor(referenceId),
       kind: KIND,
       chartConnector: 'xero',
-      activeConnector: 'quickbooks',
+      activeConnector: 'retired-ledger',
       reason: 'retired_chart',
       committed: 'the production order is completed in IMS and its stock movements are posted',
       remedy: 'Post it by hand in the ledger it belongs to and mark this row handled.',
@@ -782,7 +782,7 @@ test(
     await recordAccountingPostingRefusal(db as never, paymentKey('pay-B'), {
       kind: 'invoice_payment_receipt' as never,
       chartConnector: 'xero',
-      activeConnector: 'quickbooks',
+      activeConnector: 'retired-ledger',
       reason: 'payment_account_not_in_ledger',
       committed: 'the receipt is recorded against the order in IMS',
       remedy: 'Re-map the payment method against the connector now in use.',
@@ -1055,7 +1055,7 @@ const updateKeyFor = (referenceId: string) => ({
 const updateRefusal = (reason: string) => ({
   kind: UPDATE_KIND as never,
   chartConnector: 'xero',
-  activeConnector: 'quickbooks',
+  activeConnector: 'retired-ledger',
   reason,
   committed: 'the edited invoice stands in IMS and the ledger still holds the previous version',
   remedy:
@@ -1422,7 +1422,7 @@ const receiptKeyFor = (referenceId: string, paymentId: string) => ({
 const receiptRefusal = (reason: string) => ({
   kind: RECEIPT_KIND as never,
   chartConnector: 'xero',
-  activeConnector: 'quickbooks',
+  activeConnector: 'retired-ledger',
   reason,
   committed: 'the receipt is recorded against the order in IMS and the invoice shows it as paid',
   remedy:
@@ -1436,7 +1436,7 @@ async function seedOutstandingRefusalFor(db: Db, key: ReturnType<typeof receiptK
       ...key,
       kind,
       chartConnector: 'xero',
-      activeConnector: 'quickbooks',
+      activeConnector: 'retired-ledger',
       reason: 'retired_chart',
       committed: 'the receipt is recorded against the order in IMS',
       remedy: 'Enter it by hand in the ledger it belongs to and mark this row handled.',
@@ -1654,7 +1654,7 @@ test(
       record: {
         kind: UPDATE_KIND,
         chartConnector: 'xero',
-        activeConnector: 'quickbooks',
+        activeConnector: 'retired-ledger',
         reason: 'retired_chart',
         committed: updateRefusal('retired_chart').committed,
         remedy: updateRefusal('retired_chart').remedy,

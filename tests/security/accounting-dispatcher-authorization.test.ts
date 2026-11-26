@@ -83,7 +83,7 @@ for (const { name, call } of EARLY_RETURN_DISPATCHERS) {
   })
 }
 
-test('a refused dispatcher does not answer with the "Enable Xero or QuickBooks first" oracle', async () => {
+test('a refused dispatcher does not answer with the "Enable an accounting connector first" oracle', async () => {
   // The early-return arm is a fact about the tenant's configuration. Under the
   // old allowlist a WAREHOUSE session got that fact as a normal, non-throwing
   // result, which is why "it delegates to a guarded action" was never true here.
@@ -286,8 +286,8 @@ test('MANAGER passes the accounting dispatcher and is refused by the XERO CREDEN
   // WHY THE SUBJECT MOVED, and it is not a softening. `development`'s /sync page treats a denial from
   // ANY of its reads as FATAL (o3d-osl8), and seven of those reads route through xero-sync.ts. An
   // ADMIN-only READ surface therefore does not narrow MANAGER's reach — it replaces the entire /sync
-  // page, QuickBooks half included, with the generic error boundary, which is the opposite of what
-  // round 3 said it was doing ("It keeps the whole QuickBooks branch"). See
+  // page with the generic error boundary, which is the opposite of what
+  // round 3 said it was doing ("It keeps the whole other-connector branch"). See
   // tests/accounting/dashboard-read-gates.test.ts, which measures that outcome directly.
   //
   // The property is unchanged and still in two halves: MANAGER gets THROUGH the dispatcher (so the

@@ -20,9 +20,8 @@ import { mirroredPostStanding } from '@/lib/domain/accounting/ledger-standing'
  * AND UNLIKE THE INVOICE, THERE IS NO CONNECTOR OMISSION RULE TO REPLAY. The whole reason the
  * invoice side needs `readPostedDocumentDiscount` is that Xero appends its "Order discount" line
  * only when a discount ACCOUNT CODE came with the payload, so the requested figure is not the
- * posted one. Neither credit-note adapter has such a gate: `pushCreditNote` (xero/credit-notes.ts)
- * maps `data.lines` to `LineItems` one-for-one, and `pushCreditMemo` (quickbooks/credit-notes.ts)
- * maps them to `Line` one-for-one. Every stored refund line becomes a document line. So the
+ * posted one. The credit-note adapter has no such gate: `pushCreditNote` (xero/credit-notes.ts)
+ * maps `data.lines` to `LineItems` one-for-one. Every stored refund line becomes a document line. So the
  * persisted rows ARE what the credit note carried, and no rule has to be replayed over them.
  *
  * WHAT IS STILL NOT DERIVABLE, stated precisely instead of blanket-refused:
@@ -82,8 +81,8 @@ import { mirroredPostStanding } from '@/lib/domain/accounting/ledger-standing'
  * stamps every mirrored document with the connector that posted it (`externalSystem`), and the
  * ACTIVE accounting connector can be SWITCHED — `lib/domain/accounting/connector-orphans.ts` exists
  * for precisely that event ("when the active accounting connector is switched (e.g. Xero →
- * QuickBooks)"). An order invoiced before a switch and credited after it therefore has an ACCREC
- * invoice standing at full value in Xero and an unrelated credit memo in QuickBooks, and the
+ * another connector)"). An order invoiced before a switch and credited after it therefore has an ACCREC
+ * invoice standing at full value in one ledger and an unrelated credit note in another, and the
  * difference between their two discount legs describes no ledger that exists. Netting them declares
  * a customer square while the invoice they actually owe against is untouched.
  *
@@ -93,17 +92,17 @@ import { mirroredPostStanding } from '@/lib/domain/accounting/ledger-standing'
  * the NET; the legs are still reported, as always.
  *
  * WHAT THAT ESTABLISHES AND WHAT IT DOES NOT. It establishes the CONNECTOR. It does not establish
- * the ORGANISATION/REALM within that connector: no row IMS keeps records the tenant a document was
+ * the ORGANISATION within that connector: no row IMS keeps records the tenant a document was
  * posted to — `AccountingToken` holds one row per connector (`@@unique([connector])`), so a reconnect
  * to a different Xero organisation OVERWRITES it and says nothing about a historical document, and
- * the per-realm provenance column on `AccountingSyncLog` was tried and REVERTED (o3d-gt8r/o3d-s36z).
+ * the per-organisation provenance column on `AccountingSyncLog` was tried and REVERTED (o3d-gt8r/o3d-s36z).
  * That residual is NOT silently assumed away: it is named in the precondition the netted outcome
  * carries, next to the hand-void warning, because it has the same shape — a fact about the
  * accounting system that IMS cannot read, and that the operator can, in the same glance they already
  * have to make at both documents.
  *
  * WHAT IT STILL CANNOT SEE, stated rather than papered over: a credit note VOIDED OR EDITED IN XERO
- * OR QUICKBOOKS BY HAND. Nothing writes back to IMS when that happens — the payment poller reads
+ * BY HAND. Nothing writes back to IMS when that happens — the payment poller reads
  * ACCREC invoice statuses, never ACCRECCREDIT — so no query here can detect it. That is why the
  * netted remedy carries the credit notes it was derived against in its precondition line and tells
  * the operator to confirm they still stand before posting anything (see `WcCouponRemedy`).

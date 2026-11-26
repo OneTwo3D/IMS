@@ -109,7 +109,7 @@ test('a document dated on or before the imported Xero lock date is refused; one 
 
 test('a document IMS did not create (a hand link, or the incumbent writer\'s) is refused, as is one in another connector or never pushed', () => {
   assert.ok((() => { const v = decideDocumentDelete(eligibleFacts({ createdByIms: false })); return !v.eligible && v.code === 'NOT_IMS_OWNED' })())
-  assert.ok((() => { const v = decideDocumentDelete(eligibleFacts({ documentConnector: 'quickbooks' })); return !v.eligible && v.code === 'NOT_XERO' })())
+  assert.ok((() => { const v = decideDocumentDelete(eligibleFacts({ documentConnector: 'retired-ledger' })); return !v.eligible && v.code === 'NOT_XERO' })())
   assert.ok((() => { const v = decideDocumentDelete(eligibleFacts({ documentConnector: null })); return !v.eligible && v.code === 'NOT_XERO' })())
   assert.ok((() => { const v = decideDocumentDelete(eligibleFacts({ externalDocumentId: null })); return !v.eligible && v.code === 'NOT_PUSHED' })())
 })

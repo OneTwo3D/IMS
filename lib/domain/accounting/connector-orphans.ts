@@ -2,7 +2,7 @@
 // Cross-connector orphaned sync rows (audit-H4)
 //
 // AccountingSyncLog rows are stamped with their connector at queue time. When
-// the active accounting connector is switched (e.g. Xero → QuickBooks), any
+// the active accounting connector is switched to another one, any
 // PENDING/PROCESSING rows for the OUTGOING connector become invisible to both
 // processors (each only claims rows for its own connector) — they accumulate
 // silently forever. This module classifies those orphans so the sync dashboard
@@ -15,10 +15,8 @@
 //
 // AND THE SURFACE THIS MODULE IS FOR IS NOW UNREACHABLE BY A CONNECTOR SWITCH. With one accounting
 // connector registered there is no switch to strand rows, so `orphanGroups` can only be non-empty
-// for a connector this build no longer ships — which is exactly the state a development database is
-// in after this branch (rows stamped `quickbooks`). That is not a reason to delete it: the summary is
+// for a connector this build no longer ships — rows stamped with a retired connector id. That is not a reason to delete it: the summary is
 // how those rows become visible and cancellable, and a second ledger reinstates the original case.
-// See docs/archive/quickbooks-connector-removal.md.
 import type { AccountingConnectorId } from '@/lib/connectors/accounting-registry'
 
 export type { AccountingConnectorId }

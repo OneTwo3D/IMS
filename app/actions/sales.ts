@@ -2216,8 +2216,8 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     date: documentDay ?? today,
     ...(dateUnknown ? { dateUnknown: true } : {}),
     currency: so.currency,
-    // Stamp IMS's FX rate on the document so Xero/QuickBooks don't apply
-    // their own daily rate (which causes 1-3 % drift on multi-currency
+    // Stamp IMS's FX rate on the document so Xero doesn't apply
+    // its own daily rate (which causes 1-3 % drift on multi-currency
     // invoices). Connector adapter inverts to the platform's convention.
     // o3d-q0x56.3: the order's STORED booked rate, or absent. A foreign document without one is refused at the enqueue and again at the connector.
     currencyRateToBase: usableStoredFxRate(so.fxRateToBase)?.toNumber(),
@@ -4267,7 +4267,7 @@ export async function raiseChargebackForReversedOrder(
   // WHY A DISAGREEMENT IS A REFUSAL RATHER THAN "USE THE POSTED FIGURE". Because the backfill's own
   // output puts every one of these orders on an operator's must-fix list: the posted document
   // understates and needs a manual credit/adjustment in the accounting system. Whether that
-  // adjustment has been made is invisible from IMS — it happens in Xero/QuickBooks, and neither the
+  // adjustment has been made is invisible from IMS — it happens in Xero, and neither the
   // order nor the mirror records it. Before it, the ledger holds the posted figure and mirroring
   // that is right; after it, the ledger holds the corrected figure and mirroring the posted one
   // under-reverses by the same amount. Both candidate credit notes are wrong in one of the two
@@ -4356,9 +4356,9 @@ export async function raiseChargebackForReversedOrder(
       // "credit the full goods" precisely because the amount question is already answered. Its two
       // ordinary causes cannot reach this point: an order with no discount fails the guard above,
       // and a Xero invoice that omitted the line resolves to 0 above and fails it too. What is left
-      // is a genuine DISAGREEMENT between the two reads about one document — the QuickBooks shape,
-      // where the adapter posts the discount line on amount alone while this reader requires an
-      // account code, so the document carries a discount whose account nobody here can name. That is
+      // is a genuine DISAGREEMENT between the two reads about one document — a document whose
+      // discount line was posted on amount alone while this reader requires an account code, so the
+      // document carries a discount whose account nobody here can name. That is
       // the one case where crediting the full goods value would be a guess, so it goes to a human.
       await logActivity({
         entityType: 'SALES_ORDER',

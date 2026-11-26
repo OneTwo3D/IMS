@@ -59,8 +59,8 @@ import {
  *
  * WHAT `linesJson` ACTUALLY IS, and how the posted figure is derived from it (r4 finding 3).
  *
- * The mirror records the payload IMS ENQUEUED, not a read-back of the document Xero or QuickBooks
- * created. Treating `discount.amount` as "the figure the document carried" was therefore wrong: the
+ * The mirror records the payload IMS ENQUEUED, not a read-back of the document Xero created.
+ * Treating `discount.amount` as "the figure the document carried" was therefore wrong: the
  * Xero adapter appends its negative "Order discount" line only when a discount ACCOUNT CODE is
  * present (`lib/connectors/xero/invoices.ts`), so an invoice enqueued with a discount but no
  * configured account posted the FULL goods and no discount line at all — while the mirror recorded a
@@ -75,14 +75,12 @@ import {
  *
  *   xero        the line is posted only when the payload carried a discount account code. Without
  *               one the document's order-level discount is 0, and 0 is the ANSWER, not a fallback.
- *   quickbooks  the DiscountLineDetail is pushed whenever the amount is positive — the account ref
- *               is optional and merely left undefined — so the recorded amount IS the posted one,
- *               rounded to 2dp exactly as that adapter rounds it.
- *   anything else, including a mirrored event with no `externalSystem`: REFUSED. A rule that cannot
- *               be replayed cannot be replayed optimistically.
+ *   anything else, including a mirrored event with no `externalSystem` or one naming a connector this
+ *               build no longer registers: REFUSED. A rule that cannot be replayed cannot be replayed
+ *               optimistically.
  *
- * `connector-omission-rules.test.ts`-style source assertions in the test file pin both adapters, so
- * a change to either condition fails here rather than silently rotting this derivation.
+ * `connector-omission-rules.test.ts`-style source assertions in the test file pin the adapter, so
+ * a change to its condition fails here rather than silently rotting this derivation.
  *
  * WHAT THE CONSTRAINT ON `AccountingEvent` MAKES REPRESENTABLE (r4 finding 2).
  *
@@ -228,11 +226,6 @@ function postedDiscountForConnector(
       }
       // And when it is posted, it is posted verbatim as `UnitAmount: -data.discountAmount`.
       return { ok: true, amount: requested }
-    case 'quickbooks':
-      // lib/connectors/quickbooks/invoices.ts: the DiscountLineDetail is pushed on `discountAmount >
-      // 0` alone — the account ref is resolved from the payload OR the connector setting and is
-      // simply left undefined when neither resolves — so the line always exists, rounded to 2dp.
-      return { ok: true, amount: Math.round(requested * 100) / 100 }
     default:
       return {
         ok: false,

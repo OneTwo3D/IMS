@@ -4,13 +4,14 @@
  *
  * WHEN YOU NEED THIS. A document posted successfully to the accounting ledger, and the write of its
  * external id onto the local record was rejected because another local record of the SAME TYPE
- * already holds that id. The commonest cause is a QuickBooks realm switch: company B reissues an
- * integer a retired company A's bill still carries.
+ * already holds that id. The commonest cause is a switch of the connected company or organisation:
+ * the new one reissues an id a record from the retired one still carries.
  *
- * WHAT THE ROW LOOKS LIKE depends on the connector, and both are handled:
- *   • QUICKBOOKS quarantines it — a `quickbooks_backreference_id_conflict` activity entry, and the
- *     sync row keeps `status = SYNCED` with the same text in `errorMessage`. It is left SYNCED on
- *     purpose: a row out of SYNCED stops suppressing its own re-enqueue and the document posts twice.
+ * WHAT THE ROW LOOKS LIKE depends on the connector that wrote it, and both shapes are handled:
+ *   • A QUARANTINED row — a `<connector>_backreference_id_conflict` activity entry, and the sync row
+ *     keeps `status = SYNCED` with the same text in `errorMessage`. It is left SYNCED on purpose: a
+ *     row out of SYNCED stops suppressing its own re-enqueue and the document posts twice. Xero does
+ *     not write this shape; historical rows of a retired connector can still carry it.
  *   • XERO does not quarantine — the refusal propagates, the row retries, and after the last retry
  *     it lands on `status = FAILED` with the refusal text in `errorMessage`. It still carries the
  *     external id, which is written before the back-reference is ever attempted. A FAILED row is
@@ -26,8 +27,8 @@
  *
  *   1. Read the activity entry (or the sync row's errorMessage). It names the BLOCKING record —
  *      model and id — and this command with both ids already filled in.
- *   2. Open that blocking record in IMS and confirm it is stale: it belongs to a QuickBooks company
- *      this system is no longer connected to, or to a ledger document that no longer exists.
+ *   2. Open that blocking record in IMS and confirm it is stale: it belongs to a company or
+ *      organisation this system is no longer connected to, or to a ledger document that no longer exists.
  *      IF IT IS A LIVE, CORRECTLY LINKED DOCUMENT, STOP — releasing it detaches a good link, and
  *      that is strictly worse than the refusal you started with.
  *   3. Dry-run, which reads and reports and writes nothing:
@@ -40,8 +41,8 @@
  * finding 3 — the audit used to be written afterwards through a logger that swallows its own write
  * failures, so a completed release could leave no durable record that anyone had ever run this).
  * Clearing the id and
- * stopping leaves the ledger document attached to nothing at all — for QuickBooks, permanently,
- * because no repair sweep runs there — and it is not recoverable by re-running, because the holder
+ * stopping leaves the ledger document attached to nothing at all — permanently, for a connector no
+ * repair sweep runs for — and it is not recoverable by re-running, because the holder
  * no longer holds the id and your confirmation stops matching anything. So anything short of a
  * completed re-link rolls the release back, and the recovery procedure for ANY failure of this
  * command — including a crash or a lost connection mid-way — is to run it again.
@@ -179,7 +180,7 @@ async function main() {
     )
   }
   // The row must carry SOME durable record that its back-reference was refused. Four things count,
-  // and the fourth is the retention tombstone: compaction NULLS errorMessage, and for a QuickBooks
+  // and the fourth is the retention tombstone: compaction NULLS errorMessage, and for a quarantined
   // conflict (no repair sweep, so no deferred-refusal stamp either) that would otherwise erase the
   // last marker and close this route for good at the retention horizon.
   // AN OPERATOR-SETTLED ROW HAS NO CONFLICT TO RESOLVE (o3d-anu8). Refused before the marker is

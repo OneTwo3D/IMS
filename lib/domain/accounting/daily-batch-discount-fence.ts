@@ -232,9 +232,8 @@ export function preBatchRefundDeferredParts(
  *
  * THE ID LIST IS ONE BIND PARAMETER, NOT ONE PER ORDER (o3d-y14 r3 finding 4). The first revision
  * expanded the ids with `Prisma.join`, which spends a bind parameter per member. Group A1 selects
- * every eligible order with no `take`, and QuickBooks — unlike Xero — has no bounded window through
- * which a backlog can drain, so past PostgreSQL's 65535-parameter ceiling the fence itself would
- * throw and the batch would fail before staging anything. A batch that cannot run is not a safe
+ * every eligible order with no `take`, so a large enough backlog would pass PostgreSQL's
+ * 65535-parameter ceiling, the fence itself would throw and the batch would fail before staging anything. A batch that cannot run is not a safe
  * batch; it is the same outage the fence exists to avoid, arriving through the fence.
  *
  * `id = ANY($1::text[])` binds the whole set as ONE array parameter, which is already the house

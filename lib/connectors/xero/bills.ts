@@ -73,7 +73,7 @@ export function buildPurchaseBillPayload(
   // the line level — so we apply any generic per-line `discountAmount` by
   // reducing `UnitAmount`. Keeping the Xero-specific handling inside the
   // connector means callers can pass the same generic `discountAmount` field
-  // regardless of whether the target system is Xero or (future) QuickBooks.
+  // regardless of which accounting system is the target.
   const effectiveLines = billEffectiveLines(data)
   const lineItems = data.lines.map((line: InvoiceLine, i) => {
     const xeroLine: Record<string, unknown> = {

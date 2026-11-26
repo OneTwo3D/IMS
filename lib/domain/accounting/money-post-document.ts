@@ -43,10 +43,9 @@ function str(value: unknown): string {
 /**
  * CASE IS NOT PART OF A DOCUMENT'S IDENTITY (Codex round 7, HIGH #2).
  *
- * Both connectors' document ids are case-INSENSITIVE by construction: Xero's are GUIDs (hex and
+ * Document ids are case-INSENSITIVE by construction: Xero's are GUIDs (hex and
  * hyphens — `4d8a…` and `4D8A…` address the same invoice, which is why the credit-note allocation
- * probe has always compared them with `toLowerCase`), and QuickBooks' are decimal strings, on
- * which case is not expressible at all. A key that keeps case therefore lets ONE document take
+ * probe has always compared them with `toLowerCase`). A key that keeps case therefore lets ONE document take
  * TWO locks, and the whole point of the document key was that it cannot.
  *
  * CAN THIS COLLIDE TWO GENUINELY DIFFERENT DOCUMENTS? No. Over the alphabet either connector
@@ -65,8 +64,7 @@ function documentIdentity(value: unknown): string {
  * THE HOLE. The key was the UNION of every anchor a money payload can hold: `accountingInvoiceId`
  * AND `creditNoteId`, for every type. For a PAYMENT `creditNoteId` is not part of the document's
  * identity at all — it is not in the body the connector sends, and neither probe dereferences it
- * on a payment branch (Xero fetches `Invoices/{accountingInvoiceId}`, QuickBooks
- * `bill|invoice/{accountingInvoiceId}`). So two payment rows settling ONE invoice, one of which
+ * on a payment branch (Xero fetches `Invoices/{accountingInvoiceId}`). So two payment rows settling ONE invoice, one of which
  * happens to carry a `creditNoteId` and one of which does not, produced two DIFFERENT keys: two
  * advisory locks, two cached probe readings, and — through `attemptCouldBeTheSameDocument`, which
  * compared the same union — two disjoint contender sets. That is precisely the cross-scope double

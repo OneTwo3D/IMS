@@ -46,7 +46,7 @@ async function loadValidator() {
 
 test('validateAccountingTaxTypeForWrite: non-Xero connector is a no-op (not the cached connector)', async () => {
   const validate = await loadValidator()
-  activeConnector = { id: 'quickbooks' }
+  activeConnector = { id: 'retired-ledger' }
   assert.deepEqual(await validate('WHATEVER'), { ok: true })
 })
 

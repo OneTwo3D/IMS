@@ -102,12 +102,12 @@ mock.module('@/lib/integration-plugins', {
   namedExports: {
     isIntegrationPluginEnabled: async (id: string) => state.plugins[id] === true,
     getIntegrationPluginState: async () => ({
-      woocommerce: false, xero: false, quickbooks: false, mintsoft: false,
+      woocommerce: false, xero: false, mintsoft: false,
       ...state.plugins,
     }),
     INTEGRATION_PLUGIN_SETTING_KEYS: {
       woocommerce: 'plugin_woocommerce_enabled',
-      xero: 'plugin_xero_enabled', quickbooks: 'plugin_quickbooks_enabled',
+      xero: 'plugin_xero_enabled',
       mintsoft: 'plugin_mintsoft_enabled',
     },
     isIntegrationModuleVisible: () => true,
@@ -192,7 +192,6 @@ test('the premise: MANAGER holds `sync`, and the page admits it on exactly that'
 
 const PLUGIN_SCENARIOS: Array<{ label: string; value: Record<string, boolean> }> = [
   { label: 'Xero enabled', value: { xero: true, woocommerce: true } },
-  { label: 'QuickBooks enabled', value: { quickbooks: true, woocommerce: true } },
   { label: 'no accounting connector', value: { woocommerce: true } },
 ]
 

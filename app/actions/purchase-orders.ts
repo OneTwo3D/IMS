@@ -814,7 +814,7 @@ export async function getPurchaseOrders(params: PoListParams = {}): Promise<PoLi
  *
  * SCOPED TO THE ACTIVE CONNECTOR. Payment and invoice ids are owned by the connector and tenant that
  * issued them, and disconnecting does not delete historical sync logs — so an old Xero SYNCED payment
- * would otherwise be presented as proof that a now-active QuickBooks ledger agrees, which it cannot be
+ * would otherwise be presented as proof that a now-active different ledger agrees, which it cannot be
  * (Codex, PR #570 round 2). With no active connector there is no ledger to agree, so nothing is
  * returned and every locally-paid bill reads NOT_SENT rather than falsely settled.
  */
@@ -5972,12 +5972,12 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       settings.connector === 'xero' && settings.syncEnabled && creditNotePosting.verdict === 'post'
     // o3d-j625 r5 (review M-8) — AND THE ONE CASE THAT POSTS LOCALLY WITH NOTHING RECORDED IS RECORDED.
     //
-    // PURCHASE_CREDIT_NOTE is absent from QUICKBOOKS_SYNC_TYPE_SETTING, so under QuickBooks the verdict is
-    // `post` (the type falls through to the default posting mode) while `shouldQueueXero` is false — the
-    // credit note commits DRAFT→POSTED and NOTHING is queued and nothing said. That is pre-existing and the
-    // new verdict function did not close it. It is not an outstanding DEBT — there is no ACCPAYCREDIT
-    // poster for QuickBooks, so no posting is ever coming — so it is not an inbox row; it is a WARNING that
-    // says plainly what the ledger will not receive.
+    // When the chart's connector is not Xero (none active, or one this build has no ACCPAYCREDIT poster
+    // for) the verdict can still be `post` while `shouldQueueXero` is false — the credit note commits
+    // DRAFT→POSTED and NOTHING is queued and nothing said. That is pre-existing and the new verdict
+    // function did not close it. It is not an outstanding DEBT — there is no poster for that connector,
+    // so no posting is ever coming — so it is not an inbox row; it is a WARNING that says plainly what
+    // the ledger will not receive.
     // One credit amount cannot mirror a bill that mixes VAT treatments: refused BEFORE anything is claimed (the credit stays a draft). Per-line credits are a follow-up.
     // A bill with a reverse-charge line is credited by its own lines against its NET PAYABLE (below), so mixing reverse-charge with standard lines is supported there; any other mix is still refused.
     const billHasReverseCharge = billTreatments.some((t) => t.reverseCharge)
@@ -6124,8 +6124,8 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
           //
           // Consulted only when the payload actually carries it (it is omitted when the bill has no
           // external id yet), and then it must agree with the chart. A bill linked under Xero and then
-          // allocated against after a switch to QuickBooks would otherwise hand QuickBooks a Xero
-          // InvoiceID to allocate a credit note to. `null` — a link predating the provenance column —
+          // allocated against after a switch to a different connector would otherwise hand that connector a
+          // Xero InvoiceID to allocate a credit note to. `null` — a link predating the provenance column —
           // refuses, which rolls this transaction back and leaves the credit note DRAFT and retryable.
           documentConnector: asRoutableAccountingConnector(cn.purchaseInvoice?.accountingInvoiceConnector),
           // o3d-j625 r3: the reason, so the rollback message names the right remedy.

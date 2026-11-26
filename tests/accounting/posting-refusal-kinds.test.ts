@@ -41,7 +41,7 @@ type EnqueueSite = { file: string; line: number; type: string; referenceType: st
  */
 const OBJECT_ENQUEUES = [
   'queueAccountingSync', 'queueAccountingSyncTx', 'queueAccountingSyncTxWithOutcome',
-  'queueXeroSync', 'queueQuickBooksSync', 'createAccountingSyncLogRow',
+  'queueXeroSync', 'createAccountingSyncLogRow',
 ]
 const POSITIONAL_ENQUEUES = ['enqueueFollowUpSyncLog']
 

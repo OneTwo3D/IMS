@@ -37,7 +37,7 @@ import {
  *
  * The fixtures at the bottom are what stop this being a rule that cannot fire. They run the SAME
  * detector over sources that break the invariant in each shape production actually uses — including
- * the untyped `Record<string, unknown>` in the QuickBooks poller, where a missing column is not a type
+ * an untyped `Record<string, unknown>` update object, where a missing column is not a type
  * error and this test is the only thing that would notice.
  */
 
@@ -57,7 +57,7 @@ export type WriteSite = {
 
 /**
  * Every `salesOrder.<write>(...)` in one source, with its `data` resolved — through a local variable
- * when the call passes one, because that is exactly how the QuickBooks poller builds its update and
+ * when the call passes one, because that is exactly how an untyped update object is built and
  * a detector that only reads inline literals would score it a clean pass.
  */
 export function salesOrderWriteSites(file: string, source: string): WriteSite[] {
@@ -124,13 +124,10 @@ test('[o3d-psrx r2] EVERY writer of SalesOrder.paidAt names unregisteredPaidAt i
     'lib/connectors/woocommerce/sync/order-import.ts',      // the initial import AND the paid-later update
     'lib/connectors/xero/payment-poller.ts',                // forward pass + the reversal's clear
     'lib/connectors/xero/payment-reconcile.ts',             // the backlog sweep
-    // o3d-remove-parked-connectors: `lib/connectors/quickbooks/payment-poller.ts` was enumerated here
-    // (forward pass + the reversal's clear) and is archived.
   ]) {
     assert.ok(files.has(expected), `${expected} writes SalesOrder.paidAt and the scan did not reach it`)
   }
-  // o3d-remove-parked-connectors: the floor was 10 while the archived QuickBooks poller contributed
-  // two write sites. It is lowered to the number the tree now holds. This is a VACUITY guard — it
+  // The floor is the number of write sites the tree holds. This is a VACUITY guard — it
   // stops a broken walk making an empty scan look clean — not a claim about how many writers there
   // ought to be; the `unpaired` assertion below is the rule.
   assert.ok(writers.length >= 8,
@@ -155,7 +152,7 @@ const OFFENDERS: Array<[string, string]> = [
     `await tx.salesOrder.create({ data: { orderNumber: 'x', paidAt: w.date_paid_gmt ? new Date(w.date_paid_gmt) : null } })`],
   ['a guarded updateMany (the forward-pass shape)',
     `await db.salesOrder.updateMany({ where: { id, paidAt: null }, data: { paidAt: d } })`],
-  ['an untyped object built separately (the QuickBooks poller shape)',
+  ['an untyped object built separately (an untyped update-object shape)',
     `const updateData: Record<string, unknown> = { paidAt: new Date() }\n`
     + `await db.salesOrder.update({ where: { id }, data: updateData })`],
   ['a clear that would leave the provenance behind',

@@ -304,8 +304,8 @@ test('[o3d-y14] unfinished work is kept by the OTHER clause on the same predicat
 // ---------------------------------------------------------------------------
 // o3d-9kek r3 finding 3 — the exemption above was called "bounded" because the sweep stamps every
 // row it settles. It is not: a permanently ambiguous row is never stamped BY DESIGN, a
-// disconnected connector's rows are never swept at all, and no QuickBooks sweep runs (deliberately
-// — r6 finding 1), so every QuickBooks invoice/bill row stays unstamped forever. Full payloads — customer
+// disconnected or retired connector's rows are never swept at all, so every invoice/bill row of such
+// a connector stays unstamped forever. Full payloads — customer
 // names, emails, addresses, financial lines — could therefore outlive the configured retention
 // period without limit. A retention policy that silently fails to delete is worse than one that
 // deletes too much.

@@ -277,7 +277,7 @@ test('[refund 182 persisted] a refund recorded under the scheme treatment keeps 
   const skipped = await treatCreditNotePayload({ refundId: bare.id, orderId: fx.orderId, payload: r182.payload, refundLineIds: lineIds, connector: 'xero', accounts: ACCOUNTS, now: new Date(), enqueueHeldRow: (async () => ({ queued: true })) as never })
   assert.deepEqual(skipped, { kind: 'skipped', why: 'switch_off' })
   // (5) the connector is no longer Xero but the refund was recorded under the scheme: refused, never skipped.
-  const other = await treatCreditNotePayload({ refundId: r182.refundId, orderId: fx.orderId, payload: r182.payload, refundLineIds: r182.lineIds, connector: 'quickbooks', accounts: ACCOUNTS, now: new Date(), enqueueHeldRow: (async () => ({ queued: true })) as never })
+  const other = await treatCreditNotePayload({ refundId: r182.refundId, orderId: fx.orderId, payload: r182.payload, refundLineIds: r182.lineIds, connector: 'retired-ledger', accounts: ACCOUNTS, now: new Date(), enqueueHeldRow: (async () => ({ queued: true })) as never })
   assert.equal(other.kind === 'refused' && other.code, 'hand_post')
 })
 

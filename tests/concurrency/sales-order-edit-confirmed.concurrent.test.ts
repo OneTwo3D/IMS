@@ -631,7 +631,7 @@ test('an invoice update that cannot be queued (the posted invoice belongs to ano
   const id = await createConfirmed(w, [{ p: 'p1', qty: 2 }])
   await db.accountingSyncLog.deleteMany({ where: { referenceId: id } })
   // The invoice was posted by ANOTHER accounting connector: the update helper declines without asking the queue, which used to commit the edit with the invoice left at the old lines.
-  await db.salesOrder.update({ where: { id }, data: { accountingInvoiceId: `QBO-${w.tag}`, accountingInvoiceConnector: 'quickbooks', invoiceNumber: `INV-${w.tag}`, invoicedAt: new Date('2026-09-30T00:00:00Z') } })
+  await db.salesOrder.update({ where: { id }, data: { accountingInvoiceId: `OTHER-${w.tag}`, accountingInvoiceConnector: 'retired-ledger', invoiceNumber: `INV-${w.tag}`, invoicedAt: new Date('2026-09-30T00:00:00Z') } })
   const before = await snapshot(id)
   const reservationBefore = await reservation(w, id)
   const refused = await updateSalesOrder(id, inputFor(w, [{ p: 'p1', qty: 3 }]) as never, await versionOf(id))

@@ -314,7 +314,7 @@ test('an order carrying NO invoice id is the back-reference having failed, and i
   // Since r2 the caller PINS the id the post just returned, and the only caller is a connector that
   // has just posted a SALES_INVOICE. "The invoice has not posted" is no longer expressible here at
   // all. What a null column now means is the opposite: the invoice IS in the ledger and the local
-  // back-reference write did not land — the exact state QuickBooks reaches by catching that failure.
+  // back-reference write did not land — the exact state a connector reaches by swallowing that failure.
   // Staying silent there is what let the receipts stay unregistered while the connector cleared the
   // row's follow-up obligation, so silence is now the bug and the report is the fix.
   state.order.accountingInvoiceId = null
@@ -379,7 +379,7 @@ const ONE_RECEIPT = [{ id: 'pay-1', amount: 100, currency: 'GBP', method: 'card'
 // registered AGAINST INV-2 — the same payment id, queued a second time. That is silent
 // over-settlement replacing silent under-settlement. The row is the record of a payment that was
 // actually SENT, and "the old document has been deleted, so its payment went with it" is an
-// assumption about a ledger nothing in this path has read. On QuickBooks a deleted invoice leaves
+// assumption about a ledger nothing in this path has read. On some ledgers a deleted invoice leaves
 // its payment behind as an unapplied credit, and the customer is credited twice.
 //
 // So the receipt is still SELECTED — that is what keeps o3d-ekn8's "never silently unsettled"
@@ -622,14 +622,14 @@ test('[o3d-ekn8 r3] the same order registers normally when nothing moves under t
 
 test('[o3d-ekn8 r4] a row this call WROTE for the wrong connector is rolled back, and says so', async () => {
   state.payments = [...ONE_RECEIPT]
-  state.enqueueConnector = 'quickbooks'
+  state.enqueueConnector = 'retired-ledger'
 
   await redrive('INV-1')
 
   const refusals = state.activity.filter((a) => a.metadata.refusal === 'PINNED_CONNECTOR_MOVED')
   assert.equal(refusals.length, 1)
   assert.equal(refusals[0].metadata.rolledBack, true)
-  assert.equal(refusals[0].metadata.wroteFor, 'quickbooks')
+  assert.equal(refusals[0].metadata.wroteFor, 'retired-ledger')
   assert.match(refusals[0].description, /Nothing was sent/)
 })
 
@@ -640,7 +640,7 @@ test('[o3d-ekn8 r4] but a row that was ALREADY QUEUED elsewhere is not rolled ba
   // from the capacity sum (`live` drops our own row) and registers — and the fence then fires on a
   // call that wrote nothing.
   state.payments = [...ONE_RECEIPT]
-  state.enqueueConnector = 'quickbooks'
+  state.enqueueConnector = 'retired-ledger'
   onOrderLock = () => {
     state.syncRows = [{
       id: 'log-live',

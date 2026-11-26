@@ -167,7 +167,6 @@ test('the confirmation asks the SAME question the enqueue dedupes on, so the two
   // own. Asserted on the files themselves, because a drift here is a silent duplicate posting.
   for (const file of [
     'lib/connectors/xero/queue.ts',
-    // o3d-remove-parked-connectors: the archived QuickBooks file was the second entry here, so this rule was checked against TWO independently-written implementations. One now.
     'lib/accounting.ts',
   ]) {
     const source = readFileSync(file, 'utf8')
@@ -333,7 +332,7 @@ test('the ledger document outranks the sync row in the explanation an operator r
  * connector's — frozen at import time. The release then enqueued with no connector at all, which
  * resolved the active one afresh, and the gap between the two is not a race at all: it is however long
  * WooCommerce takes to number the order, which can be days. A hold taken while Xero was active and
- * released after a move to QuickBooks posted a QuickBooks invoice carrying Xero account codes.
+ * released after a move to a different connector posted that connector's invoice carrying Xero account codes.
  *
  * So the chart is parked WITH the codes, and the release routes by it.
  */

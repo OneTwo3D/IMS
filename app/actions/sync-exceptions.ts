@@ -363,7 +363,7 @@ type RefundPostingTaxContext = {
  * and the shipping tax lines, and allocates coupon money INTO the lines — o3d-y14), and a WC-imported
  * order is created WITH its ShoppingOrderLink in the same write, so the link's presence is the writer's
  * own mark. `createSalesOrder` instead SUBTRACTS the order discount's VAT from the same total, and it
- * creates no link — the same discriminator the Xero/QuickBooks payment pollers read as "a manual order"
+ * creates no link — the same discriminator the Xero payment poller reads as "a manual order"
  * (`shoppingLinks: { none: {} }`).
  *
  * Fails closed: any other provenance (no link, or a link from a connector whose import arithmetic is
@@ -1387,8 +1387,8 @@ async function loadExceptionCounts(): Promise<ExceptionInboxSummary> {
     // blocking anything, and showing it would invite an isolate on stale
     // evidence (o3d-bjc.12).
     getEnabledWmsConnectorId().then((id) => (id ? loadUnresolvedDriftIncidents([id]) : [])),
-    // o3d-0bfh r6 (Codex HIGH). NOT scoped to the active connector: a QuickBooks row that owes a
-    // payment owes it whether or not QuickBooks is the connector enabled today, and the whole reason
+    // o3d-0bfh r6 (Codex HIGH). NOT scoped to the active connector: a row on a retired connector that owes a
+    // payment owes it whether or not that connector is the one enabled today, and the whole reason
     // the row is here is that nothing will ever come back to it on its own.
     db.accountingSyncLog.count({ where: buildFollowUpObligationBacklogWhere({ databaseNow: followUpDatabaseNow }) }),
     // o3d-j625 r4: outstanding refusals. NOT scoped to the active connector, for the same reason the

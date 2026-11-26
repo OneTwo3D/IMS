@@ -73,18 +73,11 @@ export async function GET(request: Request) {
     return answer(body)
   }
 
-  // THE QUICKBOOKS BRANCH WAS HERE, AND IS ARCHIVED (o3d-remove-parked-connectors).
-  //
-  // It gated on plugin + `quickbooks_sync_enabled` + a stored token, drained the landed-cost journal
-  // outbox and then ran `processPendingQuickBooksSync()`. Recoverable at
-  // `git show archive/quickbooks-connector:app/api/cron/accounting-sync/route.ts`.
-  //
-  // IT DELIBERATELY RAN NO BACK-REFERENCE REPAIR SWEEP, and that asymmetry with Xero above was the
-  // interesting part: the sweep's candidate query is scoped by connector alone, and a QuickBooks
-  // external id is only meaningful inside one realm, so after a reconnect to a different company it
-  // would have written a retired realm's id onto a live document. The two prerequisites it named —
-  // POST-TIME AUTHORIZATION (o3d-8prh) and ORIGIN PROPAGATION — are what a second connector would
-  // have to satisfy before its rows may be swept. See docs/archive/quickbooks-connector-removal.md.
+  // A SECOND CONNECTOR WOULD NOT INHERIT THE BACK-REFERENCE REPAIR SWEEP ABOVE. The sweep's candidate
+  // query is scoped by connector alone, and an external id is only meaningful inside one ledger
+  // tenant, so after a reconnect to a different tenant it would write a retired tenant's id onto a
+  // live document. The prerequisites for sweeping another connector's rows are POST-TIME
+  // AUTHORIZATION (o3d-8prh) and ORIGIN PROPAGATION.
 
   return answer({ skipped: true, reason: 'No accounting plugin enabled', provisionalPostingRefusals })
 }

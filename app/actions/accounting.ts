@@ -16,7 +16,7 @@ import {
 // Connector-agnostic accounting actions.
 //
 // These actions live in the core system and are independent of which
-// accounting integration is active (Xero today, QuickBooks in future). The
+// accounting integration is active (Xero today). The
 // active connector is responsible for interpreting the stored account codes
 // in its own chart of accounts.
 // ---------------------------------------------------------------------------

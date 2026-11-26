@@ -150,6 +150,7 @@ function matches(row: Record<string, unknown>, where: Record<string, unknown>): 
         const left = value instanceof Date ? value.getTime() : value
         const right = operand instanceof Date ? operand.getTime() : operand
         if (op === 'in') { if (!(operand as unknown[]).includes(value)) return false; continue }
+        if (op === 'notIn') { if ((operand as unknown[]).includes(value)) return false; continue }
         if (op === 'not') { if (operand === null ? value === null : left === right) return false; continue }
         // SQL: a range comparison against NULL is UNKNOWN, never true. JavaScript coerces null to 0
         // and would answer `null < anyDate` = true, which would have made a NULL `syncedAt` satisfy
@@ -241,7 +242,7 @@ const state = {
   activityRows: [] as Array<Record<string, unknown>>,
   /**
    * o3d-0bfh r6: the back-reference WRITE fails (not a unique-id conflict — an ordinary transient
-   * error). QuickBooks swallows that, so the entry still succeeds while the link never landed, which
+   * error). A connector can swallow that, so the entry still succeeds while the link never landed, which
    * is the path that reaches settleFollowUpObligation's RETAINED branch.
    */
   failBackReferenceWrite: false,
@@ -480,7 +481,7 @@ mock.module('@/lib/activity-log', {
 })
 // RECORDED, not swallowed (Codex round 2, HIGH). The mirrored AccountingEvent is the ledger's own
 // copy of what IMS believes it posted, and the whole finding is that a follow-up failure on the
-// already-posted arm could stamp it FAILED for a document that is in QuickBooks. A no-op double
+// already-posted arm could stamp it FAILED for a document that is in the ledger. A no-op double
 // cannot see that, which is how the port shipped with it.
 mock.module('@/lib/domain/accounting/accounting-event-mirror', {
   namedExports: {
@@ -538,10 +539,6 @@ mock.module('@/lib/connectors/xero/bills', {
     updatePurchaseBill: async () => ({ success: true, invoiceId: 'XBILL-1' }),
   },
 })
-// o3d-remove-parked-connectors: a switchable `qboPostVerdict` and a mock for
-// `@/lib/connectors/quickbooks/bills` were here, so the QuickBooks post could be made to refuse. Both
-// went with the connector.
-
 /**
  * THE EXTERNAL SIDE EFFECT OF A NO-IDENTIFIER OPERATION, COUNTED (o3d-qn21).
  *
@@ -554,9 +551,6 @@ mock.module('@/lib/connectors/xero/bills', {
  * Counted on ENTRY, not on success: a send that throws may still have reached the customer, and the
  * subject is how many times the operation was DISPATCHED.
  */
-// o3d-remove-parked-connectors: the assertions that READ this counter were in the QuickBooks half of
-// the file (the invoice-email follow-up cases). The counter itself is kept because the mock it lives
-// in is shared, and because a re-established Xero-side version of those cases needs it.
 let emailsSent = 0
 
 mock.module('@/lib/accounting-email', {
@@ -1252,147 +1246,6 @@ test('[o3d-9kek r10 f1] a fresh post whose follow-ups fail keeps the obligation,
   )
 })
 
-// ---------------------------------------------------------------------------
-// THE QUICKBOOKS HALF OF THIS FILE IS DELETED (o3d-remove-parked-connectors)
-// ---------------------------------------------------------------------------
-//
-// TWENTY-EIGHT cases drove `processPendingQuickBooksSync` — the archived processor — and they were
-// deliberately the Xero tests again against the other writer, because three rounds running a fix had
-// landed in one connector and the identical hole had survived in the other. That whole half is gone
-// with the connector, and it is the LARGEST single block of coverage this removal takes.
-//
-// WHAT WENT WITH IT, named so it can be re-established rather than rediscovered:
-//
-//   * o3d-9kek r10 f1 — the obligation claimed IN the SYNCED write, on the fresh-post branch and on
-//     the already-posted one.
-//   * o3d-peh1 (r1, r2, r4, r5) — a REFUSED follow-up enqueue must not report the parent as settled;
-//     a plain follow-up FAILURE stays best-effort; a failure on the ALREADY-POSTED arm must never be
-//     recorded as a failed post; a persistence failure AFTER a successful post likewise; and the
-//     durable-write re-drive. These ran on QuickBooks because its catch treated every follow-up
-//     exception as best-effort and fell through to `succeeded++` — the shape the Xero arm does not
-//     have, which is exactly why they were written here.
-//   * o3d-qn21 — a no-identifier operation escalated as a REPLAY rather than a deduplicated re-post,
-//     including the case proving the replay is real (three sweeps, three dispatches).
-//   * o3d-0bfh r4/r5/r6 — the connector-versus-sweep claim interleaving on this connector; that a
-//     crash after the SYNCED/marker commit is re-driven by NOTHING here (the marker having no
-//     consumer, pinned as a FACT) with its control that the recovery logic works and is merely
-//     unreachable; and that the only human-recovery notification is not silently lost.
-//
-// WHAT SURVIVES: everything above, driven through the Xero processor, plus the two pure-function
-// backlog cases below, which need no processor at all.
-//
-// Recoverable with the connector:
-// `git show archive/quickbooks-connector:tests/accounting/followup-obligation-writers.test.ts`.
-// A bd follow-up asks for the o3d-peh1 / o3d-qn21 / o3d-0bfh r5 properties to be re-established
-// against the Xero processor, since none of them is Xero-specific.
-// ---------------------------------------------------------------------------
-
-
-// ---------------------------------------------------------------------------
-// o3d-peh1, CROSS-PORTED — A REFUSED FOLLOW-UP ENQUEUE MUST NOT REPORT THE PARENT AS SETTLED.
-//
-// `requireFollowUpsEnqueued` exists on both connectors: the enqueue can decline (the planner cannot
-// tell which of several attempts committed, or the ledger fence says the settlement is already in
-// it) and it says so by RETURNING `{ enqueued: false }`. The guard turns that into a throw so the
-// obligation release below it cannot run.
-//
-// On QuickBooks the throw landed in a catch that treats every follow-up exception as best-effort:
-// it logged an ERROR and fell through to `result.succeeded++`. So the parent was SYNCED, counted
-// synced, and the money-moving child had never been queued — the o3d-peh1 defect exactly, surviving
-// on the connector whose caller was not changed. The QuickBooks repair sweep is still unwired
-// (o3d-s36z), so nothing else was going to come back for it either.
-//
-// These run the REAL processPendingQuickBooksSync down the fresh-post branch — the branch the
-// finding names — so what is asserted is the caller's behaviour, not a re-description of the guard.
-// A passing Xero test proves nothing here: the two callers are separate code.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// CODEX ROUND 2, HIGH — THE FINAL REFUSAL MUST NOT RECORD A LIVE DOCUMENT AS A FAILED POST.
-//
-// Round 1 closed o3d-peh1 by preserving `externalTransactionId` across a refusal. That is what puts
-// the row into the ALREADY-POSTED short-circuit on its next pass, and the short-circuit does two
-// things before it touches the follow-ups: it writes the row SYNCED and it writes the mirrored
-// AccountingEvent POSTED. Then the follow-up refusal threw — into the loop's MAIN-POST failure
-// handler, whose terminal arm stamps that same mirrored event FAILED.
-//
-// So the row round 1 saved from being reported settled ended up reported as a FAILED POST of a
-// document that is in QuickBooks. Round 1's own note on `markSyncLogForFollowUpRetry` says why that
-// is the wrong write — "this document POSTED, the mirror already says so, and overwriting it would
-// make the ledger's own copy of the record contradict the ledger" — and that transition is now the
-// one both posted arms use.
-//
-// THESE DRIVE THE QUICKBOOKS LOOP, from a row that ALREADY CARRIES AN EXTERNAL ID, all the way to
-// the final retry. The Xero twin has had its own catch since o3d-nepa and passes either way, so only
-// the QuickBooks path can show this.
-// ---------------------------------------------------------------------------
-
-
-// ---------------------------------------------------------------------------
-// ROUND 4 (Codex HIGH) — THE OUTER HANDLER COULD STILL MARK AN ALREADY-POSTED DOCUMENT FAILED.
-//
-// Round 3 gave the short-circuit arm's FOLLOW-UP WORK a catch of its own and routed it to the
-// transition that writes no mirrored event. That closed one route. The generic outer handler was
-// not touched, and it still asked only "have the retries run out?" — so a failure ANYWHERE ELSE on
-// that arm reached it and, on the last retry, stamped the mirrored AccountingEvent FAILED for a
-// document that is in the ledger. The routes are real and none of them is follow-up work:
-//
-//   • the SYNCED/POSTED transaction itself, and the payload re-read before it (short-circuit arm);
-//   • the announcement inside the FRESH-POST arm's follow-up catch, which is awaited with no
-//     `.catch()` of its own — and which fires at the one moment `entry.externalTransactionId` is
-//     STALE, because the row acquired its id in this same iteration and the snapshot still says null.
-//
-// THE PRINCIPLE, RESTATED BECAUSE IT IS THE WHOLE FIX: THE EXTERNAL ID IS POST EVIDENCE, AND A
-// FAILED MIRROR CONTRADICTS A DOCUMENT THAT EXISTS. It is untrue for a transient error exactly as it
-// is for a refusal — the reasons are facts about the ledger, not about the exception. So the outer
-// handler now asks the DATABASE, in the statement that writes.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// ROUND 5 (Codex HIGH) — A POST-SUCCESS PERSISTENCE FAILURE STILL WROTE A FAILED MIRROR.
-//
-// Rounds 2 and 4 fixed the cases where the row ALREADY CARRIED an external id. The database could
-// be asked, so the outer handler could establish there was a document not to contradict, and
-// `markPostedSyncLogRetryPreservingEvidence` is that question asked in the statement that writes.
-//
-// THIS IS THE CASE WHERE THE ROW DOES NOT CARRY ONE YET. `processEntry` returns success —
-// QUICKBOOKS ALREADY HOLDS THE DOCUMENT — and the id becomes durable only in the transaction that
-// follows. When that transaction fails, the database never learns the id; the evidence fence
-// correctly answers "this row names no document" (it does not); and the ordinary failure path
-// stamps the mirrored AccountingEvent FAILED FOR A DOCUMENT THAT EXISTS. No fence built on the
-// database can close it, because at that instant the database is the thing that is wrong.
-//
-// It is o3d-jit6 on this connector. The full answer — a pre-post dispatch record — is in flight for
-// Xero on o3d-batch-prov and is filed here as o3d-tr2q. What this branch does instead is the
-// smaller thing that is unambiguously correct: the process HOLDS the returned id and KNOWS the post
-// succeeded, so it re-drives the durable write, and if that is exhausted it RECORDS AND ESCALATES
-// the unrecorded posted document rather than recording a falsehood.
-//
-// The mirror-failure assertions below are the same shape as r2's and r4's for a reason: this is the
-// third route to one untrue write, and the property is stated identically each time.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// o3d-qn21 (Codex MEDIUM) — THE ESCALATION PROMISED A DEDUPLICATION FOUR OPERATIONS DO NOT HAVE.
-//
-// Round 5's escalation is given EVERY successful QuickBooks result, and its wording told one story:
-// the row keeps its claim, the stale-claim reclaim re-posts UNDER THE SAME DERIVED INTUIT
-// REQUEST-ID, so the replay is deduplicated rather than duplicated.
-//
-// FOUR TYPES BREAK THAT SENTENCE. BILL_ATTACHMENT, INVOICE_PDF, INVOICE_EMAIL and WC_INVOICE_NOTE
-// are not document posts: they upload a file, save a PDF, SEND AN EMAIL, write a note onto a
-// WooCommerce order. None reaches the idempotent poster, none carries a Request-Id, and every one
-// returns success with no external id. For them the reclaim is not a deduplicated replay — it is the
-// side effect again, on every sweep.
-//
-// ROUNDS 6 AND 7 STAY REVERTED. This is a MESSAGE fix, not the fence: both attempts at the fence
-// were unsound (a claim is not proof of dispatch; a failure is not proof of no effect) and the hole
-// is filed as o3d-qn21. What these tests pin is that the record an operator reads no longer
-// describes a protection that is not there — and, in the second test, that the replay it now warns
-// about is real, so the wording is true rather than merely different.
-// ---------------------------------------------------------------------------
-
-
 // o3d-0bfh r4 (Codex HIGH) — THE CONNECTOR-VERSUS-SWEEP INTERLEAVING.
 //
 // r3 made the SWEEP's claim a strictly-later compare-and-set and proved it exclusive BETWEEN SWEEPS.
@@ -1489,53 +1342,6 @@ test('[o3d-0bfh r4] an UNDISTURBED row is still released — the fence must not 
   assert.equal(state.syncRows.filter((row) => row.type === 'BILL_ATTACHMENT').length, 1)
 })
 
-// ---------------------------------------------------------------------------
-// o3d-0bfh r5 (Codex HIGH) — THE QUICKBOOKS MARKER HAS NO CONSUMER, PINNED AS A FACT.
-//
-// Codex asked for "a test that terminates execution after the SYNCED/marker transaction and proves a
-// later production run enqueues the outstanding money work". On QuickBooks that test CANNOT PASS,
-// and that is the finding rather than an obstacle to it: there is no sweep binding and no cron
-// invocation, so nothing re-reads the marker. The honest test is therefore the inverse — the same
-// crash, the same later production run, and an assertion of exactly how far it gets — which turns a
-// silent hole into a named one that fails the day somebody closes it without reading the plan.
-//
-// THE CRASH STATE IS PRODUCED BY THE REAL PROCESSOR, NOT SEEDED. A hand-built row would drift from
-// whatever the connector actually leaves behind, and then the gap this pins would be a gap in the
-// test's imagination. Run one is the existing fresh-post-with-failing-follow-ups path: it commits
-// SYNCED with the external id, claims the obligation in that same transaction, fails the enqueue,
-// swallows it and counts the entry succeeded. That is byte-for-byte the state a process death one
-// instruction after the commit leaves.
-//
-// AND THE CONTROL BELOW IS THE POINT OF THE WHOLE BLOCK AT THE END OF THE QUICKBOOKS PROCESSOR: the
-// recovery logic EXISTS and works perfectly. The idempotency branch re-claims and re-enqueues the
-// outstanding work exactly as it should. It is simply unreachable, because no candidate query on
-// this connector will ever select the row again. Without that control, "run two enqueued nothing"
-// would be equally satisfied by a harness that cannot observe an enqueue at all.
-// ---------------------------------------------------------------------------
-
-
-// ---------------------------------------------------------------------------
-// o3d-0bfh r6 (Codex HIGH) — THE ONLY HUMAN-RECOVERY NOTIFICATION COULD BE SILENTLY LOST.
-//
-// The two QuickBooks paths above said, in as many words, that the activity entry IS the notification
-// and human action is the entire recovery. Both wrote it with `logActivity`, which swallows a
-// persistence failure and resolves `void` — so the appended `.catch()` could never fire on the
-// failure that matters. The entry was then counted successful, the row stayed SYNCED, nothing
-// selected it again, and no sweep consumes its marker: one transient activity-log failure left a
-// payment, PDF, email or attachment permanently stalled with NO operator-visible notice at all.
-//
-// The fix is not a better log line. It is that the obligation is no longer announced only in the log:
-// the marker on the row — a state that is already committed by the time any of this runs — is
-// surfaced as an operational backlog (buildFollowUpObligationBacklogWhere, rendered in the exception
-// inbox). A row carrying a marker with no consumer is ALREADY a queryable state, and a view over it
-// depends on no second write landing at the worst possible moment.
-//
-// SO THESE TESTS FAIL THE ACTIVITY-LOG INSERT AND ASSERT THE OBLIGATION IS STILL VISIBLE, by
-// evaluating the PRODUCTION where-clause against the row the production processor left behind. The
-// where-interpreter throws on any predicate it cannot honour, so this cannot degrade into "some
-// query matched something".
-// ---------------------------------------------------------------------------
-
 /**
  * Does the operational backlog select this row? The REAL predicate, evaluated by the same matcher
  * every other assertion in this file uses. `now` is pushed past the settling grace, because a row
@@ -1574,20 +1380,15 @@ test('[o3d-0bfh r7] a FAILED row that never reached SYNCED is aged on createdAt,
   // `syncedAt`; without the createdAt branch it could never be listed at all, and FAILED is one of
   // the two statuses this backlog exists for.
   //
-  // o3d-remove-parked-connectors — WHY THE ROW STILL NAMES AN ARCHIVED CONNECTOR.
-  //
-  // The backlog's population IS `CONNECTORS_WITHOUT_FOLLOW_UP_CONSUMER` — connectors whose retained
-  // markers nothing re-reads — so the connector is NOT immaterial here: a Xero row is deliberately
-  // excluded, because Xero's sweep comes back for it. QuickBooks was the only connector in that
-  // population and is archived, and its registry entry is KEPT for exactly this reason (see
-  // lib/domain/accounting/follow-up-obligation-registry.ts): development databases hold SYNCED and
-  // FAILED `quickbooks` rows with a non-null marker, and this backlog is the one screen that lists
-  // them. So the fixture names it directly rather than through `reset`, and this case is now about a
-  // HISTORICAL row — which is the only kind there will ever be.
+  // WHY THE ROW NAMES A RETIRED CONNECTOR. The backlog's population is every connector NOT declared
+  // with a sweep (`CONNECTORS_WITH_FOLLOW_UP_SWEEP`), so the connector is NOT immaterial here: a Xero
+  // row is deliberately excluded, because Xero's sweep comes back for it. A row written by a
+  // connector this build no longer registers is still listed — it is the one screen that shows such
+  // rows. So the fixture names a retired id directly rather than through `reset`.
   reset()
   const row: SyncRow = {
     ...blankRow(),
-    connector: 'quickbooks',
+    connector: 'retired-ledger',
     status: 'FAILED',
     syncedAt: null,
     createdAt: new Date(Date.now() - 60 * 60_000),

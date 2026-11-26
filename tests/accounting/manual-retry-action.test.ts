@@ -242,11 +242,6 @@ const ledgerHoldsTheAttemptOn = (invoiceId: string) =>
 
 const ACTIONS = [
   { connector: 'xero', module: '@/app/actions/xero-sync', fn: 'retryFailedXeroSync', refusalAction: 'xero_manual_retry_refused' },
-  // o3d-remove-parked-connectors: the second entry was `app/actions/quickbooks-sync.ts`'s
-  // `retryFailedQuickBooksSync`, and every case in the loop below therefore ran against BOTH manual
-  // retry actions. It is archived. The loop shape is kept so a second action inherits every case;
-  // what is lost is the cross-port evidence that the o3d-0m56 guard is honoured by an
-  // independently-written second action.
 ] as const
 
 type RetryFn = (entryId?: string) => Promise<{ success: boolean; reset: number; refused?: number; error?: string }>

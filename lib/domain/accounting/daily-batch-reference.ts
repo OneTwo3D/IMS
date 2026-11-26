@@ -18,7 +18,7 @@
  *
  * Reference shapes in the wild:
  *   Xero        `<group>-<YYYY-MM-DD>-<8 lowercase hex>`  (buildDailyBatchReferenceId)
- *   QuickBooks  `<group>-<YYYY-MM-DD>`
+ *   bare        `<group>-<YYYY-MM-DD>`  (no digest; still parsed, and still what a derived reference looks like)
  * where group is A1 (revenue deferral), A2 (inventory allocation) or B (shipment COGS).
  */
 
@@ -40,7 +40,7 @@ export type ParsedDailyBatchReference = {
   group: DailyBatchGroupCode
   /** The BATCH's own date, `YYYY-MM-DD`. Not the stage stamp's date. */
   date: string
-  /** The 8-hex entity digest (Xero), or null for the bare QuickBooks shape. */
+  /** The 8-hex entity digest (Xero), or null for the bare, digest-less shape. */
   digest: string | null
 }
 

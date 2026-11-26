@@ -733,7 +733,7 @@ const DAILY_BATCH_EVENT_TYPES = new Set([
 
 // Live Xero daily-batch logs carry a digest-suffixed referenceId
 // (buildDailyBatchReferenceId -> `<group>-<date>-<8 hex>`), and accounting-event-mirror copies that
-// string verbatim into AccountingEvent.sourceEntityId. QuickBooks writes the bare `<group>-<date>`.
+// string verbatim into AccountingEvent.sourceEntityId. A bare `<group>-<date>` (no digest) is also tolerated.
 // Same rule, same regex, same reason as invariants.ts stripDailyBatchDigest (scjz.37).
 function stripDailyBatchDigest(sourceEntityId: string): string {
   return sourceEntityId.replace(/-[0-9a-f]{8}$/, '')
@@ -2075,8 +2075,8 @@ async function collectVoidMirrorContradictions(
  *     same key and matched each other.
  *
  * None of the three is reachable from rows IMS writes: `accounting_sync_logs.connector` is NOT NULL
- * DEFAULT 'xero', and the create/upsert sites in the tree set 'xero', 'quickbooks', XERO_CONNECTOR,
- * QBO_CONNECTOR or a caller's connector, or leave the default — never an empty string; no system is
+ * DEFAULT 'xero', and the create/upsert sites in the tree set 'xero', XERO_CONNECTOR
+ * or a caller's connector, or leave the default — never an empty string; no system is
  * named `*`; and a reference type containing `|` is not one IMS uses. Where they could differ, the
  * equalities are the correct answer: each of the three made an unrelated event count as this row's
  * mirror, i.e. a false NEGATIVE in a detector.

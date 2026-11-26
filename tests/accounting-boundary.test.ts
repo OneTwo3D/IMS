@@ -33,7 +33,7 @@ function staticImportSpecifiers(code: string): string[] {
  * definition list and the keyed factory. It is the opposite of what this rule forbids: the rule
  * exists so a new accounting connector does not require editing this file, and resolving "which
  * connectors exist" from the registry is precisely what makes that true. The alternative is the
- * shape this branch removed — hand-written `if (id === 'xero') … if (id === 'quickbooks')` chains,
+ * shape this branch removed — hand-written `if (id === 'xero') … if (id === '<other>')` chains,
  * which name connectors in this file and have to be edited for every new one.
  *
  * It is allowed BY NAME, not by pattern: `lib/connectors/xero/...` and every other connector module
@@ -60,13 +60,13 @@ test('the allowance names only modules that really are in the file, and really a
   const specifiers = staticImportSpecifiers(source)
   for (const allowed of CONNECTOR_AGNOSTIC_IMPORTS) {
     assert.ok(specifiers.includes(allowed), `${allowed} is allowed but not imported — delete the allowance`)
-    assert.ok(!/xero|quickbooks|woocommerce|mintsoft|shopify/i.test(allowed),
+    assert.ok(!/xero|woocommerce|mintsoft|shopify/i.test(allowed),
       `${allowed} names a connector, so it cannot be allowed as connector-agnostic`)
   }
 })
 
 test('lib/accounting.ts static imports name no specific accounting connector (bulhr)', () => {
-  const offenders = staticImportSpecifiers(source).filter((spec) => /xero|quickbooks/i.test(spec))
+  const offenders = staticImportSpecifiers(source).filter((spec) => /xero/i.test(spec))
   assert.deepEqual(
     offenders,
     [],
@@ -76,7 +76,7 @@ test('lib/accounting.ts static imports name no specific accounting connector (bu
 
 test('exported type names in lib/accounting.ts are connector-agnostic (bulhr)', () => {
   const exportedTypeNames = [...source.matchAll(/^export\s+(?:type|interface)\s+([A-Za-z0-9_]+)/gm)].map((m) => m[1])
-  const offenders = exportedTypeNames.filter((name) => /Xero|QuickBooks/i.test(name))
+  const offenders = exportedTypeNames.filter((name) => /Xero/i.test(name))
   assert.deepEqual(
     offenders,
     [],

@@ -3,16 +3,14 @@ import type { IntegrationConnectionTestState } from '@/lib/integration-connectio
 import type { MissingTaxRatePreviewResult, MissingTaxRateGenerateResult } from '@/lib/tax/generate-missing-tax-rates'
 
 /**
- * ONE ENTRY TODAY (o3d-remove-parked-connectors). QuickBooks was the second and is archived — see
- * archive/connectors/README.md and docs/archive/quickbooks-connector-removal.md. The union, the
+ * ONE ENTRY TODAY. The union, the
  * definition list, the definition lookup and the factory below are all still driven by the registry
  * rather than by a Xero literal, so a second connector is a registration plus a factory entry.
  *
  * WHAT A UNION OF ONE COSTS, stated rather than implied: nothing drives the accounting seam with a
  * second id any more, because there is no second id. The genericity of everything keyed by
- * `AccountingConnectorId` is type-checked, not tested. The removal note's "What is no longer proven"
- * enumerates the specific losses; do not read a green suite as evidence that a second accounting
- * connector would work.
+ * `AccountingConnectorId` is type-checked, not tested. Do not read a green suite as evidence that a
+ * second accounting connector would work.
  */
 export type AccountingConnectorId = 'xero'
 
@@ -171,14 +169,13 @@ export const ACCOUNTING_CONNECTORS: readonly AccountingConnectorDef[] = [
 
 /**
  * Whether a value — typically a `connector` string read back off a stored row — names a connector
- * THIS BUILD registers (o3d-remove-parked-connectors).
+ * THIS BUILD registers.
  *
  * The `connector` columns on `AccountingSyncLog`, `AccountingToken`, `AccountingAccount` and
  * `AccountingAccountBalanceSnapshot` are plain `String @default("xero")`, so a row can name a
- * connector that has since been archived — development databases hold `quickbooks` rows right now.
- * Several call sites used to test that with a literal pair (`=== 'xero' || === 'quickbooks'`), which
- * both hard-codes the roster and, worse, would accept `quickbooks` after the code to service it was
- * gone. One predicate, keyed off the registry, is the answer to both.
+ * connector this build no longer registers. A literal roster test would both hard-code the roster and
+ * accept an id after the code to service it was gone; one predicate, keyed off the registry, avoids
+ * both.
  */
 export function isRegisteredAccountingConnector(value: unknown): value is AccountingConnectorId {
   return typeof value === 'string' && ACCOUNTING_CONNECTORS.some((connector) => connector.id === value)
@@ -191,12 +188,10 @@ export function getAccountingConnectorDefinition(id: AccountingConnectorId): Acc
 }
 
 /**
- * THE FACTORY, KEYED BY THE REGISTRY (o3d-remove-parked-connectors).
+ * THE FACTORY, KEYED BY THE REGISTRY.
  *
- * This used to be `if (id === 'quickbooks') { ...45 methods... }` followed by a fall-through to
- * Xero — not a map, not even a switch, and one edit away from being deleted as an `if` with one arm.
- * Removing QuickBooks was the moment to take that back rather than leave a bare `return xero()`
- * behind, because a bare return is what a second connector would have to reverse-engineer.
+ * A keyed record rather than a bare `return xero()` or an `if` with one arm, because a bare return is
+ * what a second connector would have to reverse-engineer.
  *
  * The record is TOTAL over `AccountingConnectorId`, so adding an id to the union is a `tsc` error
  * here until a builder is supplied, and the builder is typed per key (`(def) => AccountingConnector`

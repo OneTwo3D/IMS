@@ -281,9 +281,8 @@ for (const path of CALL_PATHS) {
     // downstream cannot represent. Two of the three reasons are now fixed: the movement
     // builder used to abs() the total (so a -£4 layer booked a +£4 TRANSFER_IN) and now
     // refuses a negative implied unit cost instead, on the from-total and from-consumed
-    // forms alike (o3d-gd2f). The third stands: both connector daily syncs emit the COGS
-    // pair only when the batch total is above zero (xero/daily-sync.ts:2104 and :2144,
-    // quickbooks/daily-sync.ts:1324 and :1354), and log no skip when they do not.
+    // forms alike (o3d-gd2f). The third stands: the connector daily sync emits the COGS
+    // pair only when the batch total is above zero (xero/daily-sync.ts:2104 and :2144), and logs no skip when they do not.
     // Round 5 refuses, and refusing is only safe because NOTHING is written.
     const { store, tx } = createStore(false)
 

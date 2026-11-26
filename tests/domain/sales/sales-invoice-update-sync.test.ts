@@ -101,16 +101,16 @@ test('queueSalesInvoiceUpdateForExistingAccountingInvoice queues Xero update wit
 
 test('queueSalesInvoiceUpdateForExistingAccountingInvoice skips non-Xero connectors with warning activity', async () => {
   const { deps, queued, activity } = makeDeps({
-    connector: { id: 'quickbooks', name: 'QuickBooks' },
+    connector: { id: 'retired-ledger', name: 'Retired Ledger' },
     enabled: true,
   })
 
   // o3d-j625: the chart AGREES with the active connector here, so the refusal under test is the
-  // unsupported-connector one and not the chart mismatch. A QuickBooks-charted payload offered while
-  // QuickBooks is active is exactly the case this test is about.
-  // o3d-j625 r3: and the INVOICE is QuickBooks' too, so the document-provenance refusal is not the one
+  // unsupported-connector one and not the chart mismatch. A payload charted for another connector offered while
+  // that connector is active is exactly the case this test is about.
+  // o3d-j625 r3: and the INVOICE is that connector's too, so the document-provenance refusal is not the one
   // exercised either.
-  await queueSalesInvoiceUpdateForExistingAccountingInvoice({ ...baseParams, chartConnector: 'quickbooks', documentConnector: 'quickbooks' }, deps)
+  await queueSalesInvoiceUpdateForExistingAccountingInvoice({ ...baseParams, chartConnector: 'retired-ledger', documentConnector: 'retired-ledger' }, deps)
 
   assert.equal(queued.length, 0)
   assert.equal(activity.length, 1)
@@ -120,11 +120,11 @@ test('queueSalesInvoiceUpdateForExistingAccountingInvoice skips non-Xero connect
     action: 'sales_invoice_update_skipped_unsupported_connector',
     tag: 'accounting',
     level: 'WARNING',
-    description: 'Sales invoice update for SO-1001 was not queued because QuickBooks invoice updates are not supported yet',
+    description: 'Sales invoice update for SO-1001 was not queued because Retired Ledger invoice updates are not supported yet',
     metadata: {
       accountingInvoiceId: 'xero-invoice-1',
       orderNumber: 'SO-1001',
-      connector: 'quickbooks',
+      connector: 'retired-ledger',
       idempotencyKey: baseParams.idempotencyKey,
     },
   })
@@ -177,7 +177,7 @@ test('[o3d-j625 r4] an already-queued answer is recorded as queued, and says so'
  * `queueSalesInvoiceForOrder` reads `getAccountingSettings()` — which resolves the active connector
  * internally and returns THAT connector's chart — builds the update payload out of those codes, and then
  * calls this helper, which resolved the active connector AGAIN and handed the payload to `queueXeroSync`.
- * Two independent reads: with QuickBooks active the payload is composed with QuickBooks
+ * Two independent reads: with another connector active the payload is composed with that connector's
  * `salesAccount`/`shippingAccount`/`discountAccount`, a switch to Xero commits, and this queued that
  * document as a XERO invoice update. Xero then rejects it, or posts the order's revenue against
  * whatever those codes happen to name in its own chart.
@@ -186,26 +186,26 @@ test('[o3d-j625 r4] an already-queued answer is recorded as queued, and says so'
  * order, so refusing costs a re-save and writing the wrong one costs a wrong document in a live ledger.
  */
 
-test('[o3d-j625] a payload built from QuickBooks’s chart is NOT queued as a Xero invoice update', async () => {
+test('[o3d-j625] a payload built from another connector’s chart is NOT queued as a Xero invoice update', async () => {
   const { deps, queued, activity } = makeDeps({
     connector: { id: 'xero', name: 'Xero' },
     enabled: true,
   })
 
-  // The window: the chart was read while QuickBooks was active, the switch to Xero committed during the
+  // The window: the chart was read while another connector was active, the switch to Xero committed during the
   // payload build, and Xero is what this helper resolves.
   await queueSalesInvoiceUpdateForExistingAccountingInvoice(
-    { ...baseParams, chartConnector: 'quickbooks' },
+    { ...baseParams, chartConnector: 'retired-ledger' },
     deps,
   )
 
-  assert.equal(queued.length, 0, 'a QuickBooks-charted document must not be queued to Xero')
+  assert.equal(queued.length, 0, 'a document charted for another connector must not be queued to Xero')
   assert.equal(activity.length, 1)
   const refusal = activity[0] as { action: string; description: string; metadata: Record<string, unknown> }
   assert.equal(refusal.action, 'sales_invoice_update_refused_retired_chart')
   assert.match(refusal.description, /NOTHING WAS QUEUED/)
   assert.match(refusal.description, /still OUTSTANDING/)
-  assert.equal(refusal.metadata.chartConnector, 'quickbooks')
+  assert.equal(refusal.metadata.chartConnector, 'retired-ledger')
   assert.equal(refusal.metadata.connector, 'xero')
 })
 
@@ -241,7 +241,7 @@ test('[o3d-j625] the refusal is a MISMATCH check, not a new reason to skip Xero:
 
 // o3d-j625 r3 (Codex HIGH 2) — the chart can agree while the INVOICE id is another connector's.
 for (const [label, documentConnector] of [
-  ['recorded under the OTHER connector', 'quickbooks'],
+  ['recorded under the OTHER connector', 'retired-ledger'],
   ['never recorded (a link predating the column)', null],
 ] as const) {
   test(`queueSalesInvoiceUpdateForExistingAccountingInvoice REFUSES an invoice ${label}, even with the chart agreeing`, async () => {
@@ -260,7 +260,7 @@ for (const [label, documentConnector] of [
 // o3d-j625 r4 — a refusal is OUTSTANDING work an operator can find, not only an Activity line.
 test('[o3d-j625 r4] every refusal on this path records an outstanding posting carrying BOTH connectors and a remedy', async () => {
   const cases = [
-    { params: { ...baseParams, chartConnector: 'quickbooks' as const }, reason: 'retired_chart' },
+    { params: { ...baseParams, chartConnector: 'retired-ledger' as const }, reason: 'retired_chart' },
     { params: { ...baseParams, documentConnector: null }, reason: 'unattributable_document_id' },
   ]
   for (const { params, reason } of cases) {
@@ -324,7 +324,7 @@ test('[Codex r18] the claim-held log states only the known enqueue result and cl
 })
 
 test('[Codex r19] the unattributable-document refusal never advises a re-post: it requires the ledger check and forbids the re-post', async () => {
-  for (const documentConnector of [undefined, 'quickbooks'] as const) {
+  for (const documentConnector of [undefined, 'retired-ledger'] as const) {
     const { deps, activity } = makeDeps({ connector: { id: 'xero', name: 'Xero' }, enabled: true })
     await queueSalesInvoiceUpdateForExistingAccountingInvoice({ ...baseParams, documentConnector: documentConnector as never }, deps)
     const logged = activity.find((a) => (a as { action: string }).action === 'sales_invoice_update_refused_unattributable_document') as { description: string }

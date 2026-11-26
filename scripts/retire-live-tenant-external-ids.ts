@@ -30,8 +30,8 @@
  * Both consumers key purely on the id being present, so clearing an id does remove the row from
  * both paths by construction:
  *   • the back-reference sweep selects `externalTransactionId: { not: null }`
- *     (lib/domain/accounting/back-reference.ts:402 — moved out of sync-processor.ts and now shared
- *     with QuickBooks; repairXeroBackReferences is a thin wrapper at sync-processor.ts:1650)
+ *     (lib/domain/accounting/back-reference.ts:402 — moved out of sync-processor.ts;
+ *     repairXeroBackReferences is a thin wrapper at sync-processor.ts:1650)
  *   • the payment pollers match documents by `accountingInvoiceId: { in: [...] }`
  *     (lib/connectors/xero/payment-poller.ts:101,177,248)
  *

@@ -269,6 +269,26 @@ test('the sale-cancel sweep does NOT stamp a revision-0 PENDING row that lacks t
   for (const id of ['no-custody', 'attempted']) assert.equal(store.get(id)?.attemptRevision, 0, `${id} stays at revision 0 (no forged attempt)`)
 })
 
+test('o3d-g5t0y: the sale-cancel sweep retires a revision-0 PENDING row of a RETIRED connector, but does NOT stamp it pre-call', async () => {
+  // A connector this build no longer registers cannot be shown to bump `attemptRevision` on a claim, so
+  // revision 0 plus custody plus no attempt stamp (the shape a sales-invoice row keeps after a claim that
+  // failed and went back to PENDING) is not proof nothing was sent. It is still an orphan: retired, but
+  // UNSTAMPED, so it reads UNKNOWN. The registered connector's identical row is the control.
+  const store = createSyncLogStore([
+    syncLogRow({ ...CLAIMED_ROW, id: 'registered', connector: 'xero', status: 'PENDING', attemptRevision: 0, attemptStampingCustodyAt: NOW }),
+    syncLogRow({ ...CLAIMED_ROW, id: 'retired', connector: 'retired-ledger', status: 'PENDING', attemptRevision: 0, attemptStampingCustodyAt: NOW }),
+  ])
+  const { tx } = storeTx(store)
+  const retired = await cancelPendingSalesInvoiceSyncForOrder(tx, 'order-1', NOW)
+  const standing = (id: string) => ledgerStanding(STANDING_COLUMNS(id, store))
+  assert.equal(retired, 2, 'both are retired')
+  assert.equal(store.get('retired')?.status, 'CANCELLED')
+  assert.equal(standing('registered'), 'PROVEN_NOT_POSTED')
+  assert.equal(standing('retired'), 'UNKNOWN')
+  assert.notEqual((store.get('retired') as unknown as { abandonedBeforeRemoteCall?: boolean | null }).abandonedBeforeRemoteCall, true)
+  assert.equal(store.get('retired')?.attemptRevision, 0, 'and stays at revision 0 (no forged attempt)')
+})
+
 test('o3d-f709: the writer and the ENQUEUE DECISION agree - a never-claimed cancelled row re-enqueues, a claimed one refuses', async () => {
   const store = createSyncLogStore([
     syncLogRow({ ...CLAIMED_ROW, id: 'never-claimed', status: 'PENDING', attemptRevision: 0, attemptStampingCustodyAt: NOW }),
@@ -444,12 +464,12 @@ test('retireSalesInvoiceForCancelledOrder never retires a row that already names
 })
 
 test('an UNFENCED caller retires its row and leaves it at revision 0, forging no attempt', async () => {
-  // The QuickBooks shape: that processor stamps no attempt revision, so it can name none. It is retired
+  // The unfenced shape: a processor that stamps no attempt revision can name none. It is retired
   // on the remaining guards alone, and the row must NOT come out claiming to have had an attempt — a
   // forged revision 1 would let a later decision believe it was fenced when nothing ever fenced it.
   const store = createSyncLogStore([syncLogRow({
     ...CLAIMED_ROW,
-    connector: 'quickbooks',
+    connector: 'retired-ledger',
     status: 'PROCESSING',
     attemptRevision: 0,
     processingStartedAt: new Date('2026-07-18T11:59:00.000Z'),
@@ -498,7 +518,7 @@ test('the cancel-time sweep advances the fence, so a stale-claim worker cannot r
 
 test('the cancel-time sweep leaves an UNFENCED row at revision 0 rather than forging an attempt', async () => {
   const store = createSyncLogStore([
-    syncLogRow({ ...CLAIMED_ROW, id: 'qbo-1', connector: 'quickbooks', status: 'PENDING', attemptRevision: 0 }),
+    syncLogRow({ ...CLAIMED_ROW, id: 'retired-1', connector: 'retired-ledger', status: 'PENDING', attemptRevision: 0 }),
     syncLogRow({ ...CLAIMED_ROW, id: 'xero-1', status: 'PENDING', attemptRevision: 2 }),
   ])
   const { tx } = storeTx(store)
@@ -506,8 +526,8 @@ test('the cancel-time sweep leaves an UNFENCED row at revision 0 rather than for
   const retired = await cancelPendingSalesInvoiceSyncForOrder(tx, 'order-1', NOW)
 
   assert.equal(retired, 2, 'both fence classes are swept')
-  assert.equal(store.get('qbo-1')?.status, 'CANCELLED')
-  assert.equal(store.get('qbo-1')?.attemptRevision, 0, 'revision 0 means "never fence-claimed" and must stay 0')
+  assert.equal(store.get('retired-1')?.status, 'CANCELLED')
+  assert.equal(store.get('retired-1')?.attemptRevision, 0, 'revision 0 means "never fence-claimed" and must stay 0')
   assert.equal(store.get('xero-1')?.status, 'CANCELLED')
   assert.equal(store.get('xero-1')?.attemptRevision, 3)
 })

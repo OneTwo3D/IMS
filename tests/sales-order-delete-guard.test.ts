@@ -161,7 +161,7 @@ test('dailyBatchDateKey maps a stage stamp to the batch UTC date, and null throu
 test('dailyBatchReferenceWhere matches both the bare and digest-suffixed referenceId shapes', () => {
   const where = dailyBatchReferenceWhere('A2', A2_STAGED_AT)
   assert.ok(where)
-  // QuickBooks writes the bare `<group>-<date>`; Xero appends an 8-hex entity digest.
+  // A bare `<group>-<date>` (no digest) is also matched; Xero appends an 8-hex entity digest.
   assert.equal(matches(syncLog({ referenceId: 'A2-2026-07-20' }), where as WhereNode), true)
   assert.equal(matches(syncLog({ referenceId: 'A2-2026-07-20-1a2b3c4d' }), where as WhereNode), true)
   // A different day's batch must not match.
@@ -769,11 +769,11 @@ test('o3d-0qoo: an A2 batch staged across UTC midnight blocks — Xero digest re
   assert.match(blocker!.message, /A2-2026-07-20-1a2b3c4d/)
 })
 
-test('o3d-0qoo: an A1 batch staged across UTC midnight blocks — bare QuickBooks reference', async () => {
+test('o3d-0qoo: an A1 batch staged across UTC midnight blocks — bare (digest-less) reference', async () => {
   const blocker = await findSalesOrderDeleteBlocker(
     makeTx({
       syncLogs: [syncLog({
-        id: 'a1', connector: 'quickbooks', type: 'DAILY_BATCH_REVENUE_DEFERRAL', status: 'PENDING',
+        id: 'a1', connector: 'xero', type: 'DAILY_BATCH_REVENUE_DEFERRAL', status: 'PENDING',
         referenceType: 'DailyBatch', referenceId: 'A1-2026-07-20',
       })],
     }),

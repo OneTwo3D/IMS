@@ -299,7 +299,7 @@ const EXTERNAL_CREDIT_NOTE_ID_NAMES = ['accounting_credit_note_id', 'accountingC
  * `meta.driverAdapterError.cause.constraint.fields`. So every live P2002 fell into the old
  * "unnamed target" branch — and that branch returned TRUE. A `SalesOrderRefund.externalRefundId`
  * violation, or any other unique constraint on any of these models, was therefore reported to the
- * operator as an accounting-id collision, with a message naming a realm switch and a remedy that
+ * operator as an accounting-id collision, with a message naming a tenant switch and a remedy that
  * has nothing to do with the constraint that actually failed.
  *
  * It also matched by SUBSTRING, so a hypothetical `accounting_invoice_id_hash` counted as ours.
@@ -424,11 +424,11 @@ export async function resolvePurchaseOrderBackReference(
   //     it. Both need a human; neither is repaired by writing a second copy.
   //
   // GLOBALLY, not per-connection. The unique index is on the VALUE alone, so this single lookup
-  // finds the holder whoever it is. That is deliberately strict: a QuickBooks realm switch can
-  // leave a retired company's bill holding an integer the new company has since reissued, and this
-  // will then report a conflict and refuse. A blocked write with a loud error is the correct trade
+  // finds the holder whoever it is. That is deliberately strict: a switch of accounting
+  // tenant can leave a retired organisation's bill holding an id the new one has since reissued, and
+  // this will then report a conflict and refuse. A blocked write with a loud error is the correct trade
   // — see applyBackReference's bill-keyed message, and o3d-gt8r for the connector-tenant isolation
-  // work that would let two realms coexist safely.
+  // work that would let two tenants coexist safely.
   if (params.externalId) {
     const holder = await deps.purchaseInvoice.findFirst({
       where: { accountingInvoiceId: params.externalId },
@@ -596,9 +596,9 @@ export function backReferenceHolder(type: AccountingSyncType, referenceType: str
  * THE STATUSES whose external id is a durable record of a post that may still need linking locally.
  *
  * SYNCED is the obvious one — the post succeeded and the row is the local record of it, including
- * the QuickBooks quarantine state (SYNCED with the conflict in `errorMessage`, deliberately not
- * flipped out of SYNCED because that would stop the row suppressing its own re-enqueue and the
- * document would post twice).
+ * the quarantine state a retired connector could leave (SYNCED with the conflict in `errorMessage`,
+ * deliberately not flipped out of SYNCED because that would stop the row suppressing its own
+ * re-enqueue and the document would post twice).
  *
  * FAILED belongs here too, and getting that wrong would have silently gutted the release path. XERO
  * DOES NOT QUARANTINE: `updateBackReference` lets the refusal propagate, the caller runs
@@ -637,8 +637,8 @@ export function syncTypeWritesBackReference(type: AccountingSyncType, referenceT
 //
 // `backReferenceFollowUpsPendingAt` is that record. r9 added it and wired it into the SWEEP only;
 // the sweep is the repair route and the connectors are where most rows actually go, so r10 wired it
-// here — ONCE, shared, rather than a copy per connector. Copies are exactly how the two connectors
-// drifted before (see the QuickBooks writer's own comment about its hand-rolled back-reference).
+// here — ONCE, shared, rather than a copy per connector. Copies are exactly how connectors
+// drifted before.
 //
 // TWO RULES, and they are what make the marker worth having:
 //
@@ -656,10 +656,10 @@ export function syncTypeWritesBackReference(type: AccountingSyncType, referenceT
 //
 //      THAT ASYMMETRY IS ONLY THIS FAVOURABLE WHERE A SWEEP EXISTS (o3d-0bfh r5, Codex HIGH). It is
 //      stated as a property of the protocol and it is really a property of the CONSUMER: "costs one
-//      idempotent re-enqueue" presumes something re-reads the marker. QuickBooks has no sweep
-//      binding and no cron invocation, so on that connector a retained marker is re-read by nothing
+//      idempotent re-enqueue" presumes something re-reads the marker. A connector with no sweep
+//      binding and no cron invocation has a retained marker re-read by nothing
 //      and the outstanding payment, PDF, email or attachment never runs. Retaining is still the
-//      right direction there — it is never worse than clearing — but it buys EVIDENCE, not repair,
+//      right direction on such a connector — it is never worse than clearing — but it buys EVIDENCE, not repair,
 //      and callers must say which they are getting: see {@link FollowUpObligationRecovery}.
 //
 // AND RULE 3, WHICH IS WHAT r4 ADDED (o3d-0bfh r4, Codex HIGH). EVERY WRITER AND EVERY RELEASER OF
@@ -813,10 +813,9 @@ export type FollowUpObligationReleaseOutcome = 'released' | 'superseded' | 'unwr
  *
  * Every message this module used to emit ended with some form of "a later sweep will re-enqueue
  * them". On Xero that is true — `repairXeroBackReferences` is bound and cron invokes it. ON
- * QUICKBOOKS IT IS FALSE: there is no sweep binding and no cron invocation (see the block at the end
- * of lib/connectors/quickbooks/sync-processor.ts), so a retained marker is read by NOTHING. The
- * asymmetry of rule 2 above — "a marker left set costs one idempotent re-enqueue on a later sweep" —
- * silently assumed a consumer that only one of the two connectors has.
+ * A CONNECTOR WITH NO SWEEP IT IS FALSE: there is no sweep binding and no cron invocation, so a
+ * retained marker is read by NOTHING. The asymmetry of rule 2 above — "a marker left set costs one
+ * idempotent re-enqueue on a later sweep" — silently assumed a consumer that not every connector has.
  *
  * That assumption is not a documentation slip; it is the load-bearing half of the whole design. The
  * protocol deliberately prefers RETAINING a marker to clearing one, on the ground that retention
@@ -828,8 +827,8 @@ export type FollowUpObligationReleaseOutcome = 'released' | 'superseded' | 'unwr
  *
  * So the caller has to STATE which case it is in, and the compiler makes it: this is a required
  * field, not an optional one with a convenient default. A default would have been read as `sweep` by
- * whichever connector forgot to think about it, which is exactly how QuickBooks acquired the claim
- * side of this protocol without the consumer side and had it read as complete for three rounds.
+ * whichever connector forgot to think about it, which is exactly how a connector could acquire the claim
+ * side of this protocol without the consumer side and have it read as complete.
  */
 export type FollowUpObligationRecovery =
   /** A repair sweep is bound for this connector and cron invokes it: a retained marker is re-read. */
@@ -874,7 +873,7 @@ export function followUpObligationRecoveryNote(recovery: FollowUpObligationRecov
  *
  * WHETHER IT IS ALSO RECOVERABLE IS THE CALLER'S FACT TO STATE, NOT THIS MODULE'S TO ASSUME (o3d-0bfh
  * r5, Codex HIGH). Both deferring outcomes above used to end "and a later sweep will discharge it".
- * That sentence is true on Xero and false on QuickBooks, which has no sweep binding at all — see
+ * That sentence is true on Xero and false on a connector with no sweep binding — see
  * {@link FollowUpObligationRecovery}. `recovery` is therefore required, and what these messages say
  * about the outstanding work now comes from the caller rather than from a hope this module holds
  * about connectors in general. On a connector with no consumer the line says so in as many words, so
@@ -1202,25 +1201,24 @@ export async function backReferenceIsMissing(deps: BackReferenceDeps, params: Ba
 // ---------------------------------------------------------------------------
 // THE ROUTE FORWARD out of a refused external-id write (o3d-9kek r7 finding 1).
 //
-// The global unique index turns a realm collision into a REFUSAL, which is the right trade —
+// The global unique index turns a tenant collision into a REFUSAL, which is the right trade —
 // see applyBackReference. But a refusal is only acceptable if something can still be done, and
 // for a document that has ALREADY POSTED to the remote ledger there was nothing:
 //
-//   • QuickBooks posts a bill under company B and gets id 145 back. The sync row is marked SYNCED
+//   • A connector posts a bill under tenant B and gets id 145 back. The sync row is marked SYNCED
 //     with externalTransactionId = 145 — so the fact of the post is durable and retention-protected
 //     (UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE compacts that row to a tombstone rather than
 //     deleting it, and the tombstone keeps the external id). Nothing is lost.
 //   • The write of 145 onto the local bill is then refused, because a bill from the retired
-//     company A still holds 145.
+//     tenant A still holds 145.
 //   • The warning said "link the document by hand". THAT INSTRUCTION COULD NOT BE CARRIED OUT: the
-//     same index refuses a manual link for exactly the same reason. And with the QuickBooks sweep
-//     deliberately unwired — waiting on POST-TIME AUTHORIZATION (o3d-8prh) and origin propagation,
-//     NOT on the long-closed o3d-s36z — nothing retried it either.
+//     same index refuses a manual link for exactly the same reason. And where no sweep is bound
+//     to the connector, nothing retried it either.
 //
-// So the missing piece was never the record — it was the RELEASE. The retired company's claim has
+// So the missing piece was never the record — it was the RELEASE. The retired tenant's claim has
 // to come off before anything, human or machine, can put the id where it belongs.
 //
-// WHY THIS IS NOT AUTOMATIC. Nothing in the database can tell a retired realm's stale id from a
+// WHY THIS IS NOT AUTOMATIC. Nothing in the database can tell a retired tenant's stale id from a
 // live, correct link: SalesOrder, SalesOrderRefund, PurchaseInvoice and SupplierCreditNote have no
 // provenance column for the accounting id (that is what o3d-gt8r/o3d-s36z would add). Clearing the
 // wrong one silently detaches a document that IS correctly linked — the governing principle again,
@@ -1228,7 +1226,7 @@ export async function backReferenceIsMissing(deps: BackReferenceDeps, params: Ba
 // clear is conditional on that document still holding exactly that id.
 //
 // WHY THE SYNC ROW IS NOT FLIPPED TO FAILED to make it visible, which is the obvious move and is
-// wrong: queueQuickBooksSync (and Xero's equivalent) dedupes new enqueues on
+// wrong: the connector queues (`queueXeroSync` and any other) dedupe new enqueues on
 // `status in (PENDING, PROCESSING, SYNCED)`. A row moved out of SYNCED stops suppressing its own
 // re-enqueue, and the document posts to the ledger a SECOND time. A posted document that cannot be
 // recorded is bad; two posted documents are worse.
@@ -1410,8 +1408,8 @@ const CLAIM_DELEGATES: Record<ExternalDocumentIdHolder['model'], keyof ExternalD
  *
  * SCOPED TO THE ONE MODEL, deliberately. The four unique indexes are PER TABLE, not global across
  * the four: `sales_orders.accounting_invoice_id` and `purchase_invoices.accounting_invoice_id` are
- * separate constraints, and QuickBooks issues Invoice ids and Bill ids from separate sequences — so
- * Invoice 145 and Bill 145 routinely coexist and are not related in any way. Searching all four
+ * separate constraints, and a ledger can issue Invoice ids and Bill ids from separate sequences — so
+ * Invoice 145 and Bill 145 can coexist and are not related in any way. Searching all four
  * tables would report a perfectly innocent sales order as the blocker of a bill write, and the
  * release path below would then invite an operator to detach it.
  */
@@ -1433,7 +1431,7 @@ export type ExternalDocumentIdReleaseOutcome =
   | { outcome: 'no-claim' }
   /**
    * The document currently holding the id is NOT the one the operator confirmed. Refused rather than
-   * released: the confirmation is the only thing separating "a retired realm's stale id" from "a
+   * released: the confirmation is the only thing separating "a retired tenant's stale id" from "a
    * correct link", so a confirmation about a different document confirms nothing.
    */
   | { outcome: 'holder-mismatch'; currentHolderId: string }
@@ -1511,15 +1509,16 @@ function releaseSourceRefusal(
   // DURABLE EVIDENCE that this row's back-reference was actually refused — not merely a row that
   // happens to carry an external id, which is most of the table. Four paths leave a marker:
   //
-  //   • QuickBooks quarantines the conflict into `errorMessage` on a row it keeps SYNCED;
+  //   • a connector that quarantines the conflict into `errorMessage` on a row it keeps SYNCED
+  //     (historical rows of a retired connector carry this shape);
   //   • Xero lets the refusal propagate, so markSyncLogForFollowUpRetry writes the same refusal text
   //     into `errorMessage` and the row exhausts its retries to FAILED;
   //   • the connector-agnostic repair sweep defers a refusal by stamping
   //     `backReferenceAmbiguousLoggedAt` rather than writing any text at all;
   //   • DATA RETENTION stamps `backReferenceEvidenceCompactedAt`, and that one has to be here or the
   //     guard would undo the thing it guards. The tombstone deliberately NULLS `errorMessage` (it is
-  //     free text quoting the payload), so at the retention horizon a QuickBooks quarantine loses
-  //     its only marker — and QuickBooks has no repair sweep to leave the other one, so this command
+  //     free text quoting the payload), so at the retention horizon such a quarantine loses
+  //     its only marker — and a connector with no repair sweep leaves no other one, so this command
   //     is the sole route out. Accepting only the first three would let retention permanently retire
   //     an operator's ability to fix it: the r4 finding 3 mistake — compaction is scheduled by AGE
   //     and says nothing about repairability — in a new place. It is also the STRONGEST of the four:
@@ -1572,7 +1571,7 @@ function releaseSourceRefusal(
  *
  * ONE TRANSACTION, not one call (o3d-9kek r8 finding 1). Releasing alone leaves the id owned by
  * nobody, which is a WORSE state than the refusal it replaced: the ledger document is attached to
- * nothing at all, and for QuickBooks nothing sweeps it up afterwards. Doing both halves in one
+ * nothing at all, and where no sweep is bound nothing sweeps it up afterwards. Doing both halves in one
  * FUNCTION was not enough to prevent that — a crash, a dropped connection or a refused re-link
  * between the two writes left exactly the state the design existed to avoid, and it was not even
  * recoverable by re-running: the holder no longer held the id, so the operator's confirmation no
@@ -1583,7 +1582,7 @@ function releaseSourceRefusal(
  * WHAT IS VERIFIED, and where:
  *   • the SOURCE sync row is re-read inside the transaction and must still be the row the operator
  *     read — same external id, same target, still in BACK_REFERENCE_REPAIRABLE_STATUSES (SYNCED for
- *     QuickBooks' quarantine, FAILED for Xero's propagated refusal), still carrying conflict
+ *     a quarantined conflict, FAILED for Xero's propagated refusal), still carrying conflict
  *     evidence (r8 finding 2). A row that re-posted under a new id is not evidence for moving the
  *     old one;
  *   • the HOLDER must still be the document the operator confirmed, and the clear is conditional on
@@ -1737,7 +1736,7 @@ export async function releaseAndRelinkExternalDocumentId(
       // unresolved. Two deliberate limits on that:
       //
       //   • ONLY ON A SYNCED ROW. `SYNCED` + `errorMessage` is the unreachable-by-any-other-route
-      //     state QuickBooks writes to quarantine a refused back-reference (the success path nulls
+      //     state a connector writes to quarantine a refused back-reference (the success path nulls
       //     it), so clearing it says exactly "that quarantine is over". On a FAILED row the
       //     errorMessage is the ordinary record of what went wrong; erasing it would leave an
       //     inexplicable FAILED row, and the row's own status is not this command's to rewrite.

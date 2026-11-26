@@ -1344,7 +1344,7 @@ export function ExceptionsClient({ data }: Props) {
              * what is verifiably absent" three rounds after the registry remedy stopped saying it.
              * One rule with two authors: correcting the registry protected nobody, because THIS is
              * the sentence an operator reads. A payment can be PENDING in the local queue while
-             * QuickBooks shows none — INVOICE_PAYMENT is enqueued before INVOICE_PDF, in separate
+             * the ledger shows none — INVOICE_PAYMENT is enqueued before INVOICE_PDF, in separate
              * transactions — so an operator who creates on a clean read races the queued row, and a
              * second payment against an invoice is not undoable.
              *

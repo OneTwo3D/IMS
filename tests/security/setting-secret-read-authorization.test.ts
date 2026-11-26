@@ -320,8 +320,8 @@ const RAW_MASK_SECRET_IMPORTERS: Record<string, string> = {
 
   // o3d-remove-parked-connectors — BOTH WAIVERS ARE GONE, AND SO IS EVERYTHING THEY WAIVED.
   //
-  // This map held two entries beside the one above: `app/actions/shopping-sync.ts` (Shopify) and
-  // `app/actions/quickbooks-sync.ts` (QuickBooks), each masking a key that WAS in
+  // This map held two entries beside the one above: `app/actions/shopping-sync.ts` (Shopify) and a
+  // second retired connector's sync action, each masking a key that WAS in
   // SENSITIVE_SETTING_KEYS but not routed through `maskSettingSecret` — so nothing was drifting, and
   // nothing stopped the next key they added from drifting. Both connectors are archived and neither
   // file exists in the live tree any more, so the waivers are deleted rather than left to pass
@@ -388,8 +388,10 @@ test('the in-scope maskers were converted — wc-sync, xero-sync and mintsoft-sy
  * pin. The literals below are the pin, and they are exhaustive in BOTH directions: an addition that
  * is not declared here fails just as an unexplained deletion does.
  */
+// A retired accounting connector's client-secret key was here too. It left this list (and
+// RETIRED_CREDENTIAL_SETTING_KEYS) in the same change as the migration that deletes its rows
+// (prisma/migrations/20261122140000_*), which is the rule the comment above states.
 const RETIRED_CONNECTOR_CREDENTIAL_KEYS = [
-  'quickbooks_client_secret',       // QuickBooks Online — archived on this branch
   'shiphero_access_token',          // ShipHero — archived by 2c2fd9fa (PR #680)
   'shiphero_refresh_token',
   'shiphero_webhook_secret',
@@ -443,7 +445,7 @@ for (const role of ['MANAGER', 'WAREHOUSE', 'READONLY'] as const) {
       checked += 1
     }
     assert.equal(checked, RETIRED_CONNECTOR_CREDENTIAL_KEYS.length, 'the loop must have run for every key')
-    assert.ok(checked >= 7, `expected at least 7 retired credential keys, checked ${checked}`)
+    assert.ok(checked >= 6, `expected at least 6 retired credential keys, checked ${checked}`)
   })
 }
 
@@ -536,7 +538,7 @@ test('the seeded retired-connector rows ARE readable — by ADMIN, and only by A
     console.warn = originalWarn
   }
   assert.equal(checked, RETIRED_CONNECTOR_CREDENTIAL_KEYS.length, 'the loop must have run for every key')
-  assert.ok(checked >= 7, `expected at least 7 retired credential keys, checked ${checked}`)
+  assert.ok(checked >= 6, `expected at least 6 retired credential keys, checked ${checked}`)
 })
 
 test('getSetting never returns the backup target secrets decrypted, even to an ADMIN (masked: first 4 chars + ****)', async () => {

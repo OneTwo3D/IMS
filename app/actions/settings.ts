@@ -1255,7 +1255,7 @@ type IntegrationPluginStateInput = Partial<Record<IntegrationPluginId, boolean>>
  *
  * Both properties matter, for different readers:
  *   • ATOMIC — the plugins settings page previously issued one setSetting per flag, in parallel.
- *     A switch from Xero to QuickBooks therefore passed through observable both-off and both-on
+ *     A switch between two accounting connectors therefore passed through observable both-off and both-on
  *     states. getActiveConnector resolves xero-first and returns null when both are off, so a
  *     reader landing in that window sees a DIFFERENT active connector than either the before or
  *     the after — including "none", which is the state the orphan cancel treats as "specify a
@@ -1295,10 +1295,10 @@ export async function saveIntegrationPluginState(
   // PARTIAL write cannot turn both connectors on across two calls. That check is only worth
   // anything if the state it reads cannot move before the write lands — and it could: this used to
   // read through the pooled client BEFORE opening the locked transaction. Two concurrent partial
-  // requests then both observed both connectors disabled, one enabled Xero and the other
-  // QuickBooks, their writes serialized, and the result was BOTH ENABLED — an invalid state that
+  // requests then both observed both connectors disabled, each enabled a different
+  // connector, their writes serialized, and the result was BOTH ENABLED — an invalid state that
   // no later validation ever revisits and that getActiveConnector silently resolves Xero-first, so
-  // nothing ever complains. The shopping pair had the identical race before Shopify was archived.
+  // nothing ever complains.
   //
   // The read now goes through the transaction client, after the lock and under a `FOR UPDATE` row
   // lock on the plugin rows (lockIntegrationPluginSelection), so the state validated IS the state
