@@ -241,7 +241,7 @@ export function buildSalesInvoicePayload(
     CurrencyCode: data.currency,
   }
   // Stamp the IMS rate on the invoice so Xero doesn't apply its own daily XE
-  // rate (which drifts from IMS by 1–3 %). Inverted to match Xero's direction.
+  // rate (which drifts from IMS by 1–3 %). Same direction as fxRateToBase: sent as is, 6 dp.
   if (xeroCurrencyRate != null) invoice.CurrencyRate = xeroCurrencyRate
   if (data.reference) invoice.Reference = data.reference
 

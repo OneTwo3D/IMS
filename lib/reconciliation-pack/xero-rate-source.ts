@@ -40,7 +40,7 @@ export const XERO_RATE_KINDS = ['sales-invoice', 'purchase-bill', 'sales-cn', 'p
 export type XeroRateKind = (typeof XERO_RATE_KINDS)[number]
 
 export type XeroRateDocument =
-  | { readable: true; kind: XeroRateKind; id: string; date: string; currency: string; /** Xero's CurrencyRate as plain decimal text (1 document-currency = X base), or null when Xero recorded none. A document in the base currency is set aside by the item whatever this is; a foreign one with none is unreadable there. */ rate: string | null }
+  | { readable: true; kind: XeroRateKind; id: string; date: string; currency: string; /** Xero's CurrencyRate as plain decimal text (1 base = X document-currency, the same convention as fxRateToBase), or null when Xero recorded none. A document in the base currency is set aside by the item whatever this is; a foreign one with none is unreadable there. */ rate: string | null }
   | { readable: false; kind: XeroRateKind; id: string; /** The date, when it could be read (the item cuts the periods by it); null when it could not. */ date: string | null }
 
 export type XeroRateRead = {

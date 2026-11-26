@@ -3,32 +3,48 @@
  * `CurrencyRate` convention.
  *
  * - IMS stores `fxRateToBase` as: 1 base = X document-currency.
- * - Xero `CurrencyRate` is defined as: 1 document-currency = X base.
+ * - Xero `CurrencyRate` is ALSO: 1 base = X document-currency (units of the
+ *   foreign currency per one unit of the organisation's base currency).
  *
- * So `xeroCurrencyRate = 1 / fxRateToBase`.
+ * So the two are the SAME number: `xeroCurrencyRate = fxRateToBase`, rounded
+ * to Xero's six decimal places. Nothing is inverted, and a foreign amount is
+ * put in base by DIVIDING by the rate (USD 1000 at 1.3125 is GBP 761.90).
  *
- * Stamping `CurrencyRate` on every Xero invoice/bill/credit note prevents Xero
- * from substituting its own daily XE rate — keeping IMS and Xero numerically
- * aligned per document.
+ * Verified 2026-11-22, read-only, against the live Xero organisation (base
+ * GBP): bills PI260907OTD (USD, 2026-09-07) at CurrencyRate 1.352650993,
+ * POQ468 (EUR) at 1.1835295458 and INV20261102001 (CNY) at 8.937375334. Each
+ * is foreign per GBP, the market quote, never its reciprocal (GBP per USD is
+ * about 0.74). The earlier header said the opposite and this function sent
+ * `1 / fxRateToBase`; nothing foreign had been sent when that was corrected.
+ * tests/connectors/xero-currency-rate-direction.test.ts pins it to those
+ * recorded values.
+ *
+ * Stamping `CurrencyRate` on every Xero invoice/bill/credit note/payment
+ * prevents Xero from substituting its own daily XE rate — keeping IMS and
+ * Xero numerically aligned per document.
  */
 
 // Xero's API schema specifies CurrencyRate as Decimal(18,6). Round here so we
 // never send more precision than Xero accepts.
 const XERO_RATE_DECIMALS = 6
+// Decimal(18,6) leaves 12 integer digits: a rate of 10^12 or more cannot be
+// held, so it is not a usable rate (as a rate that rounds to zero is not).
+const XERO_RATE_LIMIT = 1e12
 
 /**
  * Translate IMS's `fxRateToBase` (1 base = X doc-ccy) into Xero's
- * `CurrencyRate` (1 doc-ccy = X base). Returns `undefined` for non-positive,
- * non-finite, or missing inputs so the caller can omit the field cleanly and
+ * `CurrencyRate` (also 1 base = X doc-ccy): the same rate, rounded to six
+ * decimal places, NEVER inverted. Returns `undefined` for non-positive,
+ * non-finite, missing, or too large (10^12 or more) inputs so the caller can omit the field cleanly and
  * let Xero default — rather than posting an invalid rate.
  */
 export function imsRateToXeroCurrencyRate(rateToBase: number | undefined | null): number | undefined {
   if (rateToBase == null) return undefined
   const n = Number(rateToBase)
   if (!Number.isFinite(n) || n <= 0) return undefined
-  const inverted = 1 / n
+  if (n >= XERO_RATE_LIMIT) return undefined
   const factor = 10 ** XERO_RATE_DECIMALS
-  return Math.round(inverted * factor) / factor
+  return Math.round(n * factor) / factor
 }
 
 /**
@@ -69,7 +85,7 @@ export function isForeignCurrency(currency: unknown, baseCurrency: unknown): boo
 /**
  * The `CurrencyRate` to send for a document or payment, or a refusal.
  *
- *   - a usable IMS rate always converts (1 / rate, 6 dp) and is sent, base or foreign (unchanged for base-currency documents that
+ *   - a usable IMS rate is always sent as it is (the same rate, 6 dp; never inverted), base or foreign (unchanged for base-currency documents that
  *     carry one);
  *   - a BASE-currency (or currency-less) item with no usable rate returns `undefined`: Xero books it at 1, there is nothing to
  *     substitute;
@@ -112,9 +128,9 @@ export function foreignCurrencyRateProblem(params: Parameters<typeof xeroCurrenc
 
 /**
  * The READ direction, for a caller that holds a Xero document and wants its base-currency amount (the reconciliation pack's R12). Xero's
- * `CurrencyRate` is 1 document-currency = X base (above), so the base amount is the document amount TIMES the rate: EUR 50 at 1.25 is GBP
- * 62.50. Generic over the decimal type so the pack keeps its exact arithmetic; this file stays free of imports.
+ * `CurrencyRate` is 1 base = X document-currency (above), so the base amount is the document amount DIVIDED by the rate: EUR 50 at 1.25 is
+ * GBP 40, USD 1000 at 1.3125 is GBP 761.90. Generic over the decimal type so the pack keeps its exact arithmetic; this file stays free of imports.
  */
-export function xeroDocumentAmountToBase<T extends { mul(factor: string): T }>(documentAmount: T, xeroCurrencyRate: string): T {
-  return documentAmount.mul(xeroCurrencyRate)
+export function xeroDocumentAmountToBase<T extends { div(divisor: string): T }>(documentAmount: T, xeroCurrencyRate: string): T {
+  return documentAmount.div(xeroCurrencyRate)
 }

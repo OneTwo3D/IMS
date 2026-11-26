@@ -96,7 +96,7 @@ export function context(lists: Parameters<typeof rateDouble>[0], over: { double?
   return { xero, ims, ctx: { asOf: ASOF, vendorReads: true, vendor: { xero: { port: xero, binding: binding() } }, ims: ims.ims, xeroOptions: { sleep: noSleep }, ...over.context } }
 }
 
-/** A euro invoice dated 2026-09-10 unless said otherwise (1 GBP = 1.25 EUR from that morning, so Xero's rate should be 0.8). */
+/** A euro invoice dated 2026-09-10 unless said otherwise (1 GBP = 1.25 EUR from that morning, so Xero's rate should be 1.25: CurrencyRate is foreign per base, never the reciprocal). */
 export const eurInvoice = (n: number, rate: number | string | null, date = '2026-09-10'): Json => invoiceRow({ n, date, currency: 'EUR', rate })
 
 /** What IMS recorded when it posted the Xero record `ref` (the Xero id of the row built with n = ref): a connector-confirmed sync record carrying `rate` (1 base = X foreign). */

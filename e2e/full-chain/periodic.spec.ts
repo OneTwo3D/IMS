@@ -939,7 +939,9 @@ test.describe.serial('@full-chain @wc @xero periodic', () => {
   // place, the cron must answer the RETIRED skip (not a real run, not a failure) and no UNREALISED_FX_JOURNAL
   // row may exist for the date.
   test('X-03: with a real unrealised movement open, the RETIRED FX revaluation cron skips by name and queues NO UNREALISED_FX_JOURNAL', async ({ page }) => {
-    test.setTimeout(900_000)
+    // o3d-n2ci4 (#1135 review LOW-7): the same budget as the other flows here. The extra 300 s was for a revaluation sweep and its journal
+    // drain, and the retired cron now answers at once; what is left is the PO -> receipt -> bill chain every other test here runs.
+    test.setTimeout(600_000)
 
     // An open (unpaid) FOREIGN payable is the input the revaluation needs: getOpenPayables selects bills
     // with paidAt null, totalForeign > 0 and a non-base PO currency (lib/accounting-fx-revaluation.ts). A

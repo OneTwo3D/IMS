@@ -212,7 +212,7 @@ test('[l9gej] switch ON: the recorded refund payment paid a week later is dated 
   assert.equal(sent[0]!.amount, 40)
   assert.equal(payload.date, CASH_DATE)
   assert.equal(payload.settlementRateToBase, RATE_CASH_DAY, 'the realised FX is measured at the cash-out day\'s rate')
-  assert.ok(typeof sent[0]!.currencyRate === 'number' && Math.abs(sent[0]!.currencyRate - 1 / RATE_CASH_DAY) < 1e-6, `CurrencyRate is 1 / the cash-out rate (${sent[0]!.currencyRate})`)
+  assert.ok(typeof sent[0]!.currencyRate === 'number' && Math.abs(sent[0]!.currencyRate - RATE_CASH_DAY) < 1e-6, `CurrencyRate is the cash-out rate as is, never its inverse (${sent[0]!.currencyRate})`)
   assert.equal(payload.creditNoteDate, CN_DATE, 'the credit note\'s own date is kept on the row')
   assert.equal(after.status, 'SYNCED')
 })

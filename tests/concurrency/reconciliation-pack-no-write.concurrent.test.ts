@@ -770,9 +770,10 @@ test('[reconciliation pack] R16 with --vendor-reads-only: the stored (never refr
   const { randomBytes } = await import('node:crypto')
   const TOKEN = `xero_tok_${RTAG}`
   const xeroSeen: Array<{ method: string; url: string; authorization: string | undefined; tenant: string | undefined }> = []
-  // 1 GBP = 2 NZD from 2026-09-01, so Xero's CurrencyRate on a NZD document dated later in the closed months must be 0.5.
-  let invoiceRate = 0.5
-  let paymentRate = 0.5
+  // 1 GBP = 2 NZD from 2026-09-01, so Xero's CurrencyRate on a NZD document dated later in the closed months must be 2: Xero's CurrencyRate is
+  // foreign per base, IMS's convention (it was the reciprocal 0.5 here until the direction was verified on the live organisation; changed deliberately).
+  let invoiceRate = 2
+  let paymentRate = 2
   let breakCreditNotes = false
   const uuid = (n: number) => `00000000-0000-4000-8000-0000000016${String(n).padStart(2, '0')}`
   const send = (res: import('node:http').ServerResponse, body: unknown) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)) }
@@ -787,7 +788,7 @@ test('[reconciliation pack] R16 with --vendor-reads-only: the stored (never refr
       { InvoiceID: uuid(2), Type: 'ACCPAY', Status: 'PAID', DateString: '2026-09-20T00:00:00', CurrencyCode: 'GBP', CurrencyRate: 1 },
     ])
     if (url.pathname === '/api.xro/2.0/CreditNotes') {
-      const rows = [{ CreditNoteID: uuid(3), Type: 'ACCRECCREDIT', Status: 'AUTHORISED', DateString: '2026-09-06T00:00:00', CurrencyCode: 'NZD', CurrencyRate: 0.5 }]
+      const rows = [{ CreditNoteID: uuid(3), Type: 'ACCRECCREDIT', Status: 'AUTHORISED', DateString: '2026-09-06T00:00:00', CurrencyCode: 'NZD', CurrencyRate: 2 }]
       // The broken list reports two items and sends one: a count that does not match the rows proves nothing.
       return send(res, { CreditNotes: page === 1 ? rows : [], pagination: { page, pageSize: 100, pageCount: 1, itemCount: breakCreditNotes ? 2 : 1 } })
     }
@@ -860,19 +861,19 @@ test('[reconciliation pack] R16 with --vendor-reads-only: the stored (never refr
     assert.ok(!on.out.join('\n').includes(TOKEN))
 
     // A rate that differs by one millionth is a finding: the run fails (exit 1) and names the reason.
-    invoiceRate = 0.500001
+    invoiceRate = 2.000001
     const differ = await run(['--vendor-reads-only'])
     assert.equal(differ.code, 1, differ.out.join('\n'))
     assert.ok(differ.out.includes('R16 fail DIFFERENCES,XERO_RATE_DIFFERS'), differ.out.join('\n'))
-    invoiceRate = 0.5000004
+    invoiceRate = 2.0000004
     assert.ok((await run(['--vendor-reads-only'])).out.includes('R16 pass -'), 'within half a millionth agrees at six places')
-    invoiceRate = 0.5
-    paymentRate = 0.49
+    invoiceRate = 2
+    paymentRate = 1.99
     assert.ok((await run(['--vendor-reads-only'])).out.includes('R16 fail DIFFERENCES,XERO_RATE_DIFFERS'), 'a payment is judged on its own rate')
-    paymentRate = 0.5
+    paymentRate = 2
 
-    // A record IMS POSTED is held to the rate its posting carried (the real sync-log reader, in the pack's read-only snapshot): the log says IMS sent 1/1.9,
-    // Xero holds 0.5, which agrees with the table but not with the posting. Removed again so the other cases are unchanged.
+    // A record IMS POSTED is held to the rate its posting carried (the real sync-log reader, in the pack's read-only snapshot): the log says IMS sent 1.9,
+    // Xero holds 2, which agrees with the table but not with the posting. Removed again so the other cases are unchanged.
     await sql(`INSERT INTO accounting_sync_logs (id, connector, type, status, "referenceType", "referenceId", "externalTransactionId", payload) VALUES ($1, 'xero', 'SALES_INVOICE', 'SYNCED', 'SalesOrder', $2, $3, $4::jsonb)`, [`${RTAG}-log`, `${RTAG}-so`, uuid(1), JSON.stringify({ currency: 'NZD', date: '2026-09-05', currencyRateToBase: 1.9 })])
     try {
       const posted = await run(['--vendor-reads-only'])
