@@ -185,9 +185,9 @@ export const COGS_CROSS_CHECK_FLOWS = {
   ledgerSourceTypes: ['DISPATCH', 'REFUND_REVERSAL', 'SHIPMENT_REVALUATION', 'LANDED_COST_ADJUSTMENT', 'MANUFACTURING_RECLASS'],
 } as const
 
-/** The transit flows that are journals on both sides: the stock receipt (not a customer-return arrival) and the GR/IR reclass. */
+/** The transit flows that are journals on both sides: the stock receipt (not a customer-return arrival), the GR/IR reclass and the per-event purchase FX variance journal. */
 export const TRANSIT_CROSS_CHECK_FLOWS = {
-  logTypes: ['STOCK_RECEIPT', 'DAILY_BATCH_GRIR_RECLASS'],
+  logTypes: ['STOCK_RECEIPT', 'DAILY_BATCH_GRIR_RECLASS', 'PURCHASE_FX_VARIANCE'],
   excludeReferenceTypes: ['ReturnExpectation'],
-  ledgerSourceTypes: ['STOCK_RECEIPT', 'GRIR_RECLASS'],
+  ledgerSourceTypes: ['STOCK_RECEIPT', 'GRIR_RECLASS', 'PURCHASE_FX_VARIANCE'],
 } as const

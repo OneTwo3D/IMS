@@ -39,8 +39,8 @@ import { roundQuantity, type DecimalInput } from '@/lib/domain/math/decimal'
  *                                  not billed rose, the reverse when it fell; signed. The sourceRef is the batch reference, no order.
  *   - PURCHASE_FX_VARIANCE      — per-event FX (switch `purchase_event_fx_rates_enabled`): the GBP manual journal between Stock in Transit and the
  *                                  realised FX or purchase price variance account that clears the difference a bill leaves in transit when it
- *                                  is valued at another rate or price than the goods; signed. The sourceRef is the purchase order id. RESERVED:
- *                                  no writer yet; every reader already knows it.
+ *                                  is valued at another rate than the goods; signed. The sourceRef is the purchase order id; written by
+ *                                  lib/domain/purchasing/purchase-bill-fx.ts with the PURCHASE_FX_VARIANCE journal (keyed the same).
  *
  * `baseDelta` is the signed base-currency transit movement at the highest precision
  * the source carries. Idempotent on `idempotencyKey` (the transit-affecting

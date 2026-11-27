@@ -165,6 +165,7 @@ export const WRITER_OWNERSHIP_MAP = [
     accountingSyncTypes: [
       'STOCK_RECEIPT', 'INVENTORY_ADJUSTMENT', 'COGS_JOURNAL', 'COGS_REVERSAL', 'STOCK_IN_TRANSIT', 'STOCK_ALLOCATION',
       'UNEARNED_REV_REVERSAL', 'ALLOCATION_REVERSAL', 'MANUFACTURING_JOURNAL', 'MANUFACTURING_RECLASS',
+      'PURCHASE_FX_VARIANCE',
     ],
     note: 'Owner answer 2026-10-09: Qoblex posts these journals natively in Xero today; IMS owns from P2.',
   }),

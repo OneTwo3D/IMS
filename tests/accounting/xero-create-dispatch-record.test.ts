@@ -349,13 +349,13 @@ test('o3d-jit6: a type whose create UPSERTS on a number IMS mints may still re-p
   assert.equal(decision.dispatch, true)
   assert.equal(decision.dispatch === true ? decision.basis : null, 'natural-key-upsert')
 
-  // And the nineteen journal types are the population with no such remedy — the reason this exists.
+  // And the twenty journal types are the population with no such remedy — the reason this exists.
   const noRemedy = Object.entries(CREATE_REPLAY_POLICY).filter(([, policy]) => policy === 'no-remedy')
-  assert.equal(noRemedy.length, 19)
+  assert.equal(noRemedy.length, 20)
   assert.ok(noRemedy.every(([type]) => type.startsWith('DAILY_BATCH_') || [
     'COGS_JOURNAL', 'INVENTORY_ADJUSTMENT', 'STOCK_IN_TRANSIT', 'STOCK_RECEIPT', 'COGS_REVERSAL',
     'STOCK_ALLOCATION', 'UNEARNED_REV_REVERSAL', 'ALLOCATION_REVERSAL', 'REALISED_FX_JOURNAL',
-    'UNREALISED_FX_JOURNAL', 'MANUFACTURING_JOURNAL', 'MANUFACTURING_RECLASS',
+    'UNREALISED_FX_JOURNAL', 'MANUFACTURING_JOURNAL', 'MANUFACTURING_RECLASS', 'PURCHASE_FX_VARIANCE',
   ].includes(type)))
 })
 
@@ -471,7 +471,7 @@ test('o3d-jit6 r1#3: every no-remedy type prescribes a remedy the settlement act
   const noRemedy = Object.entries(CREATE_REPLAY_POLICY)
     .filter(([, policy]) => policy === 'no-remedy')
     .map(([type]) => type as keyof typeof CREATE_REPLAY_POLICY)
-  assert.equal(noRemedy.length, 19)
+  assert.equal(noRemedy.length, 20)
 
   for (const type of noRemedy) {
     const decision = decideCreateDispatch({

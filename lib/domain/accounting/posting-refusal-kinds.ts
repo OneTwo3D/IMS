@@ -138,6 +138,10 @@ export const POSTING_REFUSAL_KINDS = {
     type: 'MANUFACTURING_RECLASS', referenceType: 'ProductionOrder', clearing: 'manual',
     how: 'The reclass is queued once for this cost change; a later cost change is a different reclass.',
   },
+  purchase_fx_variance: {
+    type: 'PURCHASE_FX_VARIANCE', referenceType: 'PurchaseOrder', clearing: 'manual',
+    how: 'IMS queues only what is still owed whenever the bill or its receipts change, or when `npm run purchase-fx:reconcile -- --po <order> --apply` is run; a copy keyed into the ledger by hand as well would be booked twice.',
+  },
   allocation_reversal: {
     type: 'ALLOCATION_REVERSAL', referenceType: 'SalesOrder', clearing: 'manual',
     how: 'Each reversal belongs to one trim of the order\'s allocations and is never raised again.',

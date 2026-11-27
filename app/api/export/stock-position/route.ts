@@ -9,11 +9,15 @@ import {
   type StockPositionFilters,
 } from '@/lib/domain/inventory/stock-position-reports'
 import { getDeadStockReport, getInventoryAgingReport, InventoryHealthSourceLimitError } from '@/lib/domain/inventory/inventory-health-reports'
+import { getSlowStockReport, parseMinValue, parseNonNegativeInteger, type SlowStockFilters } from '@/lib/domain/inventory/slow-stock-report'
+import { hasPermission } from '@/lib/permissions'
 import { stockPositionApiAccessDenied } from '@/lib/security/stock-position-access'
 import { sourceLimitCsvResponse } from '@/lib/csv-source-limit'
 
 const EXPORT_COLUMNS: Record<string, string[]> = {
   'inventory-aging': ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'bucket', 'minAgeDays', 'maxAgeDays', 'qty', 'valueBase', 'source'],
+  // valueBase is dropped for roles without inventory.prices (see slowStockColumns).
+  'slow-stock': ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'stockUnit', 'qty', 'valueBase', 'oldestLayerAt', 'oldestLayerAgeDays', 'ageBand', 'lastSaleAt', 'daysSinceLastSale', 'soldQtyInWindow', 'ratePer30Days', 'monthsOfCover'],
   'dead-stock': ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'qty', 'valueBase', 'daysSinceLastSale', 'lastSaleAt', 'firstStockedAt'],
 }
 
@@ -28,6 +32,7 @@ type StockPositionExportDeps = {
   getNegativeStockReport: typeof getNegativeStockReport
   getInventoryAgingReport: typeof getInventoryAgingReport
   getDeadStockReport: typeof getDeadStockReport
+  getSlowStockReport: typeof getSlowStockReport
   loadMpnByProductId: typeof loadMpnByProductId
 }
 
@@ -59,6 +64,25 @@ function stockPositionFilters(req: NextRequest): StockPositionFilters {
   }
 }
 
+function slowStockFilters(req: NextRequest, includeCost: boolean): SlowStockFilters {
+  const minValue = one(req, 'minValue')
+  return {
+    warehouseId: one(req, 'warehouseId'),
+    categoryId: one(req, 'categoryId'),
+    supplierId: one(req, 'supplierId'),
+    productType: one(req, 'productType') as SlowStockFilters['productType'],
+    perWarehouse: one(req, 'perWarehouse') === '1',
+    minAgeDays: parseNonNegativeInteger(one(req, 'minAgeDays')),
+    noSaleDays: parseNonNegativeInteger(one(req, 'noSaleDays')),
+    minValueBase: includeCost && parseMinValue(minValue) ? minValue : undefined,
+    includeCost,
+  }
+}
+
+function slowStockColumns(includeCost: boolean): string[] {
+  return includeCost ? EXPORT_COLUMNS['slow-stock'] : EXPORT_COLUMNS['slow-stock'].filter((column) => column !== 'valueBase')
+}
+
 function positiveInteger(value: string | undefined): number | undefined {
   const parsed = Number(value)
   return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined
@@ -81,6 +105,7 @@ const defaultStockPositionExportDeps: StockPositionExportDeps = {
   getNegativeStockReport,
   getInventoryAgingReport,
   getDeadStockReport,
+  getSlowStockReport,
   loadMpnByProductId,
 }
 
@@ -246,6 +271,47 @@ export async function getStockPositionExportResponse(
         firstStockedAt: r.firstStockedAt ?? '',
       }))
       return csvResponseFor(req, toCsv(data, EXPORT_COLUMNS['dead-stock']), `dead-stock-${date}.csv`)
+    }
+
+    case 'slow-stock': {
+      // Cost and value are cost figures: only roles holding inventory.prices get the value column and value ordering.
+      const includeCost = hasPermission(session.user.role, 'inventory.prices')
+      const columns = slowStockColumns(includeCost)
+      const report = await resolvedDeps.getSlowStockReport(slowStockFilters(req, includeCost), { paginate: false }).catch((error: unknown) => {
+        if (error instanceof InventoryHealthSourceLimitError) return error
+        throw error
+      })
+      if (report instanceof InventoryHealthSourceLimitError) {
+        return sourceLimitCsvResponse(report, columns, `slow-stock-${date}.csv`)
+      }
+      const oversized = rejectOversizedExport(report.pageInfo.totalRows)
+      if (oversized) return oversized
+      const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((r) => r.productId))
+      const data = report.rows.map((r) => ({
+        sku: r.sku,
+        mpn: mpnByProductId.get(r.productId) ?? '',
+        productName: r.productName,
+        productType: r.productType,
+        category: r.categoryName ?? '',
+        suppliers: r.supplierNames.join('; '),
+        warehouseCode: r.warehouseCode,
+        stockUnit: r.stockUnit,
+        qty: r.qty,
+        ...(includeCost ? { valueBase: r.valueBase ?? '' } : {}),
+        oldestLayerAt: r.oldestLayerAt ?? '',
+        oldestLayerAgeDays: r.oldestLayerAgeDays ?? '',
+        ageBand: r.ageBand ?? '',
+        lastSaleAt: r.lastSaleAt ?? '',
+        daysSinceLastSale: r.daysSinceLastSale ?? '',
+        soldQtyInWindow: r.soldQtyInWindow,
+        ratePer30Days: r.ratePer30Days,
+        monthsOfCover: r.monthsOfCover ?? '',
+      }))
+      return csvResponseFor(req, toCsv(data, columns), `slow-stock-${date}.csv`, {
+        generatedAt: report.generatedAt,
+        rateWindowDateFrom: report.rateWindowDateFrom,
+        rateWindowDateTo: report.rateWindowDateTo,
+      })
     }
 
     default:

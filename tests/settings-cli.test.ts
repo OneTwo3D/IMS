@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import { runSettingsCli } from '../scripts/settings-cli'
 import { SYSTEM_SWITCH_KEYS, validateSwitchValue, findSwitch } from '../lib/domain/settings/system-switches'
+import { REFUND_DELETE_SETTING, refundDeleteEnabledFromSetting } from '../lib/domain/sales/refund-delete-policy'
 import { SENSITIVE_SETTING_KEYS } from '../lib/settings-store'
 
 type Row = { value: string }
@@ -51,7 +52,7 @@ const SET = ['--by', 'jan', '--reason', 'switchover step M']
 test('allowlist contains exactly the switches that exist on development, and none is a credential', () => {
   assert.deepEqual([...SYSTEM_SWITCH_KEYS].sort(), [
     'first_load_mintsoft_archive_enabled', 'mintsoft_asn_send_supplier_enabled', 'mintsoft_asn_supplier_required', 'mintsoft_parent_sku_delete_enabled',
-    'mintsoft_product_parity_enabled', 'mintsoft_supplier_create_enabled', 'purchase_event_fx_rates_enabled', 'sales_order_discount_tax_apportion_enabled', 'storefront_customer_email_enabled', 'trackship_refire_enabled', 'wc_invoice_document_enabled',
+    'mintsoft_product_parity_enabled', 'mintsoft_supplier_create_enabled', 'purchase_event_fx_rates_enabled', 'refund_delete_enabled', 'sales_order_discount_tax_apportion_enabled', 'storefront_customer_email_enabled', 'trackship_refire_enabled', 'wc_invoice_document_enabled',
     'wc_invoice_note_enabled', 'wc_order_amendment_unpaid_rewrite_enabled', 'wc_order_amendment_write_enabled', 'wc_refund_credit_note_parity_enabled', 'wc_withdrawal_outcome_enabled', 'wms_despatch_date_enabled', 'wms_despatch_quantity_check_enabled', 'wms_merge_candidate_mode',
     'wms_merge_hold_enabled', 'wms_mixed_warehouse_push_enabled', 'wms_refund_remainder_task_enabled', 'wms_sku_rename_remap_enabled', 'xero_credit_note_allocation_enabled', 'xero_credit_note_duplicate_check_enabled', 'xero_defer_unpaid_invoiced_revenue_enabled', 'xero_refund_payment_cash_out_date_enabled',
   ])
@@ -282,7 +283,15 @@ test('purchase_event_fx_rates_enabled: off by default and ADMIN; its account key
   const reader = (value: string | null) => ({ setting: { findUnique: async () => (value === null ? null : { value }) } })
   assert.equal(await isPurchaseEventFxEnabled(reader(null)), false)
   for (const off of ['false', 'TRUE', '1', ' true']) assert.equal(await isPurchaseEventFxEnabled(reader(off)), false, off)
-  assert.equal(await isPurchaseEventFxEnabled(reader('true')), true)
+  // The interlock applies on READ too: while the last step is not installed the switch reads off even when stored 'true'.
+  assert.equal(await isPurchaseEventFxEnabled(reader('true')), false, 'interlock not complete: off')
+  const { setPurchaseEventFxStepsCompleteForTests } = await import('../lib/domain/purchasing/purchase-event-fx-settings')
+  setPurchaseEventFxStepsCompleteForTests(true)
+  try {
+    assert.equal(await isPurchaseEventFxEnabled(reader('true')), true)
+  } finally {
+    setPurchaseEventFxStepsCompleteForTests(null)
+  }
 })
 
 const FX_ON = ['--key', 'purchase_event_fx_rates_enabled', '--value', 'true', ...SET, '--yes', '--confirm-admin']
@@ -302,7 +311,7 @@ test('purchase_event_fx_rates_enabled: INTERLOCK (LOW-18): turning it on is refu
   for (const argv of [FX_ON.slice(0, -2), FX_ON]) {
     const r = await run('set', argv, mapped)
     assert.equal(r.code, 3, r.out)
-    assert.match(r.err, /cannot be turned on yet: step 3 of the per-event purchase FX work/)
+    assert.match(r.err, /cannot be turned on yet: the last part of step 3 of the per-event purchase FX work/)
   }
   assert.equal(mapped.settings.get('purchase_event_fx_rates_enabled'), undefined)
   assert.equal(mapped.audits.length, 0)
@@ -369,4 +378,30 @@ test('xero_defer_unpaid_invoiced_revenue_enabled: off by default, ADMIN, stamped
   const off = await run('set', ['--key', def.key, '--value', 'false', ...SET, '--yes', '--confirm-admin'], on.f)
   assert.equal(off.code, 0, off.err)
   assert.equal(off.f.settings.has(def.stampOnKey!), false)
+})
+
+test('refund_delete_enabled: registered as an ADMIN switch, off by default, key equal to the reader\'s, no turn-on prerequisite, and turning it off is never refused', async () => {
+  const def = findSwitch('refund_delete_enabled')!
+  assert.ok(def)
+  assert.equal(def.key, REFUND_DELETE_SETTING)
+  assert.equal(def.adminOnly, true)
+  assert.equal(def.defaultValue, 'false')
+  assert.equal(def.requires, undefined)
+  assert.equal(validateSwitchValue(def, 'TRUE').ok, false)
+  assert.equal(refundDeleteEnabledFromSetting('true'), true)
+  assert.equal(refundDeleteEnabledFromSetting('TRUE'), false)
+  const args = ['--key', 'refund_delete_enabled', '--value', 'true', ...SET, '--yes']
+  const noAdmin = await run('set', args, fakeDb())
+  assert.equal(noAdmin.code, 3)
+  assert.equal(noAdmin.f.settings.get('refund_delete_enabled'), undefined)
+  const on = await run('set', [...args, '--confirm-admin'], fakeDb())
+  assert.equal(on.code, 0)
+  assert.equal(on.f.settings.get('refund_delete_enabled')!.value, 'true')
+  const dry = await run('set', ['--key', 'refund_delete_enabled', '--value', 'true', ...SET, '--confirm-admin'], fakeDb())
+  assert.equal(dry.f.settings.get('refund_delete_enabled'), undefined)
+  const off = await run('set', ['--key', 'refund_delete_enabled', '--value', 'false', ...SET, '--yes'], fakeDb({ refund_delete_enabled: 'true', xero_sync_enabled: 'true' }))
+  assert.equal(off.code, 3)
+  const offAdmin = await run('set', ['--key', 'refund_delete_enabled', '--value', 'false', ...SET, '--yes', '--confirm-admin'], fakeDb({ refund_delete_enabled: 'true' }))
+  assert.equal(offAdmin.code, 0)
+  assert.equal(offAdmin.f.settings.get('refund_delete_enabled')!.value, 'false')
 })

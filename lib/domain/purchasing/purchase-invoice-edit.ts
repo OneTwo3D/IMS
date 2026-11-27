@@ -101,6 +101,8 @@ export type PurchaseInvoiceLineDraft = {
   unitCostForeign: number
   totalForeign: number
   totalBase: number
+  /** Per-event FX PPV split: the PO goods unit cost (4dp) the line's stock part is billed at. Absent = the line was not split. */
+  stockUnitForeign?: number
 }
 
 export type PurchaseInvoiceAccountingLine = {
@@ -109,6 +111,9 @@ export type PurchaseInvoiceAccountingLine = {
   unitAmount: number
   accountCode: string
   taxType?: string
+  /** PPV split only: the exact 2dp LineAmount and TaxAmount the ledger is sent (so the two parts total the supplier's line, tax included). */
+  lineAmount?: number
+  taxAmount?: number
   /** Why this line may carry NONE (lib/domain/accounting/purchase-document-tax-types.ts); never sent to the ledger. */
   noTaxKind?: PurchaseNoTaxLineKind
   /** The rate `taxType` was read from; never sent (the enqueue guard binds the code to it, lib/tax/retired-tax-code-guard.ts). */
@@ -140,6 +145,12 @@ export type PurchaseInvoiceCalculation = {
   taxBase: number
   totalForeign: number
   totalBase: number
+  /**
+   * Per-event FX PPV split (`ppvSplit`): the base total of the purchase price variance lines, and the part of the net subtotal that is coded to
+   * Stock in Transit (`subtotalBase - ppvBase`). Without a split, `ppvBase` is 0 and `transitBase` is the whole net subtotal.
+   */
+  ppvBase: number
+  transitBase: number
 }
 
 export type PurchaseInvoiceAccountingPayload = {
@@ -302,8 +313,16 @@ export function calculatePurchaseInvoice(params: {
   reverseChargeTaxType?: string
   poLineById: Map<string, PurchaseInvoicePoLine>
   costLineById: Map<string, PurchaseInvoiceCostLine>
+  /**
+   * Per-event FX (switch `purchase_event_fx_rates_enabled`, lib/domain/purchasing/purchase-bill-fx.ts): split every goods line into its STOCK part,
+   * the billed quantity at the PO goods unit cost (`stockUnitForeignByPoLine`, 4dp, coded to transit), and its PURCHASE PRICE VARIANCE part, the
+   * rest of the line (quantity 1, coded to `ppvAccount`, the same tax treatment). Each part is taxed on its own, as the ledger taxes each bill line.
+   * Absent = no split, exactly as before.
+   */
+  ppvSplit?: { stockUnitForeignByPoLine: ReadonlyMap<string, DecimalInput>; ppvAccount: string }
 }): PurchaseInvoiceCalculation {
   assertPositiveFxRate(params.fxRateToBase)
+  let ppvBaseSum = toDecimal(0)
 
   // Accumulate AP base/foreign totals in Decimal so the invoice header reconciles
   // to the sum of its stored line bases (cogs-audit scjz.59). Float division and
@@ -337,7 +356,21 @@ export function calculatePurchaseInvoice(params: {
       // A NEW goods line takes the rate its order line was RECORDED at, not the linked rate's current value (the rate editor refreshes the order lines of draft orders only).
       const recorded = line.booked || usesOrderRate ? null : recordedLineRate(poLine, orderRate, params.currency ?? 'GBP', params.rateCandidates)
       const lineRate = line.booked ? toDecimal(String(line.booked.rate)) : recorded ? recorded.rate : purchaseLineOwnRate(poLine, orderRate, params.poType === 'FREIGHT')
-      taxForeignSum = addMoney(taxForeignSum, roundMoney(multiplyMoney(totalForeign, lineRate), currency))
+      // Per-event FX PPV split: the stock part at the PO goods unit cost, the rest is price variance (positive = the bill is dearer).
+      const stockUnitInput = params.ppvSplit?.stockUnitForeignByPoLine.get(line.poLineId)
+      if (params.ppvSplit && stockUnitInput === undefined) throw new Error(`No PO goods unit cost for ${poLine.product.sku} to split the bill line at`)
+      const stockUnitForeign = stockUnitInput === undefined ? null : roundQuantity(stockUnitInput, 4)
+      // The line's tax is the line's tax, split or not (MED-4): the stock part and the PPV part are sent with exact 2dp amounts and tax that add up to
+      // the supplier's single line (amount rounded to the currency, tax on the line), so the Xero bill total and VAT equal the supplier's.
+      const lineTax = roundMoney(multiplyMoney(totalForeign, lineRate), currency)
+      taxForeignSum = addMoney(taxForeignSum, lineTax)
+      const stockForeign = stockUnitForeign ? roundMoney(multiplyMoney(line.qtyBilled, stockUnitForeign), currency) : null
+      const ppvForeign = stockForeign ? roundMoney(totalForeign, currency).sub(stockForeign) : null
+      const stockTax = stockForeign ? roundMoney(multiplyMoney(stockForeign, lineRate), currency) : null
+      if (stockForeign) {
+        const stockBase = roundQuantity(stockForeign.div(params.fxRateToBase), 4)
+        ppvBaseSum = ppvBaseSum.add(toDecimal(totalBase).sub(stockBase))
+      }
 
       lineData.push({
         id: line.id,
@@ -348,6 +381,7 @@ export function calculatePurchaseInvoice(params: {
         unitCostForeign: line.unitCostForeign,
         totalForeign,
         totalBase,
+        ...(stockUnitForeign ? { stockUnitForeign: stockUnitForeign.toNumber() } : {}),
       })
       // A line with its own rate posts on that rate's code (blank when unmapped: refused downstream). Only a line with NO rate row follows the order's
       // recorded rate, and so its code - never an unmapped own rate falling back to a code of a different rate.
@@ -365,11 +399,7 @@ export function calculatePurchaseInvoice(params: {
         description: `PO ${params.poReference} line`, taxType: productTaxType, rate: lineRate.toNumber(), checkable: !productReverseCharge,
         taxRateId: productRateId, reverseCharge: productReverseCharge,
       })
-      accountingLines.push({
-        description: `PO ${params.poReference} line`,
-        quantity: line.qtyBilled,
-        unitAmount: rounded4(line.unitCostForeign),
-        accountCode: params.transitAccount,
+      const taxFields = {
         taxType: productTaxType,
         // A NONE that came out of the line's own (or the supplier's default) rate is that rate's decision, so it names its kind; a blank
         // is left blank and refused by the poster.
@@ -379,7 +409,30 @@ export function calculatePurchaseInvoice(params: {
           ? rateBinding(line.booked.taxRateId, 'purchase_line')
           : recorded?.code ? rateBinding(recorded.code.taxRateId, 'plain')
           : poLine.taxRate?.id ? rateBinding(poLine.taxRate.id, 'purchase_line') : rateBinding(params.fallbackTaxRateId, 'plain')),
+      }
+      const hasPpvLine = Boolean(params.ppvSplit && ppvForeign && !ppvForeign.isZero())
+      // Reverse charge: the ledger works the self-assessed tax out itself; no amount is imposed.
+      const sendsTax = stockTax !== null && !productReverseCharge
+      accountingLines.push({
+        description: `PO ${params.poReference} line`,
+        quantity: line.qtyBilled,
+        unitAmount: stockUnitForeign ? stockUnitForeign.toNumber() : rounded4(line.unitCostForeign),
+        accountCode: params.transitAccount,
+        ...taxFields,
+        ...(stockForeign ? { lineAmount: stockForeign.toNumber() } : {}),
+        ...(sendsTax ? { taxAmount: (hasPpvLine ? stockTax! : lineTax).toNumber() } : {}),
       })
+      if (params.ppvSplit && hasPpvLine && ppvForeign) {
+        accountingLines.push({
+          description: `PO ${params.poReference} ${poLine.product.sku}: price difference to the order`,
+          quantity: 1,
+          unitAmount: ppvForeign.toNumber(),
+          accountCode: params.ppvSplit.ppvAccount,
+          ...taxFields,
+          lineAmount: ppvForeign.toNumber(),
+          ...(sendsTax ? { taxAmount: lineTax.sub(stockTax!).toNumber() } : {}),
+        })
+      }
       continue
     }
 
@@ -441,6 +494,8 @@ export function calculatePurchaseInvoice(params: {
     taxBase,
     totalForeign: rounded4(addMoney(subtotalForeign, taxForeign)),
     totalBase: rounded4(addMoney(subtotalBase, taxBase)),
+    ppvBase: rounded4(ppvBaseSum),
+    transitBase: rounded4(toDecimal(rounded4(subtotalBase)).sub(rounded4(ppvBaseSum))),
   }
 }
 

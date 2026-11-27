@@ -466,7 +466,7 @@ A customer swapping an item no longer needs a refund plus a brand new order. Wit
 
 ### Deleting a refund recorded in error
 
-A refund an operator recorded in IMS by mistake can be deleted, and the delete undoes exactly what that refund did. **It is off by default**: the `refund_delete_enabled` setting must read exactly `true` (anything else, or no value, is off). It has no settings screen and `npm run settings:set` does not accept it yet, so it cannot be switched on from the application; keep it off. While it is off the order page shows no delete control.
+A refund an operator recorded in IMS by mistake can be deleted, and the delete undoes exactly what that refund did. **It is off by default**: the `refund_delete_enabled` setting must read exactly `true` (anything else, or no value, is off). It has no settings screen: an administrator switches it on from the command line on the server (`npm run settings:set`, which asks for the administrator confirmation); ask your administrator, and keep it off until they have confirmed the accounting void path works for you. While it is off the order page shows no delete control.
 
 **Where.** On the order page, open **Refunds**. Each refund shows **Delete refund** when it can be deleted, or a line beginning *Cannot be deleted* with the reason when it cannot. The action needs the same permission as recording a refund (`sales.refund`). A confirmation asks for an optional reason, which is kept in the audit record.
 

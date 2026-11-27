@@ -87,6 +87,7 @@ const SCOPE_BY_SYNC_TYPE: Record<string, string> = {
   // processor's arm for them sends nothing in any branch, so a missing journals scope must not stop a queued row being retired.
   MANUFACTURING_JOURNAL: JOURNALS,
   MANUFACTURING_RECLASS: JOURNALS,
+  PURCHASE_FX_VARIANCE: JOURNALS,
 }
 
 /** The scope this sync type needs, or null when it rides on the baseline grant. */

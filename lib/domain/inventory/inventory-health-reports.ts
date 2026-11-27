@@ -32,7 +32,7 @@ const DEAD_STOCK_SALE_MOVEMENT_ROW_LIMIT = 100000
  * `fromWarehouseId: null` is NOT sufficient, because deleting a warehouse nulls the column on ordinary
  * dispatches (optional relation, Prisma's default onDelete: SetNull).
  */
-const HISTORICAL_IMPORT_MOVEMENT_SHAPE = {
+export const HISTORICAL_IMPORT_MOVEMENT_SHAPE = {
   fromWarehouseId: null,
   toWarehouseId: null,
   referenceType: { in: [...HISTORICAL_IMPORT_REFERENCE_TYPES] },
@@ -224,13 +224,13 @@ function clampPage(value: unknown): number {
   return Number.isInteger(parsed) && parsed > 0 ? parsed : 1
 }
 
-function clampPageSize(value: unknown): number {
+export function clampPageSize(value: unknown): number {
   const parsed = Number(value)
   if (!Number.isInteger(parsed) || parsed <= 0) return DEFAULT_PAGE_SIZE
   return Math.min(Math.max(parsed, MIN_PAGE_SIZE), MAX_PAGE_SIZE)
 }
 
-function pageInfo(totalRows: number, page: number, pageSize: number): PageInfo {
+export function pageInfo(totalRows: number, page: number, pageSize: number): PageInfo {
   const totalPages = Math.max(1, Math.ceil(totalRows / pageSize))
   const safePage = Math.min(Math.max(1, page), totalPages)
   return {
@@ -243,7 +243,7 @@ function pageInfo(totalRows: number, page: number, pageSize: number): PageInfo {
   }
 }
 
-function paginate<T>(rows: T[], filters: Pick<StockPositionFilters, 'page' | 'pageSize'>): { rows: T[]; pageInfo: PageInfo } {
+export function paginate<T>(rows: T[], filters: Pick<StockPositionFilters, 'page' | 'pageSize'>): { rows: T[]; pageInfo: PageInfo } {
   const info = pageInfo(rows.length, clampPage(filters.page), clampPageSize(filters.pageSize))
   const start = (info.page - 1) * info.pageSize
   return { rows: rows.slice(start, start + info.pageSize), pageInfo: info }
@@ -276,21 +276,21 @@ function validProductType(value: unknown): ProductType | undefined {
   return PRODUCT_TYPES.includes(value as ProductType) ? value as ProductType : undefined
 }
 
-function supplierNames(product: { supplierProducts: Array<{ supplier: { name: string } }> }): string[] {
+export function supplierNames(product: { supplierProducts: Array<{ supplier: { name: string } }> }): string[] {
   return product.supplierProducts.map((supplierProduct) => supplierProduct.supplier.name)
 }
 
-function rejectOverLimit(rows: unknown[], limit: number, label: string): void {
+export function rejectOverLimit(rows: unknown[], limit: number, label: string): void {
   if (rows.length > limit) {
     throw new InventoryHealthSourceLimitError(limit, label)
   }
 }
 
-function stockKey(productId: string, warehouseId: string): string {
+export function stockKey(productId: string, warehouseId: string): string {
   return `${productId}:${warehouseId}`
 }
 
-function productWhere(filters: StockPositionFilters, typeOverride?: Prisma.EnumProductTypeFilter | ProductType): Prisma.ProductWhereInput {
+export function productWhere(filters: StockPositionFilters, typeOverride?: Prisma.EnumProductTypeFilter | ProductType): Prisma.ProductWhereInput {
   const productType = validProductType(filters.productType)
   return {
     ...(filters.categoryId ? { categoryId: filters.categoryId } : {}),
@@ -299,7 +299,7 @@ function productWhere(filters: StockPositionFilters, typeOverride?: Prisma.EnumP
   }
 }
 
-function directLayerProductTypeFilter(filters: StockPositionFilters): Prisma.EnumProductTypeFilter | ProductType {
+export function directLayerProductTypeFilter(filters: StockPositionFilters): Prisma.EnumProductTypeFilter | ProductType {
   const productType = validProductType(filters.productType)
   if (productType === ProductType.KIT) return ProductType.KIT
   return productType ?? { not: ProductType.KIT }

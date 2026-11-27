@@ -25,5 +25,6 @@ export const XERO_SYNC_TYPE_SETTING: Readonly<Record<string, XeroSettingKey>> = 
   UNREALISED_FX_JOURNAL: 'xero_sync_unrealised_fx_journal',
   MANUFACTURING_JOURNAL: 'xero_sync_manufacturing_journal',
   MANUFACTURING_RECLASS: 'xero_sync_manufacturing_journal',
+  PURCHASE_FX_VARIANCE: 'xero_sync_stock_receipt',
   TAX_RATE_SYNC: 'xero_sync_tax_rate',
 }

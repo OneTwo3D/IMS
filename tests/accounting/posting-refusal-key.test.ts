@@ -164,6 +164,8 @@ const CASES: Record<string, Case> = {
     // A re-save of the SAME edit hashes the same; the case where the retry is a DIFFERENT later edit is the
     // review-H4 case (a reclass the earlier refusal does not describe), held for the owner's decision.
   },
+  // Per-event purchase FX: the key hashes the journal AND its revision on the bill, so two changes of one bill never share a key.
+  PURCHASE_FX_VARIANCE: keyed('PURCHASE_FX_VARIANCE', 'PurchaseOrder', 'purchase-fx-variance:bill-1:aaa', 'purchase-fx-variance:bill-1:bbb'),
   DAILY_BATCH_REVENUE_DEFERRAL: doc('DAILY_BATCH_REVENUE_DEFERRAL', 'DailyBatch'),
   DAILY_BATCH_INVENTORY_ALLOC: doc('DAILY_BATCH_INVENTORY_ALLOC', 'DailyBatch'),
   DAILY_BATCH_GROUP_B: doc('DAILY_BATCH_GROUP_B', 'DailyBatch'),

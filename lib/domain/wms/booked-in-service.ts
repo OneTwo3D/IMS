@@ -70,6 +70,7 @@ import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { receiptJournalAmount } from '@/lib/domain/accounting/receipt-journal-amount'
 import { recordGrirReceipt } from '@/lib/domain/accounting/grir-subledger-movement'
+import { reconcilePurchaseBillFx, reportPurchaseFxVarianceNotQueued, type PurchaseBillFxReconcileResult } from '@/lib/domain/purchasing/purchase-bill-fx'
 import { withSavepoint } from '@/lib/db/savepoint'
 import {
   isTransferLineFullyLanded,
@@ -207,6 +208,18 @@ async function markEventLoginRefused(eventId: string, message: string, now = new
       lastError: message,
     },
   })
+}
+
+/** MED-C: an episode of waits on the purchase exchange rate ends after this many waits, or this long after the first, and the event then fails. */
+export const FX_WAIT_EPISODE_CAP = { waits: 10, ms: 3 * 24 * 60 * 60 * 1000 } as const
+
+/** Count one more wait of the current episode; true once the episode is over its cap (the caller then fails the event, counted). */
+async function recordFxWait(eventId: string, now = new Date()): Promise<{ capped: boolean; waits: number; startedAt: Date }> {
+  const row = await db.wmsInboundReceiptEvent.findUnique({ where: { id: eventId }, select: { fxWaitStartedAt: true, fxWaitCount: true } })
+  const startedAt = row?.fxWaitStartedAt ?? now
+  const waits = (row?.fxWaitCount ?? 0) + 1
+  await db.wmsInboundReceiptEvent.update({ where: { id: eventId }, data: { fxWaitStartedAt: startedAt, fxWaitCount: waits } })
+  return { capped: waits > FX_WAIT_EPISODE_CAP.waits || now.getTime() - startedAt.getTime() >= FX_WAIT_EPISODE_CAP.ms, waits, startedAt }
 }
 
 async function markEventPending(eventId: string, reason: string): Promise<void> {
@@ -460,6 +473,7 @@ export async function processBookedInEvent(
     }
     // The valuations this event laid goods at, reported after the commit (MED-5).
     const purchaseFxValuations = new Map<string, ReceiptFxValuation>()
+    const purchaseBillFxResults: Array<{ poId: string; poReference: string; result: PurchaseBillFxReconcileResult }> = []
 
     const processed = await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM wms_inbound_receipt_events WHERE id = ${event.id} FOR UPDATE`
@@ -1805,6 +1819,16 @@ export async function processBookedInEvent(
         })
       }
 
+      // Per-event FX (step 3): goods that arrive after the order's bill settle that bill's FX difference against them (per receipt), in this
+      // transaction, under the order row locks this book-in holds.
+      for (const valuation of purchaseFxValuations.values()) {
+        purchaseBillFxResults.push({
+          poId: valuation.poId,
+          poReference: valuation.poReference,
+          result: await reconcilePurchaseBillFx(tx, { poId: valuation.poId, connector: accountingConnector, syncEnabled: accountingSettings.syncEnabled, at: now }),
+        })
+      }
+
       await tx.wmsInboundReceiptEvent.update({
         where: { id: lockedEvent.id },
         data: {
@@ -1894,6 +1918,8 @@ export async function processBookedInEvent(
         },
       })
     }
+
+    for (const entry of purchaseBillFxResults) await reportPurchaseFxVarianceNotQueued(entry.poId, entry.poReference, entry.result)
 
     // Reported only for the layers this book-in actually laid (a replay or a refused path leaves the map empty).
     for (const report of creditFloorReports) {
@@ -2030,7 +2056,23 @@ export async function processBookedInEvent(
     // MED-4: a purchase FX refusal that is only "the answer is not available yet" (Xero unreadable or out of request budget, no fx_rates rate, a blank
     // mapping) waits like a login refusal: it learned nothing about the event, so it must not spend the 8-attempt ladder and dead-letter a receipt that
     // is perfectly processable once Xero answers. Real ambiguity falls through to the counted failure below.
-    if (isTransientPurchaseFxRefusal(error)) {
+    // MED-C: an episode of such waits is CAPPED (FX_WAIT_EPISODE_CAP): past it the event fails like any other refusal, with a durable WARNING, so goods
+    // never wait for ever on an answer that is not coming.
+    const fxWait = isTransientPurchaseFxRefusal(error) ? await recordFxWait(event.id) : null
+    if (fxWait?.capped) {
+      await logActivity({
+        entityType: 'SYNC',
+        entityId: event.id,
+        tag: 'sync',
+        action: 'mintsoft_booked_in_fx_wait_capped',
+        level: 'WARNING',
+        description: `Booked-in processing for ASN ${event.externalAsnId} has waited on the purchase exchange rate ${fxWait.waits} times since `
+          + `${fxWait.startedAt.toISOString().slice(0, 16).replace('T', ' ')} UTC and now counts as a failed attempt; the goods are NOT in stock. ${message}`,
+        metadata: { externalAsnId: event.externalAsnId, waits: fxWait.waits, waitingSince: fxWait.startedAt.toISOString() },
+        resolveUser: false,
+      })
+    }
+    if (fxWait && !fxWait.capped) {
       await markEventLoginRefused(event.id, message)
       if (shouldEmitWarning(`mintsoft-booked-in-fx-waiting:${event.id}`)) await logActivity({
         entityType: 'SYNC',

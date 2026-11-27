@@ -29,8 +29,13 @@ import { PURCHASE_PRICE_VARIANCE_ACCOUNT_KEY, REALISED_FX_ACCOUNT_KEY } from '@/
  *    was turned on between the two halves) it refuses, and the caller retries.
  *
  * A PREPAYMENT RECORDED AFTER EARLIER RECEIPTS (owner ruling 2026-11-26, MED-7) applies to LATER receipts only. Earlier receipts keep the rate they were
- * valued at (the table rate: each receipt stores its own rate and source), and nothing revalues them. A "no prepayment" answer is cached for
- * `purchase_fx_no_prepayment_ttl_hours` (default 6) to protect the Xero request budget; "Read from Xero" on the order refreshes it at once.
+ * valued at (the table rate: each receipt stores its own rate and source), and nothing revalues them.
+ *
+ * THE XERO REQUEST BUDGET (step-2 review round 2, MED-A/MED-B). A "no prepayment" answer stands for an automatic receipt (a WMS book-in or alignment)
+ * only while it is at most 15 minutes old (`NO_PREPAYMENT_FRESH_MS`): a prepayment recorded since an older read is never missed by a fallback receipt.
+ * A manual receipt and a bill always ask (`cache: 'manual'`). The hourly alignment sweep shares one memo across all its products
+ * (`PurchaseFxSweepMemo`), so each order is asked at most once per sweep however many products it carries; and an order whose prepayment could not be
+ * established is not asked again by an automatic receipt for a while (`REFUSED_RECHECK_MS`). The notice of a fallback receipt says when Xero was asked.
  *
  * THE GOODS UNIT COST. `unitCostForeign` (the line's net cost per stock unit: after the line discount and VAT extraction, in the order's currency)
  * x the order's header-discount factor (read from the FOREIGN totals, `subtotalForeign / SUM(line.totalForeign)`, the same function as the base
@@ -63,17 +68,42 @@ export function isPurchaseFxRefusalError(error: unknown): error is PurchaseFxRef
   return error instanceof PurchaseFxRefusalError
 }
 
-/** MED-4: a refusal that is only "the answer is not available yet" (a transient purchase FX refusal, or a missing fx_rates rate). */
-export function isTransientPurchaseFxRefusal(error: unknown): error is Error {
-  return (error instanceof PurchaseFxRefusalError && error.transient) || isMissingFxRateError(error)
+/**
+ * MED-4: a refusal that is only "the answer is not available yet" (Xero unreadable or out of budget, a rate the feed has not delivered for that
+ * instant yet). MED-C: a blank mapping, or a currency the exchange-rate feed has NEVER delivered, is configuration and is not transient; and a raw
+ * missing-rate error from anywhere else is not this module's to classify.
+ */
+export function isTransientPurchaseFxRefusal(error: unknown): error is PurchaseFxRefusalError {
+  return error instanceof PurchaseFxRefusalError && error.transient
+}
+
+/** The fx_rates rate at `asOf`, or a refusal: transient when the feed carries the currency (a later row exists), not when it never has. */
+async function tableRateOrRefuse(
+  tx: ValuationClient,
+  params: { currency: string; asOf: Date; baseCurrency: string; reference: string },
+): Promise<{ rate: Prisma.Decimal | string | number }> {
+  try {
+    return await getFxRateToBase(tx, { currency: params.currency, asOf: params.asOf, baseCurrency: params.baseCurrency })
+  } catch (error) {
+    if (!isMissingFxRateError(error)) throw error
+    const fed = await tx.fxRate.findFirst({ where: { fromCurrency: params.baseCurrency, toCurrency: params.currency }, select: { id: true } })
+    throw new PurchaseFxRefusalError(
+      fed
+        ? `There is no ${params.currency} exchange rate at ${params.asOf.toISOString()} in the exchange-rate table yet, and Xero holds no prepayment for ${params.reference}. `
+          + 'Nothing was received; it is tried again once the rate arrives.'
+        : `The exchange-rate table has never held a ${params.currency} rate, and Xero holds no prepayment for ${params.reference}. Nothing was received. `
+          + `Add ${params.currency} to the exchange-rate feed (Aelia), or give the order a Xero supplier prepayment with the Reference ${params.reference}; then receive the goods.`,
+      { transient: Boolean(fed) },
+    )
+  }
 }
 
 /** What the pre-transaction half established for one order. */
 export type PrepaymentCheck =
   /** A lock row exists (it was there, or this run stored it). */
   | { kind: 'locked' }
-  /** Xero was asked (or was asked within the cache window) and holds no live supplier prepayment with this order's reference. */
-  | { kind: 'no_prepayment' }
+  /** Xero was asked (in this run, or at `checkedAt` within the freshness window: `cached`) and holds no live supplier prepayment with this order's reference. */
+  | { kind: 'no_prepayment'; checkedAt: Date; cached: boolean }
   /** Xero sync is off: there is no ledger to hold a prepayment, so the fx_rates rule applies. */
   | { kind: 'xero_not_in_use' }
   /** MED-3: this order's prepayment could not be established. Only a receipt that actually values THIS order's goods refuses with it. */
@@ -117,8 +147,7 @@ export function matchSupplierPrepayment(params: {
       kind: 'refused',
       reason: `IMS cannot check that the Xero prepayment ${prepayment.prepaymentId} for ${params.poReference} was paid to the order's supplier: the supplier is `
         + 'not linked to a Xero contact of this organisation, and no Xero contact with the supplier\'s email or exact name was found. '
-        + 'There is no screen to set the link by hand: make the Xero contact\'s name (or email) exactly the supplier\'s name (or email) in IMS, or post a bill '
-        + 'for the supplier so IMS links it, then retry.',
+        + 'There is no screen to set the link by hand: make the Xero contact\'s name (or email) exactly the supplier\'s name (or email) in IMS, then retry.',
     }
   }
   if (prepayment.contactId !== params.supplierContactId) {
@@ -253,16 +282,29 @@ export async function lookUpPurchaseOrderPrepayment(
   }
 }
 
-/** MED-2: how long a "no prepayment" answer stands. Setting `purchase_fx_no_prepayment_ttl_hours` (hours, default 6); 0 turns the cache off. */
-export const NO_PREPAYMENT_TTL_SETTING_KEY = 'purchase_fx_no_prepayment_ttl_hours'
-export const NO_PREPAYMENT_TTL_DEFAULT_HOURS = 6
+/**
+ * MED-A: how old a "no prepayment" answer may be for an AUTOMATIC receipt to lay goods at the table rate on it. Older, Xero is asked again first, so a
+ * prepayment recorded after an earlier read (an hourly pre-read, another receipt) is never missed. Manual receipts and bills always ask.
+ */
+export const NO_PREPAYMENT_FRESH_MS = 15 * 60 * 1000
 /** MED-1: a lock read this recently is not read again before its first receipt (an operator's own "Read from Xero" a moment ago counts). */
 export const UNUSED_LOCK_FRESH_MS = 5 * 60 * 1000
+/**
+ * MED-B: an order whose prepayment could not be established is not asked again by an AUTOMATIC receipt for this long (process memory; a manual
+ * receipt, a bill and "Read from Xero" always ask). A failed read waits less than real ambiguity, which only a person resolves.
+ */
+export const REFUSED_RECHECK_MS = { transient: 15 * 60 * 1000, ambiguous: 60 * 60 * 1000 } as const
+const refusedAnswers = new Map<string, { check: Extract<PrepaymentCheck, { kind: 'refused' }>; until: number }>()
 
-export async function noPrepaymentTtlMs(client: SettingClient): Promise<number> {
-  const raw = (await settingValue(client, NO_PREPAYMENT_TTL_SETTING_KEY))?.trim()
-  if (!raw || !/^\d+(\.\d+)?$/.test(raw)) return NO_PREPAYMENT_TTL_DEFAULT_HOURS * 3_600_000
-  return Math.min(Number(raw), 24 * 30) * 3_600_000
+/** TESTS ONLY: forget the remembered refusals. */
+export function clearPurchaseFxRefusalMemoryForTests(): void {
+  refusedAnswers.clear()
+}
+
+/** MED-B: one memo per alignment sweep, shared by every product it aligns, so an order is asked at most once per sweep. */
+export type PurchaseFxSweepMemo = Map<string, PrepaymentCheck>
+export function newPurchaseFxSweepMemo(): PurchaseFxSweepMemo {
+  return new Map()
 }
 
 type AnswerOutcome =
@@ -362,9 +404,18 @@ export type PrepareOptions = {
    * and align-up). Only a receipt that actually values that order's goods then refuses; the others go through. Default: throw.
    */
   collectRefusals?: boolean
+  /**
+   * MED-A: 'manual' (the manual receipt and the bill) always asks Xero for an order with no lock; 'automatic' (the WMS book-in and alignment) relies on
+   * a "no prepayment" answer at most `NO_PREPAYMENT_FRESH_MS` old, and on a remembered refusal. Default 'automatic'.
+   */
+  cache?: 'manual' | 'automatic'
+  /** MED-B: the alignment sweep's memo (an answer already established in this sweep is reused). */
+  memo?: PurchaseFxSweepMemo
 }
 
-async function prepareOneOrder(po: PoForPrepayment, ctx: { syncOn: boolean; ttlMs: number; now: Date; deps?: PrepaymentReadDeps }): Promise<PrepaymentCheck> {
+type PrepareContext = { syncOn: boolean; manual: boolean; now: Date; deps?: PrepaymentReadDeps }
+
+async function prepareOneOrder(po: PoForPrepayment, ctx: PrepareContext): Promise<PrepaymentCheck> {
   const existing = await db.purchaseOrderFxLock.findUnique({ where: { poId: po.id }, select: { id: true, firstUsedAt: true, readAt: true, currency: true } })
   // A lock a receipt has valued goods at is final: nothing to ask.
   if (existing?.firstUsedAt) return { kind: 'locked' }
@@ -373,8 +424,10 @@ async function prepareOneOrder(po: PoForPrepayment, ctx: { syncOn: boolean; ttlM
   // MED-1: an UNUSED lock is re-read before its first receipt (unless it was read a moment ago): the prepayment may have been voided and re-entered
   // since, and the first receipt would otherwise freeze the stale rate for ever.
   if (existing && currencyAgrees && ctx.now.getTime() - existing.readAt.getTime() < UNUSED_LOCK_FRESH_MS) return { kind: 'locked' }
-  // MED-2: a "no prepayment" answer stands for the cache window.
-  if (!existing && ctx.ttlMs > 0 && po.fxNoPrepaymentCheckedAt && ctx.now.getTime() - po.fxNoPrepaymentCheckedAt.getTime() < ctx.ttlMs) return { kind: 'no_prepayment' }
+  // MED-A: a "no prepayment" answer stands for an automatic receipt only while it is fresh; a manual receipt or a bill always asks.
+  if (!existing && !ctx.manual && po.fxNoPrepaymentCheckedAt && ctx.now.getTime() - po.fxNoPrepaymentCheckedAt.getTime() < NO_PREPAYMENT_FRESH_MS) {
+    return { kind: 'no_prepayment', checkedAt: po.fxNoPrepaymentCheckedAt, cached: true }
+  }
 
   const looked = await lookUpPurchaseOrderPrepayment(po, ctx.deps)
   if (!looked.ok) {
@@ -389,7 +442,7 @@ async function prepareOneOrder(po: PoForPrepayment, ctx: { syncOn: boolean; ttlM
   const outcome = await applyPrepaymentAnswerUnderLock(po, found, { userId: null, now: ctx.now })
   // LOW-9: a lock created or changed by a receipt's lazy read is as much a decision as one made on the card, so it is in the activity log too.
   await logPrepaymentLockActivity(po, outcome, existing ? 'before its first receipt (re-read of an unused lock)' : 'by a receipt (lazy read)')
-  return outcome.kind === 'none' ? { kind: 'no_prepayment' } : { kind: 'locked' }
+  return outcome.kind === 'none' ? { kind: 'no_prepayment', checkedAt: ctx.now, cached: false } : { kind: 'locked' }
 }
 
 /**
@@ -403,16 +456,34 @@ export async function preparePurchaseReceiptFx(poIds: Iterable<string>, options:
   const ids = [...new Set(poIds)]
   if (ids.length === 0 || !(await isPurchaseEventFxEnabled(db))) return checks
   const baseCurrency = (await resolveBaseCurrencyCode({ organisation: db.organisation })).toUpperCase()
-  const ctx = { syncOn: await xeroSyncIsOn(db), ttlMs: await noPrepaymentTtlMs(db), now: (options.now ?? (() => new Date()))(), deps: options.deps }
+  const manual = options.cache === 'manual'
+  const ctx: PrepareContext = { syncOn: await xeroSyncIsOn(db), manual, now: (options.now ?? (() => new Date()))(), deps: options.deps }
   for (const poId of ids) {
+    const memoised = options.memo?.get(poId)
+    if (memoised) {
+      if (memoised.kind === 'refused' && !options.collectRefusals) throw new PurchaseFxRefusalError(memoised.reason, { transient: memoised.transient })
+      checks.set(poId, memoised)
+      continue
+    }
     const po = await loadPoForPrepayment(poId)
     if (!po || po.currency.trim().toUpperCase() === baseCurrency) continue
-    try {
-      checks.set(poId, await prepareOneOrder(po, ctx))
-    } catch (error) {
-      if (!options.collectRefusals || !isPurchaseFxRefusalError(error)) throw error
-      checks.set(poId, { kind: 'refused', reason: error.message, transient: error.transient })
+    const remembered = manual ? undefined : refusedAnswers.get(poId)
+    let check: PrepaymentCheck
+    if (remembered && remembered.until > ctx.now.getTime()) {
+      check = remembered.check
+    } else {
+      try {
+        check = await prepareOneOrder(po, ctx)
+        refusedAnswers.delete(poId)
+      } catch (error) {
+        if (!isPurchaseFxRefusalError(error)) throw error
+        check = { kind: 'refused', reason: error.message, transient: error.transient }
+        refusedAnswers.set(poId, { check, until: ctx.now.getTime() + (error.transient ? REFUSED_RECHECK_MS.transient : REFUSED_RECHECK_MS.ambiguous) })
+      }
     }
+    options.memo?.set(poId, check)
+    if (check.kind === 'refused' && !options.collectRefusals) throw new PurchaseFxRefusalError(check.reason, { transient: check.transient })
+    checks.set(poId, check)
   }
   return checks
 }
@@ -474,8 +545,9 @@ export async function resolveReceiptFxValuation(
   const currency = po.currency.trim().toUpperCase()
   if (currency === baseCurrency) return null
 
+  // MED-C: a blank mapping is configuration, not "not available yet": it does not resolve by waiting, so it is not transient.
   const accountsRefusal = await purchaseFxAccountsRefusal(tx)
-  if (accountsRefusal) throw new PurchaseFxRefusalError(accountsRefusal, { transient: true })
+  if (accountsRefusal) throw new PurchaseFxRefusalError(accountsRefusal)
 
   const check = params.checks.get(params.poId)
   // MED-3: this order's own refusal, raised only now that a receipt really values its goods. It also stops an unused lock a re-read could not confirm.
@@ -507,13 +579,14 @@ export async function resolveReceiptFxValuation(
         { transient: true },
       )
     }
-    const fx = await getFxRateToBase(tx, { currency, asOf: params.at, baseCurrency })
+    const fx = await tableRateOrRefuse(tx, { currency, asOf: params.at, baseCurrency, reference: po.reference })
     source = PURCHASE_FX_SOURCE_FX_TABLE
     rateToBase = new Prisma.Decimal(fx.rate)
     narration = `goods at the exchange-rate table rate ${rateToBase.toString()} ${currency} per ${baseCurrency} (no Xero prepayment)`
     if (check.kind === 'no_prepayment') {
-      fallbackNotice = `${po.reference} was received at the exchange-rate table rate (1 ${baseCurrency} = ${rateToBase.toString()} ${currency}) because Xero holds no live supplier `
-        + `prepayment with the Reference ${po.reference}. If the prepayment is recorded, check that its Reference is exactly the PO number: IMS finds it by that. `
+      fallbackNotice = `${po.reference} was received at the exchange-rate table rate (1 ${baseCurrency} = ${rateToBase.toString()} ${currency}) because Xero held no live supplier `
+        + `prepayment with the Reference ${po.reference} as of ${check.checkedAt.toISOString().slice(0, 16).replace('T', ' ')} UTC${check.cached ? ' (an answer IMS had already read, less than 15 minutes old)' : ''}. `
+        + `If the prepayment is recorded, check that its Reference is exactly the PO number: IMS finds it by that. `
         + 'A prepayment found later applies to LATER receipts only; this receipt keeps the table rate.'
     }
   }
@@ -591,6 +664,7 @@ export async function readPurchaseOrderPrepaymentOnDemand(
   if (outcome.kind === 'kept_used') return { status: 'refused', reason: outcome.reason }
   if (outcome.kind === 'none') return { status: 'none', removedUnusedLock: outcome.removedUnusedLock }
   const earlierTableRateReceipts = await db.purchaseReceipt.count({ where: { poId, fxRateSource: PURCHASE_FX_SOURCE_FX_TABLE } })
+    + await db.costLayer.count({ where: { poLine: { poId }, adjustmentMovementId: { not: null }, fxRateSource: PURCHASE_FX_SOURCE_FX_TABLE } })
   return {
     status: 'locked',
     changed: outcome.changed,
@@ -603,31 +677,51 @@ export async function readPurchaseOrderPrepaymentOnDemand(
 
 export type PurchaseOrderFxView = {
   lock: { rateToBase: string; currency: string; xeroPrepaymentId: string; prepaymentDate: string; prepaymentTotal: string; readAt: string; used: boolean } | null
-  /** MED-7: every receipt of the order and the rate it was valued at. `source` null = valued at the PO rate (before the switch was on). */
-  receipts: Array<{ id: string; reference: string | null; receivedAt: string; rateToBase: string | null; source: PurchaseFxSource | null }>
+  /**
+   * MED-7: every receipt of the order and the rate it was valued at. `source` null = valued at the PO rate (before the switch was on). MED-D: a WMS stock
+   * alignment lays goods with no receipt row, so each alignment layer valued under the switch is listed too (`kind: 'alignment'`).
+   */
+  receipts: Array<{ id: string; kind: 'receipt' | 'alignment'; reference: string | null; receivedAt: string; rateToBase: string | null; source: PurchaseFxSource | null }>
   tableRateReceiptCount: number
   prepaymentReceiptCount: number
 }
 
 /** The order's lock and the per-receipt rates, as the purchase order page shows them. */
 export async function getPurchaseOrderFxView(poId: string): Promise<PurchaseOrderFxView> {
-  const [lock, receipts] = await Promise.all([
+  const [lock, receipts, alignmentLayers] = await Promise.all([
     db.purchaseOrderFxLock.findUnique({ where: { poId } }),
     db.purchaseReceipt.findMany({
       where: { poId },
       orderBy: [{ receivedAt: 'asc' }, { createdAt: 'asc' }],
       select: { id: true, reference: true, receivedAt: true, fxRateToBase: true, fxRateSource: true },
     }),
+    // MED-D: the alignment's layers (laid against an adjustment movement, never a receipt row), valued under the switch.
+    db.costLayer.findMany({
+      where: { poLine: { poId }, adjustmentMovementId: { not: null }, fxRateSource: { not: null } },
+      orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
+      select: { id: true, receivedAt: true, fxRateToBase: true, fxRateSource: true },
+    }),
   ])
   const sourceOf = (value: string | null): PurchaseFxSource | null =>
     value === PURCHASE_FX_SOURCE_XERO_PREPAYMENT || value === PURCHASE_FX_SOURCE_FX_TABLE ? value : null
-  const rows = receipts.map((receipt) => ({
-    id: receipt.id,
-    reference: receipt.reference,
-    receivedAt: receipt.receivedAt.toISOString(),
-    rateToBase: receipt.fxRateToBase ? new Prisma.Decimal(receipt.fxRateToBase).toString() : null,
-    source: sourceOf(receipt.fxRateSource),
-  }))
+  const rows = [
+    ...receipts.map((receipt) => ({
+      id: receipt.id,
+      kind: 'receipt' as const,
+      reference: receipt.reference,
+      receivedAt: receipt.receivedAt.toISOString(),
+      rateToBase: receipt.fxRateToBase ? new Prisma.Decimal(receipt.fxRateToBase).toString() : null,
+      source: sourceOf(receipt.fxRateSource),
+    })),
+    ...alignmentLayers.map((layer) => ({
+      id: layer.id,
+      kind: 'alignment' as const,
+      reference: 'WMS alignment',
+      receivedAt: layer.receivedAt.toISOString(),
+      rateToBase: layer.fxRateToBase ? new Prisma.Decimal(layer.fxRateToBase).toString() : null,
+      source: sourceOf(layer.fxRateSource),
+    })),
+  ].sort((a, b) => (a.receivedAt < b.receivedAt ? -1 : a.receivedAt > b.receivedAt ? 1 : 0))
   return {
     lock: lock
       ? {
@@ -656,16 +750,16 @@ function lockedGoodsFor(valuation: ReceiptFxValuation, poLineId: string): Prisma
 export function purchaseFxLayerFields(
   valuation: ReceiptFxValuation | null,
   poLineId: string,
-): { purchaseFx?: { goodsUnitCostBase: Prisma.Decimal; fxRateToBase: Prisma.Decimal } } {
+): { purchaseFx?: { goodsUnitCostBase: Prisma.Decimal; fxRateToBase: Prisma.Decimal; fxRateSource: PurchaseFxSource } } {
   if (!valuation) return {}
-  return { purchaseFx: { goodsUnitCostBase: lockedGoodsFor(valuation, poLineId), fxRateToBase: valuation.storedRateToBase } }
+  return { purchaseFx: { goodsUnitCostBase: lockedGoodsFor(valuation, poLineId), fxRateToBase: valuation.storedRateToBase, fxRateSource: valuation.source } }
 }
 
 /** The same two columns for a direct `costLayer.create` (the WMS book-in writes the row itself). */
 export function purchaseFxLayerColumns(
   valuation: ReceiptFxValuation | null,
   poLineId: string,
-): { goodsUnitCostBase?: string; fxRateToBase?: string } {
+): { goodsUnitCostBase?: string; fxRateToBase?: string; fxRateSource?: PurchaseFxSource } {
   if (!valuation) return {}
-  return { goodsUnitCostBase: lockedGoodsFor(valuation, poLineId).toFixed(6), fxRateToBase: valuation.storedRateToBase.toFixed(8) }
+  return { goodsUnitCostBase: lockedGoodsFor(valuation, poLineId).toFixed(6), fxRateToBase: valuation.storedRateToBase.toFixed(8), fxRateSource: valuation.source }
 }

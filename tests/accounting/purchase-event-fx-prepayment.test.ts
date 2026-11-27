@@ -204,10 +204,11 @@ test('per-layer recalc: a legacy NULL layer takes the line gross and floor exact
 
 // ─── MED-4 / MED-6 (the step-2 review follow-ups) ────────────────────────────────────────────────────────────────
 
-test('MED-4: only a transient purchase FX refusal (or a missing fx_rates rate) is waited out; ambiguity and anything else counts', () => {
+test('MED-4: only a transient purchase FX refusal is waited out; ambiguity and anything else counts', () => {
   assert.equal(isTransientPurchaseFxRefusal(new PurchaseFxRefusalError('x', { transient: true })), true)
   assert.equal(isTransientPurchaseFxRefusal(new PurchaseFxRefusalError('x')), false, 'default: real ambiguity')
-  assert.equal(isTransientPurchaseFxRefusal(new MissingFxRateError('Missing GBP FX rate', 'USD', undefined)), true, 'a missing table rate waits for the rate')
+  // MED-C: a raw missing-rate error is not this module's to classify; the valuation wraps its own (transient only while the feed carries the currency).
+  assert.equal(isTransientPurchaseFxRefusal(new MissingFxRateError('Missing GBP FX rate', 'USD', undefined)), false, 'a raw missing-rate error is not classified here')
   assert.equal(isTransientPurchaseFxRefusal(new Error('boom')), false)
   assert.equal(isTransientPurchaseFxRefusal('Missing rate'), false)
 })

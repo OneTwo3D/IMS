@@ -121,7 +121,7 @@ export const ERASURE_CLASSIFICATION: Record<string, ModelClassification> = {
   CustomerClusterErasure: { erased: [], notPersonal: ['requestedCustomerId', 'memberIds', 'requestedByUserId', 'excludedMemberIds', 'cancelledByUserId', 'memberIdentityKeys'], retained: {} },
   // Linked by a relation, with no text or JSON column of their own (only keys, amounts and dates).
   CogsEntry: { erased: [], notPersonal: [], retained: {} },
-  CostLayer: { erased: [], notPersonal: ['returnMovementId'], retained: {} },
+  CostLayer: { erased: [], notPersonal: ['returnMovementId', 'fxRateSource'], retained: {} },
   CostLayerRevaluation: { erased: [], notPersonal: ['reason'], retained: {} },
   CostLayerSourceLine: { erased: [], notPersonal: ['sourceCostLayerId'], retained: {} },
   OrderAllocation: { erased: [], notPersonal: ['costLayerSnapshot'], retained: {} },

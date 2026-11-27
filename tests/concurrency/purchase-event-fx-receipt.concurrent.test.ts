@@ -165,6 +165,9 @@ async function written(po: { poId: string; lines: Array<{ poLineId: string }> })
 
 test.before(async () => {
   if (!RUN) return
+  // The switch reads off until the last step is installed (the interlock); these arms exercise the built steps with it on.
+  const { setPurchaseEventFxStepsCompleteForTests } = await import('@/lib/domain/purchasing/purchase-event-fx-settings')
+  setPurchaseEventFxStepsCompleteForTests(true)
   loadEnv()
   await enableStockReceiptPosting()
   await setSetting('xero_realised_fx_gain_loss_account', '4900')
@@ -269,7 +272,7 @@ test('ON + no prepayment + no fx_rates rate: refused, nothing written', SKIP, as
   const result = await withSwitch(true, () => receive(po, po.lines[0]!, 4))
   console.log(`# ON missing rate: ${JSON.stringify(result)}`)
   assert.equal(result.success, false)
-  assert.match(result.error ?? '', /FX rate|rate for/i)
+  assert.match(result.error ?? '', /FX rate|rate for|exchange-rate table has never held|exchange rate at/i)
   const after = await written(po)
   assert.deepEqual(after.layers, [])
   assert.deepEqual(after.receipts, [])
