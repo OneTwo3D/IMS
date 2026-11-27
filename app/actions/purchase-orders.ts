@@ -217,7 +217,7 @@ import {
   ORDER_LIST_PAGE_SIZE, isShortListQuery, PO_STATUSES, buildListPage, buildPurchaseOrderListWhere, normaliseListQuery,
   normalisePage, normaliseStatuses, poListHidesArchived, type ListPage, type PoListFilter,
 } from '@/lib/domain/lists/order-list-query'
-import { addMoney, multiplyMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
+import { addMoney, multiplyMoney, roundMoney, roundQuantity, toDecimal } from '@/lib/domain/math/decimal'
 import { supplierCreditNoteAmountBase } from '@/lib/domain/purchasing/supplier-credit-note-amount'
 import {
   buildStockMovementValueFields,

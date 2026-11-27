@@ -88,5 +88,5 @@ test('#1132 MED-4: the sales invoice UPDATE producer, the payment registration, 
   const po = readFileSync('app/actions/purchase-orders.ts', 'utf8')
   const post = po.slice(po.indexOf('const postSupplierCreditNoteTransaction = () => db.$transaction(async (tx) => {'))
   assert.ok(post.indexOf('FROM purchase_orders WHERE id = ${cn.poId} FOR UPDATE') < post.indexOf('await assertNoPendingDeletion(cn.purchaseInvoiceId, tx)'))
-  assert.ok(post.indexOf('await assertNoPendingDeletion(cn.purchaseInvoiceId, tx)') < post.indexOf("data: { status: 'POSTED', postedAt: creditNotePostedAt }"))
+  assert.ok(post.indexOf('await assertNoPendingDeletion(cn.purchaseInvoiceId, tx)') < post.indexOf("data: { status: 'POSTED', postedAt: creditNotePostedAt, ...creditRateColumns }"))
 })
