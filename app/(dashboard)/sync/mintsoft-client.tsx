@@ -1441,7 +1441,7 @@ export function MintsoftClient({ data, configured }: Props) {
               </Select>
               <p className="text-xs text-muted-foreground">
                 {restockCondition === 'UNSELLABLE'
-                  ? 'An unsellable unit at the Mintsoft warehouse cannot be quarantined in IMS (quarantine is IMS-only, and Mintsoft would still count it). Handle it at the 3PL, then mark this item Refunded only or Dismissed.'
+                  ? 'An unsellable unit at the Mintsoft warehouse cannot be quarantined in IMS (quarantine is IMS-only, and Mintsoft would still count it). Restock it as Sellable into the bound warehouse (this clears a return in transit), ask the warehouse to write it off or hold it out of sellable stock, then write it off with a stock adjustment.'
                   : 'Quarantine is kept in IMS only, so a return held at the Mintsoft warehouse is restocked here only when it is sellable.'}
               </p>
             </div>

@@ -100,15 +100,35 @@ export function quarantineWarehouseSettingsRefusal(params: {
   availableForSale: boolean
   syncToStore: boolean
   isDefault: boolean
+  /** Optional so older callers keep their shape; a missing value is read as not set. */
+  defaultReturnWarehouse?: boolean
+  availableForPurchaseOrders?: boolean
 }): string | null {
   if (!params.enabled || !isQuarantineWarehouseType(params.type)) return null
-  const flags = [
+  const flags = quarantineSellableFlags(params)
+  if (flags.length === 0) return null
+  return `A quarantine warehouse holds stock that is not sellable, so it cannot be marked ${flags.join(', ')}. Clear ${flags.length === 1 ? 'that option' : 'those options'} or choose another type.`
+}
+
+/**
+ * The flags a quarantine warehouse may not carry. Default return warehouse: storefront refunds restock there with no condition asked, so
+ * sellable returns would land in quarantine unseen. Available in purchase orders: a quarantine warehouse takes only unsellable returns and
+ * transfers; new purchases received into it would be fresh stock booked as unsellable.
+ */
+export function quarantineSellableFlags(params: {
+  availableForSale: boolean
+  syncToStore: boolean
+  isDefault: boolean
+  defaultReturnWarehouse?: boolean
+  availableForPurchaseOrders?: boolean
+}): string[] {
+  return [
     params.availableForSale ? 'Available for sale' : null,
     params.syncToStore ? 'Sync to store' : null,
     params.isDefault ? 'Default warehouse' : null,
+    params.defaultReturnWarehouse ? 'Default return warehouse' : null,
+    params.availableForPurchaseOrders ? 'Available in purchase orders' : null,
   ].filter((flag): flag is string => flag != null)
-  if (flags.length === 0) return null
-  return `A quarantine warehouse holds stock that is not sellable, so it cannot be marked ${flags.join(', ')}. Clear ${flags.length === 1 ? 'that option' : 'those options'} or choose another type.`
 }
 
 export const QUARANTINE_ALLOCATION_REFUSAL =
@@ -141,6 +161,12 @@ export async function loadQuarantineQtyByProduct(
   return out
 }
 
+export const QUARANTINE_IN_TRANSIT_EXPECTED_REFUSAL =
+  'Returns in transit are on, so this refund restocks nothing now: the units come back when the parcel is restocked from the returns inbox, and that is where their condition is asked. Choose an ordinary return warehouse (not a quarantine one). Nothing was recorded.'
+
+export const QUARANTINE_PRODUCTION_REFUSAL =
+  'That warehouse is a quarantine warehouse: its stock is not sellable and cannot be used in a production order. Transfer the units to a sellable warehouse first if they can be used.'
+
 export const QUARANTINE_REORDER_REFUSAL =
   'That warehouse is a quarantine warehouse: it holds unsellable stock and cannot receive a reorder. Choose a sellable warehouse.'
 
@@ -163,7 +189,7 @@ export async function isQuarantineTargetWarehouse(client: WarehouseTypeReader, w
  * is always refused.
  */
 export const WMS_UNSELLABLE_RETURN_REFUSAL =
-  'This return is at the 3PL warehouse, and quarantine is kept in IMS only: the warehouse system would still count the unit, and stock alignment would book it into the bound warehouse a second time. Handle the unsellable unit at the 3PL (ask the warehouse to write it off or hold it out of sellable stock, then mark this item Refunded only or Dismissed), or mark it sellable and restock it. Nothing was recorded.'
+  'This return is at the 3PL warehouse, and quarantine is kept in IMS only: the warehouse system would still count the unit, and stock alignment would book it into the bound warehouse a second time. Restock it as Sellable into the bound warehouse instead (that also clears a return in transit), ask the 3PL to write it off or hold it out of sellable stock, then write it off in IMS with a stock adjustment in that warehouse (a reason mapped to your write-off account). Nothing was recorded.'
 
 /** The rule for the warehouse-system (WMS) returns-inbox restock: the general rule, except that an unsellable unit held at the 3PL is never quarantined. Pure. */
 export function wmsReturnRestockRefusal(params: {
@@ -175,37 +201,62 @@ export function wmsReturnRestockRefusal(params: {
   return returnConditionRestockRefusal(params)
 }
 
-type QuarantineCensusClient = Pick<Prisma.TransactionClient, 'externalWmsBinding' | 'orderAllocation' | 'shipment' | 'productionOrder'>
+type QuarantineCensusClient = Pick<Prisma.TransactionClient, 'externalWmsBinding' | 'orderAllocation' | 'shipment' | 'productionOrder' | 'stockTransfer' | 'purchaseOrder'>
 
-/**
- * What would make a warehouse's stock sellable work if it became a quarantine warehouse: a warehouse-system binding, open
- * allocations, shipments not yet shipped and open production orders. Each count is exact (no sampling).
- */
-export async function loadQuarantineBlockers(client: QuarantineCensusClient, warehouseId: string): Promise<{
+export type QuarantineBlockers = {
   wmsBindings: number
   allocations: number
   openShipments: number
   openProductionOrders: number
-}> {
-  const [wmsBindings, allocations, openShipments, openProductionOrders] = await Promise.all([
+  inboundTransfers: number
+  openPurchaseOrders: number
+}
+
+/** Purchase orders still to be received (not received, closed, invoiced, returned or cancelled). */
+const OPEN_PURCHASE_ORDER_STATUSES = ['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED', 'PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'] as const
+
+/**
+ * Sellable work that points at a warehouse: a warehouse-system binding, open allocations, shipments not yet shipped, open production orders,
+ * transfers in flight into it and purchase orders still to be received there. Each count is exact (no sampling).
+ */
+export async function loadQuarantineBlockers(client: QuarantineCensusClient, warehouseId: string): Promise<QuarantineBlockers> {
+  const [wmsBindings, allocations, openShipments, openProductionOrders, inboundTransfers, openPurchaseOrders] = await Promise.all([
     client.externalWmsBinding.count({ where: { warehouseId } }),
     client.orderAllocation.count({ where: { warehouseId, qty: { gt: 0 } } }),
     client.shipment.count({ where: { warehouseId, status: { in: ['PENDING', 'PICKING', 'PACKED'] } } }),
     client.productionOrder.count({ where: { warehouseId, status: { in: ['DRAFT', 'IN_PROGRESS'] } } }),
+    client.stockTransfer.count({ where: { toWarehouseId: warehouseId, status: 'IN_TRANSIT' } }),
+    client.purchaseOrder.count({ where: { destinationWarehouseId: warehouseId, status: { in: [...OPEN_PURCHASE_ORDER_STATUSES] } } }),
   ])
-  return { wmsBindings, allocations, openShipments, openProductionOrders }
+  return { wmsBindings, allocations, openShipments, openProductionOrders, inboundTransfers, openPurchaseOrders }
 }
 
-/** The refusal for turning a warehouse INTO a quarantine warehouse while it still carries sellable work, or null. Pure. */
-export function quarantineTypeChangeRefusal(blockers: Awaited<ReturnType<typeof loadQuarantineBlockers>>): string | null {
-  const parts = [
+export function quarantineBlockerParts(blockers: QuarantineBlockers): string[] {
+  return [
     blockers.wmsBindings > 0 ? `${blockers.wmsBindings} warehouse-system binding(s)` : null,
     blockers.allocations > 0 ? `${blockers.allocations} open allocation(s)` : null,
     blockers.openShipments > 0 ? `${blockers.openShipments} shipment(s) not yet shipped` : null,
     blockers.openProductionOrders > 0 ? `${blockers.openProductionOrders} open production order(s)` : null,
+    blockers.inboundTransfers > 0 ? `${blockers.inboundTransfers} transfer(s) in transit into it` : null,
+    blockers.openPurchaseOrders > 0 ? `${blockers.openPurchaseOrders} purchase order(s) still to be received there` : null,
   ].filter((part): part is string => part != null)
+}
+
+/** The refusal for turning a warehouse INTO a quarantine warehouse while it still carries sellable work, or null. Pure. */
+export function quarantineTypeChangeRefusal(blockers: QuarantineBlockers): string | null {
+  const parts = quarantineBlockerParts(blockers)
   if (parts.length === 0) return null
   return `This warehouse cannot become a quarantine warehouse while it has ${parts.join(', ')}: its stock would stop being sellable under them. Finish, move or release them first (and remove the binding), then change the type.`
+}
+
+/**
+ * The refusal for turning a quarantine warehouse into an ordinary one while it holds stock (switch on): its units would become sellable
+ * without anyone deciding so. Pure; null when it holds none.
+ */
+export function quarantineLeaveRefusal(onHandQty: Prisma.Decimal | number): string | null {
+  const qty = typeof onHandQty === 'number' ? onHandQty : onHandQty.toNumber()
+  if (!(qty > 0)) return null
+  return `This quarantine warehouse still holds ${qty} unit(s) of unsellable stock, which would become sellable if its type changed. Empty it first: write units off with a stock adjustment (a reason mapped to your write-off account), or transfer the ones that can be sold to a sellable warehouse. Then change the type.`
 }
 
 export type QuarantineWarehouseIssue = {
@@ -221,29 +272,35 @@ export type QuarantineWarehouseIssue = {
  * default) or open allocations against its stock. Shown with the switch's status so turning it on is never blind.
  */
 export async function listQuarantineWarehouseIssues(
-  client: Pick<Prisma.TransactionClient, 'warehouse' | 'orderAllocation'>,
+  client: Pick<Prisma.TransactionClient, 'warehouse'> & QuarantineCensusClient,
 ): Promise<QuarantineWarehouseIssue[]> {
   const warehouses = await client.warehouse.findMany({
     where: { type: QUARANTINE_WAREHOUSE_TYPE },
-    select: { id: true, code: true, name: true, availableForSale: true, syncToStore: true, isDefault: true },
+    select: { id: true, code: true, name: true, availableForSale: true, syncToStore: true, isDefault: true, defaultReturnWarehouse: true, availableForPurchaseOrders: true },
     orderBy: { code: 'asc' },
   })
   const issues: QuarantineWarehouseIssue[] = []
   for (const w of warehouses) {
-    const allocations = await client.orderAllocation.count({ where: { warehouseId: w.id, qty: { gt: 0 } } })
     const problems = [
-      w.availableForSale ? 'marked Available for sale' : null,
-      w.syncToStore ? 'marked Sync to store' : null,
-      w.isDefault ? 'is the default warehouse' : null,
-      allocations > 0 ? `${allocations} open allocation(s)` : null,
-    ].filter((p): p is string => p != null)
+      ...quarantineSellableFlags(w).map((flag) => `marked ${flag}`),
+      ...quarantineBlockerParts(await loadQuarantineBlockers(client, w.id)),
+    ]
     if (problems.length > 0) issues.push({ id: w.id, code: w.code, name: w.name, problems })
   }
   return issues
 }
 
+/** The turn-on interlock of the switch: refused while any quarantine warehouse is not clean. Run in the dry run and inside the write. */
+export async function quarantineSwitchOnRefusal(
+  client: Pick<Prisma.TransactionClient, 'warehouse'> & QuarantineCensusClient,
+): Promise<string | null> {
+  const issues = await listQuarantineWarehouseIssues(client)
+  if (issues.length === 0) return null
+  return `return_condition_check_enabled cannot be turned on while a quarantine warehouse still looks sellable: ${issues.map((i) => `${i.code} (${i.problems.join('; ')})`).join(' | ')}. Fix them (Inventory Settings, Warehouses; release or move the work) and try again. Nothing was written.`
+}
+
 export const WMS_UNSELLABLE_REFUND_REFUSAL =
-  'These units shipped from a 3PL warehouse (bound to the warehouse system), so they go back to the 3PL, and quarantine is kept in IMS only: the warehouse system would count them again and stock alignment would book them into the bound warehouse a second time. Record the refund as sellable into that warehouse and handle the unsellable unit at the 3PL, or record it with no stock return. Nothing was recorded.'
+  'These units shipped from a 3PL warehouse (bound to the warehouse system), so they go back to the 3PL, and quarantine is kept in IMS only: the warehouse system would count them again and stock alignment would book them into the bound warehouse a second time. Record the refund as Sellable into that warehouse, ask the 3PL to write the unit off or hold it out of sellable stock, then write it off in IMS with a stock adjustment there (a reason mapped to your write-off account); or record the refund with no stock return. Nothing was recorded.'
 
 /**
  * The refund dialog's counterpart of the returns-inbox rule: units that shipped from a warehouse bound to a warehouse system (or an

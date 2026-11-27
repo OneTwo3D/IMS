@@ -201,7 +201,8 @@ import { deleteSalesOrderAttachmentsInTx, drainOrderAttachmentFileDeletions } fr
 import { recordPegsRemovedWithLines } from '@/lib/domain/sales/peg-service'
 import { SHOP_DESYNC_WARNING, paidOrderTotalChangeRefusal, resolveSalesOrderAddressEditBlock, resolveSalesOrderEditBlock, shopDesyncAcknowledgementRefusal, type SalesOrderEditInput } from '@/lib/domain/sales/order-edit-affordance'
 import { RETURN_EXCHANGE_OFF_REFUSAL, RETURN_EXCHANGE_SETTING_KEY, exchangeRequestRefusal, resolveReturnExchangeBlock, returnExchangeEnabledFromSetting, returnExchangeRefusals } from '@/lib/domain/sales/return-exchange'
-import { parseReturnCondition, readReturnConditionCheckEnabled, refundReturnsToWmsWarehouse, returnConditionRestockRefusal, WMS_UNSELLABLE_REFUND_REFUSAL, type ReturnCondition } from '@/lib/domain/inventory/quarantine-warehouse'
+import { readReturnsInTransitEnabled } from '@/lib/domain/sales/return-expectation'
+import { isQuarantineWarehouseType, parseReturnCondition, QUARANTINE_IN_TRANSIT_EXPECTED_REFUSAL, readReturnConditionCheckEnabled, refundReturnsToWmsWarehouse, returnConditionRestockRefusal, WMS_UNSELLABLE_REFUND_REFUSAL, type ReturnCondition } from '@/lib/domain/inventory/quarantine-warehouse'
 import { hasPermission } from '@/lib/permissions'
 import { buildSalesOrderWriteModel, type SalesOrderWriteModel } from '@/lib/domain/sales/sales-order-write-model'
 import { isQuoteExpired, quoteDateToYmd, quoteStatusMoveRefused, quoteYmdToDate, validateQuoteInput } from '@/lib/domain/sales/sales-quote'
@@ -3739,8 +3740,17 @@ export async function createRefund(
     if (deletePendingForRefund) return { success: false, error: deletePendingForRefund }
     // THE CONDITION CHECK (switch return_condition_check_enabled): an operator restock states the returned items' condition, and the warehouse must agree with it.
     // The stock, its cost layer and the journal are exactly those of today; only the warehouse differs. Off, nothing is read beyond the switch.
-    const conditionCheck = !isInternal && await readReturnConditionCheckEnabled(db)
+    // With returns in transit on (refund_returns_in_transit_enabled) the refund restocks NOTHING: its units come back when the parcel is restocked
+    // from the returns inbox, and that restock is where the condition is asked. So no condition is asked or recorded here, and the expected
+    // warehouse may not be a quarantine one (the parcel's restock decides where the units go).
+    const conditionSwitchOn = !isInternal && await readReturnConditionCheckEnabled(db)
+    const returnsInTransit = conditionSwitchOn && returnWarehouseId ? await readReturnsInTransitEnabled(db) : false
+    const conditionCheck = conditionSwitchOn && !returnsInTransit
     const returnCondition = conditionCheck ? parseReturnCondition(options?.returnCondition) : null
+    if (returnsInTransit && returnWarehouseId) {
+      const expected = await db.warehouse.findUnique({ where: { id: returnWarehouseId }, select: { type: true } })
+      if (isQuarantineWarehouseType(expected?.type)) return { success: false, error: QUARANTINE_IN_TRANSIT_EXPECTED_REFUSAL }
+    }
     if (conditionCheck && returnWarehouseId && lines.some((line) => line.qty > 0)) {
       const returnWarehouse = await db.warehouse.findUnique({ where: { id: returnWarehouseId }, select: { code: true, type: true } })
       if (returnWarehouse) {
