@@ -3,6 +3,7 @@ import { db } from '@/lib/db'
 import { buildTemplateCsv, toCsv, csvResponse } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
+import { canViewStockValue } from '@/lib/security/stock-position-policy'
 
 const HEADERS = ['sku', 'warehouseCode', 'qty', 'unitCostBase', 'productName', 'type', 'stockUnit', 'warehouseName', 'reserved', 'available', 'inventoryValueBase']
 const TEMPLATE_HEADERS = HEADERS
@@ -54,7 +55,10 @@ export async function GET(req: NextRequest) {
 
   const productIds = Array.from(new Set(filtered.map((level) => level.productId)))
   const exportWarehouseIds = Array.from(new Set(filtered.map((level) => level.warehouseId)))
-  const costLayers = productIds.length > 0 && exportWarehouseIds.length > 0
+  // Unit cost and stock value are cost figures: without inventory.prices the cost layers are not even read and both columns are
+  // blank (they keep their place in the header so the column contract holds).
+  const includeCost = canViewStockValue(session.user.role)
+  const costLayers = includeCost && productIds.length > 0 && exportWarehouseIds.length > 0
     ? await db.costLayer.findMany({
         where: {
           productId: { in: productIds },
@@ -93,14 +97,14 @@ export async function GET(req: NextRequest) {
       sku: l.product.sku,
       warehouseCode: l.warehouse.code,
       qty,
-      unitCostBase: unitCostBase.toFixed(6),
+      unitCostBase: includeCost ? unitCostBase.toFixed(6) : '',
       productName: l.product.name,
       type: l.product.type,
       stockUnit: l.product.stockUnit,
       warehouseName: l.warehouse.name,
       reserved: Number(l.reservedQty),
       available: qty - Number(l.reservedQty),
-      inventoryValueBase: (qty * unitCostBase).toFixed(2),
+      inventoryValueBase: includeCost ? (qty * unitCostBase).toFixed(2) : '',
     }
   })
 

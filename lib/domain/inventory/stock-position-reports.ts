@@ -90,6 +90,11 @@ export type StockPositionFilters = {
   // reorder-report-only. Attach forecast quantity / sales / margin to the rows. Prices and cost,
   // so callers set it only for roles holding inventory.prices.
   includeForecastMoney?: boolean
+  // Stock value / unit cost on the stock-on-hand, inventory-aging and dead-stock reports (and the slow-stock report, which has its
+  // own filters type). Fail closed: value fields are present only when this is exactly true, so callers set it only for roles
+  // holding inventory.prices (see canViewStockValue in lib/security/stock-position-policy.ts). When false the value fields are
+  // OMITTED from rows, totals and summaries, not nulled, and no ordering is derived from value.
+  includeCost?: boolean
   page?: number
   pageSize?: number
 }
@@ -156,8 +161,9 @@ export type StockOnHandReportRow = {
   reservationQtySource: StockOnHandReservationQtySource
   reservationSnapshotDate: string | null
   reservationSourceCount: number | null
-  unitCostBase: string | null
-  totalValueBase: string
+  // Present only when the report was requested with includeCost (inventory.prices); omitted for other roles.
+  unitCostBase?: string | null
+  totalValueBase?: string
 }
 
 export type StockOnHandReservationQtySource =
@@ -194,7 +200,7 @@ export type StockOnHandReport = {
     quantity: string
     reservedQty: string
     availableQty: string
-    totalValueBase: string
+    totalValueBase?: string
   }
 }
 
@@ -903,11 +909,14 @@ export async function getStockOnHandReport(
       quantity: sum.quantity.add(toDecimal(row.quantity)),
       reservedQty: sum.reservedQty.add(toDecimal(row.reservedQty)),
       availableQty: sum.availableQty.add(toDecimal(row.availableQty)),
-      totalValueBase: sum.totalValueBase.add(toDecimal(row.totalValueBase)),
+      totalValueBase: sum.totalValueBase.add(toDecimal(row.totalValueBase ?? 0)),
     }),
     { quantity: ZERO, reservedQty: ZERO, availableQty: ZERO, totalValueBase: ZERO },
   )
-  const paged = options.paginate === false ? { rows, pageInfo: pageInfo(rows.length, 1, Math.max(rows.length, 1)) } : paginate(rows, filters)
+  // Value fields leave the server only for inventory.prices roles: strip them BEFORE paging so nothing downstream can see them.
+  const costVisible = filters.includeCost === true
+  const outputRows = costVisible ? rows : rows.map(stripStockOnHandValue)
+  const paged = options.paginate === false ? { rows: outputRows, pageInfo: pageInfo(outputRows.length, 1, Math.max(outputRows.length, 1)) } : paginate(outputRows, filters)
 
   return {
     asOf: asOfResult.asOf,
@@ -936,9 +945,14 @@ export async function getStockOnHandReport(
       quantity: decimalString(totals.quantity),
       reservedQty: decimalString(totals.reservedQty),
       availableQty: decimalString(totals.availableQty),
-      totalValueBase: moneyString(totals.totalValueBase),
+      ...(costVisible ? { totalValueBase: moneyString(totals.totalValueBase) } : {}),
     },
   }
+}
+
+function stripStockOnHandValue(row: StockOnHandReportRow): StockOnHandReportRow {
+  const { unitCostBase: _unitCostBase, totalValueBase: _totalValueBase, ...rest } = row
+  return rest
 }
 
 export async function getStockAllocationReport(

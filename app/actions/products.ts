@@ -116,7 +116,8 @@ export type ProductRow = {
   allocatedStock: string    // sum of reservedQty across all warehouses
   availableStock: string    // totalStock - allocatedStock
   incomingStock: string     // in-transit transfers + open PO lines
-  inventoryValue: string  // sum of remainingQty * unitCostBase
+  // sum of remainingQty * unitCostBase; null (never computed) for roles without inventory.prices
+  inventoryValue: string | null
   createdAt: Date
   updatedAt: Date
 }
@@ -147,6 +148,7 @@ export type ProductDetail = ProductRow & {
     incomingPoQty: string        // open PO lines destined for this warehouse
   }[]
   incomingPoQty: string    // open PO lines with no warehouse assigned yet (unassigned)
+  // Always empty for roles without inventory.prices: unit costs are cost figures.
   costLayers: { id: string; receivedAt: Date; receivedQty: string; remainingQty: string; unitCostBase: string }[]
 }
 
@@ -339,9 +341,11 @@ export async function listProducts(params: {
     allocatedStock: allocatedStock.toFixed(2),
     availableStock: availableStock.toFixed(2),
     incomingStock: incomingStock.toFixed(2),
-    inventoryValue: p.costLayers
-      .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostBase), 0)
-      .toFixed(2),
+    inventoryValue: canSeePrices
+      ? p.costLayers
+        .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostBase), 0)
+        .toFixed(2)
+      : null,
     createdAt: p.createdAt,
     updatedAt: p.updatedAt,
   }}
@@ -514,7 +518,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
 
   // For KIT/BOM: compute unit cost from components; BOM also uses actual stock
   const isKitOrBom = p.type === 'KIT' || p.type === 'BOM'
-  const kitUnitCostBase = isKitOrBom ? await computeKitUnitCostBase(p.id) : 0
+  const kitUnitCostBase = isKitOrBom && canSeePrices ? await computeKitUnitCostBase(p.id) : 0
   const fifoInventoryValue = p.costLayers
     .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostBase), 0)
   const totalStockQty = p.stockLevels.reduce((sum, s) => sum + Number(s.quantity), 0)
@@ -523,9 +527,12 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
   const isQuarantineLevel = (level: { warehouse: { type: string } }): boolean => conditionCheck && isQuarantineWarehouseType(level.warehouse.type)
   const quarantinedQty = p.stockLevels.filter(isQuarantineLevel).reduce((sum, s) => sum + Number(s.quantity), 0)
   const variantQuarantine = await loadQuarantineQtyByProduct(db, conditionCheck, variantIds)
-  const inventoryValue = isKitOrBom
-    ? (p.type === 'BOM' ? kitUnitCostBase * totalStockQty : kitUnitCostBase).toFixed(2)
-    : fifoInventoryValue.toFixed(2)
+  // Stock value and unit cost are cost figures: withheld here, on the server, for roles without inventory.prices.
+  const inventoryValue = !canSeePrices
+    ? null
+    : isKitOrBom
+      ? (p.type === 'BOM' ? kitUnitCostBase * totalStockQty : kitUnitCostBase).toFixed(2)
+      : fifoInventoryValue.toFixed(2)
 
   return {
     id: p.id,
@@ -613,7 +620,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
         (variantQuarantine.get(v.id)?.toNumber() ?? 0)
       ).toFixed(2),
       incomingStock: (variantIncomingMap.get(v.id) ?? 0).toFixed(2),
-      inventoryValue: '0.00',
+      inventoryValue: canSeePrices ? '0.00' : null,
       createdAt: v.createdAt,
       updatedAt: v.updatedAt,
     })),
@@ -659,7 +666,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       }
       return rows
     })(),
-    costLayers: p.costLayers.map((c) => ({
+    costLayers: !canSeePrices ? [] : p.costLayers.map((c) => ({
       id: c.id,
       receivedAt: c.receivedAt,
       receivedQty: c.receivedQty.toString(),

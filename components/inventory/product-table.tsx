@@ -68,6 +68,8 @@ type Props = {
   canEdit?: boolean
   /** inventory.prices: unlocks the price columns in Edit by CSV. */
   canEditPrices?: boolean
+  /** inventory.prices: shows the COGS Value (stock value) column; the server sends no value to other roles. */
+  canSeeStockValue?: boolean
 }
 
 const STATUS_LABELS: Record<ProductLifecycleStatus, string> = {
@@ -84,7 +86,7 @@ const STATUS_VARIANTS: Record<ProductLifecycleStatus, 'default' | 'secondary' | 
   ARCHIVED: 'outline',
 }
 
-export function ProductTable({ products, total, page, pageSize, searchParams, canEdit = false, canEditPrices = false }: Props) {
+export function ProductTable({ products, total, page, pageSize, searchParams, canEdit = false, canEditPrices = false, canSeeStockValue = false }: Props) {
   const baseCurrency = useBaseCurrency()
   const fmtBase = (value: number) => formatMoney(value, baseCurrency.symbol, baseCurrency.symbolPosition)
   const router = useRouter()
@@ -162,7 +164,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams, ca
     return () => window.removeEventListener(COLS_CHANGED_EVENT, load)
   }, [])
 
-  const visibleCols = ALL_COLUMNS.filter((c) => visible[c.key])
+  const visibleCols = ALL_COLUMNS.filter((c) => visible[c.key] && (canSeeStockValue || c.key !== 'inventoryValue'))
   const totalPages = Math.ceil(total / pageSize)
 
   const currentSort = searchParams.sort
@@ -275,6 +277,7 @@ export function ProductTable({ products, total, page, pageSize, searchParams, ca
         { const val = Number(p.incomingStock); return val > 0 ? <span className="text-blue-600">+{val.toLocaleString()}</span> : '—' }
       case 'inventoryValue':
         if (p.type === 'VARIABLE' || p.type === 'NON_INVENTORY') return '—'
+        if (p.inventoryValue == null) return '—'
         return fmtBase(Number(p.inventoryValue))
       case 'variantCount':
         return p.variantCount > 0 ? p.variantCount : '—'
@@ -418,10 +421,12 @@ export function ProductTable({ products, total, page, pageSize, searchParams, ca
                       <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Stock</p>
                       <p className="mt-1 font-medium">{renderCell(p, 'totalStock')}</p>
                     </div>
-                    <div className="rounded-md bg-muted/50 px-2.5 py-2">
-                      <p className="text-[11px] uppercase tracking-wide text-muted-foreground">COGS Value</p>
-                      <p className="mt-1 font-medium">{renderCell(p, 'inventoryValue')}</p>
-                    </div>
+                    {canSeeStockValue && (
+                      <div className="rounded-md bg-muted/50 px-2.5 py-2">
+                        <p className="text-[11px] uppercase tracking-wide text-muted-foreground">COGS Value</p>
+                        <p className="mt-1 font-medium">{renderCell(p, 'inventoryValue')}</p>
+                      </div>
+                    )}
                     <div className="rounded-md bg-muted/50 px-2.5 py-2">
                       <p className="text-[11px] uppercase tracking-wide text-muted-foreground">Updated</p>
                       <p className="mt-1 font-medium">{renderCell(p, 'updatedAt')}</p>

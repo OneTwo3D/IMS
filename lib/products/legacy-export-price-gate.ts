@@ -2,9 +2,9 @@ import type { Permission } from '@/lib/permissions'
 
 /**
  * The price columns of the legacy product export (/api/export/products). Same set the Edit-by-CSV
- * columns guard with `inventory.prices`.
+ * columns guard with `inventory.prices`, plus inventoryValue: the on-hand stock value is a cost figure held to the same permission.
  */
-export const LEGACY_EXPORT_PRICE_COLUMNS = ['salesPriceBase', 'salePriceBase', 'salesPriceTaxInclusive'] as const
+export const LEGACY_EXPORT_PRICE_COLUMNS = ['salesPriceBase', 'salePriceBase', 'salesPriceTaxInclusive', 'inventoryValue'] as const
 
 /**
  * Without `inventory.prices` the price columns keep their place in the header (so the column contract

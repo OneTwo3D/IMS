@@ -18,6 +18,7 @@ import {
 import { ProductLink } from '@/components/inventory/product-link'
 import { getOrganisation } from '@/app/actions/company'
 import { requireStockPositionReportAccess } from '@/lib/security/stock-position-access'
+import { canViewStockValue } from '@/lib/security/stock-position-policy'
 import { formatMoneyCode } from '@/lib/utils'
 
 export const metadata: Metadata = { title: 'Inventory Aging' }
@@ -28,8 +29,9 @@ function one(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value
 }
 
-function filtersFromSearch(searchParams: SearchParams): StockPositionFilters {
+function filtersFromSearch(searchParams: SearchParams, includeCost: boolean): StockPositionFilters {
   return {
+    includeCost,
     asOf: one(searchParams.asOf),
     warehouseId: one(searchParams.warehouseId),
     categoryId: one(searchParams.categoryId),
@@ -47,9 +49,11 @@ function ageLabel(row: InventoryAgingReportRow): string {
 }
 
 export default async function InventoryAgingPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  await requireStockPositionReportAccess()
+  const session = await requireStockPositionReportAccess()
+  // Value is a cost figure: only inventory.prices roles get it, and the report omits it server-side otherwise.
+  const costVisible = canViewStockValue(session.user.role)
   const resolvedSearchParams = await searchParams
-  const filters = filtersFromSearch(resolvedSearchParams)
+  const filters = filtersFromSearch(resolvedSearchParams, costVisible)
   const [report, filterOptions, organisation] = await Promise.all([
     getInventoryAgingReport(filters).catch((error: unknown) => {
       if (error instanceof InventoryHealthSourceLimitError) return emptyInventoryAgingReportForSourceLimit(filters, error)
@@ -86,13 +90,13 @@ export default async function InventoryAgingPage({ searchParams }: { searchParam
       render: (row) => `${row.qty} ${row.stockUnit}`,
       footer: report.totals.qty,
     },
-    {
+    ...(costVisible ? [{
       key: 'value',
       label: `Value (${currency})`,
-      align: 'right',
-      render: (row) => formatMoneyCode(Number(row.valueBase), currency),
-      footer: formatMoneyCode(Number(report.totals.valueBase), currency),
-    },
+      align: 'right' as const,
+      render: (row: InventoryAgingReportRow) => formatMoneyCode(Number(row.valueBase ?? '0'), currency),
+      footer: formatMoneyCode(Number(report.totals.valueBase ?? '0'), currency),
+    }] : []),
   ]
 
   return (
@@ -109,7 +113,7 @@ export default async function InventoryAgingPage({ searchParams }: { searchParam
       summary={[
         { label: 'Aged rows', value: report.pageInfo.totalRows.toLocaleString() },
         { label: 'Quantity', value: report.totals.qty },
-        { label: `Value (${currency})`, value: formatMoneyCode(Number(report.totals.valueBase), currency) },
+        ...(costVisible ? [{ label: `Value (${currency})`, value: formatMoneyCode(Number(report.totals.valueBase ?? '0'), currency) }] : []),
       ]}
       notices={report.notices}
       dateMode="as-of"

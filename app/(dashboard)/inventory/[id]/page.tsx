@@ -88,6 +88,8 @@ export default async function ProductDetailPage({
   const holdsOwnStock = product.type === 'SIMPLE' || product.type === 'VARIANT' || product.type === 'BOM'
   const session = await getSession()
   const canEditInventory = session ? hasPermission(session.user.role, 'inventory.edit') : false
+  // Stock value and unit cost are cost figures: the action sends none to roles without inventory.prices, and the page hides the blocks.
+  const canSeeStockValue = session ? hasPermission(session.user.role, 'inventory.prices') : false
   const locationBuffers = holdsOwnStock ? await getLocationBuffers(id) : null
   const reorderThresholds = holdsOwnStock ? await getWarehouseReorderThresholds(id) : null
   const customFields = await getCustomFieldCardData('PRODUCT', id)
@@ -354,7 +356,7 @@ export default async function ProductDetailPage({
                   </div>
                 </div>
               )}
-              {Number(product.inventoryValue) > 0 && (
+              {canSeeStockValue && Number(product.inventoryValue) > 0 && (
                 <div className="mt-3 pt-3 border-t border-border flex justify-between text-sm">
                   <span className="text-muted-foreground">Unit COGS (components)</span>
                   <span className="font-mono font-semibold">{fmtBase(Number(product.inventoryValue))}</span>
@@ -459,7 +461,7 @@ export default async function ProductDetailPage({
                   </div>
 
                   {/* COGS value + avg unit cost */}
-                  <div className="pt-2 mt-1 border-t border-border space-y-1">
+                  {canSeeStockValue && <div className="pt-2 mt-1 border-t border-border space-y-1">
                     <div className="flex justify-between items-center text-sm">
                       <span className="text-muted-foreground">COGS Value</span>
                       <span className="font-mono font-semibold">{fmtBase(Number(product.inventoryValue))}</span>
@@ -472,7 +474,7 @@ export default async function ProductDetailPage({
                           : '—'}
                       </span>
                     </div>
-                  </div>
+                  </div>}
 
                   {/* Unassigned PO incoming (no warehouse set) */}
                   {Number(product.incomingPoQty) > 0 && (
@@ -506,7 +508,7 @@ export default async function ProductDetailPage({
           />
 
           {/* FIFO cost layers */}
-          {product.type !== 'VARIABLE' && product.type !== 'NON_INVENTORY' && product.type !== 'KIT' && (
+          {canSeeStockValue && product.type !== 'VARIABLE' && product.type !== 'NON_INVENTORY' && product.type !== 'KIT' && (
             <Card className="p-4">
               <h2 className="text-sm font-semibold mb-3">FIFO Cost Layers</h2>
               {product.costLayers.length === 0 ? (

@@ -78,7 +78,7 @@ test('inventory aging reconstructs as-of quantity from remaining cost layers plu
   })
 
   const report = await getInventoryAgingReport(
-    { asOf: '2026-06-01' },
+    { includeCost: true, asOf: '2026-06-01' },
     {
       paginate: false,
       deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') },
@@ -117,7 +117,7 @@ test('inventory aging reports BOM products from their own production cost layer'
   })
 
   const report = await getInventoryAgingReport(
-    { asOf: '2026-06-01', productType: ProductType.BOM },
+    { includeCost: true, asOf: '2026-06-01', productType: ProductType.BOM },
     {
       paginate: false,
       deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') },
@@ -143,7 +143,7 @@ test('inventory aging filtered to KIT is empty with a notice and reads no cost l
   })
 
   const report = await getInventoryAgingReport(
-    { asOf: '2026-06-01', productType: ProductType.KIT },
+    { includeCost: true, asOf: '2026-06-01', productType: ProductType.KIT },
     {
       paginate: false,
       deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') },
@@ -178,7 +178,7 @@ test('inventory aging caps source cost-layer scans before in-memory bucketing', 
 
   await assert.rejects(
     () => getInventoryAgingReport(
-      { asOf: '2026-06-01' },
+      { includeCost: true, asOf: '2026-06-01' },
       {
         paginate: false,
         deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') },
@@ -234,7 +234,7 @@ test('warehouse-less imported sales history counts as demand, so the SKU is not 
   })
 
   const report = await getDeadStockReport(
-    { asOf: '2026-06-01', thresholdDays: 90, warehouseId: 'warehouse-1' },
+    { includeCost: true, asOf: '2026-06-01', thresholdDays: 90, warehouseId: 'warehouse-1' },
     { paginate: false, deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') } },
   )
 
@@ -346,7 +346,7 @@ test('a warehouse-less ordinary dispatch is NOT treated as imported demand (o3d-
   })
 
   const report = await getDeadStockReport(
-    { asOf: '2026-06-01', thresholdDays: 90 },
+    { includeCost: true, asOf: '2026-06-01', thresholdDays: 90 },
     { paginate: false, deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') } },
   )
 
@@ -393,7 +393,7 @@ test('a historical-typed row WITH a destination warehouse is not imported demand
   })
 
   const report = await getDeadStockReport(
-    { asOf: '2026-06-01', thresholdDays: 90 },
+    { includeCost: true, asOf: '2026-06-01', thresholdDays: 90 },
     { paginate: false, deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') } },
   )
 
@@ -431,7 +431,7 @@ test('warehouse-less demand is collapsed per product, not cloned per movement, a
   })
 
   const report = await getDeadStockReport(
-    { asOf: '2026-06-01', thresholdDays: 90 },
+    { includeCost: true, asOf: '2026-06-01', thresholdDays: 90 },
     { paginate: false, deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') } },
   )
 
@@ -461,7 +461,7 @@ test('dead stock skips the movement scan entirely when no positions are in scope
   })
 
   const report = await getDeadStockReport(
-    { asOf: '2026-06-01', thresholdDays: 90, warehouseId: 'warehouse-1' },
+    { includeCost: true, asOf: '2026-06-01', thresholdDays: 90, warehouseId: 'warehouse-1' },
     { paginate: false, deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') } },
   )
 
@@ -556,7 +556,7 @@ test('dead stock report sources current stocked rows and sale-dispatch velocity'
   })
 
   const report = await getDeadStockReport(
-    { asOf: '2026-06-01', thresholdDays: 90 },
+    { includeCost: true, asOf: '2026-06-01', thresholdDays: 90 },
     {
       paginate: false,
       deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') },
@@ -595,7 +595,7 @@ test('dead stock report caps stock-level source scan before valuation and veloci
 
   await assert.rejects(
     () => getDeadStockReport(
-      { asOf: '2026-06-01' },
+      { includeCost: true, asOf: '2026-06-01' },
       {
         paginate: false,
         deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') },
@@ -641,7 +641,7 @@ test('dead stock uses historical first-stocked evidence, not only open cost laye
   })
 
   const report = await getDeadStockReport(
-    { asOf: '2026-06-15', thresholdDays: 90 },
+    { includeCost: true, asOf: '2026-06-15', thresholdDays: 90 },
     {
       paginate: false,
       deps: { client, now: () => new Date('2026-06-16T00:00:00.000Z') },
@@ -709,7 +709,7 @@ test('dead stock is evaluated per warehouse without rewriting product identity',
   })
 
   const report = await getDeadStockReport(
-    { asOf: '2026-06-15', thresholdDays: 90 },
+    { includeCost: true, asOf: '2026-06-15', thresholdDays: 90 },
     {
       paginate: false,
       deps: { client, now: () => new Date('2026-06-16T00:00:00.000Z') },
@@ -763,7 +763,7 @@ test('dead stock supports thresholds beyond the default lookback and paginates r
   })
 
   const report = await getDeadStockReport(
-    { asOf: '2026-06-01', thresholdDays: 730, page: 1, pageSize: 50 },
+    { includeCost: true, asOf: '2026-06-01', thresholdDays: 730, page: 1, pageSize: 50 },
     {
       deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') },
     },
@@ -789,7 +789,7 @@ test('dead stock handles empty stocked positions without querying cost-layer val
   })
 
   const report = await getDeadStockReport(
-    { asOf: '2026-06-01' },
+    { includeCost: true, asOf: '2026-06-01' },
     {
       paginate: false,
       deps: { client, now: () => new Date('2026-06-02T00:00:00.000Z') },
@@ -811,7 +811,7 @@ test('dead stock report caps cost-layer and sale-movement source scans', async (
 
   await assert.rejects(
     () => getDeadStockReport(
-      { asOf: '2026-06-01' },
+      { includeCost: true, asOf: '2026-06-01' },
       {
         paginate: false,
         deps: {
@@ -836,7 +836,7 @@ test('dead stock report caps cost-layer and sale-movement source scans', async (
 
   await assert.rejects(
     () => getDeadStockReport(
-      { asOf: '2026-06-01' },
+      { includeCost: true, asOf: '2026-06-01' },
       {
         paginate: false,
         deps: {

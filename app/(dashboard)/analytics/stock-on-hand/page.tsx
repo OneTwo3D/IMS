@@ -15,6 +15,7 @@ import { ProductLink } from '@/components/inventory/product-link'
 import { formatMoneyCode } from '@/lib/utils'
 import { getOrganisation } from '@/app/actions/company'
 import { requireStockPositionReportAccess } from '@/lib/security/stock-position-access'
+import { canViewStockValue } from '@/lib/security/stock-position-policy'
 
 export const metadata: Metadata = { title: 'Stock on Hand' }
 
@@ -24,8 +25,9 @@ function one(value: string | string[] | undefined): string | undefined {
   return Array.isArray(value) ? value[0] : value
 }
 
-function filtersFromSearch(searchParams: SearchParams): StockPositionFilters {
+function filtersFromSearch(searchParams: SearchParams, includeCost: boolean): StockPositionFilters {
   return {
+    includeCost,
     asOf: one(searchParams.asOf),
     warehouseId: one(searchParams.warehouseId),
     categoryId: one(searchParams.categoryId),
@@ -54,9 +56,11 @@ function reservationSnapshotsCopy(count: number): string {
 }
 
 export default async function StockOnHandPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  await requireStockPositionReportAccess()
+  const session = await requireStockPositionReportAccess()
+  // Stock value and unit cost are cost figures: only inventory.prices roles get them, and the report omits them server-side otherwise.
+  const costVisible = canViewStockValue(session.user.role)
   const resolvedSearchParams = await searchParams
-  const filters = filtersFromSearch(resolvedSearchParams)
+  const filters = filtersFromSearch(resolvedSearchParams, costVisible)
   const [report, filterOptions, organisation] = await Promise.all([
     getStockOnHandReport(filters),
     getStockPositionFilterOptions(stockPositionSelectedFilterOptionInputs(filters)),
@@ -85,19 +89,19 @@ export default async function StockOnHandPage({ searchParams }: { searchParams: 
     { key: 'quantity', label: 'On hand', align: 'right', render: (row) => `${row.quantity} ${row.stockUnit}`, footer: report.totals.quantity },
     { key: 'reserved', label: 'Reserved', align: 'right', render: (row) => row.reservedQty, footer: report.totals.reservedQty },
     { key: 'available', label: 'Available', align: 'right', render: (row) => row.availableQty, footer: report.totals.availableQty },
-    {
+    ...(costVisible ? [{
       key: 'unitCost',
       label: `Unit cost (${currency})`,
-      align: 'right',
-      render: (row) => row.unitCostBase == null ? 'Unvalued' : formatMoneyCode(Number(row.unitCostBase), currency, { minimumFractionDigits: 6, maximumFractionDigits: 6 }),
+      align: 'right' as const,
+      render: (row: StockOnHandReportRow) => row.unitCostBase == null ? 'Unvalued' : formatMoneyCode(Number(row.unitCostBase), currency, { minimumFractionDigits: 6, maximumFractionDigits: 6 }),
     },
     {
       key: 'value',
       label: `Value (${currency})`,
-      align: 'right',
-      render: (row) => formatMoneyCode(Number(row.totalValueBase), currency),
-      footer: formatMoneyCode(Number(report.totals.totalValueBase), currency),
-    },
+      align: 'right' as const,
+      render: (row: StockOnHandReportRow) => formatMoneyCode(Number(row.totalValueBase ?? '0'), currency),
+      footer: formatMoneyCode(Number(report.totals.totalValueBase ?? '0'), currency),
+    }] : []),
   ]
   const notices = [
     report.reservedQtyScope === 'current'
@@ -138,7 +142,7 @@ export default async function StockOnHandPage({ searchParams }: { searchParams: 
         { label: 'On hand', value: report.totals.quantity },
         { label: 'Reserved', value: report.totals.reservedQty, tone: Number(report.totals.reservedQty) > 0 ? 'warning' : 'default' },
         { label: 'Available', value: report.totals.availableQty, tone: isNegativeDecimalString(report.totals.availableQty) ? 'danger' : 'default' },
-        { label: `Value (${currency})`, value: formatMoneyCode(Number(report.totals.totalValueBase), currency) },
+        ...(costVisible ? [{ label: `Value (${currency})`, value: formatMoneyCode(Number(report.totals.totalValueBase ?? '0'), currency) }] : []),
       ]}
       notices={notices}
       dateMode="as-of"

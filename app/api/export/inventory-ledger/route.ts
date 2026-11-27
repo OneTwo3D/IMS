@@ -12,6 +12,7 @@ import {
   type InventoryLedgerFilters,
 } from '@/lib/domain/inventory/inventory-ledger-reports'
 import { inventoryLedgerApiAccessDenied } from '@/lib/security/inventory-ledger-access'
+import { canViewStockValue } from '@/lib/security/stock-position-policy'
 
 const INVENTORY_LEDGER_CSV_ROW_LIMIT = 100000
 export const STOCK_MOVEMENT_LEDGER_CSV_HEADERS = ['createdAt', 'type', 'sku', 'mpn', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'qty', 'signedQty', 'unitCostBase', 'totalValueBase', 'signedValueBase', 'referenceType', 'referenceId', 'note']
@@ -41,8 +42,15 @@ function one(req: NextRequest, key: string): string | undefined {
   return req.nextUrl.searchParams.get(key) ?? undefined
 }
 
-function filtersFromRequest(req: NextRequest): InventoryLedgerFilters {
+// Value, unit cost and write-off value columns are cost figures: dropped (and minValue ignored) for roles without inventory.prices.
+const LEDGER_COST_COLUMNS = new Set(['unitCostBase', 'totalValueBase', 'signedValueBase', 'movementValueBase', 'linkedAdjustmentValueBase'])
+function columnsFor(columns: string[], includeCost: boolean): string[] {
+  return includeCost ? columns : columns.filter((column) => !LEDGER_COST_COLUMNS.has(column))
+}
+
+function filtersFromRequest(req: NextRequest, includeCost: boolean): InventoryLedgerFilters {
   return {
+    includeCost,
     dateFrom: one(req, 'dateFrom') ?? one(req, 'from'),
     dateTo: one(req, 'dateTo') ?? one(req, 'to'),
     warehouseId: one(req, 'warehouseId'),
@@ -77,7 +85,8 @@ export async function getInventoryLedgerExportResponse(
 
   const type = req.nextUrl.searchParams.get('report') ?? 'stock-movements'
   const date = new Date().toISOString().slice(0, 10)
-  const filters = filtersFromRequest(req)
+  const includeCost = canViewStockValue(session.user.role)
+  const filters = filtersFromRequest(req, includeCost)
 
   if (!isInventoryLedgerExportReportType(type)) {
     return NextResponse.json({ error: 'Unknown inventory-ledger export type' }, { status: 400 })
@@ -105,16 +114,14 @@ export async function getInventoryLedgerExportResponse(
         warehouseName: row.warehouseName,
         qty: row.qty,
         signedQty: row.signedQty,
-        unitCostBase: row.unitCostBase ?? '',
-        totalValueBase: row.totalValueBase,
-        signedValueBase: row.signedValueBase,
+        ...(includeCost ? { unitCostBase: row.unitCostBase ?? '', totalValueBase: row.totalValueBase ?? '', signedValueBase: row.signedValueBase ?? '' } : {}),
         referenceType: row.referenceType ?? '',
         referenceId: row.referenceId ?? '',
         note: row.note ?? '',
       }))
       return csvBufferedStreamResponseFor(req, 
         rows,
-        STOCK_MOVEMENT_LEDGER_CSV_HEADERS,
+        columnsFor(STOCK_MOVEMENT_LEDGER_CSV_HEADERS, includeCost),
         `stock-movements-${date}.csv`,
         { generatedAt: report.generatedAt, ...report.totals },
       )
@@ -134,14 +141,14 @@ export async function getInventoryLedgerExportResponse(
         reasonName: row.reasonName,
         reasonMatched: row.reasonMatched,
         signedQty: row.signedQty,
-        totalValueBase: row.totalValueBase,
+        ...(includeCost ? { totalValueBase: row.totalValueBase ?? '' } : {}),
         referenceType: row.referenceType ?? '',
         referenceId: row.referenceId ?? '',
         note: row.note ?? '',
       }))
       return csvBufferedStreamResponseFor(req, 
         rows,
-        ['createdAt', 'sku', 'mpn', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'reasonName', 'reasonMatched', 'signedQty', 'totalValueBase', 'referenceType', 'referenceId', 'note'],
+        columnsFor(['createdAt', 'sku', 'mpn', 'productName', 'stockUnit', 'warehouseCode', 'warehouseName', 'reasonName', 'reasonMatched', 'signedQty', 'totalValueBase', 'referenceType', 'referenceId', 'note'], includeCost),
         `stock-adjustments-${date}.csv`,
         { generatedAt: report.generatedAt },
       )
@@ -165,11 +172,11 @@ export async function getInventoryLedgerExportResponse(
         driftQty: row.driftQty,
         movementOutQty: row.movementOutQty,
         movementInQty: row.movementInQty,
-        movementValueBase: row.movementValueBase,
+        ...(includeCost ? { movementValueBase: row.movementValueBase ?? '' } : {}),
       }))
       return csvBufferedStreamResponseFor(req, 
         rows,
-        ['reference', 'status', 'fromWarehouseCode', 'fromWarehouseName', 'toWarehouseCode', 'toWarehouseName', 'dispatchedAt', 'completedAt', 'daysInTransit', 'overdue', 'requestedQty', 'receivedQty', 'driftQty', 'movementOutQty', 'movementInQty', 'movementValueBase'],
+        columnsFor(['reference', 'status', 'fromWarehouseCode', 'fromWarehouseName', 'toWarehouseCode', 'toWarehouseName', 'dispatchedAt', 'completedAt', 'daysInTransit', 'overdue', 'requestedQty', 'receivedQty', 'driftQty', 'movementOutQty', 'movementInQty', 'movementValueBase'], includeCost),
         `transfers-${date}.csv`,
         { generatedAt: report.generatedAt },
       )
@@ -189,13 +196,13 @@ export async function getInventoryLedgerExportResponse(
         expectedQty: row.expectedQty,
         countedQty: row.countedQty ?? '',
         varianceQty: row.varianceQty,
-        linkedAdjustmentValueBase: row.linkedAdjustmentValueBase ?? '',
+        ...(includeCost ? { linkedAdjustmentValueBase: row.linkedAdjustmentValueBase ?? '' } : {}),
         adjustmentEvidence: row.adjustmentEvidence,
         completedAt: row.completedAt ?? '',
       }))
       return csvBufferedStreamResponseFor(req, 
         rows,
-        ['reference', 'status', 'warehouseCode', 'warehouseName', 'sku', 'mpn', 'productId', 'expectedQty', 'countedQty', 'varianceQty', 'linkedAdjustmentValueBase', 'adjustmentEvidence', 'completedAt'],
+        columnsFor(['reference', 'status', 'warehouseCode', 'warehouseName', 'sku', 'mpn', 'productId', 'expectedQty', 'countedQty', 'varianceQty', 'linkedAdjustmentValueBase', 'adjustmentEvidence', 'completedAt'], includeCost),
         `stock-counts-${date}.csv`,
         { generatedAt: report.generatedAt },
       )

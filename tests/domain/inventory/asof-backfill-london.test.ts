@@ -104,7 +104,7 @@ test('stock-on-hand report as-of is the London end of day and still finds the re
     stockMovement: { findMany: async () => [] },
   } as unknown as StockPositionReportClient
   const report = await getStockOnHandReport(
-    { asOf: '2026-07-01' },
+    { includeCost: true, asOf: '2026-07-01' },
     { paginate: false, deps: { client, getOnHandAsOf: (o) => getOnHandAsOf({ ...o, client: reader, now: NOW }) } },
   )
   assert.equal(report.asOf, '2026-07-01T22:59:59.999Z')

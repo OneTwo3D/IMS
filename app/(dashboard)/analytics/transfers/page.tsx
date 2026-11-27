@@ -13,6 +13,7 @@ import {
   stockPositionSelectedFilterOptionInputs,
 } from '@/lib/domain/inventory/stock-position-reports'
 import { requireInventoryLedgerReportAccess } from '@/lib/security/inventory-ledger-access'
+import { canViewStockValue } from '@/lib/security/stock-position-policy'
 import { formatMoneyCode } from '@/lib/utils'
 import {
   InventoryLedgerReportPage,
@@ -22,9 +23,11 @@ import {
 export const metadata: Metadata = { title: 'Stock Transfers' }
 
 export default async function TransfersReportPage({ searchParams }: { searchParams: Promise<InventoryLedgerSearchParams> }) {
-  await requireInventoryLedgerReportAccess()
+  const session = await requireInventoryLedgerReportAccess()
+  // Value, unit cost and write-off value are cost figures: only inventory.prices roles get them, and the report omits them server-side otherwise.
+  const costVisible = canViewStockValue(session.user.role)
   const resolvedSearchParams = await searchParams
-  const filters = inventoryLedgerFiltersFromSearch(resolvedSearchParams, { includeStatus: true })
+  const filters = { ...inventoryLedgerFiltersFromSearch(resolvedSearchParams, { includeStatus: true }), includeCost: costVisible }
   const [report, filterOptions, organisation] = await Promise.all([
     getStockTransferReport(filters),
     getStockPositionFilterOptions(stockPositionSelectedFilterOptionInputs(filters)),
@@ -47,13 +50,13 @@ export default async function TransfersReportPage({ searchParams }: { searchPara
     { key: 'requested', label: 'Sent qty', align: 'right', render: (row) => row.requestedQty, footer: report.totals.requestedQty },
     { key: 'receivedQty', label: 'Received qty', align: 'right', render: (row) => row.receivedQty, footer: report.totals.receivedQty },
     { key: 'drift', label: 'Drift', align: 'right', render: (row) => row.driftQty, footer: report.totals.driftQty },
-    {
+    ...(costVisible ? [{
       key: 'value',
       label: `Movement value (${currency})`,
-      align: 'right',
-      render: (row) => formatMoneyCode(Number(row.movementValueBase), currency),
+      align: 'right' as const,
+      render: (row: StockTransferReportRow) => formatMoneyCode(Number(row.movementValueBase ?? '0'), currency),
       footer: formatMoneyCode(Number(report.totals.movementValueBase), currency),
-    },
+    }] : []),
   ]
 
   return (
@@ -71,7 +74,7 @@ export default async function TransfersReportPage({ searchParams }: { searchPara
         { label: 'In transit', value: report.totals.inTransitCount.toLocaleString(), tone: report.totals.inTransitCount > 0 ? 'warning' : 'default' },
         { label: 'Overdue', value: report.totals.overdueCount.toLocaleString(), tone: report.totals.overdueCount > 0 ? 'danger' : 'default' },
         { label: 'Drift qty', value: report.totals.driftQty, tone: Number(report.totals.driftQty) !== 0 ? 'warning' : 'default' },
-        { label: `Movement value (${currency})`, value: formatMoneyCode(Number(report.totals.movementValueBase), currency) },
+        ...(costVisible ? [{ label: `Movement value (${currency})`, value: formatMoneyCode(Number(report.totals.movementValueBase ?? '0'), currency) }] : []),
       ]}
       notices={[
         'The in-transit total is counted from StockTransfer.status in DRAFT or IN_TRANSIT using the active filters.',
