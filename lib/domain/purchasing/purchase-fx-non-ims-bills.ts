@@ -291,7 +291,10 @@ async function proposeForOrder(db: Db, poId: string, rates: ReadonlyMap<string, 
   }
   const out = new Map<string, string>()
   for (const id of rates.keys()) out.set(id, '0.00')
-  for (const journal of result?.journals ?? []) if (rates.has(journal.invoiceId)) out.set(journal.invoiceId, journal.transitDelta)
+  // #1164 LOW-4: the journal and any take-back of an earlier shadow, as the confirmation will compare them.
+  for (const entry of [...(result?.journals ?? []), ...(result?.shadowed ?? []).filter((x) => x.reversal)]) {
+    if (rates.has(entry.invoiceId)) out.set(entry.invoiceId, toDecimal(out.get(entry.invoiceId) ?? '0').add(entry.transitDelta).toFixed(2))
+  }
   return out
 }
 
@@ -364,6 +367,13 @@ export async function confirmNonImsBills(params: {
   if (Boolean(params.all) === (named.length > 0)) throw new NonImsBillsConfirmRefused('Name the bills to confirm with --bill <id>, or pass --all for every bill listed (not both).')
   // LOW-9: the digest covers the whole default list, so it goes with --all only.
   if (params.digest && !params.all) throw new NonImsBillsConfirmRefused('--digest goes with --all (it covers the whole default list); for named bills pass --expect <id>=<amount>. Nothing was confirmed.')
+  // #1164 MED-1: a journal the hold would shadow today is lost for good (the bill would then be settled with nothing in the ledger), so the confirmation
+  // is refused up front, before any Xero read, while PURCHASE_FX_VARIANCE journals are shadowed.
+  const { purchaseFxJournalShadowed } = await import('@/lib/domain/purchasing/purchase-event-fx-switch-on')
+  const { businessDateYmd } = await import('@/lib/business-date')
+  if (purchaseFxJournalShadowed(businessDateYmd(new Date()))) {
+    throw new NonImsBillsConfirmRefused('Nothing was confirmed: the producer-side hold shadows exchange-rate difference journals today (IMS is not yet the writer of these journals), so the journal would never reach Xero. Confirm once IMS writes them.')
+  }
   const { list, prepared, settings } = await listPrepared(db, { named, maxReads: params.maxReads, deps: params.deps })
   if (!list.confirmable) throw new NonImsBillsConfirmRefused(`Nothing was confirmed: ${list.notConfirmableReason}.`)
   let chosen: Prepared[]
@@ -433,8 +443,9 @@ export async function confirmNonImsBills(params: {
         // Under the lock: what the reconciliation queues for these bills must be what the admin was shown.
         const reconciled = await reconcilePurchaseBillFx(tx, { poId, connector: settings.connector, syncEnabled: settings.syncEnabled, at: new Date() })
         for (const bill of bills) {
-          // MED-4: what the reconciliation settled for the bill, however it was settled: queued, recorded as a shadow, or declined (still owed).
-          const settled = [...reconciled.journals, ...(reconciled.shadowed ?? []), ...reconciled.notQueued].filter((j) => j.invoiceId === bill.invoiceId)
+          // MED-4: what the reconciliation settled for the bill: queued, declined (still owed), or the take-back of an earlier shadow. A NEW shadow is not
+          // settled (#1164 MED-1: that journal would be lost), so it mismatches and rolls the order back.
+          const settled = [...reconciled.journals, ...(reconciled.shadowed ?? []).filter((x) => x.reversal), ...reconciled.notQueued].filter((j) => j.invoiceId === bill.invoiceId)
           const actual = settled.reduce((sum, j) => sum.add(j.transitDelta), zero()).toFixed(2)
           if (actual !== toDecimal(expected(bill)).toFixed(2)) {
             throw new ConfirmMismatch(`bill ${bill.invoiceNumber ?? bill.invoiceId}: the journal under the lock is ${actual}, not the ${expected(bill)} shown`)

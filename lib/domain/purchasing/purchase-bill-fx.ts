@@ -96,7 +96,7 @@ export async function resolveBillFxRate(
 
   // The bill-writer check, on the bill's own date (a bill dated before the cut-over, or a rollback to P1): while the producer-side hold shadows the bill,
   // Xero holds another system's bill, so this one is valued at the PO rate exactly as before (purchase-event-fx-switch-on.ts).
-  if (purchaseFxBillWriterShadowed(endOfBusinessDateUtc(params.invoiceDate.slice(0, 10)))) return null
+  if (purchaseFxBillWriterShadowed(params.invoiceDate.slice(0, 10))) return null
   const accountsRefusal = await purchaseFxAccountsRefusal(client)
   if (accountsRefusal) throw new PurchaseFxRefusalError(accountsRefusal.replace('Nothing was received.', 'The bill was not saved.'))
   const check = params.checks.get(params.poId)
@@ -438,7 +438,8 @@ export type PurchaseBillFxReconcileResult = {
   /** Journals the queue declined while owed: the caller reports them after its commit (`reportPurchaseFxVarianceNotQueued`). */
   notQueued: Array<{ invoiceId: string; invoiceNumber: string | null; outcome: EnqueueOutcomeLike; transitDelta: string }>
   /** MED-2: journals the producer-side hold recorded as a shadow; settled (never caught up later). */
-  shadowed?: Array<{ invoiceId: string; transitDelta: string }>
+  /** `reversal`: the take-back of an amount settled as a shadow before (LOW-2); otherwise a new journal the hold recorded as a shadow. */
+  shadowed?: Array<{ invoiceId: string; transitDelta: string; reversal?: boolean }>
 }
 
 export const NO_BILL_FX_RECONCILE: PurchaseBillFxReconcileResult = { journals: [], notQueued: [] }
@@ -734,8 +735,9 @@ export async function reconcilePurchaseBillFx(
           create: { poId: params.poId, invoiceId, idempotencyKey: key, baseDelta: back, journalDate: businessDateYmd(params.at) },
           update: {},
         })
-        result.shadowed!.push({ invoiceId, transitDelta: back.toFixed(2) })
       }
+      // Reported in a dry run as well (#1164 LOW-4), so a proposal shows the part a confirmation settles as a shadow reversal.
+      result.shadowed!.push({ invoiceId, transitDelta: back.toFixed(2), reversal: true })
       delta = roundQuantity(delta.sub(back), 2)
       if (delta.isZero()) continue
     }

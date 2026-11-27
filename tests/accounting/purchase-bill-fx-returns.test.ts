@@ -597,6 +597,16 @@ async function withXeroToken<T>(fn: () => Promise<T>): Promise<T> {
     await s.db.accountingToken.deleteMany({ where: { connector: 'xero' } })
   }
 }
+/** Run with the producer-side hold variables set (and restored after). */
+async function withHold<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
+  const before = Object.fromEntries(Object.keys(vars).map((k) => [k, process.env[k]]))
+  Object.assign(process.env, vars)
+  try {
+    return await fn()
+  } finally {
+    for (const [k, v] of Object.entries(before)) { if (v === undefined) delete process.env[k]; else process.env[k] = v }
+  }
+}
 let guidSeq = 0
 const guid = () => `00000000-0000-4000-8000-${String(++guidSeq).padStart(12, '0')}`
 
@@ -794,26 +804,57 @@ test('MED-5: the basis is frozen with the confirmation; an IMS bill edit, an ord
   assert.match((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).staleReason ?? '', /linked to another Xero bill/)
 })
 
-// [mutation: compare only the queued journals under the lock (MED-4): a confirmation whose journal is shadowed would always mismatch]
-test('MED-4: a confirmation whose journal the producer-side hold shadows is confirmed, its journal settled as a shadow', async () => {
-  const { confirmNonImsBills } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
+// [mutation: confirm while the hold shadows the journal (#1164 MED-1: the journal would be lost), or read Xero first]
+test('MED-1 (#1164): while the hold shadows exchange-rate journals, a confirmation is refused up front, before any Xero read', async () => {
+  const { confirmNonImsBills, NonImsBillsConfirmRefused } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
   const po = await seedPo(10)
   const qoblex = await nonImsBill(po, 10, 12.5, { rate: 1.2 })
   await lockAt(po)
   assert.equal((await receive(po, 10)).success, true)
-  const before = process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
-  process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = 'xero'
-  try {
-    const done = await withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'one-off', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '-26.04']]), deps: xeroDeps })))
-    assert.equal(done.failed.length, 0, String(done.failed[0]?.error))
-    assert.equal(done.confirmed.length, 1)
-    assert.equal(done.shadowed, 1)
-  } finally {
-    if (before === undefined) delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
-    else process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = before
-  }
-  assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id, status: { not: 'CANCELLED' } } }), 0, 'nothing live')
-  close((await s.db.purchaseFxVarianceShadow.findMany({ where: { poId: po.id } })).reduce((a, r) => a + Number(r.baseDelta), 0), -26.04, 'settled as a shadow')
+  xeroReads.length = 0
+  await withHold({ PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' }, async () => {
+    await assert.rejects(
+      withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'one-off', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '-26.04']]), deps: xeroDeps }))),
+      (error: unknown) => error instanceof NonImsBillsConfirmRefused && /shadows exchange-rate difference journals/.test(error.message),
+    )
+  })
+  assert.equal(xeroReads.length, 0, 'refused before any Xero read')
+  assert.equal(await s.db.purchaseFxNonImsBillApproval.count({ where: { invoiceId: qoblex.id } }), 0)
+  assert.equal(await s.db.purchaseFxVarianceShadow.count({ where: { poId: po.id } }), 0, 'nothing settled as a shadow')
+})
+
+// [mutation: leave the take-back of an earlier shadow out of a dry run (#1164 LOW-4)]
+test('LOW-4 (#1164): a dry run reports the take-back of an earlier shadow, as the real run settles it', async () => {
+  const { rerunPurchaseBillFx } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  const po = await seedPo(10)
+  assert.equal((await receive(po, 10)).success, true) // table 1.25: 100
+  await lockAt(po)
+  assert.equal((await bill(po, 10, 12.5)).success, true) // lock: 78.125 -> journal +21.88
+  const row = await billOf(po)
+  await markBillsPosted(po)
+  await s.db.purchaseFxVarianceShadow.create({ data: { poId: po.id, invoiceId: row.id, idempotencyKey: `purchase-fx-variance:${row.id}:shadow-low4`, baseDelta: '21.88', journalDate: BILL_DATE } })
+  // The bill now bills 6 (target 13.13): the 8.75 taken back is a shadow reversal.
+  await s.db.purchaseInvoiceLine.update({ where: { id: row.lines[0]!.id }, data: { qtyBilled: '6', totalForeign: '75', totalBase: '46.875' } })
+  const dry = await withXeroPosting(() => rerunPurchaseBillFx(po.id, { dryRun: true }))
+  assert.deepEqual((dry.shadowed ?? []).map((x) => [x.transitDelta, x.reversal]), [['-8.75', true]])
+  assert.equal(dry.journals.length, 0)
+  assert.equal(await s.db.purchaseFxVarianceShadow.count({ where: { poId: po.id } }), 1, 'the dry run wrote nothing')
+})
+
+// [mutation: judge the bill's date at the END of the day instead of the producer's START of the day (#1164 HIGH-1)]
+test('HIGH-1 (#1164): a bill dated on a live-from day whose instant is after midnight is shadowed as its posting is, so it stays at the PO rate', async () => {
+  const live = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero', XERO_WRITES_LIVE_FROM: '2026-11-20T09:00:00Z', XERO_WRITE_ALLOWED_TENANT: 'tenant-pfr' }
+  const { createInvoice } = await import('@/app/actions/purchase-orders')
+  await withHold(live, async () => {
+    const onTheDay = await seedPo(10)
+    await lockAt(onTheDay)
+    assert.equal((await createInvoice(onTheDay.id, { invoiceDate: '2026-11-20', invoiceNumber: `SUP-H1-${++seq}`, lines: [{ kind: 'product', poLineId: onTheDay.lineId, qtyBilled: 10, unitCostForeign: 12.5 }] } as never)).success, true)
+    assert.equal((await billOf(onTheDay)).fxRateSource, null, 'dated 11-20: its posting is judged at 11-20T00:00Z, before the 09:00 live-from: shadowed')
+    const dayAfter = await seedPo(10)
+    await lockAt(dayAfter)
+    assert.equal((await createInvoice(dayAfter.id, { invoiceDate: '2026-11-21', invoiceNumber: `SUP-H1-${++seq}`, lines: [{ kind: 'product', poLineId: dayAfter.lineId, qtyBilled: 10, unitCostForeign: 12.5 }] } as never)).success, true)
+    assert.equal((await billOf(dayAfter)).fxRateSource, 'XERO_PREPAYMENT', 'dated 11-21: live, valued under the switch')
+  })
 })
 
 // [mutation: value a bill under the switch while the producer-side hold shadows supplier bills on its date, or edit such a bill]
@@ -835,6 +876,14 @@ test('bill writer: while the hold shadows supplier bills, a new bill is valued a
     const row = await billOf(po)
     assert.equal(row.fxRateSource, null, 'shadowed: the PO rate, no per-event valuation')
     assert.equal(row.fxRateToBase.toString(), PO_RATE)
+    // MED-2 (#1164): the STORED date is judged too.
+    const live = { XERO_WRITES_LIVE_FROM: '2026-11-20T09:00:00Z', XERO_WRITE_ALLOWED_TENANT: 'tenant-pfr' }
+    const movedOut = await withHold(live, () => updateInvoice(managed.id, {
+      invoiceNumber: managed.invoiceNumber, invoiceDate: '2026-11-25', dueDate: null, notes: null, supplierInvoiceUrl: null,
+      lines: [{ id: managed.lines[0]!.id, qtyBilled: 9, unitCostForeign: 12.5 }],
+    } as never))
+    assert.equal(movedOut.success, false, 'stored 11-10 is shadowed, though the new 11-25 is live')
+    assert.match(movedOut.error ?? '', /dated 2026-11-10 are now shadowed/)
     const edited = await updateInvoice(managed.id, {
       invoiceNumber: managed.invoiceNumber, invoiceDate: BILL_DATE, dueDate: null, notes: null, supplierInvoiceUrl: null,
       lines: [{ id: managed.lines[0]!.id, qtyBilled: 9, unitCostForeign: 12.5 }],

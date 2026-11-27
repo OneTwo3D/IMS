@@ -1,3 +1,4 @@
+import { businessDateYmd } from '@/lib/business-date'
 import { xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-seam'
 
 /**
@@ -14,13 +15,20 @@ import { xeroProducerSeamVerdict } from '@/lib/domain/accounting/xero-producer-s
 const HOLD_ENV = 'PRODUCER_HOLD_ENFORCED_DESTINATIONS'
 
 /**
- * Whether the producer-side hold shadows a supplier bill (PURCHASE_INVOICE) dated `at`, judged on `env` (the application's own environment by default).
+ * Whether the producer-side hold shadows a supplier bill (PURCHASE_INVOICE) dated `ymd`, judged on `env` (the application's own environment by default)
+ * EXACTLY as the producer judges the bill's posting: from its payload date, which the seam reads as the START of that day in UTC (xeroObligationAt), so
+ * a bill dated on a live-from day whose instant is after midnight is shadowed, as its posting is (#1164 HIGH-1).
  *
  * THE ASSUMPTION: a hold that is NOT enforced (the variable empty, or Xero not among its destinations) means IMS writes the bills itself (the verdict is
  * `legacy` or `live`, so nothing is shadowed). That is how the hold is designed: an installation that does not enforce it sends its postings.
  */
-export function purchaseFxBillWriterShadowed(at: Date, env: Record<string, string | undefined> = process.env, now: Date = new Date()): boolean {
-  return xeroProducerSeamVerdict({ connector: 'xero', type: 'PURCHASE_INVOICE', payload: {}, obligationAt: at, now, env }).kind === 'shadow'
+export function purchaseFxBillWriterShadowed(ymd: string, env: Record<string, string | undefined> = process.env, now: Date = new Date()): boolean {
+  return xeroProducerSeamVerdict({ connector: 'xero', type: 'PURCHASE_INVOICE', payload: { date: ymd.slice(0, 10) }, now, env }).kind === 'shadow'
+}
+
+/** Whether an exchange-rate difference journal (PURCHASE_FX_VARIANCE) dated `ymd` would be shadowed now, judged as its producer judges it. */
+export function purchaseFxJournalShadowed(ymd: string, env: Record<string, string | undefined> = process.env, now: Date = new Date()): boolean {
+  return xeroProducerSeamVerdict({ connector: 'xero', type: 'PURCHASE_FX_VARIANCE', payload: { date: ymd.slice(0, 10) }, now, env }).kind === 'shadow'
 }
 
 /**
@@ -47,7 +55,8 @@ export function purchaseFxSwitchOnRefusal(options: {
       + 'the hold is not enforced, which this check takes as IMS writing the bills.)'
   }
   const env = { ...processEnv, ...(installationEnv ?? {}) }
-  if (!purchaseFxBillWriterShadowed(options.now ?? new Date(), env, options.now ?? new Date())) return null
+  const now = options.now ?? new Date()
+  if (!purchaseFxBillWriterShadowed(businessDateYmd(now), env, now)) return null
   return 'purchase_event_fx_rates_enabled cannot be turned on while the producer-side hold shadows supplier bills (PURCHASE_INVOICE) to Xero: another '
     + 'system writes the bills (phase P1), so the bills IMS would value under the switch would not be the ones in Xero. Turn it on once IMS is the bill writer (P2).'
 }

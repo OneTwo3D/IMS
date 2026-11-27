@@ -4929,8 +4929,16 @@ export async function updateInvoice(
     const billFxManaged = Boolean(invoice.fxRateSource && invoice.fxEventRateToBase)
     // The bill-writer check, on the edited bill's date: while the producer-side hold shadows supplier bills (a rollback to P1, a date before the cut-over)
     // a bill valued under the switch is not edited, since Xero holds another system's bill (lib/domain/purchasing/purchase-event-fx-switch-on.ts).
-    if (billFxManaged && purchaseFxBillWriterShadowed(new Date(`${input.invoiceDate.slice(0, 10)}T23:59:59.999Z`))) {
-      return { success: false, error: withLedgerCheck(`Bill ${invoice.invoiceNumber ?? invoice.id} was valued under per-event FX rates, and supplier bills dated ${input.invoiceDate.slice(0, 10)} are shadowed by the producer-side hold (another system writes them to Xero), so it is not edited. Nothing was changed.`) }
+    // #1164 MED-2: judged on the bill's stored date and on the new one, as the producer judges them (the start of the day).
+    const storedBillDay = invoice.invoiceDate.toISOString().slice(0, 10)
+    const shadowedDay = [storedBillDay, input.invoiceDate.slice(0, 10)].find((day) => purchaseFxBillWriterShadowed(day))
+    if (billFxManaged && shadowedDay) {
+      return {
+        success: false,
+        error: withLedgerCheck(`Bill ${invoice.invoiceNumber ?? invoice.id} is IMS's own bill in Xero, valued under per-event FX rates, but supplier bills dated ${shadowedDay} are now shadowed `
+          + 'by the producer-side hold (another system is the bill writer again), so IMS cannot send the edit and does not make it. Nothing was changed. Edit it once IMS writes the bills '
+          + 'again; until then leave it unchanged here and in Xero (Xero Accounting Sync > Per-event FX rates explains why).'),
+      }
     }
     const fxRate = billFxManaged ? Number(invoice.fxEventRateToBase) : Number(invoice.fxRateToBase)
     if (!Number.isFinite(fxRate) || fxRate <= 0) {
