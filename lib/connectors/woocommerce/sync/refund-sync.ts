@@ -1253,24 +1253,53 @@ export async function syncWcRefund(
     // goods line, so a marked (wclc) fee reaches the credit-note builder as a marked fee. A fee that cannot be matched is NEVER
     // dropped: the refund is QUARANTINED with a message naming it, for an operator to record by hand.
     // ---------------------------------------------------------------------------------------------
-    // A ZERO-QUANTITY GOODS AMOUNT (a line_items entry that returns money but no units) is not mapped above. With no fee line the monetary-only fallback below records the whole refund; WITH a fee line the refund has a mapped line, the fallback is skipped,
-    // and the mapped gross would hold only the fee, so it could never reconcile and would retry for ever with the customer already refunded. IMS does not split that mix: it is QUARANTINED for an operator to record by hand.
+    // A ZERO-QUANTITY GOODS AMOUNT (a line_items entry that returns money but no units, e.g. a partial-price refund of a goods line) is recorded as its OWN refund line, linked to the ORDER line it refers to (the same `_refunded_item_id` link the quantity path uses),
+    // with qty 0 (so no stock movement and no COGS reversal), its stated net, and the VAT WooCommerce states it returned. It is mapped whenever the refund ALSO has a quantity line, a refunded shipping line or a fee line: those refunds have mapped lines, so the monetary-only
+    // fallback below does not run, and without this the mapped gross would miss the amount, never reconcile and retry for ever with the customer already refunded. The writer already accepts exactly this shape (a qty-0 line linked to an order line is what a fee refund is),
+    // and the per-target cap (enforcePerTargetBalances, set below) holds each line to the net it has left across ALL the order's refunds.
+    // Amount-only lines ALONE (nothing else on the refund) keep the monetary-only fallback below, unchanged: it converts the stated gross at the order's own VAT basis, and handles rate 182 and the VAT-only hold, none of which per-line linking would reproduce.
+    // A line that cannot be written exactly (no linked ORDER line, e.g. it was removed by an edit in IMS or the storefront id is unknown; or VAT with no net, which the writer's line filter would drop after the gross counted it) is QUARANTINED with a message, never guessed at.
+    const amountOnlyGoods = wcRefund.line_items.filter((l) => Math.abs(l.quantity) === 0 && (parseDecimalAbs(l.total).gt(0.000001) || parseDecimalAbs(l.total_tax).gt(0.000001)))
     const hasFeeLine = (wcRefund.fee_lines ?? []).some((feeLine) => parseDecimalAbs(feeLine.total).gt(0.000001) || parseDecimalAbs(feeLine.total_tax).gt(0.000001))
-    const hasAmountOnlyGoods = wcRefund.line_items.some((l) => Math.abs(l.quantity) === 0 && (parseDecimalAbs(l.total).gt(0.000001) || parseDecimalAbs(l.total_tax).gt(0.000001)))
-    if (hasFeeLine && hasAmountOnlyGoods) {
-      const error = withLedgerCheck(`WooCommerce refund ${wcRefund.id} mixes an amount-only goods refund (money returned on a line with no quantity) with a fee refund, which IMS cannot split automatically, so the refund was NOT recorded and nothing was sent to Xero. The money has ALREADY been returned in the storefront (refund ${wcRefund.id}) - do NOT issue another storefront refund. ${REFUND_PARK_MANUAL_RESOLUTION_HINT}`)
-      await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: error, payload: wcRefund })
-      await writeActivity({
-        entityType: 'SALES_ORDER',
-        entityId: so.id,
-        action: 'refund_sync_amount_only_goods_with_fee',
-        tag: 'sync',
-        level: 'WARNING',
-        description: error,
-        metadata: { externalRefundId: wcRefund.id },
-        resolveUser: false,
-      })
-      return { outcome: 'quarantined-refusal', error }
+    const mapAmountOnlyGoods = amountOnlyGoods.length > 0 && (hasQtyRefund || refundedShippingLines.length > 0 || hasFeeLine)
+    if (mapAmountOnlyGoods) {
+      const describeAmountOnly = (rl: (typeof amountOnlyGoods)[number]) => `"${rl.name || `item ${refundedOrderLineId(rl)}`}" (${parseDecimalAbs(rl.total).toFixed(2)} net, ${parseDecimalAbs(rl.total_tax).toFixed(2)} tax)`
+      const unlinked = amountOnlyGoods.filter((rl) => !so.lines.some((l) => l.externalLineItemId === refundedOrderLineId(rl)))
+      const unwritable = amountOnlyGoods.filter((rl) => !(divideRoundedNumber(parseDecimalAbs(rl.total), fxRate, 4) > 0))
+      if (unlinked.length > 0 || unwritable.length > 0) {
+        const parts: string[] = []
+        if (unlinked.length > 0) parts.push(`returns money (no quantity) on ${unlinked.map(describeAmountOnly).join(', ')}, a line IMS cannot link to an order line${so.editedInImsAt != null ? ' (the order was edited in IMS after confirmation)' : ''}`)
+        if (unwritable.length > 0) parts.push(`returns ${unwritable.map(describeAmountOnly).join(', ')}: a goods refund carrying tax but no net cannot be recorded automatically`)
+        const error = withLedgerCheck(`WooCommerce refund ${wcRefund.id} ${parts.join(' and ')}, so the refund was NOT recorded and nothing was sent to Xero. The money has ALREADY been returned in the storefront (refund ${wcRefund.id}) - do NOT issue another storefront refund. ${REFUND_PARK_MANUAL_RESOLUTION_HINT}`)
+        await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: error, payload: wcRefund })
+        await writeActivity({
+          entityType: 'SALES_ORDER',
+          entityId: so.id,
+          action: 'refund_sync_amount_only_goods_unlinked',
+          tag: 'sync',
+          level: 'WARNING',
+          description: error,
+          metadata: { externalRefundId: wcRefund.id },
+          resolveUser: false,
+        })
+        return { outcome: 'quarantined-refusal', error }
+      }
+      for (const rl of amountOnlyGoods) {
+        const imsLine = so.lines.find((l) => l.externalLineItemId === refundedOrderLineId(rl))!
+        const net = parseDecimalAbs(rl.total)
+        const tax = parseDecimalAbs(rl.total_tax)
+        mappedGrossForeign = mappedGrossForeign.add(net).add(tax)
+        refundLines.push({
+          lineId: imsLine.id,
+          productId: imsLine.productId ?? null,
+          description: rl.name || imsLine.description || 'Refund item',
+          qty: 0,
+          totalForeign: roundDecimalNumber(net, 4),
+          totalBase: divideRoundedNumber(net, fxRate, 4),
+          lineKind: 'sale',
+          chargedTaxForeign: roundDecimalNumber(tax, 4),
+        })
+      }
     }
 
     const refundedFeeLines = (wcRefund.fee_lines ?? [])
@@ -1580,7 +1609,7 @@ export async function syncWcRefund(
         refundLines.filter((l) => l.qty > 0 || l.totalBase > 0),
         wcRefund.reason || 'WooCommerce refund',
         returnWarehouseId,
-        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id, ...(typeof wcRefund.refunded_payment === 'boolean' ? { refundedViaGateway: wcRefund.refunded_payment } : {}), ...(returnReasonId ? { returnReasonId } : {}), statedGrossForeign: parityStatedGross ?? refundAmountForeign.toNumber(), ...(eas182StatedTaxForeign !== undefined ? { eas182StatedTaxForeign } : {}), ...(refundedFeeLines.length > 0 ? { enforcePerTargetBalances: true } : {}), ...(parityOn && Object.keys(parityFacts).length > 0 ? { refundParity: parityFacts } : {}) },
+        { internalBypassToken: INTERNAL_ACTION_BYPASS, externalRefundId: wcRefund.id, ...(typeof wcRefund.refunded_payment === 'boolean' ? { refundedViaGateway: wcRefund.refunded_payment } : {}), ...(returnReasonId ? { returnReasonId } : {}), statedGrossForeign: parityStatedGross ?? refundAmountForeign.toNumber(), ...(eas182StatedTaxForeign !== undefined ? { eas182StatedTaxForeign } : {}), ...(refundedFeeLines.length > 0 || mapAmountOnlyGoods ? { enforcePerTargetBalances: true } : {}), ...(parityOn && Object.keys(parityFacts).length > 0 ? { refundParity: parityFacts } : {}) },
       )
     } catch (error) {
       if (!isExternalRefundIdUniqueConflict(error)) throw error

@@ -654,6 +654,9 @@ Refunds created in WooCommerce are automatically synced to One Two Inventory:
 
 - **Line-item refunds** (with quantities) create itemised refund lines and restock items to the default return warehouse
 - **Monetary-only refunds** (no quantities) create a single refund line with the full amount and the WC refund reason
+- **Amount-only goods lines beside other lines.** A refund line with no quantity but money on it (a partial-price refund of a goods line) that comes with a quantity line, a refunded shipping line or a refunded fee is recorded automatically as its own refund line on the same order line (no stock, no cost reversal; its net and stated VAT are credited). If it cannot be linked to an order line (an order edited in IMS), or carries VAT but no net, the refund is parked on Sync > Exceptions for you to record by hand; the money has already been returned in the store.
+
+**Recommended setup when refunding returned goods in WooCommerce: enter the refunded quantity and leave "Restock refunded items" UNTICKED.** WooCommerce's own stock is then not raised (no back-in-stock emails), and IMS books the return itself: into the default return warehouse, or as a return expectation in transit when the admin switch `refund_returns_in_transit_enabled` is on (see Sales, "Returned goods in transit"). IMS then pushes its own stock level to the store. A money-only refund (quantity 0) moves no stock.
 
 Refunds are deduplicated by WooCommerce refund ID, so they are safe to re-process.
 
