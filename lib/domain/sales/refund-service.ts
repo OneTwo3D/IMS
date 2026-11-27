@@ -38,6 +38,7 @@ import { findGrossOverPaidBalance, findOverAllocatedRefundTarget, invalidQuantit
 import { orderDiscountReversal, refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
 import { discountSplitEntryTaxType, parseDiscountTaxSplit } from '@/lib/domain/sales/discount-tax-split'
 import { refreshedDiscountSplit } from '@/lib/domain/sales/discount-tax-split-codes'
+import { postedDiscountTaxType, postedTaxTypeByLineId, readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { planSplitDiscountReversal } from '@/lib/domain/sales/discount-tax-split-plan'
 import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basis'
 import { resolveSchemePostingSnapshot } from '@/lib/domain/sales/refund-scheme-posting'
@@ -4257,6 +4258,8 @@ export async function createSalesOrderRefund(
         status: true,
         paidAt: true,
         invoiceNumber: true,
+        // The posted invoice's id: its sync record says which codes the invoice was posted with, and a refund reverses it on those (posted-invoice-tax-codes.ts).
+        accountingInvoiceId: true,
         refundStatus: true,
         fxRateToBase: true,
         totalBase: true,
@@ -4352,6 +4355,11 @@ export async function createSalesOrderRefund(
           select: { accountingTaxType: true },
         }))?.accountingTaxType ?? null
       : null
+
+    // THE CODES THE ORDER'S POSTED INVOICE WAS SENT WITH (null: no posted invoice, or no readable record of it, and then every derivation below reads the rates' current codes, as before). Owner ruling: after posting, a refund
+    // reverses the invoice's goods lines and discount on the codes it posted with; a rate remapped since only affects invoices not yet posted.
+    const postedInvoiceCodes = await readPostedInvoiceTaxCodes(tx, so.id, so.accountingInvoiceId)
+    const postedCodeByLineId = postedTaxTypeByLineId(so.lines, postedInvoiceCodes)
 
     // AN EXCHANGE IS CHECKED BEFORE ANYTHING IS WRITTEN: under the order lock, the replacement lines may be added now, or the whole refund is refused (nothing created).
     if (input.exchange) {
@@ -4458,7 +4466,8 @@ export async function createSalesOrderRefund(
         })
         const refundedNetByLine = new Map<string, number>()
         for (const l of refundLines) if (l.lineId && l.qty > 0 && (l.lineKind ?? 'sale') === 'sale') refundedNetByLine.set(l.lineId, (refundedNetByLine.get(l.lineId) ?? 0) + (l.totalForeign ?? 0))
-        // Each group's code is read from its rate NOW, as the invoice build does (refreshedDiscountSplit), not from the snapshot the draft was saved with.
+        // Each group's code is the one the posted invoice carried its discount part on (postedDiscountTaxType); only a group the posted record does not state (no posted invoice yet, or an invoice with no readable
+        // record) is read from its rate NOW, as the invoice build does (refreshedDiscountSplit), not from the snapshot the draft was saved with.
         const plan = planSplitDiscountReversal({
           split: await refreshedDiscountSplit(tx, discountSplit),
           lines: so.lines.map((l) => ({ id: l.id, taxRateId: l.taxRateId, totalForeign: refundBoundaryNumber(l.totalForeign) })),
@@ -4492,7 +4501,8 @@ export async function createSalesOrderRefund(
             lineKind: 'discount',
             discountTaxIdentity: {
               taxRateId: part.entry.taxRateId ?? '',
-              accountingTaxType: discountSplitEntryTaxType(part.entry, { orderDefaultTaxType, reverseChargeSalesTaxType: input.accountingSettings?.reverseChargeSalesTaxType }),
+              accountingTaxType: postedDiscountTaxType(postedInvoiceCodes, part.entry)
+                ?? discountSplitEntryTaxType(part.entry, { orderDefaultTaxType, reverseChargeSalesTaxType: input.accountingSettings?.reverseChargeSalesTaxType }),
               reverseCharge: part.entry.reverseCharge,
               rate: part.entry.rate,
             },
@@ -4560,7 +4570,7 @@ export async function createSalesOrderRefund(
     let publicPriorRateOf: ((row: { salesOrderLineId: string | null; accountingTaxType: string | null }) => number | null) | null = null
     if (input.deriveSaleLineNetsFromStoredBalance) {
       const salesRates = buildTaxTypeRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))
-      const taxTypeOfLine = creditNoteLineTaxTypeResolver({ orderLines: so.lines, reverseChargeSalesTaxType, orderDefaultTaxType })
+      const taxTypeOfLine = creditNoteLineTaxTypeResolver({ orderLines: so.lines, reverseChargeSalesTaxType, orderDefaultTaxType, postedTaxTypeByLineId: postedCodeByLineId })
       const findPostedRate = (lineId: string): number | null => {
         const taxType = taxTypeOfLine({ accountingTaxType: null, lineId })
         const priced = taxType ? priceSnapshottedTaxIdentity({ accountingTaxType: taxType, rateByTaxType: salesRates, label: 'refund line' }) : null
@@ -4657,7 +4667,8 @@ export async function createSalesOrderRefund(
       const linked = lineId ? salesLineTaxById.get(lineId) : undefined
       if (linked) {
         return {
-          accountingTaxType: resolveSalesLineTaxType({
+          // The code the posted invoice carried this line on, else (no posted record) the rate's code now.
+          accountingTaxType: (lineId ? postedCodeByLineId.get(lineId) : undefined) ?? resolveSalesLineTaxType({
             baseTaxType: linked.accountingTaxType ?? orderDefaultTaxType,
             reverseCharge: linked.reverseCharge,
             reverseChargeSalesTaxType,
@@ -5362,6 +5373,7 @@ export async function createSalesOrderRefund(
           // Resolved from the SAME map resolveRefundLineTaxIdentity resolves from, so the identity
           // checked here and the identity snapshotted below cannot differ by construction.
           lineTaxRate: refundLine.lineId ? salesLineTaxById.get(refundLine.lineId) ?? null : null,
+          postedTaxType: refundLine.lineId ? postedCodeByLineId.get(refundLine.lineId) ?? null : null,
           orderDefaultTaxType,
           orderUniform: {
             singleSafeTaxType: orderSingleSafeTaxType,

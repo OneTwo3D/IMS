@@ -150,6 +150,7 @@ import {
 } from '@/lib/domain/sales/sales-order-vat-basis'
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import { refreshedDiscountSplit } from '@/lib/domain/sales/discount-tax-split-codes'
+import { postedTaxTypeByLineId, readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { discountSplitEntryTaxType, discountSplitTaxCodeRefusal, invoiceDiscountParts, parseDiscountTaxSplit, type DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
 import { decideChargebackOrderDiscount, resolvePostedOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
 import { claimDocumentNumber, mintCommittedDocumentNumber, retryWhenNumberTaken } from '@/lib/domain/numbering/mint'
@@ -3027,6 +3028,7 @@ async function queueRefundAccountingActions(input: {
         customer: { select: { firstName: true, lastName: true, email: true } },
         currency: true,
         taxRateName: true,
+        accountingInvoiceId: true,
         refundStatus: true,
         refunds: { select: { id: true, chargeback: true } },
         lines: {
@@ -3065,10 +3067,12 @@ async function queueRefundAccountingActions(input: {
   // exactly how the invoice posts its shipping/discount lines (shippingTaxType = orderDefaultTaxType, no
   // swap): swapping there would post credit-note shipping under the reverse-charge code while the
   // invoice posted it under the standard code — an asymmetry the VAT return would flag.
+  // A line with no snapshot is credited on the code the order's POSTED invoice carried it on (a credit note reverses the invoice as posted), else on its rate's code now (no posted invoice).
   const creditNoteTaxTypeOf = creditNoteLineTaxTypeResolver({
     orderLines: orderForCN?.lines ?? [],
     reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
     orderDefaultTaxType: cnTaxRate?.accountingTaxType ?? null,
+    postedTaxTypeByLineId: postedTaxTypeByLineId(orderForCN?.lines ?? [], await readPostedInvoiceTaxCodes(db, input.orderId, orderForCN?.accountingInvoiceId)),
   })
 
   // THE RECORDED OBLIGATIONS OF THIS HAND-OFF: the credit note, plus every sync staging recorded.

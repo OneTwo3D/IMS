@@ -527,6 +527,11 @@ export type PostedRefundTaxIdentityInput = {
   /** accountingTaxType of the ACTIVE TaxRate named SalesOrder.taxRateName, or null. */
   orderDefaultTaxType: string | null
   /**
+   * The code the order's POSTED invoice carried this line on (already post reverse-charge swap), for a `sale` target linked to a rate. When present it IS the code: a credit note reverses the
+   * invoice on the codes the invoice posted with, not on the rate's current mapping. Absent/null (no posted invoice, or the record does not state it): the rate's current code, as before.
+   */
+  postedTaxType?: string | null
+  /**
    * The order's money snapshot of its SHIPPING leg, for a `shipping` target. Ignored for `sale`.
    *
    * Codex r5 #1: deliberately NOT `SalesOrder.taxRatePercent`. That column is the order's HEADER
@@ -839,14 +844,15 @@ function resolveIdentityCode(input: PostedRefundTaxIdentityInput): ResolvedIdent
         ? Boolean(input.orderUniform?.uniformlyReverseCharged)
         : Boolean(input.lineTaxRate?.reverseCharge))
     : false
+  const postedLinked = isSale && !unlinkedSale && typeof input.postedTaxType === 'string' && input.postedTaxType.trim() !== '' ? input.postedTaxType : null
   const baseTaxType = isSale
     ? (unlinkedSale
         ? (input.orderUniform?.singleSafeTaxType ?? null)
         : (input.lineTaxRate?.accountingTaxType ?? input.orderDefaultTaxType))
     : input.orderDefaultTaxType
   // The order's single safe identity is ALREADY post-swap, so it must not be swapped a second time.
-  const accountingTaxType = (unlinkedSale
-    ? baseTaxType
+  const accountingTaxType = (unlinkedSale || postedLinked
+    ? (postedLinked ?? baseTaxType)
     : resolveSalesLineTaxType({
         baseTaxType,
         reverseCharge,
@@ -935,6 +941,8 @@ export function creditNoteLineTaxTypeResolver(input: {
   reverseChargeSalesTaxType?: string | null
   /** accountingTaxType of the ACTIVE TaxRate named `SalesOrder.taxRateName`, or null — the fallback. */
   orderDefaultTaxType?: string | null
+  /** lineId -> the code the order's posted invoice carried that line on (posted-invoice-tax-codes.ts); it wins over the line's CURRENT rate code, which is only the fallback for an order with no posted record. */
+  postedTaxTypeByLineId?: ReadonlyMap<string, string>
 }): (refundLine: { accountingTaxType?: string | null; lineId?: string | null }) => string | null {
   const bySalesLineId = new Map(input.orderLines.map((line) => [
     line.id,
@@ -945,6 +953,7 @@ export function creditNoteLineTaxTypeResolver(input: {
     }) ?? null,
   ]))
   return (refundLine) => refundLine.accountingTaxType
+    ?? (refundLine.lineId ? input.postedTaxTypeByLineId?.get(refundLine.lineId) ?? null : null)
     ?? (refundLine.lineId ? bySalesLineId.get(refundLine.lineId) ?? null : null)
     ?? input.orderDefaultTaxType
     ?? null

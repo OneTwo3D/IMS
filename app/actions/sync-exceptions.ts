@@ -129,6 +129,7 @@ import {
   resolvePostedRefundTaxIdentity,
   type TaxTypeRateIndex,
 } from '@/lib/domain/sales/refund-posted-tax-identity'
+import { postedTaxTypeByLineId, readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import {
   findOverAllocatedRefundTarget,
   overAllocatedRefundTargetMessage,
@@ -1714,6 +1715,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
             orderNumber: true,
             currency: true,
             taxRateName: true,
+            accountingInvoiceId: true,
             shippingForeign: true,
             shippingService: true,
             // Codex r6 #3: WHO wrote this order's totals. A WooCommerce-imported order is created with
@@ -1738,6 +1740,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
                 // r4 #1 — this, not the live TaxRate.rate, is what the line was CHARGED at.
                 totalForeign: true,
                 taxForeign: true,
+                taxRateId: true,
                 // accountingTaxType (o3d-w00 Codex r3 #1): the identity the credit note posts under, and
                 // therefore the rate the operator's gross is really converted at. `rate` is deliberately
                 // NOT read — it is today's rate, not the one this order was billed under.
@@ -1758,6 +1761,8 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
     loadRefundPostingTaxContext(),
   ])
   const refundOrderById = new Map(refundOrders.map((order) => [order.id, order]))
+  // The codes each order's POSTED invoice carried its lines on (the targets' rates are those codes' rates, as the refund posts them).
+  const postedCodesByOrderId = new Map(await Promise.all(refundOrders.map(async (order) => [order.id, await readPostedInvoiceTaxCodes(db, order.id, order.accountingInvoiceId)] as const)))
   // o3d-54p: which WooCommerce order each parked order is linked to. Read for the whole page in one
   // query rather than per row.
   const refundOrderLinks = refundOrderIds.length > 0
@@ -1815,6 +1820,7 @@ export async function getExceptionInboxData(): Promise<ExceptionInboxData> {
       const identity = resolvePostedRefundTaxIdentity({
         kind: 'sale',
         lineTaxRate: line.taxRate,
+        postedTaxType: postedTaxTypeByLineId([line], postedCodesByOrderId.get(order.id) ?? null).get(line.id) ?? null,
         chargedLine: { currency: order.currency, netForeign: line.totalForeign, taxForeign: line.taxForeign },
         orderDefaultTaxType,
         orderUniform,
@@ -3171,6 +3177,8 @@ export async function recordRefundParkManually(
         // either (o3d-w00 Codex r3 #1 / r5 #1). taxRatePercent is deliberately NOT read: it is the
         // order's header default rate, not the shipping leg's.
         taxRateName: true,
+        // The posted invoice's id: its sync record says which codes it was posted with (posted-invoice-tax-codes.ts), and the refund is converted at THOSE codes' rates, as createSalesOrderRefund posts it.
+        accountingInvoiceId: true,
         shippingForeign: true,
         // Shipping's own VAT, which IMS stores in no column of its own: the VAT the order records over
         // and above its lines. discountAmount is read because an order-level discount's VAT is netted
@@ -3193,6 +3201,7 @@ export async function recordRefundParkManually(
             // against today's rate.
             totalForeign: true,
             taxForeign: true,
+            taxRateId: true,
             taxRate: { select: { reverseCharge: true, accountingTaxType: true } },
           },
         },
@@ -3319,6 +3328,8 @@ export async function recordRefundParkManually(
       lines: order.lines,
       reverseChargeSalesTaxType: postingTaxContext.reverseChargeSalesTaxType,
     })
+    // The code each line's POSTED invoice carried it on: a refund reverses the invoice as posted, so the gross is divided at THAT code's rate and the fence in createSalesOrderRefund agrees.
+    const postedCodeByLineId = postedTaxTypeByLineId(order.lines, await readPostedInvoiceTaxCodes(db, order.id, order.accountingInvoiceId))
     // What the ORDER says its shipping leg was charged (Codex r5 #1) — its own money, not the header
     // default rate, which is shipping's rate only on a uniformly taxed order.
     const chargedShipping = {
@@ -3367,6 +3378,7 @@ export async function recordRefundParkManually(
       const identity = resolvePostedRefundTaxIdentity({
         kind: allocation.lineKind,
         lineTaxRate: line?.taxRate ?? null,
+        postedTaxType: line ? postedCodeByLineId.get(line.id) ?? null : null,
         chargedLine: line ? { currency: order.currency, netForeign: line.totalForeign, taxForeign: line.taxForeign } : null,
         chargedShipping,
         orderDefaultTaxType,
