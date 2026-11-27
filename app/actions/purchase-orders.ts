@@ -77,7 +77,7 @@ import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purcha
 import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_INEXACT_MESSAGE, SupplierCreditNoteEnqueueDeclined, SupplierCreditNoteChangedWhilePosting, planReverseChargeSupplierCredit, billNetPayable } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { receiptJournalAmount } from '@/lib/domain/accounting/receipt-journal-amount'
-import { recordGrirBill, recordGrirBillEdit, recordGrirReceipt, recordGrirReturnCreditNote, recordGrirSupplierReturn, returnCreditAllocation, returnGoodsValueByLine } from '@/lib/domain/accounting/grir-subledger-movement'
+import { recordGrirBill, recordGrirBillEdit, recordGrirReceipt, recordGrirReturnCreditNote, recordGrirSupplierReturn, returnCreditAllocation, returnCreditScope, returnGoodsValueByLine } from '@/lib/domain/accounting/grir-subledger-movement'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
 import { readPayloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
 import {
@@ -6256,7 +6256,11 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     // difference on it), never from the bill's overall proportion. A one-line credit becomes a stock line and a PPV line with exact amounts and tax; a
     // reverse-charge plan has the price-variance part of each credited line split off its own plan line. Re-checked under the locks (below).
     const creditSplitApplies = cn.isReturnGenerated && Boolean(creditBill && billIsFxManaged(creditBill))
-    const creditAllocation = creditSplitApplies ? await returnCreditAllocation(db, cn.poId, creditNetBase) : new Map<string, Prisma.Decimal>()
+    // o3d-ygc2x: the credit clears only the lines of the return that raised it (its reference), on its own bill, at most what that return took back.
+    const creditScope = creditSplitApplies && creditBill
+      ? await returnCreditScope(db, { poId: cn.poId, creditReference: cn.reference, billLineIds: creditBill.lines.flatMap((l) => (l.poLineId ? [l.poLineId] : [])) })
+      : undefined
+    const creditAllocation = creditSplitApplies ? await returnCreditAllocation(db, cn.poId, creditNetBase, creditScope) : new Map<string, Prisma.Decimal>()
     const creditPpvByLine = creditSplitApplies && creditBill ? returnCreditPpvByLine({ allocation: creditAllocation, billLines: creditBill.lines, currency: cn.currency }) : new Map<string, Prisma.Decimal>()
     const creditPpvNetForeign = [...creditPpvByLine.values()].reduce((sum, v) => sum.add(v), new Prisma.Decimal(0))
     const splitCreditPpv = shouldQueueXero && !creditPpvNetForeign.isZero()
@@ -6265,19 +6269,50 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       return { success: false, error: withLedgerCheck('The credit note was NOT posted (it is still a draft): it reverses a bill whose price difference went to the purchase price variance account, and that account (xero_purchase_price_variance_account) is not mapped. Map it under Sync > Accounting settings, then post again.') }
     }
     let creditPpvSplit: Parameters<typeof buildSupplierCreditNoteSyncPayload>[0]['ppvSplit'] | undefined
+    // What the PPV lines actually carry (a reverse-charge plan may leave a residue on transit, o3d-tqs3o).
+    let creditPpvPlacedForeign = creditPpvNetForeign
     if (splitCreditPpv && creditBill) {
       if (reverseChargePlan) {
-        const plan: Array<{ ppvNet: number; stockVat: number; ppvVat: number } | null> = reverseChargePlan.lines.map(() => null)
+        // o3d-tqs3o: the plan spreads the credit over the bill's lines pro rata, so the returned line's plan line can carry less than its price variance.
+        // Each credited line's PPV goes on its own plan line FIRST, at most that line's net (never a negative stock part or VAT), and what does not fit
+        // on the plan lines of the bill's other goods lines, each again at most its net; a residue no line can take (the credit is smaller than its
+        // price variance) stays on transit and is reported. So the post is never refused for this.
+        const placed = reverseChargePlan.lines.map(() => new Prisma.Decimal(0))
+        let residue = new Prisma.Decimal(0)
+        const place = (at: number, amount: Prisma.Decimal): Prisma.Decimal => {
+          const net = toDecimal(reverseChargePlan.lines[at]!.net)
+          if (amount.lte(0)) { placed[at] = placed[at]!.add(amount); return new Prisma.Decimal(0) }
+          const room = Prisma.Decimal.max(0, net.sub(placed[at]!))
+          const take = Prisma.Decimal.min(room, amount)
+          placed[at] = placed[at]!.add(take)
+          return amount.sub(take)
+        }
+        const goodsPlanLines = reverseChargePlan.lines.map((l, at) => ({ at, poLineId: creditBill.lines[l.billLineIndex]?.poLineId ?? null })).filter((l) => l.poLineId)
         for (const [poLineId, ppv] of creditPpvByLine) {
-          const at = reverseChargePlan.lines.findIndex((l) => creditBill.lines[l.billLineIndex]?.poLineId === poLineId)
-          if (at < 0) {
-            return { success: false, error: withLedgerCheck('The credit note was NOT posted (it is still a draft): it reverses a bill whose price difference went to the purchase price variance account, and the credit\'s split across the bill\'s reverse-charge lines gives nothing to the returned line, so IMS cannot put the price-variance part on that line\'s tax treatment. Nothing was sent.') }
-          }
-          const line = reverseChargePlan.lines[at]!
+          let left = ppv
+          for (const own of goodsPlanLines.filter((l) => l.poLineId === poLineId)) left = place(own.at, left)
+          for (const other of goodsPlanLines.filter((l) => l.poLineId !== poLineId)) { if (left.isZero()) break; left = place(other.at, left) }
+          residue = residue.add(left)
+        }
+        const plan: Array<{ ppvNet: number; stockVat: number; ppvVat: number } | null> = reverseChargePlan.lines.map((line, at) => {
+          const ppvNet = placed[at]!
+          if (ppvNet.isZero()) return null
           const rate = toDecimal(billTreatments[line.billLineIndex]?.rate ?? 0)
-          const ppvNet = toDecimal(plan[at]?.ppvNet ?? 0).add(ppv)
           const ppvVat = line.reverseCharge ? new Prisma.Decimal(0) : roundMoney(ppvNet.mul(rate), cn.currency)
-          plan[at] = { ppvNet: ppvNet.toNumber(), ppvVat: ppvVat.toNumber(), stockVat: toDecimal(line.vat).sub(ppvVat).toNumber() }
+          return { ppvNet: ppvNet.toNumber(), ppvVat: ppvVat.toNumber(), stockVat: toDecimal(line.vat).sub(ppvVat).toNumber() }
+        })
+        creditPpvPlacedForeign = placed.reduce((sum, v) => sum.add(v), new Prisma.Decimal(0))
+        if (!residue.isZero()) {
+          await logActivity({
+            entityType: 'PURCHASE_ORDER',
+            entityId: cn.poId,
+            action: 'supplier_credit_note_ppv_residue',
+            tag: 'accounting',
+            level: 'WARNING',
+            description: `Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference}: ${cn.currency} ${residue.toFixed(2)} of the price variance it reverses `
+              + 'is larger than the credit\'s share of the bill\'s lines, so it stays on Stock in Transit (the GR/IR report shows it). Review it with the accountant.',
+            metadata: { creditNoteId: cn.id, reference: cn.po.reference, residueForeign: residue.toString() },
+          }).catch(() => { /* the post is unaffected */ })
         }
         creditPpvSplit = { account: creditPpvAccount, plan }
       } else {
@@ -6286,8 +6321,23 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         creditPpvSplit = { account: creditPpvAccount, single: { stockNet: single.stockNet.toNumber(), stockTax: single.stockTax.toNumber(), ppvNet: single.ppvNet.toNumber(), ppvTax: single.ppvTax.toNumber() } }
       }
     }
+    // o3d-j8fer: everything the payload and the split were built from (the credit's own amount and rate, the bill's totals, rate and every line's
+    // amounts and tax treatment, and the other credits on the bill), compared again under the locks; any change refuses the post (it stays a draft).
+    const creditInputsFingerprint = (credit: { status: string; amountForeign: unknown; fxRateToBase: unknown; fxEventRateToBase: unknown } | null, bill: {
+      subtotalForeign: unknown; taxForeign: unknown; fxRateToBase: unknown; fxRateSource: string | null; fxEventRateToBase: unknown
+      lines: ReadonlyArray<{ poLineId: string | null; costLineId: string | null; qtyBilled: unknown; totalForeign: unknown; stockUnitForeign: unknown; taxType: string | null; taxRateValue: unknown; taxRateId: string | null; taxReverseCharge: boolean | null }>
+    } | null, othersForeign: unknown): string => JSON.stringify({
+      credit: credit ? [credit.status, String(credit.amountForeign), String(credit.fxRateToBase), String(credit.fxEventRateToBase)] : null,
+      bill: bill ? [String(bill.subtotalForeign), String(bill.taxForeign), String(bill.fxRateToBase), bill.fxRateSource, String(bill.fxEventRateToBase),
+        bill.lines.map((l) => [l.poLineId, l.costLineId, String(l.qtyBilled), String(l.totalForeign), String(l.stockUnitForeign), l.taxType, String(l.taxRateValue), l.taxRateId, l.taxReverseCharge]).map((l) => JSON.stringify(l)).sort()] : null,
+      others: String(othersForeign ?? 0),
+    })
+    const otherCreditsForeign = async (client: Pick<Prisma.TransactionClient, 'supplierCreditNote'>) => (cn.purchaseInvoiceId
+      ? (await client.supplierCreditNote.aggregate({ where: { purchaseInvoiceId: cn.purchaseInvoiceId, id: { not: cn.id } }, _sum: { amountForeign: true } }))._sum.amountForeign
+      : null)
+    const creditFingerprintBefore = creditSplitApplies ? creditInputsFingerprint(cn, cn.purchaseInvoice, await otherCreditsForeign(db)) : null
     // The price-variance part in base (what the PPV line takes off transit).
-    const creditPpvBase = splitCreditPpv ? roundQuantity(creditPpvNetForeign.div(creditRate), 4) : null
+    const creditPpvBase = splitCreditPpv && !creditPpvPlacedForeign.isZero() ? roundQuantity(creditPpvPlacedForeign.div(creditRate), 4) : null
     const creditNotePayload = shouldQueueXero ? buildSupplierCreditNoteSyncPayload({
       creditNoteId: cn.id,
       creditNoteNumber: cn.creditNoteNumber,
@@ -6371,14 +6421,21 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       // #1157 LOW-4: the bill and the allocation the split was worked out from are read again under the locks; a bill edited, or another credit or
       // return committed, in between refuses the post (nothing is claimed: the credit stays a draft, and posting again works it out afresh).
       if (creditSplitApplies && cn.purchaseInvoiceId) {
-        const locked = await tx.purchaseInvoice.findUnique({
+        const lockedBill = await tx.purchaseInvoice.findUnique({
           where: { id: cn.purchaseInvoiceId },
-          select: { fxRateSource: true, fxEventRateToBase: true, lines: { select: { poLineId: true, qtyBilled: true, totalForeign: true, stockUnitForeign: true } } },
+          select: {
+            subtotalForeign: true, taxForeign: true, fxRateToBase: true, fxRateSource: true, fxEventRateToBase: true,
+            lines: { select: { poLineId: true, costLineId: true, qtyBilled: true, totalForeign: true, stockUnitForeign: true, taxType: true, taxRateValue: true, taxRateId: true, taxReverseCharge: true } },
+          },
         })
-        const sameBill = locked && String(locked.fxRateSource) === String(creditBill?.fxRateSource) && String(locked.fxEventRateToBase) === String(creditBill?.fxEventRateToBase)
-          && JSON.stringify(locked.lines.map((l) => [l.poLineId, String(l.qtyBilled), String(l.totalForeign), String(l.stockUnitForeign)]).sort())
-            === JSON.stringify((creditBill?.lines ?? []).map((l) => [l.poLineId, String(l.qtyBilled), String(l.totalForeign), String(l.stockUnitForeign)]).sort())
-        const lockedAllocation = await returnCreditAllocation(tx, cn.poId, creditNetBase)
+        const lockedCredit = await tx.supplierCreditNote.findUnique({ where: { id: cn.id }, select: { status: true, amountForeign: true, fxRateToBase: true, fxEventRateToBase: true } })
+        // The claim above already set POSTED (and a no-bill rate): compare the credit as it was read, before the claim's own change.
+        const sameBill = creditInputsFingerprint(lockedCredit ? { ...lockedCredit, status: cn.status, fxRateToBase: cn.fxRateToBase, fxEventRateToBase: cn.fxEventRateToBase } : null, lockedBill, await otherCreditsForeign(tx)) === creditFingerprintBefore
+          && lockedCredit !== null && String(lockedCredit.amountForeign) === String(cn.amountForeign)
+        const lockedScope = creditBill
+          ? await returnCreditScope(tx, { poId: cn.poId, creditReference: cn.reference, billLineIds: (lockedBill?.lines ?? []).flatMap((l) => (l.poLineId ? [l.poLineId] : [])) })
+          : undefined
+        const lockedAllocation = await returnCreditAllocation(tx, cn.poId, creditNetBase, lockedScope)
         const sameAllocation = JSON.stringify([...lockedAllocation].map(([k, v]) => [k, v.toString()]).sort()) === JSON.stringify([...creditAllocation].map(([k, v]) => [k, v.toString()]).sort())
         if (!sameBill || !sameAllocation) throw new SupplierCreditNoteChangedWhilePosting(cn.id)
       }
@@ -6399,6 +6456,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
           journalDate: creditNoteDate,
           at: new Date(),
           ...(unitBaseByLine ? { unitBaseByLine } : {}),
+          ...(creditScope ? { scope: creditScope } : {}),
         })
       }
       if (shouldQueueXero) {

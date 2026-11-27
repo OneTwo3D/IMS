@@ -349,10 +349,12 @@ export async function recordGrirReturnCreditNote(
      * unit, at its own rate: what it accrued its unreceived quantity at). A line absent from it is cleared at the PO goods unit cost, as before.
      */
     unitBaseByLine?: ReadonlyMap<string, Decimal>
+    /** Per-event FX (o3d-ygc2x): the lines (and at most what quantity) this credit may clear (`returnCreditScope`). Absent = every line, as before. */
+    scope?: ReadonlyMap<string, Decimal>
   },
 ): Promise<void> {
   const valuation = await loadGrirPoValuation(client, input.poId)
-  const allocation = await returnCreditAllocation(client, input.poId, input.netBase)
+  const allocation = await returnCreditAllocation(client, input.poId, input.netBase, input.scope)
   let poValued = new Prisma.Decimal(0)
   for (const [lineId, qty] of allocation) {
     const value = roundQuantity(qty.mul(input.unitBaseByLine?.get(lineId) ?? unitCostFor(valuation, lineId)), 6)
@@ -392,9 +394,15 @@ export async function returnCreditAllocation(
   client: Pick<Prisma.TransactionClient, 'grirSubledgerMovement' | 'purchaseOrderLine' | 'purchaseInvoiceLine'>,
   poId: string,
   netBase: DecimalInput,
+  /**
+   * Per-event FX (o3d-ygc2x): only these lines, each at most this quantity (the return that raised the credit, on its bill's lines). Without it the
+   * credit is spent over every line of the order in id order, which lets one return's credit clear another return's line.
+   */
+  scope?: ReadonlyMap<string, Decimal>,
 ): Promise<Map<string, Decimal>> {
   const input = { poId, netBase }
-  const lines = await client.purchaseOrderLine.findMany({ where: { poId: input.poId }, select: { id: true, qtyReturned: true } })
+  const allLines = await client.purchaseOrderLine.findMany({ where: { poId: input.poId }, select: { id: true, qtyReturned: true } })
+  const lines = scope ? allLines.filter((line) => scope.has(line.id)) : allLines
   const history = await client.grirSubledgerMovement.groupBy({
     by: ['poLineId', 'sourceType'],
     where: { poId: input.poId, poLineId: { not: null }, sourceType: { in: [...GRIR_BALANCE_SOURCE_TYPES] } },
@@ -412,9 +420,36 @@ export async function returnCreditAllocation(
   return allocateReturnCredit(lines.map((line) => ({
     id: line.id,
     billedNotReceived: Prisma.Decimal.max(0, (netQty.get(line.id) ?? new Prisma.Decimal(0)).neg()),
-    returnedNotCredited: toDecimal(line.qtyReturned).sub(creditedQty.get(line.id) ?? 0),
+    returnedNotCredited: scope
+      ? Prisma.Decimal.min(scope.get(line.id)!, toDecimal(line.qtyReturned).sub(creditedQty.get(line.id) ?? 0))
+      : toDecimal(line.qtyReturned).sub(creditedQty.get(line.id) ?? 0),
     billedUnitBase: billedUnit.get(line.id) ?? new Prisma.Decimal(0),
   })), input.netBase)
+}
+
+/**
+ * Per-event FX (o3d-ygc2x): THE LINES A RETURN CREDIT MAY CLEAR. A return-generated credit carries its return's reference; it clears only that return's
+ * lines, at most the quantity that return took back, and only lines its own bill billed. A credit whose return cannot be found (recorded before the
+ * reference was relied on) is limited to its bill's lines. Read-only.
+ */
+export async function returnCreditScope(
+  client: Pick<Prisma.TransactionClient, 'purchaseReturn'>,
+  params: { poId: string; creditReference: string | null; billLineIds: ReadonlyArray<string> },
+): Promise<Map<string, Decimal>> {
+  const billLines = new Set(params.billLineIds)
+  const out = new Map<string, Decimal>()
+  const purchaseReturn = params.creditReference
+    ? await client.purchaseReturn.findFirst({ where: { poId: params.poId, reference: params.creditReference }, select: { lines: { select: { poLineId: true, qtyReturned: true } } } })
+    : null
+  if (!purchaseReturn) {
+    for (const lineId of billLines) out.set(lineId, new Prisma.Decimal('1e12'))
+    return out
+  }
+  for (const line of purchaseReturn.lines) {
+    if (!billLines.has(line.poLineId)) continue
+    out.set(line.poLineId, (out.get(line.poLineId) ?? new Prisma.Decimal(0)).add(toDecimal(line.qtyReturned)))
+  }
+  return out
 }
 
 /** The open GR/IR balance (credit-positive) up to and including `asOf`, optionally for one order. */

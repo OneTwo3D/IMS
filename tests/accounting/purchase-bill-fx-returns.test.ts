@@ -551,3 +551,114 @@ test('LOW-2 (#1157): taking back an amount settled as a shadow (the bill deleted
   const shadows = await s.db.purchaseFxVarianceShadow.findMany({ where: { poId: po.id } })
   close(shadows.reduce((a, r) => a + Number(r.baseDelta), 0), 0, 'the shadow is taken back as a shadow')
 })
+
+// ─── MED-C: bills posted to Xero outside IMS; o3d-ygc2x and o3d-tqs3o ────────────────────────────────────────────────────────────────
+
+/** A sent order with two lines (qtyA, qtyB) at 12.5 foreign each (10 GBP at the PO rate), no tax; the lines can carry their own tax rate. */
+async function seedTwoLinePo(qtyA: number, qtyB: number, taxRateId?: string) {
+  const { createPurchaseOrder } = await import('@/app/actions/purchase-orders')
+  const second = (await s.db.product.findFirst({ where: { sku: 'PFR-2' }, select: { id: true } }))?.id
+    ?? (await s.db.product.create({ data: { sku: 'PFR-2', name: 'PFR 2', type: 'SIMPLE' }, select: { id: true } })).id
+  const reference = `PFR-PO2-${++seq}-${Date.now()}`
+  const created = await createPurchaseOrder({
+    reference, supplierId, currency: 'GBP', destinationWarehouseId: warehouseId, pricesIncludeVat: false, taxRateValue: 0,
+    lines: [{ productId, sku: 'PFR-1', productName: 'PFR 1', qty: qtyA, unitCostForeign: 10 }, { productId: second, sku: 'PFR-2', productName: 'PFR 2', qty: qtyB, unitCostForeign: 10 }],
+  } as never)
+  assert.equal(created.success, true, String(created.error))
+  const row = await s.db.purchaseOrder.findUniqueOrThrow({ where: { reference }, select: { id: true, subtotalBase: true, totalBase: true, lines: { select: { id: true, productId: true, totalBase: true } } } })
+  await s.db.purchaseOrder.update({ where: { id: row.id }, data: { status: 'PO_SENT', currency: CURRENCY, fxRateToBase: PO_RATE, subtotalForeign: row.subtotalBase.mul(PO_RATE).toFixed(4), totalForeign: row.totalBase.mul(PO_RATE).toFixed(4) } })
+  // A line's own tax rate is recorded with the tax it was priced at (a bill bills at the RECORDED rate).
+  for (const line of row.lines) await s.db.purchaseOrderLine.update({ where: { id: line.id }, data: { unitCostForeign: '12.5', totalForeign: line.totalBase.mul(PO_RATE).toFixed(4), ...(taxRateId ? { taxRateId, taxForeign: line.totalBase.mul(PO_RATE).mul('0.2').toFixed(4) } : {}) } })
+  return { id: row.id, reference, lineA: row.lines.find((l) => l.productId === productId)!.id, lineB: row.lines.find((l) => l.productId === second)!.id }
+}
+
+// [mutation: let the reconciliation owe a journal for a bill posted outside IMS without a confirmation, or let a confirmation post twice]
+test('MED-C: a bill posted to Xero outside IMS is listed with its proposed journal, posts nothing until an admin confirms, then posts once', async () => {
+  const { setPurchaseEventFxStepsCompleteForTests } = await import('@/lib/domain/purchasing/purchase-event-fx-settings')
+  const { listNonImsBills, confirmNonImsBills, NonImsBillsConfirmRefused } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
+  const { rerunPurchaseBillFx } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  const po = await seedPo(10)
+  setPurchaseEventFxStepsCompleteForTests(false) // before switch-on: the bill is at the PO rate, and Qoblex posted it (no PURCHASE_BILL transit row)
+  try {
+    assert.equal((await bill(po, 10, 12.5)).success, true)
+    assert.deepEqual(await withXeroPosting(() => listNonImsBills()), [], 'interlock off: nothing is listed')
+    await assert.rejects(confirmNonImsBills({ by: 'Jan', reason: 'turn-on' }), NonImsBillsConfirmRefused)
+  } finally {
+    setPurchaseEventFxStepsCompleteForTests(true)
+  }
+  const row = await billOf(po)
+  await lockAt(po)
+  assert.equal((await receive(po, 10)).success, true) // after switch-on, at the lock: 78.125
+  const before = await withXeroPosting(() => rerunPurchaseBillFx(po.id))
+  assert.equal(before.journals.length, 0, 'not posted by IMS: no journal owed')
+  const listed = (await withXeroPosting(() => listNonImsBills())).filter((b) => b.poId === po.id)
+  assert.deepEqual(listed.map((b) => [b.invoiceId, b.proposedTransitDelta]), [[row.id, '-21.88']], 'the bill (100 in transit) against the receipt (78.125): credit transit 21.88')
+  assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id } }), 0, 'the list writes nothing')
+  await assert.rejects(confirmNonImsBills({ by: '', reason: 'x' }), NonImsBillsConfirmRefused, 'who is required')
+  const confirmed = await withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'owner ruling: one-off journal', invoiceIds: [row.id] }))
+  assert.equal(confirmed.confirmed.length, 1)
+  assert.deepEqual(confirmed.journals.filter((j) => j.invoiceId === row.id).map((j) => j.transitDelta), ['-21.88'])
+  assert.equal(await s.db.purchaseFxNonImsBillApproval.count({ where: { invoiceId: row.id } }), 1)
+  assert.equal(await s.db.activityLog.count({ where: { action: 'purchase_fx_non_ims_bill_confirmed', entityId: po.id } }), 1)
+  const again = await withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'again' }))
+  assert.equal(again.confirmed.filter((c) => c.invoiceId === row.id).length, 0, 'already confirmed: not a candidate')
+  assert.equal((await withXeroPosting(() => rerunPurchaseBillFx(po.id))).journals.length, 0, 'posted once: a re-run queues nothing')
+  assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id } }), 1)
+})
+
+// [mutation: spend a return credit over the order's lines in id order instead of the lines of the return that raised it (o3d-ygc2x)]
+test('o3d-ygc2x: two return credits posted in reverse order, then one draft deleted: each credit clears only its own return\'s line', async () => {
+  const noVat = await s.db.taxRate.findFirstOrThrow({ where: { accountingTaxType: 'NONE' }, select: { id: true } })
+  await s.db.supplier.update({ where: { id: supplierId }, data: { taxRateId: noVat.id } })
+  const po = await seedTwoLinePo(10, 10)
+  await lockAt({ id: po.id, lineId: po.lineA, reference: po.reference })
+  const { receivePurchaseOrder, createInvoice, returnPurchaseOrder } = await import('@/app/actions/purchase-orders')
+  assert.equal((await receivePurchaseOrder(po.id, [{ poLineId: po.lineA, qtyReceived: 10, warehouseId }, { poLineId: po.lineB, qtyReceived: 10, warehouseId }])).success, true)
+  assert.equal((await createInvoice(po.id, { invoiceDate: BILL_DATE, invoiceNumber: `SUP-YG-${++seq}`, lines: [
+    { kind: 'product', poLineId: po.lineA, qtyBilled: 10, unitCostForeign: 12.5 }, { kind: 'product', poLineId: po.lineB, qtyBilled: 10, unitCostForeign: 18.75 },
+  ] } as never)).success, true)
+  assert.equal((await returnPurchaseOrder(po.id, [{ poLineId: po.lineA, qtyReturned: 4, warehouseId }], 'damaged')).success, true)
+  assert.equal((await returnPurchaseOrder(po.id, [{ poLineId: po.lineB, qtyReturned: 2, warehouseId }], 'damaged')).success, true)
+  const drafts = await s.db.supplierCreditNote.findMany({ where: { poId: po.id }, orderBy: { createdAt: 'asc' } })
+  assert.equal(drafts.length, 2)
+  const [creditA, creditB] = drafts as [typeof drafts[0], typeof drafts[0]]
+  // B's credit first: it must clear line B (2 x 7.8125), not the earlier-id line A.
+  const posted = await withXeroPosting(() => postCredit(creditB.id))
+  assert.equal(posted.success, true, String(posted.error))
+  const rowsB = await s.db.grirSubledgerMovement.findMany({ where: { sourceRef: creditB.id, sourceType: 'SUPPLIER_CREDIT_NOTE' }, select: { poLineId: true, baseDelta: true } })
+  assert.deepEqual(rowsB.map((r) => [r.poLineId, Number(r.baseDelta)]), [[po.lineB, 15.625]])
+  const log = await s.db.accountingSyncLog.findFirstOrThrow({ where: { type: 'PURCHASE_CREDIT_NOTE', referenceId: creditB.id }, select: { payload: true } })
+  assert.deepEqual((log.payload as { lines: Array<{ accountCode: string; unitAmount: number }> }).lines.map((l) => [l.accountCode, l.unitAmount]), [['631', 25], ['5050', 12.5]])
+  close(Number((await s.db.transitSubledgerMovement.findFirstOrThrow({ where: { sourceType: 'SUPPLIER_CREDIT_NOTE', sourceRef: creditB.id } })).baseDelta), -15.625, 'stock part only')
+  // A's draft is deleted (never posted): line A stays returned and not credited, nothing stranded by B.
+  await s.db.supplierCreditNote.delete({ where: { id: creditA.id } })
+  close((await balance({ id: po.id, lineId: po.lineA, reference: po.reference })).toNumber(), -31.25, 'GR/IR: only line A\'s 4 returned units are billed and not credited (4 x 7.8125)')
+})
+
+// [mutation: put a returned line's whole PPV on its own pro-rata plan line (o3d-tqs3o): negative transit and VAT lines]
+test('o3d-tqs3o end to end: a reverse-charge return credit whose line PPV exceeds its pro-rata share: PPV capped per plan line, no negative line, transit nets', async () => {
+  const rc = await s.db.taxRate.create({ data: { name: `ZQ RC 20 ${++seq}`, rate: '0.2', usedFor: 'PURCHASE', active: true, reverseCharge: true, accountingTaxType: 'ECACQGOODS' }, select: { id: true } })
+  const po = await seedTwoLinePo(10, 100, rc.id)
+  await lockAt({ id: po.id, lineId: po.lineA, reference: po.reference })
+  const { receivePurchaseOrder, createInvoice, returnPurchaseOrder } = await import('@/app/actions/purchase-orders')
+  assert.equal((await receivePurchaseOrder(po.id, [{ poLineId: po.lineA, qtyReceived: 10, warehouseId }, { poLineId: po.lineB, qtyReceived: 100, warehouseId }])).success, true)
+  // Line A dearer (25 against 12.5: half of it is price variance), line B at the order's cost and much larger (its pro-rata share dominates).
+  const billed = await createInvoice(po.id, { invoiceDate: BILL_DATE, invoiceNumber: `SUP-RC-${++seq}`, lines: [
+    { kind: 'product', poLineId: po.lineA, qtyBilled: 10, unitCostForeign: 25 }, { kind: 'product', poLineId: po.lineB, qtyBilled: 100, unitCostForeign: 12.5 },
+  ] } as never)
+  assert.equal(billed.success, true, String(billed.error))
+  assert.equal((await returnPurchaseOrder(po.id, [{ poLineId: po.lineA, qtyReturned: 2, warehouseId }], 'damaged')).success, true)
+  const credit = await s.db.supplierCreditNote.findFirstOrThrow({ where: { poId: po.id } })
+  close(Number(credit.amountForeign), 50, '2 x 25')
+  const posted = await withXeroPosting(() => postCredit(credit.id))
+  assert.equal(posted.success, true, String(posted.error))
+  const payload = (await s.db.accountingSyncLog.findFirstOrThrow({ where: { type: 'PURCHASE_CREDIT_NOTE', referenceId: credit.id }, select: { payload: true } })).payload as {
+    lines: Array<{ accountCode: string; unitAmount: number; taxAmount?: number }>
+  }
+  assert.ok(payload.lines.every((l) => l.unitAmount > 0 && (l.taxAmount ?? 0) >= 0), `no negative or zero line: ${JSON.stringify(payload.lines)}`)
+  const sum = (code: string) => payload.lines.filter((l) => l.accountCode === code).reduce((a, l) => a + l.unitAmount, 0)
+  close(sum('5050'), 25, 'the whole PPV of the returned units (2 x 12.5), though line A\'s own plan share is far smaller')
+  close(sum('631'), 25, 'the stock part on transit')
+  close(Number((await s.db.transitSubledgerMovement.findFirstOrThrow({ where: { sourceType: 'SUPPLIER_CREDIT_NOTE', sourceRef: credit.id } })).baseDelta), -15.625, 'transit gets back the returned goods (2 x 7.8125)')
+  close((await balance({ id: po.id, lineId: po.lineA, reference: po.reference })).toNumber(), 0, 'GR/IR nets to zero')
+})

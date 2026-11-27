@@ -193,7 +193,7 @@ export function billCreditRate(bill: { fxRateToBase: DecimalInput; fxRateSource:
  * switch is off, for a base-currency order, or for an order the switch never touched (the caller keeps its old rule). Read on the caller's client.
  */
 export async function resolveNoBillCreditFxRate(
-  client: Pick<Prisma.TransactionClient, 'setting' | 'purchaseOrder' | 'organisation' | 'fxRate' | 'purchaseInvoice' | 'purchaseReceipt' | 'grirSubledgerMovement' | 'transitSubledgerMovement' | 'purchaseFxVarianceShadow'>,
+  client: Pick<Prisma.TransactionClient, 'setting' | 'purchaseOrder' | 'organisation' | 'fxRate' | 'purchaseInvoice' | 'purchaseReceipt' | 'grirSubledgerMovement' | 'transitSubledgerMovement' | 'purchaseFxVarianceShadow' | 'purchaseFxNonImsBillApproval'>,
   params: { poId: string; creditDate: string },
 ): Promise<{ rateToBase: Prisma.Decimal; storedRateToBase: Prisma.Decimal; columns: { fxRateSource: string; fxEventRateToBase: Prisma.Decimal } } | null> {
   if (!(await isPurchaseEventFxEnabled(client))) return null
@@ -442,6 +442,8 @@ export type ReconcilePurchaseBillFxParams = {
   billEventInvoiceId?: string
   /** LOW: compute what would be queued without queueing it (the caller rolls the transaction back): `journals` lists the deltas. */
   dryRun?: boolean
+  /** MED-C proposal only (with `dryRun`): treat these bills as confirmed by the owner, to show the journal a confirmation would post. */
+  assumeConfirmedInvoiceIds?: ReadonlySet<string>
 }
 
 type Accum = { balQty: Decimal; balBase: Decimal; fx: Decimal; ppv: Decimal; rows: number; journalDate: Date | null }
@@ -636,7 +638,11 @@ export async function reconcilePurchaseBillFx(
   const billTransitKeys = (await tx.transitSubledgerMovement.findMany({
     where: { sourceType: 'PURCHASE_BILL', sourceRef: params.poId }, select: { idempotencyKey: true },
   })).map((row) => row.idempotencyKey)
-  const billPosted = (invoiceId: string): boolean => billTransitKeys.some((key) => key.startsWith(`purchase-invoice:${invoiceId}:`))
+  // MED-C (owner ruling "post a one-off journal"): a bill that reached Xero OUTSIDE IMS has no such row; once an admin has confirmed it
+  // (`purchase_fx_non_ims_bill_approvals`, lib/domain/purchasing/purchase-fx-non-ims-bills.ts) it is treated as being in transit at its own GR/IR value.
+  const confirmed = new Set((await tx.purchaseFxNonImsBillApproval.findMany({ where: { poId: params.poId }, select: { invoiceId: true } })).map((row) => row.invoiceId))
+  if (params.dryRun) for (const id of params.assumeConfirmedInvoiceIds ?? []) confirmed.add(id)
+  const billPosted = (invoiceId: string): boolean => confirmed.has(invoiceId) || billTransitKeys.some((key) => key.startsWith(`purchase-invoice:${invoiceId}:`))
   const billIds = new Set([...fxByBill.keys(), ...postedByBill.keys()])
   const result: PurchaseBillFxReconcileResult = { journals: [], notQueued: [], shadowed: [] }
   let accounts: { transit: string; realisedFx: string } | null = null
@@ -759,13 +765,14 @@ export async function reportPurchaseFxVarianceNotQueued(poId: string, poReferenc
  * nothing changes. Read in the event's transaction, under the order's row lock.
  */
 export async function purchaseFxOrderHasHistory(
-  tx: Pick<Prisma.TransactionClient, 'purchaseInvoice' | 'purchaseReceipt' | 'grirSubledgerMovement' | 'transitSubledgerMovement' | 'purchaseFxVarianceShadow'>,
+  tx: Pick<Prisma.TransactionClient, 'purchaseInvoice' | 'purchaseReceipt' | 'grirSubledgerMovement' | 'transitSubledgerMovement' | 'purchaseFxVarianceShadow' | 'purchaseFxNonImsBillApproval'>,
   poId: string,
 ): Promise<boolean> {
   if (await tx.purchaseInvoice.findFirst({ where: { poId, fxRateSource: { not: null } }, select: { id: true } })) return true
   if (await tx.purchaseReceipt.findFirst({ where: { poId, fxRateSource: { not: null } }, select: { id: true } })) return true
   if (await tx.grirSubledgerMovement.findFirst({ where: { poId, idempotencyKey: { startsWith: GRIR_KEY_PREFIX } }, select: { id: true } })) return true
   if (await tx.transitSubledgerMovement.findFirst({ where: { sourceType: 'PURCHASE_FX_VARIANCE', sourceRef: poId }, select: { id: true } })) return true
+  if (await tx.purchaseFxNonImsBillApproval.findFirst({ where: { poId }, select: { id: true } })) return true
   return Boolean(await tx.purchaseFxVarianceShadow.findFirst({ where: { poId }, select: { id: true } }))
 }
 
@@ -774,7 +781,7 @@ export async function purchaseFxOrderHasHistory(
  * Read-only.
  */
 export async function purchaseFxOrdersToReconcile(
-  client: Pick<Prisma.TransactionClient, 'purchaseInvoice' | 'purchaseReceipt' | 'costLayer' | 'grirSubledgerMovement' | 'transitSubledgerMovement' | 'purchaseFxVarianceShadow'>,
+  client: Pick<Prisma.TransactionClient, 'purchaseInvoice' | 'purchaseReceipt' | 'costLayer' | 'grirSubledgerMovement' | 'transitSubledgerMovement' | 'purchaseFxVarianceShadow' | 'purchaseFxNonImsBillApproval'>,
 ): Promise<string[]> {
   const ids = new Set<string>()
   for (const row of await client.purchaseInvoice.findMany({ where: { fxRateSource: { not: null } }, select: { poId: true } })) ids.add(row.poId)
@@ -785,6 +792,7 @@ export async function purchaseFxOrdersToReconcile(
   for (const row of await client.grirSubledgerMovement.findMany({ where: { idempotencyKey: { startsWith: GRIR_KEY_PREFIX } }, select: { poId: true }, distinct: ['poId'] })) ids.add(row.poId)
   for (const row of await client.transitSubledgerMovement.findMany({ where: { sourceType: 'PURCHASE_FX_VARIANCE' }, select: { sourceRef: true }, distinct: ['sourceRef'] })) ids.add(row.sourceRef)
   for (const row of await client.purchaseFxVarianceShadow.findMany({ select: { poId: true }, distinct: ['poId'] })) ids.add(row.poId)
+  for (const row of await client.purchaseFxNonImsBillApproval.findMany({ select: { poId: true }, distinct: ['poId'] })) ids.add(row.poId)
   return [...ids].sort()
 }
 
