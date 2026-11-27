@@ -227,7 +227,19 @@ test('a credit with no bill is valued at the exchange-rate table rate on its own
   assert.equal(after.fxEventRateToBase?.toString(), NOW_TABLE_RATE, 'the table rate on the day it is posted, not the 1.11 it was drafted at')
   close(Number(after.amountBase), 20, '25 at 1.25')
 
+  // #1157 MED-3: an order the switch never touched keeps today's rule (the stored rate), even with the switch on.
+  const untouched = await seedPo(5)
+  const plain = await s.db.supplierCreditNote.create({
+    data: { poId: untouched.id, supplierId, reference: untouched.reference, amountForeign: '25', amountBase: '22.5225', currency: CURRENCY, fxRateToBase: '1.11', status: 'DRAFT' },
+  })
+  assert.equal((await postCredit(plain.id)).success, true)
+  const plainAfter = await s.db.supplierCreditNote.findUniqueOrThrow({ where: { id: plain.id } })
+  assert.equal(plainAfter.fxRateSource, null, 'never touched: no table rate')
+  assert.equal(plainAfter.fxRateToBase.toString(), '1.11')
+
   const noRate = await seedPo(5, NO_RATE_CURRENCY)
+  // An order the switch has touched (here: a journal it settled as a shadow).
+  await s.db.purchaseFxVarianceShadow.create({ data: { poId: noRate.id, invoiceId: 'gone', idempotencyKey: `purchase-fx-variance:gone:${noRate.id}`, baseDelta: '0', journalDate: BILL_DATE } })
   const stuck = await s.db.supplierCreditNote.create({
     data: { poId: noRate.id, supplierId, reference: noRate.reference, amountForeign: '10', amountBase: '8', currency: NO_RATE_CURRENCY, fxRateToBase: '1.25', status: 'DRAFT' },
   })
@@ -437,4 +449,105 @@ test('the FX journal raised by the bill\'s own create or edit is dated on the bi
   assert.equal((logs[0]!.payload as { date: string }).date, BILL_DATE, 'the bill date, as the bill\'s own transit row')
   const transit = await s.db.transitSubledgerMovement.findFirstOrThrow({ where: { sourceType: 'PURCHASE_FX_VARIANCE', sourceRef: po.id } })
   assert.equal(transit.journalDate.toISOString().slice(0, 10), BILL_DATE)
+})
+
+// [mutation: split a return credit by the bill's overall proportion instead of per credited line (#1157 HIGH-1), or send the parts without exact amounts]
+test('HIGH-1 / MED-7 end to end: a two-line bill with uneven price differences, two return credits posted to Xero: each credit splits only its own line\'s PPV; GR/IR and transit net', async () => {
+  const { createPurchaseOrder } = await import('@/app/actions/purchase-orders')
+  const second = (await s.db.product.create({ data: { sku: 'PFR-2', name: 'PFR 2', type: 'SIMPLE' }, select: { id: true } })).id
+  const noVat = await s.db.taxRate.findFirstOrThrow({ where: { accountingTaxType: 'NONE' }, select: { id: true } })
+  await s.db.supplier.update({ where: { id: supplierId }, data: { taxRateId: noVat.id } })
+  const reference = `PFR-PO2-${++seq}-${Date.now()}`
+  const created = await createPurchaseOrder({
+    reference, supplierId, currency: 'GBP', destinationWarehouseId: warehouseId, pricesIncludeVat: false, taxRateValue: 0,
+    lines: [{ productId, sku: 'PFR-1', productName: 'PFR 1', qty: 10, unitCostForeign: 10 }, { productId: second, sku: 'PFR-2', productName: 'PFR 2', qty: 10, unitCostForeign: 10 }],
+  } as never)
+  assert.equal(created.success, true, String(created.error))
+  const row = await s.db.purchaseOrder.findUniqueOrThrow({ where: { reference }, select: { id: true, subtotalBase: true, totalBase: true, lines: { orderBy: { sortOrder: 'asc' }, select: { id: true, productId: true, totalBase: true } } } })
+  await s.db.purchaseOrder.update({ where: { id: row.id }, data: { status: 'PO_SENT', currency: CURRENCY, fxRateToBase: PO_RATE, subtotalForeign: row.subtotalBase.mul(PO_RATE).toFixed(4), totalForeign: row.totalBase.mul(PO_RATE).toFixed(4) } })
+  for (const line of row.lines) await s.db.purchaseOrderLine.update({ where: { id: line.id }, data: { unitCostForeign: '12.5', totalForeign: line.totalBase.mul(PO_RATE).toFixed(4) } })
+  const lineA = row.lines.find((l) => l.productId === productId)!.id
+  const lineB = row.lines.find((l) => l.productId === second)!.id
+  const po: Po = { id: row.id, lineId: lineA, reference }
+  await lockAt(po)
+  const { receivePurchaseOrder, createInvoice, returnPurchaseOrder } = await import('@/app/actions/purchase-orders')
+  assert.equal((await receivePurchaseOrder(po.id, [{ poLineId: lineA, qtyReceived: 10, warehouseId }, { poLineId: lineB, qtyReceived: 10, warehouseId }])).success, true)
+  // Line A at the PO cost (12.5), line B dearer (18.75: 6.25 a unit of price variance).
+  const billed = await createInvoice(po.id, { invoiceDate: BILL_DATE, invoiceNumber: `SUP-R2-${++seq}`, lines: [
+    { kind: 'product', poLineId: lineA, qtyBilled: 10, unitCostForeign: 12.5 }, { kind: 'product', poLineId: lineB, qtyBilled: 10, unitCostForeign: 18.75 },
+  ] } as never)
+  assert.equal(billed.success, true, String(billed.error))
+  close(Number((await billOf(po)).ppvBase), 39.0625, '62.5 foreign of price variance, all on line B, at 1.6')
+
+  const postLatest = async () => {
+    const credit = await s.db.supplierCreditNote.findFirstOrThrow({ where: { poId: po.id, status: 'DRAFT' } })
+    const posted = await withXeroPosting(() => postCredit(credit.id))
+    assert.equal(posted.success, true, String(posted.error))
+    const log = await s.db.accountingSyncLog.findFirstOrThrow({ where: { type: 'PURCHASE_CREDIT_NOTE', referenceId: credit.id }, select: { payload: true } })
+    const transit = await s.db.transitSubledgerMovement.findFirstOrThrow({ where: { sourceType: 'SUPPLIER_CREDIT_NOTE', sourceRef: credit.id } })
+    return { credit: await s.db.supplierCreditNote.findUniqueOrThrow({ where: { id: credit.id } }), payload: log.payload as { lines: Array<{ accountCode: string; unitAmount: number; lineAmount?: number; taxAmount?: number }>; lineAmountsIncludeTax: boolean }, transit: Number(transit.baseDelta) }
+  }
+
+  // Return 4 of line A (no price variance on it): the credit is all stock, on transit. The bill's overall share (62.5 / 250) would have moved 12.5 to PPV.
+  assert.equal((await returnPurchaseOrder(po.id, [{ poLineId: lineA, qtyReturned: 4, warehouseId }], 'damaged')).success, true)
+  const first = await postLatest()
+  close(Number(first.credit.amountForeign), 50, '4 x 12.5')
+  assert.deepEqual(first.payload.lines.map((l) => [l.accountCode, l.unitAmount]), [['631', 50]], 'one transit line: nothing to split')
+  close(first.transit, -31.25, 'transit credited with the whole credit (50 at 1.6)')
+  assert.equal(first.credit.ppvBase, null)
+
+  // Return 2 of line B: its credit (2 x 18.75 = 37.5) splits 25 stock / 12.5 price variance, exclusive with exact amounts.
+  assert.equal((await returnPurchaseOrder(po.id, [{ poLineId: lineB, qtyReturned: 2, warehouseId }], 'damaged')).success, true)
+  const secondCredit = await postLatest()
+  close(Number(secondCredit.credit.amountForeign), 37.5, 'the top-up for line B')
+  assert.deepEqual(secondCredit.payload.lines.map((l) => [l.accountCode, l.unitAmount, l.lineAmount, l.taxAmount]), [['631', 25, 25, 0], ['5050', 12.5, 12.5, 0]])
+  assert.equal(secondCredit.payload.lineAmountsIncludeTax, false)
+  close(Number(secondCredit.credit.ppvBase), 7.8125, '12.5 at 1.6')
+  close(secondCredit.transit, -15.625, 'transit gets back only the stock part (25 at 1.6), what the bill put there for 2 units')
+
+  const credited = await s.db.grirSubledgerMovement.findMany({ where: { poId: po.id, sourceType: 'SUPPLIER_CREDIT_NOTE' }, select: { poLineId: true, baseDelta: true } })
+  close(credited.filter((r) => r.poLineId === lineA).reduce((a, r) => a + Number(r.baseDelta), 0), 31.25, 'line A cleared at the bill\'s stock value (4 x 7.8125)')
+  close(credited.filter((r) => r.poLineId === lineB).reduce((a, r) => a + Number(r.baseDelta), 0), 15.625, 'line B likewise (2 x 7.8125)')
+  close((await balance(po)).toNumber(), 0, 'GR/IR nets to zero')
+  // Transit for the 6 returned units: the returns debited their goods (6 x 7.8125 = 46.875), the credits took back exactly that.
+  close(first.transit + secondCredit.transit, -46.875, 'transit nets to zero against the returns')
+})
+
+// [mutation: gate the bill create's reconciliation on the switch-on rate only (#1157 MED-2)]
+test('MED-2 (#1157): after a switch-off rollback, a bill at the PO rate for goods received under the switch is reconciled at once', async () => {
+  const po = await seedPo(10)
+  await lockAt(po)
+  assert.equal((await receive(po, 10)).success, true) // at the lock: 78.125
+  await setSettings({ purchase_event_fx_rates_enabled: 'false' })
+  try {
+    assert.equal((await bill(po, 10, 12.5)).success, true) // switch off: the PO rate, 100
+  } finally {
+    await setSettings({ purchase_event_fx_rates_enabled: 'true' })
+  }
+  assert.equal((await billOf(po)).fxRateSource, null)
+  close(await grir(po, 'BILL_FX_VARIANCE'), 100 - 78.125, 'the bill\'s FX difference against the lock-rate receipt')
+  close((await balance(po)).toNumber(), 0, 'GR/IR nets to zero')
+})
+
+// [mutation: post live the reversal of an amount that was settled as a shadow (#1157 LOW-2)]
+test('LOW-2 (#1157): taking back an amount settled as a shadow (the bill deleted) is settled as a shadow, never posted live', async () => {
+  const po = await seedPo(10)
+  assert.equal((await receive(po, 10)).success, true)
+  await lockAt(po)
+  assert.equal((await bill(po, 10, 12.5)).success, true)
+  const row = await billOf(po)
+  await markBillsPosted(po)
+  await s.db.purchaseFxVarianceShadow.create({ data: { poId: po.id, invoiceId: row.id, idempotencyKey: `purchase-fx-variance:${row.id}:shadow-test`, baseDelta: '21.88', journalDate: BILL_DATE } })
+  await s.db.purchaseInvoice.update({ where: { id: row.id }, data: { accountingInvoiceId: `XB-${row.id}`, accountingInvoiceConnector: 'xero' } })
+  await s.db.accountingDocumentDeletion.create({
+    data: {
+      kind: 'PURCHASE_INVOICE', referenceType: 'PurchaseInvoice', referenceId: row.id, documentId: row.id, externalDocumentId: `XB-${row.id}`,
+      originalNumber: row.invoiceNumber ?? '', releasedNumber: `${row.invoiceNumber}-released`, targetStatus: 'VOIDED', snapshot: { purchaseOrderId: po.id },
+    },
+  })
+  const { completeAccountingDocumentDeletion } = await import('@/lib/domain/accounting/document-delete-service')
+  await withXeroPosting(async () => assert.equal(await completeAccountingDocumentDeletion(`XB-${row.id}`), 'completed'))
+  assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id } }), 0, 'no live journal')
+  const shadows = await s.db.purchaseFxVarianceShadow.findMany({ where: { poId: po.id } })
+  close(shadows.reduce((a, r) => a + Number(r.baseDelta), 0), 0, 'the shadow is taken back as a shadow')
 })

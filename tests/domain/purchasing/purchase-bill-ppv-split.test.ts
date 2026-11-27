@@ -120,31 +120,70 @@ test('a return takes back the receipt valued at its own unit value first, then i
   assert.deepEqual(beyond, [], 'a return beyond the lots removes what there is')
 })
 
-// [mutation: split a credit by the whole bill instead of its goods lines, or split a bill that was not split]
-test('a return credit reversing a split bill: the price-variance fraction of the bill\'s goods lines', async () => {
-  const { creditPpvFractions } = await import('@/lib/domain/purchasing/purchase-bill-fx')
-  const split = creditPpvFractions([
-    { poLineId: 'p', qtyBilled: 10, totalForeign: '135', stockUnitForeign: '12.5' },
+// [mutation: split a credit by the whole bill's proportion instead of per credited line (#1157 HIGH-1)]
+test('a return credit\'s price variance is worked out per CREDITED line: quantity x (billed unit - stock unit)', async () => {
+  const { returnCreditPpvByLine } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  // Line A billed at the PO cost, line B 5 a unit dearer: returning 4 of A carries no price variance at all (the bill's overall share would give 1/5).
+  const billLines = [
+    { poLineId: 'A', qtyBilled: 10, totalForeign: '100', stockUnitForeign: '10' },
+    { poLineId: 'B', qtyBilled: 10, totalForeign: '150', stockUnitForeign: '10' },
     { poLineId: null, qtyBilled: 1, totalForeign: '50', stockUnitForeign: null },
-  ], 'EUR')
-  assert.equal(split.overall.toString(), D(10).div(135).toString(), '10 of the 135 billed for goods is price variance; the freight line is not in it')
-  assert.equal(split.byLine[1]!.toString(), '0')
-  assert.equal(creditPpvFractions([{ poLineId: 'p', qtyBilled: 10, totalForeign: '135', stockUnitForeign: null }], 'EUR').overall.toString(), '0', 'an unsplit bill: nothing')
+  ]
+  assert.deepEqual([...returnCreditPpvByLine({ allocation: new Map([['A', D(4)]]), billLines, currency: 'EUR' })], [])
+  const both = returnCreditPpvByLine({ allocation: new Map([['A', D(4)], ['B', D(2)]]), billLines, currency: 'EUR' })
+  assert.deepEqual([...both].map(([k, v]) => [k, v.toString()]), [['B', '10']], '2 x (15 - 10)')
 })
 
-// [mutation: put the whole credit on transit, or let the two lines not add up to the credit]
-test('the credit payload carries the stock part on transit and the price variance on the PPV account, adding up to the credit', async () => {
+// [mutation: tax the two parts by the inclusive split instead of exactly, or let them not add up to the credit]
+test('the one-line split: exact net and tax per part, adding up to the credit to the penny', async () => {
+  const { planCreditPpvSplit } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  const split = planCreditPpvSplit({ grossForeign: '120.01', taxRate: '0.2', ppvNetForeign: '10.005', currency: 'EUR' })
+  assert.equal(split.ppvNet.toString(), '10.01')
+  assert.equal(split.ppvTax.toString(), '2')
+  const total = split.stockNet.add(split.stockTax).add(split.ppvNet).add(split.ppvTax)
+  assert.equal(total.toString(), '120.01')
+  assert.equal(split.stockTax.add(split.ppvTax).toString(), '20', 'the VAT Xero takes out of 120.01 inclusive (20.0017 -> 20.00)')
+})
+
+// [mutation: put the whole credit on transit, or send the split parts without their exact amounts]
+test('the credit payload: stock part on transit and price variance on the PPV account, exclusive with exact LineAmount and TaxAmount', async () => {
   const { buildSupplierCreditNoteSyncPayload } = await import('@/lib/domain/purchasing/supplier-credit-note')
   const base = {
     creditNoteId: 'cn1', creditNoteNumber: null, reference: 'PO-1', reason: 'Supplier return', supplierName: 'S', supplierId: 's', currency: 'EUR',
     fxRateToBase: 1.6, amountForeign: 27, transitAccount: '631', taxType: 'NONE', date: '2026-11-27',
   }
-  const plain = buildSupplierCreditNoteSyncPayload(base) as { lines: Array<{ unitAmount: number; accountCode: string }> }
-  assert.deepEqual(plain.lines.map((l) => [l.accountCode, l.unitAmount]), [['631', 27]], 'no split: one transit line, as before')
-  const split = buildSupplierCreditNoteSyncPayload({ ...base, ppvSplit: { account: '5050', ppvAmount: 2 } }) as { lines: Array<{ unitAmount: number; accountCode: string; taxType: string }>; currencyRateToBase: number }
-  assert.deepEqual(split.lines.map((l) => [l.accountCode, l.unitAmount]), [['631', 25], ['5050', 2]])
+  const plain = buildSupplierCreditNoteSyncPayload(base) as { lines: Array<{ unitAmount: number; accountCode: string; lineAmount?: number }>; lineAmountsIncludeTax: boolean }
+  assert.deepEqual(plain.lines.map((l) => [l.accountCode, l.unitAmount, l.lineAmount]), [['631', 27, undefined]], 'no split: one transit line, as before')
+  assert.equal(plain.lineAmountsIncludeTax, true)
+  const split = buildSupplierCreditNoteSyncPayload({ ...base, ppvSplit: { account: '5050', single: { stockNet: 25, stockTax: 0, ppvNet: 2, ppvTax: 0 } } }) as {
+    lines: Array<{ unitAmount: number; accountCode: string; taxType: string; lineAmount?: number; taxAmount?: number }>; currencyRateToBase: number; lineAmountsIncludeTax: boolean
+  }
+  assert.deepEqual(split.lines.map((l) => [l.accountCode, l.unitAmount, l.lineAmount, l.taxAmount]), [['631', 25, 25, 0], ['5050', 2, 2, 0]])
   assert.ok(split.lines.every((l) => l.taxType === 'NONE'), 'the same tax treatment on both parts')
+  assert.equal(split.lineAmountsIncludeTax, false, 'exclusive: net plus tax per part')
   assert.equal(split.currencyRateToBase, 1.6)
+})
+
+// [mutation: leave a reverse-charge credit unsplit, or put its price variance on a line that was not returned (#1157 MED-1)]
+test('a reverse-charge plan: the returned line\'s plan line is split, the VAT of a standard part adds up to the line\'s own', async () => {
+  const { buildSupplierCreditNoteSyncPayload } = await import('@/lib/domain/purchasing/supplier-credit-note')
+  const payload = buildSupplierCreditNoteSyncPayload({
+    creditNoteId: 'cn2', creditNoteNumber: null, reference: 'PO-1', reason: 'Supplier return', supplierName: 'S', supplierId: 's', currency: 'EUR',
+    fxRateToBase: 1.6, amountForeign: 0, transitAccount: '631', taxType: undefined, date: '2026-11-27',
+    reverseChargePlan: {
+      lines: [
+        { net: 40, vat: 0, taxType: 'ECACQGOODS', reverseCharge: true, billLineIndex: 0 },
+        { net: 30, vat: 6, taxType: 'INPUT2', reverseCharge: false, billLineIndex: 1 },
+      ],
+      netTotal: 70, xeroTotal: 76,
+    },
+    ppvSplit: { account: '5050', plan: [null, { ppvNet: 10, ppvVat: 2, stockVat: 4 }] },
+  }) as { lines: Array<{ unitAmount: number; accountCode: string; lineAmount?: number; taxAmount?: number }> }
+  assert.deepEqual(payload.lines.map((l) => [l.accountCode, l.unitAmount, l.lineAmount, l.taxAmount]), [
+    ['631', 40, undefined, undefined],
+    ['631', 20, 20, 4],
+    ['5050', 10, 10, 2],
+  ])
 })
 
 // [mutation: drop the >4dp quantity guard on a split line]

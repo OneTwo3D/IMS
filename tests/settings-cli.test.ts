@@ -283,12 +283,12 @@ test('purchase_event_fx_rates_enabled: off by default and ADMIN; its account key
   const reader = (value: string | null) => ({ setting: { findUnique: async () => (value === null ? null : { value }) } })
   assert.equal(await isPurchaseEventFxEnabled(reader(null)), false)
   for (const off of ['false', 'TRUE', '1', ' true']) assert.equal(await isPurchaseEventFxEnabled(reader(off)), false, off)
-  // The interlock applies on READ too: a build before the last step reads off even when stored 'true'. Step 3b installed it, so 'true' now reads on.
-  assert.equal(await isPurchaseEventFxEnabled(reader('true')), true, 'interlock complete: on only for the exact string true')
+  // The interlock applies on READ too: while the last step is not installed the switch reads off even when stored 'true'.
+  assert.equal(await isPurchaseEventFxEnabled(reader('true')), false, 'interlock not complete: off')
   const { setPurchaseEventFxStepsCompleteForTests } = await import('../lib/domain/purchasing/purchase-event-fx-settings')
-  setPurchaseEventFxStepsCompleteForTests(false)
+  setPurchaseEventFxStepsCompleteForTests(true)
   try {
-    assert.equal(await isPurchaseEventFxEnabled(reader('true')), false, 'interlock not complete: off')
+    assert.equal(await isPurchaseEventFxEnabled(reader('true')), true)
   } finally {
     setPurchaseEventFxStepsCompleteForTests(null)
   }
@@ -296,7 +296,7 @@ test('purchase_event_fx_rates_enabled: off by default and ADMIN; its account key
 
 const FX_ON = ['--key', 'purchase_event_fx_rates_enabled', '--value', 'true', ...SET, '--yes', '--confirm-admin']
 
-/** The interlock (LOW-18): the account/mapping rules below are proved with it open, on the real definition (step 3b installed it), restored after. */
+/** The interlock (LOW-18) is on until step 3 installs the bill side; the account/mapping rules below are proved with it opened, on the real definition, restored after. */
 async function withStepsInstalled<T>(fn: () => Promise<T>): Promise<T> {
   const def = findSwitch('purchase_event_fx_rates_enabled')! as { turnOnBlockedUntil?: { installed: boolean; why: string } }
   const before = def.turnOnBlockedUntil
@@ -304,33 +304,21 @@ async function withStepsInstalled<T>(fn: () => Promise<T>): Promise<T> {
   try { return await fn() } finally { def.turnOnBlockedUntil = before }
 }
 
-test('purchase_event_fx_rates_enabled: INTERLOCK (LOW-18): installed by step 3b; while a build lacks it, turning on is refused however well mapped, and off is never refused (MUTATION: drop the check => red)', async () => {
+test('purchase_event_fx_rates_enabled: INTERLOCK (LOW-18): turning it on is refused until step 3 is installed, however well mapped; turning it off is never refused (MUTATION: drop the check or flip the constant => red)', async () => {
   const { PURCHASE_EVENT_FX_STEPS_COMPLETE } = await import('../lib/domain/settings/system-switches')
-  assert.equal(PURCHASE_EVENT_FX_STEPS_COMPLETE, true, 'step 3b (returns and supplier credit notes) installed the last part')
-  const def = findSwitch('purchase_event_fx_rates_enabled')! as { turnOnBlockedUntil?: { installed: boolean; why: string } }
-  assert.equal(def.turnOnBlockedUntil?.installed, true, 'the definition reads the constant')
-  const before = def.turnOnBlockedUntil
-  def.turnOnBlockedUntil = { installed: false, why: before?.why ?? '' }
-  try {
-    const mapped = fakeDb({ xero_sync_enabled: 'true', xero_realised_fx_gain_loss_account: '499', xero_purchase_price_variance_account: '510' })
-    for (const argv of [FX_ON.slice(0, -2), FX_ON]) {
-      const r = await run('set', argv, mapped)
-      assert.equal(r.code, 3, r.out)
-      assert.match(r.err, /cannot be turned on yet: the last part of step 3 of the per-event purchase FX work/)
-    }
-    assert.equal(mapped.settings.get('purchase_event_fx_rates_enabled'), undefined)
-    assert.equal(mapped.audits.length, 0)
-    const syncOff = fakeDb({ xero_sync_enabled: 'false' })
-    assert.equal((await run('set', FX_ON, syncOff)).code, 3, 'not only while Xero sync is on')
-    const on = fakeDb({ purchase_event_fx_rates_enabled: 'true' })
-    assert.equal((await run('set', ['--key', 'purchase_event_fx_rates_enabled', '--value', 'false', ...SET, '--yes', '--confirm-admin'], on)).code, 0)
-  } finally {
-    def.turnOnBlockedUntil = before
-  }
-  // Installed: a mapped install turns it on (the owner's go is the only thing left).
+  assert.equal(PURCHASE_EVENT_FX_STEPS_COMPLETE, false, 'step 3 flips this to true; until then the switch cannot be turned on')
   const mapped = fakeDb({ xero_sync_enabled: 'true', xero_realised_fx_gain_loss_account: '499', xero_purchase_price_variance_account: '510' })
-  assert.equal((await run('set', FX_ON, mapped)).code, 0)
-  assert.equal(mapped.settings.get('purchase_event_fx_rates_enabled')!.value, 'true')
+  for (const argv of [FX_ON.slice(0, -2), FX_ON]) {
+    const r = await run('set', argv, mapped)
+    assert.equal(r.code, 3, r.out)
+    assert.match(r.err, /cannot be turned on yet: the last part of step 3 of the per-event purchase FX work/)
+  }
+  assert.equal(mapped.settings.get('purchase_event_fx_rates_enabled'), undefined)
+  assert.equal(mapped.audits.length, 0)
+  const syncOff = fakeDb({ xero_sync_enabled: 'false' })
+  assert.equal((await run('set', FX_ON, syncOff)).code, 3, 'not only while Xero sync is on')
+  const on = fakeDb({ purchase_event_fx_rates_enabled: 'true' })
+  assert.equal((await run('set', ['--key', 'purchase_event_fx_rates_enabled', '--value', 'false', ...SET, '--yes', '--confirm-admin'], on)).code, 0)
 })
 
 test('purchase_event_fx_rates_enabled: refused on while Xero sync is on and the realised FX or PPV account is unmapped, in the dry run and with --yes; nothing is written (MUTATION: drop the check => red)', () => withStepsInstalled(async () => {

@@ -352,27 +352,7 @@ export async function recordGrirReturnCreditNote(
   },
 ): Promise<void> {
   const valuation = await loadGrirPoValuation(client, input.poId)
-  const lines = await client.purchaseOrderLine.findMany({ where: { poId: input.poId }, select: { id: true, qtyReturned: true } })
-  const history = await client.grirSubledgerMovement.groupBy({
-    by: ['poLineId', 'sourceType'],
-    where: { poId: input.poId, poLineId: { not: null }, sourceType: { in: [...GRIR_BALANCE_SOURCE_TYPES] } },
-    _sum: { qtyDelta: true },
-  })
-  const netQty = new Map<string, Decimal>()
-  const creditedQty = new Map<string, Decimal>()
-  for (const row of history) {
-    if (!row.poLineId) continue
-    const qty = toDecimal(row._sum.qtyDelta)
-    netQty.set(row.poLineId, (netQty.get(row.poLineId) ?? new Prisma.Decimal(0)).add(qty))
-    if (row.sourceType === 'SUPPLIER_CREDIT_NOTE') creditedQty.set(row.poLineId, (creditedQty.get(row.poLineId) ?? new Prisma.Decimal(0)).add(qty))
-  }
-  const billedUnit = await loadBilledUnitBaseByLine(client, lines.map((line) => line.id))
-  const allocation = allocateReturnCredit(lines.map((line) => ({
-    id: line.id,
-    billedNotReceived: Prisma.Decimal.max(0, (netQty.get(line.id) ?? new Prisma.Decimal(0)).neg()),
-    returnedNotCredited: toDecimal(line.qtyReturned).sub(creditedQty.get(line.id) ?? 0),
-    billedUnitBase: billedUnit.get(line.id) ?? new Prisma.Decimal(0),
-  })), input.netBase)
+  const allocation = await returnCreditAllocation(client, input.poId, input.netBase)
   let poValued = new Prisma.Decimal(0)
   for (const [lineId, qty] of allocation) {
     const value = roundQuantity(qty.mul(input.unitBaseByLine?.get(lineId) ?? unitCostFor(valuation, lineId)), 6)
@@ -402,6 +382,39 @@ export async function recordGrirReturnCreditNote(
     journalDate: input.journalDate,
     occurredAt: input.at,
   })
+}
+
+/**
+ * The quantity a return credit of `netBase` clears per order line (`allocateReturnCredit` over the order's GR/IR history): what the GR/IR row above
+ * writes, and (step 3b) what the credit's price-variance split is worked out from, so the two cannot disagree. Read-only.
+ */
+export async function returnCreditAllocation(
+  client: Pick<Prisma.TransactionClient, 'grirSubledgerMovement' | 'purchaseOrderLine' | 'purchaseInvoiceLine'>,
+  poId: string,
+  netBase: DecimalInput,
+): Promise<Map<string, Decimal>> {
+  const input = { poId, netBase }
+  const lines = await client.purchaseOrderLine.findMany({ where: { poId: input.poId }, select: { id: true, qtyReturned: true } })
+  const history = await client.grirSubledgerMovement.groupBy({
+    by: ['poLineId', 'sourceType'],
+    where: { poId: input.poId, poLineId: { not: null }, sourceType: { in: [...GRIR_BALANCE_SOURCE_TYPES] } },
+    _sum: { qtyDelta: true },
+  })
+  const netQty = new Map<string, Decimal>()
+  const creditedQty = new Map<string, Decimal>()
+  for (const row of history) {
+    if (!row.poLineId) continue
+    const qty = toDecimal(row._sum.qtyDelta)
+    netQty.set(row.poLineId, (netQty.get(row.poLineId) ?? new Prisma.Decimal(0)).add(qty))
+    if (row.sourceType === 'SUPPLIER_CREDIT_NOTE') creditedQty.set(row.poLineId, (creditedQty.get(row.poLineId) ?? new Prisma.Decimal(0)).add(qty))
+  }
+  const billedUnit = await loadBilledUnitBaseByLine(client, lines.map((line) => line.id))
+  return allocateReturnCredit(lines.map((line) => ({
+    id: line.id,
+    billedNotReceived: Prisma.Decimal.max(0, (netQty.get(line.id) ?? new Prisma.Decimal(0)).neg()),
+    returnedNotCredited: toDecimal(line.qtyReturned).sub(creditedQty.get(line.id) ?? 0),
+    billedUnitBase: billedUnit.get(line.id) ?? new Prisma.Decimal(0),
+  })), input.netBase)
 }
 
 /** The open GR/IR balance (credit-positive) up to and including `asOf`, optionally for one order. */

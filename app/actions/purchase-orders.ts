@@ -74,10 +74,10 @@ import {
 import { getBaseCurrencyCode, resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { cancelPurchaseOrderAction } from '@/lib/domain/purchasing/cancel-purchase-order-action'
 import { resolvePurchaseOrderFxRateToBase } from '@/lib/domain/purchasing/purchase-order-fx'
-import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_INEXACT_MESSAGE, SupplierCreditNoteEnqueueDeclined, planReverseChargeSupplierCredit, billNetPayable } from '@/lib/domain/purchasing/supplier-credit-note'
+import { validateRecordSupplierCreditNote, buildSupplierCreditNoteSyncPayload, resolveSupplierCreditNoteTaxType, resolveSupplierCreditNoteTransitBase, SUPPLIER_CREDIT_NOTE_MIXED_VAT_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_EXCEEDS_MESSAGE, SUPPLIER_CREDIT_NOTE_REVERSE_CHARGE_INEXACT_MESSAGE, SupplierCreditNoteEnqueueDeclined, SupplierCreditNoteChangedWhilePosting, planReverseChargeSupplierCredit, billNetPayable } from '@/lib/domain/purchasing/supplier-credit-note'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { receiptJournalAmount } from '@/lib/domain/accounting/receipt-journal-amount'
-import { recordGrirBill, recordGrirBillEdit, recordGrirReceipt, recordGrirReturnCreditNote, recordGrirSupplierReturn, returnGoodsValueByLine } from '@/lib/domain/accounting/grir-subledger-movement'
+import { recordGrirBill, recordGrirBillEdit, recordGrirReceipt, recordGrirReturnCreditNote, recordGrirSupplierReturn, returnCreditAllocation, returnGoodsValueByLine } from '@/lib/domain/accounting/grir-subledger-movement'
 import { settlementStatus, type PaymentSyncRow, type SettlementVerdict } from '@/lib/domain/accounting/settlement-status'
 import { readPayloadRegisteredAmount } from '@/lib/domain/accounting/registered-amount'
 import {
@@ -146,7 +146,7 @@ import {
   type OnDemandPrepaymentResult, type PrepaymentChecks,
 } from '@/lib/domain/purchasing/purchase-receipt-fx'
 import {
-  billCreditRate, billIsFxManaged, creditPpvFractions, markPurchaseFxLockUsedByBill, purchaseFxOrderHasHistory, resolveNoBillCreditFxRate, purchasePriceVarianceAccount, reconcilePurchaseBillFx, reportPurchaseFxVarianceNotQueued, resolveBillFxRate, sameBillFxRate,
+  billCreditRate, billIsFxManaged, markPurchaseFxLockUsedByBill, planCreditPpvSplit, returnCreditPpvByLine, purchaseFxOrderHasHistory, resolveNoBillCreditFxRate, purchasePriceVarianceAccount, reconcilePurchaseBillFx, reportPurchaseFxVarianceNotQueued, resolveBillFxRate, sameBillFxRate,
   stockUnitsForeign, NO_BILL_FX_RECONCILE, type PurchaseBillFxReconcileResult,
 } from '@/lib/domain/purchasing/purchase-bill-fx'
 import {
@@ -4700,7 +4700,8 @@ export async function createInvoice(
         }
       }
       // Per-event FX: the bill's GR/IR rows and, where its rate differs from its receipts', the FX-difference journal (after the bill, in its transaction).
-      if (billFx) {
+      // #1157 MED-2: also after a switch-off rollback, for an order whose bills or receipts the switch still manages (this bill is then at the PO rate).
+      if (billFx || await purchaseFxOrderHasHistory(tx, poId)) {
         billFxReconcile.result = await reconcilePurchaseBillFx(tx, { poId, connector: accountingSettings.connector, syncEnabled: accountingSettings.syncEnabled, at: new Date(), billEventInvoiceId: createdInvoice.id })
       }
     }, STOCK_TX_OPTIONS)
@@ -5328,7 +5329,8 @@ export async function updateInvoice(
         },
       })
       // Per-event FX: the edited bill's GR/IR rows and FX-difference journal, adjusted to what the bill now is.
-      if (billFxManaged) {
+      // #1157 MED-2: also an unmanaged bill's edit on an order the switch manages (a switch-off rollback, or a bill from before the switch).
+      if (billFxManaged || await purchaseFxOrderHasHistory(tx, invoice.poId)) {
         billFxReconcile.result = await reconcilePurchaseBillFx(tx, { poId: invoice.poId, connector: accountingSettings.connector, syncEnabled: accountingSettings.syncEnabled, at: new Date(), billEventInvoiceId: invoice.id })
       }
     }, STOCK_TX_OPTIONS)
@@ -6240,32 +6242,52 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       }
     }
     // THE PRICE-VARIANCE PART. A bill valued under the switch put each goods line's stock part on transit and the rest on the PPV account; its RETURN
-    // credit (the supplier taking back billed goods) is split the same way, so transit and the PPV account each get back what the bill put there. A
-    // credit against a reverse-charge bill keeps its per-line plan (the VAT each line self-accounts must stay exact) and is not split: its price
-    // variance part stays on transit, and a WARNING says so. A manual credit (an allowance, a freight credit) is coded to transit as before.
+    // credit (the supplier taking back billed goods) is split the same way, so transit and the PPV account each get back what the bill put there; a
+    // credit against a reverse-charge bill is split inside its per-line plan. A manual credit (an allowance, a freight credit) is coded to transit as before.
     const creditBill = cn.purchaseInvoice
-    const creditPpv = cn.isReturnGenerated && creditBill && billIsFxManaged(creditBill)
-      ? creditPpvFractions(creditBill.lines, cn.currency).overall
-      : new Prisma.Decimal(0)
-    const splitCreditPpv = creditPpv.gt(0) || creditPpv.lt(0)
-    const creditPpvAccount = splitCreditPpv && shouldQueueXero && !reverseChargePlan ? await purchasePriceVarianceAccount(db) : ''
-    if (splitCreditPpv && shouldQueueXero && !reverseChargePlan && !creditPpvAccount) {
+    // The credit's NET in base currency: ONE computation, the figure the transit row carries as well as the GR/IR row (worked out before the
+    // transaction because the price-variance split below is derived from the GR/IR allocation of exactly this figure).
+    const creditNetBase = reverseChargePlan ? supplierCreditNoteAmountBase(reverseChargePlan.netTotal, creditRate).toNumber() : resolveSupplierCreditNoteTransitBase({
+      grossBase: supplierCreditNoteAmountBase(cn.amountForeign, creditRate).toNumber(),
+      billSubtotalForeign: Number(cn.purchaseInvoice?.subtotalForeign ?? 0),
+      billTaxForeign: Number(cn.purchaseInvoice?.taxForeign ?? 0),
+    })
+    // #1157 HIGH-1 / MED-1: the price-variance part is worked out PER CREDITED LINE (the quantity the GR/IR allocation clears on it x the bill's price
+    // difference on it), never from the bill's overall proportion. A one-line credit becomes a stock line and a PPV line with exact amounts and tax; a
+    // reverse-charge plan has the price-variance part of each credited line split off its own plan line. Re-checked under the locks (below).
+    const creditSplitApplies = cn.isReturnGenerated && Boolean(creditBill && billIsFxManaged(creditBill))
+    const creditAllocation = creditSplitApplies ? await returnCreditAllocation(db, cn.poId, creditNetBase) : new Map<string, Prisma.Decimal>()
+    const creditPpvByLine = creditSplitApplies && creditBill ? returnCreditPpvByLine({ allocation: creditAllocation, billLines: creditBill.lines, currency: cn.currency }) : new Map<string, Prisma.Decimal>()
+    const creditPpvNetForeign = [...creditPpvByLine.values()].reduce((sum, v) => sum.add(v), new Prisma.Decimal(0))
+    const splitCreditPpv = shouldQueueXero && !creditPpvNetForeign.isZero()
+    const creditPpvAccount = splitCreditPpv ? await purchasePriceVarianceAccount(db) : ''
+    if (splitCreditPpv && !creditPpvAccount) {
       return { success: false, error: withLedgerCheck('The credit note was NOT posted (it is still a draft): it reverses a bill whose price difference went to the purchase price variance account, and that account (xero_purchase_price_variance_account) is not mapped. Map it under Sync > Accounting settings, then post again.') }
     }
-    const creditPpvGrossForeign = creditPpvAccount ? roundMoney(toDecimal(cn.amountForeign).mul(creditPpv), cn.currency) : null
-    if (splitCreditPpv && shouldQueueXero && reverseChargePlan) {
-      await logActivity({
-        entityType: 'PURCHASE_ORDER',
-        entityId: cn.poId,
-        action: 'supplier_credit_note_ppv_not_split',
-        tag: 'accounting',
-        level: 'WARNING',
-        description: withLedgerCheck(`Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference} reverses a bill whose price difference went to the purchase price `
-          + 'variance account, but the bill has reverse-charge lines, so the credit keeps its per-line plan and is coded to Stock in Transit in full. The price-variance part of the '
-          + 'credit is left on Stock in Transit: move it to the purchase price variance account by journal.'),
-        metadata: { creditNoteId: cn.id, reference: cn.po.reference, ppvFraction: creditPpv.toString() },
-      }).catch(() => { /* the post itself is unaffected */ })
+    let creditPpvSplit: Parameters<typeof buildSupplierCreditNoteSyncPayload>[0]['ppvSplit'] | undefined
+    if (splitCreditPpv && creditBill) {
+      if (reverseChargePlan) {
+        const plan: Array<{ ppvNet: number; stockVat: number; ppvVat: number } | null> = reverseChargePlan.lines.map(() => null)
+        for (const [poLineId, ppv] of creditPpvByLine) {
+          const at = reverseChargePlan.lines.findIndex((l) => creditBill.lines[l.billLineIndex]?.poLineId === poLineId)
+          if (at < 0) {
+            return { success: false, error: withLedgerCheck('The credit note was NOT posted (it is still a draft): it reverses a bill whose price difference went to the purchase price variance account, and the credit\'s split across the bill\'s reverse-charge lines gives nothing to the returned line, so IMS cannot put the price-variance part on that line\'s tax treatment. Nothing was sent.') }
+          }
+          const line = reverseChargePlan.lines[at]!
+          const rate = toDecimal(billTreatments[line.billLineIndex]?.rate ?? 0)
+          const ppvNet = toDecimal(plan[at]?.ppvNet ?? 0).add(ppv)
+          const ppvVat = line.reverseCharge ? new Prisma.Decimal(0) : roundMoney(ppvNet.mul(rate), cn.currency)
+          plan[at] = { ppvNet: ppvNet.toNumber(), ppvVat: ppvVat.toNumber(), stockVat: toDecimal(line.vat).sub(ppvVat).toNumber() }
+        }
+        creditPpvSplit = { account: creditPpvAccount, plan }
+      } else {
+        const goodsRate = billTreatments.find((t, i) => creditBill.lines[i]?.poLineId)?.rate ?? 0
+        const single = planCreditPpvSplit({ grossForeign: cn.amountForeign, taxRate: goodsRate, ppvNetForeign: creditPpvNetForeign, currency: cn.currency })
+        creditPpvSplit = { account: creditPpvAccount, single: { stockNet: single.stockNet.toNumber(), stockTax: single.stockTax.toNumber(), ppvNet: single.ppvNet.toNumber(), ppvTax: single.ppvTax.toNumber() } }
+      }
     }
+    // The price-variance part in base (what the PPV line takes off transit).
+    const creditPpvBase = splitCreditPpv ? roundQuantity(creditPpvNetForeign.div(creditRate), 4) : null
     const creditNotePayload = shouldQueueXero ? buildSupplierCreditNoteSyncPayload({
       creditNoteId: cn.id,
       creditNoteNumber: cn.creditNoteNumber,
@@ -6277,7 +6299,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       fxRateToBase: creditRate.toNumber(),
       amountForeign: Number(cn.amountForeign),
       transitAccount: settings.transitAccount,
-      ...(creditPpvAccount && creditPpvGrossForeign ? { ppvSplit: { account: creditPpvAccount, ppvAmount: creditPpvGrossForeign.toNumber() } } : {}),
+      ...(creditPpvSplit ? { ppvSplit: creditPpvSplit } : {}),
       taxType: creditNoteTaxType,
       // The rate that code was read from and how (lib/accounting/reverse-charge.ts): bound only when the type IS that rate's derivation (a purchase goods line, else its own code); a NONE or mixed-bill type that is neither stays unbound.
       // The rate the code was read from (the bill line's booked rate id): bound on the goods-line basis for a reverse-charge credit, plain otherwise.
@@ -6346,15 +6368,20 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       // GR/IR accrual: a return-generated credit note is the supplier crediting back goods that were billed and then returned, which lifts the
       // debit the return left on GR/IR. Its NET is the figure its transit row carries. Recorded with the claim, whether or not the Xero posting is on.
       // The credit's NET in base currency: ONE computation, the figure the transit row below carries as well as the GR/IR row.
-      const creditNetBase = reverseChargePlan ? supplierCreditNoteAmountBase(reverseChargePlan.netTotal, creditRate).toNumber() : resolveSupplierCreditNoteTransitBase({
-        grossBase: supplierCreditNoteAmountBase(cn.amountForeign, creditRate).toNumber(),
-        billSubtotalForeign: Number(cn.purchaseInvoice?.subtotalForeign ?? 0),
-        billTaxForeign: Number(cn.purchaseInvoice?.taxForeign ?? 0),
-      })
-      // Per-event FX (step 3b): the price-variance part of a split credit, in base (the share of its net the PPV line carries).
-      const creditPpvBase = creditPpvAccount && creditPpvGrossForeign && Number(cn.amountForeign) > 0
-        ? roundQuantity(toDecimal(creditNetBase).mul(creditPpvGrossForeign).div(toDecimal(cn.amountForeign)), 4)
-        : null
+      // #1157 LOW-4: the bill and the allocation the split was worked out from are read again under the locks; a bill edited, or another credit or
+      // return committed, in between refuses the post (nothing is claimed: the credit stays a draft, and posting again works it out afresh).
+      if (creditSplitApplies && cn.purchaseInvoiceId) {
+        const locked = await tx.purchaseInvoice.findUnique({
+          where: { id: cn.purchaseInvoiceId },
+          select: { fxRateSource: true, fxEventRateToBase: true, lines: { select: { poLineId: true, qtyBilled: true, totalForeign: true, stockUnitForeign: true } } },
+        })
+        const sameBill = locked && String(locked.fxRateSource) === String(creditBill?.fxRateSource) && String(locked.fxEventRateToBase) === String(creditBill?.fxEventRateToBase)
+          && JSON.stringify(locked.lines.map((l) => [l.poLineId, String(l.qtyBilled), String(l.totalForeign), String(l.stockUnitForeign)]).sort())
+            === JSON.stringify((creditBill?.lines ?? []).map((l) => [l.poLineId, String(l.qtyBilled), String(l.totalForeign), String(l.stockUnitForeign)]).sort())
+        const lockedAllocation = await returnCreditAllocation(tx, cn.poId, creditNetBase)
+        const sameAllocation = JSON.stringify([...lockedAllocation].map(([k, v]) => [k, v.toString()]).sort()) === JSON.stringify([...creditAllocation].map(([k, v]) => [k, v.toString()]).sort())
+        if (!sameBill || !sameAllocation) throw new SupplierCreditNoteChangedWhilePosting(cn.id)
+      }
       if (creditPpvBase) await tx.supplierCreditNote.update({ where: { id: cn.id }, data: { ppvBase: creditPpvBase } })
       if (cn.isReturnGenerated) {
         // Per-event FX (step 3b): a credit reversing a bill valued under the switch clears GR/IR at THAT bill's stock value per unit (what the bill
@@ -6444,6 +6471,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
       posted = await postSupplierCreditNoteTransaction()
     } catch (declined) {
       if (declined instanceof PendingDocumentDeletionError) return { success: false, error: declined.message }
+      if (declined instanceof SupplierCreditNoteChangedWhilePosting) return { success: false, error: declined.message }
       if (!(declined instanceof SupplierCreditNoteEnqueueDeclined)) throw declined
       await logActivity({
         entityType: 'PURCHASE_ORDER',

@@ -190,13 +190,15 @@ export function billCreditRate(bill: { fxRateToBase: DecimalInput; fxRateSource:
 
 /**
  * A CREDIT WITH NO BILL (owner ruling 4): valued at the fx_rates rate in force at the end of its own date, refused when there is none. Null while the
- * switch is off or for a base-currency order (the caller keeps its old rule). Read on the caller's client.
+ * switch is off, for a base-currency order, or for an order the switch never touched (the caller keeps its old rule). Read on the caller's client.
  */
 export async function resolveNoBillCreditFxRate(
-  client: Pick<Prisma.TransactionClient, 'setting' | 'purchaseOrder' | 'organisation' | 'fxRate'>,
+  client: Pick<Prisma.TransactionClient, 'setting' | 'purchaseOrder' | 'organisation' | 'fxRate' | 'purchaseInvoice' | 'purchaseReceipt' | 'grirSubledgerMovement' | 'transitSubledgerMovement' | 'purchaseFxVarianceShadow'>,
   params: { poId: string; creditDate: string },
 ): Promise<{ rateToBase: Prisma.Decimal; storedRateToBase: Prisma.Decimal; columns: { fxRateSource: string; fxEventRateToBase: Prisma.Decimal } } | null> {
   if (!(await isPurchaseEventFxEnabled(client))) return null
+  // #1157 MED-3: only for an order the switch has touched (a bill, receipt or row valued under it); an order it never touched keeps today's rule.
+  if (!(await purchaseFxOrderHasHistory(client, params.poId))) return null
   const po = await client.purchaseOrder.findUnique({ where: { id: params.poId }, select: { reference: true, currency: true } })
   if (!po) throw new Error(`Purchase order ${params.poId} not found`)
   const baseCurrency = (await resolveBaseCurrencyCode({ organisation: client.organisation })).toUpperCase()
@@ -220,25 +222,49 @@ export async function resolveNoBillCreditFxRate(
 }
 
 /**
- * THE PRICE-VARIANCE PART OF A RETURN CREDIT reversing a bill valued under the switch: that bill put each goods line's stock part on transit at the PO
- * goods cost and the rest on the PPV account, so its credit is split the same way, in the proportion of the bill's goods lines (stock / billed). The
- * fraction of the credit that is price variance, per bill line (index = the bill line), and over all goods lines. 0 = nothing to split.
+ * THE PRICE-VARIANCE PART OF A RETURN CREDIT reversing a bill valued under the switch (#1157 HIGH-1): per CREDITED order line, the quantity the credit
+ * clears there (`returnCreditAllocation`, the same allocation its GR/IR row uses) x (the bill's unit price for the line - the stock unit it put on
+ * transit), rounded to the currency. Never the bill's overall proportion: a bill whose lines carry uneven price differences would otherwise move PPV
+ * that the returned line never had. Only non-zero lines are returned (order line id -> net foreign). Pure; exported for tests.
  */
-export function creditPpvFractions(
-  lines: ReadonlyArray<{ poLineId: string | null; qtyBilled: DecimalInput; totalForeign: DecimalInput; stockUnitForeign: DecimalInput | null }>,
-  currency: string,
-): { byLine: Decimal[]; overall: Decimal } {
-  let stock = zero()
-  let billed = zero()
-  const byLine = lines.map((line) => {
-    const total = toDecimal(line.totalForeign)
-    if (!line.poLineId || line.stockUnitForeign === null || !total.gt(0)) return zero()
-    const lineStock = roundMoney(toDecimal(line.qtyBilled).mul(toDecimal(line.stockUnitForeign)), currency)
-    stock = stock.add(lineStock)
-    billed = billed.add(total)
-    return total.sub(lineStock).div(total)
-  })
-  return { byLine, overall: billed.gt(0) ? billed.sub(stock).div(billed) : zero() }
+export function returnCreditPpvByLine(params: {
+  allocation: ReadonlyMap<string, Decimal>
+  billLines: ReadonlyArray<{ poLineId: string | null; qtyBilled: DecimalInput; totalForeign: DecimalInput; stockUnitForeign: DecimalInput | null }>
+  currency: string
+}): Map<string, Decimal> {
+  const perLine = new Map<string, { qty: Decimal; total: Decimal; stockUnit: Decimal }>()
+  for (const line of params.billLines) {
+    if (!line.poLineId || line.stockUnitForeign === null) continue
+    const entry = perLine.get(line.poLineId) ?? { qty: zero(), total: zero(), stockUnit: toDecimal(line.stockUnitForeign) }
+    entry.qty = entry.qty.add(toDecimal(line.qtyBilled))
+    entry.total = entry.total.add(toDecimal(line.totalForeign))
+    perLine.set(line.poLineId, entry)
+  }
+  const out = new Map<string, Decimal>()
+  for (const [poLineId, qty] of params.allocation) {
+    const line = perLine.get(poLineId)
+    if (!line || !line.qty.gt(0) || !qty.gt(0)) continue
+    const ppv = roundMoney(qty.mul(line.total.div(line.qty).sub(line.stockUnit)), params.currency)
+    if (!ppv.isZero()) out.set(poLineId, ppv)
+  }
+  return out
+}
+
+/**
+ * The split of a one-line (non reverse-charge) credit of `grossForeign`, tax-inclusive at `taxRate`, into its stock part and its price-variance part
+ * `ppvNetForeign`, each with an exact net and tax (sent as LineAmount and TaxAmount, exclusive, as a split bill is): the tax of the whole is what Xero
+ * would take out of the inclusive amount (`round(gross x r / (1 + r))`), the PPV part is taxed on its own and the stock part takes the rest, so the two
+ * lines add up to the credit to the penny, tax included. Pure; exported for tests.
+ */
+export function planCreditPpvSplit(params: { grossForeign: DecimalInput; taxRate: DecimalInput; ppvNetForeign: DecimalInput; currency: string }): {
+  stockNet: Decimal; stockTax: Decimal; ppvNet: Decimal; ppvTax: Decimal
+} {
+  const gross = roundMoney(toDecimal(params.grossForeign), params.currency)
+  const rate = toDecimal(params.taxRate)
+  const tax = roundMoney(gross.mul(rate).div(rate.add(1)), params.currency)
+  const ppvNet = roundMoney(toDecimal(params.ppvNetForeign), params.currency)
+  const ppvTax = roundMoney(ppvNet.mul(rate), params.currency)
+  return { stockNet: gross.sub(tax).sub(ppvNet), stockTax: tax.sub(ppvTax), ppvNet, ppvTax }
 }
 
 // ─── THE MATCHING (pure) ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -598,6 +624,13 @@ export async function reconcilePurchaseBillFx(
   }
   for (const row of transitRows) count(row.idempotencyKey.slice(JOURNAL_KEY_PREFIX.length).split(':')[0]!, row.baseDelta)
   for (const row of shadowRows) count(row.invoiceId, row.baseDelta)
+  const shadowByBill = new Map<string, { sum: Decimal; rows: number }>()
+  for (const row of shadowRows) {
+    const entry = shadowByBill.get(row.invoiceId) ?? { sum: zero(), rows: 0 }
+    entry.sum = entry.sum.add(toDecimal(row.baseDelta))
+    entry.rows += 1
+    shadowByBill.set(row.invoiceId, entry)
+  }
   // MED-1: only a bill whose OWN posting was queued (its PURCHASE_BILL transit row exists, keyed `purchase-invoice:<bill>:...`) can leave a difference
   // in the ledger's transit account. A bill posted by hand, declined, or recorded with bill sync off has nothing in transit to clear: its target is 0.
   const billTransitKeys = (await tx.transitSubledgerMovement.findMany({
@@ -611,8 +644,25 @@ export async function reconcilePurchaseBillFx(
     const owed = billById.has(invoiceId) && billPosted(invoiceId)
     const targetTransit = owed ? roundQuantity((fxByBill.get(invoiceId) ?? zero()).neg(), 2) : zero()
     const posted = postedByBill.get(invoiceId) ?? { sum: zero(), rows: 0 }
-    const delta = roundQuantity(targetTransit.sub(posted.sum), 2)
+    let delta = roundQuantity(targetTransit.sub(posted.sum), 2)
     if (delta.isZero()) continue
+    // #1157 LOW-2: a change that takes back an amount settled as a SHADOW (the bill deleted, an edit, a return) is settled as a shadow too: the ledger
+    // never received that amount from IMS, so a live journal reversing it would post a difference that was never there.
+    const shadowed = shadowByBill.get(invoiceId)
+    if (shadowed && !shadowed.sum.isZero() && delta.isNegative() !== shadowed.sum.isNegative()) {
+      const back = Prisma.Decimal.min(delta.abs(), shadowed.sum.abs()).mul(delta.isNegative() ? -1 : 1)
+      if (!params.dryRun) {
+        const key = `${JOURNAL_KEY_PREFIX}${invoiceId}:shadow-reversal:${shadowed.rows}`
+        await tx.purchaseFxVarianceShadow.upsert({
+          where: { idempotencyKey: key },
+          create: { poId: params.poId, invoiceId, idempotencyKey: key, baseDelta: back, journalDate: businessDateYmd(params.at) },
+          update: {},
+        })
+        result.shadowed!.push({ invoiceId, transitDelta: back.toFixed(2) })
+      }
+      delta = roundQuantity(delta.sub(back), 2)
+      if (delta.isZero()) continue
+    }
     if (!params.syncEnabled || params.connector !== 'xero') continue
     const bill = billById.get(invoiceId)
     const invoiceNumber = bill?.invoiceNumber ?? null

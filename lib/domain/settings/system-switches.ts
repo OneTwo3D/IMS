@@ -97,11 +97,11 @@ export const PURCHASE_EVENT_FX_SWITCH_KEY = 'purchase_event_fx_rates_enabled'
  * bill at the locked rate, the price-variance line and the FX-difference journal). Steps 1 and 2 alone value the stock at the prepayment rate while the
  * bill still goes to Xero at the PO rate, so turning the switch on before step 3 would leave a foreign purchase half-way through the policy. Turning it on
  * is refused while this is false, and the switch READS off while it is false (purchase-event-fx-settings.ts). Step 3 is installed in two parts (the bill side,
- * then supplier returns and credit notes); the second part (3b) flipped it to true. The switch itself still needs the owner's go: it stays off until an admin
- * turns it on with `npm run settings:set`, after the turn-on check (`npm run purchase-fx:reconcile -- --in-flight`) and the demo-tenant probe in
- * docs/xero-sync.md.
+ * then supplier returns and credit notes). Both parts are installed, but it stays FALSE: it is flipped by its own small change once the owner has ruled
+ * on bills IMS did not post (`--in-flight` "no journal") and the demo-tenant probe in docs/xero-sync.md has been run. Even then the switch itself stays
+ * off until an admin turns it on with `npm run settings:set`.
  */
-export const PURCHASE_EVENT_FX_STEPS_COMPLETE = true
+export const PURCHASE_EVENT_FX_STEPS_COMPLETE = false
 export const PURCHASE_PRICE_VARIANCE_ACCOUNT_KEY = 'xero_purchase_price_variance_account'
 export const REALISED_FX_ACCOUNT_KEY = 'xero_realised_fx_gain_loss_account'
 
@@ -157,7 +157,7 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
     ...booleanSwitch(PURCHASE_EVENT_FX_SWITCH_KEY, undefined, true),
     turnOnBlockedUntil: {
       installed: PURCHASE_EVENT_FX_STEPS_COMPLETE,
-      why: 'the last part of step 3 of the per-event purchase FX work (supplier returns and supplier credit notes at the bill\'s rate) is not installed yet; without it a return or a credit would still be valued at the order rate while the stock and the bill are at the prepayment rate',
+      why: 'the last part of step 3 of the per-event purchase FX work is not signed off yet (the owner\'s ruling on bills IMS did not post, which get no exchange-rate journal, and the demo-tenant probe of the split bill); it is enabled by its own change once both are done',
     },
     requiresMappedSettings: {
       whenKey: 'xero_sync_enabled',

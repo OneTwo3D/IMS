@@ -46,12 +46,20 @@ async function main() {
   const ids = only ? [only] : covered
   const apply = process.argv.includes('--apply')
   console.log(`${apply ? '' : 'DRY RUN (pass --apply to queue; computed in a rolled-back transaction). '}${ids.length} order(s) covered.`)
+  // #1157 LOW-3: one order's failure (an unmapped account, a lock timeout) is reported and the run goes on; the exit code says some failed.
+  let failed = 0
   for (const poId of ids) {
-    const result = await fx.rerunPurchaseBillFx(poId, { dryRun: !apply })
-    const verb = apply ? 'queued' : 'would be queued'
-    console.log(`  ${poId}: ${result.journals.length} journal(s) ${verb}${result.journals.map((j) => ` [bill ${j.invoiceNumber ?? j.invoiceId}: transit ${j.transitDelta}]`).join('')}`
-      + `${result.notQueued.length ? `; ${result.notQueued.length} declined (reported)` : ''}${result.shadowed?.length ? `; ${result.shadowed.length} settled as a shadow` : ''}`)
+    try {
+      const result = await fx.rerunPurchaseBillFx(poId, { dryRun: !apply })
+      const verb = apply ? 'queued' : 'would be queued'
+      console.log(`  ${poId}: ${result.journals.length} journal(s) ${verb}${result.journals.map((j) => ` [bill ${j.invoiceNumber ?? j.invoiceId}: transit ${j.transitDelta}]`).join('')}`
+        + `${result.notQueued.length ? `; ${result.notQueued.length} declined (reported)` : ''}${result.shadowed?.length ? `; ${result.shadowed.length} settled as a shadow` : ''}`)
+    } catch (error) {
+      failed += 1
+      console.error(`  ${poId}: FAILED, nothing written for this order: ${error instanceof Error ? error.message : String(error)}`)
+    }
   }
+  if (failed > 0) throw new Error(`${failed} of ${ids.length} order(s) failed (listed above); the others ran.`)
 }
 
 main().then(
