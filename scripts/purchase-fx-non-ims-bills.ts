@@ -2,7 +2,7 @@
  * Per-event FX rates for purchasing, MED-C: the owner's gate for bills that reached Xero outside IMS (lib/domain/purchasing/purchase-fx-non-ims-bills.ts).
  *
  * Usage:
- *   tsx scripts/purchase-fx-non-ims-bills.ts [--bill <invoice id> ...]
+ *   tsx scripts/purchase-fx-non-ims-bills.ts [--bill <invoice id> ...] [--max-reads <n>]
  *       DRY RUN (the default): each bill (and its Xero bill, read once, read-only), why IMS has no transit row for it, the basis assumed (quantity, goods
  *       value in transit, the Xero rate, the account), the goods not received yet that a confirmation also covers, and the journal it would post now,
  *       plus a digest of the whole list. Writes nothing. --bill also shows a bill the default list leaves out (a delete pending, declined and marked handled).
@@ -12,7 +12,10 @@
  *
  * Refused while purchase_event_fx_rates_enabled (or its interlock) or Xero sync is off: the list is then shown without reading Xero, "not confirmable yet".
  * Both --yes and --confirm-admin are required to write: the command has no session, so it assumes ADMIN authority from shell access and says so in the
- * audit entry. Each Xero read counts against the organisation's shared daily budget. Never key these journals into Xero by hand as well.
+ * audit entry. Xero is read in BOTH runs (the dry run and the confirmation), at most --max-reads bills each (default 50), only the named ones when
+ * --bill is given, stopping at the first rate-limited or unsent read. The Xero client's limiter here is per process and cannot see the application's own
+ * calls against the organisation's 1,000-a-day allowance, so keep runs small. The digest covers the whole default list (with --all only).
+ * Never key these journals into Xero by hand as well.
  * Exit codes: 0 ok, 3 refused input, 5 failed (some orders not confirmed).
  */
 import { config } from 'dotenv'
@@ -22,9 +25,9 @@ config({ path: '.env.local', quiet: true })
 config({ quiet: true })
 
 const FLAGS = new Set(['--yes', '--confirm-admin', '--all'])
-const VALUED = new Set(['--by', '--reason', '--bill', '--expect', '--digest'])
+const VALUED = new Set(['--by', '--reason', '--bill', '--expect', '--digest', '--max-reads'])
 
-export type ParsedArgs = { yes: boolean; confirmAdmin: boolean; all: boolean; by?: string; reason?: string; bills: string[]; expect: Map<string, string>; digest?: string }
+export type ParsedArgs = { yes: boolean; confirmAdmin: boolean; all: boolean; by?: string; reason?: string; bills: string[]; expect: Map<string, string>; digest?: string; maxReads?: number }
 
 /** Strict: an unknown flag, a value that is missing or starts with --, an empty --bill, or a malformed --expect is an error (nothing runs). */
 export function parseArgs(argv: ReadonlyArray<string>): ParsedArgs | { error: string } {
@@ -46,7 +49,10 @@ export function parseArgs(argv: ReadonlyArray<string>): ParsedArgs | { error: st
     else if (arg === '--reason') out.reason = value
     else if (arg === '--bill') out.bills.push(value.trim())
     else if (arg === '--digest') out.digest = value.trim()
-    else {
+    else if (arg === '--max-reads') {
+      if (!/^\d+$/.test(value.trim()) || Number(value) < 1 || Number(value) > 500) return { error: `--max-reads takes a whole number from 1 to 500, not ${JSON.stringify(value)}.` }
+      out.maxReads = Number(value)
+    } else {
       const match = value.match(/^([^=\s]+)=(-?\d+(\.\d{1,2})?)$/)
       if (!match) return { error: `--expect takes <bill id>=<amount> (as the dry run prints it), not ${JSON.stringify(value)}.` }
       out.expect.set(match[1]!, match[2]!)
@@ -66,24 +72,25 @@ async function main(): Promise<number> {
   }
   const mod = await import('../lib/domain/purchasing/purchase-fx-non-ims-bills')
   if (!write) {
-    const list = await mod.listNonImsBills({ named: args.bills })
-    console.log(`DRY RUN. ${list.candidates.length} bill(s) posted to Xero outside IMS.${list.confirmable ? '' : ` ${list.notConfirmableReason!.toUpperCase()}.`}`)
+    const list = await mod.listNonImsBills({ named: args.bills, maxReads: args.maxReads })
+    console.log(`DRY RUN. ${list.candidates.length} bill(s) posted to Xero outside IMS; ${list.xeroReads} Xero read(s) made.${list.confirmable ? '' : ` ${list.notConfirmableReason!.toUpperCase()}.`}`)
     for (const c of list.candidates) {
-      console.log(`  ${c.poReference} (${c.currency}) bill ${c.invoiceNumber ?? c.invoiceId} [${c.invoiceId}], Xero ${c.accountingInvoiceId ?? '(not linked)'}`)
+      console.log(`  ${c.poReference} (${c.currency}) bill ${c.invoiceNumber ?? c.invoiceId} [${c.invoiceId}], Xero ${c.accountingInvoiceId ?? '(not linked)'}${c.basis.xeroStatus ? ` (${c.basis.xeroStatus})` : ''}`)
       console.log(`    no transit row: ${c.noTransitRowReason}${c.exclusion ? `; left out unless named: ${c.exclusion}` : ''}`)
       console.log(`    basis: ${c.basis.qty} units, goods ${c.currency} ${c.basis.stockForeign} at ${c.basis.rate ?? '?'} = ${c.basis.stockTransitBase ?? '?'} in transit on ${c.basis.account ?? '?'}`
         + `${c.basis.xeroTransitBase ? ` (the Xero bill has ${c.basis.xeroTransitBase} there; its price difference ${c.basis.priceDifferenceBase} stays on transit)` : ''}`)
       console.log(`    not received yet: ${c.notReceived.qty} units${c.notReceived.base ? ` (${c.notReceived.base} in base)` : ''}: a confirmation covers them too, their receipts adjust the journal later`)
       console.log(c.problem ? `    NOT CONFIRMABLE: ${c.problem}` : `    journal now: ${c.proposedTransitDelta} on Stock in Transit   (--expect ${c.invoiceId}=${c.proposedTransitDelta})`)
     }
-    console.log(`Digest of the confirmable bills listed by default: ${list.digest} (--all --digest ${list.digest})`)
+    if (args.bills.length === 0) console.log(`Digest of every confirmable bill above (the default list): ${list.digest} (confirm all of them with --all --digest ${list.digest})`)
     return 0
   }
   try {
-    const done = await mod.confirmNonImsBills({ by: args.by ?? '', reason: args.reason ?? '', all: args.all, invoiceIds: args.bills, expect: args.expect, digest: args.digest })
-    console.log(`Confirmed ${done.confirmed.length} bill(s); ${done.journals.length} journal(s) queued${done.notQueued ? `, ${done.notQueued} declined (reported on Sync > Exceptions)` : ''}${done.shadowed ? `, ${done.shadowed} settled as a shadow` : ''}.`)
+    const done = await mod.confirmNonImsBills({ by: args.by ?? '', reason: args.reason ?? '', all: args.all, invoiceIds: args.bills, expect: args.expect, digest: args.digest, maxReads: args.maxReads })
+    console.log(`Confirmed ${done.confirmed.length} bill(s); ${done.journals.length} journal(s) queued${done.notQueued ? `, ${done.notQueued} declined (reported on Sync > Exceptions)` : ''}${done.shadowed ? `, ${done.shadowed} settled as a shadow` : ''}; ${done.xeroReads} Xero read(s) made.`)
     for (const f of done.failed) console.error(`  ${f.poReference}: NOT confirmed (rolled back): ${f.error}`)
-    return done.failed.length > 0 ? 5 : 0
+    for (const f of done.reportFailed) console.error(`  ${f.poReference}: confirmed and committed, but reporting its declined journal to Sync > Exceptions failed: ${f.error}`)
+    return done.failed.length > 0 || done.reportFailed.length > 0 ? 5 : 0
   } catch (error) {
     if (error instanceof mod.NonImsBillsConfirmRefused) { console.error(error.message); return 3 }
     throw error

@@ -3,8 +3,9 @@
  * IMS has no IMS record of what it put in Stock in Transit, so the owner's one-off exchange-rate journal for it is measured on the Xero bill itself (its
  * CurrencyRate and the accounts its lines are coded to), read once by `npm run purchase-fx:non-ims-bills` and stored with the confirmation.
  *
- * ONE GET, through the shared Xero client (`xeroGet`), bounded, so the call counts against the organisation's minute and rolling-day budget (the owner's
- * 1,000 calls a day, shared with the other integrations) and is refused (not sent) when that budget is gone. Nothing here writes to Xero.
+ * ONE GET, through the Xero client (`xeroGet`), bounded. The client's minute and day limiter is PER PROCESS: run from the command line it cannot see the
+ * calls the application makes against the organisation's 1,000-a-day allowance, so the command caps its own reads (`--max-reads`) and stops at the first
+ * rate-limited or unsent read (`stopReading`). Nothing here writes to Xero.
  *
  * The rate convention is Xero's CurrencyRate = units of the bill's currency per ONE base unit, which is IMS's fxRateToBase (see prepayments.ts).
  */
@@ -26,7 +27,8 @@ export type XeroBill = {
   lines: XeroBillLine[]
 }
 
-export type XeroBillRead = { ok: true; tenantId: string; bill: XeroBill } | { ok: false; error: string }
+/** `stopReading`: Xero rate-limited the read (HTTP 429) or the client refused to send it (status 0): no further read should be tried in this run. */
+export type XeroBillRead = { ok: true; tenantId: string; bill: XeroBill } | { ok: false; error: string; stopReading?: boolean }
 
 export type XeroBillReadDeps = {
   get: <T>(path: string) => Promise<{ ok: boolean; status: number; data?: T; error?: string; tenantId?: string }>
@@ -69,7 +71,7 @@ export async function readXeroBillById(invoiceId: string, deps: XeroBillReadDeps
   } catch (error) {
     return { ok: false, error: `the Xero bill read threw: ${String(error)}` }
   }
-  if (!res.ok) return { ok: false, error: res.error ?? `the Xero bill read failed with HTTP ${res.status}` }
+  if (!res.ok) return { ok: false, error: res.error ?? `the Xero bill read failed with HTTP ${res.status}`, ...(res.status === 429 || res.status === 0 ? { stopReading: true } : {}) }
   const tenantId = text(res.tenantId)
   if (!tenantId) return { ok: false, error: 'the Xero bill read did not report which organisation answered it' }
   const rows = res.data?.Invoices

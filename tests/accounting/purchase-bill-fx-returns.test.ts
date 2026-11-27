@@ -573,7 +573,7 @@ async function seedTwoLinePo(qtyA: number, qtyB: number, taxRateId?: string) {
 }
 
 /** A fake read-only Xero bill read (the network is never reached): answers each InvoiceID from `xeroBills`, and counts the calls. */
-const xeroBills = new Map<string, { CurrencyRate: number; lines: Array<{ AccountCode: string; LineAmount: number; TaxAmount?: number }>; Status?: string; CurrencyCode?: string }>()
+const xeroBills = new Map<string, { CurrencyRate: number; lines: Array<{ AccountCode: string; LineAmount: number; TaxAmount?: number }>; Status?: string; CurrencyCode?: string; httpStatus?: number }>()
 const xeroReads: string[] = []
 const xeroDeps = {
   get: async <T,>(path: string) => {
@@ -581,6 +581,7 @@ const xeroDeps = {
     const id = decodeURIComponent(path.replace(/^Invoices\//, ''))
     const bill = xeroBills.get(id)
     if (!bill) return { ok: false, status: 404, error: 'not found' }
+    if (bill.httpStatus) return { ok: false, status: bill.httpStatus, error: `HTTP ${bill.httpStatus}` }
     return {
       ok: true, status: 200, tenantId: 'tenant-pfr',
       data: { Invoices: [{ InvoiceID: id, Type: 'ACCPAY', Status: bill.Status ?? 'AUTHORISED', CurrencyCode: bill.CurrencyCode ?? CURRENCY, CurrencyRate: bill.CurrencyRate, LineAmountTypes: 'Exclusive', LineItems: bill.lines }] } as T,
@@ -689,6 +690,48 @@ test('MED-C candidates: unlinked, delete-pending and off-transit bills are not c
   await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', all: true, digest: 'deadbeefdeadbeef', deps: xeroDeps })), /changed since the dry run/)
   const all = await withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', all: true, digest: list.digest, deps: xeroDeps }))
   assert.ok(all.confirmed.some((c) => c.invoiceId === ok.id) && !all.confirmed.some((c) => c.invoiceId === off.id), '--all confirms only the confirmable default list')
+})
+
+// [mutation: accept a DRAFT/SUBMITTED Xero bill as a basis (#1162 HIGH-1), read past the cap or past a 429, read unnamed bills, or take --digest without --all]
+test('MED-C reads: only an AUTHORISED or PAID Xero bill is a basis; the read cap, a 429 and --bill limit the reads; --digest needs --all; --expect must name a chosen bill', async () => {
+  const { listNonImsBills, confirmNonImsBills, NonImsBillsConfirmRefused } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
+  const draftPo = await seedPo(10)
+  const draft = await nonImsBill(draftPo, 10, 12.5, { rate: 1.25 })
+  xeroBills.get(draft.xeroId!)!.Status = 'DRAFT'
+  const named = await withXeroPosting(() => listNonImsBills({ named: [draft.id], deps: xeroDeps }))
+  const row = named.candidates.find((c) => c.invoiceId === draft.id)!
+  assert.equal(row.basis.xeroStatus, 'DRAFT')
+  assert.match(row.problem ?? '', /only an AUTHORISED or PAID bill/)
+  for (const status of ['SUBMITTED', 'AUTHORISED', 'PAID']) {
+    xeroBills.get(draft.xeroId!)!.Status = status
+    const again = (await withXeroPosting(() => listNonImsBills({ named: [draft.id], deps: xeroDeps }))).candidates[0]!
+    assert.equal(again.problem === null, status !== 'SUBMITTED', status)
+  }
+  // --bill reads only the named bill; the cap stops further reads; a 429 stops the rest.
+  const other = await seedPo(10)
+  const second = await nonImsBill(other, 10, 12.5, { rate: 1.25 })
+  xeroReads.length = 0
+  const onlyNamed = await withXeroPosting(() => listNonImsBills({ named: [second.id], deps: xeroDeps }))
+  assert.deepEqual(onlyNamed.candidates.map((c) => c.invoiceId), [second.id])
+  assert.equal(onlyNamed.xeroReads, 1)
+  assert.equal(xeroReads.length, 1, 'only the named bill is read')
+  xeroReads.length = 0
+  const capped = await withXeroPosting(() => listNonImsBills({ maxReads: 1, deps: xeroDeps }))
+  assert.equal(capped.xeroReads, 1)
+  assert.equal(xeroReads.length, 1, 'the cap holds')
+  assert.ok(capped.candidates.some((c) => /cap of 1 Xero reads/.test(c.problem ?? '')))
+  const both = (await withXeroPosting(() => listNonImsBills({ named: [draft.id, second.id], deps: xeroDeps }))).candidates.map((c) => c.invoiceId)
+  const [firstId, laterId] = both as [string, string]
+  const firstXero = [draft, second].find((b) => b.id === firstId)!.xeroId!
+  xeroBills.get(firstXero)!.httpStatus = 429
+  xeroReads.length = 0
+  const limited = await withXeroPosting(() => listNonImsBills({ named: [draft.id, second.id], deps: xeroDeps }))
+  assert.equal(xeroReads.length, 1, 'stopped after the 429')
+  assert.match(limited.candidates.find((c) => c.invoiceId === laterId)?.problem ?? '', /^not read: Xero rate-limited/)
+  delete xeroBills.get(firstXero)!.httpStatus
+  // LOW-9.
+  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', invoiceIds: [second.id], digest: 'abc', deps: xeroDeps })), /--digest goes with --all/)
+  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', invoiceIds: [second.id], expect: new Map([[second.id, '0.00'], ['someone-else', '1']]), deps: xeroDeps })), NonImsBillsConfirmRefused)
 })
 
 // [mutation: spend a return credit over the order's lines in id order instead of the lines of the return that raised it (o3d-ygc2x)]

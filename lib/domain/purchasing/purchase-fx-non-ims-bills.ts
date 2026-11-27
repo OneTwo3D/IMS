@@ -17,8 +17,10 @@ import type { XeroBill, XeroBillReadDeps } from '@/lib/connectors/xero/bill-read
  * and posts nothing until an admin confirms (scripts/purchase-fx-non-ims-bills.ts).
  *
  * THE BASIS IS THE XERO BILL. What such a bill put in Stock in Transit is known only to Xero, so each candidate's Xero bill (its accountingInvoiceId) is
- * read ONCE per command run, read-only (lib/connectors/xero/bill-read.ts; one call against the shared Xero budget), and that answer is stored with the
- * confirmation (no second call). A bill is confirmable only if its Xero bill is an ACCPAY in the order's currency, not voided or deleted, every line coded
+ * read at most ONCE per command run (the dry run and the confirmation are separate runs, so each reads), read-only (lib/connectors/xero/bill-read.ts),
+ * and the confirmation stores the answer it read (not read again in that run). The Xero client's limiter is per process and cannot see the
+ * application's own calls against the organisation's 1,000-a-day allowance, so a run reads at most `maxReads` bills (default 50), only the named ones
+ * when bills are named, and stops at the first rate-limited or unsent read; the rest are listed as not read. A bill is confirmable only if its Xero bill is an ACCPAY in the order's currency, not voided or deleted, every line coded
  * to the Stock in Transit account, and its net equal to the IMS bill's. The journal is measured at the Xero bill's CurrencyRate on the order's goods cost
  * (after the header discount); the Xero bill's price difference stays on transit, as for every bill from before the switch (owner ruling 2026-11-26).
  *
@@ -54,6 +56,8 @@ export type NonImsBillCandidate = {
     qty: string
     /** The order's goods cost of those lines, in the bill's currency (after the header discount). */
     stockForeign: string
+    /** The Xero bill's status (only AUTHORISED or PAID is a basis). */
+    xeroStatus: string | null
     /** The Xero bill's CurrencyRate (1 base = rate foreign). */
     rate: string | null
     /** The account the Xero bill's lines are coded to. */
@@ -71,7 +75,11 @@ export type NonImsBillCandidate = {
   proposedTransitDelta: string | null
 }
 
+export const NON_IMS_BILLS_DEFAULT_MAX_READS = 50
+
 export type NonImsBillsList = {
+  /** Xero reads made by this run. */
+  xeroReads: number
   confirmable: boolean
   notConfirmableReason: string | null
   candidates: NonImsBillCandidate[]
@@ -127,7 +135,7 @@ async function noTransitRowReason(db: Db, bill: { id: string; accountingInvoiceI
 }
 
 /** The candidates with their basis, read from Xero once each when `readXero`. */
-async function prepare(db: Db, options: { named: ReadonlySet<string>; readXero: boolean; deps?: XeroBillReadDeps }): Promise<Prepared[]> {
+async function prepare(db: Db, options: { named: ReadonlySet<string>; readXero: boolean; maxReads: number; deps?: XeroBillReadDeps }): Promise<{ prepared: Prepared[]; reads: number }> {
   const baseCurrency = (await resolveBaseCurrencyCode({ organisation: db.organisation })).toUpperCase()
   const touched = new Set(await purchaseFxOrdersToReconcile(db))
   const { getAccountingSettings } = await import('@/lib/accounting')
@@ -151,6 +159,8 @@ async function prepare(db: Db, options: { named: ReadonlySet<string>; readXero: 
   const read = options.readXero ? (options.deps ? options.deps : undefined) : undefined
   const { readXeroBillById } = await import('@/lib/connectors/xero/bill-read')
   const out: Prepared[] = []
+  let reads = 0
+  let stopped: string | null = null
   for (const order of orders) {
     if (order.currency.trim().toUpperCase() === baseCurrency) continue
     const stockUnits = stockUnitsForeign(order)
@@ -176,6 +186,8 @@ async function prepare(db: Db, options: { named: ReadonlySet<string>; readXero: 
       if (invoice.fxRateSource !== null) continue
       if (confirmed.has(invoice.id) || billKeys.some((key) => key.startsWith(`purchase-invoice:${invoice.id}:`))) continue
       const named = options.named.has(invoice.id)
+      // MED-6: with bills named, only those are listed (and read).
+      if (options.named.size > 0 && !named) continue
       if (!named && !inFlight && !touched.has(order.id)) continue
       const why = await noTransitRowReason(db, invoice)
       const deletePending = await pendingDeletionError(invoice.id, db)
@@ -201,25 +213,33 @@ async function prepare(db: Db, options: { named: ReadonlySet<string>; readXero: 
       const candidate: Prepared = {
         poId: order.id, poReference: order.reference, currency: order.currency, invoiceId: invoice.id, invoiceNumber: invoice.invoiceNumber,
         accountingInvoiceId: invoice.accountingInvoiceId, noTransitRowReason: why.reason, exclusion, problem: null,
-        basis: { qty: qty.toString(), stockForeign: stockForeign.toFixed(2), rate: null, account: null, stockTransitBase: null, xeroTransitBase: null, priceDifferenceBase: null },
+        basis: { qty: qty.toString(), stockForeign: stockForeign.toFixed(2), xeroStatus: null, rate: null, account: null, stockTransitBase: null, xeroTransitBase: null, priceDifferenceBase: null },
         notReceived: { qty: unreceivedQty.toString(), base: null },
         proposedTransitDelta: null,
         xero: null,
       }
       if (!invoice.accountingInvoiceId) candidate.problem = 'not linked to a Xero bill: there is no basis for a journal'
       else if (!transitAccount) candidate.problem = 'the Stock in Transit account is not mapped'
+      else if (options.readXero && stopped) candidate.problem = `not read: ${stopped}`
+      else if (options.readXero && reads >= options.maxReads) candidate.problem = `not read: this run's cap of ${options.maxReads} Xero reads was reached (--max-reads); name the bills, or run again later`
       else if (options.readXero) {
+        reads += 1
         const answer = await readXeroBillById(invoice.accountingInvoiceId, read)
-        if (!answer.ok) candidate.problem = `the Xero bill could not be read: ${answer.error}`
-        else {
+        if (!answer.ok) {
+          candidate.problem = `the Xero bill could not be read: ${answer.error}`
+          if (answer.stopReading) stopped = 'Xero rate-limited or did not take an earlier read in this run (HTTP 429 or not sent); run again later'
+        } else {
           const bill = answer.bill
           candidate.xero = bill
           const accounts = [...new Set(bill.lines.map((line) => line.accountCode ?? '(none)'))]
           candidate.basis.account = accounts.join(', ')
           candidate.basis.rate = bill.currencyRate.toString()
+          candidate.basis.xeroStatus = bill.status
           const net = bill.lines.reduce((sum, line) => sum.add(bill.lineAmountTypes.toUpperCase() === 'INCLUSIVE' ? line.lineAmount.sub(line.taxAmount) : line.lineAmount), zero())
           if (bill.type.toUpperCase() !== 'ACCPAY') candidate.problem = `the Xero document is a ${bill.type}, not a bill`
-          else if (['VOIDED', 'DELETED'].includes(bill.status.toUpperCase())) candidate.problem = `the Xero bill is ${bill.status}`
+          // HIGH-1: only an approved bill is in the ledger. A DRAFT or SUBMITTED one has put nothing in Stock in Transit (and Xero may re-rate it when it is
+          // approved); a VOIDED or DELETED one no longer stands.
+          else if (!['AUTHORISED', 'PAID'].includes(bill.status.toUpperCase())) candidate.problem = `the Xero bill is ${bill.status}: only an AUTHORISED or PAID bill is in the ledger, so it is no basis for a journal`
           else if (bill.currencyCode !== order.currency.trim().toUpperCase()) candidate.problem = `the Xero bill is in ${bill.currencyCode}, the order in ${order.currency}`
           else if (accounts.length !== 1 || accounts[0] !== transitAccount) candidate.problem = `the Xero bill's lines are coded to ${accounts.join(', ')}, not (only) to Stock in Transit (${transitAccount}): what it put in transit is not known, so no journal is proposed`
           else if (!roundMoney(net, order.currency).eq(roundMoney(toDecimal(invoice.subtotalForeign), order.currency))) candidate.problem = `the Xero bill's net (${net.toFixed(2)}) differs from the IMS bill's (${toDecimal(invoice.subtotalForeign).toFixed(2)})`
@@ -237,7 +257,7 @@ async function prepare(db: Db, options: { named: ReadonlySet<string>; readXero: 
       out.push(candidate)
     }
   }
-  return out
+  return { prepared: out, reads }
 }
 
 /** The journal a confirmation of these bills would post now: the reconciliation of their order with them confirmed at their Xero rate, rolled back. */
@@ -268,9 +288,9 @@ async function confirmability(db: Db): Promise<{ confirmable: boolean; reason: s
   return { confirmable: true, reason: null, settings }
 }
 
-async function listPrepared(db: Db, options: { named?: ReadonlyArray<string>; deps?: XeroBillReadDeps }): Promise<{ list: NonImsBillsList; prepared: Prepared[]; settings: { connector: string | null; syncEnabled: boolean } }> {
+async function listPrepared(db: Db, options: { named?: ReadonlyArray<string>; maxReads?: number; deps?: XeroBillReadDeps }): Promise<{ list: NonImsBillsList; prepared: Prepared[]; settings: { connector: string | null; syncEnabled: boolean } }> {
   const gate = await confirmability(db)
-  const prepared = await prepare(db, { named: new Set(options.named ?? []), readXero: gate.confirmable, deps: options.deps })
+  const { prepared, reads } = await prepare(db, { named: new Set(options.named ?? []), readXero: gate.confirmable, maxReads: options.maxReads ?? NON_IMS_BILLS_DEFAULT_MAX_READS, deps: options.deps })
   const byOrder = new Map<string, Map<string, Decimal | null>>()
   for (const c of prepared) {
     if (c.problem || !c.xero) continue
@@ -288,24 +308,28 @@ async function listPrepared(db: Db, options: { named?: ReadonlyArray<string>; de
     return rest as NonImsBillCandidate
   })
   return {
-    list: { confirmable: gate.confirmable, notConfirmableReason: gate.reason, candidates, digest: nonImsBillsDigest(candidates.filter((c) => !c.exclusion && !c.problem)) },
+    list: { xeroReads: reads, confirmable: gate.confirmable, notConfirmableReason: gate.reason, candidates, digest: nonImsBillsDigest(candidates.filter((c) => !c.exclusion && !c.problem)) },
     prepared,
     settings: gate.settings,
   }
 }
 
 /** THE LIST (the dry run): every bill a confirmation would cover (and the named ones), its basis and the journal it would post now. Writes nothing. */
-export async function listNonImsBills(options: { named?: ReadonlyArray<string>; deps?: XeroBillReadDeps } = {}): Promise<NonImsBillsList> {
+export async function listNonImsBills(options: { named?: ReadonlyArray<string>; maxReads?: number; deps?: XeroBillReadDeps } = {}): Promise<NonImsBillsList> {
   const { db } = await import('@/lib/db')
   return (await listPrepared(db, options)).list
 }
 
 export type NonImsBillsConfirmation = {
   confirmed: Array<{ invoiceId: string; invoiceNumber: string | null; poReference: string; proposedTransitDelta: string }>
+  xeroReads: number
   journals: PurchaseBillFxReconcileResult['journals']
   notQueued: number
   shadowed: number
+  /** Orders NOT confirmed (their transaction rolled back). */
   failed: Array<{ poReference: string; error: string }>
+  /** LOW-11: orders confirmed and committed whose after-commit report (of a declined journal) failed: the confirmation stands. */
+  reportFailed: Array<{ poReference: string; error: string }>
 }
 
 /**
@@ -314,13 +338,15 @@ export type NonImsBillsConfirmation = {
  * mismatch, a refusal) rolls back that order only, and is reported in `failed`.
  */
 export async function confirmNonImsBills(params: {
-  by: string; reason: string; all?: boolean; invoiceIds?: ReadonlyArray<string>; expect?: ReadonlyMap<string, string>; digest?: string; deps?: XeroBillReadDeps
+  by: string; reason: string; all?: boolean; invoiceIds?: ReadonlyArray<string>; expect?: ReadonlyMap<string, string>; digest?: string; maxReads?: number; deps?: XeroBillReadDeps
 }): Promise<NonImsBillsConfirmation> {
   const { db } = await import('@/lib/db')
   if (!params.by.trim() || !params.reason.trim()) throw new NonImsBillsConfirmRefused('--by and --reason are required: the confirmation is audited.')
   const named = params.invoiceIds ?? []
   if (Boolean(params.all) === (named.length > 0)) throw new NonImsBillsConfirmRefused('Name the bills to confirm with --bill <id>, or pass --all for every bill listed (not both).')
-  const { list, prepared, settings } = await listPrepared(db, { named, deps: params.deps })
+  // LOW-9: the digest covers the whole default list, so it goes with --all only.
+  if (params.digest && !params.all) throw new NonImsBillsConfirmRefused('--digest goes with --all (it covers the whole default list); for named bills pass --expect <id>=<amount>. Nothing was confirmed.')
+  const { list, prepared, settings } = await listPrepared(db, { named, maxReads: params.maxReads, deps: params.deps })
   if (!list.confirmable) throw new NonImsBillsConfirmRefused(`Nothing was confirmed: ${list.notConfirmableReason}.`)
   let chosen: Prepared[]
   if (params.all) {
@@ -333,6 +359,8 @@ export async function confirmNonImsBills(params: {
     if (blocked.length > 0) throw new NonImsBillsConfirmRefused(`Not confirmable: ${blocked.map((c) => `${c.invoiceNumber ?? c.invoiceId} (${c.problem})`).join('; ')}. Nothing was confirmed.`)
   }
   if (chosen.length === 0) throw new NonImsBillsConfirmRefused('No bill to confirm. Nothing was confirmed.')
+  const strays = [...(params.expect?.keys() ?? [])].filter((id) => !chosen.some((c) => c.invoiceId === id))
+  if (strays.length > 0) throw new NonImsBillsConfirmRefused(`--expect names bills that are not being confirmed: ${strays.join(', ')}. Nothing was confirmed.`)
   if (params.digest) {
     if (nonImsBillsDigest(chosen) !== params.digest) throw new NonImsBillsConfirmRefused(`The bills or their journals changed since the dry run (digest ${nonImsBillsDigest(chosen)}, not ${params.digest}). Run the dry run again. Nothing was confirmed.`)
   } else {
@@ -341,13 +369,14 @@ export async function confirmNonImsBills(params: {
   }
   const expected = (c: Prepared): string => params.expect?.get(c.invoiceId) ?? c.proposedTransitDelta ?? '0.00'
   const { logActivityInTransaction } = await import('@/lib/activity-log')
-  const out: NonImsBillsConfirmation = { confirmed: [], journals: [], notQueued: 0, shadowed: 0, failed: [] }
+  const out: NonImsBillsConfirmation = { confirmed: [], xeroReads: list.xeroReads, journals: [], notQueued: 0, shadowed: 0, failed: [], reportFailed: [] }
   const byOrder = new Map<string, Prepared[]>()
   for (const c of chosen) byOrder.set(c.poId, [...(byOrder.get(c.poId) ?? []), c])
   for (const [poId, bills] of byOrder) {
     const ids = new Set(bills.map((b) => b.invoiceId))
+    let result: PurchaseBillFxReconcileResult
     try {
-      const result = await db.$transaction(async (tx) => {
+      result = await db.$transaction(async (tx) => {
         await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
         for (const bill of bills) {
           // The Xero answer read in this run is stored with the confirmation (it is not read again).
@@ -380,13 +409,19 @@ export async function confirmNonImsBills(params: {
         }
         return reconciled
       }, { timeout: 60_000, maxWait: 10_000 })
-      await reportPurchaseFxVarianceNotQueued(poId, bills[0]!.poReference, result)
-      for (const bill of bills) out.confirmed.push({ invoiceId: bill.invoiceId, invoiceNumber: bill.invoiceNumber, poReference: bill.poReference, proposedTransitDelta: expected(bill) })
-      out.journals.push(...result.journals.filter((j) => ids.has(j.invoiceId)))
-      out.notQueued += result.notQueued.filter((n) => ids.has(n.invoiceId)).length
-      out.shadowed += (result.shadowed ?? []).filter((n) => ids.has(n.invoiceId)).length
     } catch (error) {
       out.failed.push({ poReference: bills[0]!.poReference, error: error instanceof Error ? error.message : String(error) })
+      continue
+    }
+    // Committed: the confirmation stands whatever the report below does.
+    for (const bill of bills) out.confirmed.push({ invoiceId: bill.invoiceId, invoiceNumber: bill.invoiceNumber, poReference: bill.poReference, proposedTransitDelta: expected(bill) })
+    out.journals.push(...result.journals.filter((j) => ids.has(j.invoiceId)))
+    out.notQueued += result.notQueued.filter((n) => ids.has(n.invoiceId)).length
+    out.shadowed += (result.shadowed ?? []).filter((n) => ids.has(n.invoiceId)).length
+    try {
+      await reportPurchaseFxVarianceNotQueued(poId, bills[0]!.poReference, result)
+    } catch (error) {
+      out.reportFailed.push({ poReference: bills[0]!.poReference, error: error instanceof Error ? error.message : String(error) })
     }
   }
   return out

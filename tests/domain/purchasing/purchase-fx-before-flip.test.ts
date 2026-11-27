@@ -15,6 +15,21 @@ test('the command refuses unknown flags and bad values, and reads repeated --bil
   assert.deepEqual(ok.bills, ['a', 'b'])
   assert.deepEqual([...ok.expect], [['a', '-26.04'], ['b', '0']])
   assert.equal(ok.all, false)
+  assert.equal((parseArgs(['--max-reads', '20']) as { maxReads?: number }).maxReads, 20)
+  assert.match((parseArgs(['--max-reads', '0']) as { error: string }).error, /1 to 500/)
+  assert.match((parseArgs(['--max-reads', 'many']) as { error: string }).error, /1 to 500/)
+})
+
+// [mutation: let a rate-limited or unsent read go on to the next bill]
+test('a 429 or an unsent read tells the caller to stop reading', async () => {
+  const { readXeroBillById } = await import('@/lib/connectors/xero/bill-read')
+  const id = '00000000-0000-4000-8000-000000000002'
+  for (const status of [429, 0]) {
+    const read = await readXeroBillById(id, { get: async () => ({ ok: false, status, error: 'no' }) })
+    assert.ok(!read.ok && read.stopReading === true, String(status))
+  }
+  const notFound = await readXeroBillById(id, { get: async () => ({ ok: false, status: 404, error: 'no' }) })
+  assert.ok(!notFound.ok && !notFound.stopReading)
 })
 
 // [mutation: trust an incomplete Xero answer, or read something other than Invoices/<id>]
