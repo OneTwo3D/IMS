@@ -281,7 +281,7 @@ test('the refund journal is the same whichever warehouse the unit goes to: quara
     const r = returnLine(w, index)
     const result = await refundService.createSalesOrderRefund(db, { orderId: r.orderId, lines: r.lines, reason: 'qc', returnWarehouseId: warehouseId, creditNotePrefix: `QC${index}${w.tag.slice(0, 4)}-`, accountingSettings })
     assert.equal(result.success, true, result.success ? '' : result.error)
-    const syncs = (result as { accountingSyncs: Array<{ type: string; payload: { lines: Array<{ accountCode: string; debit?: number; credit?: number }> } }> }).accountingSyncs
+    const syncs = (result as unknown as { accountingSyncs: Array<{ type: string; payload: { lines: Array<{ accountCode: string; debit?: number; credit?: number }> } }> }).accountingSyncs
     return syncs.filter((s) => s.type === 'COGS_REVERSAL').map((s) => s.payload.lines.map((l) => ({ account: l.accountCode, debit: l.debit ?? 0, credit: l.credit ?? 0 })))
   }
   const ordinary = await journalOf(0, w.main.id)
