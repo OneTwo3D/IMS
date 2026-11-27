@@ -6673,3 +6673,28 @@ model PurchaseFxVarianceShadow {
   @@index([poId])
   @@map("purchase_fx_variance_shadows")
 }
+
+/// Per-event FX (MED-C, owner ruling "post a one-off journal"): a bill that reached Xero OUTSIDE IMS (Qoblex in P1, the first load, by hand, bill sync
+/// off), so it has no PURCHASE_BILL transit row, which an admin confirmed with `npm run purchase-fx:non-ims-bills -- --yes --confirm-admin`. From then on
+/// lib/domain/purchasing/purchase-bill-fx.ts treats it as being in Stock in Transit at its own GR/IR value and posts its exchange-rate difference through
+/// the accounting queue (target state: once, a re-run queues nothing). `invoiceId` is not a foreign key: the row outlives a deleted bill, whose journal
+/// the reconciliation then reverses.
+model PurchaseFxNonImsBillApproval {
+  id                   String   @id @default(cuid())
+  poId                 String   @map("po_id")
+  invoiceId            String   @unique @map("invoice_id")
+  approvedBy           String   @map("approved_by")
+  reason               String
+  proposedTransitDelta Decimal  @db.Decimal(18, 2) @map("proposed_transit_delta")
+  approvedAt           DateTime @default(now()) @map("approved_at")
+  /// The Xero bill the confirmation was read from (read-only, once), and what it said: its CurrencyRate (1 base = rate foreign; the basis of the journal),
+  /// the base value of its lines on Stock in Transit, and the part of that which is the order's goods cost (the rest is price difference, left on transit).
+  /// NULL = a confirmation recorded before the Xero read existed: measured at the bill's own GR/IR value.
+  xeroInvoiceId        String?  @map("xero_invoice_id")
+  xeroCurrencyRate     Decimal? @db.Decimal(28, 12) @map("xero_currency_rate")
+  xeroTransitBase      Decimal? @db.Decimal(18, 2) @map("xero_transit_base")
+  stockTransitBase     Decimal? @db.Decimal(18, 2) @map("stock_transit_base")
+
+  @@index([poId])
+  @@map("purchase_fx_non_ims_bill_approvals")
+}

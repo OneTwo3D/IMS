@@ -103,6 +103,11 @@ export async function runSettingsCli(options: SettingsCliOptions): Promise<numbe
       const interlock = await storefrontEmailSwitchOnRefusal(options.interlock)
       if (interlock) { stderr.error(interlock); return 3 }
     }
+    if (def.turnOnInterlock === 'purchase-fx-bill-writer' && proposed === 'true' && current.stored !== 'true') {
+      const { purchaseFxSwitchOnRefusal } = await import('@/lib/domain/purchasing/purchase-event-fx-switch-on')
+      const writer = purchaseFxSwitchOnRefusal()
+      if (writer) { stderr.error(writer); return 3 }
+    }
     // Turning the condition check on returns ON: refused while any quarantine warehouse still looks sellable, here (the dry run too) and again
     // inside the write transaction.
     let turnOnTxCheck: ((tx: unknown) => Promise<string | null>) | undefined
