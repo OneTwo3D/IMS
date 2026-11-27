@@ -54,14 +54,37 @@ return expectations clears them, in the inbox transaction, under the order lock:
 ## The switch
 
 Setting `refund_returns_in_transit_enabled`. It reads exactly `true`; any other value, including an empty or absent
-row, is off. There is no screen for it (the settings page refuses keys it does not list): it is set in the database
-by whoever runs the cut-over. With it off, a refund behaves exactly as before: the units are restocked at refund time
-and the COGS reversal debits Inventory.
+row, is off. It is an **ADMIN system switch** with no settings screen (the settings page refuses keys it does not list):
+set it with the settings command, never by SQL:
+
+```
+npm run settings:get -- --key refund_returns_in_transit_enabled
+npm run settings:set -- --key refund_returns_in_transit_enabled --value true --by <name> --reason "<text>" --yes --confirm-admin
+```
+
+Without `--yes` the command is a dry run. It is **off by default**. **Turn-on guard:** while Xero sync is on, turning it on is
+refused unless the **Stock in Transit** account (`xero_transit_account`) and the **Inventory** account (`xero_inventory_account`)
+are mapped, in the dry run and again inside the write transaction: the refund's COGS reversal debits Stock in Transit and the
+arrival's clearing journal credits it, and both fail closed without the accounts. With Xero sync off nothing posts, so no
+account is required. Turning it off is never refused (refunds already in transit stay in transit and clear on arrival).
+With it off, a refund behaves exactly as before: the units are restocked at refund time and the COGS reversal debits Inventory.
 
 The decision is taken **once per refund**, inside the refund transaction under the order lock, and stored on the
 refund (`return_in_transit`). An accounting retry reads the refund, never the switch, so a switch flipped between a
 refund and its retry cannot make one refund's journal debit Inventory on one attempt and Stock in Transit on the next.
 A refund is in transit only if it returns stock (it has a return warehouse) and is not a chargeback.
+
+## Recommended WooCommerce returns setup
+
+When you refund **returned goods** in WooCommerce, enter the refunded **quantity** and **untick "Restock refunded items" on every refund (WooCommerce ticks it by default)**:
+
+* WooCommerce's own stock is **not** raised, so no back-in-stock emails go out and the storefront never shows units that are
+  not on a shelf yet.
+* IMS books the return from the refund's quantity: into the default return warehouse at refund time (switch off), or as a
+  return expectation in transit until the parcel arrives (switch on). IMS then pushes its own stock level to the storefront.
+* **Caveat:** that holds only with `refund_returns_in_transit_enabled` **on**, or when the default return warehouse does not sync to the store. With the switch off IMS restocks into the default return warehouse at refund time and forces a stock push, so if that warehouse syncs to the store the store shows the units, and can send back-in-stock emails, before the parcel arrives.
+* A **money-only** refund (quantity 0, an amount on a goods line, shipping or a fee) moves **no stock** in IMS and writes no
+  return expectation.
 
 ## What a refund does when it is in transit
 

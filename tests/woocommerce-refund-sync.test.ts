@@ -1871,21 +1871,106 @@ test('EVERY mapped fee line that contributes to the gross reaches the refund wri
   assert.ok((sent[0]?.totalBase ?? 0) > 0 || (sent[0]?.qty ?? 0) > 0, 'the writer\'s filter keeps it')
 })
 
-test('a refund with an AMOUNT-ONLY goods line (zero quantity) plus a fee is QUARANTINED, not parked PENDING: createRefund is not called, it does not retry, and it says the money is already returned (o3d-k26m.14)', async () => {
-  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: FEE_ORDER_LINES } })
+// An amount-only goods line (quantity 0, money returned on a goods line) is its own refund line linked to its ORDER line, whenever the refund also has a quantity line, a shipping line or a fee line.
+const SECOND_GOODS_LINE: OrderLineDouble = { id: 'line-2', productId: 'product-2', externalLineItemId: 502, description: 'Gadget', qty: 1, totalBase: 10, taxBase: 2, taxRate: { rate: 0.2, reverseCharge: false }, totalForeign: 10, taxForeign: 2 }
+const MIXED_ORDER_LINES: OrderLineDouble[] = [{ ...DEFAULT_ORDER_LINE }, SECOND_GOODS_LINE, ...FEE_ORDER_LINES.slice(1)]
+const amountOnlyGadget = {
+  id: 505, name: 'Gadget', product_id: 11, variation_id: 0, quantity: 0, tax_class: '', subtotal: '0', subtotal_tax: '0', total: '-10.00', total_tax: '-2.00', sku: 'GADGET',
+  meta_data: [{ id: 2, key: '_refunded_item_id', value: '502' }], refund_total: 12,
+}
+
+function assertAmountOnlyLine(state: ReturnType<typeof makeDependencies>, expected: { lineId: string; net: number; tax: number }) {
+  const line = state.createRefundLines.find((l) => l.lineId === expected.lineId && l.qty === 0)
+  assert.ok(line, `an amount-only line linked to ${expected.lineId} reaches createRefund`)
+  assert.equal(line.totalForeign, expected.net)
+  assert.equal(line.chargedTaxForeign, expected.tax)
+  assert.equal(line.lineKind, 'sale')
+  assert.equal(state.createRefundOptionsSeen[0]?.enforcePerTargetBalances, true, 'the writer holds each line to the net it has left')
+}
+
+test('a quantity line PLUS an amount-only goods line on another order line maps both: the amount-only one is linked, qty 0, with its net and stated tax (mixed money-only goods refund)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: MIXED_ORDER_LINES } })
+  const result = await syncWcRefund(1001, makeRefund({ amount: '27.00', line_items: [goodsRefundLine, amountOnlyGadget] }), state.dependencies)
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
+  assert.equal(state.createRefundLines.length, 2)
+  assert.equal(state.createRefundLines.find((l) => l.lineId === 'line-1')?.qty, 1, 'the quantity line is unchanged')
+  assertAmountOnlyLine(state, { lineId: 'line-2', net: 10, tax: 2 })
+})
+
+test('a SHIPPING refund PLUS an amount-only goods line maps both', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: MIXED_ORDER_LINES } })
   const refund = makeRefund({
-    amount: '19.80',
-    line_items: [{ ...goodsRefundLine, quantity: 0 }],
-    fee_lines: [{ name: 'EU Customs Fee', total: '-4.00', total_tax: '-0.80' }],
+    amount: '18.00',
+    line_items: [amountOnlyGadget],
+    shipping_lines: [{ id: 930, method_title: 'Tracked', method_id: 'x', total: '-5.00', total_tax: '-1.00', taxes: [], meta_data: [] } as never],
   })
   const result = await syncWcRefund(1001, refund, state.dependencies)
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
+  assert.equal(state.createRefundLines.length, 2)
+  assert.equal(state.createRefundLines.find((l) => l.lineKind === 'shipping')?.totalForeign, 5)
+  assertAmountOnlyLine(state, { lineId: 'line-2', net: 10, tax: 2 })
+})
+
+test('a FEE refund PLUS an amount-only goods line is recorded, no longer quarantined: goods, fee and the amount-only line all reach createRefund', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: MIXED_ORDER_LINES } })
+  const refund = makeRefund({
+    amount: '16.80',
+    line_items: [amountOnlyGadget],
+    fee_lines: [{ id: 910, name: 'EU Customs Fee', total: '-4.00', total_tax: '-0.80', taxes: [] } as never],
+  })
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
+  assert.equal(state.createRefundLines.length, 2)
+  assert.equal(state.createRefundLines.find((l) => l.lineId === 'fee-1')?.totalForeign, 4)
+  assertAmountOnlyLine(state, { lineId: 'line-2', net: 10, tax: 2 })
+})
+
+test('quantity + shipping + fee + amount-only together all reconcile', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: MIXED_ORDER_LINES } })
+  const refund = makeRefund({
+    amount: '37.80',
+    line_items: [goodsRefundLine, amountOnlyGadget],
+    shipping_lines: [{ id: 930, method_title: 'Tracked', method_id: 'x', total: '-5.00', total_tax: '-1.00', taxes: [], meta_data: [] } as never],
+    fee_lines: [{ id: 910, name: 'EU Customs Fee', total: '-4.00', total_tax: '-0.80', taxes: [] } as never],
+  })
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
+  assert.equal(state.createRefundLines.length, 4)
+  assertAmountOnlyLine(state, { lineId: 'line-2', net: 10, tax: 2 })
+})
+
+test('an amount-only goods line that cannot be linked to an order line is QUARANTINED, with the money-already-returned warning, and createRefund is not called', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: MIXED_ORDER_LINES } })
+  const ghost = { ...amountOnlyGadget, meta_data: [{ id: 2, key: '_refunded_item_id', value: '999' }], id: 999 }
+  const result = await syncWcRefund(1001, makeRefund({ amount: '27.00', line_items: [goodsRefundLine, ghost] }), state.dependencies)
   assert.equal(result.outcome, 'quarantined-refusal')
-  assert.equal(refundOutcomeFailed(result.outcome), true)
-  assert.notEqual(result.outcome, 'retryable-failure', 'a QUARANTINED park is skipped by the sweep, never retried on a timer')
-  assert.match(result.error ?? '', /amount-only goods refund[\s\S]*fee refund[\s\S]*ALREADY been returned in the storefront/)
+  assert.match(result.error ?? '', /cannot link[\s\S]*ALREADY been returned in the storefront/)
   assert.equal(state.createRefundCalls, 0)
-  assert.equal(state.syncLogs.some((log) => (log as { data?: { status?: string } }).data?.status === 'QUARANTINED'), true)
-  assert.equal((state.activityLogs as Array<{ action?: string }>).some((e) => e.action === 'refund_sync_amount_only_goods_with_fee'), true)
+  assert.equal((state.activityLogs as Array<{ action?: string }>).some((e) => e.action === 'refund_sync_amount_only_goods_unlinked'), true)
+})
+
+test('an amount-only goods line with tax but NO net is QUARANTINED beside other lines (the writer would drop it after the gross counted it)', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { lines: MIXED_ORDER_LINES } })
+  const taxOnly = { ...amountOnlyGadget, total: '0', total_tax: '-2.00' }
+  const result = await syncWcRefund(1001, makeRefund({ amount: '17.00', line_items: [goodsRefundLine, taxOnly] }), state.dependencies)
+  assert.equal(result.outcome, 'quarantined-refusal')
+  assert.match(result.error ?? '', /tax but no net cannot be recorded automatically/)
+  assert.equal(state.createRefundCalls, 0)
+})
+
+test('amount-only goods lines ALONE (several, nothing else) keep the monetary-only fallback: one unlinked line at the order VAT basis, as before', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: TAXABLE_ORDER })
+  const refund = makeRefund({
+    amount: '120.00',
+    line_items: [{ ...goodsRefundLine, quantity: 0, total: '-50.00', total_tax: '-10.00' }, { ...goodsRefundLine, id: 506, quantity: 0, total: '-50.00', total_tax: '-10.00' }],
+    shipping_lines: [],
+  })
+  const result = await syncWcRefund(1001, refund, state.dependencies)
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
+  assert.equal(state.createRefundLines.length, 1)
+  assert.equal(state.createRefundLines[0].lineId, undefined)
+  assert.equal(state.createRefundLines[0].totalForeign, 100)
+  assert.notEqual(state.createRefundOptionsSeen[0]?.enforcePerTargetBalances, true)
 })
 
 test('the monetary-only fallback is unchanged when there is no fee line: an amount-only goods refund alone is still recorded', async () => {

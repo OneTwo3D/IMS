@@ -393,8 +393,9 @@ For Kit / Bundle sales, refunds reverse the component-level stock movements. Ret
 
 ### Returned goods in transit (switched off by default)
 
-Normally the returned units are restocked the moment the refund is recorded. When the setting
-`refund_returns_in_transit_enabled` is `true`, a refund that returns stock instead creates a **return expectation**:
+Normally the returned units are restocked the moment the refund is recorded. When the admin system switch
+`refund_returns_in_transit_enabled` is `true` (set with `npm run settings:set`; it is refused while Xero sync is on and the Stock in Transit or
+Inventory account is unmapped), a refund that returns stock instead creates a **return expectation**:
 the units are not stock yet, so they cannot be allocated, sold or pushed to the storefront, and the refund's COGS
 reversal debits **Stock in Transit** instead of Inventory (DR Stock in Transit / CR COGS). The decision is stored on the
 refund when it is created, so a retry later does the same thing. When the parcel arrives, restocking its Mintsoft returns
@@ -402,6 +403,12 @@ inbox item clears the expectation: the units come back into stock at the refund'
 in Transit is released to Inventory (DR Inventory / CR Stock in Transit). Anything the expectations do not cover is
 restocked as a plain return, as before. Writing off units that never come back is not built yet, so the setting is
 switched on only as a cut-over step. See `docs/refund-in-transit.md`.
+
+**Refunding returned goods in WooCommerce: enter the quantity and untick "Restock refunded items" on every refund (it is ticked by default).** WooCommerce's own stock is then not raised (no
+back-in-stock emails, no units shown that are not on a shelf yet); IMS books the return from the refunded quantity (into the default return
+warehouse, or as a return expectation in transit when the switch above is on) and pushes its own stock level to the store. A money-only refund (quantity 0) moves no stock. 
+
+"No early stock, no back-in-stock emails" holds only with `refund_returns_in_transit_enabled` on, or when the default return warehouse does not sync to the store: with the switch off IMS restocks into the default return warehouse at refund time and forces a stock push, so if that warehouse syncs to the store the store shows the units (and may send back-in-stock emails) before the parcel arrives.
 
 ### Refunds on a partly shipped order
 
@@ -434,6 +441,16 @@ You can still process the refund as cash-only by leaving the return warehouse un
 ### Warehouse-scoped idempotency
 
 The refund return-stock movement is bound by `(refundId, refundLineId, warehouseId)`. This means split returns to different warehouses don't collide — you can return part of an order to Warehouse A and part to Warehouse B in the same refund without idempotency conflicts.
+
+### WooCommerce refunds that carry money on a goods line with no quantity
+
+A WooCommerce refund can return money on a goods line without returning units (a partial-price refund of a line). When such a line comes with a
+refund line that has a quantity, a refunded shipping line or a refunded fee, IMS records it automatically as its **own refund line on the same order
+line**: no stock moves and no cost is reversed for it, its net and the VAT WooCommerce states are credited on the credit note, and it counts against
+what that order line has left to refund across all the order's refunds. Previously such a refund did not reconcile and was retried for ever (or, with a fee, parked
+for a person). If the order line cannot be found (the order was edited in IMS after confirmation) or the line carries VAT but no net, the refund is
+**not recorded**: it is parked on Sync > Exceptions with a message, the money has already been returned in the store, and you record it by hand. A refund whose
+only content is such amounts (nothing else on it) is recorded as before, as one money refund at the order's VAT basis.
 
 ### WooCommerce refund deduplication
 

@@ -117,6 +117,11 @@ export const INVOICE_BASIS_DEFERRAL_ENABLED_AT_KEY = 'xero_defer_unpaid_invoiced
 // credit note in the LIVE ledger. No turn-on prerequisite is encoded: a delete is refused case by case at the moment it is asked for (Xero sync off or the credit-note type off,
 // a credit note the ledger will not void, books locked, stock moved), and the void needs only the baseline accounting.invoices grant, which is held on the connection, not in a settings row.
 export const REFUND_DELETE_SWITCH_KEY = 'refund_delete_enabled'
+// Refunds that return stock hold the units IN TRANSIT (a return expectation, COGS reversal DR Stock in Transit) until the parcel arrives, instead of restocking them at refund time. The reader is
+// readReturnsInTransitEnabled in lib/domain/sales/return-expectation.ts (`=== 'true'`); a literal here for the same reason as the others (that module imports the database client), and
+// tests/settings-cli.test.ts holds it equal to REFUND_RETURNS_IN_TRANSIT_SETTING. ADMIN: it changes the journals a refund posts to the LIVE ledger and where returned stock sits. Off, a refund restocks at refund time exactly as before.
+// Turning it ON is refused while Xero sync is on and the Stock in Transit or Inventory account is unmapped: the refund's COGS reversal and the arrival's clearing journal post to those accounts and fail closed without them.
+export const REFUND_RETURNS_IN_TRANSIT_SWITCH_KEY = 'refund_returns_in_transit_enabled'
 
 export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   booleanSwitch('trackship_refire_enabled'),
@@ -155,6 +160,18 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   // (it imports the database client); tests hold them equal to its keys.
   { ...booleanSwitch(INVOICE_BASIS_DEFERRAL_SWITCH_KEY, undefined, true), stampOnKey: INVOICE_BASIS_DEFERRAL_ENABLED_AT_KEY },
   booleanSwitch(REFUND_DELETE_SWITCH_KEY, undefined, true),
+  {
+    ...booleanSwitch(REFUND_RETURNS_IN_TRANSIT_SWITCH_KEY, undefined, true),
+    requiresMappedSettings: {
+      whenKey: 'xero_sync_enabled',
+      whenValue: 'true',
+      settings: [
+        { key: 'xero_transit_account', label: 'Stock in Transit' },
+        { key: 'xero_inventory_account', label: 'Inventory' },
+      ],
+      why: 'a refund that returns stock in transit debits Stock in Transit on its COGS reversal, and the parcel\'s arrival moves it to Inventory; with either account unmapped the journal fails closed and the refund stays on the accounting retry list',
+    },
+  },
   booleanSwitch(SUPPLIER_CREATE_KEY, undefined, true),
   booleanSwitch(ASN_SEND_SUPPLIER_KEY, undefined, true),
   booleanSwitch(ASN_SUPPLIER_REQUIRED_KEY, [ASN_REQUIRED_NEEDS_SEND], true),
