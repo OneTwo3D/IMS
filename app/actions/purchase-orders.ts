@@ -6250,7 +6250,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     const splitCreditPpv = creditPpv.gt(0) || creditPpv.lt(0)
     const creditPpvAccount = splitCreditPpv && shouldQueueXero && !reverseChargePlan ? await purchasePriceVarianceAccount(db) : ''
     if (splitCreditPpv && shouldQueueXero && !reverseChargePlan && !creditPpvAccount) {
-      return { success: false, error: 'The credit note was NOT posted (it is still a draft): it reverses a bill whose price difference went to the purchase price variance account, and that account (xero_purchase_price_variance_account) is not mapped. Map it under Sync > Accounting settings, then post again.' }
+      return { success: false, error: withLedgerCheck('The credit note was NOT posted (it is still a draft): it reverses a bill whose price difference went to the purchase price variance account, and that account (xero_purchase_price_variance_account) is not mapped. Map it under Sync > Accounting settings, then post again.') }
     }
     const creditPpvGrossForeign = creditPpvAccount ? roundMoney(toDecimal(cn.amountForeign).mul(creditPpv), cn.currency) : null
     if (splitCreditPpv && shouldQueueXero && reverseChargePlan) {
