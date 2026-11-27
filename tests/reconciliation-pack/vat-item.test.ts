@@ -497,10 +497,11 @@ test('FEE-LINE TAX is not proven to be counted alike: a WooCommerce order with a
 
 // ---- the order discount booked under the per-rate split ---------------------------------------------------
 
-/** A stored SalesOrder.discountTaxSplit as the write model builds it: one entry per line rate (net and tax in the order currency and in base). */
-const splitJson = (entries: Array<{ taxRateId: string | null; rate: number; taxBase: number }>) => JSON.stringify(entries.map((e) => ({ taxRateId: e.taxRateId, accountingTaxType: null, reverseCharge: false, rate: e.rate, netForeign: e.rate > 0 ? e.taxBase / e.rate : 10, taxForeign: e.taxBase, netBase: e.rate > 0 ? e.taxBase / e.rate : 10, taxBase: e.taxBase })))
-/** September: GBP 100.00 of GB line VAT and 20.00 of IE line VAT before the discount; the order discount took 4.00 of GB VAT and 1.20 of IE VAT, posted to Xero as two parts on the discount account. */
-function discounted(splits: NonNullable<ImsFixture['discountSplits']>, xeroDiscount: Array<{ type: string; tax: number }> = [{ type: 'OUTPUT2', tax: -4 }, { type: 'OUTPUT9', tax: -1.2 }]) {
+/** One entry of a stored SalesOrder.discountTaxSplit as the write model builds it (GBP, so base = foreign): the discount's NET on a rate and its VAT at 4dp. */
+const entryOf = (taxRateId: string | null, rate: number, net: number, accountingTaxType: string | null = null) => ({ taxRateId, accountingTaxType, reverseCharge: false, rate, netForeign: net, taxForeign: Math.round(net * rate * 1e4) / 1e4, netBase: net, taxBase: Math.round(net * rate * 1e4) / 1e4 })
+const splitJson = (entries: Array<{ taxRateId: string | null; rate: number; net: number }>) => JSON.stringify(entries.map((e) => entryOf(e.taxRateId, e.rate, e.net)))
+/** September: GBP 100.00 of GB line VAT and 20.00 of IE line VAT before the discount; the order discount of 26.00 is GB net 20.00 (VAT 4.00) and IE net 6.00 (VAT 1.38), posted to Xero as two parts on the discount account. */
+function discounted(splits: NonNullable<ImsFixture['discountSplits']>, xeroDiscount: Array<{ type: string; tax: number }> = [{ type: 'OUTPUT2', tax: -4 }, { type: 'OUTPUT9', tax: -1.38 }]) {
   return standard({
     ims: { sales: [sale('2026-09', 'rGB', '100.00', 3), sale('2026-09', 'rIE', '20.00', 1), sale('2026-08', 'rGB', '50.00', 2)], discountAccount: '270', discountSplits: splits },
     xero: [
@@ -508,13 +509,13 @@ function discounted(splits: NonNullable<ImsFixture['discountSplits']>, xeroDisco
       invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40 }]),
       invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }]),
     ],
-    woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '56.00'], [12, '18.80']]), wooOrder(102, '2026-09-21T10:00:00', [[11, '40.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
+    woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '56.00'], [12, '18.62']]), wooOrder(102, '2026-09-21T10:00:00', [[11, '40.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
   })
 }
-const SPLIT = splitJson([{ taxRateId: 'rGB', rate: 0.2, taxBase: 4 }, { taxRateId: 'rIE', rate: 0.23, taxBase: 1.2 }, { taxRateId: null, rate: 0, taxBase: 0 }])
+const SPLIT = splitJson([{ taxRateId: 'rGB', rate: 0.2, net: 20 }, { taxRateId: 'rIE', rate: 0.23, net: 6 }, { taxRateId: null, rate: 0, net: 0 }])
 
 // [mutation: the discount-split loop removed / its sign flipped / the share placed by the header rate]
-test('AN ORDER BOOKED UNDER THE PER-RATE DISCOUNT SPLIT: each rate share of the discount VAT comes off that rate on the IMS side, matching the per-code discount parts Xero holds; a no-rate 0% group is harmless', async () => {
+test('AN ORDER BOOKED UNDER THE PER-RATE DISCOUNT SPLIT: each part\'s VAT comes off its own rate on the IMS side, matching the per-code discount parts Xero holds; a no-rate 0% group is harmless', async () => {
   const item = await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: SPLIT }]).ctx)
   assert.deepEqual(reasons(item), ['pass'])
   assert.ok(keys(item, 'bothEqual').includes('ims-xero|2026-09|IE|domestic'))
@@ -522,12 +523,12 @@ test('AN ORDER BOOKED UNDER THE PER-RATE DISCOUNT SPLIT: each rate share of the 
   const header = await run(discounted([]).ctx)
   assert.equal(header.outcome, 'fail')
   assert.deepEqual(keys(header, 'bothDiffer').filter((k) => k.startsWith('ims-xero')).sort(), ['ims-xero|2026-09|GB|domestic', 'ims-xero|2026-09|IE|domestic'])
-  // Every share is placed by its own rate: put all of it on GB and both keys differ.
-  const misplaced = await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: splitJson([{ taxRateId: 'rGB', rate: 0.2, taxBase: 5.2 }]) }]).ctx)
+  // Every part is placed by its own rate: put all of it on GB and both keys differ.
+  const misplaced = await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: splitJson([{ taxRateId: 'rGB', rate: 0.2, net: 26 }]) }]).ctx)
   assert.deepEqual(keys(misplaced, 'bothDiffer').filter((k) => k.startsWith('ims-xero')).sort(), ['ims-xero|2026-09|GB|domestic', 'ims-xero|2026-09|IE|domestic'])
 })
 
-test('THE SPLIT IS READ AS THE INVOICE READS IT: an unreadable split, a discount that rounds to no penny, or a month outside the window is the header-rate treatment (nothing taken off); a non-zero share on an unverified rate is VAT_MAPPING_UNVERIFIED; a bad discount figure is BAD_VALUE', async () => {
+test('THE SPLIT IS READ AS THE INVOICE READS IT: an unreadable split, a discount that rounds to no penny, or a month outside the window is the header-rate treatment (nothing taken off); a part with VAT on an unverified rate is VAT_MAPPING_UNVERIFIED; a bad discount, rate or non-adding split is BAD_VALUE', async () => {
   // Xero holds the single header-rate treatment (no parts), so "nothing taken off" is exactly the item of the same estate with no split row at all.
   const asHeader = async (splits: NonNullable<ImsFixture['discountSplits']>, label: string) => {
     assert.deepEqual(await run(discounted(splits, []).ctx), await run(discounted([], []).ctx), label)
@@ -537,26 +538,50 @@ test('THE SPLIT IS READ AS THE INVOICE READS IT: an unreadable split, a discount
   await asHeader([{ period: '2026-10', orderId: 'so-1', discount: '26.0000', split: SPLIT }], 'October is not a closed month')
   // And the control: a readable split in the window DOES change the item.
   assert.notDeepEqual(await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: SPLIT }], []).ctx), await run(discounted([], []).ctx))
-  const oss = await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: splitJson([{ taxRateId: 'rGB', rate: 0.2, taxBase: 4 }, { taxRateId: 'rIE', rate: 0.23, taxBase: 1.2 }, { taxRateId: 'rDE', rate: 0.19, taxBase: 0.5 }]) }]).ctx)
+  const oss = await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '31.0000', split: splitJson([{ taxRateId: 'rGB', rate: 0.2, net: 20 }, { taxRateId: 'rIE', rate: 0.23, net: 6 }, { taxRateId: 'rDE', rate: 0.19, net: 5 }]) }]).ctx)
   assert.deepEqual(reasons(oss), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
-  const zeroElsewhere = await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: splitJson([{ taxRateId: 'rGB', rate: 0.2, taxBase: 4 }, { taxRateId: 'rIE', rate: 0.23, taxBase: 1.2 }, { taxRateId: 'rDE', rate: 0, taxBase: 0 }]) }]).ctx)
+  const zeroElsewhere = await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '31.0000', split: splitJson([{ taxRateId: 'rGB', rate: 0.2, net: 20 }, { taxRateId: 'rIE', rate: 0.23, net: 6 }, { taxRateId: 'rDE', rate: 0, net: 5 }]) }]).ctx)
   assert.deepEqual(reasons(zeroElsewhere), ['pass'])
   assert.deepEqual(reasons(await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: 'x', split: SPLIT }]).ctx)), ['inconclusive', 'BAD_VALUE'])
+  assert.deepEqual(reasons(await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: SPLIT, fxRateToBase: '0' }]).ctx)), ['inconclusive', 'BAD_VALUE'], 'no usable order rate')
+  assert.deepEqual(reasons(await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '40.0000', split: SPLIT }]).ctx)), ['inconclusive', 'BAD_VALUE'], 'a split 14 short of the discount: the invoice would refuse it, so no invoice exists to compare')
 })
 
-// [mutation: the LOW-8 skip removed]
-test('A SPLIT ENTRY THE INVOICE POSTS NO PART FOR (it rounds to no positive penny on either basis) is not taken off: a tiny share on an unverified rate is harmless, a real one is VAT_MAPPING_UNVERIFIED', async () => {
-  const entry = (taxRateId: string, rate: number, netForeign: number, taxBase: number) => ({ taxRateId, accountingTaxType: null, reverseCharge: false, rate, netForeign, taxForeign: taxBase, netBase: netForeign, taxBase })
-  const withDe = (netForeign: number, taxBase: number) => JSON.stringify([entry('rGB', 0.2, 20, 4), entry('rIE', 0.23, 5.2174, 1.2), entry('rDE', 0.19, netForeign, taxBase)])
-  // 0.004 net, 0.00076 VAT: 0.00 net and 0.00 gross, so invoiceDiscountParts drops it and Xero holds no such discount line.
-  assert.deepEqual(reasons(await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: withDe(0.004, 0.00076) }]).ctx)), ['pass'])
-  // 0.004 net is 0.00 but 0.0048 gross is still 0.00; 0.01 net is a penny part the invoice posts, so its VAT is a constituent figure on a rate R12 cannot place.
-  assert.deepEqual(reasons(await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: withDe(0.01, 0.0019) }]).ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
-  // A gross that rounds to a penny (inclusive basis) is kept too: the invoice may post it.
-  assert.deepEqual(reasons(await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: withDe(0.0044, 0.0016) }]).ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
+// [mutation: the LOW-8 skip follows the per-entry figures instead of the merged parts]
+test('A PART THE INVOICE POSTS NO LINE FOR (its merged amount rounds to no positive penny) is not taken off: a tiny share on an unverified rate is harmless, a real one is VAT_MAPPING_UNVERIFIED; entries on one code are judged MERGED, as the invoice posts them', async () => {
+  const withDe = (net: number) => splitJson([{ taxRateId: 'rGB', rate: 0.2, net: 20 }, { taxRateId: 'rIE', rate: 0.23, net: 6 }, { taxRateId: 'rDE', rate: 0.19, net }])
+  // 0.004 net rounds to 0.00: invoiceDiscountParts drops it and Xero holds no such discount line.
+  assert.deepEqual(reasons(await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: withDe(0.004) }]).ctx)), ['pass'])
+  // 0.10 net is a part the invoice posts, with VAT 0.02 on a rate R12 cannot place.
+  assert.deepEqual(reasons(await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '26.1000', split: withDe(0.1) }]).ctx)), ['inconclusive', 'VAT_MAPPING_UNVERIFIED'])
+  // Three entries on ONE verified code (19.996, 0.004, 0.004) post as ONE part of 20.00, the way the invoice merges them: the item is judged on the merged part, not on each entry.
+  const merged = JSON.stringify([entryOf('rGB', 0.2, 19.996), entryOf('rGB', 0.2, 0.004), entryOf('rGB', 0.2, 0.004), entryOf('rIE', 0.23, 6)])
+  assert.deepEqual(reasons(await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: merged }]).ctx)), ['pass'])
 })
 
-test('END TO END FROM THE INVOICE PARTS: a split built by the write model, posted as invoiceDiscountParts with Xero working out each part\'s VAT at 2dp, reconciles on R12 (IMS takes off the 4dp taxBase)', async () => {
+// [mutation: the VAT-inclusive basis ignored / the order's rate ignored]
+test('THE BASES: VAT-inclusive lines take the part\'s VAT OUT of its gross amount at 2dp, and a foreign order is put in base by its own rate, exactly as Xero\'s document is', async () => {
+  // Inclusive GBP: the discount parts are gross (net + VAT): GB 24.00 (20.00 + 4.00) and IE 7.38 (6.00 + 1.38), 31.38 in all; Xero takes 24.00 x 0.2 / 1.2 = 4.00 and 7.38 x 0.23 / 1.23 = 1.38.
+  const inclusive = await run(discounted([{ period: '2026-09', orderId: 'so-1', discount: '31.3800', split: SPLIT, amountsIncludeVat: true }]).ctx)
+  assert.deepEqual(reasons(inclusive), ['pass'])
+  // Foreign (EUR at 1.25 = 1 GBP): the split holds EUR, Xero's lines are EUR and its document is divided by its CurrencyRate; the same GBP VAT is taken off.
+  const eur = JSON.stringify([{ ...entryOf('rGB', 0.2, 25), netBase: 20, taxBase: 4 }, { ...entryOf('rIE', 0.23, 7.5), netBase: 6, taxBase: 1.38 }])
+  const foreignEstate = standard({
+    ims: { sales: [sale('2026-09', 'rGB', '100.00', 3), sale('2026-09', 'rIE', '20.00', 1), sale('2026-08', 'rGB', '50.00', 2)], discountAccount: '270', discountSplits: [{ period: '2026-09', orderId: 'so-1', discount: '32.5000', split: eur, fxRateToBase: '1.25000000' }] },
+    xero: [
+      invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 75 }, { type: 'OUTPUT9', tax: 25 }, { type: 'OUTPUT2', tax: -5, account: '270' }, { type: 'OUTPUT9', tax: -1.73, account: '270' }], { CurrencyCode: 'EUR', CurrencyRate: 1.25 }),
+      invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40 }]),
+      invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }]),
+    ],
+    woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '56.00'], [12, '18.62']]), wooOrder(102, '2026-09-21T10:00:00', [[11, '40.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
+  })
+  const item = await run(foreignEstate.ctx)
+  // EUR 5.00 / 1.25 = GBP 4.00 on GB; the IE part is EUR 7.50 x 23% = 1.725, which Xero rounds to 1.73 (GBP 1.384), the same figure IMS takes off.
+  assert.ok(keys(item, 'bothEqual').includes('ims-xero|2026-09|GB|domestic'), JSON.stringify(item))
+  assert.ok(!keys(item, 'bothDiffer').some((k) => k.startsWith('ims-xero')), JSON.stringify(item))
+})
+
+test('END TO END FROM THE INVOICE PARTS: a split built by the write model, posted as invoiceDiscountParts with Xero working out each part\'s VAT at 2dp, reconciles on R12 with no rounding residue (the IMS side prices the parts the same way)', async () => {
   // A 26.00 discount over GB goods at 20% and IE goods at 23%, shares 17.3333 and 8.6667 (the write model's allocation), GBP, exclusive.
   const split = buildDiscountTaxSplit({
     lines: [{ taxRateId: 'rGB', accountingTaxType: 'OUTPUT2', reverseCharge: false, rate: 0.2 }, { taxRateId: 'rIE', accountingTaxType: 'OUTPUT9', reverseCharge: false, rate: 0.23 }],
@@ -567,10 +592,45 @@ test('END TO END FROM THE INVOICE PARTS: a split built by the write model, poste
   // Xero prices each exclusive discount line itself, rounded to the penny: 3.466 -> 3.47 and 1.9941 -> 1.99 (IMS holds 3.4667 and 1.9933).
   const xeroDiscount = parts.map((p) => ({ type: p.taxType!, tax: -Number((Math.round(p.amount * (p.taxType === 'OUTPUT2' ? 20 : 23)) / 100).toFixed(2)) }))
   assert.deepEqual(xeroDiscount.map((d) => d.tax), [-3.47, -1.99])
-  const estate = discounted([{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: JSON.stringify(split) }], xeroDiscount)
-  const item = await run(estate.ctx)
-  assert.ok(keys(item, 'bothEqual').includes('ims-xero|2026-09|GB|domestic'), JSON.stringify(item))
-  assert.ok(keys(item, 'bothEqual').includes('ims-xero|2026-09|IE|domestic'), JSON.stringify(item))
+  // The estate: the sale rows stay 100.00 / 20.00 of goods VAT, Xero holds the discount lines above, WooCommerce reports the net of them (60 - 3.47 = 56.53, 20 - 1.99 = 18.01).
+  const item = await standard({
+    ims: { sales: [sale('2026-09', 'rGB', '100.00', 3), sale('2026-09', 'rIE', '20.00', 1), sale('2026-08', 'rGB', '50.00', 2)], discountAccount: '270', discountSplits: [{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: JSON.stringify(split) }] },
+    xero: [
+      invoice(1, '2026-09-05', [{ type: 'OUTPUT2', tax: 60 }, { type: 'OUTPUT9', tax: 20 }, ...xeroDiscount.map((d) => ({ ...d, account: '270' }))]),
+      invoice(2, '2026-09-20', [{ type: 'OUTPUT2', tax: 40 }]),
+      invoice(3, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }]),
+    ],
+    woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, '56.53'], [12, '18.01']]), wooOrder(102, '2026-09-21T10:00:00', [[11, '40.00']]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
+  }).ctx
+  const result = await run(item)
+  assert.deepEqual(reasons(result), ['pass'], JSON.stringify(result))
+  assert.ok(keys(result, 'bothEqual').includes('ims-xero|2026-09|GB|domestic'), JSON.stringify(result))
+  assert.ok(keys(result, 'bothEqual').includes('ims-xero|2026-09|IE|domestic'), JSON.stringify(result))
+})
+
+// [mutation: the IMS side back on the 4dp taxBase of the split]
+test('MANY SPLIT ORDERS ON ONE KEY STAY INSIDE THE TOLERANCE: 200 orders of the same 26.00 discount in one month, each priced as Xero prices it, leave no residue (the 4dp taxBase would be GBP 0.66 out on GB alone)', async () => {
+  const N = 200
+  const split = buildDiscountTaxSplit({
+    lines: [{ taxRateId: 'rGB', accountingTaxType: 'OUTPUT2', reverseCharge: false, rate: 0.2 }, { taxRateId: 'rIE', accountingTaxType: 'OUTPUT9', reverseCharge: false, rate: 0.23 }],
+    shares: ['17.3333', '8.6667'], fxRate: 1, totalNetForeign: 26, totalTaxForeign: 5.46, totalNetBase: 26, totalTaxBase: 5.46,
+  })
+  // What the old IMS side would have taken off these N orders against what Xero holds (3.47 + 1.99 per order): the drift this fix removes.
+  const oldGb = split[0]!.taxBase * N
+  assert.ok(Math.abs(oldGb - N * 3.47) > 0.05, `the 4dp figures drift ${Math.abs(oldGb - N * 3.47).toFixed(4)} on GB over ${N} orders, which is the failure being fixed`)
+  const rows = Array.from({ length: N }, (_, i) => ({ period: '2026-09', orderId: `so-${i}`, discount: '26.0000', split: JSON.stringify(split) }))
+  const invoices = Array.from({ length: N }, (_, i) => invoice(i + 1, '2026-09-05', [{ type: 'OUTPUT2', tax: 20 }, { type: 'OUTPUT9', tax: 5 }, { type: 'OUTPUT2', tax: -3.47, account: '270' }, { type: 'OUTPUT9', tax: -1.99, account: '270' }]))
+  // IMS goods VAT: GB 20.00 and IE 5.00 per order. WooCommerce reports the net of the discount, summed over the month in one order (its legs are not under test).
+  const gb = (N * (20 - 3.47)).toFixed(2)
+  const ie = (N * (5 - 1.99)).toFixed(2)
+  const s = standard({
+    ims: { sales: [sale('2026-09', 'rGB', (N * 20).toFixed(2), N), sale('2026-09', 'rIE', (N * 5).toFixed(2), N), sale('2026-08', 'rGB', '50.00', 2)], discountAccount: '270', discountSplits: rows },
+    xero: [...invoices, invoice(N + 1, '2026-08-11', [{ type: 'OUTPUT2', tax: 50 }])],
+    woo: { processing: [wooOrder(101, '2026-09-10T09:30:00', [[11, gb], [12, ie]]), wooOrder(103, '2026-08-12T10:00:00', [[11, '50.00']])] },
+  })
+  const item = await run(s.ctx)
+  assert.deepEqual(reasons(item), ['pass'], JSON.stringify(item))
+  assert.ok(keys(item, 'bothEqual').includes('ims-xero|2026-09|GB|domestic'))
 })
 
 // ---- empty ----------------------------------------------------------------------------------------------

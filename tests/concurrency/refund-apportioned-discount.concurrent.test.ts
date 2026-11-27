@@ -99,3 +99,75 @@ test(
     }
   },
 )
+
+/**
+ * THE CODE A SPLIT GROUP'S DISCOUNT REVERSAL IS POSTED ON, against a real Postgres (the unit test pins the function; this pins the refund that uses it):
+ *   - a group with NO tax code of its own (the no-rate lines, entry code null) is reversed on the ORDER DEFAULT rate's code, the fallback the invoice's discount part took;
+ *   - a group whose snapshot code is STALE (saved while its rate was unmapped, mapped since) is reversed on its rate's code NOW, the code the invoice build reads.
+ * Both orders are 100 net lines with a 20 discount split onto them (VAT 20%).
+ */
+test(
+  'refunding a split order: a group with no code of its own is reversed on the order default code, and a stale snapshot code is read from its rate now',
+  { skip: process.env.RUN_DB_CONCURRENCY_TESTS !== '1' },
+  async () => {
+    config({ path: '.env.local', quiet: true })
+    config({ quiet: true })
+    const databaseUrl = process.env.DATABASE_URL
+    if (!databaseUrl) throw new Error('DATABASE_URL is required when RUN_DB_CONCURRENCY_TESTS=1')
+    const [{ Prisma, PrismaClient }, { PrismaPg }, { createSalesOrderRefund }] = await Promise.all([
+      import('@/app/generated/prisma/client'),
+      import('@prisma/adapter-pg'),
+      import('@/lib/domain/sales/refund-service'),
+    ])
+    const db = new PrismaClient({ adapter: new PrismaPg({ connectionString: databaseUrl, max: 4 }) })
+    const sfx = randomUUID().slice(0, 8)
+    const orderIds: string[] = []
+    const rateIds: string[] = []
+    try {
+      const mkRate = async (key: string, accountingTaxType: string | null) => {
+        const r = await db.taxRate.create({ data: { name: `RF-${key}-${sfx}`, rate: '0.2', accountingTaxType, countryCode: 'ZZ' }, select: { id: true, name: true } })
+        rateIds.push(r.id)
+        return r
+      }
+      const def = await mkRate('DEF', `RFDEF-${sfx}`)
+      // The group's rate has a code NOW; the stored split still says it has none (the draft was saved before it was mapped).
+      const mapped = await mkRate('MAP', `RFMAP-${sfx}`)
+      const entry = (taxRateId: string | null) => ({ taxRateId, accountingTaxType: null, reverseCharge: false, rate: 0.2, netForeign: 10, taxForeign: 2, netBase: 10, taxBase: 2 })
+      const line = (taxRateId: string | null) => ({ description: 'l', qty: new Prisma.Decimal('1'), unitPriceForeign: new Prisma.Decimal('100'), unitPriceBase: new Prisma.Decimal('100'), taxForeign: new Prisma.Decimal('20'), taxBase: new Prisma.Decimal('20'), totalForeign: new Prisma.Decimal('100'), totalBase: new Prisma.Decimal('100'), taxRateId })
+      const order = await db.salesOrder.create({
+        data: {
+          orderNumber: `RF-${randomUUID().slice(0, 8)}`, status: 'SHIPPED', currency: 'GBP', fxRateToBase: new Prisma.Decimal('1'), pricesIncludeVat: false, taxRateName: def.name, taxRatePercent: new Prisma.Decimal('0.2'),
+          subtotalForeign: new Prisma.Decimal('200'), subtotalBase: new Prisma.Decimal('200'), discountAmount: new Prisma.Decimal('20'),
+          taxForeign: new Prisma.Decimal('36'), taxBase: new Prisma.Decimal('36'), totalForeign: new Prisma.Decimal('216'), totalBase: new Prisma.Decimal('216'),
+          discountTaxSplit: [entry(mapped.id), entry(null)] as object,
+          lines: { create: [line(mapped.id), line(null)] },
+        },
+        select: { id: true, lines: { select: { id: true, taxRateId: true } } },
+      })
+      orderIds.push(order.id)
+      for (const [n, taxRateId] of [['1', mapped.id], ['2', null]] as const) {
+        const lineId = order.lines.find((l) => l.taxRateId === taxRateId)!.id
+        const r = await createSalesOrderRefund(db, {
+          orderId: order.id, lines: [{ lineId, productId: null, description: 'l', qty: 1, totalForeign: 99, totalBase: 99, lineKind: 'sale' }],
+          reason: `r${n}`, creditNotePrefix: `CNRF${sfx}-`, enforcePerTargetBalances: true, deriveSaleLineNetsFromStoredBalance: true,
+        })
+        assert.equal(r.success, true, r.success ? '' : r.error)
+      }
+      const rows = await db.salesOrderRefundLine.findMany({ where: { refund: { orderId: order.id }, lineKind: 'discount' }, select: { totalForeign: true, accountingTaxType: true, discountTaxRateId: true } })
+      const byGroup = new Map(rows.map((r) => [r.discountTaxRateId, r]))
+      assert.equal(rows.length, 2)
+      assert.equal(byGroup.get(mapped.id)!.accountingTaxType, `RFMAP-${sfx}`, 'the stale snapshot (no code) is replaced by the rate\'s code now')
+      assert.equal(byGroup.get('')!.accountingTaxType, `RFDEF-${sfx}`, 'the no-rate group is reversed on the order default rate\'s code, as the invoice posted it')
+      assert.deepEqual(rows.map((r) => Number(r.totalForeign)).sort(), [-10, -10])
+    } finally {
+      for (const orderId of orderIds) {
+        await db.salesOrderRefundLine.deleteMany({ where: { refund: { orderId } } }).catch(() => {})
+        await db.salesOrderRefund.deleteMany({ where: { orderId } }).catch(() => {})
+        await db.salesOrderLine.deleteMany({ where: { orderId } }).catch(() => {})
+        await db.salesOrder.delete({ where: { id: orderId } }).catch(() => {})
+      }
+      await db.taxRate.deleteMany({ where: { id: { in: rateIds } } }).catch(() => {})
+      await db.$disconnect()
+    }
+  },
+)

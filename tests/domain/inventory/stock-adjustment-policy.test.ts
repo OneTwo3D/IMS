@@ -45,38 +45,53 @@ test('an entered cost wins, 0 included; a blank takes the latest layer; neither 
   assert.throws(() => resolveRequiredAdditionUnitCost({ explicitUnitCostBase: Number.NaN, latest, productLabel: 'S1' }), /zero or greater/)
 })
 
-test('latest layer: this warehouse first, then any warehouse, newest first, zero-cost layers skipped', async () => {
+test('latest layer: this warehouse first, then any warehouse, then the opening-stock batch; newest first, zero-cost layers skipped', async () => {
   const calls: Array<Record<string, unknown>> = []
-  const client = (inWarehouse: string | null, anywhere: string | null) => ({
+  // rows are keyed by (isOpeningStock, in this warehouse): receipt here, receipt anywhere, opening here, opening anywhere.
+  const client = (rows: { receiptHere?: string; receiptAny?: string; openingHere?: string; openingAny?: string }) => ({
     costLayer: {
       findFirst: async (args: { where: Record<string, unknown>; orderBy: unknown }) => {
         calls.push(args as Record<string, unknown>)
-        const row = 'warehouseId' in args.where ? inWarehouse : anywhere
+        const here = 'warehouseId' in args.where
+        const opening = args.where.isOpeningStock === true
+        const row = opening ? (here ? rows.openingHere : rows.openingAny) : (here ? rows.receiptHere : rows.receiptAny)
         return row == null ? null : { unitCostBase: row }
       },
     },
   }) as never
-  calls.length = 0
-  const own = await getLatestLayerUnitCost(client('2.100000', '9.000000'), 'p', 'w')
-  assert.deepEqual([own?.unitCostBase.toFixed(6), own?.source], ['2.100000', 'warehouse'])
-  assert.equal(calls.length, 1, 'the other warehouses are not read when this one has a costed layer')
-  // o3d-jwa8m MED-4: receipt or production layers only; ties by the creation sequence, never the cuid.
+  // o3d-jwa8m MED-4 / F1 / F4: receipt (including a Mintsoft align-up layer, which also carries an adjustment movement) or production OUTPUT layers only;
+  // ties by the creation sequence, never the cuid.
   const qualifying = {
     unitCostBase: { gt: 0 },
-    adjustmentMovementId: null,
     returnMovementId: null,
     isOpeningStock: false,
-    OR: [{ poLineId: { not: null } }, { productionOrderId: { not: null } }],
+    OR: [{ poLineId: { not: null } }, { productionOrderId: { not: null }, productionOrder: { outputProductId: 'p' } }],
   }
+  const opening = { unitCostBase: { gt: 0 }, returnMovementId: null, isOpeningStock: true }
+  assert.equal('adjustmentMovementId' in qualifying, false, 'F1: an alignment layer carries an adjustment movement and still qualifies')
+  calls.length = 0
+  const own = await getLatestLayerUnitCost(client({ receiptHere: '2.100000', receiptAny: '9.000000' }), 'p', 'w')
+  assert.deepEqual([own?.unitCostBase.toFixed(6), own?.source, own?.basis], ['2.100000', 'warehouse', 'receipt_or_production'])
+  assert.equal(calls.length, 1, 'the other warehouses are not read when this one has a costed layer')
   assert.deepEqual(calls[0]!.where, { productId: 'p', warehouseId: 'w', ...qualifying })
   assert.deepEqual(calls[0]!.orderBy, [{ receivedAt: 'desc' }, { createdSeq: 'desc' }])
 
   calls.length = 0
-  const other = await getLatestLayerUnitCost(client(null, '9.000000'), 'p', 'w')
+  const other = await getLatestLayerUnitCost(client({ receiptAny: '9.000000', openingHere: '1.000000' }), 'p', 'w')
   assert.deepEqual([other?.unitCostBase.toFixed(6), other?.source], ['9.000000', 'any_warehouse'])
   assert.deepEqual(calls[1]!.where, { productId: 'p', ...qualifying })
+  assert.equal(calls.length, 2, 'a receipt layer anywhere beats an opening layer here')
 
-  assert.equal(await getLatestLayerUnitCost(client(null, null), 'p', 'w'), null)
+  // F2 (owner 2026-11-26): no receipt/production layer anywhere -> the latest opening-stock batch (here first, then any).
+  calls.length = 0
+  const openHere = await getLatestLayerUnitCost(client({ openingHere: '1.500000', openingAny: '4.000000' }), 'p', 'w')
+  assert.deepEqual([openHere?.unitCostBase.toFixed(6), openHere?.source, openHere?.basis], ['1.500000', 'warehouse', 'opening_stock'])
+  assert.deepEqual(calls[2]!.where, { productId: 'p', warehouseId: 'w', ...opening })
+  assert.deepEqual(calls[2]!.orderBy, [{ receivedAt: 'desc' }, { createdSeq: 'desc' }])
+  const openAny = await getLatestLayerUnitCost(client({ openingAny: '4.000000' }), 'p', 'w')
+  assert.deepEqual([openAny?.unitCostBase.toFixed(6), openAny?.source, openAny?.basis], ['4.000000', 'any_warehouse', 'opening_stock'])
+
+  assert.equal(await getLatestLayerUnitCost(client({}), 'p', 'w'), null)
 })
 
 test('a CSV reason cell matches an active reason by name (case-insensitive) or id, and refuses ambiguity', () => {

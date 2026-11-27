@@ -37,8 +37,9 @@
  *
  *   FIGURES. Sales VAT in GBP, SHIPPING VAT EXCLUDED (IMS holds it at order level with no rate; the other two are cut to match): IMS =
  *   the sum of line taxBase (its recorded base amount) of orders by invoice instant, not CANCELLED, not archived (the IMS VAT report's
- *   own population), less, on an order booked under the per-rate discount split (SalesOrder.discountTaxSplit), each rate's share of the
- *   discount VAT on that rate (an order without the split is read as before: no discount VAT on the IMS side); Xero = the sum of line TaxAmount of AUTHORISED and PAID sales invoices by invoice date, lines on the configured
+ *   own population), less, on an order booked under the per-rate discount split (SalesOrder.discountTaxSplit), the VAT of each discount
+ *   line its invoice posts, worked out as Xero does (merged by code, the invoice's own parts, 2dp VAT per part, base by the order's rate) on that rate
+ *   (an order without the split is read as before: no discount VAT on the IMS side); Xero = the sum of line TaxAmount of AUTHORISED and PAID sales invoices by invoice date, lines on the configured
  *   shipping account left out, a foreign invoice DIVIDED by Xero's own CurrencyRate (1 base = X document-currency, the same convention as fxRateToBase: connectors/xero/fx.ts); WooCommerce = the sum of tax-line totals of
  *   orders in processing, completed and refunded by GMT creation date, a non-GBP order divided by the fxRateToBase (1 base = X foreign) IMS recorded on the
  *   linked order (the storefront records none). Each key is rounded to the penny, half up; a key whose total is zero in a system is not
@@ -84,7 +85,7 @@ import type { ItemInput } from '@/lib/reconciliation-pack/report'
 import type { XeroBinding } from '@/lib/reconciliation-pack/xero-credentials'
 import { makeXeroWalker, readXeroBaseCurrency, readXeroInvoices, type XeroGetPort, type XeroSourceOptions } from '@/lib/reconciliation-pack/xero-source'
 import { readWooOrderTaxes, type WooGetPort, type WooSourceOptions } from '@/lib/reconciliation-pack/woo-source'
-import { parseDiscountTaxSplit } from '@/lib/domain/sales/discount-tax-split'
+import { invoiceDiscountParts, parseDiscountTaxSplit } from '@/lib/domain/sales/discount-tax-split'
 
 export const VAT_ITEM_IDS = ['R12'] as const
 export type VatItemId = (typeof VAT_ITEM_IDS)[number]
@@ -165,6 +166,8 @@ type RateCatalogue = {
   place(rateId: string | null): RateInfo | null
   /** The one IMS rate that carries a Xero tax type, or null (none, or more than one). */
   ownerOf(taxType: string): string | null
+  /** The Xero tax type a rate is posted on (its own accounting tax code), or null. */
+  typeOf(rateId: string | null): string | null
 }
 
 function buildCatalogue(rates: readonly TaxRateRow[], reportTypes: ReadonlyMap<string, string | null>): RateCatalogue {
@@ -194,6 +197,9 @@ function buildCatalogue(rates: readonly TaxRateRow[], reportTypes: ReadonlyMap<s
     ownerOf(taxType) {
       const list = owners.get(taxType)
       return list !== undefined && list.length === 1 ? list[0]! : null
+    },
+    typeOf(rateId) {
+      return rateId === null ? null : byId.get(rateId)?.accountingTaxType ?? null
     },
   }
 }
@@ -297,32 +303,45 @@ async function runR12(context: VatItemContext): Promise<ItemInput> {
     if (place === null) continue
     add(imsSums, { period: row.period, ...place }, amount)
   }
-  // THE ORDER DISCOUNT OF AN ORDER BOOKED UNDER THE PER-RATE SPLIT. Its invoice posts the discount as one negative line per tax code (discountParts, on the discount account), so the
-  // Xero side already places each part's VAT on its own rate; the IMS side takes each rate's share of the discount VAT (the split's taxBase) off that same rate. The line taxBase above is
-  // before the order discount on every order. An order without a split (every header-rate order, every WooCommerce order) adds nothing here, exactly as before; a split the one parser cannot
-  // read is the header-rate treatment, as on the invoice. Each entry is a constituent figure: a non-zero share on a rate with no verified place is VAT_MAPPING_UNVERIFIED.
+  // THE ORDER DISCOUNT OF AN ORDER BOOKED UNDER THE PER-RATE SPLIT. Its invoice posts the discount as one negative line per tax code (discountParts, on the discount account) and Xero works out
+  // each line's VAT itself, at the penny. The IMS side is computed the SAME way, per order, never from the 4dp taxBase the split stores (those differ from Xero's pennies by up to half a penny per
+  // part, and the difference adds up over a (country, category, month) key): the entries are merged by the code they post on, the parts are the invoice's own (invoiceDiscountParts: each merged
+  // amount to the penny, the rounding on the largest part, a part that rounds to nothing dropped), each part's VAT is taken at 2dp (on the net, or out of the gross when the invoice sends VAT-inclusive
+  // lines), put in base by the order's rate, and taken off the key of the part's rate. An order without a split (every header-rate order, every WooCommerce order) adds nothing here, exactly as
+  // before; a split the one parser cannot read is the header-rate treatment, as on the invoice. A part on a rate with no verified place is VAT_MAPPING_UNVERIFIED; a split the invoice itself would
+  // refuse (its parts do not add up to the discount) is BAD_VALUE, as no invoice for it can exist.
   for (const row of vat.discountSplits) {
     if (!periodSet.has(row.period)) continue
     const discount = parseDecimalStrict(row.discount)
     if (discount === null) return inconclusive([LEDGER], 'BAD_VALUE')
+    const total = discount.toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP)
     // The invoice posts the parts only when the discount, rounded to the penny, is positive (queueSalesInvoiceForOrder).
-    if (!discount.toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP).gt(0)) continue
+    if (!total.gt(0)) continue
     let parsed: unknown
     try { parsed = JSON.parse(row.split) } catch { continue }
     const split = parseDiscountTaxSplit(parsed)
     if (split === null) continue
-    for (const entry of split) {
-      const share = D(String(entry.taxBase))
-      if (share.isZero()) continue
-      // A part the invoice does not post is not taken off either: invoiceDiscountParts drops a part whose amount, rounded to the penny, is not positive, so an entry that rounds to no positive penny
-      // on either basis the invoice may use (net, or gross when the lines are sent inclusive) posts no discount line and leaves its VAT with the goods in Xero. (Two such entries merged onto one
-      // code can still make a penny part; that and the converse, a net-basis part with a positive gross, move a fraction of a penny and are accepted.)
-      const net = D(String(entry.netForeign))
-      if (!net.toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP).gt(0) && !net.add(D(String(entry.taxForeign))).toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP).gt(0)) continue
-      const place = catalogue.place(entry.taxRateId)
+    const fx = parseDecimalStrict(row.fxRateToBase)
+    if (fx === null || !fx.gt(0)) return inconclusive([LEDGER], 'BAD_VALUE')
+    const parts = invoiceDiscountParts({
+      split,
+      lineAmountsIncludeTax: row.amountsIncludeVat,
+      totalAmount: total.toNumber(),
+      // The code each entry is posted on: its rate's own accounting tax code (the invoice reads it from the rate now), else a key of its own so an entry with no rate never merges.
+      taxTypeOf: (entry) => catalogue.typeOf(entry.taxRateId),
+    })
+    if (parts === null) return inconclusive([LEDGER], 'BAD_VALUE')
+    const rateOfPart = new Map<string | null, number>()
+    for (const entry of split) if (!rateOfPart.has(entry.taxRateId)) rateOfPart.set(entry.taxRateId, entry.rate)
+    for (const part of parts) {
+      const vatRate = D(String(rateOfPart.get(part.taxRateId) ?? 0))
+      const taxForeign = (row.amountsIncludeVat ? D(String(part.amount)).mul(vatRate).div(vatRate.add(1)) : D(String(part.amount)).mul(vatRate)).toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP)
+      if (taxForeign.isZero()) continue
+      // Each part's VAT is a constituent figure: on a rate with no verified place it makes the item unverified, whatever it nets to.
+      const place = catalogue.place(part.taxRateId)
       if (place === null) return inconclusive([LEDGER], 'VAT_MAPPING_UNVERIFIED')
       imsRows += 1
-      add(imsSums, { period: row.period, ...place }, share.neg())
+      add(imsSums, { period: row.period, ...place }, taxForeign.div(fx).neg())
     }
   }
   // The storefront's rate ids resolve through IMS's own mapping rows.

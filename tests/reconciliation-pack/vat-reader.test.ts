@@ -42,12 +42,12 @@ test('the section carries the base currency, the monthly sales tax per rate, the
     settings: [{ key: 'xero_shipping_account', value: ' 260 ' }, { key: 'xero_sales_account', value: '200' }, { key: 'xero_discount_account', value: '' }],
     chart: [{ n: '1' }],
     fx: [{ external_id: '9001', currency: 'EUR', fx: '1.15000000' }],
-    splits: [{ period: '2026-09', id: 'so-1', discount: '26.0000', split: '[{"taxRateId":"rGB","taxBase":4}]' }],
+    splits: [{ period: '2026-09', id: 'so-1', discount: '26.0000', split: '[{"taxRateId":"rGB","taxBase":4}]', fx: '1.00000000', incl: false }],
   })
   assert.deepEqual(section, { ok: true, value: {
     baseCurrency: 'GBP', window: WINDOW,
     sales: [{ period: '2026-08', taxRateId: 'rGB', taxBase: '50.0000', lines: 2, nonZeroLines: 2 }, { period: '2026-09', taxRateId: 'rGB', taxBase: '100.0000', lines: 3, nonZeroLines: 3 }, { period: '2026-09', taxRateId: null, taxBase: '0.0000', lines: 1, nonZeroLines: 0 }],
-    discountSplits: [{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: '[{"taxRateId":"rGB","taxBase":4}]' }],
+    discountSplits: [{ period: '2026-09', orderId: 'so-1', discount: '26.0000', split: '[{"taxRateId":"rGB","taxBase":4}]', fxRateToBase: '1.00000000', amountsIncludeVat: false }],
     xeroTenantId: 'tenant-1', xeroReportTypes: [{ taxType: 'OUTPUT2', reportTaxType: 'OUTPUT' }, { taxType: 'NONE', reportTaxType: null }], shippingAccount: '260', shippingAccountInChart: true, salesAccount: '200', discountAccount: '', wooFx: [{ externalOrderId: '9001', currency: 'EUR', fxRateToBase: '1.15000000' }],
   } })
   // The window is a parameter of the sales statement, and the statement leaves out cancelled and archived orders (the IMS VAT report's own population).
@@ -104,10 +104,11 @@ test('a row that cannot be read exactly makes the whole section unreadable: a ba
     ['two settings', { settings: [{ key: 'xero_shipping_account', value: '1' }, { key: 'xero_shipping_account', value: '2' }] }, 'DUPLICATE_KEY'],
     ['fx rate', { fx: [{ external_id: '9', currency: 'EUR', fx: 'x' }] }, 'BAD_VALUE'],
     ['fx duplicate', { fx: [{ external_id: '9', currency: 'EUR', fx: '1.1' }, { external_id: '9', currency: 'EUR', fx: '1.1' }] }, 'DUPLICATE_KEY'],
-    ['split period', { splits: [{ period: '2026-13', id: 'so', discount: '1.0000', split: '[]' }] }, 'SOURCE_UNREADABLE'],
+    ['split period', { splits: [{ period: '2026-13', id: 'so', discount: '1.0000', split: '[]', fx: '1', incl: false }] }, 'SOURCE_UNREADABLE'],
     ['split discount', { splits: [{ period: '2026-09', id: 'so', discount: '1e3', split: '[]' }] }, 'BAD_VALUE'],
     ['split not text', { splits: [{ period: '2026-09', id: 'so', discount: '1.0000', split: [] }] }, 'SOURCE_UNREADABLE'],
-    ['split duplicate', { splits: [{ period: '2026-09', id: 'so', discount: '1.0000', split: '[]' }, { period: '2026-09', id: 'so', discount: '1.0000', split: '[]' }] }, 'DUPLICATE_KEY'],
+    ['split duplicate', { splits: [{ period: '2026-09', id: 'so', discount: '1.0000', split: '[]', fx: '1', incl: false }, { period: '2026-09', id: 'so', discount: '1.0000', split: '[]', fx: '1', incl: false }] }, 'DUPLICATE_KEY'],
+    ['split rate', { splits: [{ period: '2026-09', id: 'so', discount: '1.0000', split: '[]', fx: '1e3', incl: false }] }, 'BAD_VALUE'],
   ]
   for (const [name, answers, reason] of cases) assert.deepEqual((await read(answers)).section, { ok: false, reason }, name)
 })
