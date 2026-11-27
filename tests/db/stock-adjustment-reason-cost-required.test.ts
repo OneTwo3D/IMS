@@ -419,6 +419,92 @@ test('stock adjustments: reason and unit cost required (switch on) and unchanged
     await setSwitch(false)
   })
 
+  /** A stock movement and the layer it created, written in one transaction (the DB requires inbound movements to carry their cost-layer evidence at commit). */
+  const movementWithLayer = (productId: string, warehouseId: string, movementType: 'ADJUSTMENT' | 'OPENING_STOCK' | 'RETURN_INBOUND', unitCostBase: number, layer: { poLineId?: string; opening?: boolean; viaReturn?: boolean; receivedAt: Date }) =>
+    db.$transaction(async (tx) => {
+      const m = await tx.stockMovement.create({
+        data: { type: movementType, productId, toWarehouseId: warehouseId, qty: 4, unitCostBase, totalValueBase: unitCostBase * 4 },
+        select: { id: true },
+      })
+      await tx.costLayer.create({
+        data: {
+          productId, warehouseId, receivedQty: 4, remainingQty: 4, unitCostBase, receivedAt: layer.receivedAt,
+          ...(layer.poLineId ? { poLineId: layer.poLineId } : {}),
+          ...(layer.opening ? { isOpeningStock: true } : {}),
+          ...(layer.viaReturn ? { returnMovementId: m.id } : { adjustmentMovementId: m.id }),
+        },
+      })
+      await tx.stockLevel.upsert({ where: { productId_warehouseId: { productId, warehouseId } }, create: { productId, warehouseId, quantity: 4 }, update: { quantity: { increment: 4 } } })
+      return m
+    })
+
+  await t.test('F1: a Mintsoft align-up layer (PO line AND adjustment movement) is the default; a plain adjustment layer and a refund restock are not', async () => {
+    const w = await warehouse('f1')
+    const p = await product('f1')
+    const poLineId = await poLineFor(p.id)
+    const base = Date.now() - 600_000
+    await movementWithLayer(p.id, w.id, 'ADJUSTMENT', 6, { poLineId, receivedAt: new Date(base) }) // the alignment layer
+    await movementWithLayer(p.id, w.id, 'ADJUSTMENT', 9, { receivedAt: new Date(base + 60_000) }) // a plain adjustment layer, newer
+    await movementWithLayer(p.id, w.id, 'RETURN_INBOUND', 8, { poLineId, viaReturn: true, receivedAt: new Date(base + 120_000) }) // a refund restock, newer still
+    await setSwitch(true)
+    const res = await single({ productId: p.id, warehouseId: w.id, qty: '2', reasonId: mapped })
+    assert.equal(res.success, true, JSON.stringify(res))
+    assert.equal((await lastMovement(p.id))!.unitCostBase!.toFixed(6), '6.000000', 'the alignment layer, not the newer adjustment or refund-restock layers')
+    await setSwitch(false)
+  })
+
+  await t.test('F2: an opening-stock-only product takes the latest opening batch cost for a blank addition and a stock-count surplus; zero-cost opening is skipped; OFF unchanged', async () => {
+    const wOlder = await warehouse('f2-older')
+    const wNewer = await warehouse('f2-newer')
+    const wZero = await warehouse('f2-zero')
+    const wNone = await warehouse('f2-none')
+    const p = await product('f2')
+    const base = Date.now() - 600_000
+    // One opening layer per product and warehouse (a DB constraint), so the "batches" sit in different warehouses.
+    await movementWithLayer(p.id, wOlder.id, 'OPENING_STOCK', 3, { opening: true, receivedAt: new Date(base) })
+    await movementWithLayer(p.id, wNewer.id, 'OPENING_STOCK', 5.5, { opening: true, receivedAt: new Date(base + 60_000) })
+    await movementWithLayer(p.id, wZero.id, 'OPENING_STOCK', 0, { opening: true, receivedAt: new Date(base + 120_000) })
+    await setSwitch(true)
+    const blank = await single({ productId: p.id, warehouseId: wNone.id, qty: '2', reasonId: mapped })
+    assert.equal(blank.success, true, JSON.stringify(blank))
+    assert.equal((await lastMovement(p.id))!.unitCostBase!.toFixed(6), '5.500000', 'the latest NON-ZERO opening batch anywhere, never the average (2.8333...)')
+    const here = await single({ productId: p.id, warehouseId: wOlder.id, qty: '1', reasonId: mapped })
+    assert.equal(here.success, true, JSON.stringify(here))
+    assert.equal((await lastMovement(p.id))!.unitCostBase!.toFixed(6), '3.000000', 'this warehouse\'s opening batch first')
+
+    // Stock count surplus on the same opening-only product posts under "Stock count" at the opening cost.
+    const stockCountReason = await reason('Stock count', '821')
+    const wCount = await warehouse('f2-count')
+    const p2 = await product('f2-count')
+    await movementWithLayer(p2.id, wCount.id, 'OPENING_STOCK', 4.25, { opening: true, receivedAt: new Date(base) })
+    const created = await counts.createStockCount({ warehouseId: wCount.id })
+    assert.ok(created.success && created.count, JSON.stringify(created))
+    countIds.push(created.count!.id)
+    const line = created.count!.lines.find((l) => l.productId === p2.id)
+    assert.ok(line, 'the opening-only product is on the count')
+    await counts.saveStockCountCounts({ countId: created.count!.id, counts: [{ lineId: line!.id, countedQty: 7 }] })
+    await counts.reconcileStockCount({ countId: created.count!.id, counts: [{ lineId: line!.id, countedQty: 7 }] })
+    const posted = await counts.postStockCount({ countId: created.count!.id })
+    assert.equal(posted.success, true, JSON.stringify(posted))
+    const surplus = await lastMovement(p2.id)
+    assert.equal(surplus!.qty.toFixed(6), '3.000000')
+    assert.equal(surplus!.unitCostBase!.toFixed(6), '4.250000', 'the surplus is valued at the opening batch cost')
+    await db.adjustmentReason.update({ where: { id: stockCountReason }, data: { active: false } })
+
+    // Opening layers that are all zero still refuse a blank addition (zero is only ever booked when entered).
+    const p3 = await product('f2-zero')
+    await movementWithLayer(p3.id, wZero.id, 'OPENING_STOCK', 0, { opening: true, receivedAt: new Date(base) })
+    const refused = await single({ productId: p3.id, warehouseId: wNone.id, qty: '1', reasonId: mapped })
+    assert.match(refused.message ?? '', /Enter a unit cost for this addition/)
+
+    // OFF: unchanged (a blank addition takes the average).
+    await setSwitch(false)
+    const off = await single({ productId: p.id, warehouseId: wNone.id, qty: '1' })
+    assert.equal(off.success, true, JSON.stringify(off))
+    // The switch-off path is the average path, untouched: here this warehouse's own layer (the 5.5 booked above) is its average.
+    assert.equal((await lastMovement(p.id))!.unitCostBase!.toFixed(6), '5.500000')
+  })
+
   await t.test('LOW-7: ON builds the journal from the 6dp movement total (no one-penny mismatch)', async () => {
     const w = await warehouse('low7')
     const p = await product('low7')
