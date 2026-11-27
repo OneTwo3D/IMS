@@ -26,6 +26,7 @@ import type { PageInfo, StockPositionFilters } from '@/lib/domain/inventory/stoc
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { dateOnly, startOfUtcDay, subtractUtcDays, utcCalendarDayDelta } from '@/lib/domain/math/date-window'
 import { sourceLimitNotice } from '@/lib/security/source-scan-error'
+import { isQuarantineWarehouseType, readReturnConditionCheckEnabled } from '@/lib/domain/inventory/quarantine-warehouse'
 
 export const SLOW_STOCK_RATE_WINDOW_DAYS = 90
 /** Sales rate is reported as units per this many days. */
@@ -79,6 +80,11 @@ export type SlowStockReportRow = {
   ratePer30Days: string
   /** Null when nothing sold in the window (cover is unbounded). */
   monthsOfCover: string | null
+  /**
+   * Switch return_condition_check_enabled: the units of this row held in a quarantine warehouse (unsellable returns awaiting
+   * review). Present only with the switch on and a quantity above zero.
+   */
+  quarantineQty?: string
 }
 
 export type SlowStockReport = {
@@ -222,6 +228,8 @@ export type SlowStockReportClient = {
   stockLevel: FindManyDelegate
   costLayer: FindManyDelegate
   stockMovement: GroupByDelegate
+  /** Settings, for the switch return_condition_check_enabled. Optional: a client without it reads the switch as off. */
+  setting?: unknown
 }
 
 export type SlowStockReportDeps = { client?: SlowStockReportClient; now?: () => Date }
@@ -238,7 +246,7 @@ type LevelRow = {
     category: { name: string } | null
     supplierProducts: Array<{ supplier: { name: string } }>
   }
-  warehouse: { code: string }
+  warehouse: { code: string; type?: string }
 }
 
 type LayerRow = { productId: string; warehouseId: string; remainingQty: DecimalInput; unitCostBase: DecimalInput; receivedAt: Date }
@@ -348,6 +356,7 @@ export async function getSlowStockReport(
   const now = options.deps?.now?.() ?? new Date()
   const costVisible = filters.includeCost === true
   const perWarehouse = filters.perWarehouse === true
+  const conditionCheck = await readReturnConditionCheckEnabled(client)
   const productTypeFilter = directLayerProductTypeFilter(filters as StockPositionFilters)
   const windowTo = startOfUtcDay(now)
   const windowFrom = subtractUtcDays(windowTo, SLOW_STOCK_RATE_WINDOW_DAYS - 1)
@@ -389,6 +398,7 @@ export async function getSlowStockReport(
         `Last sale is the latest SALE_DISPATCH movement ever recorded; the rate is SALE_DISPATCH units from ${dateOnly(windowFrom)} to ${dateOnly(windowTo)} (${SLOW_STOCK_RATE_WINDOW_DAYS} days) per 30 days. Returns are not netted off. Months of cover = on hand / rate, blank when nothing sold in the window.`,
         'Virtual KIT SKUs hold no stock of their own and are excluded; their components are reported from their own layers.',
         'This report only finds candidates. Judging net realisable value and posting any write-down is a manual stock adjustment.',
+        ...(conditionCheck ? ['Units in a quarantine warehouse (unsellable returns awaiting review) are included and marked Quarantine; filter by that warehouse to review them alone. Write them off with a stock adjustment, or transfer them back to stock.'] : []),
         ...(!costVisible ? ['Cost and value are hidden for your role; rows are ordered by layer age.'] : []),
         ...(costVisible && filters.minValueBase && parseMinValue(filters.minValueBase) == null ? ['The minimum value was not a valid number and was ignored.'] : []),
         ...(missingLayerRows > 0 ? [`${missingLayerRows.toLocaleString()} row(s) hold stock but no open cost layer; their value is 0 and their age is blank.`] : []),
@@ -425,7 +435,7 @@ export async function getSlowStockReport(
             },
           },
         },
-        warehouse: { select: { code: true } },
+        warehouse: { select: { code: true, ...(conditionCheck ? { type: true } : {}) } },
       },
       orderBy: [{ product: { sku: 'asc' } }, { warehouse: { code: 'asc' } }],
       take: SLOW_STOCK_LEVEL_ROW_LIMIT + 1,
@@ -479,6 +489,9 @@ export async function getSlowStockReport(
     const first = group.levels[0]
     const groupLayers = group.levels.flatMap((level) => layersByStock.get(stockKey(level.productId, level.warehouseId)) ?? [])
     const qty = group.levels.reduce((sum, level) => sum.add(toDecimal(level.quantity)), new Prisma.Decimal(0))
+    const quarantineQty = conditionCheck
+      ? group.levels.filter((level) => isQuarantineWarehouseType(level.warehouse.type)).reduce((sum, level) => sum.add(toDecimal(level.quantity)), new Prisma.Decimal(0))
+      : null
     const value = layersValue(groupLayers)
     const oldest = oldestOpenLayerAt(groupLayers)
     if (!oldest) missingLayerRows += 1
@@ -515,6 +528,7 @@ export async function getSlowStockReport(
       soldQtyInWindow: roundQuantity(sale.soldQty, 4).toString(),
       ratePer30Days: unitsPer30Days(sale.soldQty).toString(),
       monthsOfCover: cover ? cover.toString() : null,
+      ...(quarantineQty && quarantineQty.gt(0) ? { quarantineQty: roundQuantity(quarantineQty, 4).toString() } : {}),
     }
     if (matchesSlowStockFilters(row, { minAgeDays, noSaleDays, minValueBase: minValue })) rows.push(row)
   }

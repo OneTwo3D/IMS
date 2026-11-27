@@ -306,8 +306,12 @@ export async function getStockPositionExportResponse(
         soldQtyInWindow: r.soldQtyInWindow,
         ratePer30Days: r.ratePer30Days,
         monthsOfCover: r.monthsOfCover ?? '',
+        quarantineQty: r.quarantineQty ?? '',
       }))
-      return csvResponseFor(req, toCsv(data, columns), `slow-stock-${date}.csv`, {
+      // Switch return_condition_check_enabled: a quarantineQty column is added only when some row holds quarantine stock, so an
+      // export with the switch off (or no quarantine stock) has exactly the columns of before.
+      const exportColumns = report.rows.some((r) => r.quarantineQty) ? [...columns, 'quarantineQty'] : columns
+      return csvResponseFor(req, toCsv(data, exportColumns), `slow-stock-${date}.csv`, {
         generatedAt: report.generatedAt,
         rateWindowDateFrom: report.rateWindowDateFrom,
         rateWindowDateTo: report.rateWindowDateTo,

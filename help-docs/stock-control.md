@@ -169,6 +169,46 @@ Stock the warehouse system has already brought in (through its stock sync) count
 A transfer that stays in transit for a long time is reported to administrators as stranded, counted from its dispatch date.
 
 
+## Quarantine: unsellable returns (switched off by default)
+
+Returned goods that cannot be sold again should not go back into sellable stock at their full cost (FRS 102 s13.4: stock is carried at the lower of cost and estimated selling price). With the **Condition check on returns** switch on (**Settings > Sales**; the `return_condition_check_enabled` setting, **off by default**), every restock of a return asks for the condition of the items, and unsellable items are kept apart in a **quarantine warehouse** until you decide what to do with them. With the switch off, nothing on this page applies: returns go to the warehouse chosen for them, as before, and no condition is asked for.
+
+### Setting up the quarantine warehouse
+
+A quarantine warehouse is an ordinary warehouse whose **Type** is **Quarantine** (**Settings > Inventory > Warehouses**). Create one (for example code `QAR`) before switching the check on. While the switch is on:
+
+- A quarantine warehouse cannot be marked **Available for sale**, **Sync to store** or **Default warehouse**: saving it with any of those is refused with a message naming the option to clear. It may be the **default return warehouse** if you want every storefront return inspected first (see *Storefront refunds* below).
+- It cannot be bound to a warehouse system (**Warehouse** page, Mintsoft binding): it is kept in IMS only, so nothing in it is ever reported to the warehouse system as sellable.
+
+### What quarantine stock is (and is not)
+
+Units in a quarantine warehouse are **on hand at their cost**, but they are not sellable. While the switch is on they are:
+
+- **never allocated** to an order: automatic allocation leaves the warehouse out, and a manual allocation to it (or moving an allocation into it) is refused. The order page's allocation list does not offer it.
+- **never counted as available**: the product list and product page count them in **On hand** but not in **Available** (the product page marks the warehouse **Quarantine** and shows 0 available there), and the dashboard stock tiles, the sales statistics and **Reorder Planning** leave them out, so quarantined units never cover demand or hold back a reorder.
+- **never pushed to the store**: the WooCommerce stock push leaves the warehouse out even if it was flagged to sync.
+- not usable in a **production order** (the order is refused for a quarantine warehouse).
+
+Their value stays in Inventory: putting units into quarantine moves no value and posts no journal of its own.
+
+### Recording the condition when you restock
+
+- **Refund dialog** (sales order, **Refund**): when the refund returns stock to a warehouse, choose **Condition of returned items**. **Sellable** offers the ordinary warehouses; **Unsellable** offers the quarantine warehouses. The refund is refused if no condition is chosen, if an unsellable return is sent to an ordinary warehouse, or if a sellable one is sent to quarantine. **No stock return** needs no condition.
+- **Mintsoft returns inbox** (**Warehouse** page, **Restock**): the restock dialog has the same **Condition of the returned items** choice, and the warehouse list follows it. Restocking a parcel that clears a return in transit works the same way.
+
+In both, the stock comes back exactly as it would without the check: at the cost of the units that were shipped (the return cost layer), with the same cost-reversal journal as before. Only the warehouse is different. The condition is recorded on the refund's activity entry and on the returns inbox item's resolution note.
+
+**Storefront refunds.** A refund imported from WooCommerce has no one to ask, so it is restocked to the **default return warehouse** as before. If that is a quarantine warehouse, every storefront return lands in quarantine and is reviewed there; otherwise move unsellable units with a transfer (below).
+
+### Reviewing the quarantine
+
+Filter any stock report by the quarantine warehouse to see what is waiting (**Analytics > Slow Stock** also marks quarantine units **Quarantine** on each row and adds a `quarantineQty` column to its CSV export when there are any). For each item, decide:
+
+- **Write it off**: make a **stock adjustment** in the quarantine warehouse with a negative quantity and a reason mapped to your write-off account (for example *Damaged goods* mapped to a stock write-off expense account; see *Adjustment Reasons* and *Xero Account Mapping* above). The units leave at the cost of their oldest quarantine layers (FIFO) and the journal is Dr the reason's account / Cr Inventory, as for any removal. Create and map the reason before you need it: a reason without an account cannot post its journal.
+- **Return it to stock**: make a **warehouse transfer** from the quarantine warehouse to a sellable warehouse (dispatch and receive it as usual). The cost layers move with the units at their own cost, so nothing is revalued, and the units become available and are pushed to the store once received. A transfer into a warehouse bound to Mintsoft raises its goods-in notice (ASN) as usual.
+
+A return with some sellable and some unsellable items: record it with the condition of most of them, then move the others with a transfer (sellable warehouse to quarantine, or back). A transfer takes the oldest layers of the source warehouse, which may not be the returned units' own layer.
+
 ## FIFO and Cost Layers
 
 Every stock-in (purchase receipt, manufacturing output, transfer-in) creates a **cost layer** — a record of how much stock arrived at what unit cost, per warehouse. Every stock-out (sale, transfer-out, negative adjustment) consumes from the **oldest layer first** — strict FIFO. The system never picks layers out of order, and never lets a layer's remaining quantity go negative.
