@@ -80,6 +80,7 @@ test('admin sidebar analytics items group reports under expected section heading
         '/analytics/stock-on-hand',
         '/analytics/inventory-aging',
         '/analytics/dead-stock',
+        '/analytics/slow-stock',
         '/analytics/stock-allocations',
         '/analytics/negative-stock',
       ],

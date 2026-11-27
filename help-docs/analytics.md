@@ -26,7 +26,7 @@ The **CSV** button on a report downloads the filtered result as **data rows only
 |---|---|
 | Sales Statistics, Product Profitability, Inventory Report | Admin, Manager, Finance |
 | Purchase Statistics (page, data and its CSV exports) and the Purchasing reports (Open POs, Supplier Performance, Purchase Price Variance, Spend, Lead Times) | Admin, Manager, Finance |
-| Stock Position reports | Admin, Manager, Finance, Read-only, Warehouse |
+| Stock Position reports | Admin, Manager, Finance, Read-only, Warehouse. Slow Stock hides cost and value (columns, tiles, the minimum-value filter, the CSV value column) for roles without the `inventory.prices` permission: Read-only and Warehouse see quantities, ages, sales and cover only |
 | Stock Movement Ledger, Stock Adjustments, Stock Transfers, Stock Counts | Admin, Manager, Finance, Warehouse |
 | Inventory Valuation, COGS Report, Landed Cost Analysis, Inventory Turnover | Admin, Manager, Finance |
 | Replenishment (Reorder Planning, Backorders, Component Shortages), Sales reports, Manufacturing reports | Admin, Manager, Finance |
@@ -36,7 +36,7 @@ A role that is not allowed a report does not see it in the Analytics menu and is
 
 ### Source-row limits
 
-To keep large reports responsive, the underlying data fetch is capped per report, and the cap depends on the report family: **50,000 source rows** for Sales, Purchasing, Finance, Replenishment (reorder, backorder, component shortage) and Manufacturing reports, and **100,000 source rows** for Inventory Health (aging, dead stock) and Inventory Costing (COGS, inventory turnover). If your date range or filters select more than that, the report is **not computed**. A red banner at the top of the page says "This report hit its row limit (<the report's limit> rows); narrow the date range or filters", the summary tiles show a dash instead of a figure, and the table says "Report not computed". It never shows zeros or "No rows" for a report that was refused. The CSV button gives the same refusal as a file, not an error: a normal download (HTTP 200) with the report's usual column headings and one row whose first cell reads `REPORT NOT COMPUTED` and whose next cell carries the same message, with no data rows and no totals. It is never a file of zeros. Scripts can detect it from the `X-IMS-Report-Not-Computed: 1` response header (the row limit is in `X-IMS-Report-Row-Limit` and in the `X-IMS-Export-Metadata` header).
+To keep large reports responsive, the underlying data fetch is capped per report, and the cap depends on the report family: **50,000 source rows** for Sales, Purchasing, Finance, Replenishment (reorder, backorder, component shortage) and Manufacturing reports, and **100,000 source rows** for Inventory Health (aging, dead stock, slow stock) and Inventory Costing (COGS, inventory turnover). If your date range or filters select more than that, the report is **not computed**. A red banner at the top of the page says "This report hit its row limit (<the report's limit> rows); narrow the date range or filters", the summary tiles show a dash instead of a figure, and the table says "Report not computed". It never shows zeros or "No rows" for a report that was refused. The CSV button gives the same refusal as a file, not an error: a normal download (HTTP 200) with the report's usual column headings and one row whose first cell reads `REPORT NOT COMPUTED` and whose next cell carries the same message, with no data rows and no totals. It is never a file of zeros. Scripts can detect it from the `X-IMS-Report-Not-Computed: 1` response header (the row limit is in `X-IMS-Report-Row-Limit` and in the `X-IMS-Export-Metadata` header).
 
 The cap applies before any aggregation, so a report that displays "120 supplier rows" might still hit it if those 120 rows roll up from millions of PO lines — narrow by date in that case.
 
@@ -47,10 +47,38 @@ The cap applies before any aggregation, so a report that displays "120 supplier 
 | **Stock on Hand** | Current or as-of stock quantity, reserved quantity, available quantity, unit cost, total value, and reservation evidence. |
 | **Inventory Aging** | FIFO cost-layer quantity and value by age bucket. BOM products age from their production layers. Virtual KIT products hold no cost layers of their own, so they are left out of the list; if you filter to Type KIT the report is empty and says so, and you age the component SKUs instead. |
 | **Dead Stock** | Current positive-stock SKUs with no recent sales-dispatch demand inside the selected threshold. Recent never-sold SKUs can be treated separately from dead stock. |
+| **Slow Stock (NRV review)** | One row per product (or per product and warehouse) with on-hand quantity, on-hand value from the open FIFO cost layers, the age of the oldest layer that still has stock, the last sale date, the sales rate and the months of cover. Built for the period-end lower-of-cost-and-net-realisable-value review. See [Slow Stock and the period-end NRV review](#slow-stock-and-the-period-end-nrv-review) below. |
 | **Stock Allocations** | Reserved stock by source, including sales, manufacturing, and unattributed reservation drift. |
 | **Negative Stock** | Current negative stock rows and products that went negative during the selected movement window. |
 
 Warehouse users can access the stock-position report family. Broader analytics roles can access the full analytics menu.
+
+### Slow Stock and the period-end NRV review
+
+FRS 102 section 13.4 values stock at the lower of cost and net realisable value (NRV). IMS carries stock at FIFO cost and has no automatic write-down, so at each period end someone has to decide which stock may be worth less than it cost. **Analytics > Stock Position > Slow Stock (NRV review)** lists the candidates. It is read only: it never changes stock or values, and a write-down is still booked as a manual stock adjustment.
+
+**Columns** (one row per product; tick **One row per warehouse** to split by warehouse, or pick a Warehouse to scope every figure to it):
+
+| Column | Meaning |
+|---|---|
+| On hand | Current `StockLevel` quantity, summed across warehouses. |
+| Value | Sum of remaining layer quantity times that layer's current unit cost (exact decimal arithmetic). Needs cost visibility, see below. |
+| Oldest layer | Days since the oldest cost layer that **still has stock** was received, with its band (0-90, 91-180, 181-365, 365+ days). Fully consumed layers do not count. "No layer" means stock is held with no open cost layer; its value is shown as 0. |
+| Last sale | Date of the latest sales-dispatch movement ever recorded for the product (no time limit). "Never" means none. Adjustments, transfers and returns are not sales. |
+| Sold per 30 days | Units dispatched on sales in the last 90 days (to today, UTC), divided by 90 and multiplied by 30. Returns are not netted off. |
+| Months of cover | On hand divided by the 30-day rate. Blank ("No sales") when nothing sold in the 90 days: the cover is unbounded, so read it together with the last sale date. |
+
+**Filters:** *Oldest layer at least (days)* (try 90, 180 or 365), *No sale in (days)* (a never-sold product only matches when its stock is itself at least that old, so a brand-new product is not flagged), *Minimum value*, warehouse, category, supplier and type. Rows are sorted by value, highest first (the value at risk), then by age. Virtual KIT products hold no stock of their own and are left out; their components appear on their own rows. Positions are current (there is no as-of date).
+
+**Using it for the period-end review:**
+
+1. Open the report on the first working day after the period ends. Start with *Oldest layer at least* 365 and *No sale in* 365, then repeat at 180 and 90 to widen the net. Set a *Minimum value* so the review covers the lines that matter.
+2. For each row, use the last sale, rate and cover to judge whether the stock can still be sold at or above cost. A product with years of cover, or old layers and no sales, is the main candidate. Open the product to check its current selling price, any discounts or clearance, and the cost to sell.
+3. Decide the NRV per product and record the judgement and evidence outside IMS (the report is the list of what was reviewed, so keep the CSV with the working papers).
+4. Book any write-down as a **negative stock adjustment** (Stock Control > Stock Adjustments) with a reason, so it is audited. Check the Stock Adjustments report afterwards.
+5. Export with the **CSV** button. The file holds the same filtered rows; a report that hit its row limit downloads as the "REPORT NOT COMPUTED" file described under Source-row limits.
+
+**Who sees costs:** the report is open to the Stock Position roles, but value and the minimum-value filter appear only for roles holding `inventory.prices` (Admin, Manager, Finance). Other roles see quantities, ages, sales and cover, ordered by layer age, and their CSV has no value column.
 
 ## Inventory Ledger and Costing
 
