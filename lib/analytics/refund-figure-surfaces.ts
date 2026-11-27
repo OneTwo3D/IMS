@@ -170,7 +170,7 @@ export const RETURNS_EXCHANGE_NOTICE =
 export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   {
     file: 'lib/domain/erasure/erasure-classification.ts',
-    figures: ['revenueDeferredBatchRef'],
+    figures: ['revenueDeferredBatchRef', 'revenueDeferralUnwindReason', 'revenueDeferralUnwindRef'],
     treatment: 'not-refund-sensitive',
     reason:
       'A catalogue of column NAMES for the personal-data erasure (one entry is the ledger batch reference column, classified not-personal). It computes and displays no figure.',

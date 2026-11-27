@@ -8,6 +8,7 @@ import { loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory
 import { loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
 import { COGS_CROSS_CHECK_FLOWS, TRANSIT_CROSS_CHECK_FLOWS, crossCheckSubledgerAgainstQueuedJournals, type SubledgerCrossCheck } from '@/lib/domain/accounting/subledger-journal-cross-check'
 import { loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { openInvoiceBasisDeferral, type OpenDeferralInputs } from '@/lib/domain/accounting/invoice-basis-deferral'
 import { reversalRecordVerdict } from '@/lib/domain/sales/refund-reversal-record'
 
@@ -1142,8 +1143,8 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
       code: 'invoice_basis_deferral_stranded',
       orderId: order.id,
       message: open.ok
-        ? `Sales order ${label} still holds £${open.open.toFixed(2)} of revenue deferred from its invoice in Unearned Revenue, but ${why}, so no shipment will release it`
-          + (order.revenueDeferralUnwindOwedAt != null ? '; the daily batch owes its unwind and has not posted it yet' : '; credit the order (refund) or post the release by hand')
+        ? withLedgerCheck(`Sales order ${label} still holds £${open.open.toFixed(2)} of revenue deferred from its invoice in Unearned Revenue, but ${why}, so no shipment will release it`
+          + (order.revenueDeferralUnwindOwedAt != null ? '; the daily batch owes its unwind and has not posted it yet' : '; credit the order (refund) or post the release by hand'))
         : `Sales order ${label} holds revenue deferred from its invoice, but ${why}, and the open amount cannot be established (${open.reason})`,
       details: {
         status: order.status,

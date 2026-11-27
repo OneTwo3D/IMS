@@ -2954,7 +2954,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
             continue
           }
           if (open.open.greaterThan(0) && !(order.revenueDeferredBatchRef && postedRefs.has(order.revenueDeferredBatchRef))) {
-            result.errors.push(`Group A1 unwind: order ${label}: its deferral journal ${order.revenueDeferredBatchRef ?? '(none)'} is not known to have reached the ledger, so the £${open.open.toFixed(2)} is not reversed; check the Unearned Revenue account and post by hand if it did`)
+            result.errors.push(withLedgerCheck(`Group A1 unwind: order ${label}: its deferral journal ${order.revenueDeferredBatchRef ?? '(none)'} is not known to have reached the ledger, so the £${open.open.toFixed(2)} is not reversed; check the Unearned Revenue account and post the release by hand if the deferral did post`))
             continue
           }
           ready.push({ orderId: order.id, amount: open.open.toFixed(2), day: businessDay(order.revenueDeferralUnwindOwedAt) })
