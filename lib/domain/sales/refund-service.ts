@@ -4299,7 +4299,7 @@ export async function createSalesOrderRefund(
             // The VAT this line actually bore, as the order recorded it once at creation/import.
             taxForeign: true,
             taxRateId: true,
-            taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
+            taxRate: { select: { accountingTaxType: true, reverseCharge: true, rate: true } },
           },
         },
         shipments: {
