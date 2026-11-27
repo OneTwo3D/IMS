@@ -103,3 +103,21 @@ test('the stranded-deferral invariant: INVOICE basis only, not yet unwound, and 
   assert.equal(codes({ status: 'CANCELLED', revenueDeferralBasis: null }).length, 0)
   assert.equal(codes({ status: 'CANCELLED', shipments: [{ shipmentJournalDate: new Date(), revenueRecognizedAmount: '400' }] }).length, 0, 'fully released')
 })
+
+test('the stranded-Allocated invariant: a CANCELLED INVOICE-basis order with its invoice gone and A2 debit still open', async () => {
+  const { evaluateAccountingInvariantRows } = await import('@/lib/domain/accounting/invariants')
+  const codes = (over: Record<string, unknown>) => evaluateAccountingInvariantRows({
+    salesOrders: [], postedShipments: [], syncLogs: [], unresolvedAllocationBasisRefunds: [], reversalNeverRecordedRefunds: [],
+    strandedInvoiceBasisDeferrals: [{
+      id: 'so-1', orderNumber: 'SO-1', externalOrderNumber: null, status: 'CANCELLED', accountingInvoiceId: null, revenueDeferralBasis: 'INVOICE',
+      unearnedRevenueAmount: '400', revenueDeferralUnwoundAmount: '400', revenueDeferralUnwindOwedAt: new Date(), revenueDeferralUnwindReason: 'INVOICE_DELETED',
+      inventoryAllocatedDate: new Date(), allocationBatchAmount: '40', allocationReversalAmount: null,
+      shipments: [], refunds: [], allocationShipmentRelief: [], allocationRefundRelief: [], ...over,
+    } as never],
+  }).filter((f) => f.code === 'invoice_basis_allocation_stranded')
+  assert.equal(codes({}).length, 1, 'open A2 debit on a cancelled, invoice-gone order')
+  assert.equal(codes({ allocationReversalAmount: '40' }).length, 0, 'reversed')
+  assert.equal(codes({ status: 'ALLOCATED' }).length, 0, 'not cancelled: it can still ship')
+  assert.equal(codes({ accountingInvoiceId: 'INV-1', revenueDeferralUnwoundAmount: null, revenueDeferralUnwindOwedAt: null }).length, 0, 'invoice still standing: the refund owns it')
+  assert.equal(codes({ revenueDeferralBasis: 'PAID' }).length, 0)
+})

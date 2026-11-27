@@ -499,10 +499,17 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/connectors/xero/daily-sync.ts',
-    figures: ['shippedRevenue', 'shippedRevenueOf', 'proportionalRevenue', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueProportion', 'revenueRecognizedAmount', 'runningRevenue', 'totalRevenueDeferred', 'groupRevenue', 'groupRevenueRaw', 'unearnedRevenueAmount', 'xero_unearned_revenue_account', 'revenueDeferralEventAt', 'revenueDeferralBasis', 'revenueDeferralUnwindOwedAt', 'revenueDeferralUnwindRef', 'revenueDeferralUnwoundAmount'],
+    figures: ['shippedRevenue', 'shippedRevenueOf', 'proportionalRevenue', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueProportion', 'revenueRecognizedAmount', 'runningRevenue', 'totalRevenueDeferred', 'groupRevenue', 'groupRevenueRaw', 'unearnedRevenueAmount', 'xero_unearned_revenue_account', 'revenueDeferralEventAt', 'revenueDeferralBasis', 'revenueDeferralUnwindOwedAt', 'revenueDeferralUnwindRef', 'revenueDeferralUnwoundAmount', 'revenueDeferralUnwindReason'],
     treatment: 'not-refund-sensitive',
     reason:
       'Revenue deferral/recognition journal amounts. Ledger postings (per event date).',
+  },
+  {
+    file: 'lib/domain/sales/allocation-service.ts',
+    figures: ['revenueDeferralBasis', 'revenueDeferralUnwindOwedAt', 'revenueDeferralUnwoundAmount', 'revenueDeferredDate'],
+    treatment: 'not-refund-sensitive',
+    reason:
+      'Unpaid-invoice deferral: the cancel reads the deferral basis and its unwind markers only to tell that the invoice is gone, so the cancel needs no refund and A2\u2019s open debit is reversed. No revenue figure is computed, netted or rendered here.',
   },
   {
     file: 'lib/domain/settings/system-switches.ts',

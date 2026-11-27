@@ -1234,6 +1234,16 @@ async function processDeltaChunk(
       await markInvoiceBasisDeferralUnwindOwed(db, { accountingInvoiceIds: [...voidedSalesIds] }, 'INVOICE_VOIDED')
     } catch (error) {
       result.errors.push(`Recording the deferral unwind owed for voided invoice(s) failed: ${String(error)}`)
+      // Its own alert as well as the chunk error: a write that keeps failing would otherwise only show as a cursor that
+      // does not move. Best effort; a failure to log changes nothing about the retry.
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'invoice_basis_unwind_mark_failed',
+        tag: 'accounting',
+        level: 'ERROR',
+        description: `Xero reported ${voidedSalesIds.size} sales invoice(s) VOIDED, but IMS could not record the revenue-deferral unwind they may owe (${String(error)}). The poll repeats it; if this persists, Unearned Revenue holds deferrals whose invoices are gone (see the accounting check invoice_basis_deferral_stranded).`,
+        metadata: { voidedInvoiceIds: [...voidedSalesIds].slice(0, 50) },
+      }).catch(() => { /* logging must never change the poll */ })
     }
   }
   const paidBillIds = idsWhere(changed, 'ACCPAY', ['PAID'])

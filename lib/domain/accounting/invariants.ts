@@ -252,6 +252,11 @@ export type StrandedInvoiceBasisDeferralRow = OpenDeferralInputs & {
   revenueDeferralUnwindOwedAt: Date | string | null
   revenueDeferralUnwindReason: string | null
   revenueDeferralBasis: string | null
+  inventoryAllocatedDate?: Date | string | null
+  allocationBatchAmount?: DecimalLike | null
+  allocationReversalAmount?: DecimalLike | null
+  allocationShipmentRelief?: ReadonlyArray<{ allocatedReliefAmount: DecimalLike | null }>
+  allocationRefundRelief?: ReadonlyArray<{ allocatedReliefAmount: DecimalLike | null }>
 }
 
 type AccountingInvariantClient = {
@@ -1127,8 +1132,27 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
   // is overstated by it until the daily batch's unwind posts (when the invoice was deleted or voided) or an operator
   // credits the order (a cancellation with its invoice still standing).
   for (const order of rows.strandedInvoiceBasisDeferrals ?? []) {
+    if (order.revenueDeferralBasis !== 'INVOICE') continue
+    // ALLOCATED INVENTORY: a CANCELLED order whose invoice is gone will neither ship nor be refunded, so whatever of A2's
+    // debit is still open (recorded debit less every relief: shipments, refunds, reversals) stands for good unless the
+    // cancel or the unwind reversed it.
+    const invoiceGone = order.accountingInvoiceId == null || order.revenueDeferralUnwindOwedAt != null || order.revenueDeferralUnwoundAmount != null
+    if (order.status === 'CANCELLED' && invoiceGone && order.inventoryAllocatedDate != null) {
+      const relieved = [...(order.allocationShipmentRelief ?? []), ...(order.allocationRefundRelief ?? [])]
+        .reduce((sum, row) => sum + decimalToNumber(row.allocatedReliefAmount ?? 0), 0)
+      const openAllocated = Math.round((decimalToNumber(order.allocationBatchAmount ?? 0) - decimalToNumber(order.allocationReversalAmount ?? 0) - relieved) * 100) / 100
+      if (openAllocated > 0.01) {
+        findings.push({
+          severity: 'warning',
+          code: 'invoice_basis_allocation_stranded',
+          orderId: order.id,
+          message: withLedgerCheck(`Sales order ${order.orderNumber ?? order.externalOrderNumber ?? order.id.slice(0, 8)} is cancelled and the invoice its revenue was deferred from is gone, but £${openAllocated.toFixed(2)} of Group A2's Allocated Inventory debit is still open; nothing will relieve it. Post DR Inventory / CR Allocated Inventory by hand if the debit is real.`),
+          details: { status: order.status, openAllocated, allocationBatchAmount: decimalToNumber(order.allocationBatchAmount ?? 0), allocationReversalAmount: decimalToNumber(order.allocationReversalAmount ?? 0) },
+        })
+      }
+    }
     // Restated on the rows: only a deferral made from the invoice, not yet unwound, with its invoice gone or the order cancelled.
-    if (order.revenueDeferralBasis !== 'INVOICE' || order.revenueDeferralUnwoundAmount != null) continue
+    if (order.revenueDeferralUnwoundAmount != null) continue
     if (!(order.status === 'CANCELLED' || order.accountingInvoiceId == null || order.revenueDeferralUnwindOwedAt != null)) continue
     const open = openInvoiceBasisDeferral(order)
     const label = order.orderNumber ?? order.externalOrderNumber ?? order.id.slice(0, 8)
@@ -1216,8 +1240,10 @@ export async function collectAccountingInvariantRows(
     where: {
       revenueDeferralBasis: 'INVOICE',
       revenueDeferredDate: { not: null },
-      revenueDeferralUnwoundAmount: null,
-      OR: [{ accountingInvoiceId: null }, { status: 'CANCELLED' }, { revenueDeferralUnwindOwedAt: { not: null } }],
+      OR: [
+        { revenueDeferralUnwoundAmount: null, OR: [{ accountingInvoiceId: null }, { status: 'CANCELLED' }, { revenueDeferralUnwindOwedAt: { not: null } }] },
+        { status: 'CANCELLED', inventoryAllocatedDate: { not: null } },
+      ],
     },
     select: {
       id: true,
@@ -1230,10 +1256,14 @@ export async function collectAccountingInvariantRows(
       revenueDeferralUnwoundAmount: true,
       revenueDeferralUnwindOwedAt: true,
       revenueDeferralUnwindReason: true,
-      shipments: { select: { shipmentJournalDate: true, revenueRecognizedAmount: true } },
-      refunds: { select: { id: true, deferralAdjustmentRef: true, unearnedReversedAmount: true, reversalStagingState: true, accountingRetryRequired: true } },
+      inventoryAllocatedDate: true,
+      allocationBatchAmount: true,
+      allocationReversalAmount: true,
+      shipments: { select: { shipmentJournalDate: true, revenueRecognizedAmount: true, allocatedReliefAmount: true } },
+      refunds: { where: { deletedAt: null }, select: { id: true, deferralAdjustmentRef: true, unearnedReversedAmount: true, reversalStagingState: true, accountingRetryRequired: true, allocatedReliefAmount: true } },
     },
-  }) as unknown as StrandedInvoiceBasisDeferralRow[]
+  }).then((orders) => (orders as unknown as Array<StrandedInvoiceBasisDeferralRow & { shipments: Array<{ allocatedReliefAmount: DecimalLike | null }>; refunds: Array<{ allocatedReliefAmount: DecimalLike | null }> }>)
+    .map((order) => ({ ...order, allocationShipmentRelief: order.shipments, allocationRefundRelief: order.refunds }))) as StrandedInvoiceBasisDeferralRow[]
   const [salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds, reversalNeverRecordedRefunds] = await Promise.all([
     client.salesOrder.findMany({
       where: {

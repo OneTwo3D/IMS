@@ -249,13 +249,29 @@ export const INVOICE_BASIS_UNWIND_OWED_WHERE = {
  * deferral journal with no row at all, or only rows proven never sent, is not unwound: reversing a credit that never
  * landed would put the pounds into Sales twice.
  */
-export async function deferralJournalsThatMayHavePosted(client: SyncLogReader, refs: readonly string[]): Promise<Set<string>> {
+export async function deferralJournalsThatMayHavePosted(
+  client: SyncLogReader,
+  refs: readonly string[],
+  retention: { retentionCutoff: Date | null; stampedAtByRef: ReadonlyMap<string, Date> } = { retentionCutoff: null, stampedAtByRef: new Map() },
+): Promise<Set<string>> {
   if (refs.length === 0) return new Set()
   const rows = await client.accountingSyncLog.findMany({
     where: { type: 'DAILY_BATCH_REVENUE_DEFERRAL', referenceId: { in: [...refs] } },
     select: { ...LEDGER_STANDING_SELECT, referenceId: true },
   })
-  return new Set(rows.filter((row) => mayHaveReachedLedger(row)).map((row) => row.referenceId))
+  const posted = new Set(rows.filter((row) => mayHaveReachedLedger(row)).map((row) => row.referenceId))
+  // RETENTION: `retention_sync_logs_months` deletes terminal rows past the cutoff. A ref with NO row at all whose order
+  // was stamped before the cutoff is a journal whose row retention swept, not one that never posted (a journal that
+  // never posted keeps a FAILED/CANCELLED row that retention also sweeps, but the recreate sweep rebuilds any lost
+  // batch inside the window, so a stamp that old with no rebuild is treated as posted).
+  const seen = new Set(rows.map((row) => row.referenceId))
+  if (retention.retentionCutoff) {
+    for (const ref of refs) {
+      const stampedAt = retention.stampedAtByRef.get(ref)
+      if (!seen.has(ref) && stampedAt && stampedAt.getTime() < retention.retentionCutoff.getTime()) posted.add(ref)
+    }
+  }
+  return posted
 }
 
 /** Prisma expands `{ in: [...] }` into one bind parameter per id; reads over many ids are chunked. */
@@ -296,3 +312,17 @@ export async function findProvenInvoiceBasisCandidates(
   }
   return proofs
 }
+
+/**
+ * Unwound INVOICE-basis orders that may be RE-deferred: unwound (or unwound with nothing open), still carrying an invoice,
+ * not cancelled, drafted or fully refunded. Whether the invoice is a NEW one proved AUTHORISED after the unwind was owed
+ * is decided by the proof, per order.
+ */
+export const INVOICE_BASIS_REDEFER_WHERE = {
+  revenueDeferralBasis: 'INVOICE',
+  revenueDeferredDate: { not: null },
+  revenueDeferralUnwoundAmount: { not: null },
+  accountingInvoiceId: { not: null },
+  status: { notIn: ['CANCELLED', 'DRAFT'] },
+  refundStatus: { not: 'FULL' },
+} satisfies Prisma.SalesOrderWhereInput
