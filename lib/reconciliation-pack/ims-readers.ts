@@ -134,7 +134,16 @@ export type VatSalesRow = { period: string; taxRateId: string | null; taxBase: s
  * invoice posts the discount as one negative line per tax code, so R12 takes each rate's share of the discount VAT off that rate (vat-item.ts). `discount` is the stored discountAmount (the
  * invoice posts the parts only when it rounds to a positive penny) and `split` the stored JSON as text, read by the one parser every consumer uses. No row for an order without a split.
  */
-export type VatDiscountSplitRow = { period: string; orderId: string; discount: string; split: string }
+export type VatDiscountSplitRow = {
+  period: string
+  orderId: string
+  discount: string
+  split: string
+  /** SalesOrder.fxRateToBase (1 base = X order currency): the split's order-currency figures are put in base by it, as Xero puts the invoice's. */
+  fxRateToBase: string
+  /** Whether the invoice sends its lines (and so the discount parts) VAT-inclusive: the order's prices-include-VAT flag with a header rate above zero, and never for a WooCommerce-linked order (storedAmountsIncludeVat). */
+  amountsIncludeVat: boolean
+}
 export type VatXeroReportTypeRow = { taxType: string; reportTaxType: string | null }
 export type VatOrderFxRow = { externalOrderId: string; currency: string; fxRateToBase: string }
 export type ImsVat = {
@@ -627,12 +636,12 @@ const READERS: { [K in ImsSectionId]: Reader<K> } = {
     })
     unique(sales, (row) => `${row.period}\u0001${row.taxRateId ?? ''}`)
     // The orders of the same population (bounds, CANCELLED and archived as above) whose discount tax was split by line rate. Header-rate orders carry no split and are not read here.
-    const splitRows = await readCapped(tx, `SELECT to_char((so."invoicedAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Europe/London', 'YYYY-MM') AS period, so.id, COALESCE(so."discountAmount", 0)::text AS discount, so.discount_tax_split::text AS split FROM sales_orders so WHERE so."invoicedAt" >= ($1::date::timestamp AT TIME ZONE 'Europe/London') AT TIME ZONE 'UTC' AND so."invoicedAt" < ($2::date::timestamp AT TIME ZONE 'Europe/London') AT TIME ZONE 'UTC' AND so.status::text <> 'CANCELLED' AND so.archived = false AND so.discount_tax_split IS NOT NULL ORDER BY so.id`, [window.from, window.toExclusive])
+    const splitRows = await readCapped(tx, `SELECT to_char((so."invoicedAt" AT TIME ZONE 'UTC') AT TIME ZONE 'Europe/London', 'YYYY-MM') AS period, so.id, COALESCE(so."discountAmount", 0)::text AS discount, so.discount_tax_split::text AS split, so."fxRateToBase"::text AS fx, (so."pricesIncludeVat" AND COALESCE(so."taxRatePercent", 0) > 0 AND NOT EXISTS (SELECT 1 FROM shopping_order_links l WHERE l."orderId" = so.id AND l.connector = 'woocommerce')) AS incl FROM sales_orders so WHERE so."invoicedAt" >= ($1::date::timestamp AT TIME ZONE 'Europe/London') AT TIME ZONE 'UTC' AND so."invoicedAt" < ($2::date::timestamp AT TIME ZONE 'Europe/London') AT TIME ZONE 'UTC' AND so.status::text <> 'CANCELLED' AND so.archived = false AND so.discount_tax_split IS NOT NULL ORDER BY so.id`, [window.from, window.toExclusive])
     const discountSplits = splitRows.map((row): VatDiscountSplitRow => {
       const period = text(row.period, 'SOURCE_UNREADABLE')
       if (!/^[0-9]{4}-(?:0[1-9]|1[0-2])$/.test(period)) throw new Unreadable('SOURCE_UNREADABLE')
       if (typeof row.split !== 'string') throw new Unreadable('SOURCE_UNREADABLE')
-      return { period, orderId: text(row.id), discount: decimal(row.discount), split: row.split }
+      return { period, orderId: text(row.id), discount: decimal(row.discount), split: row.split, fxRateToBase: decimal(row.fx), amountsIncludeVat: bool(row.incl) }
     })
     unique(discountSplits, (row) => row.orderId)
     const tokens = await tx.query(`SELECT "tenantId" AS tenant FROM accounting_tokens WHERE connector = 'xero'`)
@@ -788,7 +797,7 @@ export const TRANSIT_SOURCE_TYPES: ReadonlyArray<{ type: string }> = [
   { type: 'PURCHASE_BILL' }, { type: 'PURCHASE_BILL_UPDATE' }, { type: 'SUPPLIER_CREDIT_NOTE' }, { type: 'STOCK_RECEIPT' }, { type: 'LANDED_COST_RECLASS' },
   { type: 'LANDED_COST_CONSUMED_OFFSET' }, { type: 'PURCHASE_ORDER_CANCEL' }, { type: 'SUPPLIER_RETURN' }, { type: 'CUSTOMER_RETURN_IN_TRANSIT' },
   { type: 'GRIR_RECLASS' },
-  // Per-event FX (reserved, no writer yet): a purchase FX variance row names its purchase order in source_ref, so it falls to the ELSE branch above.
+  // Per-event FX (lib/domain/purchasing/purchase-bill-fx.ts): a purchase FX variance row names its purchase order in source_ref, so it falls to the ELSE branch above.
   { type: 'PURCHASE_FX_VARIANCE' },
 ]
 

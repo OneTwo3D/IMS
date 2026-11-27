@@ -236,7 +236,7 @@ test('[reconciliation pack] the vat section reads the sales tax per month and ra
     assert.deepEqual(mine, [{ period: '2026-09', taxRateId: `${VP}-t`, taxBase: '13.7500', lines: 5, nonZeroLines: 4 }])
     // The split is read over the same population (invoice-instant bounds, cancelled and archived left out), as the stored JSON text.
     const splits = section.value.discountSplits.filter((row) => row.orderId.startsWith(VP))
-    assert.deepEqual(splits.map((row) => ({ ...row, split: JSON.parse(row.split) })), [{ period: '2026-09', orderId: `${VP}-o1`, discount: '26.0000', split: JSON.parse(SPLIT) }])
+    assert.deepEqual(splits.map((row) => ({ ...row, split: JSON.parse(row.split) })), [{ period: '2026-09', orderId: `${VP}-o1`, discount: '26.0000', split: JSON.parse(SPLIT), fxRateToBase: '1.00000000', amountsIncludeVat: false }])
     assert.equal(section.value.shippingAccount, '260')
     assert.equal(section.value.shippingAccountInChart, true)
     assert.equal(section.value.baseCurrency, 'GBP')

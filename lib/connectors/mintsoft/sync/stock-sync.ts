@@ -16,6 +16,7 @@ import {
   consolidateMintsoftStockLines,
   hasMintsoftThresholdBreach,
   mintsoftAlignDownReasonState,
+  adjustmentPostingWouldBeRefused,
   planMintsoftAlignDown,
   planMintsoftAlignmentAllocations,
   parseMintsoftThresholds,
@@ -68,6 +69,7 @@ import { enqueueStockSync } from '@/lib/shopping'
 import { classifyStockEnqueueFailure, type StockEnqueueOutcome } from '@/lib/domain/integrations/stock-enqueue-failure'
 import {
   getAccountingSettings,
+  accountingPostingVerdictForChart,
   getAccountingSettingsFor,
   getActiveAccountingConnectorId,
   queueAccountingSyncTx,
@@ -77,7 +79,7 @@ import {
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { recordGrirReceipt } from '@/lib/domain/accounting/grir-subledger-movement'
-import { reconcilePurchaseBillFx, reportPurchaseFxVarianceNotQueued, type PurchaseBillFxReconcileResult } from '@/lib/domain/purchasing/purchase-bill-fx'
+import { purchaseFxOrderHasHistory, reconcilePurchaseBillFx, reportPurchaseFxVarianceNotQueued, type PurchaseBillFxReconcileResult } from '@/lib/domain/purchasing/purchase-bill-fx'
 import {
   NO_PREPAYMENT_CHECKS, isPurchaseFxRefusalError, markPurchaseFxLockUsed, preparePurchaseReceiptFx, purchaseFxLayerFields, reportPurchaseFxFallback,
   resolveReceiptFxValuation, newPurchaseFxSweepMemo,
@@ -198,6 +200,28 @@ export type MintsoftStockSyncResult = {
   /** PRESENT ONLY WHEN NON-ZERO: those the outbound-write hold refused. */
   stockEnqueueHeld?: number
   skippedReason?: string
+}
+
+/**
+ * o3d-jwa8m F5: the value a FIFO removal of `qty` would book, read WITHOUT consuming (same order as consumeFifoLayers: receivedAt, id).
+ * Used only to tell whether the removal is worth zero to the penny (then applyStockAdjustment would not refuse for a missing inventory account).
+ */
+async function estimateFifoRemovalValue(client: Pick<typeof db, 'costLayer'>, productId: string, warehouseId: string, qty: number) {
+  const layers = await client.costLayer.findMany({
+    where: { productId, warehouseId, remainingQty: { gt: 0 } },
+    orderBy: [{ receivedAt: 'asc' }, { id: 'asc' }],
+    select: { remainingQty: true, unitCostBase: true },
+  })
+  let remaining = toDecimal(qty)
+  let total = toDecimal(0)
+  for (const layer of layers) {
+    if (remaining.lte(0)) break
+    const layerRemaining = toDecimal(layer.remainingQty)
+    const take = layerRemaining.lt(remaining) ? layerRemaining : remaining
+    total = addMoney(total, multiplyMoney(take, toDecimal(layer.unitCostBase)))
+    remaining = remaining.minus(take)
+  }
+  return total
 }
 
 function formatQuantity(value: number): string {
@@ -1637,6 +1661,8 @@ export async function applyMintsoftAlignmentForProduct(params: {
   // The valuations this alignment laid goods at, reported after the commit (MED-5).
   const purchaseFxValuations = new Map<string, ReceiptFxValuation>()
   const purchaseBillFxResults: Array<{ poId: string; poReference: string; result: PurchaseBillFxReconcileResult }> = []
+  // MED-3: every order this alignment laid goods for, so an order whose bills the switch manages still reconciles after a switch-off rollback.
+  const purchaseFxReceivedOrders = new Map<string, string>()
 
   const outcome = await db.$transaction(async (tx) => {
     // THE LOCKS, IN THE GLOBAL ORDER (6oyu.19, Codex round-9 HIGH-1).
@@ -2065,6 +2091,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
         // Per-event FX: the lock is used once goods are laid at its rate (LOW-11).
         await markPurchaseFxLockUsed(tx, purchaseCost.fxValuation, now)
         if (purchaseCost.fxValuation) purchaseFxValuations.set(purchaseCost.fxValuation.poId, purchaseCost.fxValuation)
+        purchaseFxReceivedOrders.set(purchaseCost.poId, purchaseCost.poReference)
 
         // ─── o3d-6nd55: THE RECEIPT JOURNAL, IN THE SAME TRANSACTION AS THE STOCK ───
         //
@@ -2351,11 +2378,13 @@ export async function applyMintsoftAlignmentForProduct(params: {
 
     // Per-event FX (step 3): goods that arrive after the order's bill settle that bill's FX difference against them (per receipt), here, under
     // the order row locks this alignment holds.
-    for (const valuation of purchaseFxValuations.values()) {
+    // MED-3: and so does an order valued before a switch-off rollback, whose bills the switch still manages.
+    for (const [poId, poReference] of [...purchaseFxReceivedOrders].sort(([a], [b]) => (a < b ? -1 : 1))) {
+      if (!purchaseFxValuations.has(poId) && !(await purchaseFxOrderHasHistory(tx, poId))) continue
       purchaseBillFxResults.push({
-        poId: valuation.poId,
-        poReference: valuation.poReference,
-        result: await reconcilePurchaseBillFx(tx, { poId: valuation.poId, connector: accountingConnector, syncEnabled: accountingSettings.syncEnabled, at: now }),
+        poId,
+        poReference,
+        result: await reconcilePurchaseBillFx(tx, { poId, connector: accountingConnector, syncEnabled: accountingSettings.syncEnabled, at: now }),
       })
     }
 
@@ -2540,12 +2569,28 @@ async function applyMintsoftAlignDownForProduct(params: {
     // o3d-jwa8m: switch off = no further read; the plan below sees exactly the inputs it always did.
     readStockAdjustmentReasonCostRequired(db),
   ])
+  // o3d-jwa8m F5: the inventory-account hold applies only where applyStockAdjustment's assertAdjustmentPostable would actually refuse:
+  // reason has an account, no inventory account mapped, a connector present, verdict post/chart-retired, and a write-off value that is not zero.
+  // Evaluated only in that corner (switch off = no further read; the plan sees exactly the inputs it always did).
+  let inventoryAccountForPlan: string | null = null
+  let adjustmentWouldBeRefused = false
+  if (reasonCostRequired && alignDownReason?.active && alignDownReason?.accountCode) {
+    const accountingSettings = await getAccountingSettings()
+    inventoryAccountForPlan = accountingSettings.inventoryAccount
+    if (!inventoryAccountForPlan && accountingSettings.connector && params.delta < 0) {
+      const { verdict } = await accountingPostingVerdictForChart(accountingSettings.connector, 'INVENTORY_ADJUSTMENT')
+      adjustmentWouldBeRefused = adjustmentPostingWouldBeRefused({
+        connectorPresent: true,
+        verdict,
+        valueBase: await estimateFifoRemovalValue(db, params.productId, params.binding.warehouseId, Math.abs(params.delta)),
+      })
+    }
+  }
   const reasonState = mintsoftAlignDownReasonState({
     reason: alignDownReason,
     reasonCostRequired,
-    inventoryAccount: reasonCostRequired && alignDownReason?.active && alignDownReason?.accountCode
-      ? (await getAccountingSettings()).inventoryAccount
-      : null,
+    inventoryAccount: inventoryAccountForPlan,
+    adjustmentWouldBeRefused,
   })
 
   const decision = planMintsoftAlignDown({

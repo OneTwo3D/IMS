@@ -37,6 +37,7 @@ import { REFUND_PARK_MANUAL_RESOLUTION_HINT } from '@/lib/domain/sales/refund-ma
 import { findGrossOverPaidBalance, findOverAllocatedRefundTarget, invalidQuantityRefusal, nonSaleRowRefusal, overAllocatedRefundTargetMessage, publicRefundLineRefusal } from '@/lib/domain/sales/refund-target-balances'
 import { orderDiscountReversal, refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
 import { discountSplitEntryTaxType, parseDiscountTaxSplit } from '@/lib/domain/sales/discount-tax-split'
+import { refreshedDiscountSplit } from '@/lib/domain/sales/discount-tax-split-codes'
 import { planSplitDiscountReversal } from '@/lib/domain/sales/discount-tax-split-plan'
 import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basis'
 import { resolveSchemePostingSnapshot } from '@/lib/domain/sales/refund-scheme-posting'
@@ -1612,6 +1613,8 @@ async function stageRefundAccountingReversals(
     accountingSettings: AccountingSettings
     so: {
       unearnedRevenueAmount: Prisma.Decimal | number | string | null
+      /** Unpaid-invoice deferral: what an unwind (its invoice deleted or voided) already took back out of Unearned Revenue. */
+      revenueDeferralUnwoundAmount?: Prisma.Decimal | number | string | null
     }
     newStatus: 'REFUNDED' | 'PARTIALLY_REFUNDED'
     /** scjz.70: revenue-only chargeback — suppress the COGS reversal (cost kept as a loss). */
@@ -3077,7 +3080,8 @@ async function stageRefundAccountingReversals(
       : Math.round(Math.max(
         0,
         refundBoundaryNumber(params.so.unearnedRevenueAmount) - totalRecognized
-          - Math.max(sweepPriorReversed, priorUnearnedReversed),
+          - Math.max(sweepPriorReversed, priorUnearnedReversed)
+          - refundBoundaryNumber(params.so.revenueDeferralUnwoundAmount ?? 0),
       ) * 100) / 100
     const sweepTrusted = unreadableUnearnedReversalRows.length === 0 && sweepUnprovenRefundIds.length === 0
     // Never more than the deferral stamped on the order less the recognition stamped on its shipments less every
@@ -3588,6 +3592,9 @@ async function stageRefundAccountingReversals(
         data: {
           revenueDeferredDate: null,
           revenueDeferredBatchRef: null,
+          // unpaid-invoice deferral: the basis and its day go with the stamp they describe (NULL on every order deferred with the switch off).
+          revenueDeferralBasis: null,
+          revenueDeferralEventAt: null,
           ...(allocationBasisUnresolved ? {} : {
             inventoryAllocatedDate: null,
             inventoryAllocatedBatchRef: null,
@@ -4261,6 +4268,7 @@ export async function createSalesOrderRefund(
         discountTaxSplit: true,
         revenueDeferredDate: true,
         unearnedRevenueAmount: true,
+        revenueDeferralUnwoundAmount: true,
         inventoryAllocatedDate: true,
         allocationBatchAmount: true,
         // taxRateName -> the order-default tax type; per-line taxRate -> each line's own identity. Both
@@ -4336,6 +4344,14 @@ export async function createSalesOrderRefund(
       }
       throw error
     }
+
+    // The order default rate's accounting tax code: the ACTIVE rate the order names (the invoice's own lookup). ONE read, used by the per-rate discount reversal and by every refund line's tax identity below.
+    const orderDefaultTaxType = so.taxRateName
+      ? (await tx.taxRate.findFirst({
+          where: { name: so.taxRateName, active: true },
+          select: { accountingTaxType: true },
+        }))?.accountingTaxType ?? null
+      : null
 
     // AN EXCHANGE IS CHECKED BEFORE ANYTHING IS WRITTEN: under the order lock, the replacement lines may be added now, or the whole refund is refused (nothing created).
     if (input.exchange) {
@@ -4442,8 +4458,9 @@ export async function createSalesOrderRefund(
         })
         const refundedNetByLine = new Map<string, number>()
         for (const l of refundLines) if (l.lineId && l.qty > 0 && (l.lineKind ?? 'sale') === 'sale') refundedNetByLine.set(l.lineId, (refundedNetByLine.get(l.lineId) ?? 0) + (l.totalForeign ?? 0))
+        // Each group's code is read from its rate NOW, as the invoice build does (refreshedDiscountSplit), not from the snapshot the draft was saved with.
         const plan = planSplitDiscountReversal({
-          split: discountSplit,
+          split: await refreshedDiscountSplit(tx, discountSplit),
           lines: so.lines.map((l) => ({ id: l.id, taxRateId: l.taxRateId, totalForeign: refundBoundaryNumber(l.totalForeign) })),
           refundedNetByLine,
           prior: priorRows.map((row) => ({ lineKind: row.lineKind, salesOrderLineId: row.salesOrderLineId, discountTaxRateId: row.discountTaxRateId, totalForeign: refundBoundaryNumber(row.totalForeign), totalBase: refundBoundaryNumber(row.totalBase) })),
@@ -4464,9 +4481,6 @@ export async function createSalesOrderRefund(
         })
         // Each share posts on the code the INVOICE posted that rate's discount part on (discountSplitEntryTaxType, the one derivation): the group's own code, else the order default rate's (the same
         // active-rate-by-name lookup the invoice and the snapshot below make), so a group with no code of its own (the no-rate lines) is reversed on the code its sale was discounted on.
-        const splitOrderDefaultTaxType = so.taxRateName
-          ? (await tx.taxRate.findFirst({ where: { name: so.taxRateName, active: true }, select: { accountingTaxType: true } }))?.accountingTaxType ?? null
-          : null
         for (const part of plan) {
           refundLines.push({
             lineId: null,
@@ -4478,7 +4492,7 @@ export async function createSalesOrderRefund(
             lineKind: 'discount',
             discountTaxIdentity: {
               taxRateId: part.entry.taxRateId ?? '',
-              accountingTaxType: discountSplitEntryTaxType(part.entry, { orderDefaultTaxType: splitOrderDefaultTaxType, reverseChargeSalesTaxType: input.accountingSettings?.reverseChargeSalesTaxType }),
+              accountingTaxType: discountSplitEntryTaxType(part.entry, { orderDefaultTaxType, reverseChargeSalesTaxType: input.accountingSettings?.reverseChargeSalesTaxType }),
               reverseCharge: part.entry.reverseCharge,
               rate: part.entry.rate,
             },
@@ -4536,12 +4550,7 @@ export async function createSalesOrderRefund(
     // (o3d-w00). Store the resolved connector tax type so the credit note posts under the rate that was
     // actually validated, instead of re-predicting it from the order default at post time — which
     // mis-taxed deactivated-rate, reverse-charged and mixed-rate refunds.
-    const orderDefaultTaxType = so.taxRateName
-      ? (await tx.taxRate.findFirst({
-          where: { name: so.taxRateName, active: true },
-          select: { accountingTaxType: true },
-        }))?.accountingTaxType ?? null
-      : null
+    // (`orderDefaultTaxType`, read once above.)
     const salesLineTaxById = new Map(so.lines.map((line) => [line.id, line.taxRate]))
     const reverseChargeSalesTaxType = input.accountingSettings?.reverseChargeSalesTaxType
 
@@ -6499,6 +6508,7 @@ export async function retrySalesOrderRefundAccounting(
               refundStatus: true,
               revenueDeferredDate: true,
               unearnedRevenueAmount: true,
+              revenueDeferralUnwoundAmount: true,
               // o3d-w00 (Codex r8 #4): the order's own money snapshot, so the retry can re-run the
               // creation fence against what every part of this order was CHARGED. Same figures, same
               // reasons as the createSalesOrderRefund read — see the fence there.

@@ -21,6 +21,8 @@ mock.module('@/lib/db', {
             ? { id: 'e1', externalAsnId: 'ASN-1', processedAt: null }
             : { processingAttempts: attempts },
         update: async ({ data }: { data: Record<string, unknown> }) => { updates.push(data); return {} },
+        // Step 3b (MED-6): a failure for another reason ends the episode of waits on the purchase rate (a no-op here: nothing was waiting).
+        updateMany: async () => ({ count: 0 }),
       },
       wmsAsnMap: { findUnique: async () => ({ id: 'm1' }) },
     },

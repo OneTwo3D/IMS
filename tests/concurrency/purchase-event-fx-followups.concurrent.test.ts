@@ -232,7 +232,7 @@ test.beforeEach(async () => {
   contactLedger.answer = () => ({ success: true, contactId: null })
   if (RUN) {
     const { clearPurchaseFxRefusalMemoryForTests } = await import('@/lib/domain/purchasing/purchase-receipt-fx')
-    clearPurchaseFxRefusalMemoryForTests()
+    await clearPurchaseFxRefusalMemoryForTests()
     await setSetting('xero_sync_enabled', 'true')
   }
 })
@@ -523,7 +523,7 @@ test('MED-4: a book-in refused only because Xero cannot be read (or a table rate
     assert.deepEqual(await layersOf(po), [])
     // Xero answers: the same event books in (once the remembered refusal has lapsed).
     const { clearPurchaseFxRefusalMemoryForTests } = await import('@/lib/domain/purchasing/purchase-receipt-fx')
-    clearPurchaseFxRefusalMemoryForTests()
+    await clearPurchaseFxRefusalMemoryForTests()
     answerWith([[po, [prepaymentFor(po)]]])
     assert.equal((await event.run()).status, 'processed')
     assert.deepEqual((await layersOf(po)).map((l) => l.rate), ['1.6'])
@@ -550,17 +550,74 @@ test('MED-C: an episode of waits on the purchase rate is capped: the 11th wait c
   await withSwitch(true, async () => {
     ledger.answer = () => ({ ok: false, error: 'HTTP 503' })
     for (let i = 0; i < 10; i += 1) {
-      clearPurchaseFxRefusalMemoryForTests()
+      await clearPurchaseFxRefusalMemoryForTests()
       assert.equal((await event.run()).status, 'failed')
     }
     assert.equal((await event.row()).processingAttempts, 0, 'ten waits are free')
-    clearPurchaseFxRefusalMemoryForTests()
+    await clearPurchaseFxRefusalMemoryForTests()
     assert.equal((await event.run()).status, 'failed')
     assert.equal((await event.row()).processingAttempts, 1, 'the eleventh counts')
     const { db } = await import('@/lib/db')
     const warnings = await db.activityLog.findMany({ where: { action: 'mintsoft_booked_in_fx_wait_capped', entityId: event.eventId } })
     assert.equal(warnings.length, 1)
     assert.equal(warnings[0]!.level, 'WARNING')
+    // Step 3b, MED-6: the capped WARNING is written once per episode, not on every counted retry after it.
+    await clearPurchaseFxRefusalMemoryForTests()
+    assert.equal((await event.run()).status, 'failed')
+    assert.equal((await event.row()).processingAttempts, 2, 'still counting')
+    assert.equal(await db.activityLog.count({ where: { action: 'mintsoft_booked_in_fx_wait_capped', entityId: event.eventId } }), 1, 'throttled: no second WARNING')
+    // ...and the episode ends once the event gets past the exchange-rate step.
+    await clearPurchaseFxRefusalMemoryForTests()
+    answerWith([[po, [prepaymentFor(po)]]])
+    assert.equal((await event.run()).status, 'processed')
+    const done = await db.wmsInboundReceiptEvent.findUniqueOrThrow({ where: { id: event.eventId }, select: { fxWaitCount: true, fxWaitStartedAt: true } })
+    assert.deepEqual(done, { fxWaitCount: 0, fxWaitStartedAt: null }, 'the episode is reset')
+  })
+})
+
+test('MED-6: a failure for another reason ends the episode of waits on the purchase rate', SKIP, async () => {
+  const po = await seedForeignPo('med6', [5])
+  const asn = await addAsn(po, po.lines[0]!, { expectedQty: 5 })
+  const event = await bookInEvent(asn, po.lines[0]!, 5, 5)
+  const { clearPurchaseFxRefusalMemoryForTests } = await import('@/lib/domain/purchasing/purchase-receipt-fx')
+  const { db } = await import('@/lib/db')
+  await withSwitch(true, async () => {
+    ledger.answer = () => ({ ok: false, error: 'HTTP 503' })
+    for (let i = 0; i < 3; i += 1) {
+      await clearPurchaseFxRefusalMemoryForTests()
+      assert.equal((await event.run()).status, 'failed')
+    }
+    assert.equal((await db.wmsInboundReceiptEvent.findUniqueOrThrow({ where: { id: event.eventId } })).fxWaitCount, 3)
+    await clearPurchaseFxRefusalMemoryForTests()
+    answerWith([[po, [prepaymentFor(po), prepaymentFor(po)]]]) // real ambiguity: a counted failure, not a wait
+    assert.equal((await event.run()).status, 'failed')
+    const row = await db.wmsInboundReceiptEvent.findUniqueOrThrow({ where: { id: event.eventId }, select: { fxWaitCount: true, fxWaitStartedAt: true, processingAttempts: true } })
+    assert.equal(row.processingAttempts, 1)
+    assert.deepEqual({ count: row.fxWaitCount, startedAt: row.fxWaitStartedAt }, { count: 0, startedAt: null }, 'the episode is over: a later wait starts a new one')
+  })
+})
+
+test('MED-5: the remembered refusal is on the order (every process sees it) and yields to a newer lock', SKIP, async () => {
+  const po = await seedForeignPo('med5', [5])
+  const { preparePurchaseReceiptFx, clearPurchaseFxRefusalMemoryForTests } = await import('@/lib/domain/purchasing/purchase-receipt-fx')
+  const { db } = await import('@/lib/db')
+  await clearPurchaseFxRefusalMemoryForTests()
+  await withSwitch(true, async () => {
+    ledger.answer = () => ({ ok: false, error: 'HTTP 503' })
+    const first = await preparePurchaseReceiptFx([po.poId], { collectRefusals: true })
+    assert.equal(first.get(po.poId)?.kind, 'refused')
+    const stored = await db.purchaseOrder.findUniqueOrThrow({ where: { id: po.poId }, select: { fxPrepaymentRefusedAt: true, fxPrepaymentRefusedTransient: true } })
+    assert.ok(stored.fxPrepaymentRefusedAt, 'remembered in the database, not in process memory')
+    assert.equal(stored.fxPrepaymentRefusedTransient, true)
+    ledger.calls = []
+    answerWith([[po, [prepaymentFor(po)]]])
+    assert.equal((await preparePurchaseReceiptFx([po.poId], { collectRefusals: true })).get(po.poId)?.kind, 'refused', 'inside the window: not asked again')
+    assert.equal(ledger.calls.length, 0)
+    // An operator reads the prepayment (a newer lock): the remembered refusal no longer stands.
+    await onDemand(po.poId)
+    assert.equal((await preparePurchaseReceiptFx([po.poId], { collectRefusals: true })).get(po.poId)?.kind, 'locked')
+    const cleared = await db.purchaseOrder.findUniqueOrThrow({ where: { id: po.poId }, select: { fxPrepaymentRefusedAt: true } })
+    assert.equal(cleared.fxPrepaymentRefusedAt, null, 'and it is forgotten')
   })
 })
 

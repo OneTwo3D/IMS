@@ -8,6 +8,8 @@ import { loadInventoryGlReconciliation } from '@/lib/domain/accounting/inventory
 import { loadCogsGlReconciliation } from '@/lib/domain/accounting/cogs-gl-reconciliation'
 import { COGS_CROSS_CHECK_FLOWS, TRANSIT_CROSS_CHECK_FLOWS, crossCheckSubledgerAgainstQueuedJournals, type SubledgerCrossCheck } from '@/lib/domain/accounting/subledger-journal-cross-check'
 import { loadTransitGlReconciliation } from '@/lib/domain/accounting/transit-gl-reconciliation'
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
+import { openInvoiceBasisDeferral, type OpenDeferralInputs } from '@/lib/domain/accounting/invoice-basis-deferral'
 import { reversalRecordVerdict } from '@/lib/domain/sales/refund-reversal-record'
 
 export type AccountingInvariantSeverity = 'info' | 'warning' | 'critical'
@@ -46,6 +48,10 @@ type SalesOrderAccountingRow = {
   // null — i.e. a payment reversal cleared it). The DB loader always selects it.
   paidAt?: Date | string | null
   revenueDeferredDate: Date | string | null
+  // unpaid-invoice deferral: INVOICE = deferred from the invoice while unpaid (switch `xero_defer_unpaid_invoiced_revenue_enabled`). Absent/NULL = PAID.
+  revenueDeferralBasis?: string | null
+  // Unpaid-invoice deferral: what an unwind (invoice deleted or voided) already took back out of Unearned Revenue.
+  revenueDeferralUnwoundAmount?: DecimalLike | null
   // o3d-0qoo: the exact A1 batch referenceId stamped on this row in the same
   // transaction as revenueDeferredDate. Optional for the same reason as paidAt
   // (pure-evaluator fixtures); the DB loader always selects it. Absent/null means
@@ -228,6 +234,29 @@ export type AccountingInvariantRows = {
    * forgot it would make the drop invisible again, which is the whole defect.
    */
   reversalNeverRecordedRefunds: ReversalNeverRecordedRefundRow[]
+  /**
+   * Unpaid-invoice deferral: every order Group A1 deferred FROM its invoice whose deferral is not yet unwound and whose
+   * invoice is gone (none linked, or Xero reported it voided) or which is CANCELLED. CANCELLED orders are deliberately
+   * included: the lifecycle checks above skip them, and a cancelled order never ships, so nothing would release it.
+   * Optional for pure-evaluator fixtures; the DB loader always reads it.
+   */
+  strandedInvoiceBasisDeferrals?: StrandedInvoiceBasisDeferralRow[]
+}
+
+export type StrandedInvoiceBasisDeferralRow = OpenDeferralInputs & {
+  id: string
+  orderNumber: string | null
+  externalOrderNumber: string | null
+  status: string
+  accountingInvoiceId: string | null
+  revenueDeferralUnwindOwedAt: Date | string | null
+  revenueDeferralUnwindReason: string | null
+  revenueDeferralBasis: string | null
+  inventoryAllocatedDate?: Date | string | null
+  allocationBatchAmount?: DecimalLike | null
+  allocationReversalAmount?: DecimalLike | null
+  allocationShipmentRelief?: ReadonlyArray<{ allocatedReliefAmount: DecimalLike | null }>
+  allocationRefundRelief?: ReadonlyArray<{ allocatedReliefAmount: DecimalLike | null }>
 }
 
 type AccountingInvariantClient = {
@@ -667,7 +696,7 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
       postedShipments.length > 0 &&
       order.shipments.every((shipment) => shipment.shipmentJournalDate != null || shipment.status !== 'SHIPPED')
     ) {
-      const deferred = decimalToNumber(order.unearnedRevenueAmount)
+      const deferred = decimalToNumber(order.unearnedRevenueAmount) - decimalToNumber(order.revenueDeferralUnwoundAmount ?? 0)
       const recognized = postedShipments.reduce(
         (sum, shipment) => sum + decimalToNumber(shipment.revenueRecognizedAmount),
         0,
@@ -705,7 +734,9 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     // amount is unknown (<= 0) fall back to presence to avoid false positives.
     const fullyCompensated = creditNotes.length > 0
       && (postedRevenue <= 0 || creditedTotal + 0.01 >= postedRevenue)
-    if ((hasA1 || hasA2 || stagedPostedShipments.length > 0) && order.paidAt === null && !fullyCompensated) {
+    // unpaid-invoice deferral: an order Group A1 deferred from its invoice while unpaid never took that deferral from a payment, so
+    // revenue with no cash is its ordinary state (an open receivable), not a reversed payment.
+    if ((hasA1 || hasA2 || stagedPostedShipments.length > 0) && order.paidAt === null && !fullyCompensated && order.revenueDeferralBasis !== 'INVOICE') {
       findings.push({
         severity: 'critical',
         code: 'revenue_posted_without_payment',
@@ -1096,6 +1127,63 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
     })
   }
 
+  // Unpaid-invoice deferral: a deferral still open on an order whose invoice is gone, or which is cancelled. Nothing will
+  // ever release it (no shipment of a voided invoice, or of a cancelled order, recognises revenue), so Unearned Revenue
+  // is overstated by it until the daily batch's unwind posts (when the invoice was deleted or voided) or an operator
+  // credits the order (a cancellation with its invoice still standing).
+  for (const order of rows.strandedInvoiceBasisDeferrals ?? []) {
+    if (order.revenueDeferralBasis !== 'INVOICE') continue
+    // ALLOCATED INVENTORY: a CANCELLED order whose invoice is gone will neither ship nor be refunded, so whatever of A2's
+    // debit is still open (recorded debit less every relief: shipments, refunds, reversals) stands for good unless the
+    // cancel or the unwind reversed it.
+    const invoiceGone = order.accountingInvoiceId == null || order.revenueDeferralUnwindOwedAt != null || order.revenueDeferralUnwoundAmount != null
+    if (order.status === 'CANCELLED' && invoiceGone && order.inventoryAllocatedDate != null) {
+      const relieved = [...(order.allocationShipmentRelief ?? []), ...(order.allocationRefundRelief ?? [])]
+        .reduce((sum, row) => sum + decimalToNumber(row.allocatedReliefAmount ?? 0), 0)
+      const openAllocated = Math.round((decimalToNumber(order.allocationBatchAmount ?? 0) - decimalToNumber(order.allocationReversalAmount ?? 0) - relieved) * 100) / 100
+      // Either sign is wrong: open means a debit nothing will relieve; NEGATIVE means more was credited back than A2 debited.
+      if (Math.abs(openAllocated) > 0.01) {
+        const label = order.orderNumber ?? order.externalOrderNumber ?? order.id.slice(0, 8)
+        findings.push({
+          severity: openAllocated < 0 ? 'critical' : 'warning',
+          code: 'invoice_basis_allocation_stranded',
+          orderId: order.id,
+          message: withLedgerCheck(openAllocated > 0
+            ? `Sales order ${label} is cancelled and the invoice its revenue was deferred from is gone, but £${openAllocated.toFixed(2)} of Group A2's Allocated Inventory debit is still open; nothing will relieve it. Post DR Inventory / CR Allocated Inventory by hand if the debit is real.`
+            : `Sales order ${label} is cancelled and the invoice its revenue was deferred from is gone, but £${(-openAllocated).toFixed(2)} MORE has been credited out of Allocated Inventory than Group A2 debited for it (reversals plus shipment and refund reliefs). Post DR Allocated Inventory / CR Inventory by hand for the excess.`),
+          details: { status: order.status, openAllocated, allocationBatchAmount: decimalToNumber(order.allocationBatchAmount ?? 0), allocationReversalAmount: decimalToNumber(order.allocationReversalAmount ?? 0) },
+        })
+      }
+    }
+    // Restated on the rows: only a deferral made from the invoice, not yet unwound, with its invoice gone or the order cancelled.
+    if (order.revenueDeferralUnwoundAmount != null) continue
+    if (!(order.status === 'CANCELLED' || order.accountingInvoiceId == null || order.revenueDeferralUnwindOwedAt != null)) continue
+    const open = openInvoiceBasisDeferral(order)
+    const label = order.orderNumber ?? order.externalOrderNumber ?? order.id.slice(0, 8)
+    if (open.ok && !open.open.greaterThan('0.01')) continue
+    const why = order.status === 'CANCELLED'
+      ? 'the order is cancelled'
+      : order.revenueDeferralUnwindOwedAt != null
+        ? `its invoice was ${order.revenueDeferralUnwindReason === 'INVOICE_VOIDED' ? 'voided in Xero' : 'deleted'}`
+        : 'it has no invoice'
+    findings.push({
+      severity: 'warning',
+      code: 'invoice_basis_deferral_stranded',
+      orderId: order.id,
+      message: open.ok
+        ? withLedgerCheck(`Sales order ${label} still holds £${open.open.toFixed(2)} of revenue deferred from its invoice in Unearned Revenue, but ${why}, so no shipment will release it`
+          + (order.revenueDeferralUnwindOwedAt != null ? '; the daily batch owes its unwind and has not posted it yet' : '; credit the order (refund) or post the release by hand'))
+        : `Sales order ${label} holds revenue deferred from its invoice, but ${why}, and the open amount cannot be established (${open.reason})`,
+      details: {
+        status: order.status,
+        accountingInvoiceId: order.accountingInvoiceId,
+        unwindOwedAt: order.revenueDeferralUnwindOwedAt,
+        unwindReason: order.revenueDeferralUnwindReason,
+        openDeferral: open.ok ? Number(open.open.toFixed(2)) : null,
+      },
+    })
+  }
+
   return findings
 }
 
@@ -1150,6 +1238,36 @@ export async function collectAccountingInvariantRows(
           SHADOWED_OBLIGATION_WHERE,
         ],
       }
+  // Unpaid-invoice deferral: CANCELLED orders included on purpose (see the row set's comment). Bounded by what qualifies:
+  // INVOICE-basis deferrals not yet unwound, so with the switch never turned on this returns nothing.
+  const strandedInvoiceBasisDeferrals = await client.salesOrder.findMany({
+    where: {
+      revenueDeferralBasis: 'INVOICE',
+      revenueDeferredDate: { not: null },
+      OR: [
+        { revenueDeferralUnwoundAmount: null, OR: [{ accountingInvoiceId: null }, { status: 'CANCELLED' }, { revenueDeferralUnwindOwedAt: { not: null } }] },
+        { status: 'CANCELLED', inventoryAllocatedDate: { not: null } },
+      ],
+    },
+    select: {
+      id: true,
+      orderNumber: true,
+      externalOrderNumber: true,
+      status: true,
+      accountingInvoiceId: true,
+      revenueDeferralBasis: true,
+      unearnedRevenueAmount: true,
+      revenueDeferralUnwoundAmount: true,
+      revenueDeferralUnwindOwedAt: true,
+      revenueDeferralUnwindReason: true,
+      inventoryAllocatedDate: true,
+      allocationBatchAmount: true,
+      allocationReversalAmount: true,
+      shipments: { select: { shipmentJournalDate: true, revenueRecognizedAmount: true, allocatedReliefAmount: true } },
+      refunds: { where: { deletedAt: null }, select: { id: true, deferralAdjustmentRef: true, unearnedReversedAmount: true, reversalStagingState: true, accountingRetryRequired: true, allocatedReliefAmount: true } },
+    },
+  }).then((orders) => (orders as unknown as Array<StrandedInvoiceBasisDeferralRow & { shipments: Array<{ allocatedReliefAmount: DecimalLike | null }>; refunds: Array<{ allocatedReliefAmount: DecimalLike | null }> }>)
+    .map((order) => ({ ...order, allocationShipmentRelief: order.shipments, allocationRefundRelief: order.refunds }))) as StrandedInvoiceBasisDeferralRow[]
   const [salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds, reversalNeverRecordedRefunds] = await Promise.all([
     client.salesOrder.findMany({
       where: {
@@ -1177,6 +1295,9 @@ export async function collectAccountingInvariantRows(
         status: true,
         paidAt: true,
         revenueDeferredDate: true,
+        // unpaid-invoice deferral: an INVOICE-basis deferral is not evidence of a payment.
+        revenueDeferralBasis: true,
+        revenueDeferralUnwoundAmount: true,
         // o3d-0qoo: the persisted batch refs are what the evidence check matches on;
         // omitting them silently demotes every row to the derive-from-stamp fallback.
         revenueDeferredBatchRef: true,
@@ -1346,7 +1467,7 @@ export async function collectAccountingInvariantRows(
     }) as unknown as Promise<ReversalNeverRecordedRefundRow[]>,
   ])
 
-  return { salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds, reversalNeverRecordedRefunds, historicalBatchCutoff: retentionCutoff }
+  return { salesOrders, postedShipments, syncLogs, unresolvedAllocationBasisRefunds, reversalNeverRecordedRefunds, strandedInvoiceBasisDeferrals, historicalBatchCutoff: retentionCutoff }
 }
 
 /**

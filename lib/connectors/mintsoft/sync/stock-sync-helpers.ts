@@ -1,4 +1,5 @@
 import { Prisma } from '@/app/generated/prisma/client'
+import { roundQuantity, type Decimal } from '@/lib/domain/math/decimal'
 import type { WmsStockLine } from '@/lib/connectors/wms/types'
 import {
   requireTransferLineResidualQty,
@@ -360,18 +361,40 @@ export type MintsoftAlignDownInput = {
 
 /**
  * o3d-jwa8m: whether the binding's align-down reason is usable. Always: active and carrying an account. With the switch
- * `stock_adjustment_reason_cost_required` ON also an inventory account mapped, because applyStockAdjustment then refuses a valued
- * adjustment without one INSIDE the transaction, which the sweep would count as an error on every run. The plan holds instead.
+ * `stock_adjustment_reason_cost_required` ON, the plan also holds when applyStockAdjustment's own `assertAdjustmentPostable` would refuse the
+ * write-off INSIDE the transaction (which the sweep would count as an error on every run). That refusal needs ALL of: a reason account
+ * (checked above), no inventory account mapped, an accounting connector present, a posting verdict of 'post' or 'chart-retired', and a
+ * write-off value that is not zero to the penny. `adjustmentWouldBeRefused` is that test, evaluated by the caller (stock-sync.ts) with the
+ * same inputs; it is only read when the inventory account is missing. Anywhere else no hold is added: the adjustment goes ahead as it always did.
  */
 export function mintsoftAlignDownReasonState(params: {
   reason: { active: boolean; accountCode: string | null } | null | undefined
   reasonCostRequired: boolean
   inventoryAccount: string | null | undefined
+  /** True when assertAdjustmentPostable would throw for this write-off: connector present, verdict post/chart-retired, value non-zero. */
+  adjustmentWouldBeRefused?: boolean
 }): { reasonConfigured: boolean; inventoryAccountMissing: boolean } {
   const reasonUsable = Boolean(params.reason?.active && params.reason?.accountCode)
   if (!reasonUsable) return { reasonConfigured: false, inventoryAccountMissing: false }
-  if (params.reasonCostRequired && !params.inventoryAccount) return { reasonConfigured: false, inventoryAccountMissing: true }
+  if (params.reasonCostRequired && !params.inventoryAccount && params.adjustmentWouldBeRefused) {
+    return { reasonConfigured: false, inventoryAccountMissing: true }
+  }
   return { reasonConfigured: true, inventoryAccountMissing: false }
+}
+
+/**
+ * The refusal test shared with assertAdjustmentPostable (stock-adjustment-apply.ts), as a pure function of what it reads:
+ * a connector is present, the posting verdict is 'post' or 'chart-retired', and the value is non-zero at 2dp. The caller has already
+ * established that the reason has an account and the inventory account is unmapped.
+ */
+export function adjustmentPostingWouldBeRefused(params: {
+  connectorPresent: boolean
+  verdict: string | null | undefined
+  valueBase: Decimal
+}): boolean {
+  if (!params.connectorPresent) return false
+  if (params.verdict !== 'post' && params.verdict !== 'chart-retired') return false
+  return !roundQuantity(params.valueBase.abs(), 2).isZero()
 }
 
 export type MintsoftAlignDownDecision =
@@ -416,7 +439,7 @@ export function planMintsoftAlignDown(input: MintsoftAlignDownInput): MintsoftAl
   if (!input.reasonConfigured && input.inventoryAccountMissing) {
     return {
       action: 'hold',
-      reason: 'Align To WMS holds this delta because no inventory account is mapped in the accounting settings: the adjustment would be refused, so the delta stays a manual discrepancy.',
+      reason: 'Align To WMS holds this delta because no inventory account is mapped in the accounting settings and this write-off carries a ledger value for the connected accounting system, so the adjustment would be refused. The delta stays a manual discrepancy.',
     }
   }
 

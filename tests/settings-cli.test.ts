@@ -4,6 +4,7 @@ import test from 'node:test'
 import { runSettingsCli } from '../scripts/settings-cli'
 import { SYSTEM_SWITCH_KEYS, validateSwitchValue, findSwitch } from '../lib/domain/settings/system-switches'
 import { REFUND_DELETE_SETTING, refundDeleteEnabledFromSetting } from '../lib/domain/sales/refund-delete-policy'
+import { REFUND_RETURNS_IN_TRANSIT_SETTING } from '../lib/domain/sales/return-expectation'
 import { SENSITIVE_SETTING_KEYS } from '../lib/settings-store'
 
 type Row = { value: string }
@@ -52,9 +53,9 @@ const SET = ['--by', 'jan', '--reason', 'switchover step M']
 test('allowlist contains exactly the switches that exist on development, and none is a credential', () => {
   assert.deepEqual([...SYSTEM_SWITCH_KEYS].sort(), [
     'first_load_mintsoft_archive_enabled', 'mintsoft_asn_send_supplier_enabled', 'mintsoft_asn_supplier_required', 'mintsoft_parent_sku_delete_enabled',
-    'mintsoft_product_parity_enabled', 'mintsoft_supplier_create_enabled', 'purchase_event_fx_rates_enabled', 'refund_delete_enabled', 'return_condition_check_enabled', 'sales_order_discount_tax_apportion_enabled', 'storefront_customer_email_enabled', 'trackship_refire_enabled', 'wc_invoice_document_enabled',
+    'mintsoft_product_parity_enabled', 'mintsoft_supplier_create_enabled', 'purchase_event_fx_rates_enabled', 'refund_delete_enabled', 'refund_returns_in_transit_enabled', 'return_condition_check_enabled', 'sales_order_discount_tax_apportion_enabled', 'storefront_customer_email_enabled', 'trackship_refire_enabled', 'wc_invoice_document_enabled',
     'wc_invoice_note_enabled', 'wc_order_amendment_unpaid_rewrite_enabled', 'wc_order_amendment_write_enabled', 'wc_refund_credit_note_parity_enabled', 'wc_withdrawal_outcome_enabled', 'wms_despatch_date_enabled', 'wms_despatch_quantity_check_enabled', 'wms_merge_candidate_mode',
-    'wms_merge_hold_enabled', 'wms_mixed_warehouse_push_enabled', 'wms_refund_remainder_task_enabled', 'wms_sku_rename_remap_enabled', 'xero_credit_note_allocation_enabled', 'xero_credit_note_duplicate_check_enabled', 'xero_refund_payment_cash_out_date_enabled',
+    'wms_merge_hold_enabled', 'wms_mixed_warehouse_push_enabled', 'wms_refund_remainder_task_enabled', 'wms_sku_rename_remap_enabled', 'xero_credit_note_allocation_enabled', 'xero_credit_note_duplicate_check_enabled', 'xero_defer_unpaid_invoiced_revenue_enabled', 'xero_refund_payment_cash_out_date_enabled',
   ])
   for (const k of SYSTEM_SWITCH_KEYS) assert.equal(SENSITIVE_SETTING_KEYS.has(k), false)
 })
@@ -359,6 +360,27 @@ test('purchase_event_fx_rates_enabled: the write transaction re-checks the accou
   assert.equal(f.settings.get('purchase_event_fx_rates_enabled'), undefined)
 }))
 
+// unpaid-invoice deferral: unpaid invoiced revenue deferral. Off by default, ADMIN, stamps its switch-on instant, and its keys are the ones the daily batch reads.
+test('xero_defer_unpaid_invoiced_revenue_enabled: off by default, ADMIN, stamped on and cleared off; keys equal the reader\'s', async () => {
+  const def = findSwitch('xero_defer_unpaid_invoiced_revenue_enabled')!
+  assert.equal(def.defaultValue, 'false')
+  assert.equal(def.adminOnly, true)
+  const reader = await import('../lib/domain/accounting/invoice-basis-deferral')
+  const sw = await import('../lib/domain/settings/system-switches')
+  assert.equal(sw.INVOICE_BASIS_DEFERRAL_SWITCH_KEY, reader.INVOICE_BASIS_DEFERRAL_SWITCH_KEY)
+  assert.equal(sw.INVOICE_BASIS_DEFERRAL_ENABLED_AT_KEY, reader.INVOICE_BASIS_DEFERRAL_ENABLED_AT_KEY)
+  assert.equal(def.stampOnKey, reader.INVOICE_BASIS_DEFERRAL_ENABLED_AT_KEY)
+  const refused = await run('set', ['--key', def.key, '--value', 'true', ...SET, '--yes'])
+  assert.equal(refused.code, 3)
+  const on = await run('set', ['--key', def.key, '--value', 'true', ...SET, '--yes', '--confirm-admin'])
+  assert.equal(on.code, 0, on.err)
+  const stamp = on.f.settings.get(def.stampOnKey!)?.value
+  assert.ok(stamp && !Number.isNaN(new Date(stamp).getTime()), 'switch-on instant stamped')
+  const off = await run('set', ['--key', def.key, '--value', 'false', ...SET, '--yes', '--confirm-admin'], on.f)
+  assert.equal(off.code, 0, off.err)
+  assert.equal(off.f.settings.has(def.stampOnKey!), false)
+})
+
 test('refund_delete_enabled: registered as an ADMIN switch, off by default, key equal to the reader\'s, no turn-on prerequisite, and turning it off is never refused', async () => {
   const def = findSwitch('refund_delete_enabled')!
   assert.ok(def)
@@ -383,4 +405,35 @@ test('refund_delete_enabled: registered as an ADMIN switch, off by default, key 
   const offAdmin = await run('set', ['--key', 'refund_delete_enabled', '--value', 'false', ...SET, '--yes', '--confirm-admin'], fakeDb({ refund_delete_enabled: 'true' }))
   assert.equal(offAdmin.code, 0)
   assert.equal(offAdmin.f.settings.get('refund_delete_enabled')!.value, 'false')
+})
+
+test('refund_returns_in_transit_enabled: an ADMIN switch, off by default, key equal to the reader\'s, refused on while Xero sync is on and the Stock in Transit or Inventory account is unmapped, and turning it off is never refused', async () => {
+  const def = findSwitch('refund_returns_in_transit_enabled')!
+  assert.ok(def)
+  assert.equal(def.key, REFUND_RETURNS_IN_TRANSIT_SETTING)
+  assert.equal(def.adminOnly, true)
+  assert.equal(def.defaultValue, 'false')
+  assert.equal(validateSwitchValue(def, 'TRUE').ok, false)
+  const on = ['--key', 'refund_returns_in_transit_enabled', '--value', 'true', ...SET, '--yes', '--confirm-admin']
+  for (const [name, rows, missing] of [
+    ['both unmapped', { xero_sync_enabled: 'true' }, /Stock in Transit.*and Inventory/],
+    ['transit blank', { xero_sync_enabled: 'true', xero_transit_account: '  ', xero_inventory_account: '630' }, /Stock in Transit \(xero_transit_account\) is not mapped/],
+    ['inventory unmapped', { xero_sync_enabled: 'true', xero_transit_account: '631' }, /Inventory \(xero_inventory_account\) is not mapped/],
+  ] as const) {
+    const f = fakeDb({ ...rows })
+    const r = await run('set', on, f)
+    assert.equal(r.code, 3, `${name}: ${r.out}`)
+    assert.match(r.err, missing, name)
+    assert.equal(f.settings.get('refund_returns_in_transit_enabled'), undefined, name)
+    assert.equal(f.audits.length, 0, name)
+  }
+  const noAdmin = await run('set', on.slice(0, -1), fakeDb({ xero_sync_enabled: 'false' }))
+  assert.equal(noAdmin.f.settings.get('refund_returns_in_transit_enabled'), undefined)
+  const mapped = await run('set', on, fakeDb({ xero_sync_enabled: 'true', xero_transit_account: '631', xero_inventory_account: '630' }))
+  assert.equal(mapped.code, 0, mapped.err)
+  assert.equal(mapped.f.settings.get('refund_returns_in_transit_enabled')!.value, 'true')
+  const syncOff = await run('set', on, fakeDb({ xero_sync_enabled: 'false' }))
+  assert.equal(syncOff.code, 0, 'with Xero sync off nothing posts, so no account is needed')
+  const off = await run('set', ['--key', 'refund_returns_in_transit_enabled', '--value', 'false', ...SET, '--yes', '--confirm-admin'], fakeDb({ refund_returns_in_transit_enabled: 'true', xero_sync_enabled: 'true' }))
+  assert.equal(off.code, 0, off.err)
 })

@@ -360,6 +360,12 @@ export function calculatePurchaseInvoice(params: {
       const stockUnitInput = params.ppvSplit?.stockUnitForeignByPoLine.get(line.poLineId)
       if (params.ppvSplit && stockUnitInput === undefined) throw new Error(`No PO goods unit cost for ${poLine.product.sku} to split the bill line at`)
       const stockUnitForeign = stockUnitInput === undefined ? null : roundQuantity(stockUnitInput, 4)
+      // Step 3b (LOW): a split line is sent as Quantity x UnitAmount with an exact LineAmount; Xero keeps at most 4 decimal places of a quantity, so a
+      // quantity finer than that could not reproduce the amounts and is refused rather than sent (nothing is saved).
+      if (stockUnitForeign && toDecimal(line.qtyBilled).decimalPlaces() > 4) {
+        throw new PurchaseBillTaxRefusal(`The billed quantity ${line.qtyBilled} of ${poLine.product.sku} has more than 4 decimal places, which the accounting system cannot hold on a bill line `
+          + 'split into its stock and price-variance parts. Bill a quantity with at most 4 decimal places.')
+      }
       // The line's tax is the line's tax, split or not (MED-4): the stock part and the PPV part are sent with exact 2dp amounts and tax that add up to
       // the supplier's single line (amount rounded to the currency, tax on the line), so the Xero bill total and VAT equal the supplier's.
       const lineTax = roundMoney(multiplyMoney(totalForeign, lineRate), currency)

@@ -7,7 +7,7 @@
  * recordTransitSubledgerMovement: PURCHASE_BILL and PURCHASE_BILL_UPDATE and SUPPLIER_CREDIT_NOTE and PURCHASE_ORDER_CANCEL and SUPPLIER_RETURN in
  * app/actions/purchase-orders.ts and lib/domain/purchasing, STOCK_RECEIPT in lib/domain/wms/booked-in-service.ts and the warehouse-system stock sync,
  * LANDED_COST_RECLASS and LANDED_COST_CONSUMED_OFFSET in lib/domain/purchasing/landed-cost-service.ts, CUSTOMER_RETURN_IN_TRANSIT in
- * lib/domain/sales/refund-service.ts, GRIR_RECLASS in lib/connectors/xero/daily-sync.ts: the GR/IR reclass leg, which belongs to no order and is 0 while GR/IR posting is off; PURCHASE_FX_VARIANCE, reserved for the per-event FX journal, which belongs to the order it names and has no writer yet). THE SCHEDULE IS THE SUM OF ALL OF IT: the value in transit for each purchase order (its rows by recorded source,
+ * lib/domain/sales/refund-service.ts, GRIR_RECLASS in lib/connectors/xero/daily-sync.ts: the GR/IR reclass leg, which belongs to no order and is 0 while GR/IR posting is off; PURCHASE_FX_VARIANCE in lib/domain/purchasing/purchase-bill-fx.ts: the per-event FX exchange-rate difference journal, which belongs to the order it names). THE SCHEDULE IS THE SUM OF ALL OF IT: the value in transit for each purchase order (its rows by recorded source,
  * summed), open or not, plus the refund-in-transit leg, which belongs to no order. R11 compares that total with the stored Stock in Transit balance of
  * Xero for the cycle date (owner ruling 2026-10-24: the balance holds all of it, so the comparison must).
  *

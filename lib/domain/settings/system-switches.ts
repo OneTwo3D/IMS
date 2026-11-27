@@ -97,7 +97,9 @@ export const PURCHASE_EVENT_FX_SWITCH_KEY = 'purchase_event_fx_rates_enabled'
  * bill at the locked rate, the price-variance line and the FX-difference journal). Steps 1 and 2 alone value the stock at the prepayment rate while the
  * bill still goes to Xero at the PO rate, so turning the switch on before step 3 would leave a foreign purchase half-way through the policy. Turning it on
  * is refused while this is false, and the switch READS off while it is false (purchase-event-fx-settings.ts). Step 3 is installed in two parts (the bill side,
- * then supplier returns and credit notes); the second part flips it to true.
+ * then supplier returns and credit notes). Both parts are installed, but it stays FALSE: it is flipped by its own small change once the owner has ruled
+ * on bills IMS did not post (`--in-flight` "no journal") and the demo-tenant probe in docs/xero-sync.md has been run. Even then the switch itself stays
+ * off until an admin turns it on with `npm run settings:set`.
  */
 export const PURCHASE_EVENT_FX_STEPS_COMPLETE = false
 export const PURCHASE_PRICE_VARIANCE_ACCOUNT_KEY = 'xero_purchase_price_variance_account'
@@ -107,11 +109,19 @@ export const REALISED_FX_ACCOUNT_KEY = 'xero_realised_fx_gain_loss_account'
 // Off by default; turned on only at the owner's go for the one run at the cut-over, and back off afterwards. ADMIN: it lets a command write to the LIVE warehouse.
 export const FIRST_LOAD_WMS_ARCHIVE_SWITCH_KEY = 'first_load_mintsoft_archive_enabled' // wms-connector-boundary-ok: 2026-11-21: operator switch registry names the setting key
 
+// The unpaid-invoice revenue deferral switch (see its entry below).
+export const INVOICE_BASIS_DEFERRAL_SWITCH_KEY = 'xero_defer_unpaid_invoiced_revenue_enabled'
+export const INVOICE_BASIS_DEFERRAL_ENABLED_AT_KEY = 'xero_defer_unpaid_invoiced_revenue_enabled_at'
 // o3d-ngmt.22 / o3d-v7fs5: deleting a refund recorded in error. The reader is refundDeleteEnabledFromSetting in lib/domain/sales/refund-delete-policy.ts (`=== 'true'`); a literal here
 // for the same reason as the others, and tests/settings-cli.test.ts holds it equal to REFUND_DELETE_SETTING. ADMIN: a delete reverses stock, cost layers and journals and voids a
 // credit note in the LIVE ledger. No turn-on prerequisite is encoded: a delete is refused case by case at the moment it is asked for (Xero sync off or the credit-note type off,
 // a credit note the ledger will not void, books locked, stock moved), and the void needs only the baseline accounting.invoices grant, which is held on the connection, not in a settings row.
 export const REFUND_DELETE_SWITCH_KEY = 'refund_delete_enabled'
+// Refunds that return stock hold the units IN TRANSIT (a return expectation, COGS reversal DR Stock in Transit) until the parcel arrives, instead of restocking them at refund time. The reader is
+// readReturnsInTransitEnabled in lib/domain/sales/return-expectation.ts (`=== 'true'`); a literal here for the same reason as the others (that module imports the database client), and
+// tests/settings-cli.test.ts holds it equal to REFUND_RETURNS_IN_TRANSIT_SETTING. ADMIN: it changes the journals a refund posts to the LIVE ledger and where returned stock sits. Off, a refund restocks at refund time exactly as before.
+// Turning it ON is refused while Xero sync is on and the Stock in Transit or Inventory account is unmapped: the refund's COGS reversal and the arrival's clearing journal post to those accounts and fail closed without them.
+export const REFUND_RETURNS_IN_TRANSIT_SWITCH_KEY = 'refund_returns_in_transit_enabled'
 
 // FRS 102 s13.4 part 2: the condition check on returns and the quarantine warehouse. The reader is readReturnConditionCheckEnabled in
 // lib/domain/inventory/quarantine-warehouse.ts (`=== 'true'`); a literal here for the same reason as the others, and tests/settings-cli.test.ts holds it equal to
@@ -149,8 +159,25 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   // o3d-l9gej: a recorded refund payment against a sales credit note is dated and rated on the day its cash went out, not the credit note's day. Literal, not an
   // import of lib/domain/accounting/credit-note-allocation.ts; tests hold it equal to REFUND_CASH_OUT_DATE_SETTING_KEY.
   booleanSwitch('xero_refund_payment_cash_out_date_enabled'),
+  // Unpaid-invoice deferral (FRS 102 s23.10): Group A1 also defers the unshipped revenue of an UNPAID order whose AUTHORISED invoice IMS posted after the switch went on, from
+  // the invoice's document day. ADMIN: it changes the journals IMS posts to the LIVE ledger. Turning it ON stamps the instant (`stampOnKey`): only invoices posted
+  // at or after it are deferred, so invoices already open stay in Sales (no backfill). Literals, not imports of lib/domain/accounting/invoice-basis-deferral.ts
+  // (it imports the database client); tests hold them equal to its keys.
+  { ...booleanSwitch(INVOICE_BASIS_DEFERRAL_SWITCH_KEY, undefined, true), stampOnKey: INVOICE_BASIS_DEFERRAL_ENABLED_AT_KEY },
   booleanSwitch(REFUND_DELETE_SWITCH_KEY, undefined, true),
   booleanSwitch(RETURN_CONDITION_CHECK_SWITCH_KEY, undefined, true),
+  {
+    ...booleanSwitch(REFUND_RETURNS_IN_TRANSIT_SWITCH_KEY, undefined, true),
+    requiresMappedSettings: {
+      whenKey: 'xero_sync_enabled',
+      whenValue: 'true',
+      settings: [
+        { key: 'xero_transit_account', label: 'Stock in Transit' },
+        { key: 'xero_inventory_account', label: 'Inventory' },
+      ],
+      why: 'a refund that returns stock in transit debits Stock in Transit on its COGS reversal, and the parcel\'s arrival moves it to Inventory; with either account unmapped the journal fails closed and the refund stays on the accounting retry list',
+    },
+  },
   booleanSwitch(SUPPLIER_CREATE_KEY, undefined, true),
   booleanSwitch(ASN_SEND_SUPPLIER_KEY, undefined, true),
   booleanSwitch(ASN_SUPPLIER_REQUIRED_KEY, [ASN_REQUIRED_NEEDS_SEND], true),
@@ -161,7 +188,7 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
     ...booleanSwitch(PURCHASE_EVENT_FX_SWITCH_KEY, undefined, true),
     turnOnBlockedUntil: {
       installed: PURCHASE_EVENT_FX_STEPS_COMPLETE,
-      why: 'the last part of step 3 of the per-event purchase FX work (supplier returns and supplier credit notes at the bill\'s rate) is not installed yet; without it a return or a credit would still be valued at the order rate while the stock and the bill are at the prepayment rate',
+      why: 'the last part of step 3 of the per-event purchase FX work is not signed off yet (the owner\'s ruling on bills IMS did not post, which get no exchange-rate journal, and the demo-tenant probe of the split bill); it is enabled by its own change once both are done',
     },
     requiresMappedSettings: {
       whenKey: 'xero_sync_enabled',

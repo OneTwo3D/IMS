@@ -18,6 +18,7 @@
  * An activity-log entry is written in the same transaction.
  */
 
+import { markInvoiceBasisDeferralUnwindOwed } from '@/lib/domain/accounting/invoice-basis-deferral'
 import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
@@ -465,6 +466,13 @@ export async function completeAccountingDocumentDeletion(externalDocumentId: str
         })
         unwound.orderLinkCleared = cleared.count === 1
         unwound.invoiceNumberReleased = cleared.count === 1 ? order.invoiceNumber : null
+        // Unpaid-invoice deferral: an order Group A1 deferred FROM this invoice (unpaid, switch on) has that deferral in
+        // Unearned Revenue with nothing left to release it once the invoice is gone. The obligation to unwind it is
+        // recorded HERE, in the transaction that unwinds the document, and the daily batch posts DR Unearned / CR Sales for
+        // what is still open. A PAID-basis deferral is not touched (the refund and chargeback paths own it).
+        unwound.deferralUnwindOwed = cleared.count === 1
+          ? (await markInvoiceBasisDeferralUnwindOwed(tx, { orders: [{ orderId: order.id, invoiceId: externalDocumentId }] }, 'INVOICE_DELETED')) === 1
+          : false
         const withdrawn = await tx.salesOrderInvoiceDocument.updateMany({
           where: { orderId: order.id, externalDocumentId, withdrawnAt: null },
           data: { withdrawnAt: new Date() },
@@ -502,10 +510,31 @@ export async function completeAccountingDocumentDeletion(externalDocumentId: str
         const fxHistory = billFxManaged || (await tx.grirSubledgerMovement.count({ where: { sourceRef: bill.id, idempotencyKey: { startsWith: 'grir:bill-fx:' } } })) > 0
         if (fxHistory) {
           const { reconcilePurchaseBillFx } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+          const { isPurchaseFxRefusalError } = await import('@/lib/domain/purchasing/purchase-receipt-fx')
           const syncEnabled = (await tx.setting.findUnique({ where: { key: 'xero_sync_enabled' }, select: { value: true } }))?.value === 'true'
-          const fx = await reconcilePurchaseBillFx(tx, { poId: bill.poId, connector: 'xero', syncEnabled, at: new Date() })
-          unwound.purchaseFxJournals = fx.journals
-          if (fx.notQueued.length > 0) unwound.purchaseFxJournalsNotQueued = fx.notQueued.map((entry) => entry.invoiceId)
+          try {
+            const fx = await reconcilePurchaseBillFx(tx, { poId: bill.poId, connector: 'xero', syncEnabled, at: new Date() })
+            unwound.purchaseFxJournals = fx.journals
+            if (fx.notQueued.length > 0) unwound.purchaseFxJournalsNotQueued = fx.notQueued.map((entry) => entry.invoiceId)
+          } catch (error) {
+            // LOW (step 3b): a refusal of the FX journal (an account unmapped) must not hold the deletion, which Xero has already confirmed: thrown here
+            // it rolled the completion back and the sweep retried it for ever. The refusal is raised before any statement of the journal part, so the
+            // transaction is intact; the GR/IR rows above stand (the sub-ledger always accrues) and the journal stays owed: the next bill event of the
+            // order, or `npm run purchase-fx:reconcile -- --po <id> --apply`, queues it once the mapping is fixed. Recorded on the snapshot and logged.
+            if (!isPurchaseFxRefusalError(error)) throw error
+            unwound.purchaseFxJournalRefused = error.message
+            await logActivityInTransaction(tx, {
+              userId: deletion.requestedById,
+              entityType: 'PURCHASE_ORDER',
+              entityId: bill.poId,
+              action: 'purchase_fx_variance_refused_on_bill_delete',
+              tag: 'accounting',
+              level: 'WARNING',
+              description: `The deleted bill ${bill.invoiceNumber ?? bill.id} is unwound in IMS, but its exchange-rate difference journal was not queued: ${error.message} `
+                + `Once that is fixed, run \`npm run purchase-fx:reconcile -- --po ${bill.poId} --apply\`.`,
+              metadata: { invoiceId: bill.id, invoiceNumber: bill.invoiceNumber },
+            })
+          }
         }
         const remaining = await tx.purchaseInvoice.count({ where: { poId: bill.poId } })
         if (remaining === 0) await tx.purchaseOrder.update({ where: { id: bill.poId }, data: { invoicedAt: null } })

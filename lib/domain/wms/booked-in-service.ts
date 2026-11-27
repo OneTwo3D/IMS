@@ -70,7 +70,7 @@ import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { receiptJournalAmount } from '@/lib/domain/accounting/receipt-journal-amount'
 import { recordGrirReceipt } from '@/lib/domain/accounting/grir-subledger-movement'
-import { reconcilePurchaseBillFx, reportPurchaseFxVarianceNotQueued, type PurchaseBillFxReconcileResult } from '@/lib/domain/purchasing/purchase-bill-fx'
+import { purchaseFxOrderHasHistory, reconcilePurchaseBillFx, reportPurchaseFxVarianceNotQueued, type PurchaseBillFxReconcileResult } from '@/lib/domain/purchasing/purchase-bill-fx'
 import { withSavepoint } from '@/lib/db/savepoint'
 import {
   isTransferLineFullyLanded,
@@ -213,13 +213,31 @@ async function markEventLoginRefused(eventId: string, message: string, now = new
 /** MED-C: an episode of waits on the purchase exchange rate ends after this many waits, or this long after the first, and the event then fails. */
 export const FX_WAIT_EPISODE_CAP = { waits: 10, ms: 3 * 24 * 60 * 60 * 1000 } as const
 
-/** Count one more wait of the current episode; true once the episode is over its cap (the caller then fails the event, counted). */
-async function recordFxWait(eventId: string, now = new Date()): Promise<{ capped: boolean; waits: number; startedAt: Date }> {
+/**
+ * Count one more wait of the current episode; `capped` once the episode is over its cap (the caller then fails the event, counted), `firstCapped` only
+ * on the wait that crossed it (step 3b, MED-6: the capped WARNING is written once per episode, not on every counted retry after it).
+ */
+async function recordFxWait(eventId: string, now = new Date()): Promise<{ capped: boolean; firstCapped: boolean; waits: number; startedAt: Date }> {
   const row = await db.wmsInboundReceiptEvent.findUnique({ where: { id: eventId }, select: { fxWaitStartedAt: true, fxWaitCount: true } })
   const startedAt = row?.fxWaitStartedAt ?? now
-  const waits = (row?.fxWaitCount ?? 0) + 1
-  await db.wmsInboundReceiptEvent.update({ where: { id: eventId }, data: { fxWaitStartedAt: startedAt, fxWaitCount: waits } })
-  return { capped: waits > FX_WAIT_EPISODE_CAP.waits || now.getTime() - startedAt.getTime() >= FX_WAIT_EPISODE_CAP.ms, waits, startedAt }
+  const previous = row?.fxWaitCount ?? 0
+  const waits = previous + 1
+  const capped = waits > FX_WAIT_EPISODE_CAP.waits || now.getTime() - startedAt.getTime() >= FX_WAIT_EPISODE_CAP.ms
+  // A count over the cap marks the episode capped, so a time cap is remembered as such too and the next wait knows it is not the first over it.
+  const stored = capped ? Math.max(waits, FX_WAIT_EPISODE_CAP.waits + 1) : waits
+  await db.wmsInboundReceiptEvent.update({ where: { id: eventId }, data: { fxWaitStartedAt: startedAt, fxWaitCount: stored } })
+  return { capped, firstCapped: capped && previous <= FX_WAIT_EPISODE_CAP.waits, waits, startedAt }
+}
+
+/**
+ * Step 3b, MED-6: the episode of waits ends once the event gets past the exchange-rate step (processed) or stops for any other reason (pending, review,
+ * a failure that is not a wait on the rate), so a later wait starts a new episode instead of inheriting an old count. A no-op when it is not waiting.
+ */
+async function endFxWaitEpisode(eventId: string): Promise<void> {
+  await db.wmsInboundReceiptEvent.updateMany({
+    where: { id: eventId, OR: [{ fxWaitCount: { gt: 0 } }, { fxWaitStartedAt: { not: null } }] },
+    data: { fxWaitStartedAt: null, fxWaitCount: 0 },
+  })
 }
 
 async function markEventPending(eventId: string, reason: string): Promise<void> {
@@ -474,6 +492,8 @@ export async function processBookedInEvent(
     // The valuations this event laid goods at, reported after the commit (MED-5).
     const purchaseFxValuations = new Map<string, ReceiptFxValuation>()
     const purchaseBillFxResults: Array<{ poId: string; poReference: string; result: PurchaseBillFxReconcileResult }> = []
+    // MED-3: every order this book-in received goods for, so an order whose bills the switch manages still reconciles after a switch-off rollback.
+    const purchaseFxReceivedPoIds = new Set<string>()
 
     const processed = await db.$transaction(async (tx) => {
       await tx.$queryRaw`SELECT id FROM wms_inbound_receipt_events WHERE id = ${event.id} FOR UPDATE`
@@ -1286,6 +1306,7 @@ export async function processBookedInEvent(
               // Per-event FX: the lock is used once goods are laid at its rate (LOW-11).
               await markPurchaseFxLockUsed(tx, fxValuation, now)
               if (fxValuation) purchaseFxValuations.set(poId, fxValuation)
+              purchaseFxReceivedPoIds.add(poId)
 
               // GR/IR accrual: the same units the layer above carries, at the PO goods unit cost, keyed on the stock movement's own key so a replayed
               // book-in (which the movement's unique key already refused) records nothing. In this transaction, whether or not Xero posting is on.
@@ -1821,11 +1842,15 @@ export async function processBookedInEvent(
 
       // Per-event FX (step 3): goods that arrive after the order's bill settle that bill's FX difference against them (per receipt), in this
       // transaction, under the order row locks this book-in holds.
-      for (const valuation of purchaseFxValuations.values()) {
+      // MED-3: and so does an order valued before a switch-off rollback, whose bills the switch still manages.
+      for (const poId of [...purchaseFxReceivedPoIds].sort()) {
+        const valuation = purchaseFxValuations.get(poId)
+        if (!valuation && !(await purchaseFxOrderHasHistory(tx, poId))) continue
+        const poReference = valuation?.poReference ?? (await tx.purchaseOrder.findUniqueOrThrow({ where: { id: poId }, select: { reference: true } })).reference
         purchaseBillFxResults.push({
-          poId: valuation.poId,
-          poReference: valuation.poReference,
-          result: await reconcilePurchaseBillFx(tx, { poId: valuation.poId, connector: accountingConnector, syncEnabled: accountingSettings.syncEnabled, at: now }),
+          poId,
+          poReference,
+          result: await reconcilePurchaseBillFx(tx, { poId, connector: accountingConnector, syncEnabled: accountingSettings.syncEnabled, at: now }),
         })
       }
 
@@ -1837,6 +1862,9 @@ export async function processBookedInEvent(
           nextRetryAt: null,
           deadLetteredAt: null,
           lastError: null,
+          // MED-6: past the exchange-rate step, the episode of waits is over.
+          fxWaitStartedAt: null,
+          fxWaitCount: 0,
         },
       })
 
@@ -1940,6 +1968,7 @@ export async function processBookedInEvent(
     }
 
     if (processed.reviewRequired) {
+      await endFxWaitEpisode(event.id)
       await logActivity({
         entityType: 'SYNC',
         entityId: event.id,
@@ -1964,6 +1993,7 @@ export async function processBookedInEvent(
 
     if (processed.pending) {
       const pendingReason = normalizePendingReason(processed.pendingReason ?? `ASN ${event.externalAsnId ?? 'unknown'} is not mapped yet`)
+      await endFxWaitEpisode(event.id)
       await markEventPending(event.id, pendingReason)
       return {
         status: 'pending',
@@ -2059,7 +2089,9 @@ export async function processBookedInEvent(
     // MED-C: an episode of such waits is CAPPED (FX_WAIT_EPISODE_CAP): past it the event fails like any other refusal, with a durable WARNING, so goods
     // never wait for ever on an answer that is not coming.
     const fxWait = isTransientPurchaseFxRefusal(error) ? await recordFxWait(event.id) : null
-    if (fxWait?.capped) {
+    // MED-6: a failure for any other reason ends the episode of waits (a capped episode stays: its retries keep counting until the event gets past).
+    if (!fxWait) await endFxWaitEpisode(event.id)
+    if (fxWait?.firstCapped) {
       await logActivity({
         entityType: 'SYNC',
         entityId: event.id,
