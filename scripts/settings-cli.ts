@@ -103,6 +103,11 @@ export async function runSettingsCli(options: SettingsCliOptions): Promise<numbe
       const interlock = await storefrontEmailSwitchOnRefusal(options.interlock)
       if (interlock) { stderr.error(interlock); return 3 }
     }
+    if (def.turnOnInterlock === 'purchase-fx-bill-writer' && proposed === 'true' && current.stored !== 'true') {
+      const { purchaseFxSwitchOnRefusal } = await import('@/lib/domain/purchasing/purchase-event-fx-switch-on')
+      const writer = purchaseFxSwitchOnRefusal()
+      if (writer) { stderr.error(writer); return 3 }
+    }
     if (def.adminOnly && yes && !confirmAdmin) { stderr.error(adminRefusal(def)); return 3 }
     if (!yes) {
       if (def.adminOnly) stdout.log(`${def.key} is an ADMIN switch in the screen; writing it needs --yes --confirm-admin (ADMIN authority is assumed from shell access).`)

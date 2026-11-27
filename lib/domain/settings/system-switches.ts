@@ -42,7 +42,7 @@ export type SwitchDefinition = {
   /** A row stamped with the ISO instant, in the same transaction, whenever the switch changes to ON (not when it is left as it is); the row is deleted when the switch changes to OFF. */
   readonly stampOnKey?: string
   /** Turning ON is refused by this interlock (run by the command, which may read the store; the registry stays free of the database client). */
-  readonly turnOnInterlock?: 'storefront-customer-email'
+  readonly turnOnInterlock?: 'storefront-customer-email' | 'purchase-fx-bill-writer'
   /**
    * Turning ON is refused while `whenKey` is `whenValue` and any of `settings` is blank (unset or only spaces). Settings rows only, so it is checked here,
    * in the dry run and again inside the write transaction.
@@ -186,6 +186,8 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   // ADMIN: it changes how purchase receipts and bills are valued in the LIVE ledger.
   {
     ...booleanSwitch(PURCHASE_EVENT_FX_SWITCH_KEY, undefined, true),
+    // Refused while the producer-side hold shadows supplier bills: IMS must be the bill writer (lib/domain/purchasing/purchase-event-fx-switch-on.ts).
+    turnOnInterlock: 'purchase-fx-bill-writer',
     turnOnBlockedUntil: {
       installed: PURCHASE_EVENT_FX_STEPS_COMPLETE,
       why: 'the last part of step 3 of the per-event purchase FX work is not signed off yet (the owner\'s ruling on bills IMS did not post, which get no exchange-rate journal, and the demo-tenant probe of the split bill); it is enabled by its own change once both are done',
