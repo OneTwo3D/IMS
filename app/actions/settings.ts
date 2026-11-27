@@ -1665,20 +1665,30 @@ export async function updateWarehouse(
     if (dup && dup.id !== id) return { success: false, error: `Warehouse code "${data.code}" already exists.` }
 
     const item = await db.$transaction(async (tx) => {
-      // THE TYPE CHANGE, under the warehouse row lock so an allocation or a restock cannot slip in between the check and the write.
-      //  - Into QUARANTINE (whatever the switch): refused while the warehouse still carries sellable work (a WMS binding, allocations, unshipped
-      //    shipments, open production orders, transfers in transit into it, purchase orders still to be received there).
+      // THE TYPE CHANGE across the QUARANTINE boundary. An ordinary save (name, flags, address, the same type) takes no lock beyond what it
+      // took before: the current type is only READ. Only a save that moves the warehouse into or out of QUARANTINE locks the row, with FOR NO
+      // KEY UPDATE (it does not conflict with the FOR KEY SHARE every stock, allocation or shipment insert takes through its foreign key), and
+      // re-reads the type under that lock. The allocation writers take FOR SHARE on the row while the switch is on, so an allocation and this
+      // change serialise; other sellable work (a shipment, a production order, a transfer, a purchase order) is not locked out, so the census
+      // below is a check at the moment of the change, not a guarantee against a write that commits just after it.
+      //  - Into QUARANTINE (whatever the switch): refused while the warehouse still carries sellable work (a WMS binding, residual allocations,
+      //    unshipped shipments, open production orders, transfers in transit into it, purchase orders still to be received there).
       //  - Out of QUARANTINE (switch on): refused while it holds stock, which would otherwise become sellable without a decision.
-      await tx.$queryRaw`SELECT id FROM warehouses WHERE id = ${id} FOR UPDATE`
-      const current = await tx.warehouse.findUnique({ where: { id }, select: { type: true } })
-      if (current && isQuarantineWarehouseType(data.type) && !isQuarantineWarehouseType(current.type)) {
-        const typeRefusal = quarantineTypeChangeRefusal(await loadQuarantineBlockers(tx, id))
-        if (typeRefusal) throw new WarehouseSettingsRefusal(typeRefusal)
-      }
-      if (current && conditionCheck && isQuarantineWarehouseType(current.type) && !isQuarantineWarehouseType(data.type)) {
-        const held = await tx.stockLevel.aggregate({ where: { warehouseId: id, quantity: { gt: 0 } }, _sum: { quantity: true } })
-        const leaveRefusal = quarantineLeaveRefusal(held._sum.quantity ?? 0)
-        if (leaveRefusal) throw new WarehouseSettingsRefusal(leaveRefusal)
+      // A sellable flag on a quarantine warehouse needs no lock: it is refused from the request alone, before this transaction.
+      const crossesQuarantine = (type: string | undefined): boolean => type != null && isQuarantineWarehouseType(type) !== isQuarantineWarehouseType(data.type)
+      const before = await tx.warehouse.findUnique({ where: { id }, select: { type: true } })
+      if (crossesQuarantine(before?.type)) {
+        await tx.$queryRaw`SELECT id FROM warehouses WHERE id = ${id} FOR NO KEY UPDATE`
+        const current = await tx.warehouse.findUnique({ where: { id }, select: { type: true } })
+        if (current && isQuarantineWarehouseType(data.type) && !isQuarantineWarehouseType(current.type)) {
+          const typeRefusal = quarantineTypeChangeRefusal(await loadQuarantineBlockers(tx, id))
+          if (typeRefusal) throw new WarehouseSettingsRefusal(typeRefusal)
+        }
+        if (current && conditionCheck && isQuarantineWarehouseType(current.type) && !isQuarantineWarehouseType(data.type)) {
+          const held = await tx.stockLevel.aggregate({ where: { warehouseId: id, quantity: { gt: 0 } }, _sum: { quantity: true } })
+          const leaveRefusal = quarantineLeaveRefusal(held._sum.quantity ?? 0)
+          if (leaveRefusal) throw new WarehouseSettingsRefusal(leaveRefusal)
+        }
       }
       // If setting as default, unset others
       if (data.isDefault) {

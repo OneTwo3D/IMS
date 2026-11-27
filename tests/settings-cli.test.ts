@@ -449,7 +449,7 @@ test('return_condition_check_enabled: the quarantine interlock refuses in the dr
     const zero = { count: async () => 0 }
     return {
       warehouse: { findMany: async () => [{ id: 'w1', code: 'QAR', name: 'Quarantine', availableForSale: dirty(), syncToStore: false, isDefault: false, defaultReturnWarehouse: false, availableForPurchaseOrders: false }] },
-      externalWmsBinding: zero, orderAllocation: zero, shipment: zero, productionOrder: zero, stockTransfer: zero, purchaseOrder: zero,
+      externalWmsBinding: zero, orderAllocation: { findMany: async () => [] }, shipmentLine: { findMany: async () => [] }, shipment: zero, productionOrder: zero, stockTransfer: zero, purchaseOrder: zero,
     }
   }
   const withInterlock = (f: ReturnType<typeof fakeDb>) => {

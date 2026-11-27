@@ -576,6 +576,38 @@ test('before switch-on: the interlock, the type change both ways, production in 
   assert.equal('returnCondition' in (audit.metadata as object), false, 'and none is recorded')
 })
 
+test('open allocations are counted by residual: a warehouse whose only allocation shipped in full can become Quarantine; an inbound transfer blocks only the type change', SKIP, async (t) => {
+  const w = await seedWorld({ orders: 1 })
+  t.after(() => w.teardown())
+  const { db, quarantine } = await loadDeps()
+  const { updateWarehouse } = await import('@/app/actions/settings')
+  const save = (type: 'STANDARD' | 'QUARANTINE') =>
+    updateWarehouse(w.main.id, { code: w.main.code, name: 'qc main', type, country: 'GB', availableForSale: false, syncToStore: false, availableForPurchaseOrders: false, isDefault: false, defaultReturnWarehouse: false, active: true })
+  await setSwitch(false)
+  // The seeded order shipped both units from MAIN; its allocation row survives dispatch with qty 2.
+  const { orderId, lineId } = w.orders[0]
+  const allocation = await db.orderAllocation.create({ data: { orderId, lineId, productId: w.product.id, warehouseId: w.main.id, qty: '2' }, select: { id: true } })
+  assert.equal(await quarantine.countOpenAllocations(db, w.main.id), 0, 'fully shipped: nothing is still reserved')
+  // A residual (3 allocated, 2 shipped) is still open and blocks.
+  await db.orderAllocation.update({ where: { id: allocation.id }, data: { qty: '3' } })
+  assert.equal(await quarantine.countOpenAllocations(db, w.main.id), 1)
+  const blocked = await save('QUARANTINE')
+  assert.equal(blocked.success, false)
+  assert.match(blocked.error ?? '', /1 open allocation/)
+  await db.orderAllocation.update({ where: { id: allocation.id }, data: { qty: '2' } })
+  const ok = await save('QUARANTINE')
+  assert.equal(ok.success, true, `a warehouse whose only allocation shipped in full can become Quarantine (${ok.error})`)
+
+  // Transferring damaged stock INTO a quarantine warehouse is normal: an in-transit transfer into it is not an issue for the switch-on census.
+  const transfer = await db.stockTransfer.create({ data: { reference: `QC-T2-${w.tag}`, fromWarehouseId: w.qar.id, toWarehouseId: w.main.id, status: 'IN_TRANSIT' }, select: { id: true } })
+  t.after(() => db.stockTransfer.deleteMany({ where: { id: transfer.id } }))
+  assert.equal((await quarantine.listQuarantineWarehouseIssues(db)).some((i) => i.id === w.main.id), false)
+  // ...but it still blocks turning another warehouse into Quarantine (the type change counts it).
+  assert.equal((await quarantine.loadQuarantineBlockers(db, w.main.id)).inboundTransfers, 1)
+  assert.equal((await quarantine.loadQuarantineBlockers(db, w.main.id, { inboundTransfers: false })).inboundTransfers, 0)
+  assert.equal((await save('STANDARD')).success, true, 'switch off: leaving quarantine is not checked')
+})
+
 test('switch off is identical: no condition, any warehouse, and a quarantine-typed warehouse flagged for sale behaves as before', SKIP, async (t) => {
   const w = await seedWorld({ orders: 1 })
   t.after(() => w.teardown())

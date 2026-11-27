@@ -21,6 +21,7 @@
  * it may be sold.
  */
 import type { Prisma } from '@/app/generated/prisma/client'
+import { RESERVATION_RELEASING_SHIPMENT_STATUS, residualAllocationRows } from '@/lib/domain/inventory/reservation-residual'
 
 export const RETURN_CONDITION_CHECK_SETTING_KEY = 'return_condition_check_enabled'
 
@@ -201,7 +202,7 @@ export function wmsReturnRestockRefusal(params: {
   return returnConditionRestockRefusal(params)
 }
 
-type QuarantineCensusClient = Pick<Prisma.TransactionClient, 'externalWmsBinding' | 'orderAllocation' | 'shipment' | 'productionOrder' | 'stockTransfer' | 'purchaseOrder'>
+type QuarantineCensusClient = Pick<Prisma.TransactionClient, 'externalWmsBinding' | 'orderAllocation' | 'shipment' | 'shipmentLine' | 'productionOrder' | 'stockTransfer' | 'purchaseOrder'>
 
 export type QuarantineBlockers = {
   wmsBindings: number
@@ -216,16 +217,46 @@ export type QuarantineBlockers = {
 const OPEN_PURCHASE_ORDER_STATUSES = ['DRAFT', 'RFQ_SENT', 'QUOTE_RECEIVED', 'PO_SENT', 'SHIPPED', 'PARTIALLY_RECEIVED'] as const
 
 /**
- * Sellable work that points at a warehouse: a warehouse-system binding, open allocations, shipments not yet shipped, open production orders,
- * transfers in flight into it and purchase orders still to be received there. Each count is exact (no sampling).
+ * Open allocations in a warehouse: allocation rows whose RESIDUAL (qty less what SHIPPED shipments of the same line, warehouse and product
+ * dispatched; lib/domain/inventory/reservation-residual.ts) is still above zero. Allocation rows survive dispatch, so counting raw rows would
+ * call every warehouse that ever shipped "allocated".
  */
-export async function loadQuarantineBlockers(client: QuarantineCensusClient, warehouseId: string): Promise<QuarantineBlockers> {
+export async function countOpenAllocations(
+  client: Pick<Prisma.TransactionClient, 'orderAllocation' | 'shipmentLine'>,
+  warehouseId: string,
+): Promise<number> {
+  const allocations = await client.orderAllocation.findMany({
+    where: { warehouseId, qty: { gt: 0 } },
+    select: { lineId: true, productId: true, warehouseId: true, qty: true },
+  })
+  if (allocations.length === 0) return 0
+  const lines = await client.shipmentLine.findMany({
+    where: {
+      lineId: { in: [...new Set(allocations.map((a) => a.lineId))] },
+      shipment: { warehouseId, status: RESERVATION_RELEASING_SHIPMENT_STATUS },
+    },
+    select: { lineId: true, productId: true, qty: true, shipment: { select: { warehouseId: true } } },
+  })
+  const dispatched = lines.map((line) => ({ lineId: line.lineId, productId: line.productId, warehouseId: line.shipment.warehouseId, qty: line.qty }))
+  return residualAllocationRows(allocations, dispatched).filter((row) => row.qty.gt(0)).length
+}
+
+/**
+ * Sellable work that points at a warehouse: a warehouse-system binding, open (residual) allocations, shipments not yet shipped, open
+ * production orders, purchase orders still to be received there and, for a TYPE CHANGE only, transfers in transit into it (moving damaged
+ * stock into an existing quarantine warehouse is the normal route, so the switch-on census leaves them out). Each count is exact.
+ */
+export async function loadQuarantineBlockers(
+  client: QuarantineCensusClient,
+  warehouseId: string,
+  options: { inboundTransfers?: boolean } = { inboundTransfers: true },
+): Promise<QuarantineBlockers> {
   const [wmsBindings, allocations, openShipments, openProductionOrders, inboundTransfers, openPurchaseOrders] = await Promise.all([
     client.externalWmsBinding.count({ where: { warehouseId } }),
-    client.orderAllocation.count({ where: { warehouseId, qty: { gt: 0 } } }),
+    countOpenAllocations(client, warehouseId),
     client.shipment.count({ where: { warehouseId, status: { in: ['PENDING', 'PICKING', 'PACKED'] } } }),
     client.productionOrder.count({ where: { warehouseId, status: { in: ['DRAFT', 'IN_PROGRESS'] } } }),
-    client.stockTransfer.count({ where: { toWarehouseId: warehouseId, status: 'IN_TRANSIT' } }),
+    options.inboundTransfers === false ? Promise.resolve(0) : client.stockTransfer.count({ where: { toWarehouseId: warehouseId, status: 'IN_TRANSIT' } }),
     client.purchaseOrder.count({ where: { destinationWarehouseId: warehouseId, status: { in: [...OPEN_PURCHASE_ORDER_STATUSES] } } }),
   ])
   return { wmsBindings, allocations, openShipments, openProductionOrders, inboundTransfers, openPurchaseOrders }
@@ -283,7 +314,7 @@ export async function listQuarantineWarehouseIssues(
   for (const w of warehouses) {
     const problems = [
       ...quarantineSellableFlags(w).map((flag) => `marked ${flag}`),
-      ...quarantineBlockerParts(await loadQuarantineBlockers(client, w.id)),
+      ...quarantineBlockerParts(await loadQuarantineBlockers(client, w.id, { inboundTransfers: false })),
     ]
     if (problems.length > 0) issues.push({ id: w.id, code: w.code, name: w.name, problems })
   }
