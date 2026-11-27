@@ -37,6 +37,7 @@ import {
   type MissingTaxRateGenerateResult,
 } from '@/lib/tax/generate-missing-tax-rates'
 import { xeroReportTaxType, XERO_REPORT_TAX_TYPES, isXeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
+import { isQuarantineWarehouseType, listQuarantineWarehouseIssues, loadQuarantineBlockers, quarantineTypeChangeRefusal, quarantineWarehouseSettingsRefusal, readReturnConditionCheckEnabled, type QuarantineWarehouseIssue } from '@/lib/domain/inventory/quarantine-warehouse'
 import {
   effectiveTaxRateFromComponents,
   normalizeTaxRateComponents,
@@ -1515,6 +1516,13 @@ const warehouseFields = {
   active: true,
 } as const
 
+/** The condition check on returns (switch return_condition_check_enabled, an ADMIN system switch): its state, and every quarantine warehouse not clean for it. */
+export async function getReturnConditionCheckStatus(): Promise<{ enabled: boolean; issues: QuarantineWarehouseIssue[] }> {
+  await requirePermission('settings.company')
+  const [enabled, issues] = await Promise.all([readReturnConditionCheckEnabled(db), listQuarantineWarehouseIssues(db)])
+  return { enabled, issues }
+}
+
 export async function getWarehousesForSettings(): Promise<WarehouseRow[]> {
   await requireInternalUser()
   return db.warehouse.findMany({
@@ -1558,6 +1566,9 @@ export async function createWarehouse(
   if (!normalizedCountry) {
     return { success: false, error: 'Select a valid country.' }
   }
+  // Switch return_condition_check_enabled: a quarantine warehouse holds unsellable stock, so its sellable flags are refused.
+  const quarantineRefusal = quarantineWarehouseSettingsRefusal({ enabled: await readReturnConditionCheckEnabled(db), ...data })
+  if (quarantineRefusal) return { success: false, error: quarantineRefusal }
   try {
     /**
      * ONE TRANSACTION, NOT THREE COMMITS (o3d-osl8 round 11, finding 3).
@@ -1639,6 +1650,18 @@ export async function updateWarehouse(
   const normalizedCountry = toIsoCountryCode(data.country)
   if (!normalizedCountry) {
     return { success: false, error: 'Select a valid country.' }
+  }
+  // Switch return_condition_check_enabled: a quarantine warehouse holds unsellable stock, so its sellable flags are refused, and a warehouse
+  // still carrying sellable work (a WMS binding, allocations, unshipped shipments, open production orders) cannot be turned into one.
+  const conditionCheck = await readReturnConditionCheckEnabled(db)
+  const quarantineRefusal = quarantineWarehouseSettingsRefusal({ enabled: conditionCheck, ...data })
+  if (quarantineRefusal) return { success: false, error: quarantineRefusal }
+  if (conditionCheck && isQuarantineWarehouseType(data.type)) {
+    const current = await db.warehouse.findUnique({ where: { id }, select: { type: true } })
+    if (current && !isQuarantineWarehouseType(current.type)) {
+      const typeRefusal = quarantineTypeChangeRefusal(await loadQuarantineBlockers(db, id))
+      if (typeRefusal) return { success: false, error: typeRefusal }
+    }
   }
   try {
     // Enforce unique code (excluding self)

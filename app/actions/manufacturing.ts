@@ -75,6 +75,7 @@ import {
 } from '@/lib/products/bom-recipe'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { businessDateYmd } from '@/lib/business-date'
+import { isQuarantineWarehouseType, readReturnConditionCheckEnabled } from '@/lib/domain/inventory/quarantine-warehouse'
 
 type JournalLine = { accountCode: string; description: string; debit?: number; credit?: number }
 
@@ -396,6 +397,11 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
     if (preflight.productComponents.length === 0) return { success: false, error: 'Product has no components defined.' }
 
     if (input.qtyPlanned <= 0) return { success: false, error: 'Quantity must be greater than 0.' }
+    // Switch return_condition_check_enabled: quarantine stock is not sellable, so it is never assembled into (or out of) a product.
+    if (await readReturnConditionCheckEnabled(db)) {
+      const target = await db.warehouse.findUnique({ where: { id: input.warehouseId }, select: { type: true } })
+      if (isQuarantineWarehouseType(target?.type)) return { success: false, error: 'That warehouse is a quarantine warehouse: its stock is not sellable and cannot be used in a production order. Transfer the units to a sellable warehouse first if they can be used.' }
+    }
 
     // Foreign-currency cost lines (o3d-hgcj1): the rate is the central fx_rates table rate or a blocking refusal, never a default of 1.
     const baseCurrency = await getBaseCurrencyCode()

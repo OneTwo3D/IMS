@@ -12,6 +12,7 @@ import { normalizeLineDiscountBase, normalizeOrderDiscountBase } from '@/lib/sal
 import { getDisplayTimeZone } from '@/lib/display-timezone'
 import { formatDateTime } from '@/lib/format-datetime'
 import { marginFigureBound, netLinearFigureBound, refundLineBucket, unplacedCreditBoundFromParts, type DerivedFigureBound } from '@/lib/domain/sales/refund-basis-analytics'
+import { readReturnConditionCheckEnabled, sellableStockLevelWhere } from '@/lib/domain/inventory/quarantine-warehouse'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -274,6 +275,8 @@ export async function getDashboardData(
   // Fetch all data needed — go back far enough to cover comparison range
   const fetchFrom = new Date(Math.min(compFrom.getTime(), periodFrom.getTime(), now.getTime() - 2 * 365 * 86400000))
 
+  // Switch return_condition_check_enabled: stock in a quarantine warehouse is not sellable, so the stock KPIs leave it out (an empty filter with the switch off).
+  const sellableLevels = sellableStockLevelWhere(await readReturnConditionCheckEnabled(db))
   const [orders, products, openPOs, pendingSales, , costLayers, incomingPOData, allRecent] = await Promise.all([
     db.salesOrder.findMany({
       where: {
@@ -296,7 +299,7 @@ export async function getDashboardData(
     db.product.findMany({
       // o3d-iigc round 5: sku/name are read by the Best Sellers list so a product that appears there
       // ONLY through a refund line still has a label. Without them such a row rendered blank.
-      select: { id: true, sku: true, name: true, lifecycleStatus: true, stockLevels: { select: { quantity: true, reservedQty: true } } },
+      select: { id: true, sku: true, name: true, lifecycleStatus: true, stockLevels: { where: sellableLevels, select: { quantity: true, reservedQty: true } } },
     }),
     // Open POs KPI (o3d-1di): the canonical COMMITTED-incoming set (includes SHIPPED, excludes the
     // RFQ_SENT/QUOTE_RECEIVED quote pipeline) so this agrees with the incoming card and the

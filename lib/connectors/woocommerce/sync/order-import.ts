@@ -1,6 +1,7 @@
 /**
  * WooCommerce → IMS order import.
  */
+import { readReturnConditionCheckEnabled, sellableWarehouseWhere } from '@/lib/domain/inventory/quarantine-warehouse'
 
 import { businessDateYmd } from '@/lib/business-date'
 import { salesInvoiceDocumentDay } from '@/lib/domain/accounting/document-date'
@@ -3783,7 +3784,8 @@ async function importWcOrderOnce(wcOrder: WcFullOrder, options: ImportWcOrderOpt
     // Find the default WC warehouse — prefer isDefault + syncToStore,
     // fall back to any syncToStore warehouse.
     const wcWarehouses = await db.warehouse.findMany({
-      where: { active: true, syncToStore: true },
+      // Switch return_condition_check_enabled: never a quarantine warehouse (an empty filter with the switch off).
+      where: { active: true, syncToStore: true, ...sellableWarehouseWhere(await readReturnConditionCheckEnabled(db)) },
       select: { id: true, isDefault: true },
       orderBy: { isDefault: 'desc' },
     })

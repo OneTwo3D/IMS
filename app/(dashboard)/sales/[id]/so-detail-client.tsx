@@ -69,7 +69,7 @@ import { getTrackingUrl } from '@/lib/tracking'
 import { countryName, formatCountryDisplay } from '@/lib/countries'
 import { businessDateYmd } from '@/lib/business-date'
 
-type WarehouseInfo = { id: string; code: string; name: string }
+type WarehouseInfo = { id: string; code: string; name: string; type?: string }
 
 // Client-side display helper. Server allocation paths use Decimal coverage in
 // lib/products/fulfillment-coverage.ts; this keeps Prisma Decimal out of the
@@ -119,6 +119,8 @@ type Props = {
   warehouses: WarehouseInfo[]
   /** The active configured return reasons the refund dialog offers. */
   returnReasons?: ReturnReason[]
+  /** Switch return_condition_check_enabled: the refund dialog asks for the returned items' condition, and quarantine warehouses take no allocation. */
+  returnConditionCheckEnabled?: boolean
   currencies: CurrencyRow[]
   externalOrderLinks?: Array<{ label: string; url: string }>
   wmsOrderStatus?: WmsOrderStatusView | null
@@ -214,13 +216,16 @@ function moneyViewOrderOf(so: SoDetail): MoneyViewOrder & { fxRateToBase: number
 // ---------------------------------------------------------------------------
 // Refund dialog
 // ---------------------------------------------------------------------------
-function RefundDialog({ order, warehouses, returnReasons, sym, exchangeOffer, exchangeCatalogue, onClose }: { order: SoDetail; warehouses: WarehouseInfo[]; returnReasons: ReturnReason[]; sym: string; exchangeOffer: ReturnExchangeOffer | null; exchangeCatalogue: ExchangeCatalogueRow[]; onClose: () => void }) {
+function RefundDialog({ order, warehouses, returnReasons, sym, exchangeOffer, exchangeCatalogue, conditionCheck = false, onClose }: { order: SoDetail; warehouses: WarehouseInfo[]; returnReasons: ReturnReason[]; sym: string; exchangeOffer: ReturnExchangeOffer | null; exchangeCatalogue: ExchangeCatalogueRow[]; conditionCheck?: boolean; onClose: () => void }) {
   const router = useRouter()
   const [isPending, startTransition] = useTransition()
   const [reason, setReason] = useState('')
   const [returnReasonId, setReturnReasonId] = useState('')
   // Nothing has shipped yet (the only orders that can take an exchange): there is no stock to return, and the server refuses a return warehouse before the order has shipped.
-  const [returnWhId, setReturnWhId] = useState(order.shipmentStatuses.includes('SHIPPED') ? (warehouses[0]?.id ?? '') : '')
+  const [returnWhId, setReturnWhId] = useState(order.shipmentStatuses.includes('SHIPPED') ? ((conditionCheck ? warehouses.find((w) => w.type !== 'QUARANTINE') : warehouses[0])?.id ?? '') : '')
+  // Switch return_condition_check_enabled: the returned items' condition; unsellable goes to a quarantine warehouse.
+  const [returnCondition, setReturnCondition] = useState<'' | 'SELLABLE' | 'UNSELLABLE'>('')
+  const conditionWarehouses = conditionCheck && returnCondition ? warehouses.filter((w) => (w.type === 'QUARANTINE') === (returnCondition === 'UNSELLABLE')) : warehouses
   const [refundLines, setRefundLines] = useState(order.lines.map((l) => ({ ...l, qtyRefund: 0 })))
   const [error, setError] = useState('')
   const [warning, setWarning] = useState('')
@@ -258,6 +263,7 @@ function RefundDialog({ order, warehouses, returnReasons, sym, exchangeOffer, ex
     const toRefund = refundLines.filter((l) => l.qtyRefund > 0)
     if (!toRefund.length) { setError('Select at least one line'); return }
     if (!reason.trim()) { setError('Reason is required'); return }
+    if (conditionCheck && returnWhId && !returnCondition) { setError('State the condition of the returned items (sellable or unsellable)'); return }
     if (exchangeOn) {
       if (exchangeLines.length === 0) { setError('Add at least one replacement item, or switch the exchange off'); return }
       if (exchangeLines.some((l) => !(l.qty > 0))) { setError('Every replacement item needs a quantity above zero'); return }
@@ -266,6 +272,7 @@ function RefundDialog({ order, warehouses, returnReasons, sym, exchangeOffer, ex
     startTransition(async () => {
       const result = await createRefund(order.id, request.lines, reason, returnWhId || undefined, {
         ...(returnReasonId ? { returnReasonId } : {}),
+        ...(conditionCheck && returnWhId && returnCondition ? { returnCondition } : {}),
         ...(exchangeOn ? { exchange: { lines: exchangePayload, ...(exchangeOffer?.needsShopAcknowledgement ? { acknowledgeShopDesync: exchangeAcknowledged } : {}) } } : {}),
       })
       if (result.success) {
@@ -298,10 +305,26 @@ function RefundDialog({ order, warehouses, returnReasons, sym, exchangeOffer, ex
                 {returnReasons.map((r) => (<option key={r.id} value={r.id}>{r.name}</option>))}
               </select></div>
           )}
+          {conditionCheck && (
+            <div className="space-y-1.5"><Label>Condition of returned items</Label>
+              <select value={returnCondition} onChange={(e) => {
+                const next = e.target.value as '' | 'SELLABLE' | 'UNSELLABLE'
+                setReturnCondition(next)
+                // The warehouse must agree with the condition: unsellable into quarantine, sellable into an ordinary warehouse.
+                const current = warehouses.find((w) => w.id === returnWhId)
+                if (next && returnWhId && (current?.type === 'QUARANTINE') !== (next === 'UNSELLABLE')) {
+                  setReturnWhId(warehouses.find((w) => (w.type === 'QUARANTINE') === (next === 'UNSELLABLE'))?.id ?? '')
+                }
+              }} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
+                <option value="">Select the condition</option>
+                <option value="SELLABLE">Sellable: back into stock</option>
+                <option value="UNSELLABLE">Unsellable: into quarantine</option>
+              </select></div>
+          )}
           <div className="space-y-1.5"><Label>Return to Warehouse</Label>
             <select value={returnWhId} onChange={(e) => setReturnWhId(e.target.value)} className="w-full h-9 rounded-md border border-input bg-background px-3 text-sm">
               <option value="">No stock return</option>
-              {warehouses.map((w) => (<option key={w.id} value={w.id}>{w.code} — {w.name}</option>))}
+              {conditionWarehouses.map((w) => (<option key={w.id} value={w.id}>{w.code} — {w.name}{conditionCheck && w.type === 'QUARANTINE' ? ' (quarantine)' : ''}</option>))}
             </select></div>
         </div>
         <Table className="rounded-md border"><TableHeader className="bg-muted/50"><TableRow>
@@ -1243,7 +1266,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, returnReasons = [], currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, mergeHold = null, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, quoteEmailEnabled = false, editForm, exchangeOffer = null, exchangeCatalogue = [], pegs = [], invoiceDeleteState }: Props) {
+export function SoDetailClient({ order: so, warehouses, returnReasons = [], returnConditionCheckEnabled = false, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, mergeHold = null, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, quoteEmailEnabled = false, editForm, exchangeOffer = null, exchangeCatalogue = [], pegs = [], invoiceDeleteState }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -2163,7 +2186,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
           orderId={so.id}
           allocations={allocations}
           lines={so.lines}
-          warehouses={warehouses}
+          warehouses={returnConditionCheckEnabled ? warehouses.filter((w) => w.type !== 'QUARANTINE') : warehouses}
           status={so.status}
           shipments={shipments}
           requirementsByLine={requirementsByLine}
@@ -2546,7 +2569,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], curr
 
       {/* Dialogs */}
       {deleteTarget && <DeleteRefundDialog refund={deleteTarget} onClose={() => setDeleteTarget(null)} />}
-      {showRefund && <RefundDialog order={so} warehouses={warehouses} returnReasons={returnReasons} sym={sym} exchangeOffer={exchangeOffer} exchangeCatalogue={exchangeCatalogue} onClose={() => setShowRefund(false)} />}
+      {showRefund && <RefundDialog order={so} warehouses={warehouses} returnReasons={returnReasons} sym={sym} exchangeOffer={exchangeOffer} exchangeCatalogue={exchangeCatalogue} conditionCheck={returnConditionCheckEnabled} onClose={() => setShowRefund(false)} />}
       {showNotes && <NotesDialog order={so} onClose={() => setShowNotes(false)} />}
       {showAddresses && editScope.scope === 'ADDRESS_NOTES' && <AddressesDialog order={so} onClose={() => setShowAddresses(false)} />}
       {showEdit && editForm && editScope.scope === 'FULL' && (

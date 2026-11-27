@@ -39,7 +39,7 @@ type Props = { params: Promise<{ id: string }> }
 
 export default async function SalesOrderDetailPage({ params }: Props) {
   const { id } = await params
-  const [session, so, warehouses, currencies, externalOrderLinks, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable, rejectedAccountingSyncs, invoiceTrigger, wmsOrderStatus, wmsPushState, mergeCandidate, returnReasons, shopRefundDue, mergeHold] = await Promise.all([
+  const [session, so, warehouses, currencies, externalOrderLinks, allocations, shipments, fulfillmentRequirements, carriersJson, deliveryTrackingEnabled, invoiceUrlTemplate, accountingSettings, accountingAvailable, rejectedAccountingSyncs, invoiceTrigger, wmsOrderStatus, wmsPushState, mergeCandidate, returnReasons, shopRefundDue, mergeHold, returnConditionCheckSetting] = await Promise.all([
     requireAuth(),
     getSalesOrder(id),
     getWarehouses(),
@@ -61,6 +61,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
     getReturnReasons(true),
     getShopRefundDueForSalesOrder(id),
     getMergeHoldForSalesOrder(id),
+    getSetting('return_condition_check_enabled'),
   ])
   let carriers: string[] = DEFAULT_CARRIERS
   try { if (carriersJson) carriers = JSON.parse(carriersJson) } catch { /* empty */ }
@@ -118,6 +119,7 @@ export default async function SalesOrderDetailPage({ params }: Props) {
         mergeCandidate={mergeCandidate}
         mergeHold={mergeHold}
         returnReasons={returnReasons}
+        returnConditionCheckEnabled={returnConditionCheckSetting === 'true'}
         shopRefundDue={shopRefundDue}
         stockLevels={stockLevels}
         initialAllocations={allocations}

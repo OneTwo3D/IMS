@@ -37,6 +37,7 @@
 import { enabledWmsConnectorIds } from '@/lib/connectors/wms/enabled-connector'
 import { getIntegrationPluginState } from '@/lib/integration-plugins'
 import { isKitIgnoredComponentType } from '@/lib/products/kit-component-policy'
+import { readReturnConditionCheckEnabled, sellableWarehouseWhere } from '@/lib/domain/inventory/quarantine-warehouse'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import type { Prisma } from '@/app/generated/prisma/client'
@@ -686,6 +687,18 @@ export function selectChunkWindow<T extends { id: string }>(
   return { window, nextCursor }
 }
 
+/**
+ * The warehouses whose stock the storefront is told about: active and flagged syncToStore. With the switch
+ * return_condition_check_enabled on, a quarantine warehouse is left out even if flagged (its stock is not sellable);
+ * with it off the query is the one of before.
+ */
+export async function loadStorefrontStockWarehouses(client: Pick<typeof db, 'warehouse' | 'setting'>): Promise<Array<{ id: string }>> {
+  return client.warehouse.findMany({
+    where: { syncToStore: true, active: true, ...sellableWarehouseWhere(await readReturnConditionCheckEnabled(client)) },
+    select: { id: true },
+  })
+}
+
 export async function pushStockToWc(options?: PushStockOptions): Promise<StockSyncResult> {
   const enabled = await db.setting.findUnique({ where: { key: 'wc_stock_sync_enabled' } })
   if (enabled?.value !== 'true') {
@@ -773,10 +786,7 @@ export async function pushStockToWc(options?: PushStockOptions): Promise<StockSy
   })
   if (writeRefusal) return heldStockResult(new OutboundWriteHeldError(writeRefusal, 0).message)
 
-  const warehouses = await db.warehouse.findMany({
-    where: { syncToStore: true, active: true },
-    select: { id: true },
-  })
+  const warehouses = await loadStorefrontStockWarehouses(db)
   if (!warehouses.length) {
     return gateRefusalResult('No warehouses flagged syncToStore')
   }

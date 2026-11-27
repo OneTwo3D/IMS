@@ -78,6 +78,7 @@ import {
 import type { ProductLifecycleStatus, TaxCategory } from '@/app/generated/prisma/client'
 import { getBaseCurrencyCode, getFallbackCurrencyMeta } from '@/lib/base-currency'
 import { resolveFxRatesToBase } from '@/lib/currencies/fx-lookup'
+import { isQuarantineWarehouseType, loadQuarantineQtyByProduct, readReturnConditionCheckEnabled } from '@/lib/domain/inventory/quarantine-warehouse'
 
 // ---------------------------------------------------------------------------
 // Types
@@ -140,6 +141,8 @@ export type ProductDetail = ProductRow & {
     reservedQty: string
     allocatedQty: string    // from active sales orders
     availableQty: string    // quantity - allocatedQty
+    /** Switch return_condition_check_enabled: a quarantine warehouse, whose stock is not sellable (availableQty is 0). Absent otherwise. */
+    quarantine?: boolean
     incomingTransferQty: string  // in-transit transfers arriving at this warehouse
     incomingPoQty: string        // open PO lines destined for this warehouse
   }[]
@@ -271,6 +274,10 @@ export async function listProducts(params: {
     incomingByProduct.set(productId, (incomingByProduct.get(productId) ?? 0) + remaining)
   }
 
+  // Switch return_condition_check_enabled: quarantine stock is on hand but never available (an empty map with the switch off).
+  const quarantineByProduct = await loadQuarantineQtyByProduct(db, await readReturnConditionCheckEnabled(db), allProductIds)
+  const quarantineQty = (productId: string): number => quarantineByProduct.get(productId)?.toNumber() ?? 0
+
   const products: ProductRow[] = rawProducts.map((p) => {
     // Compute variant price range for VARIABLE products
     let priceRange: { min: string; max: string } | null = null
@@ -295,7 +302,10 @@ export async function listProducts(params: {
       ? p.variants.reduce((sum, v) => sum + (incomingByProduct.get(v.id) ?? 0), 0)
       : (incomingByProduct.get(p.id) ?? 0)
 
-    const availableStock = totalStock - allocatedStock
+    const quarantinedStock = p.type === 'VARIABLE'
+      ? p.variants.reduce((sum, v) => sum + quarantineQty(v.id), 0)
+      : quarantineQty(p.id)
+    const availableStock = totalStock - allocatedStock - quarantinedStock
 
     return {
     id: p.id,
@@ -373,7 +383,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
           orderBy: { sku: 'asc' },
         },
         stockLevels: {
-          include: { warehouse: { select: { id: true, code: true, name: true } } },
+          include: { warehouse: { select: { id: true, code: true, name: true, type: true } } },
           orderBy: { warehouse: { code: 'asc' } },
         },
         costLayers: {
@@ -508,6 +518,11 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
   const fifoInventoryValue = p.costLayers
     .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostBase), 0)
   const totalStockQty = p.stockLevels.reduce((sum, s) => sum + Number(s.quantity), 0)
+  // Switch return_condition_check_enabled: stock in a quarantine warehouse is on hand but never available (nothing changes with the switch off).
+  const conditionCheck = await readReturnConditionCheckEnabled(db)
+  const isQuarantineLevel = (level: { warehouse: { type: string } }): boolean => conditionCheck && isQuarantineWarehouseType(level.warehouse.type)
+  const quarantinedQty = p.stockLevels.filter(isQuarantineLevel).reduce((sum, s) => sum + Number(s.quantity), 0)
+  const variantQuarantine = await loadQuarantineQtyByProduct(db, conditionCheck, variantIds)
   const inventoryValue = isKitOrBom
     ? (p.type === 'BOM' ? kitUnitCostBase * totalStockQty : kitUnitCostBase).toFixed(2)
     : fifoInventoryValue.toFixed(2)
@@ -553,7 +568,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
     variantCount: p.variants.length,
     totalStock: totalStockQty.toFixed(2),
     allocatedStock: totalAllocated.toFixed(2),
-    availableStock: (totalStockQty - totalAllocated).toFixed(2),
+    availableStock: (totalStockQty - totalAllocated - quarantinedQty).toFixed(2),
     incomingStock: productIncoming.toFixed(2),
     inventoryValue,
     createdAt: p.createdAt,
@@ -594,7 +609,8 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
         .toFixed(2),
       availableStock: (
         v.stockLevels.reduce((sum, s) => sum + Number(s.quantity), 0) -
-        v.stockLevels.reduce((sum, s) => sum + Number(s.reservedQty), 0)
+        v.stockLevels.reduce((sum, s) => sum + Number(s.reservedQty), 0) -
+        (variantQuarantine.get(v.id)?.toNumber() ?? 0)
       ).toFixed(2),
       incomingStock: (variantIncomingMap.get(v.id) ?? 0).toFixed(2),
       inventoryValue: '0.00',
@@ -608,11 +624,13 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
         const wid = s.warehouse.id
         const qty = Number(s.quantity)
         const reserved = Number(s.reservedQty)
-        const available = qty - reserved
+        const quarantine = isQuarantineLevel(s)
+        const available = quarantine ? 0 : qty - reserved
         return {
           warehouseId: wid,
           warehouseCode: s.warehouse.code,
           warehouseName: s.warehouse.name,
+          ...(quarantine ? { quarantine: true } : {}),
           quantity: qty.toFixed(2),
           reservedQty: s.reservedQty.toString(),
           allocatedQty: reserved.toFixed(2),

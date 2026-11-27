@@ -70,6 +70,8 @@ FRS 102 section 13.4 values stock at the lower of cost and net realisable value 
 
 **Filters:** *Oldest layer at least (days)* (try 90, 180 or 365), *No sale in (days)* (a never-sold product only matches when its stock is itself at least that old, so a brand-new product is not flagged), *Minimum value*, warehouse, category, supplier and type. Rows are sorted by value, highest first (the value at risk), then by age. Virtual KIT products hold no stock of their own and are left out; their components appear on their own rows. Positions are current (there is no as-of date).
 
+**Quarantine stock.** With the condition check on returns switched on (`return_condition_check_enabled`, off by default), units held in a quarantine warehouse (unsellable returns awaiting review) are included in the figures and marked **Quarantine** with their quantity on each row; the CSV export then adds a `quarantineQty` column (only when some row holds quarantine stock, so the file is unchanged otherwise). Pick the quarantine warehouse in the Warehouse filter to review them alone. See *Quarantine: unsellable returns* in [Stock Control](stock-control.md).
+
 **Using it for the period-end review:**
 
 1. Open the report on the first working day after the period ends. Start with *Oldest layer at least* 365 and *No sale in* 365, then repeat at 180 and 90 to widen the net. Set a *Minimum value* so the review covers the lines that matter.

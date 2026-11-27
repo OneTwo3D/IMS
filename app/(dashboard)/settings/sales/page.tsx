@@ -1,14 +1,15 @@
 import { AccessDenied } from '@/components/auth/access-denied'
 import { authorizePage } from '@/lib/auth/server'
 import type { Metadata } from 'next'
-import { AlertTriangle, FileText, Mail, Repeat2, ShieldAlert, Truck } from 'lucide-react'
+import { AlertTriangle, FileText, Mail, PackageX, Repeat2, ShieldAlert, Truck } from 'lucide-react'
 import { Card } from '@/components/ui/card'
-import { getSetting } from '@/app/actions/settings'
+import { getReturnConditionCheckStatus, getSetting } from '@/app/actions/settings'
 import { getRecentInvoicePdfTokenSecurityEvents, getRecentTaxRateFallbackEvents } from '@/app/actions/activity-log'
 import { InvoiceTriggerSetting } from '@/components/settings/invoice-trigger'
 import { DispatchEmailSetting } from '@/components/settings/dispatch-email'
 import { CrmTimelineEmailsSetting } from '@/components/settings/crm-timeline-emails'
 import { ReturnExchangeSetting } from '@/components/settings/return-exchange'
+import { ReturnConditionCheckStatus } from '@/components/settings/return-condition-check'
 import { DeliveryTrackingSettings } from '@/components/settings/delivery-tracking'
 import { isIntegrationPluginEnabled } from '@/lib/integration-plugins'
 import { formatDateTime } from '@/lib/format-datetime'
@@ -29,6 +30,7 @@ export default async function SalesSettingsPage() {
     dispatchEmailEnabled,
     storefrontCustomerEmailEnabled,
     returnExchangeEnabled,
+    returnConditionCheck,
     crmTimelineEmailsEnabled,
     trackingEnabled,
     trackingSource,
@@ -42,6 +44,7 @@ export default async function SalesSettingsPage() {
     getSetting('dispatch_email_enabled'),
     getSetting('storefront_customer_email_enabled'),
     getSetting('return_exchange_enabled'),
+    getReturnConditionCheckStatus(),
     getSetting('crm_timeline_emails_enabled'),
     getSetting('delivery_tracking_enabled'),
     getSetting('delivery_tracking_source'),
@@ -94,6 +97,17 @@ export default async function SalesSettingsPage() {
           Let the refund dialog record replacement items together with the return. They become new lines on the same order, linked to the refund.
         </p>
         <ReturnExchangeSetting currentValue={returnExchangeEnabled ?? 'false'} />
+      </Card>
+
+      <Card className="p-6">
+        <div className="flex items-center gap-2 mb-4">
+          <PackageX className="h-4 w-4 text-muted-foreground" />
+          <h2 className="text-base font-semibold">Condition check on returns</h2>
+        </div>
+        <p className="text-sm text-muted-foreground mb-4">
+          Ask for the condition of returned items when they are restocked, and keep unsellable items in a quarantine warehouse (a warehouse of type Quarantine) until they are written off or moved back to stock. An administrator switch, set from the command line.
+        </p>
+        <ReturnConditionCheckStatus enabled={returnConditionCheck.enabled} issues={returnConditionCheck.issues} />
       </Card>
 
       <Card className="p-6">

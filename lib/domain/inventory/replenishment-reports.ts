@@ -34,6 +34,7 @@ import {
 } from '@/lib/products/fulfillment-coverage'
 import { loadFulfillmentProductGraph } from '@/lib/products/kit-fulfillment'
 import { lineFulfillmentRequirements } from '@/lib/products/fulfillment-requirement-snapshot'
+import { readReturnConditionCheckEnabled, sellableStockLevelWhere } from '@/lib/domain/inventory/quarantine-warehouse'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -99,6 +100,8 @@ export type ReplenishmentReportClient = {
   bomItem: FindManyDelegate
   /** Per-warehouse threshold overrides. Optional so a client without the table reads as "no overrides". */
   reorderThresholdOverride?: FindManyDelegate
+  /** Settings, for the switch return_condition_check_enabled. Optional so a client without it reads the switch as off. */
+  setting?: unknown
 }
 
 type ThresholdOverrideRow = {
@@ -872,6 +875,9 @@ async function loadStockLevels(client: ReplenishmentReportClient, filters: Stock
       ...(productId ? { productId } : {}),
       ...(filters.warehouseId ? { warehouseId: filters.warehouseId } : {}),
       product: productWhere(filters),
+      // Switch return_condition_check_enabled: quarantine stock is not available, so it neither covers demand nor suppresses a
+      // reorder (an empty filter with the switch off).
+      ...sellableStockLevelWhere(await readReturnConditionCheckEnabled(client)),
     },
     select: {
       productId: true,

@@ -1,6 +1,7 @@
 'use server'
 
 import { netUnpricedReturnRowsAgainstRefunds, priceUnpricedReturnRows, queueReturnRestockValueJournal } from '@/lib/domain/sales/return-restock-cost'
+import { isQuarantineWarehouseType, QUARANTINE_WMS_BINDING_REFUSAL, readReturnConditionCheckEnabled, RETURN_CONDITIONS, wmsReturnRestockRefusal, type ReturnCondition } from '@/lib/domain/inventory/quarantine-warehouse'
 import { parseShopIossNumber, SHOP_IOSS_NUMBER_SETTING } from '@/lib/domain/accounting/shop-ioss-number'
 import { randomUUID } from 'node:crypto'
 
@@ -357,6 +358,8 @@ export type MintsoftWarehouseOption = {
   code: string
   name: string
   active: boolean
+  /** STANDARD, QUARANTINE or RESTOCK. With return_condition_check_enabled on, a QUARANTINE warehouse takes unsellable returns. */
+  type: string
 }
 
 export type MintsoftExternalWarehouseOption = {
@@ -403,6 +406,8 @@ type MintsoftReturnRestockActivityMetadata = {
   productId: string
   qty: number
   orderId: string | null
+  /** Only with the switch return_condition_check_enabled on: the condition the operator recorded. */
+  condition?: ReturnCondition | null
 }
 
 // ASN view-models conform to the connector-agnostic WMS contract
@@ -455,6 +460,8 @@ export type MintsoftDashboardData = {
   orderLookupConnectorRequired: boolean
   /** Active adjustment reasons for the align-down reason picker (6oyu.1). */
   adjustmentReasons: MintsoftAdjustmentReasonOption[]
+  /** The switch return_condition_check_enabled: the restock dialog asks for the returned items' condition. */
+  returnConditionCheckEnabled: boolean
 }
 
 export type MintsoftAdjustmentReasonOption = {
@@ -684,6 +691,8 @@ const MintsoftExternalAsnIdSchema = z.string().trim().min(1, 'ASN ID is required
 const MintsoftReturnRestockInputSchema = z.object({
   id: z.string().min(1, 'Return inbox item ID is required.'),
   warehouseId: z.string().min(1, 'Warehouse is required.'),
+  /** Switch return_condition_check_enabled: the condition of the returned items, checked against the warehouse (unsellable goes to quarantine). Ignored with the switch off. */
+  condition: z.enum(RETURN_CONDITIONS).nullable().optional(),
   /** The adjustment reason whose GL account is credited for the value of units no refund covers. */
   adjustmentReasonId: z.string().min(1).nullable().optional(),
 })
@@ -1457,6 +1466,7 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
         code: true,
         name: true,
         active: true,
+        type: true,
       },
     }),
     db.externalWmsBinding.findMany({
@@ -1689,6 +1699,7 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
       name: reason.name,
       hasAccountCode: Boolean(reason.accountCode),
     })),
+    returnConditionCheckEnabled: await readReturnConditionCheckEnabled(db),
   }
 }
 
@@ -2375,6 +2386,12 @@ export async function saveMintsoftBinding(
 
   if (data.returnsMode === 'WEBHOOK') {
     return { success: false, error: 'Webhook returns mode is not available yet. Use Poll for now.' }
+  }
+
+  // Switch return_condition_check_enabled: a quarantine warehouse is kept in IMS only, so nothing in it is reported to a WMS as sellable.
+  if (await readReturnConditionCheckEnabled(db)) {
+    const target = await db.warehouse.findUnique({ where: { id: data.warehouseId }, select: { type: true } })
+    if (isQuarantineWarehouseType(target?.type)) return { success: false, error: QUARANTINE_WMS_BINDING_REFUSAL }
   }
 
   const nextStockSyncMode: WmsStockSyncMode = data.stockSyncMode ?? 'NOTIFICATION_ONLY'
@@ -5702,6 +5719,8 @@ export async function restockMintsoftReturnInboxItem(
 
   // Pool read before the transaction: the ledger an arrival that clears a refund's Stock in Transit would post to.
   const receiptAccounting = await readReceiptAccounting()
+  // Switch return_condition_check_enabled, read once before the transaction: with it on, the condition must agree with the warehouse.
+  const conditionCheck = await readReturnConditionCheckEnabled(db)
 
   try {
     await db.$transaction(async (tx) => {
@@ -5738,6 +5757,7 @@ export async function restockMintsoftReturnInboxItem(
             code: true,
             name: true,
             active: true,
+            type: true,
           },
         }),
       ])
@@ -5751,6 +5771,8 @@ export async function restockMintsoftReturnInboxItem(
       if (!warehouse || !warehouse.active) {
         throw new Error('Select an active warehouse for restocking.')
       }
+      const conditionRefusal = wmsReturnRestockRefusal({ enabled: conditionCheck, condition: data.condition ?? null, warehouse })
+      if (conditionRefusal) throw new Error(conditionRefusal)
       if (!item.productId) {
         throw new Error('This Mintsoft return cannot be restocked because its SKU is not mapped to an IMS product.')
       }
@@ -5827,7 +5849,7 @@ export async function restockMintsoftReturnInboxItem(
           status: 'RESTOCKED',
           warehouseId: warehouse.id,
           resolvedAt: new Date(),
-          resolutionNote: `Restocked ${qty - partlyCoveredQty} unit${qty - partlyCoveredQty === 1 ? '' : 's'} to ${warehouse.code}${partlyCoveredQty > 0 ? `; ${partlyCoveredQty} already restocked by the refund` : ''}`,
+          resolutionNote: `Restocked ${qty - partlyCoveredQty} unit${qty - partlyCoveredQty === 1 ? '' : 's'} to ${warehouse.code}${conditionCheck && data.condition === 'SELLABLE' ? ' (condition: sellable)' : ''}${partlyCoveredQty > 0 ? `; ${partlyCoveredQty} already restocked by the refund` : ''}`,
         },
       })
 
@@ -5841,6 +5863,7 @@ export async function restockMintsoftReturnInboxItem(
         productId: item.productId,
         qty,
         orderId: item.orderId,
+        ...(conditionCheck ? { condition: data.condition ?? null } : {}),
       }
     })
   } catch (error) {

@@ -122,7 +122,7 @@ Use the **PDF preview** and **Email preview** buttons to see how your template l
 
 Found at **Settings > Inventory**, this section includes:
 
-- **Warehouses** — create and edit warehouses, default sales/returns warehouses, and store-sync eligibility when a shopping connector is enabled
+- **Warehouses** — create and edit warehouses, default sales/returns warehouses, and store-sync eligibility when a shopping connector is enabled. A warehouse's **Type** can be Standard, Quarantine or Restock; with the condition check on returns switched on (an administrator switch; status under Sales Settings), a Quarantine warehouse holds unsellable stock and cannot be marked available for sale, synced to the store or made the default warehouse
   - **Available in Purchase Orders** (on by default): turn it off for a location that must never receive bought-in stock, such as a dropship, quarantine or virtual location. A warehouse with it off is left out of the destination warehouse list on purchase orders and of the warehouse list in **Receive Goods**, and IMS refuses it as a destination or receipt location with a message naming the warehouse (this includes the draft POs made from Reorder Planning and imported purchase orders). The warehouse list shows an amber **Restricted** tag beside it. A purchase order that already points at the warehouse keeps working: you can still edit it with that destination left as it is, and you can still receive it into that warehouse, with a warning. Receipts that come from the warehouse system itself (a Mintsoft ASN book-in) are not affected by this setting, because the warehouse decides where those goods land. Existing warehouses are unchanged until you turn it off.
 - **Product Categories** — manage the reporting category tree. Add top-level categories or sub-categories under any node; rename inline; move a subtree under a new parent (cycles are prevented); delete a node to promote its children one level up and reassign its products to the parent. The same leaf name can be reused under different parents — for example `Apparel > T-Shirts` and `Promo > T-Shirts` are distinct. WooCommerce product sync mirrors the WC category tree into this list automatically, so connected stores stay in step without manual entry.
 - **Stock adjustment reasons** — define selectable reasons for manual stock adjustments
@@ -155,6 +155,10 @@ Shown when the WooCommerce integration is enabled. Toggle the delivery tracking 
 ### Exchanges inside a return
 
 A switch (off by default; the `return_exchange_enabled` setting) that lets the refund dialog record replacement items together with the return. They become new lines on the same order, linked to the refund. See *Exchanges inside a return* in [Sales Orders](sales.md).
+
+### Condition check on returns
+
+Shows whether the condition check on returns is on (the `return_condition_check_enabled` setting, off by default) and lists every quarantine warehouse that still looks sellable (marked available for sale, sync to store or default, or with open allocations). It is an administrator switch with no on/off control here: an administrator sets it on the server with `npm run settings:set ... --yes --confirm-admin`. When it is on, every restock of a return you record asks whether the items are sellable, and unsellable items go into a warehouse of type **Quarantine**, where they are never allocated, never counted as available and never pushed to the store until they are written off or transferred back to stock. See *Quarantine: unsellable returns* in [Stock Control](stock-control.md).
 
 ### Emails on the customer timeline
 

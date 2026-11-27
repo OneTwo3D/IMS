@@ -83,7 +83,12 @@ export default async function SlowStockPage({ searchParams }: { searchParams: Pr
       render: (row) => <ProductLink productId={row.productId} sku={row.sku} name={row.productName} />,
       footer: 'Totals',
     },
-    { key: 'warehouse', label: 'Warehouse', render: (row) => <span className="font-medium">{row.warehouseCode}</span> },
+    { key: 'warehouse', label: 'Warehouse', render: (row) => (
+      <span className="font-medium">
+        {row.warehouseCode}
+        {row.quarantineQty && <span className="ml-1 rounded bg-amber-100 px-1 text-[10px] font-medium text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" title="Units in a quarantine warehouse: unsellable returns awaiting review">Quarantine {row.quarantineQty}</span>}
+      </span>
+    ) },
     { key: 'category', label: 'Category', render: (row) => row.categoryName ?? 'Uncategorised' },
     { key: 'qty', label: 'On hand', align: 'right', render: (row) => `${row.qty} ${row.stockUnit}`, footer: report.totals.qty },
     ...(costVisible ? [{
