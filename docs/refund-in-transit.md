@@ -76,13 +76,13 @@ A refund is in transit only if it returns stock (it has a return warehouse) and 
 
 ## Recommended WooCommerce returns setup
 
-When you refund **returned goods** in WooCommerce, enter the refunded **quantity** and leave **Restock refunded items
-UNTICKED**:
+When you refund **returned goods** in WooCommerce, enter the refunded **quantity** and **untick "Restock refunded items" on every refund (WooCommerce ticks it by default)**:
 
 * WooCommerce's own stock is **not** raised, so no back-in-stock emails go out and the storefront never shows units that are
   not on a shelf yet.
 * IMS books the return from the refund's quantity: into the default return warehouse at refund time (switch off), or as a
   return expectation in transit until the parcel arrives (switch on). IMS then pushes its own stock level to the storefront.
+* **Caveat:** that holds only with `refund_returns_in_transit_enabled` **on**, or when the default return warehouse does not sync to the store. With the switch off IMS restocks into the default return warehouse at refund time and forces a stock push, so if that warehouse syncs to the store the store shows the units, and can send back-in-stock emails, before the parcel arrives.
 * A **money-only** refund (quantity 0, an amount on a goods line, shipping or a fee) moves **no stock** in IMS and writes no
   return expectation.
 

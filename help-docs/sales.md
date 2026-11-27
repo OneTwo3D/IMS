@@ -404,9 +404,11 @@ in Transit is released to Inventory (DR Inventory / CR Stock in Transit). Anythi
 restocked as a plain return, as before. Writing off units that never come back is not built yet, so the setting is
 switched on only as a cut-over step. See `docs/refund-in-transit.md`.
 
-**Refunding returned goods in WooCommerce: enter the quantity, leave "Restock refunded items" unticked.** WooCommerce's own stock is then not raised (no
+**Refunding returned goods in WooCommerce: enter the quantity and untick "Restock refunded items" on every refund (it is ticked by default).** WooCommerce's own stock is then not raised (no
 back-in-stock emails, no units shown that are not on a shelf yet); IMS books the return from the refunded quantity (into the default return
-warehouse, or as a return expectation in transit when the switch above is on) and pushes its own stock level to the store. A money-only refund (quantity 0) moves no stock.
+warehouse, or as a return expectation in transit when the switch above is on) and pushes its own stock level to the store. A money-only refund (quantity 0) moves no stock. 
+
+"No early stock, no back-in-stock emails" holds only with `refund_returns_in_transit_enabled` on, or when the default return warehouse does not sync to the store: with the switch off IMS restocks into the default return warehouse at refund time and forces a stock push, so if that warehouse syncs to the store the store shows the units (and may send back-in-stock emails) before the parcel arrives.
 
 ### Refunds on a partly shipped order
 
