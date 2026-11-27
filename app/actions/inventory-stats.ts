@@ -4,6 +4,7 @@ import { db } from '@/lib/db'
 import { requirePermission } from '@/lib/auth/server'
 import { assertOverviewAnalyticsAccess } from '@/lib/security/overview-analytics-access'
 import type { ProductLifecycleStatus } from '@/app/generated/prisma/client'
+import { isQuarantineWarehouseType, readReturnConditionCheckEnabled } from '@/lib/domain/inventory/quarantine-warehouse'
 
 // ---------------------------------------------------------------------------
 // Stock on Hand
@@ -28,10 +29,11 @@ export type StockOnHandRow = {
 
 export async function getStockOnHand(): Promise<StockOnHandRow[]> {
   assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
+  const conditionCheck = await readReturnConditionCheckEnabled(db)
   const levels = await db.stockLevel.findMany({
     include: {
       product: { select: { id: true, sku: true, name: true, type: true, stockUnit: true, barcode: true, mpn: true, lifecycleStatus: true } },
-      warehouse: { select: { code: true, name: true } },
+      warehouse: { select: { code: true, name: true, type: true } },
     },
     orderBy: [{ product: { sku: 'asc' } }, { warehouse: { code: 'asc' } }],
   })
@@ -60,7 +62,8 @@ export async function getStockOnHand(): Promise<StockOnHandRow[]> {
     warehouseName: l.warehouse.name,
     quantity: Number(l.quantity),
     reservedQty: Number(l.reservedQty),
-    available: Number(l.quantity) - Number(l.reservedQty),
+    // Switch return_condition_check_enabled: a quarantine row is on hand but never available.
+    available: conditionCheck && isQuarantineWarehouseType(l.warehouse.type) ? 0 : Number(l.quantity) - Number(l.reservedQty),
     inventoryValue: Math.round((valueMap.get(`${l.productId}:${l.warehouseId}`) ?? 0) * 100) / 100,
   }))
 }
@@ -143,11 +146,12 @@ export type StockAllocationRow = {
 
 export async function getStockAllocations(): Promise<StockAllocationRow[]> {
   assertOverviewAnalyticsAccess((await requirePermission('analytics')).user.role)
+  const conditionCheck = await readReturnConditionCheckEnabled(db)
   const levels = await db.stockLevel.findMany({
     where: { reservedQty: { gt: 0 } },
     include: {
       product: { select: { id: true, sku: true, name: true } },
-      warehouse: { select: { code: true } },
+      warehouse: { select: { code: true, type: true } },
     },
   })
 
@@ -170,7 +174,8 @@ export async function getStockAllocations(): Promise<StockAllocationRow[]> {
     warehouseCode: l.warehouse.code,
     totalStock: Number(l.quantity),
     reservedQty: Number(l.reservedQty),
-    available: Number(l.quantity) - Number(l.reservedQty),
+    // Switch return_condition_check_enabled: a quarantine row is on hand but never available.
+    available: conditionCheck && isQuarantineWarehouseType(l.warehouse.type) ? 0 : Number(l.quantity) - Number(l.reservedQty),
     pendingOrders: pendingByProduct.get(l.productId)?.size ?? 0,
   }))
 }

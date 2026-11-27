@@ -82,7 +82,17 @@ async function seedWorld(options: { orders?: number; journaled?: boolean } = {})
   // fence): the world starts with none and puts them back at teardown. The line also carries its own mapped tax rate, so the refund has a
   // tax identity whichever settings are present.
   const leftover = await db.setting.findMany({ where: { OR: [{ key: { startsWith: 'xero_' } }, { key: 'plugin_xero_enabled' }] } })
+  // The restore is registered BEFORE the delete and runs exactly once: from the teardown, or from the catch below when seeding fails part way,
+  // so a failed seed never leaves the shared tier without the settings an earlier file left.
+  let settingsRestored = false
+  const restoreSettings = async () => {
+    if (settingsRestored) return
+    settingsRestored = true
+    await db.setting.deleteMany({ where: { key: { in: leftover.map((r) => r.key) } } })
+    for (const r of leftover) await db.setting.create({ data: { key: r.key, value: r.value } })
+  }
   await db.setting.deleteMany({ where: { key: { in: leftover.map((r) => r.key) } } })
+  try {
   const taxRate = await db.taxRate.create({ data: { name: `QC Zero ${tag}`, rate: '0', usedFor: 'SALES', taxCategory: 'ZERO', accountingTaxType: 'ZERORATEDOUTPUT', active: true }, select: { id: true, name: true } })
   const product = await db.product.create({ data: { sku: `QC-${tag}`, name: `Quarantine ${tag}`, type: 'SIMPLE', oversellAllowed: false }, select: { id: true, sku: true, name: true } })
   const main = await db.warehouse.create({ data: { code: `QM${tag.slice(0, 8)}`, name: `qc main ${tag}`, type: 'STANDARD', availableForSale: true, syncToStore: true }, select: { id: true, code: true } })
@@ -123,6 +133,7 @@ async function seedWorld(options: { orders?: number; journaled?: boolean } = {})
     for (const id of orderIds) await db.integrationOutbox.deleteMany({ where: { payloadJson: { path: ['orderId'], equals: id } } })
     await db.accountingSyncLog.deleteMany({ where: { OR: [{ referenceId: { in: [...orderIds, ...refundIds] } }] } })
     await db.activityLog.deleteMany({ where: { entityId: { in: [...orderIds, ...refundIds, ...inboxIds, product.id] } } })
+    await db.returnExpectationLine.deleteMany({ where: { expectation: { orderId: { in: orderIds } } } })
     await db.returnExpectation.deleteMany({ where: { orderId: { in: orderIds } } })
     await db.wmsReturnsInbox.deleteMany({ where: { id: { in: inboxIds } } })
     const transfers = await db.stockTransfer.findMany({ where: { OR: [{ fromWarehouseId: { in: [main.id, qar.id] } }, { toWarehouseId: { in: [main.id, qar.id] } }] }, select: { id: true } })
@@ -142,20 +153,24 @@ async function seedWorld(options: { orders?: number; journaled?: boolean } = {})
     await db.salesOrder.deleteMany({ where: { id: { in: orderIds } } })
     await db.stockLevel.deleteMany({ where: { productId: product.id } })
     await db.adjustmentReason.deleteMany({ where: { id: { in: reasonIds } } })
+    await db.productionOrder.deleteMany({ where: { warehouseId: { in: [main.id, qar.id] } } })
+    await db.bom.deleteMany({ where: { name: `qc bom ${tag}` } })
     await db.product.deleteMany({ where: { id: product.id } })
     await db.externalWmsBinding.deleteMany({ where: { warehouseId: { in: [main.id, qar.id] } } })
     await db.wmsConnection.deleteMany({ where: { label: `qc-${tag}` } })
-    await db.productionOrder.deleteMany({ where: { warehouseId: { in: [main.id, qar.id] } } })
     await db.warehouse.deleteMany({ where: { id: { in: [main.id, qar.id] } } })
     await db.taxRate.deleteMany({ where: { id: taxRate.id } })
-    await db.setting.deleteMany({ where: { key: { in: leftover.map((r) => r.key) } } })
-    for (const r of leftover) await db.setting.create({ data: { key: r.key, value: r.value } })
+    await restoreSettings()
     await db.setting.deleteMany({ where: { key: SWITCH } })
     if (savedSwitch) await db.setting.create({ data: { key: SWITCH, value: savedSwitch.value } })
     await db.activityLog.deleteMany({ where: { userId: 'qc-test-user' } })
     await db.user.deleteMany({ where: { id: 'qc-test-user' } })
   }
   return { tag, product, main, qar, orders, extraOrderIds, reasonIds, inboxIds, taxRateId: taxRate.id, teardown }
+  } catch (error) {
+    await restoreSettings()
+    throw error
+  }
 }
 
 function returnLine(w: World, index = 0, qty = 1) {
@@ -478,6 +493,119 @@ test('a warehouse with sellable work cannot become a quarantine warehouse; an al
   const forecastOff = (await generateForecasts()).find((f) => f.productId === w.product.id)
   assert.equal(forecastOff?.availableStock, 3, 'off: both warehouses count, as before')
   assert.equal(forecastOn?.availableStock, 1, 'on: the quarantine units are not available')
+})
+
+test('before switch-on: the interlock, the type change both ways, production in quarantine, the stock reports and returns in transit', SKIP, async (t) => {
+  const w = await seedWorld({ orders: 2 })
+  t.after(() => w.teardown())
+  const { db, sales, quarantine } = await loadDeps()
+  const { updateWarehouse } = await import('@/app/actions/settings')
+  const { updateManufacturingOrderStatus } = await import('@/app/actions/manufacturing')
+  const { getStockOnHand } = await import('@/app/actions/inventory-stats')
+  const { getStockOnHandReport } = await import('@/lib/domain/inventory/stock-position-reports')
+  const save = (id: string, code: string, type: 'STANDARD' | 'QUARANTINE', flags: Partial<{ availableForSale: boolean; syncToStore: boolean; availableForPurchaseOrders: boolean; defaultReturnWarehouse: boolean }> = {}) =>
+    updateWarehouse(id, { code, name: `qc ${code}`, type, country: 'GB', availableForSale: false, syncToStore: false, availableForPurchaseOrders: false, isDefault: false, defaultReturnWarehouse: false, active: true, ...flags })
+
+  // THE INTERLOCK: the seeded quarantine warehouse is still "available in purchase orders" (the column default), so turning the switch on is refused.
+  await setSwitch(false)
+  const refusal = await quarantine.quarantineSwitchOnRefusal(db)
+  assert.match(refusal ?? '', new RegExp(`${w.qar.code} \\(marked Available in purchase orders`))
+  assert.equal((await save(w.qar.id, w.qar.code, 'QUARANTINE')).success, true)
+  const others = (await quarantine.listQuarantineWarehouseIssues(db)).filter((i) => i.id !== w.qar.id)
+  assert.equal((await quarantine.listQuarantineWarehouseIssues(db)).some((i) => i.id === w.qar.id), false, 'clean once its flags are cleared')
+  if (others.length === 0) assert.equal(await quarantine.quarantineSwitchOnRefusal(db), null)
+
+  // INTO QUARANTINE is refused whatever the switch, here with it OFF: a transfer in transit into MAIN is sellable work.
+  const transfer = await db.stockTransfer.create({ data: { reference: `QC-T-${w.tag}`, fromWarehouseId: w.qar.id, toWarehouseId: w.main.id, status: 'IN_TRANSIT' }, select: { id: true } })
+  const into = await save(w.main.id, w.main.code, 'QUARANTINE')
+  assert.equal(into.success, false)
+  assert.match(into.error ?? '', /1 transfer\(s\) in transit into it/)
+  await db.stockTransfer.delete({ where: { id: transfer.id } })
+
+  // L1: with the switch on, a quarantine warehouse may not be the default return warehouse.
+  await setSwitch(true)
+  const asDefaultReturn = await save(w.qar.id, w.qar.code, 'QUARANTINE', { defaultReturnWarehouse: true })
+  assert.equal(asDefaultReturn.success, false)
+  assert.match(asDefaultReturn.error ?? '', /Default return warehouse/)
+
+  // OUT OF QUARANTINE (switch on) is refused while it holds stock.
+  const r = returnLine(w, 0)
+  assert.equal((await sales.createRefund(r.orderId, r.lines, 'qc return', w.qar.id, { returnCondition: 'UNSELLABLE' })).success, true)
+  const out = await save(w.qar.id, w.qar.code, 'STANDARD')
+  assert.equal(out.success, false)
+  assert.match(out.error ?? '', /still holds 1 unit/)
+  assert.match(out.error ?? '', /write units off with a stock adjustment/)
+  assert.match(out.error ?? '', /transfer/)
+  assert.equal((await db.warehouse.findUniqueOrThrow({ where: { id: w.qar.id }, select: { type: true } })).type, 'QUARANTINE')
+
+  // STOCK REPORTS (switch on): the quarantine row is on hand, 0 available.
+  const onHand = (await getStockOnHand()).find((row) => row.productId === w.product.id && row.warehouseCode === w.qar.code)
+  assert.equal(onHand?.quantity, 1)
+  assert.equal(onHand?.available, 0)
+  const report = await getStockOnHandReport({ warehouseId: w.qar.id }, { paginate: false })
+  const reportRow = report.rows.find((row) => row.productId === w.product.id)
+  assert.equal(Number(reportRow?.quantity), 1)
+  assert.equal(Number(reportRow?.availableQty), 0)
+
+  // L7: a production order in a quarantine warehouse is neither started nor completed.
+  const bom = await db.bom.create({ data: { name: `qc bom ${w.tag}` }, select: { id: true } })
+  const mo = await db.productionOrder.create({ data: { reference: `QC-MO-${w.tag}`, bomId: bom.id, outputProductId: w.product.id, warehouseId: w.qar.id, qtyPlanned: '1', status: 'DRAFT' }, select: { id: true } })
+  for (const status of ['IN_PROGRESS', 'COMPLETED'] as const) {
+    const moved = await updateManufacturingOrderStatus(mo.id, status)
+    assert.equal(moved.success, false)
+    assert.equal(moved.error, quarantine.QUARANTINE_PRODUCTION_REFUSAL)
+  }
+  assert.equal((await db.productionOrder.findUniqueOrThrow({ where: { id: mo.id }, select: { status: true } })).status, 'DRAFT')
+
+  // M4: with returns in transit on, the refund asks no condition and may not expect the units in quarantine.
+  const transitKey = 'refund_returns_in_transit_enabled'
+  const savedTransit = await db.setting.findUnique({ where: { key: transitKey } })
+  t.after(async () => {
+    await db.setting.deleteMany({ where: { key: transitKey } })
+    if (savedTransit) await db.setting.create({ data: { key: transitKey, value: savedTransit.value } })
+  })
+  await db.setting.upsert({ where: { key: transitKey }, create: { key: transitKey, value: 'true' }, update: { value: 'true' } })
+  const r2 = returnLine(w, 1)
+  const expectQar = await sales.createRefund(r2.orderId, r2.lines, 'qc return', w.qar.id, { returnCondition: 'UNSELLABLE' })
+  assert.equal(expectQar.success, false)
+  assert.equal(expectQar.error, quarantine.QUARANTINE_IN_TRANSIT_EXPECTED_REFUSAL)
+  assert.equal(await db.salesOrderRefund.count({ where: { orderId: r2.orderId } }), 0)
+  const plain = await sales.createRefund(r2.orderId, r2.lines, 'qc return', w.main.id)
+  assert.equal(plain.success, true, `no condition is asked while returns are in transit (${plain.error})`)
+  const audit = await db.activityLog.findFirstOrThrow({ where: { entityId: r2.orderId, action: 'refunded' }, select: { metadata: true } })
+  assert.equal('returnCondition' in (audit.metadata as object), false, 'and none is recorded')
+})
+
+test('open allocations are counted by residual: a warehouse whose only allocation shipped in full can become Quarantine; an inbound transfer blocks only the type change', SKIP, async (t) => {
+  const w = await seedWorld({ orders: 1 })
+  t.after(() => w.teardown())
+  const { db, quarantine } = await loadDeps()
+  const { updateWarehouse } = await import('@/app/actions/settings')
+  const save = (type: 'STANDARD' | 'QUARANTINE') =>
+    updateWarehouse(w.main.id, { code: w.main.code, name: 'qc main', type, country: 'GB', availableForSale: false, syncToStore: false, availableForPurchaseOrders: false, isDefault: false, defaultReturnWarehouse: false, active: true })
+  await setSwitch(false)
+  // The seeded order shipped both units from MAIN; its allocation row survives dispatch with qty 2.
+  const { orderId, lineId } = w.orders[0]
+  const allocation = await db.orderAllocation.create({ data: { orderId, lineId, productId: w.product.id, warehouseId: w.main.id, qty: '2' }, select: { id: true } })
+  assert.equal(await quarantine.countOpenAllocations(db, w.main.id), 0, 'fully shipped: nothing is still reserved')
+  // A residual (3 allocated, 2 shipped) is still open and blocks.
+  await db.orderAllocation.update({ where: { id: allocation.id }, data: { qty: '3' } })
+  assert.equal(await quarantine.countOpenAllocations(db, w.main.id), 1)
+  const blocked = await save('QUARANTINE')
+  assert.equal(blocked.success, false)
+  assert.match(blocked.error ?? '', /1 open allocation/)
+  await db.orderAllocation.update({ where: { id: allocation.id }, data: { qty: '2' } })
+  const ok = await save('QUARANTINE')
+  assert.equal(ok.success, true, `a warehouse whose only allocation shipped in full can become Quarantine (${ok.error})`)
+
+  // Transferring damaged stock INTO a quarantine warehouse is normal: an in-transit transfer into it is not an issue for the switch-on census.
+  const transfer = await db.stockTransfer.create({ data: { reference: `QC-T2-${w.tag}`, fromWarehouseId: w.qar.id, toWarehouseId: w.main.id, status: 'IN_TRANSIT' }, select: { id: true } })
+  t.after(() => db.stockTransfer.deleteMany({ where: { id: transfer.id } }))
+  assert.equal((await quarantine.listQuarantineWarehouseIssues(db)).some((i) => i.id === w.main.id), false)
+  // ...but it still blocks turning another warehouse into Quarantine (the type change counts it).
+  assert.equal((await quarantine.loadQuarantineBlockers(db, w.main.id)).inboundTransfers, 1)
+  assert.equal((await quarantine.loadQuarantineBlockers(db, w.main.id, { inboundTransfers: false })).inboundTransfers, 0)
+  assert.equal((await save('STANDARD')).success, true, 'switch off: leaving quarantine is not checked')
 })
 
 test('switch off is identical: no condition, any warehouse, and a quarantine-typed warehouse flagged for sale behaves as before', SKIP, async (t) => {

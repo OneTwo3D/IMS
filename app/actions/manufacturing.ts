@@ -75,7 +75,7 @@ import {
 } from '@/lib/products/bom-recipe'
 import { recordCogsSubledgerMovement } from '@/lib/domain/accounting/cogs-subledger-movement'
 import { businessDateYmd } from '@/lib/business-date'
-import { isQuarantineWarehouseType, readReturnConditionCheckEnabled } from '@/lib/domain/inventory/quarantine-warehouse'
+import { isQuarantineTargetWarehouse, isQuarantineWarehouseType, QUARANTINE_PRODUCTION_REFUSAL, readReturnConditionCheckEnabled } from '@/lib/domain/inventory/quarantine-warehouse'
 
 type JournalLine = { accountCode: string; description: string; debit?: number; credit?: number }
 
@@ -400,7 +400,7 @@ export async function createManufacturingOrder(input: CreateInput): Promise<{ su
     // Switch return_condition_check_enabled: quarantine stock is not sellable, so it is never assembled into (or out of) a product.
     if (await readReturnConditionCheckEnabled(db)) {
       const target = await db.warehouse.findUnique({ where: { id: input.warehouseId }, select: { type: true } })
-      if (isQuarantineWarehouseType(target?.type)) return { success: false, error: 'That warehouse is a quarantine warehouse: its stock is not sellable and cannot be used in a production order. Transfer the units to a sellable warehouse first if they can be used.' }
+      if (isQuarantineWarehouseType(target?.type)) return { success: false, error: QUARANTINE_PRODUCTION_REFUSAL }
     }
 
     // Foreign-currency cost lines (o3d-hgcj1): the rate is the central fx_rates table rate or a blocking refusal, never a default of 1.
@@ -667,6 +667,11 @@ export async function updateManufacturingOrderStatus(
       },
     })
     if (!orderPreview) return { success: false, error: 'Order not found.' }
+    // Switch return_condition_check_enabled: quarantine stock is not sellable, so a production order there is never started or completed
+    // (an order created before the warehouse became quarantine can still be cancelled).
+    if ((status === 'IN_PROGRESS' || status === 'COMPLETED') && await isQuarantineTargetWarehouse(db, orderPreview.warehouseId)) {
+      return { success: false, error: QUARANTINE_PRODUCTION_REFUSAL }
+    }
 
     const now = new Date()
     const isAssembly = orderPreview.orderType === 'ASSEMBLY'

@@ -10,6 +10,7 @@ import {
 import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { businessDateYmd } from '@/lib/business-date'
 import { startOfNextBusinessDay } from '@/lib/domain/inventory/inventory-snapshot'
+import { QUARANTINE_WAREHOUSE_TYPE, readReturnConditionCheckEnabled } from '@/lib/domain/inventory/quarantine-warehouse'
 
 const DEFAULT_PAGE_SIZE = 100
 const MIN_PAGE_SIZE = 50
@@ -55,6 +56,8 @@ export type StockPositionReportClient = {
   inventoryReservationSnapshot: FindManyDelegate
   inventoryReservationSnapshotRun: FindUniqueDelegate
   stockMovement: FindManyDelegate
+  /** Settings, for the switch return_condition_check_enabled. Optional: a client without it reads the switch as off. */
+  setting?: unknown
 }
 
 export type StockPositionReportDeps = {
@@ -837,6 +840,14 @@ export async function getStockOnHandReport(
     return reservationSnapshotRun == null
   })
   const reservedQtyByStock = await loadReservedQty(rowsNeedingLiveReservations, client)
+  // Switch return_condition_check_enabled: stock in a quarantine warehouse (its CURRENT type, also for an as-of date) is on hand but never
+  // available. Off, no query is made and every row is as before.
+  const quarantineWarehouseIds = await readReturnConditionCheckEnabled(client) && warehouseIds.length > 0
+    ? new Set((await client.warehouse.findMany({
+        where: { id: { in: [...new Set(warehouseIds)] }, type: QUARANTINE_WAREHOUSE_TYPE },
+        select: { id: true },
+      }) as Array<{ id: string }>).map((w) => w.id))
+    : new Set<string>()
 
   let reservationSnapshotCount = 0
   let missingReservationSnapshotCount = 0
@@ -861,7 +872,9 @@ export async function getStockOnHandReport(
         : reservationQtySource === 'snapshot_zero'
           ? ZERO
         : reservedQtyByStock.get(key) ?? ZERO
-      const availableQty = reservationSnapshot
+      const availableQty = quarantineWarehouseIds.has(row.warehouseId)
+        ? ZERO
+        : reservationSnapshot
         ? toDecimal(reservationSnapshot.availableQty)
         : reservationQtySource === 'snapshot_zero'
           ? quantity

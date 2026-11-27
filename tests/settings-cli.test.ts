@@ -437,3 +437,45 @@ test('refund_returns_in_transit_enabled: an ADMIN switch, off by default, key eq
   const off = await run('set', ['--key', 'refund_returns_in_transit_enabled', '--value', 'false', ...SET, '--yes', '--confirm-admin'], fakeDb({ refund_returns_in_transit_enabled: 'true', xero_sync_enabled: 'true' }))
   assert.equal(off.code, 0, off.err)
 })
+
+// The condition check on returns: turning it ON is refused while a quarantine warehouse still looks sellable, in the dry run and again inside
+// the write transaction (a warehouse that turns dirty between the two is still refused).
+test('return_condition_check_enabled: the quarantine interlock refuses in the dry run and inside the write; turning off never asks', async () => {
+  const def = findSwitch('return_condition_check_enabled')!
+  assert.equal(def.adminOnly, true)
+  assert.equal(def.turnOnInterlock, 'quarantine-warehouses')
+  const state = { dirtyOutside: true, dirtyInside: true }
+  const delegates = (dirty: () => boolean) => {
+    const zero = { count: async () => 0 }
+    return {
+      warehouse: { findMany: async () => [{ id: 'w1', code: 'QAR', name: 'Quarantine', availableForSale: dirty(), syncToStore: false, isDefault: false, defaultReturnWarehouse: false, availableForPurchaseOrders: false }] },
+      externalWmsBinding: zero, orderAllocation: { findMany: async () => [] }, shipmentLine: { findMany: async () => [] }, shipment: zero, productionOrder: zero, stockTransfer: zero, purchaseOrder: zero,
+    }
+  }
+  const withInterlock = (f: ReturnType<typeof fakeDb>) => {
+    Object.assign(f.db, delegates(() => state.dirtyOutside))
+    const realTx = f.db.$transaction.bind(f.db)
+    ;(f.db as { $transaction: unknown }).$transaction = (fn: (tx: unknown) => Promise<unknown>) => realTx((tx) => fn({ ...tx, ...delegates(() => state.dirtyInside) }))
+    return f
+  }
+  const on = ['--key', def.key, '--value', 'true', ...SET]
+
+  const dry = await run('set', on, withInterlock(fakeDb()))
+  assert.equal(dry.code, 3, 'the dry run refuses too')
+  assert.match(dry.err, /QAR \(marked Available for sale\)/)
+
+  state.dirtyOutside = false
+  const inside = await run('set', [...on, '--yes', '--confirm-admin'], withInterlock(fakeDb()))
+  assert.equal(inside.code, 3, 'refused inside the write transaction')
+  assert.equal(inside.f.settings.get(def.key), undefined, 'nothing written')
+
+  state.dirtyInside = false
+  const ok = await run('set', [...on, '--yes', '--confirm-admin'], withInterlock(fakeDb()))
+  assert.equal(ok.code, 0, ok.err)
+  assert.equal(ok.f.settings.get(def.key)!.value, 'true')
+
+  state.dirtyOutside = true
+  state.dirtyInside = true
+  const off = await run('set', ['--key', def.key, '--value', 'false', ...SET, '--yes', '--confirm-admin'], withInterlock(ok.f))
+  assert.equal(off.code, 0, `turning it off is never refused (${off.err})`)
+})

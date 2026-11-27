@@ -121,6 +121,8 @@ type Props = {
   returnReasons?: ReturnReason[]
   /** Switch return_condition_check_enabled: the refund dialog asks for the returned items' condition, and quarantine warehouses take no allocation. */
   returnConditionCheckEnabled?: boolean
+  /** Switch refund_returns_in_transit_enabled: a refund restocks nothing, so the dialog asks no condition and offers no quarantine warehouse. */
+  returnsInTransitEnabled?: boolean
   currencies: CurrencyRow[]
   externalOrderLinks?: Array<{ label: string; url: string }>
   wmsOrderStatus?: WmsOrderStatusView | null
@@ -1266,7 +1268,7 @@ function ShipmentsPanel({
 // ---------------------------------------------------------------------------
 // Main detail
 // ---------------------------------------------------------------------------
-export function SoDetailClient({ order: so, warehouses, returnReasons = [], returnConditionCheckEnabled = false, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, mergeHold = null, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, quoteEmailEnabled = false, editForm, exchangeOffer = null, exchangeCatalogue = [], pegs = [], invoiceDeleteState }: Props) {
+export function SoDetailClient({ order: so, warehouses, returnReasons = [], returnConditionCheckEnabled = false, returnsInTransitEnabled = false, currencies, externalOrderLinks, wmsOrderStatus, wmsPushState, mergeCandidate, mergeHold = null, shopRefundDue, stockLevels, initialAllocations, initialShipments, fulfillmentRequirements, carriers, deliveryTrackingEnabled, accountingAvailable, accountingInvoiceUrlTemplate, accountingSyncEnabled, currentUserRole, rejectedAccountingSyncs, paidWithoutInvoice, quoteEmailEnabled = false, editForm, exchangeOffer = null, exchangeCatalogue = [], pegs = [], invoiceDeleteState }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -2569,7 +2571,7 @@ export function SoDetailClient({ order: so, warehouses, returnReasons = [], retu
 
       {/* Dialogs */}
       {deleteTarget && <DeleteRefundDialog refund={deleteTarget} onClose={() => setDeleteTarget(null)} />}
-      {showRefund && <RefundDialog order={so} warehouses={warehouses} returnReasons={returnReasons} sym={sym} exchangeOffer={exchangeOffer} exchangeCatalogue={exchangeCatalogue} conditionCheck={returnConditionCheckEnabled} onClose={() => setShowRefund(false)} />}
+      {showRefund && <RefundDialog order={so} warehouses={returnConditionCheckEnabled && returnsInTransitEnabled ? warehouses.filter((w) => w.type !== 'QUARANTINE') : warehouses} returnReasons={returnReasons} sym={sym} exchangeOffer={exchangeOffer} exchangeCatalogue={exchangeCatalogue} conditionCheck={returnConditionCheckEnabled && !returnsInTransitEnabled} onClose={() => setShowRefund(false)} />}
       {showNotes && <NotesDialog order={so} onClose={() => setShowNotes(false)} />}
       {showAddresses && editScope.scope === 'ADDRESS_NOTES' && <AddressesDialog order={so} onClose={() => setShowAddresses(false)} />}
       {showEdit && editForm && editScope.scope === 'FULL' && (

@@ -42,7 +42,7 @@ export type SwitchDefinition = {
   /** A row stamped with the ISO instant, in the same transaction, whenever the switch changes to ON (not when it is left as it is); the row is deleted when the switch changes to OFF. */
   readonly stampOnKey?: string
   /** Turning ON is refused by this interlock (run by the command, which may read the store; the registry stays free of the database client). */
-  readonly turnOnInterlock?: 'storefront-customer-email' | 'purchase-fx-bill-writer'
+  readonly turnOnInterlock?: 'storefront-customer-email' | 'quarantine-warehouses' | 'purchase-fx-bill-writer'
   /**
    * Turning ON is refused while `whenKey` is `whenValue` and any of `settings` is blank (unset or only spaces). Settings rows only, so it is checked here,
    * in the dry run and again inside the write transaction.
@@ -165,7 +165,9 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   // (it imports the database client); tests hold them equal to its keys.
   { ...booleanSwitch(INVOICE_BASIS_DEFERRAL_SWITCH_KEY, undefined, true), stampOnKey: INVOICE_BASIS_DEFERRAL_ENABLED_AT_KEY },
   booleanSwitch(REFUND_DELETE_SWITCH_KEY, undefined, true),
-  booleanSwitch(RETURN_CONDITION_CHECK_SWITCH_KEY, undefined, true),
+  // Turning it ON is refused while any QUARANTINE warehouse still looks sellable (flags, allocations, bindings, open work): the command runs the
+  // interlock in the dry run and again inside the write transaction (lib/domain/inventory/quarantine-warehouse.ts quarantineSwitchOnRefusal).
+  { ...booleanSwitch(RETURN_CONDITION_CHECK_SWITCH_KEY, undefined, true), turnOnInterlock: 'quarantine-warehouses' },
   {
     ...booleanSwitch(REFUND_RETURNS_IN_TRANSIT_SWITCH_KEY, undefined, true),
     requiresMappedSettings: {
@@ -333,7 +335,18 @@ export async function readSwitch(client: AuditReadClient, def: SwitchDefinition)
   }
 }
 
-export type SwitchWriteInput = { def: SwitchDefinition; value: string; by: string; reason: string; adminConfirmed?: boolean }
+export type SwitchWriteInput = {
+  def: SwitchDefinition
+  value: string
+  by: string
+  reason: string
+  adminConfirmed?: boolean
+  /**
+   * A turn-on interlock that reads the database (the command supplies it; this registry stays free of the client). Run INSIDE the write
+   * transaction, only when the switch changes to ON; a refusal aborts the write.
+   */
+  turnOnTxCheck?: (tx: unknown) => Promise<string | null>
+}
 
 type TxClient = ReadClient & {
   setting: ReadClient['setting'] & { upsert(args: Record<string, unknown>): Promise<unknown>; deleteMany(args: Record<string, unknown>): Promise<unknown> }
@@ -357,7 +370,7 @@ class SwitchRefused extends Error {}
  * An unchanged value writes nothing, not even an audit row.
  */
 export async function writeSwitch(client: SwitchWriteClient, input: SwitchWriteInput): Promise<SwitchWriteResult> {
-  const { def, value, by, reason, adminConfirmed } = input
+  const { def, value, by, reason, adminConfirmed, turnOnTxCheck } = input
   if (def.adminOnly && !adminConfirmed) return { ok: false, error: adminRefusal(def) }
   try {
     return await client.$transaction(async (tx) => {
@@ -366,6 +379,10 @@ export async function writeSwitch(client: SwitchWriteClient, input: SwitchWriteI
       const before = await tx.setting.findUnique({ where: { key: def.key } })
       const oldValue = before?.value ?? null
       if (oldValue === value) return { ok: true, changed: false, oldValue, newValue: value } as const
+      if (turnOnTxCheck && isOn(def, value)) {
+        const interlock = await turnOnTxCheck(tx)
+        if (interlock) throw new SwitchRefused(interlock)
+      }
       await tx.setting.upsert({ where: { key: def.key }, create: { key: def.key, value }, update: { value } })
       if (def.stampOnKey && isOn(def, value)) {
         const at = new Date().toISOString()

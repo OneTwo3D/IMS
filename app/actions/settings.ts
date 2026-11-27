@@ -37,7 +37,7 @@ import {
   type MissingTaxRateGenerateResult,
 } from '@/lib/tax/generate-missing-tax-rates'
 import { xeroReportTaxType, XERO_REPORT_TAX_TYPES, isXeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
-import { isQuarantineWarehouseType, listQuarantineWarehouseIssues, loadQuarantineBlockers, quarantineTypeChangeRefusal, quarantineWarehouseSettingsRefusal, readReturnConditionCheckEnabled, type QuarantineWarehouseIssue } from '@/lib/domain/inventory/quarantine-warehouse'
+import { isQuarantineWarehouseType, listQuarantineWarehouseIssues, loadQuarantineBlockers, quarantineLeaveRefusal, quarantineTypeChangeRefusal, quarantineWarehouseSettingsRefusal, readReturnConditionCheckEnabled, type QuarantineWarehouseIssue } from '@/lib/domain/inventory/quarantine-warehouse'
 import {
   effectiveTaxRateFromComponents,
   normalizeTaxRateComponents,
@@ -1637,6 +1637,9 @@ export async function createWarehouse(
   }
 }
 
+/** A refusal decided inside the warehouse write transaction (it rolls the transaction back and is returned as the operator's message). */
+class WarehouseSettingsRefusal extends Error {}
+
 export async function updateWarehouse(
   id: string,
   input: WarehouseInput
@@ -1651,24 +1654,42 @@ export async function updateWarehouse(
   if (!normalizedCountry) {
     return { success: false, error: 'Select a valid country.' }
   }
-  // Switch return_condition_check_enabled: a quarantine warehouse holds unsellable stock, so its sellable flags are refused, and a warehouse
-  // still carrying sellable work (a WMS binding, allocations, unshipped shipments, open production orders) cannot be turned into one.
+  // Switch return_condition_check_enabled: a quarantine warehouse holds unsellable stock, so its sellable flags are refused (with the switch on).
+  // The type change itself is checked inside the write transaction, under the warehouse row lock (below).
   const conditionCheck = await readReturnConditionCheckEnabled(db)
   const quarantineRefusal = quarantineWarehouseSettingsRefusal({ enabled: conditionCheck, ...data })
   if (quarantineRefusal) return { success: false, error: quarantineRefusal }
-  if (conditionCheck && isQuarantineWarehouseType(data.type)) {
-    const current = await db.warehouse.findUnique({ where: { id }, select: { type: true } })
-    if (current && !isQuarantineWarehouseType(current.type)) {
-      const typeRefusal = quarantineTypeChangeRefusal(await loadQuarantineBlockers(db, id))
-      if (typeRefusal) return { success: false, error: typeRefusal }
-    }
-  }
   try {
     // Enforce unique code (excluding self)
     const dup = await db.warehouse.findUnique({ where: { code: data.code } })
     if (dup && dup.id !== id) return { success: false, error: `Warehouse code "${data.code}" already exists.` }
 
     const item = await db.$transaction(async (tx) => {
+      // THE TYPE CHANGE across the QUARANTINE boundary. An ordinary save (name, flags, address, the same type) takes no lock beyond what it
+      // took before: the current type is only READ. Only a save that moves the warehouse into or out of QUARANTINE locks the row, with FOR NO
+      // KEY UPDATE (it does not conflict with the FOR KEY SHARE every stock, allocation or shipment insert takes through its foreign key), and
+      // re-reads the type under that lock. The allocation writers take FOR SHARE on the row while the switch is on, so an allocation and this
+      // change serialise; other sellable work (a shipment, a production order, a transfer, a purchase order) is not locked out, so the census
+      // below is a check at the moment of the change, not a guarantee against a write that commits just after it.
+      //  - Into QUARANTINE (whatever the switch): refused while the warehouse still carries sellable work (a WMS binding, residual allocations,
+      //    unshipped shipments, open production orders, transfers in transit into it, purchase orders still to be received there).
+      //  - Out of QUARANTINE (switch on): refused while it holds stock, which would otherwise become sellable without a decision.
+      // A sellable flag on a quarantine warehouse needs no lock: it is refused from the request alone, before this transaction.
+      const crossesQuarantine = (type: string | undefined): boolean => type != null && isQuarantineWarehouseType(type) !== isQuarantineWarehouseType(data.type)
+      const before = await tx.warehouse.findUnique({ where: { id }, select: { type: true } })
+      if (crossesQuarantine(before?.type)) {
+        await tx.$queryRaw`SELECT id FROM warehouses WHERE id = ${id} FOR NO KEY UPDATE`
+        const current = await tx.warehouse.findUnique({ where: { id }, select: { type: true } })
+        if (current && isQuarantineWarehouseType(data.type) && !isQuarantineWarehouseType(current.type)) {
+          const typeRefusal = quarantineTypeChangeRefusal(await loadQuarantineBlockers(tx, id))
+          if (typeRefusal) throw new WarehouseSettingsRefusal(typeRefusal)
+        }
+        if (current && conditionCheck && isQuarantineWarehouseType(current.type) && !isQuarantineWarehouseType(data.type)) {
+          const held = await tx.stockLevel.aggregate({ where: { warehouseId: id, quantity: { gt: 0 } }, _sum: { quantity: true } })
+          const leaveRefusal = quarantineLeaveRefusal(held._sum.quantity ?? 0)
+          if (leaveRefusal) throw new WarehouseSettingsRefusal(leaveRefusal)
+        }
+      }
       // If setting as default, unset others
       if (data.isDefault) {
         await tx.warehouse.updateMany({ where: { isDefault: true, id: { not: id } }, data: { isDefault: false } })
@@ -1709,6 +1730,7 @@ export async function updateWarehouse(
     return { success: true, item }
   } catch (e) {
     unstable_rethrow(e)
+    if (e instanceof WarehouseSettingsRefusal) return { success: false, error: e.message }
     await logActivity({ entityType: 'SETTING', entityId: id, tag: 'settings', action: 'updated', level: 'ERROR', description: `Failed to update warehouse: ${data.code}` })
     if (uniqueViolationTargetsField(e, 'code')) return { success: false, error: `Warehouse code "${data.code}" already exists.` }
     return { success: false, error: String(e) }
