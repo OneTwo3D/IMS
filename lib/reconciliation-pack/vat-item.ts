@@ -323,14 +323,6 @@ async function runR12(context: VatItemContext): Promise<ItemInput> {
     if (split === null) continue
     const fx = parseDecimalStrict(row.fxRateToBase)
     if (fx === null || !fx.gt(0)) return inconclusive([LEDGER], 'BAD_VALUE')
-    // Entries merged onto one code are priced at ONE rate (the code's): two rates sharing a code cannot be told apart here, so the item cannot be trusted.
-    const rateOfCode = new Map<string, number>()
-    for (const entry of split) {
-      const code = catalogue.typeOf(entry.taxRateId)
-      if (code === null) continue
-      if (rateOfCode.has(code) && rateOfCode.get(code) !== entry.rate) return inconclusive([LEDGER], 'VAT_MAPPING_UNVERIFIED')
-      rateOfCode.set(code, entry.rate)
-    }
     const parts = invoiceDiscountParts({
       split,
       lineAmountsIncludeTax: row.amountsIncludeVat,
