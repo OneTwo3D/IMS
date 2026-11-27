@@ -1,7 +1,7 @@
 'use server'
 
 import { netUnpricedReturnRowsAgainstRefunds, priceUnpricedReturnRows, queueReturnRestockValueJournal } from '@/lib/domain/sales/return-restock-cost'
-import { isQuarantineWarehouseType, QUARANTINE_WMS_BINDING_REFUSAL, readReturnConditionCheckEnabled, RETURN_CONDITIONS, wmsReturnRestockRefusal, type ReturnCondition } from '@/lib/domain/inventory/quarantine-warehouse'
+import { isQuarantineWarehouseType, QUARANTINE_WMS_BINDING_REFUSAL, readReturnConditionCheckEnabled, RETURN_CONDITIONS, loadWmsStockMode, wmsReturnRestockRefusal, type ReturnCondition } from '@/lib/domain/inventory/quarantine-warehouse'
 import { parseShopIossNumber, SHOP_IOSS_NUMBER_SETTING } from '@/lib/domain/accounting/shop-ioss-number'
 import { randomUUID } from 'node:crypto'
 
@@ -5741,6 +5741,7 @@ export async function restockMintsoftReturnInboxItem(
             sku: true,
             qty: true,
             receivedAt: true,
+            warehouseId: true,
             order: {
               select: {
                 id: true,
@@ -5771,7 +5772,10 @@ export async function restockMintsoftReturnInboxItem(
       if (!warehouse || !warehouse.active) {
         throw new Error('Select an active warehouse for restocking.')
       }
-      const conditionRefusal = wmsReturnRestockRefusal({ enabled: conditionCheck, condition: data.condition ?? null, warehouse })
+      // The write-off route of an unsellable unit depends on the binding of the warehouse the return arrived at (the inbox row's own warehouse,
+      // set from the binding when it was polled); only read when that refusal can fire.
+      const stockMode = conditionCheck && data.condition === 'UNSELLABLE' ? await loadWmsStockMode(tx, item.warehouseId) : undefined
+      const conditionRefusal = wmsReturnRestockRefusal({ enabled: conditionCheck, condition: data.condition ?? null, warehouse, ...(stockMode ? { stockMode } : {}) })
       if (conditionRefusal) throw new Error(conditionRefusal)
       if (!item.productId) {
         throw new Error('This Mintsoft return cannot be restocked because its SKU is not mapped to an IMS product.')

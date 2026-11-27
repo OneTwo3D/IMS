@@ -379,7 +379,8 @@ test('Mintsoft returns inbox: an unsellable unit held at the 3PL is never quaran
   // A costed unit elsewhere, so the unpriced inbox row is valued at an average (orderless return).
   await db.costLayer.create({ data: { productId: w.product.id, warehouseId: w.main.id, receivedQty: '1', remainingQty: '1', unitCostBase: '45' } })
   await db.stockLevel.update({ where: { productId_warehouseId: { productId: w.product.id, warehouseId: w.main.id } }, data: { quantity: '1' } })
-  const inbox = await db.wmsReturnsInbox.create({ data: { connector: 'mintsoft', externalReturnId: `QC-RET-${w.tag}`, productId: w.product.id, sku: w.product.sku, qty: 1, status: 'NEW' } as never, select: { id: true } })
+  // The poller sets the row's warehouse from the binding; that binding's mode picks the write-off route in the refusal.
+  const inbox = await db.wmsReturnsInbox.create({ data: { connector: 'mintsoft', externalReturnId: `QC-RET-${w.tag}`, productId: w.product.id, sku: w.product.sku, qty: 1, status: 'NEW', warehouseId: w.main.id } as never, select: { id: true } })
   w.inboxIds.push(inbox.id)
 
   const noCondition = await mintsoft.restockMintsoftReturnInboxItem({ id: inbox.id, warehouseId: w.main.id })
@@ -388,7 +389,8 @@ test('Mintsoft returns inbox: an unsellable unit held at the 3PL is never quaran
   for (const warehouseId of [w.qar.id, w.main.id]) {
     const unsellable = await mintsoft.restockMintsoftReturnInboxItem({ id: inbox.id, warehouseId, condition: 'UNSELLABLE' })
     assert.equal(unsellable.success, false, 'an unsellable unit at the 3PL is refused into any warehouse')
-    assert.equal(unsellable.error, quarantine.WMS_UNSELLABLE_RETURN_REFUSAL)
+    assert.equal(unsellable.error, quarantine.wmsUnsellableReturnRefusal('ALIGNED'))
+    assert.match(unsellable.error ?? '', /Do not also make a stock adjustment in IMS/)
   }
   assert.equal((await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: inbox.id }, select: { status: true } })).status, 'NEW', 'refused: nothing restocked')
   assert.deepEqual(await stockAt(w, w.qar.id), { qty: 0, reserved: 0, layers: [] }, 'nothing entered quarantine, so Mintsoft\'s count of the unit (aligned into the bound warehouse) is the only one')
@@ -425,7 +427,12 @@ test('refund dialog: an unsellable return of units shipped from a 3PL (WMS-bound
   const binding = await db.externalWmsBinding.create({ data: { connectionId: connection.id, warehouseId: w.main.id, connector: 'mintsoft', externalWarehouseId: `qc-ext-${w.tag}`, stockSyncMode: 'ALIGN_TO_WMS', stockMasterSystem: 'WMS' }, select: { id: true } })
   const bound = await sales.createRefund(r.orderId, r.lines, 'qc return', w.qar.id, { returnCondition: 'UNSELLABLE' })
   assert.equal(bound.success, false)
-  assert.equal(bound.error, quarantine.WMS_UNSELLABLE_REFUND_REFUSAL)
+  assert.equal(bound.error, quarantine.wmsUnsellableRefundRefusal('ALIGNED'), 'aligned binding: the 3PL writes it off and align-down books it')
+  await nothingWritten()
+  // The same binding in notification-only mode (IMS is the stock master): the IMS stock adjustment route.
+  await db.externalWmsBinding.update({ where: { id: binding.id }, data: { stockSyncMode: 'NOTIFICATION_ONLY', stockMasterSystem: 'IMS' } })
+  const notification = await sales.createRefund(r.orderId, r.lines, 'qc return', w.qar.id, { returnCondition: 'UNSELLABLE' })
+  assert.equal(notification.error, quarantine.wmsUnsellableRefundRefusal('IMS_MASTER'))
   await nothingWritten()
 
   // No binding, but the warehouse system holds the order (a SYNCED push link): refused the same way.
@@ -433,7 +440,7 @@ test('refund dialog: an unsellable return of units shipped from a 3PL (WMS-bound
   await db.wmsOrderPushLink.create({ data: { orderId: r.orderId, connector: 'mintsoft', state: 'SYNCED' } })
   const pushed = await sales.createRefund(r.orderId, r.lines, 'qc return', w.qar.id, { returnCondition: 'UNSELLABLE' })
   assert.equal(pushed.success, false)
-  assert.equal(pushed.error, quarantine.WMS_UNSELLABLE_REFUND_REFUSAL)
+  assert.equal(pushed.error, quarantine.wmsUnsellableRefundRefusal('UNKNOWN'), 'no bound shipment: both routes are given')
   await nothingWritten()
 
   // Control: neither, the same unsellable return is quarantined.
