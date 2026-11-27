@@ -1981,6 +1981,68 @@ test('the monetary-only fallback is unchanged when there is no fee line: an amou
   assert.equal(state.createRefundLines[0].totalForeign, 100)
 })
 
+// A TYPED PRICE REFUND: WooCommerce fills a line's tax only when its quantity changes, so a price typed on a 20% line arrives as total 5.00, total_tax 0.
+// onetwo3D sells one VAT rate per order, so the typed figure is GROSS at the order's rate: net 4.1667, VAT 0.8333 (4dp), gross still 5.00.
+const TYPED_ORDER: Partial<OrderDouble> = makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2, lineCount: 2 })
+const typedPriceGadget = { ...amountOnlyGadget, total: '-5.00', total_tax: '0', meta_data: [{ id: 2, key: '_refunded_item_id', value: '502' }], refund_total: 5 }
+const typedShipping = { id: 930, method_title: 'Tracked', method_id: 'x', total: '-5.00', total_tax: '-1.00', taxes: [], meta_data: [] } as never
+
+test('a typed price (5.00, tax 0) on a 20% line beside a shipping refund is split net 4.1667 / VAT 0.8333 and the gross still reconciles to 5.00', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: TYPED_ORDER })
+  const result = await syncWcRefund(1001, makeRefund({ amount: '11.00', line_items: [typedPriceGadget], shipping_lines: [typedShipping] }), state.dependencies)
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
+  assertAmountOnlyLine(state, { lineId: 'line-2', net: 4.1667, tax: 0.8333 })
+  const line = state.createRefundLines.find((l) => l.lineId === 'line-2')!
+  assert.equal(roundQuantity(toDecimal(line.totalForeign as number).add(line.chargedTaxForeign as number), 4).toNumber(), 5)
+  assert.equal(state.createRefundLines.find((l) => l.lineKind === 'shipping')?.totalForeign, 5, 'the shipping line is untouched')
+})
+
+test('a typed price alongside a QUANTITY line: the quantity line keeps its stated tax and the typed one is split', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: TYPED_ORDER })
+  const result = await syncWcRefund(1001, makeRefund({ amount: '20.00', line_items: [goodsRefundLine, typedPriceGadget] }), state.dependencies)
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
+  assert.equal(state.createRefundLines.find((l) => l.lineId === 'line-1')?.chargedTaxForeign, 2.5)
+  assertAmountOnlyLine(state, { lineId: 'line-2', net: 4.1667, tax: 0.8333 })
+})
+
+test('a typed price on a ZERO-RATED order is unchanged: net 5.00, no VAT', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: makeOrder({ grossTotal: 100, taxBase: 0, rate: 0, lineCount: 2 }) })
+  const result = await syncWcRefund(1001, makeRefund({ amount: '11.00', line_items: [typedPriceGadget], shipping_lines: [typedShipping] }), state.dependencies)
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
+  assertAmountOnlyLine(state, { lineId: 'line-2', net: 5, tax: 0 })
+})
+
+test('an amount-only line that STATES non-zero tax keeps its stated net and tax', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: TYPED_ORDER })
+  const stated = { ...typedPriceGadget, total: '-10.00', total_tax: '-2.00' }
+  const result = await syncWcRefund(1001, makeRefund({ amount: '18.00', line_items: [stated], shipping_lines: [typedShipping] }), state.dependencies)
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
+  assertAmountOnlyLine(state, { lineId: 'line-2', net: 10, tax: 2 })
+})
+
+test('a typed price whose order rate cannot be established is QUARANTINED with a message that does NOT tell the operator to map a tax code', async () => {
+  for (const order of [
+    { ...makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2, lineCount: 2 }), taxRatePercent: null },
+    makeOrder({ grossTotal: 120, taxBase: 20, rate: 0.2, lineCount: 2, lineRate: 0.1 }),
+  ]) {
+    const state = makeDependencies({ alwaysMissExistingRefund: true, order })
+    const result = await syncWcRefund(1001, makeRefund({ amount: '11.00', line_items: [typedPriceGadget], shipping_lines: [typedShipping] }), state.dependencies)
+    assert.equal(result.outcome, 'quarantined-refusal')
+    assert.match(result.error ?? '', /no VAT stated[\s\S]*ALREADY been returned in the storefront[\s\S]*do NOT issue another storefront refund/)
+    assert.doesNotMatch(result.error ?? '', /tax code|Settings → Tax Rates/)
+    assert.equal(state.createRefundCalls, 0)
+    assert.equal((state.activityLogs as Array<{ action?: string }>).some((e) => e.action === 'refund_sync_typed_price_vat_undeterminable'), true)
+  }
+})
+
+test('a typed price on a FOREIGN-currency order: net and VAT are foreign, totalBase is net / fxRate', async () => {
+  const state = makeDependencies({ alwaysMissExistingRefund: true, order: { ...TYPED_ORDER, currency: 'USD', fxRateToBase: 1.25 } as unknown as Partial<OrderDouble> })
+  const result = await syncWcRefund(1001, makeRefund({ amount: '11.00', line_items: [typedPriceGadget], shipping_lines: [typedShipping] }), state.dependencies)
+  assert.equal(refundIsInIms(result.outcome), true, result.error)
+  assertAmountOnlyLine(state, { lineId: 'line-2', net: 4.1667, tax: 0.8333 })
+  assert.equal(state.createRefundLines.find((l) => l.lineId === 'line-2')?.totalBase, 3.3334)
+})
+
 const REASONS = [
   { id: 'rr-damaged', name: 'Damaged item', active: true, sortOrder: 1 },
   { id: 'rr-retired', name: 'Too small', active: false, sortOrder: 2 },

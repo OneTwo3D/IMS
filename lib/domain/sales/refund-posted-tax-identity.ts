@@ -660,7 +660,11 @@ export function postedCreditNoteTotalCheck(input: {
       `credit note would come to ${postedGross.toDecimalPlaces(2).toFixed(2)} — the accounting tax code ` +
       `it posts under is worth ${input.postedRate.mul(100).toString()}%, which is not the VAT this money ` +
       'bore. ' +
-      (input.kind === 'sale'
+      (input.kind === 'sale' && tax.isZero()
+        ? 'The storefront stated NO VAT on this line, so IMS cannot tell how much of the money was VAT: ' +
+          'record this refund by hand against the order lines (Sync → Exceptions → Record manually), ' +
+          'entering the GROSS amount returned. Do not refund the customer again.'
+        : input.kind === 'sale'
         ? "Map this line's tax rate to an accounting tax code carrying the rate it was sold at " +
           '(Settings → Tax Rates), then record this refund.'
         : "Shipping posts under the ORDER's default VAT identity, which is not the rate this order " +
