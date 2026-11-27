@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { UNPAID_INVOICE_BASIS_A1_WHERE, findProvenInvoiceBasisCandidates, readInvoiceBasisDeferralSwitch } from '@/lib/domain/accounting/invoice-basis-deferral'
 import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { parseCostLayerSnapshot, sumCostLayerSnapshot } from '@/lib/cost-layer-snapshots'
 import {
@@ -128,6 +129,18 @@ export async function computeDailyBatchA1A2Preview(): Promise<DailyBatchA1A2Prev
     },
     orderBy: { paidAt: 'asc' },
   })
+  // unpaid-invoice deferral: with `xero_defer_unpaid_invoiced_revenue_enabled` on, the unpaid orders whose AUTHORISED invoice was posted
+  // after switch-on are deferred too, so the preview lists them after the paid ones. Off, nothing is added.
+  const invoiceBasisSwitch = await readInvoiceBasisDeferralSwitch(db)
+  if (invoiceBasisSwitch.on) {
+    const proven = await findProvenInvoiceBasisCandidates(db, invoiceBasisSwitch.since)
+    const unpaid = proven.size === 0 ? [] : await db.salesOrder.findMany({
+      where: { ...UNPAID_INVOICE_BASIS_A1_WHERE, id: { in: [...proven.keys()].slice(0, 1000) } },
+      select: { id: true, orderNumber: true, externalOrderNumber: true, totalBase: true, taxBase: true },
+      orderBy: { id: 'asc' },
+    })
+    a1Orders.push(...unpaid)
+  }
 
   const groupA1 = {
     orderCount: a1Orders.length,

@@ -121,6 +121,12 @@ enum RefundDisposition {
 // Invoicing state of a sales order, orthogonal to the fulfilment lifecycle status (and to RefundDisposition): an order can
 // be SHIPPED and NOT_INVOICED, or CANCELLED and FULLY_INVOICED. Derived from the order's invoice evidence, never set by hand:
 // lib/domain/sales/invoicing-state.ts (SalesOrder.invoicingState).
+// unpaid-invoice deferral: why Group A1 deferred an order's revenue (SalesOrder.revenueDeferralBasis). NULL reads as PAID.
+enum RevenueDeferralBasis {
+  PAID
+  INVOICE
+}
+
 enum InvoicingState {
   NOT_INVOICED
   PARTIALLY_INVOICED
@@ -2387,6 +2393,27 @@ model SalesOrder {
   // Accounting sub-ledger tracking
   revenueDeferredDate    DateTime?              @map("accounting_revenue_deferred_date") // Set by Group A1 — revenue deferred to Unearned
   unearnedRevenueAmount  Decimal?  @db.Decimal(18, 4) @map("accounting_unearned_revenue_amount") // Amount deferred
+  // unpaid-invoice deferral: WHY and FROM WHEN Group A1 deferred this order. NULL (every order deferred with the switch
+  // `xero_defer_unpaid_invoiced_revenue_enabled` off, and every order before it) means PAID: deferred on the day the
+  // order was paid. INVOICE: an UNPAID order whose AUTHORISED invoice IMS posted after the switch went on, deferred
+  // on the invoice's document day (`revenueDeferralEventAt`). A2, Group B and the pre-batch refund adjustments
+  // date from that day instead of paidAt, the payment-removal chargeback is not raised, and the
+  // revenue-without-payment check does not apply (the order was never deferred because it was paid).
+  revenueDeferralBasis   RevenueDeferralBasis?  @map("accounting_revenue_deferral_basis")
+  revenueDeferralEventAt DateTime?              @map("accounting_revenue_deferral_event_at")
+  // Unpaid-invoice deferral: the invoice an INVOICE-basis deferral was made from is gone (IMS document delete completed,
+  // or Xero reports it VOIDED). `revenueDeferralUnwindOwedAt` is the durable obligation, written in the transaction that
+  // learned it; the daily batch then posts DR Unearned Revenue / CR Sales for what is still open and records the pounds
+  // (`revenueDeferralUnwoundAmount`, 0 when nothing was open) and the journal (`revenueDeferralUnwindRef`). The A1 stamp
+  // stays: A2 may hold the units in Allocated Inventory, so later shipments must keep the ordinary path. Every reader of
+  // the open deferral (Group B, refunds, the tie-out) subtracts the unwound amount.
+  revenueDeferralUnwindOwedAt  DateTime?            @map("accounting_revenue_deferral_unwind_owed_at")
+  revenueDeferralUnwindReason  String?              @map("accounting_revenue_deferral_unwind_reason")
+  revenueDeferralUnwoundAmount Decimal?             @db.Decimal(18, 4) @map("accounting_revenue_deferral_unwound_amount")
+  revenueDeferralUnwindRef     String?              @map("accounting_revenue_deferral_unwind_ref")
+  // The invoice whose deletion or void the unwind is owed for. A cancel needs no refund only while the order still names
+  // THAT invoice, or none: a re-issued, live invoice is credited by a refund as any other.
+  revenueDeferralUnwindInvoiceId String?            @map("accounting_revenue_deferral_unwind_invoice_id")
   inventoryAllocatedDate DateTime?              @map("accounting_inventory_allocated_date") // Set by Group A2 — inventory reclassified to Allocated
   allocationBatchAmount  Decimal?  @db.Decimal(18, 4) @map("accounting_allocation_batch_amount") // Cost value reclassified
   // o3d-0qoo: the EXACT AccountingSyncLog.referenceId of the batch this row was staged into,

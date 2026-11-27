@@ -54,7 +54,7 @@ test('allowlist contains exactly the switches that exist on development, and non
     'first_load_mintsoft_archive_enabled', 'mintsoft_asn_send_supplier_enabled', 'mintsoft_asn_supplier_required', 'mintsoft_parent_sku_delete_enabled',
     'mintsoft_product_parity_enabled', 'mintsoft_supplier_create_enabled', 'purchase_event_fx_rates_enabled', 'refund_delete_enabled', 'sales_order_discount_tax_apportion_enabled', 'storefront_customer_email_enabled', 'trackship_refire_enabled', 'wc_invoice_document_enabled',
     'wc_invoice_note_enabled', 'wc_order_amendment_unpaid_rewrite_enabled', 'wc_order_amendment_write_enabled', 'wc_refund_credit_note_parity_enabled', 'wc_withdrawal_outcome_enabled', 'wms_despatch_date_enabled', 'wms_despatch_quantity_check_enabled', 'wms_merge_candidate_mode',
-    'wms_merge_hold_enabled', 'wms_mixed_warehouse_push_enabled', 'wms_refund_remainder_task_enabled', 'wms_sku_rename_remap_enabled', 'xero_credit_note_allocation_enabled', 'xero_credit_note_duplicate_check_enabled', 'xero_refund_payment_cash_out_date_enabled',
+    'wms_merge_hold_enabled', 'wms_mixed_warehouse_push_enabled', 'wms_refund_remainder_task_enabled', 'wms_sku_rename_remap_enabled', 'xero_credit_note_allocation_enabled', 'xero_credit_note_duplicate_check_enabled', 'xero_defer_unpaid_invoiced_revenue_enabled', 'xero_refund_payment_cash_out_date_enabled',
   ])
   for (const k of SYSTEM_SWITCH_KEYS) assert.equal(SENSITIVE_SETTING_KEYS.has(k), false)
 })
@@ -358,6 +358,27 @@ test('purchase_event_fx_rates_enabled: the write transaction re-checks the accou
   assert.equal(result.ok, false)
   assert.equal(f.settings.get('purchase_event_fx_rates_enabled'), undefined)
 }))
+
+// unpaid-invoice deferral: unpaid invoiced revenue deferral. Off by default, ADMIN, stamps its switch-on instant, and its keys are the ones the daily batch reads.
+test('xero_defer_unpaid_invoiced_revenue_enabled: off by default, ADMIN, stamped on and cleared off; keys equal the reader\'s', async () => {
+  const def = findSwitch('xero_defer_unpaid_invoiced_revenue_enabled')!
+  assert.equal(def.defaultValue, 'false')
+  assert.equal(def.adminOnly, true)
+  const reader = await import('../lib/domain/accounting/invoice-basis-deferral')
+  const sw = await import('../lib/domain/settings/system-switches')
+  assert.equal(sw.INVOICE_BASIS_DEFERRAL_SWITCH_KEY, reader.INVOICE_BASIS_DEFERRAL_SWITCH_KEY)
+  assert.equal(sw.INVOICE_BASIS_DEFERRAL_ENABLED_AT_KEY, reader.INVOICE_BASIS_DEFERRAL_ENABLED_AT_KEY)
+  assert.equal(def.stampOnKey, reader.INVOICE_BASIS_DEFERRAL_ENABLED_AT_KEY)
+  const refused = await run('set', ['--key', def.key, '--value', 'true', ...SET, '--yes'])
+  assert.equal(refused.code, 3)
+  const on = await run('set', ['--key', def.key, '--value', 'true', ...SET, '--yes', '--confirm-admin'])
+  assert.equal(on.code, 0, on.err)
+  const stamp = on.f.settings.get(def.stampOnKey!)?.value
+  assert.ok(stamp && !Number.isNaN(new Date(stamp).getTime()), 'switch-on instant stamped')
+  const off = await run('set', ['--key', def.key, '--value', 'false', ...SET, '--yes', '--confirm-admin'], on.f)
+  assert.equal(off.code, 0, off.err)
+  assert.equal(off.f.settings.has(def.stampOnKey!), false)
+})
 
 test('refund_delete_enabled: registered as an ADMIN switch, off by default, key equal to the reader\'s, no turn-on prerequisite, and turning it off is never refused', async () => {
   const def = findSwitch('refund_delete_enabled')!

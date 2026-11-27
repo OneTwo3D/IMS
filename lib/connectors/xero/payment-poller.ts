@@ -42,6 +42,7 @@ import {
   retireBillPaymentRegistrationsReversedInLedger,
   type LedgerClassifierProof,
 } from '@/lib/domain/accounting/payment-reversal'
+import { markInvoiceBasisDeferralUnwindOwed } from '@/lib/domain/accounting/invoice-basis-deferral'
 import { handleDetectedReversal, type DetectedReversalOrder } from '@/lib/domain/accounting/reversal-handling'
 import {
   matchRemovedRegisteredPayments,
@@ -1224,6 +1225,27 @@ async function processDeltaChunk(
   // payment IMS posted seconds ago reads exactly like one that was taken away.
   const salesReversal = partitionPaymentReversals(changed, 'ACCREC')
   const voidedSalesIds = salesReversal.voided
+  // Unpaid-invoice deferral: an unpaid order Group A1 deferred FROM its invoice holds that deferral in Unearned Revenue, and
+  // a VOIDED invoice took its Sales credit back. Record the unwind the daily batch owes (idempotent; only INVOICE-basis
+  // orders are ever marked, and paid orders keep the reversal handling below). A failed write is an error on this chunk,
+  // so it is not checkpointed and the void is seen again on the next poll.
+  if (voidedSalesIds.size > 0) {
+    try {
+      await markInvoiceBasisDeferralUnwindOwed(db, { accountingInvoiceIds: [...voidedSalesIds] }, 'INVOICE_VOIDED')
+    } catch (error) {
+      result.errors.push(`Recording the deferral unwind owed for voided invoice(s) failed: ${String(error)}`)
+      // Its own alert as well as the chunk error: a write that keeps failing would otherwise only show as a cursor that
+      // does not move. Best effort; a failure to log changes nothing about the retry.
+      await logActivity({
+        entityType: 'SYSTEM',
+        action: 'invoice_basis_unwind_mark_failed',
+        tag: 'accounting',
+        level: 'ERROR',
+        description: `Xero reported ${voidedSalesIds.size} sales invoice(s) VOIDED, but IMS could not record the revenue-deferral unwind they may owe (${String(error)}). The poll repeats it; if this persists, Unearned Revenue holds deferrals whose invoices are gone (see the accounting check invoice_basis_deferral_stranded).`,
+        metadata: { voidedInvoiceIds: [...voidedSalesIds].slice(0, 50) },
+      }).catch(() => { /* logging must never change the poll */ })
+    }
+  }
   const paidBillIds = idsWhere(changed, 'ACCPAY', ['PAID'])
   const billReversal = partitionPaymentReversals(changed, 'ACCPAY')
   const invoiceById = new Map(changed.map((i) => [i.InvoiceID, i]))
@@ -1392,7 +1414,7 @@ async function processDeltaChunk(
       // `paidAt: { not: null }` inside a file that decides reversals carries the provenance", with no
       // exceptions for reads that happen not to need it today. An exception is a hole the next reader
       // walks through, which is the shape of the defect this round exists to close.
-      select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true, revenueDeferredDate: true, unregisteredPaidAt: true },
+      select: { id: true, accountingInvoiceId: true, orderNumber: true, externalOrderNumber: true, status: true, revenueDeferredDate: true, revenueDeferralBasis: true, unregisteredPaidAt: true },
     })
     if (paidOrders.length > 0) {
       for (const order of detectPaymentReversals(paidOrders, reversedSalesIds)) {

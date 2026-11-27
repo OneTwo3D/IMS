@@ -1613,6 +1613,8 @@ async function stageRefundAccountingReversals(
     accountingSettings: AccountingSettings
     so: {
       unearnedRevenueAmount: Prisma.Decimal | number | string | null
+      /** Unpaid-invoice deferral: what an unwind (its invoice deleted or voided) already took back out of Unearned Revenue. */
+      revenueDeferralUnwoundAmount?: Prisma.Decimal | number | string | null
     }
     newStatus: 'REFUNDED' | 'PARTIALLY_REFUNDED'
     /** scjz.70: revenue-only chargeback — suppress the COGS reversal (cost kept as a loss). */
@@ -3078,7 +3080,8 @@ async function stageRefundAccountingReversals(
       : Math.round(Math.max(
         0,
         refundBoundaryNumber(params.so.unearnedRevenueAmount) - totalRecognized
-          - Math.max(sweepPriorReversed, priorUnearnedReversed),
+          - Math.max(sweepPriorReversed, priorUnearnedReversed)
+          - refundBoundaryNumber(params.so.revenueDeferralUnwoundAmount ?? 0),
       ) * 100) / 100
     const sweepTrusted = unreadableUnearnedReversalRows.length === 0 && sweepUnprovenRefundIds.length === 0
     // Never more than the deferral stamped on the order less the recognition stamped on its shipments less every
@@ -3589,6 +3592,9 @@ async function stageRefundAccountingReversals(
         data: {
           revenueDeferredDate: null,
           revenueDeferredBatchRef: null,
+          // unpaid-invoice deferral: the basis and its day go with the stamp they describe (NULL on every order deferred with the switch off).
+          revenueDeferralBasis: null,
+          revenueDeferralEventAt: null,
           ...(allocationBasisUnresolved ? {} : {
             inventoryAllocatedDate: null,
             inventoryAllocatedBatchRef: null,
@@ -4262,6 +4268,7 @@ export async function createSalesOrderRefund(
         discountTaxSplit: true,
         revenueDeferredDate: true,
         unearnedRevenueAmount: true,
+        revenueDeferralUnwoundAmount: true,
         inventoryAllocatedDate: true,
         allocationBatchAmount: true,
         // taxRateName -> the order-default tax type; per-line taxRate -> each line's own identity. Both
@@ -6501,6 +6508,7 @@ export async function retrySalesOrderRefundAccounting(
               refundStatus: true,
               revenueDeferredDate: true,
               unearnedRevenueAmount: true,
+              revenueDeferralUnwoundAmount: true,
               // o3d-w00 (Codex r8 #4): the order's own money snapshot, so the retry can re-run the
               // creation fence against what every part of this order was CHARGED. Same figures, same
               // reasons as the createSalesOrderRefund read — see the fence there.
