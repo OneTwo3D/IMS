@@ -610,6 +610,11 @@ export function postedCreditNoteTotalCheck(input: {
   /** For the refusal message: what this target is called on screen. */
   label: string
   /**
+   * True only when the refund's SOURCE (the WooCommerce sync) stated this line's VAT as zero while the line's OWN tax rate is above zero:
+   * the cause is then the missing stated tax, not a missing tax-code mapping. Every other case keeps the "map this line's tax rate" remedy.
+   */
+  taxStatedBySource?: boolean
+  /**
    * o3d-w00 (Codex r10 #4): HOW MANY independently-quantised money figures the charged pair above was
    * composed from.
    *
@@ -660,7 +665,7 @@ export function postedCreditNoteTotalCheck(input: {
       `credit note would come to ${postedGross.toDecimalPlaces(2).toFixed(2)} — the accounting tax code ` +
       `it posts under is worth ${input.postedRate.mul(100).toString()}%, which is not the VAT this money ` +
       'bore. ' +
-      (input.kind === 'sale' && tax.isZero()
+      (input.kind === 'sale' && input.taxStatedBySource === true && tax.isZero()
         ? 'The storefront stated no VAT on this line, so IMS cannot tell how much of the money was VAT, ' +
           'and the credit note cannot be raised from the figures it sent.'
         : input.kind === 'sale'

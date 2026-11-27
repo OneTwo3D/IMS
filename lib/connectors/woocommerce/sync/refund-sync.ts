@@ -1308,6 +1308,7 @@ export async function syncWcRefund(
           const lineRate = imsLine.taxRate?.rate == null ? toDecimal(0) : toDecimal(imsLine.taxRate.rate)
           if (!(lineRate.gt(0) && imsLine.taxRate?.reverseCharge !== true)) continue
           const basis = resolveMonetaryRefundVatRate(so)
+          // The line-rate comparison below cannot fire today (the resolver already refuses an order whose lines are not all at the header rate); it is kept as a defensive fence in case that contract changes.
           const why = !basis.ok
             ? `the order's VAT rate cannot be established (${undeterminableBasisCause(basis.error)})`
             : basis.vatRate.lte(0) || basis.vatRate.sub(lineRate).abs().gt(RATE_EPSILON)

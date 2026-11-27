@@ -2259,8 +2259,29 @@ test('an ITEMISED SALE refund whose credit note would restate VAT is refused (o3
   assert.match(error, /credit note would come to 12\.00/)
   // A storefront refund is money that has ALREADY left, so the message must not read as "try again".
   assert.match(error, /do NOT issue another storefront refund/)
+  // The line's OWN rate is 0%: the cause is an unmapped tax code, so the old remedy stays (the stated-VAT wording is not used).
+  assert.match(error, /Map this line's tax rate to an accounting tax code/)
+  assert.doesNotMatch(error, /stated no VAT/)
   assert.equal(state.refunds.length, 0, 'nothing was created')
   assert.equal(state.refundLines.length, 0)
+})
+
+test('a line whose OWN rate is 20% that the source states 0 VAT on is refused naming the missing stated VAT, not a tax-code mapping', async () => {
+  const state = fallsBackToOrderDefaultState(2)
+  ;(state.lines[0] as { taxRate: unknown }).taxRate = { accountingTaxType: null, reverseCharge: false, rate: 0.2 }
+  const result = await createSalesOrderRefund(createClient(state), {
+    orderId: 'order-1',
+    lines: [{ ...ITEMISED_SALE_REFUND, chargedTaxForeign: 0 }],
+    reason: 'Customer return',
+    externalRefundId: 8803,
+    creditNotePrefix: 'CN-',
+    activeAccountingConnector: 'xero',
+    creditNotePostingEnabled: true,
+  })
+  assert.equal(result.success, false)
+  const error = result.success === false ? result.error : ''
+  assert.match(error, /stated no VAT on this line/)
+  assert.doesNotMatch(error, /Map this line's tax rate/)
 })
 
 test('the same line at the rate its credit will post at is recorded (o3d-w00 Codex r7 #1)', async () => {

@@ -5406,6 +5406,8 @@ export async function createSalesOrderRefund(
           postedRate: priced.vatRate,
           kind: lineKind,
           label,
+          // The Woo sync stated zero VAT on a line whose OWN rate is positive (a typed price): say so, rather than send the operator to map a tax code.
+          taxStatedBySource: stated != null && lineKind === 'sale' && toDecimal(refundLine.lineId ? salesLineTaxById.get(refundLine.lineId)?.rate ?? 0 : 0).gt(0),
           chargedSourceCount: chargedMoney?.sourceCount ?? 1,
         })
         if (!total.ok) return refuse(total.reason)
