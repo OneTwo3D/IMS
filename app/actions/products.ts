@@ -213,10 +213,11 @@ export async function listProducts(params: {
           },
         },
         stockLevels: { select: { quantity: true, reservedQty: true } },
-        costLayers: {
+        // Cost layers feed only the COGS Value figure, so they are not read at all without inventory.prices.
+        ...(canSeePrices ? { costLayers: {
           where: { remainingQty: { gt: 0 } },
           select: { remainingQty: true, unitCostBase: true },
-        },
+        } } : {}),
       },
       orderBy: isComputedSort ? { sku: 'asc' } : { [sortField]: sortDir },
       // For computed sorts, fetch all rows so we can sort in memory then paginate
@@ -342,7 +343,7 @@ export async function listProducts(params: {
     availableStock: availableStock.toFixed(2),
     incomingStock: incomingStock.toFixed(2),
     inventoryValue: canSeePrices
-      ? p.costLayers
+      ? (('costLayers' in p ? p.costLayers : []) as Array<{ remainingQty: Prisma.Decimal; unitCostBase: Prisma.Decimal }>)
         .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostBase), 0)
         .toFixed(2)
       : null,
@@ -390,10 +391,11 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
           include: { warehouse: { select: { id: true, code: true, name: true, type: true } } },
           orderBy: { warehouse: { code: 'asc' } },
         },
-        costLayers: {
-          orderBy: { receivedAt: 'asc' },
+        // Cost layers are not read at all without inventory.prices.
+        ...(canSeePrices ? { costLayers: {
+          orderBy: { receivedAt: 'asc' as const },
           where: { remainingQty: { gt: 0 } },
-        },
+        } } : {}),
       },
     }),
     // Allocated: active sales order lines, grouped by shipFromWarehouseId
@@ -425,6 +427,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
   ])
 
   if (!p) return null
+  const costLayers: Array<{ id: string; receivedAt: Date; receivedQty: Prisma.Decimal; remainingQty: Prisma.Decimal; unitCostBase: Prisma.Decimal }> = 'costLayers' in p ? p.costLayers : []
 
   // Build per-warehouse maps
   const allocatedByWarehouse = new Map<string, number>()
@@ -519,7 +522,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
   // For KIT/BOM: compute unit cost from components; BOM also uses actual stock
   const isKitOrBom = p.type === 'KIT' || p.type === 'BOM'
   const kitUnitCostBase = isKitOrBom && canSeePrices ? await computeKitUnitCostBase(p.id) : 0
-  const fifoInventoryValue = p.costLayers
+  const fifoInventoryValue = costLayers
     .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostBase), 0)
   const totalStockQty = p.stockLevels.reduce((sum, s) => sum + Number(s.quantity), 0)
   // Switch return_condition_check_enabled: stock in a quarantine warehouse is on hand but never available (nothing changes with the switch off).
@@ -666,7 +669,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       }
       return rows
     })(),
-    costLayers: !canSeePrices ? [] : p.costLayers.map((c) => ({
+    costLayers: !canSeePrices ? [] : costLayers.map((c) => ({
       id: c.id,
       receivedAt: c.receivedAt,
       receivedQty: c.receivedQty.toString(),

@@ -60,6 +60,7 @@ export function StockCountsClient({
   initialVarianceSort,
   initialOpenCountId,
   reasonCostRequired = false,
+  costVisible = false,
 }: {
   initialCounts: StockCountRow[]
   warehouses: Warehouse[]
@@ -70,6 +71,8 @@ export function StockCountsClient({
   initialOpenCountId: string | null
   /** o3d-0ypv9: switch `stock_adjustment_reason_cost_required` (off by default). */
   reasonCostRequired?: boolean
+  /** inventory.prices: shows the Est. value column and the value sort; the server sends no unit cost to other roles. */
+  costVisible?: boolean
 }) {
   const router = useRouter()
   const pathname = usePathname()
@@ -154,6 +157,7 @@ export function StockCountsClient({
                   count={count}
                   reasons={reasons}
                   reasonCostRequired={reasonCostRequired}
+                  costVisible={costVisible}
                   expanded={expandedId === count.id}
                   onToggle={() => { const next = expandedId === count.id ? null : count.id; setExpandedId(next); writeUrl({ count: next }) }}
                   threshold={smallVarianceThreshold}
@@ -250,11 +254,12 @@ function NewCountDialog({ warehouses, onClose, onCreated }: { warehouses: Wareho
 }
 
 function StockCountRowView({
-  count, reasons, expanded, onToggle, onChanged, threshold, varianceTab, varianceSort, onVarianceTab, onVarianceSort, reasonCostRequired,
+  count, reasons, expanded, onToggle, onChanged, threshold, varianceTab, varianceSort, onVarianceTab, onVarianceSort, reasonCostRequired, costVisible,
 }: {
   count: StockCountRow
   reasons: AdjustmentReasonOption[]
   reasonCostRequired: boolean
+  costVisible: boolean
   expanded: boolean
   onToggle: () => void
   onChanged: (message?: string) => void
@@ -334,7 +339,7 @@ function StockCountRowView({
   const triaged = count.lines.map((l) => triageLine({ id: l.id, sku: l.sku, expectedQty: l.expectedQty, countedQty: editable ? typedCount(l) : l.countedQty, unitCost: l.unitCost }, threshold))
   const lineById = new Map(count.lines.map((l) => [l.id, l]))
   const tabTotals = tabCounts(triaged)
-  const shown = sortTriaged(filterByTab(triaged, varianceTab), varianceSort)
+  const shown = sortTriaged(filterByTab(triaged, varianceTab), !costVisible && varianceSort === 'VALUE' ? 'QTY' : varianceSort)
   const dirty = count.lines.some((l) => (typedCount(l) ?? null) !== l.countedQty)
   const [thresholdQty, setThresholdQty] = useState(String(threshold.qty || ''))
   const [thresholdPct, setThresholdPct] = useState(String(threshold.pct || ''))
@@ -425,7 +430,7 @@ function StockCountRowView({
                 </Button>
               ))}
               <Select value={varianceSort} onChange={(e) => onVarianceSort(e.target.value as VarianceSort)} className="h-8 text-xs w-48" aria-label="Sort lines">
-                {VARIANCE_SORTS.map((o) => <option key={o} value={o}>{SORT_LABEL[o]}</option>)}
+                {VARIANCE_SORTS.filter((o) => costVisible || o !== 'VALUE').map((o) => <option key={o} value={o}>{SORT_LABEL[o]}</option>)}
               </Select>
               {editable && varianceTab === 'NONE' && tabTotals.NONE > 0 && (
                 <Button size="sm" disabled={pending || dirty} title={dirty ? 'Save counts first: only saved counts can be accepted' : undefined} onClick={() => handleBulkAccept('NO_VARIANCE')}>
@@ -464,7 +469,7 @@ function StockCountRowView({
                     <th className="px-3 py-1.5 text-right">Book qty</th>
                     <th className="px-3 py-1.5 text-right">Counted</th>
                     <th className="px-3 py-1.5 text-right">Variance</th>
-                    <th className="px-3 py-1.5 text-right">Est. value</th>
+                    {costVisible && <th className="px-3 py-1.5 text-right">Est. value</th>}
                   </tr>
                 </thead>
                 <tbody>
@@ -503,9 +508,11 @@ function StockCountRowView({
                         <td className={`px-3 py-1 text-right font-mono text-xs ${variance == null ? 'text-muted-foreground' : variance < 0 ? 'text-destructive' : variance > 0 ? 'text-green-700 dark:text-green-400' : ''}`}>
                           {(editable ? variance : l.variance) ?? '—'}
                         </td>
-                        <td className="px-3 py-1 text-right font-mono text-xs text-muted-foreground">
-                          {t.varianceValue == null ? '—' : formatMoney(t.varianceValue, '£')}
-                        </td>
+                        {costVisible && (
+                          <td className="px-3 py-1 text-right font-mono text-xs text-muted-foreground">
+                            {t.varianceValue == null ? '—' : formatMoney(t.varianceValue, '£')}
+                          </td>
+                        )}
                       </tr>
                     )
                   })}

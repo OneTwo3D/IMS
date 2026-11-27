@@ -62,6 +62,7 @@ export default async function InventoryPage({
         productCategories={categories}
         supplierId={sp.supplierId}
         supplierOptions={supplierOptions}
+        canSeeStockValue={canEditPrices}
       />
 
       <ProductTable

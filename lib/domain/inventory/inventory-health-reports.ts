@@ -631,7 +631,8 @@ async function loadDeadStockPositions(
   const missingCostLayerCount = positions.filter((position) => toDecimal(position.valueBase).eq(0)).length
   return {
     positions,
-    notices: missingCostLayerCount > 0
+    // The count of zero-value rows is itself a statement about value, so it is only given to roles that see value.
+    notices: filters.includeCost === true && missingCostLayerCount > 0
       ? [`${missingCostLayerCount.toLocaleString()} stocked row(s) have no positive cost-layer value; dead-stock value is reported as 0 for those rows.`]
       : [],
   }

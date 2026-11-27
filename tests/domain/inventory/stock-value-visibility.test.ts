@@ -151,7 +151,7 @@ const movement = {
   note: 'Damaged', createdAt: new Date('2026-06-01T10:00:00.000Z'),
 }
 
-function ledgerClient(): InventoryLedgerReportClient {
+function ledgerClient(wheres: unknown[] = []): InventoryLedgerReportClient {
   const transfer = {
     id: 't1', reference: 'TR-1', status: 'COMPLETED', fromWarehouse: { code: 'WH1', name: 'Main' }, toWarehouse: { code: 'WH2', name: 'Other' },
     dispatchedAt: new Date('2026-06-01T10:00:00.000Z'), completedAt: new Date('2026-06-02T10:00:00.000Z'), createdAt: new Date('2026-06-01T09:00:00.000Z'),
@@ -163,8 +163,8 @@ function ledgerClient(): InventoryLedgerReportClient {
   }
   return {
     stockMovement: {
-      count: async () => 1,
-      findMany: async () => [movement],
+      count: async (args?: { where?: unknown }) => { wheres.push(args?.where); return 1 },
+      findMany: async (args?: { where?: unknown }) => { wheres.push(args?.where); return [movement] },
       aggregate: async () => ({ _sum: { qty: decimal('2'), totalValueBase: decimal('14') } }),
       groupBy: async (args: { by: string[] }) => args.by[0] === 'productId'
         ? [{ productId: 'p1', _count: { _all: 1 }, _sum: { qty: decimal('2'), totalValueBase: decimal('14') } }]
@@ -185,10 +185,19 @@ function ledgerClient(): InventoryLedgerReportClient {
 }
 
 test('stock movement ledger carries no value fields (and ignores minValue) without inventory.prices', async () => {
-  const report = await getStockMovementLedgerReport({ includeCost: false, minValue: '1' }, { client: ledgerClient() })
+  const wheres: unknown[] = []
+  const report = await getStockMovementLedgerReport({ includeCost: false, minValue: '1' }, { client: ledgerClient(wheres) })
   assert.deepEqual(valueKeys(report), [])
+  assert.ok(wheres.length > 0)
+  assert.ok(!JSON.stringify(wheres).includes('totalValueBase'), 'the value filter is not applied to the query')
   assert.equal(report.rows.length, 1)
   assert.equal(report.rows[0]!.signedQty, '-2')
+})
+
+test('stock movement ledger applies the minValue filter for an inventory.prices caller', async () => {
+  const wheres: unknown[] = []
+  await getStockMovementLedgerReport({ includeCost: true, minValue: '1' }, { client: ledgerClient(wheres) })
+  assert.ok(JSON.stringify(wheres).includes('"totalValueBase":{"gte":1}'))
 })
 
 test('stock movement ledger keeps value for an inventory.prices caller', async () => {
@@ -223,4 +232,14 @@ test('stock count report carries no value fields without inventory.prices', asyn
   assert.equal(hidden.rows.length, 1)
   const shown = await getStockCountReport({ includeCost: true }, { client: ledgerClient() })
   assert.ok(shown.totals.linkedAdjustmentValueBase != null)
+})
+
+test('dead stock drops the "no positive cost-layer value" notice without inventory.prices', async () => {
+  const client = healthClient()
+  // A stocked row with no cost layer yields a zero-value position and the notice, for a value caller only.
+  const noLayers = { ...client, costLayer: { findMany: async () => [] } } as InventoryHealthReportClient
+  const hidden = await getDeadStockReport({ asOf: '2026-06-01', thresholdDays: 90, includeCost: false }, { paginate: false, deps: { client: noLayers, now: () => new Date('2026-06-02T00:00:00.000Z') } })
+  assert.ok(!hidden.notices.some((notice) => /cost-layer value/.test(notice)))
+  const shown = await getDeadStockReport({ asOf: '2026-06-01', thresholdDays: 90, includeCost: true }, { paginate: false, deps: { client: noLayers, now: () => new Date('2026-06-02T00:00:00.000Z') } })
+  assert.ok(shown.notices.some((notice) => /cost-layer value/.test(notice)))
 })
