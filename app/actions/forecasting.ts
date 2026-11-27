@@ -22,6 +22,7 @@ import { growthForCarry } from '@/lib/domain/inventory/forecast-growth'
 import type { StockPositionFilters } from '@/lib/domain/inventory/stock-position-reports'
 import { ProductType } from '@/app/generated/prisma/client'
 import { refuseRestrictedDestination } from '@/lib/domain/purchasing/po-warehouse-eligibility'
+import { isQuarantineTargetWarehouse, QUARANTINE_REORDER_REFUSAL, QUARANTINE_WAREHOUSE_TYPE, readReturnConditionCheckEnabled, sellableStockLevelWhere, sellableWarehouseWhere } from '@/lib/domain/inventory/quarantine-warehouse'
 
 // audit-pcc0: the filter subset the Reorder Planning page passes to the PO/MO
 // buttons so draft quantities are computed from the SAME getReorderReport the
@@ -212,6 +213,9 @@ export async function generateForecasts(options: GenerateForecastOptions = {}): 
   const priorStart = new Date(reviewStart.getTime() - settings.reviewPeriodDays * 86400000)
   const z = zScore(settings.serviceLevelPercent)
 
+  // Switch return_condition_check_enabled: quarantine stock is not available, so it never covers demand or delays a reorder (an empty filter with the switch off).
+  const sellableLevels = sellableStockLevelWhere(await readReturnConditionCheckEnabled(db))
+
   // 1. Get all stockable products with current stock levels
   const products = await db.product.findMany({
     where: {
@@ -223,7 +227,7 @@ export async function generateForecasts(options: GenerateForecastOptions = {}): 
       id: true, sku: true, name: true, imageUrl: true, parent: { select: { imageUrl: true } }, stockUnit: true,
       preferredSupplierId: true,
       preferredSupplier: { select: { id: true, name: true } },
-      stockLevels: { select: { quantity: true, reservedQty: true } },
+      stockLevels: { where: sellableLevels, select: { quantity: true, reservedQty: true } },
     },
   })
 
@@ -438,6 +442,10 @@ export async function createReorderPOs(
     // A warehouse with "Available in purchase orders" off cannot be a PO destination (po-warehouse-eligibility.ts).
     const restrictedDestination = await refuseRestrictedDestination(db, actionFilters.warehouseId)
     if (restrictedDestination) return { success: false, poCount: 0, error: restrictedDestination }
+    // Switch return_condition_check_enabled: a quarantine warehouse holds unsellable stock and is never a reorder destination.
+    if (actionFilters.warehouseId && await isQuarantineTargetWarehouse(db, actionFilters.warehouseId)) {
+      return { success: false, poCount: 0, error: QUARANTINE_REORDER_REFUSAL }
+    }
     // audit-pcc0: source draft-PO quantities from the SAME Reorder Planning report
     // the operator selected from (whole-unit order-up-to suggestedReorderQty, the
     // page's filters, inbound netting, lowest-cost supplier choice) — not the legacy
@@ -646,10 +654,20 @@ export async function createReorderMOs(
     // duplicate win over the recipe the product claims.
     const bomIdByProduct = await claimedActiveBomIdsByProduct(db, eligible)
 
+    // Switch return_condition_check_enabled: never a quarantine warehouse, neither the copied one nor the fallback (empty filters with the switch off).
+    const conditionCheck = await readReturnConditionCheckEnabled(db)
     const fallbackWarehouse = await db.warehouse.findFirst({
+      ...(conditionCheck ? { where: sellableWarehouseWhere(true) } : {}),
       orderBy: { code: 'asc' },
       select: { id: true },
     })
+    const quarantineWarehouseIds = conditionCheck
+      ? new Set((await db.warehouse.findMany({ where: { type: QUARANTINE_WAREHOUSE_TYPE }, select: { id: true } })).map((w) => w.id))
+      : new Set<string>()
+    const moWarehouseFor = (productId: string): string | undefined => {
+      const copied = latestByProduct.get(productId)?.warehouseId
+      return copied && !quarantineWarehouseIds.has(copied) ? copied : fallbackWarehouse?.id
+    }
 
     // audit-M-mfg #2: double-click idempotency — skip products that already have
     // a DRAFT MO created in the last few minutes (a re-order minutes later is
@@ -666,7 +684,7 @@ export async function createReorderMOs(
       productIds: eligible,
       rowByProduct: new Map([...suggestedByProduct].map(([id, row]) => [id, { sku: row.sku, suggestedReorderQty: Number(row.suggestedReorderQty) }])),
       bomIdByProduct,
-      warehouseByProduct: new Map(eligible.map((id) => [id, latestByProduct.get(id)?.warehouseId ?? fallbackWarehouse?.id])),
+      warehouseByProduct: new Map(eligible.map((id) => [id, moWarehouseFor(id)])),
       recentDraftProductIds,
     })
 

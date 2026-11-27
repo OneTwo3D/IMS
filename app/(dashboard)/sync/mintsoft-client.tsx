@@ -1434,25 +1434,15 @@ export function MintsoftClient({ data, configured }: Props) {
           {data.returnConditionCheckEnabled && (
             <div className="space-y-1.5">
               <Label className="text-xs">Condition of the returned items</Label>
-              <Select
-                value={restockCondition}
-                onChange={(event) => {
-                  const next = event.target.value as '' | 'SELLABLE' | 'UNSELLABLE'
-                  setRestockCondition(next)
-                  // The warehouse must agree with the condition: unsellable goes to a quarantine warehouse, sellable to an ordinary one.
-                  const current = data.warehouses.find((warehouse) => warehouse.id === restockWarehouseId)
-                  const wantQuarantine = next === 'UNSELLABLE'
-                  if (next && (current?.type === 'QUARANTINE') !== wantQuarantine) {
-                    setRestockWarehouseId(data.warehouses.find((warehouse) => warehouse.active && (warehouse.type === 'QUARANTINE') === wantQuarantine)?.id ?? '')
-                  }
-                }}
-              >
+              <Select value={restockCondition} onChange={(event) => setRestockCondition(event.target.value as '' | 'SELLABLE' | 'UNSELLABLE')}>
                 <option value="">Select the condition</option>
                 <option value="SELLABLE">Sellable: back into stock</option>
-                <option value="UNSELLABLE">Unsellable: into quarantine</option>
+                <option value="UNSELLABLE">Unsellable</option>
               </Select>
               <p className="text-xs text-muted-foreground">
-                Unsellable items go into a quarantine warehouse at their cost. They are not sold from there: write them off with an adjustment or transfer them back to stock.
+                {restockCondition === 'UNSELLABLE'
+                  ? 'An unsellable unit at the Mintsoft warehouse cannot be quarantined in IMS (quarantine is IMS-only, and Mintsoft would still count it). Handle it at the 3PL, then mark this item Refunded only or Dismissed.'
+                  : 'Quarantine is kept in IMS only, so a return held at the Mintsoft warehouse is restocked here only when it is sellable.'}
               </p>
             </div>
           )}
@@ -1463,7 +1453,7 @@ export function MintsoftClient({ data, configured }: Props) {
               <option value="">Select a warehouse</option>
               {data.warehouses
                 .filter((warehouse) => warehouse.active)
-                .filter((warehouse) => !data.returnConditionCheckEnabled || !restockCondition || (warehouse.type === 'QUARANTINE') === (restockCondition === 'UNSELLABLE'))
+                .filter((warehouse) => !data.returnConditionCheckEnabled || warehouse.type !== 'QUARANTINE')
                 .map((warehouse) => (
                   <option key={warehouse.id} value={warehouse.id}>
                     {warehouse.code} · {warehouse.name}
@@ -1491,7 +1481,7 @@ export function MintsoftClient({ data, configured }: Props) {
             <Button
               type="button"
               onClick={handleRestockReturn}
-              disabled={isPending || !restockItemId || !restockWarehouseId || (data.returnConditionCheckEnabled && !restockCondition)}
+              disabled={isPending || !restockItemId || !restockWarehouseId || (data.returnConditionCheckEnabled && restockCondition !== 'SELLABLE')}
             >
               {isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
               Confirm Restock

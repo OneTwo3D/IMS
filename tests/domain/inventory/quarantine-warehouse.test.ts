@@ -1,8 +1,12 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { Prisma } from '@/app/generated/prisma/client'
+import { findSwitch } from '@/lib/domain/settings/system-switches'
 import {
   isQuarantineWarehouseType,
+  MINTSOFT_UNSELLABLE_RETURN_REFUSAL,
+  mintsoftReturnRestockRefusal,
+  quarantineTypeChangeRefusal,
   loadQuarantineQtyByProduct,
   parseReturnCondition,
   quarantineWarehouseSettingsRefusal,
@@ -93,4 +97,32 @@ test('quarantine quantities: no query with the switch off; on, the quarantine le
   assert.deepEqual(calls[0], { by: ['productId'], where: { productId: { in: ['p1', 'p2'] }, warehouse: { type: 'QUARANTINE' } }, _sum: { quantity: true } })
   await loadQuarantineQtyByProduct(client, true, null)
   assert.deepEqual(calls[1], { by: ['productId'], where: { warehouse: { type: 'QUARANTINE' } }, _sum: { quantity: true } })
+})
+
+test('the switch is an ADMIN system switch (command line, --confirm-admin), keyed as the reader reads it', () => {
+  const def = findSwitch(RETURN_CONDITION_CHECK_SETTING_KEY)
+  assert.ok(def, 'registered')
+  assert.equal(def.adminOnly, true)
+  assert.equal(def.defaultValue, 'false')
+  assert.deepEqual([...def.allowed], ['true', 'false'])
+})
+
+test('Mintsoft returns inbox: on, an unsellable unit is always refused (quarantine is IMS-only); off, nothing is refused', () => {
+  for (const warehouse of [QAR, MAIN]) {
+    assert.equal(mintsoftReturnRestockRefusal({ enabled: true, condition: 'UNSELLABLE', warehouse }), MINTSOFT_UNSELLABLE_RETURN_REFUSAL)
+    assert.equal(mintsoftReturnRestockRefusal({ enabled: false, condition: 'UNSELLABLE', warehouse }), null)
+  }
+  assert.equal(mintsoftReturnRestockRefusal({ enabled: true, condition: 'SELLABLE', warehouse: MAIN }), null)
+  assert.match(mintsoftReturnRestockRefusal({ enabled: true, condition: 'SELLABLE', warehouse: QAR }) ?? '', /quarantine warehouse/)
+  assert.equal(mintsoftReturnRestockRefusal({ enabled: true, condition: null, warehouse: MAIN }), RETURN_CONDITION_MISSING_REFUSAL)
+  assert.match(MINTSOFT_UNSELLABLE_RETURN_REFUSAL, /at the 3PL/)
+  assert.match(MINTSOFT_UNSELLABLE_RETURN_REFUSAL, /mark it sellable/)
+})
+
+test('type change into quarantine: refused while any sellable work remains, and each is named', () => {
+  const none = { wmsBindings: 0, allocations: 0, openShipments: 0, openProductionOrders: 0 }
+  assert.equal(quarantineTypeChangeRefusal(none), null)
+  for (const [key, label] of [['wmsBindings', 'binding'], ['allocations', 'allocation'], ['openShipments', 'shipment'], ['openProductionOrders', 'production order']] as const) {
+    assert.match(quarantineTypeChangeRefusal({ ...none, [key]: 2 }) ?? '', new RegExp(`2 [a-z -]*${label}`))
+  }
 })

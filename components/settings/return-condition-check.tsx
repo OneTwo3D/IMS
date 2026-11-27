@@ -1,53 +1,36 @@
-'use client'
+import type { QuarantineWarehouseIssue } from '@/lib/domain/inventory/quarantine-warehouse'
 
-import { useState, useTransition } from 'react'
-import { useRouter } from 'next/navigation'
-import { Loader2 } from 'lucide-react'
-import { Button } from '@/components/ui/button'
-import { setSetting } from '@/app/actions/settings'
+type Props = { enabled: boolean; issues: QuarantineWarehouseIssue[] }
 
-const OPTIONS = [
-  { value: 'false', label: 'Off (default)', description: 'Returned items go back into the warehouse chosen for the return, as today. No condition is asked for.' },
-  { value: 'true', label: 'On', description: 'Every restock of a return asks whether the items are sellable. Unsellable items go into a quarantine warehouse at their cost, where they are never allocated, never counted as available and never pushed to the store. Review them there: write them off with an adjustment, or transfer them back to stock.' },
-]
-
-type Props = { currentValue: string }
-
-export function ReturnConditionCheckSetting({ currentValue }: Props) {
-  const router = useRouter()
-  const [isPending, startTransition] = useTransition()
-  const [value, setValue] = useState(currentValue)
-  const [saved, setSaved] = useState(false)
-
-  function handleSave() {
-    setSaved(false)
-    startTransition(async () => {
-      await setSetting('return_condition_check_enabled', value)
-      router.refresh()
-      setSaved(true)
-      setTimeout(() => setSaved(false), 2000)
-    })
-  }
-
+/**
+ * Read only: the condition check on returns is an ADMIN system switch (`return_condition_check_enabled`), set from the command line
+ * (`npm run settings:set -- --key return_condition_check_enabled --value true ... --yes --confirm-admin`). This card shows its state and
+ * every quarantine warehouse that is not clean for it.
+ */
+export function ReturnConditionCheckStatus({ enabled, issues }: Props) {
   return (
     <div className="space-y-3">
-      <div className="space-y-2">
-        {OPTIONS.map((o) => (
-          <label key={o.value} className="flex items-start gap-3 cursor-pointer">
-            <input type="radio" name="returnConditionCheck" value={o.value} checked={value === o.value} onChange={() => setValue(o.value)} className="mt-0.5" />
-            <div>
-              <span className="text-sm font-medium">{o.label}</span>
-              <p className="text-xs text-muted-foreground">{o.description}</p>
-            </div>
-          </label>
-        ))}
-      </div>
-      <div className="flex items-center gap-2">
-        <Button size="sm" onClick={handleSave} disabled={isPending || value === currentValue}>
-          {isPending && <Loader2 className="h-3 w-3 mr-1 animate-spin" />}Save
-        </Button>
-        {saved && <span className="text-xs text-green-600">Saved</span>}
-      </div>
+      <p className="text-sm">
+        Status: <span className="font-medium">{enabled ? 'On' : 'Off (default)'}</span>.{' '}
+        <span className="text-muted-foreground">
+          An administrator switches it with <code className="text-xs">npm run settings:set -- --key return_condition_check_enabled --value true --by &lt;name&gt; --reason &quot;&lt;text&gt;&quot; --yes --confirm-admin</code>.
+        </span>
+      </p>
+      {issues.length > 0 && (
+        <div className="rounded-md border border-amber-300 bg-amber-50 p-3 text-sm text-amber-900 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-200">
+          <p className="font-medium">
+            {enabled ? 'Quarantine warehouses that still look sellable:' : 'Before switching it on, fix these quarantine warehouses:'}
+          </p>
+          <ul className="mt-1 list-disc pl-5">
+            {issues.map((issue) => (
+              <li key={issue.id}><span className="font-mono">{issue.code}</span> ({issue.name}): {issue.problems.join('; ')}</li>
+            ))}
+          </ul>
+          <p className="mt-1 text-xs">
+            While the switch is on their stock is never allocated, counted as available or pushed whatever these flags say. Clear the flags in Inventory Settings, Warehouses, and release or move the allocations.
+          </p>
+        </div>
+      )}
     </div>
   )
 }

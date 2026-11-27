@@ -113,6 +113,11 @@ export const FIRST_LOAD_WMS_ARCHIVE_SWITCH_KEY = 'first_load_mintsoft_archive_en
 // a credit note the ledger will not void, books locked, stock moved), and the void needs only the baseline accounting.invoices grant, which is held on the connection, not in a settings row.
 export const REFUND_DELETE_SWITCH_KEY = 'refund_delete_enabled'
 
+// FRS 102 s13.4 part 2: the condition check on returns and the quarantine warehouse. The reader is readReturnConditionCheckEnabled in
+// lib/domain/inventory/quarantine-warehouse.ts (`=== 'true'`); a literal here for the same reason as the others, and tests/settings-cli.test.ts holds it equal to
+// RETURN_CONDITION_CHECK_SETTING_KEY. ADMIN: it changes which stock is sellable (allocation, available stock, the storefront push) on the LIVE system.
+export const RETURN_CONDITION_CHECK_SWITCH_KEY = 'return_condition_check_enabled'
+
 export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   booleanSwitch('trackship_refire_enabled'),
   booleanSwitch('wc_withdrawal_outcome_enabled'),
@@ -145,6 +150,7 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   // import of lib/domain/accounting/credit-note-allocation.ts; tests hold it equal to REFUND_CASH_OUT_DATE_SETTING_KEY.
   booleanSwitch('xero_refund_payment_cash_out_date_enabled'),
   booleanSwitch(REFUND_DELETE_SWITCH_KEY, undefined, true),
+  booleanSwitch(RETURN_CONDITION_CHECK_SWITCH_KEY, undefined, true),
   booleanSwitch(SUPPLIER_CREATE_KEY, undefined, true),
   booleanSwitch(ASN_SEND_SUPPLIER_KEY, undefined, true),
   booleanSwitch(ASN_SUPPLIER_REQUIRED_KEY, [ASN_REQUIRED_NEEDS_SEND], true),

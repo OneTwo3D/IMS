@@ -140,3 +140,103 @@ export async function loadQuarantineQtyByProduct(
   }
   return out
 }
+
+export const QUARANTINE_REORDER_REFUSAL =
+  'That warehouse is a quarantine warehouse: it holds unsellable stock and cannot receive a reorder. Choose a sellable warehouse.'
+
+type WarehouseTypeReader = {
+  setting: SettingReader['setting']
+  warehouse: { findUnique(args: { where: { id: string }; select: { type: true } }): Promise<{ type: string } | null> }
+}
+
+/** True only with the switch on and a QUARANTINE-type warehouse: the caller then refuses to put sellable work there. */
+export async function isQuarantineTargetWarehouse(client: WarehouseTypeReader, warehouseId: string): Promise<boolean> {
+  if (!(await readReturnConditionCheckEnabled(client))) return false
+  const warehouse = await client.warehouse.findUnique({ where: { id: warehouseId }, select: { type: true } })
+  return isQuarantineWarehouseType(warehouse?.type)
+}
+
+/**
+ * Owner ruling (2026-11-27): quarantine is kept in IMS only. A Mintsoft (3PL) return is physically at the 3PL, where Mintsoft
+ * still counts it: booking it into an IMS-only quarantine warehouse would hold the unit twice once stock alignment (ALIGN_TO_WMS)
+ * books Mintsoft's count into the bound warehouse. So with the switch on an UNSELLABLE returns-inbox restock is always refused.
+ */
+export const MINTSOFT_UNSELLABLE_RETURN_REFUSAL =
+  'This return is at the Mintsoft warehouse (3PL), and quarantine is kept in IMS only: Mintsoft would still count the unit, and stock alignment would book it into the bound warehouse a second time. Handle the unsellable unit at the 3PL (ask the warehouse to write it off or hold it out of sellable stock, then mark this item Refunded only or Dismissed), or mark it sellable and restock it. Nothing was recorded.'
+
+/** The rule for the Mintsoft returns-inbox restock: the general rule, except that an unsellable unit held at the 3PL is never quarantined. Pure. */
+export function mintsoftReturnRestockRefusal(params: {
+  enabled: boolean
+  condition: ReturnCondition | null
+  warehouse: { code: string; type: string | null }
+}): string | null {
+  if (params.enabled && params.condition === 'UNSELLABLE') return MINTSOFT_UNSELLABLE_RETURN_REFUSAL
+  return returnConditionRestockRefusal(params)
+}
+
+type QuarantineCensusClient = Pick<Prisma.TransactionClient, 'externalWmsBinding' | 'orderAllocation' | 'shipment' | 'productionOrder'>
+
+/**
+ * What would make a warehouse's stock sellable work if it became a quarantine warehouse: a warehouse-system binding, open
+ * allocations, shipments not yet shipped and open production orders. Each count is exact (no sampling).
+ */
+export async function loadQuarantineBlockers(client: QuarantineCensusClient, warehouseId: string): Promise<{
+  wmsBindings: number
+  allocations: number
+  openShipments: number
+  openProductionOrders: number
+}> {
+  const [wmsBindings, allocations, openShipments, openProductionOrders] = await Promise.all([
+    client.externalWmsBinding.count({ where: { warehouseId } }),
+    client.orderAllocation.count({ where: { warehouseId, qty: { gt: 0 } } }),
+    client.shipment.count({ where: { warehouseId, status: { in: ['PENDING', 'PICKING', 'PACKED'] } } }),
+    client.productionOrder.count({ where: { warehouseId, status: { in: ['DRAFT', 'IN_PROGRESS'] } } }),
+  ])
+  return { wmsBindings, allocations, openShipments, openProductionOrders }
+}
+
+/** The refusal for turning a warehouse INTO a quarantine warehouse while it still carries sellable work, or null. Pure. */
+export function quarantineTypeChangeRefusal(blockers: Awaited<ReturnType<typeof loadQuarantineBlockers>>): string | null {
+  const parts = [
+    blockers.wmsBindings > 0 ? `${blockers.wmsBindings} warehouse-system binding(s)` : null,
+    blockers.allocations > 0 ? `${blockers.allocations} open allocation(s)` : null,
+    blockers.openShipments > 0 ? `${blockers.openShipments} shipment(s) not yet shipped` : null,
+    blockers.openProductionOrders > 0 ? `${blockers.openProductionOrders} open production order(s)` : null,
+  ].filter((part): part is string => part != null)
+  if (parts.length === 0) return null
+  return `This warehouse cannot become a quarantine warehouse while it has ${parts.join(', ')}: its stock would stop being sellable under them. Finish, move or release them first (and remove the binding), then change the type.`
+}
+
+export type QuarantineWarehouseIssue = {
+  id: string
+  code: string
+  name: string
+  /** The sellable flags still set on it, and the open allocations still pointing at it. */
+  problems: string[]
+}
+
+/**
+ * Every quarantine warehouse that is not clean for the switch: a sellable flag still set (available for sale, sync to store,
+ * default) or open allocations against its stock. Shown with the switch's status so turning it on is never blind.
+ */
+export async function listQuarantineWarehouseIssues(
+  client: Pick<Prisma.TransactionClient, 'warehouse' | 'orderAllocation'>,
+): Promise<QuarantineWarehouseIssue[]> {
+  const warehouses = await client.warehouse.findMany({
+    where: { type: QUARANTINE_WAREHOUSE_TYPE },
+    select: { id: true, code: true, name: true, availableForSale: true, syncToStore: true, isDefault: true },
+    orderBy: { code: 'asc' },
+  })
+  const issues: QuarantineWarehouseIssue[] = []
+  for (const w of warehouses) {
+    const allocations = await client.orderAllocation.count({ where: { warehouseId: w.id, qty: { gt: 0 } } })
+    const problems = [
+      w.availableForSale ? 'marked Available for sale' : null,
+      w.syncToStore ? 'marked Sync to store' : null,
+      w.isDefault ? 'is the default warehouse' : null,
+      allocations > 0 ? `${allocations} open allocation(s)` : null,
+    ].filter((p): p is string => p != null)
+    if (problems.length > 0) issues.push({ id: w.id, code: w.code, name: w.name, problems })
+  }
+  return issues
+}

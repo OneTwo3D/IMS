@@ -1,7 +1,7 @@
 'use server'
 
 import { netUnpricedReturnRowsAgainstRefunds, priceUnpricedReturnRows, queueReturnRestockValueJournal } from '@/lib/domain/sales/return-restock-cost'
-import { isQuarantineWarehouseType, QUARANTINE_WMS_BINDING_REFUSAL, readReturnConditionCheckEnabled, RETURN_CONDITIONS, returnConditionRestockRefusal, type ReturnCondition } from '@/lib/domain/inventory/quarantine-warehouse'
+import { isQuarantineWarehouseType, QUARANTINE_WMS_BINDING_REFUSAL, readReturnConditionCheckEnabled, RETURN_CONDITIONS, mintsoftReturnRestockRefusal, type ReturnCondition } from '@/lib/domain/inventory/quarantine-warehouse'
 import { parseShopIossNumber, SHOP_IOSS_NUMBER_SETTING } from '@/lib/domain/accounting/shop-ioss-number'
 import { randomUUID } from 'node:crypto'
 
@@ -5771,7 +5771,7 @@ export async function restockMintsoftReturnInboxItem(
       if (!warehouse || !warehouse.active) {
         throw new Error('Select an active warehouse for restocking.')
       }
-      const conditionRefusal = returnConditionRestockRefusal({ enabled: conditionCheck, condition: data.condition ?? null, warehouse })
+      const conditionRefusal = mintsoftReturnRestockRefusal({ enabled: conditionCheck, condition: data.condition ?? null, warehouse })
       if (conditionRefusal) throw new Error(conditionRefusal)
       if (!item.productId) {
         throw new Error('This Mintsoft return cannot be restocked because its SKU is not mapped to an IMS product.')
@@ -5849,7 +5849,7 @@ export async function restockMintsoftReturnInboxItem(
           status: 'RESTOCKED',
           warehouseId: warehouse.id,
           resolvedAt: new Date(),
-          resolutionNote: `Restocked ${qty - partlyCoveredQty} unit${qty - partlyCoveredQty === 1 ? '' : 's'} to ${warehouse.code}${conditionCheck && data.condition ? ` (${data.condition === 'UNSELLABLE' ? 'unsellable, quarantined' : 'sellable'})` : ''}${partlyCoveredQty > 0 ? `; ${partlyCoveredQty} already restocked by the refund` : ''}`,
+          resolutionNote: `Restocked ${qty - partlyCoveredQty} unit${qty - partlyCoveredQty === 1 ? '' : 's'} to ${warehouse.code}${conditionCheck && data.condition === 'SELLABLE' ? ' (condition: sellable)' : ''}${partlyCoveredQty > 0 ? `; ${partlyCoveredQty} already restocked by the refund` : ''}`,
         },
       })
 

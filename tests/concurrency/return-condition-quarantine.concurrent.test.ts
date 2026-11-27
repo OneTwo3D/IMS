@@ -78,6 +78,12 @@ async function seedWorld(options: { orders?: number; journaled?: boolean } = {})
   const D = (value: string) => value
   await db.user.upsert({ where: { id: 'qc-test-user' }, create: { id: 'qc-test-user', email: 'qc-test-user@example.invalid', name: 'qc test user', passwordHash: 'x' }, update: {} })
   const savedSwitch = await db.setting.findUnique({ where: { key: SWITCH } })
+  // The shared tier may carry accounting settings an earlier file left (a Xero connector with credit-note posting on arms the posted-VAT
+  // fence): the world starts with none and puts them back at teardown. The line also carries its own mapped tax rate, so the refund has a
+  // tax identity whichever settings are present.
+  const leftover = await db.setting.findMany({ where: { OR: [{ key: { startsWith: 'xero_' } }, { key: 'plugin_xero_enabled' }] } })
+  await db.setting.deleteMany({ where: { key: { in: leftover.map((r) => r.key) } } })
+  const taxRate = await db.taxRate.create({ data: { name: `QC Zero ${tag}`, rate: '0', usedFor: 'SALES', taxCategory: 'ZERO', accountingTaxType: 'ZERORATEDOUTPUT', active: true }, select: { id: true, name: true } })
   const product = await db.product.create({ data: { sku: `QC-${tag}`, name: `Quarantine ${tag}`, type: 'SIMPLE', oversellAllowed: false }, select: { id: true, sku: true, name: true } })
   const main = await db.warehouse.create({ data: { code: `QM${tag.slice(0, 8)}`, name: `qc main ${tag}`, type: 'STANDARD', availableForSale: true, syncToStore: true }, select: { id: true, code: true } })
   const qar = await db.warehouse.create({ data: { code: `QQ${tag.slice(0, 8)}`, name: `qc quarantine ${tag}`, type: 'QUARANTINE', availableForSale: false, syncToStore: false }, select: { id: true, code: true } })
@@ -92,8 +98,9 @@ async function seedWorld(options: { orders?: number; journaled?: boolean } = {})
         currency: 'GBP',
         fxRateToBase: D('1'),
         subtotalForeign: D('200'), totalForeign: D('200'), subtotalBase: D('200'), taxBase: D('0'), totalBase: D('200'),
+        taxRateName: taxRate.name, taxRatePercent: D('0'),
         ...(options.journaled ? { revenueDeferredDate: new Date('2026-01-01T00:00:00.000Z'), unearnedRevenueAmount: D('200') } : {}),
-        lines: { create: [{ productId: product.id, sku: product.sku, description: 'qc line', qty: D('2'), unitPriceForeign: D('100'), unitPriceBase: D('100'), taxForeign: D('0'), taxBase: D('0'), totalForeign: D('200'), totalBase: D('200') }] },
+        lines: { create: [{ productId: product.id, sku: product.sku, description: 'qc line', taxRateId: taxRate.id, qty: D('2'), unitPriceForeign: D('100'), unitPriceBase: D('100'), taxForeign: D('0'), taxBase: D('0'), totalForeign: D('200'), totalBase: D('200') }] },
       },
       select: { id: true, lines: { select: { id: true } } },
     })
@@ -136,13 +143,19 @@ async function seedWorld(options: { orders?: number; journaled?: boolean } = {})
     await db.stockLevel.deleteMany({ where: { productId: product.id } })
     await db.adjustmentReason.deleteMany({ where: { id: { in: reasonIds } } })
     await db.product.deleteMany({ where: { id: product.id } })
+    await db.externalWmsBinding.deleteMany({ where: { warehouseId: { in: [main.id, qar.id] } } })
+    await db.wmsConnection.deleteMany({ where: { label: `qc-${tag}` } })
+    await db.productionOrder.deleteMany({ where: { warehouseId: { in: [main.id, qar.id] } } })
     await db.warehouse.deleteMany({ where: { id: { in: [main.id, qar.id] } } })
+    await db.taxRate.deleteMany({ where: { id: taxRate.id } })
+    await db.setting.deleteMany({ where: { key: { in: leftover.map((r) => r.key) } } })
+    for (const r of leftover) await db.setting.create({ data: { key: r.key, value: r.value } })
     await db.setting.deleteMany({ where: { key: SWITCH } })
     if (savedSwitch) await db.setting.create({ data: { key: SWITCH, value: savedSwitch.value } })
     await db.activityLog.deleteMany({ where: { userId: 'qc-test-user' } })
     await db.user.deleteMany({ where: { id: 'qc-test-user' } })
   }
-  return { tag, product, main, qar, orders, extraOrderIds, reasonIds, inboxIds, teardown }
+  return { tag, product, main, qar, orders, extraOrderIds, reasonIds, inboxIds, taxRateId: taxRate.id, teardown }
 }
 
 function returnLine(w: World, index = 0, qty = 1) {
@@ -162,14 +175,14 @@ async function stockAt(w: World, warehouseId: string) {
 }
 
 /** A PROCESSING order for one unit of the product, for the allocation arms. */
-async function demandOrder(w: World): Promise<string> {
+async function demandOrder(w: World, qty = 1): Promise<string> {
   const { db } = await loadDeps()
   const order = await db.salesOrder.create({
     data: {
       orderNumber: `QD-${w.tag.slice(0, 8)}-${w.extraOrderIds.length}`,
       status: 'PROCESSING', currency: 'GBP', fxRateToBase: '1',
       subtotalForeign: '100', totalForeign: '100', subtotalBase: '100', taxBase: '0', totalBase: '100',
-      lines: { create: [{ productId: w.product.id, sku: w.product.sku, description: 'qc demand', qty: '1', unitPriceForeign: '100', unitPriceBase: '100', taxForeign: '0', taxBase: '0', totalForeign: '100', totalBase: '100' }] },
+      lines: { create: [{ productId: w.product.id, sku: w.product.sku, description: 'qc demand', taxRateId: w.taxRateId, qty: String(qty), unitPriceForeign: '100', unitPriceBase: '100', taxForeign: '0', taxBase: '0', totalForeign: String(100 * qty), totalBase: String(100 * qty) }] },
     },
     select: { id: true, lines: { select: { id: true } } },
   })
@@ -340,33 +353,93 @@ test('move back to stock: the ordinary transfer takes the unit out of quarantine
   assert.equal(await db.orderAllocation.count({ where: { orderId: demand, warehouseId: w.main.id } }), 1, 'back in stock: allocatable again')
 })
 
-test('Mintsoft returns inbox: the restock condition is checked against the warehouse', SKIP, async (t) => {
+test('Mintsoft returns inbox: an unsellable unit held at the 3PL is never quarantined, so alignment cannot hold it twice', SKIP, async (t) => {
   const w = await seedWorld({ orders: 1 })
   t.after(() => w.teardown())
-  const { db, mintsoft } = await loadDeps()
+  const { db, mintsoft, quarantine } = await loadDeps()
   await setSwitch(true)
+  // The bound warehouse is aligned to Mintsoft (Mintsoft is the stock master): Mintsoft's count of the returned unit is booked into it.
+  const connection = await db.wmsConnection.create({ data: { connector: 'mintsoft', label: `qc-${w.tag}` }, select: { id: true } })
+  await db.externalWmsBinding.create({ data: { connectionId: connection.id, warehouseId: w.main.id, connector: 'mintsoft', externalWarehouseId: `qc-ext-${w.tag}`, stockSyncMode: 'ALIGN_TO_WMS', stockMasterSystem: 'WMS' } })
   // A costed unit elsewhere, so the unpriced inbox row is valued at an average (orderless return).
   await db.costLayer.create({ data: { productId: w.product.id, warehouseId: w.main.id, receivedQty: '1', remainingQty: '1', unitCostBase: '45' } })
   await db.stockLevel.update({ where: { productId_warehouseId: { productId: w.product.id, warehouseId: w.main.id } }, data: { quantity: '1' } })
   const inbox = await db.wmsReturnsInbox.create({ data: { connector: 'mintsoft', externalReturnId: `QC-RET-${w.tag}`, productId: w.product.id, sku: w.product.sku, qty: 1, status: 'NEW' } as never, select: { id: true } })
   w.inboxIds.push(inbox.id)
 
-  const noCondition = await mintsoft.restockMintsoftReturnInboxItem({ id: inbox.id, warehouseId: w.qar.id })
+  const noCondition = await mintsoft.restockMintsoftReturnInboxItem({ id: inbox.id, warehouseId: w.main.id })
   assert.equal(noCondition.success, false)
   assert.match(noCondition.error ?? '', /condition/)
-  const wrong = await mintsoft.restockMintsoftReturnInboxItem({ id: inbox.id, warehouseId: w.main.id, condition: 'UNSELLABLE' })
-  assert.equal(wrong.success, false)
-  assert.match(wrong.error ?? '', /is not one/)
+  for (const warehouseId of [w.qar.id, w.main.id]) {
+    const unsellable = await mintsoft.restockMintsoftReturnInboxItem({ id: inbox.id, warehouseId, condition: 'UNSELLABLE' })
+    assert.equal(unsellable.success, false, 'an unsellable unit at the 3PL is refused into any warehouse')
+    assert.equal(unsellable.error, quarantine.MINTSOFT_UNSELLABLE_RETURN_REFUSAL)
+  }
   assert.equal((await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: inbox.id }, select: { status: true } })).status, 'NEW', 'refused: nothing restocked')
+  assert.deepEqual(await stockAt(w, w.qar.id), { qty: 0, reserved: 0, layers: [] }, 'nothing entered quarantine, so Mintsoft\'s count of the unit (aligned into the bound warehouse) is the only one')
+  assert.equal(await db.stockMovement.count({ where: { productId: w.product.id, toWarehouseId: w.qar.id } }), 0)
 
-  const ok = await mintsoft.restockMintsoftReturnInboxItem({ id: inbox.id, warehouseId: w.qar.id, condition: 'UNSELLABLE' })
+  const sellableIntoQar = await mintsoft.restockMintsoftReturnInboxItem({ id: inbox.id, warehouseId: w.qar.id, condition: 'SELLABLE' })
+  assert.equal(sellableIntoQar.success, false)
+  assert.match(sellableIntoQar.error ?? '', /quarantine warehouse/)
+  const ok = await mintsoft.restockMintsoftReturnInboxItem({ id: inbox.id, warehouseId: w.main.id, condition: 'SELLABLE' })
   assert.equal(ok.success, true, ok.error)
-  const qar = await stockAt(w, w.qar.id)
-  assert.equal(qar.qty, 1)
-  assert.deepEqual(qar.layers.map((l) => l.unit), [45])
+  assert.equal((await stockAt(w, w.main.id)).qty, 2)
   const row = await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: inbox.id }, select: { status: true, resolutionNote: true } })
   assert.equal(row.status, 'RESTOCKED')
-  assert.match(row.resolutionNote ?? '', /unsellable, quarantined/)
+  assert.match(row.resolutionNote ?? '', /condition: sellable/)
+})
+
+test('a warehouse with sellable work cannot become a quarantine warehouse; an allocation is never grown in quarantine; forecasts leave quarantine out', SKIP, async (t) => {
+  const w = await seedWorld({ orders: 2 })
+  t.after(() => w.teardown())
+  const { db, sales, allocation, allocationService } = await loadDeps()
+  const { updateWarehouse } = await import('@/app/actions/settings')
+  const { generateForecasts } = await import('@/app/actions/forecasting')
+  const asWarehouse = (id: string, code: string, type: 'STANDARD' | 'QUARANTINE', flags: { availableForSale: boolean; syncToStore: boolean }) =>
+    updateWarehouse(id, { code, name: `qc ${code}`, type, country: 'GB', ...flags, availableForPurchaseOrders: false, isDefault: false, defaultReturnWarehouse: false, active: true })
+
+  // Stock in MAIN and an order allocated from it.
+  await setSwitch(false)
+  const r = returnLine(w, 0)
+  assert.equal((await sales.createRefund(r.orderId, r.lines, 'qc return', w.main.id)).success, true)
+  const demand = await demandOrder(w)
+  await allocationService.allocateSalesOrder(db, { orderId: demand })
+  assert.equal(await db.orderAllocation.count({ where: { orderId: demand, warehouseId: w.main.id } }), 1)
+
+  await setSwitch(true)
+  const refused = await asWarehouse(w.main.id, w.main.code, 'QUARANTINE', { availableForSale: false, syncToStore: false })
+  assert.equal(refused.success, false)
+  assert.match(refused.error ?? '', /1 open allocation/)
+  assert.equal((await db.warehouse.findUniqueOrThrow({ where: { id: w.main.id }, select: { type: true } })).type, 'STANDARD')
+
+  // An allocation already sitting in a quarantine-typed warehouse (made while the switch was off) may shrink, never grow.
+  await setSwitch(false)
+  await db.orderAllocation.deleteMany({ where: { orderId: demand } })
+  await db.stockLevel.update({ where: { productId_warehouseId: { productId: w.product.id, warehouseId: w.main.id } }, data: { reservedQty: '0' } })
+  const t2 = returnLine(w, 1, 2)
+  const intoQar = await sales.createRefund(t2.orderId, t2.lines, 'qc return', w.qar.id)
+  assert.equal(intoQar.success, true, intoQar.error)
+  const demand2 = await demandOrder(w, 2)
+  const line = await db.salesOrderLine.findFirstOrThrow({ where: { orderId: demand2 }, select: { id: true } })
+  const legacy = await allocation.addAllocation(demand2, line.id, w.product.id, w.qar.id, 1)
+  assert.equal(legacy.success, true, `switch off: allowed, as before (${legacy.error})`)
+  const held = await db.orderAllocation.findFirstOrThrow({ where: { orderId: demand2, warehouseId: w.qar.id }, select: { id: true } })
+  await setSwitch(true)
+  const grow = await allocation.updateAllocation(held.id, w.qar.id, 2)
+  assert.equal(grow.success, false, 'growing an allocation in quarantine is refused (the stock is there: 2 units)')
+  assert.match(grow.error ?? '', /quarantine/)
+  const release = await allocation.updateAllocation(held.id, w.qar.id, 0)
+  assert.equal(release.success, true, release.error)
+
+  // Forecasts: the quarantine units are not available stock.
+  await db.orderAllocation.deleteMany({ where: { orderId: { in: [demand, demand2] } } })
+  await db.stockLevel.updateMany({ where: { productId: w.product.id }, data: { reservedQty: '0' } })
+  const forecastOn = (await generateForecasts()).find((f) => f.productId === w.product.id)
+  await setSwitch(false)
+  const forecastOff = (await generateForecasts()).find((f) => f.productId === w.product.id)
+  assert.equal(forecastOff?.availableStock, 3, 'off: both warehouses count, as before')
+  assert.equal(forecastOn?.availableStock, 1, 'on: the quarantine units are not available')
 })
 
 test('switch off is identical: no condition, any warehouse, and a quarantine-typed warehouse flagged for sale behaves as before', SKIP, async (t) => {

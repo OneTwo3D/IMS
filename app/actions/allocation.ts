@@ -62,7 +62,7 @@ import { countResumableRefundReservationReleases, resolveRefundReservationReleas
 import { describeRepackReallocation } from '@/lib/domain/sales/repack-recovery-report'
 import { shipmentIsUnreopenableCommitment, summariseRepackBlockers } from '@/lib/domain/sales/repack-recovery-affordance'
 import { describeAllocationAttempt } from '@/lib/domain/sales/allocation-activity'
-import { isQuarantineWarehouseType, QUARANTINE_ALLOCATION_REFUSAL, readReturnConditionCheckEnabled } from '@/lib/domain/inventory/quarantine-warehouse'
+import { isQuarantineTargetWarehouse, QUARANTINE_ALLOCATION_REFUSAL } from '@/lib/domain/inventory/quarantine-warehouse'
 import {
   allocationScopeKey,
   dispatchedAllocationLines,
@@ -549,9 +549,7 @@ export async function autoAllocateOrder(
 
 /** True only with the switch on and a QUARANTINE-type target warehouse: then the allocation is refused. */
 async function isQuarantineAllocationTarget(warehouseId: string): Promise<boolean> {
-  if (!(await readReturnConditionCheckEnabled(db))) return false
-  const warehouse = await db.warehouse.findUnique({ where: { id: warehouseId }, select: { type: true } })
-  return isQuarantineWarehouseType(warehouse?.type)
+  return isQuarantineTargetWarehouse(db, warehouseId)
 }
 
 export async function updateAllocation(
@@ -567,8 +565,9 @@ export async function updateAllocation(
     })
     if (!alloc) return { success: false, error: 'Allocation not found' }
     if (newQty < 0) return { success: false, error: 'Quantity cannot be negative' }
-    // Switch return_condition_check_enabled: an allocation is never MOVED into a quarantine warehouse (its stock is not sellable).
-    if (newQty > 0 && newWarehouseId !== alloc.warehouseId && await isQuarantineAllocationTarget(newWarehouseId)) {
+    // Switch return_condition_check_enabled: an allocation is never moved into, or grown in, a quarantine warehouse (its stock is not sellable).
+    // Reducing or releasing one that is already there is allowed.
+    if (newQty > 0 && (newWarehouseId !== alloc.warehouseId || toDecimal(newQty).gt(toDecimal(alloc.qty))) && await isQuarantineAllocationTarget(newWarehouseId)) {
       return { success: false, error: QUARANTINE_ALLOCATION_REFUSAL }
     }
 
