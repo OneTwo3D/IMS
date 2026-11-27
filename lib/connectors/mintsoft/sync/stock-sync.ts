@@ -77,7 +77,7 @@ import {
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-subledger-movement'
 import { recordGrirReceipt } from '@/lib/domain/accounting/grir-subledger-movement'
-import { reconcilePurchaseBillFx, reportPurchaseFxVarianceNotQueued, type PurchaseBillFxReconcileResult } from '@/lib/domain/purchasing/purchase-bill-fx'
+import { purchaseFxOrderHasHistory, reconcilePurchaseBillFx, reportPurchaseFxVarianceNotQueued, type PurchaseBillFxReconcileResult } from '@/lib/domain/purchasing/purchase-bill-fx'
 import {
   NO_PREPAYMENT_CHECKS, isPurchaseFxRefusalError, markPurchaseFxLockUsed, preparePurchaseReceiptFx, purchaseFxLayerFields, reportPurchaseFxFallback,
   resolveReceiptFxValuation, newPurchaseFxSweepMemo,
@@ -1637,6 +1637,8 @@ export async function applyMintsoftAlignmentForProduct(params: {
   // The valuations this alignment laid goods at, reported after the commit (MED-5).
   const purchaseFxValuations = new Map<string, ReceiptFxValuation>()
   const purchaseBillFxResults: Array<{ poId: string; poReference: string; result: PurchaseBillFxReconcileResult }> = []
+  // MED-3: every order this alignment laid goods for, so an order whose bills the switch manages still reconciles after a switch-off rollback.
+  const purchaseFxReceivedOrders = new Map<string, string>()
 
   const outcome = await db.$transaction(async (tx) => {
     // THE LOCKS, IN THE GLOBAL ORDER (6oyu.19, Codex round-9 HIGH-1).
@@ -2065,6 +2067,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
         // Per-event FX: the lock is used once goods are laid at its rate (LOW-11).
         await markPurchaseFxLockUsed(tx, purchaseCost.fxValuation, now)
         if (purchaseCost.fxValuation) purchaseFxValuations.set(purchaseCost.fxValuation.poId, purchaseCost.fxValuation)
+        purchaseFxReceivedOrders.set(purchaseCost.poId, purchaseCost.poReference)
 
         // ─── o3d-6nd55: THE RECEIPT JOURNAL, IN THE SAME TRANSACTION AS THE STOCK ───
         //
@@ -2351,11 +2354,13 @@ export async function applyMintsoftAlignmentForProduct(params: {
 
     // Per-event FX (step 3): goods that arrive after the order's bill settle that bill's FX difference against them (per receipt), here, under
     // the order row locks this alignment holds.
-    for (const valuation of purchaseFxValuations.values()) {
+    // MED-3: and so does an order valued before a switch-off rollback, whose bills the switch still manages.
+    for (const [poId, poReference] of [...purchaseFxReceivedOrders].sort(([a], [b]) => (a < b ? -1 : 1))) {
+      if (!purchaseFxValuations.has(poId) && !(await purchaseFxOrderHasHistory(tx, poId))) continue
       purchaseBillFxResults.push({
-        poId: valuation.poId,
-        poReference: valuation.poReference,
-        result: await reconcilePurchaseBillFx(tx, { poId: valuation.poId, connector: accountingConnector, syncEnabled: accountingSettings.syncEnabled, at: now }),
+        poId,
+        poReference,
+        result: await reconcilePurchaseBillFx(tx, { poId, connector: accountingConnector, syncEnabled: accountingSettings.syncEnabled, at: now }),
       })
     }
 

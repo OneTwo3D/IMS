@@ -3,10 +3,14 @@
  *
  * Usage:
  *   tsx scripts/purchase-fx-reconcile.ts --in-flight            list the foreign orders billed at the PO rate for goods not received yet (read-only;
- *                                                               the check before turning purchase_event_fx_rates_enabled on)
- *   tsx scripts/purchase-fx-reconcile.ts [--po <id>]            show which orders the reconciliation covers (read-only)
+ *                                                               the check before turning purchase_event_fx_rates_enabled on). Each order also names
+ *                                                               the bills IMS did not post ("no journal: bill not posted by IMS")
+ *   tsx scripts/purchase-fx-reconcile.ts [--po <id>]            DRY RUN: per order, the exchange-rate journals --apply would queue, computed inside a
+ *                                                               transaction that is rolled back (writes nothing)
  *   tsx scripts/purchase-fx-reconcile.ts [--po <id>] --apply    run the reconciliation now, under each order's row lock: it queues only the
  *                                                               exchange-rate difference that is still owed (idempotent; a second run queues nothing)
+ *
+ * --po is refused for an order the switch never touched (it is not in the list the reconciliation covers).
  *
  * The journals it queues go through the normal accounting queue (and so to Xero only while Xero sync is on). Never key the same journal into the
  * ledger by hand as well: it would be booked twice.
@@ -30,17 +34,23 @@ async function main() {
     console.log(`${orders.length} foreign order(s) billed at the PO rate for goods not received yet:`)
     for (const order of orders) {
       console.log(`  ${order.reference} (${order.currency}, ${order.status}): ${order.lines.map((l) => `line ${l.poLineId} billed ${l.billedQty}, received ${l.receivedQty}`).join('; ')}`)
+      for (const bill of order.billsNotPostedByIms) {
+        console.log(`    no journal: bill not posted by IMS - bill ${bill.invoiceNumber ?? bill.invoiceId} (its GR/IR is corrected; whether a journal is raised is an open owner decision)`)
+      }
     }
     return
   }
   const only = valueOf('po')
-  const ids = only ? [only] : await fx.purchaseFxOrdersToReconcile(db)
+  const covered = await fx.purchaseFxOrdersToReconcile(db)
+  if (only && !covered.includes(only)) throw new fx.PurchaseFxNotReconcilableError(only)
+  const ids = only ? [only] : covered
   const apply = process.argv.includes('--apply')
-  console.log(`${apply ? '' : 'DRY RUN (pass --apply to queue). '}${ids.length} order(s) covered.`)
+  console.log(`${apply ? '' : 'DRY RUN (pass --apply to queue; computed in a rolled-back transaction). '}${ids.length} order(s) covered.`)
   for (const poId of ids) {
-    if (!apply) { console.log(`  ${poId}`); continue }
-    const result = await fx.rerunPurchaseBillFx(poId)
-    console.log(`  ${poId}: ${result.journals.length} journal(s) queued${result.journals.map((j) => ` [bill ${j.invoiceId}: transit ${j.transitDelta}]`).join('')}${result.notQueued.length ? `; ${result.notQueued.length} declined (reported)` : ''}`)
+    const result = await fx.rerunPurchaseBillFx(poId, { dryRun: !apply })
+    const verb = apply ? 'queued' : 'would be queued'
+    console.log(`  ${poId}: ${result.journals.length} journal(s) ${verb}${result.journals.map((j) => ` [bill ${j.invoiceNumber ?? j.invoiceId}: transit ${j.transitDelta}]`).join('')}`
+      + `${result.notQueued.length ? `; ${result.notQueued.length} declined (reported)` : ''}${result.shadowed?.length ? `; ${result.shadowed.length} settled as a shadow` : ''}`)
   }
 }
 

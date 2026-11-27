@@ -17,13 +17,17 @@ import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib
  *
  *   RECEIPT               +  received qty x PO goods unit cost, 6dp.      Written with the stock, the layer and the receipt journal. With per-event
  *                            FX on (`purchase_event_fx_rates_enabled`), a foreign order's receipt is credited at the rate-locked goods unit cost its
- *                            layers carry instead (`goodsUnitCostByLine`); bills, returns and credit notes stay at the PO valuation until step 3.
+ *                            layers carry instead (`goodsUnitCostByLine`).
  *   BILL                  -  billed qty x PO goods unit cost.             Written with the bill. Only goods lines (a freight cost line is not here).
- *   BILL_UPDATE           -  the signed delta of an edited bill's goods quantity, valued the same way.
- *   SUPPLIER_RETURN       -  returned qty x PO goods unit cost: reverses the receipt portion. Written with the return.
+ *                            A bill valued under the per-event FX switch is written instead by lib/domain/purchasing/purchase-bill-fx.ts (target
+ *                            state, keys `grir:bill-fx:`): at the ACCRUED RECEIPT VALUE of the quantity it matches, its own stock value for the rest.
+ *   BILL_UPDATE           -  the signed delta of an edited bill's goods quantity, valued the same way (and the per-event FX writer's own adjustments).
+ *   SUPPLIER_RETURN       -  returned qty x PO goods unit cost: reverses the receipt portion. Written with the return. A line whose consumed layers were
+ *                            valued under the switch is reversed at THOSE layers' goods cost (`goodsValueByLine`), what their receipt credited.
  *   SUPPLIER_CREDIT_NOTE  +  a return-generated credit note: the supplier crediting back goods that were billed and then returned, valued per line at
  *                            the PO goods unit cost (like the return), lifting the debit that return left. The difference to the credit's net goes to
- *                            BILL_PRICE_VARIANCE. Only return-generated notes (a freight credit note is the transit path's).
+ *                            BILL_PRICE_VARIANCE. Only return-generated notes (a freight credit note is the transit path's). A credit reversing a bill
+ *                            valued under the switch clears at THAT bill's stock value per unit (`unitBaseByLine`), at the bill's own rate.
  *   OPENING_BALANCE       +/- the received-not-billed (or billed-not-received) quantity of a line that had no sub-ledger history, at the PO goods unit cost.
  *                         Written ONLY by the stage opening-balance script (scripts/grir-opening-balance.ts); production is reinstalled and has none.
  *   BILL_PRICE_VARIANCE   billed value - PO value of the billed goods (positive = the bill is dearer than the order). THE PRICE DIFFERENCE. No
@@ -223,14 +227,22 @@ export async function recordGrirBillEdit(
   }
 }
 
-/** A SUPPLIER RETURN: reverse the receipt portion, the returned quantity at the PO goods unit cost. */
+/**
+ * A SUPPLIER RETURN: reverse the receipt portion, the returned quantity at the PO goods unit cost, or (per-event FX, step 3b) at the GOODS cost of the
+ * layers the return consumed, for a line whose consumed layers carry one (`goodsValueByLine`: a layer valued under the switch holds its own goods unit
+ * cost), so the return takes back exactly what those layers' receipt credited. A line absent from it is valued as before.
+ */
 export async function recordGrirSupplierReturn(
   client: GrirClient,
-  input: { poId: string; returnId: string; at: Date; lines: ReadonlyArray<{ poLineId: string; qty: DecimalInput }> },
+  input: {
+    poId: string; returnId: string; at: Date; lines: ReadonlyArray<{ poLineId: string; qty: DecimalInput }>
+    goodsValueByLine?: ReadonlyMap<string, Decimal>
+  },
 ): Promise<void> {
   const valuation = await loadGrirPoValuation(client, input.poId)
   for (const [poLineId, qty] of sumByLine(input.lines)) {
     if (qty.lte(0)) continue
+    const consumedGoods = input.goodsValueByLine?.get(poLineId)
     await writeGrirMovement(client, {
       sourceType: 'SUPPLIER_RETURN',
       sourceRef: input.returnId,
@@ -239,11 +251,39 @@ export async function recordGrirSupplierReturn(
       poLineId,
       supplierId: valuation.supplierId,
       qtyDelta: qty.neg(),
-      baseDelta: qty.mul(unitCostFor(valuation, poLineId)).neg(),
+      baseDelta: (consumedGoods ?? qty.mul(unitCostFor(valuation, poLineId))).neg(),
       journalDate: input.at,
       occurredAt: input.at,
     })
   }
+}
+
+/**
+ * Per-event FX (step 3b): the goods value of the layers a return consumed, per order line, for the lines where at least one consumed layer carries its
+ * own goods unit cost (`cost_layers.goods_unit_cost_base`, written only under the switch). A layer without one is valued at the PO goods unit cost, as
+ * the return always was. Lines whose layers carry none are left out, so the return is valued exactly as before.
+ */
+export async function returnGoodsValueByLine(
+  client: Pick<Prisma.TransactionClient, 'costLayer' | 'purchaseOrder'>,
+  poId: string,
+  consumed: ReadonlyArray<{ poLineId: string; costLayerId: string; qty: DecimalInput }>,
+): Promise<Map<string, Decimal>> {
+  const out = new Map<string, Decimal>()
+  if (consumed.length === 0) return out
+  const layers = await client.costLayer.findMany({ where: { id: { in: [...new Set(consumed.map((c) => c.costLayerId))] } }, select: { id: true, goodsUnitCostBase: true } })
+  const goodsById = new Map(layers.map((layer) => [layer.id, layer.goodsUnitCostBase]))
+  if (![...goodsById.values()].some((goods) => goods !== null)) return out
+  const valuation = await loadGrirPoValuation(client, poId)
+  const touched = new Set<string>()
+  const sums = new Map<string, Decimal>()
+  for (const entry of consumed) {
+    const goods = goodsById.get(entry.costLayerId) ?? null
+    if (goods !== null) touched.add(entry.poLineId)
+    const unit = goods !== null ? toDecimal(goods) : unitCostFor(valuation, entry.poLineId)
+    sums.set(entry.poLineId, (sums.get(entry.poLineId) ?? new Prisma.Decimal(0)).add(toDecimal(entry.qty).mul(unit)))
+  }
+  for (const lineId of touched) out.set(lineId, roundQuantity(sums.get(lineId)!, 6))
+  return out
 }
 
 export type GrirCreditAllocationLine = {
@@ -302,7 +342,14 @@ export async function loadBilledUnitBaseByLine(client: Pick<Prisma.TransactionCl
  */
 export async function recordGrirReturnCreditNote(
   client: GrirClient,
-  input: { poId: string; supplierId: string; creditNoteId: string; netBase: DecimalInput; journalDate: Date | string; at: Date },
+  input: {
+    poId: string; supplierId: string; creditNoteId: string; netBase: DecimalInput; journalDate: Date | string; at: Date
+    /**
+     * Per-event FX (step 3b): the unit value to clear a line at, for a credit reversing a bill valued under the switch (that bill's stock value per
+     * unit, at its own rate: what it accrued its unreceived quantity at). A line absent from it is cleared at the PO goods unit cost, as before.
+     */
+    unitBaseByLine?: ReadonlyMap<string, Decimal>
+  },
 ): Promise<void> {
   const valuation = await loadGrirPoValuation(client, input.poId)
   const lines = await client.purchaseOrderLine.findMany({ where: { poId: input.poId }, select: { id: true, qtyReturned: true } })
@@ -328,7 +375,7 @@ export async function recordGrirReturnCreditNote(
   })), input.netBase)
   let poValued = new Prisma.Decimal(0)
   for (const [lineId, qty] of allocation) {
-    const value = roundQuantity(qty.mul(unitCostFor(valuation, lineId)), 6)
+    const value = roundQuantity(qty.mul(input.unitBaseByLine?.get(lineId) ?? unitCostFor(valuation, lineId)), 6)
     poValued = poValued.add(value)
     await writeGrirMovement(client, {
       sourceType: 'SUPPLIER_CREDIT_NOTE',

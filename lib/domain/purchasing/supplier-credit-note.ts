@@ -434,6 +434,12 @@ export function buildSupplierCreditNoteSyncPayload(params: {
    * line; the allocation is then `allocateAmount`. `amountForeign`, `taxType` and `lineAmountsIncludeTax` are ignored for the lines.
    */
   reverseChargePlan?: ReverseChargeCreditPlan
+  /**
+   * Per-event FX (step 3b): a return credit reversing a bill whose price difference went to the purchase price variance account is split the same
+   * way: `ppvAmount` (same currency and tax basis as `amountForeign`, same tax type) on its own line coded to `account`, the rest on transit. Ignored
+   * with a reverse-charge plan. Omitted = one line on transit, as before.
+   */
+  ppvSplit?: { account: string; ppvAmount: number }
 }): Record<string, unknown> {
   const planned = params.reverseChargePlan
   const lines = planned
@@ -446,18 +452,25 @@ export function buildSupplierCreditNoteSyncPayload(params: {
       ...(noVatRateKind(l.taxType) ? { noTaxKind: noVatRateKind(l.taxType) } : {}),
       ...(l.taxRateId ? rateBinding(l.taxRateId, 'purchase_line') : {}),
     }))
-    : [
-      {
-        description: params.reason ?? 'Supplier credit note',
+    : (() => {
+      const line = (description: string, unitAmount: number, accountCode: string) => ({
+        description,
         quantity: 1,
-        unitAmount: params.amountForeign,
-        accountCode: params.transitAccount,
+        unitAmount,
+        accountCode,
         taxType: params.taxType,
         // A NONE here is a decision (the offset bill carried no VAT, or the supplier's rate is itself No VAT), so it names its kind.
         ...(noVatRateKind(params.taxType) ? { noTaxKind: noVatRateKind(params.taxType) } : {}),
         ...(params.taxRateBasis ? rateBinding(params.taxRateId, params.taxRateBasis) : {}),
-      },
-    ]
+      })
+      const split = params.ppvSplit && params.ppvSplit.ppvAmount !== 0 ? params.ppvSplit : null
+      if (!split) return [line(params.reason ?? 'Supplier credit note', params.amountForeign, params.transitAccount)]
+      const stockAmount = roundMoney(toDecimal(params.amountForeign).sub(split.ppvAmount), params.currency).toNumber()
+      return [
+        line(params.reason ?? 'Supplier credit note', stockAmount, params.transitAccount),
+        line(`${params.reason ?? 'Supplier credit note'} (purchase price variance)`, split.ppvAmount, split.account),
+      ]
+    })()
   return {
     creditNoteNumber: mintedSupplierCreditNoteNumber(params.creditNoteId),
     contactName: params.supplierName,

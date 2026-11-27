@@ -30,6 +30,7 @@ import { db } from '@/lib/db'
 import { getBaseCurrencyCode } from '@/lib/base-currency'
 import { isPurchaseEventFxEnabled } from '@/lib/domain/purchasing/purchase-event-fx-settings'
 import { getPurchaseOrderFxView } from '@/lib/domain/purchasing/purchase-receipt-fx'
+import { stockUnitsForeign } from '@/lib/domain/purchasing/purchase-bill-fx'
 
 export const metadata: Metadata = { title: 'Purchase Order' }
 
@@ -101,6 +102,12 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
   const baseCurrency = await getBaseCurrencyCode()
   const showPrepaymentFx = po.currency.toUpperCase() !== baseCurrency.toUpperCase() && await isPurchaseEventFxEnabled(db)
   const prepaymentFx = showPrepaymentFx ? await getPurchaseOrderFxView(id) : null
+  // Per-event FX (step 3b): a new bill's lines are prefilled at the PO goods unit cost after the header discount (the price its stock part is billed
+  // at), so a bill keyed as prefilled carries no price variance equal to the discount.
+  const billUnitPrefillForeign = showPrepaymentFx
+    ? Object.fromEntries([...stockUnitsForeign({ subtotalForeign: po.subtotalForeign, lines: po.lines.map((l) => ({ id: l.id, unitCostForeign: l.unitCostForeign, totalForeign: l.totalForeign })) })]
+      .map(([lineId, unit]) => [lineId, unit.toNumber()]))
+    : undefined
 
   const products = productsResult.products.filter(
     (p) => !['VARIABLE', 'NON_INVENTORY', 'KIT'].includes(p.type) && (p.lifecycleStatus === 'ACTIVE' || p.lifecycleStatus === 'DRAFT'),
@@ -114,7 +121,7 @@ export default async function PurchaseOrderDetailPage({ params }: Props) {
         </Link>
         <h1 className="text-2xl font-semibold font-mono">{po.reference}</h1>
       </div>
-      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} showMargin={showMargin} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} wmsAsnState={wmsAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} prepaidReconciliation={prepaidReconciliation} poEmailEnabled={poEmailEnabled} supplierSkus={supplierSkus} canEditLineNotes={!!session && hasPermission(session.user.role, 'purchasing.create')} canApprove={!!session && hasPermission(session.user.role, 'purchasing.approve')} currentUserId={session?.user.id} billDeleteStates={billDeleteStates} />
+      <PoDetailClient po={po} suppliers={suppliers} products={products} warehouses={warehouses} currencies={currencies} taxRates={taxRates} purchaseUnits={purchaseUnits} carriers={carriers} companyHomeCountry={organisation?.country ?? null} showMargin={showMargin} accountingAvailable={accountingAvailable} accountingBillUrlTemplate={billUrlTemplate ?? accountingSettings.billUrlTemplate} wmsAsnState={wmsAsnState} rejectedAccountingSyncs={rejectedAccountingSyncs} overBilling={overBilling} prepaidReconciliation={prepaidReconciliation} poEmailEnabled={poEmailEnabled} supplierSkus={supplierSkus} canEditLineNotes={!!session && hasPermission(session.user.role, 'purchasing.create')} canApprove={!!session && hasPermission(session.user.role, 'purchasing.approve')} currentUserId={session?.user.id} billDeleteStates={billDeleteStates} billUnitPrefillForeign={billUnitPrefillForeign} />
       {showPrepaymentFx && (
         <PoPrepaymentFxCard poId={po.id} poReference={po.reference} currency={po.currency} baseCurrency={baseCurrency} fx={prepaymentFx} canRead={!!session && hasPermission(session.user.role, 'purchasing.invoice')} />
       )}

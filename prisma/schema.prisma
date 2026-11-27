@@ -1600,6 +1600,12 @@ model PurchaseOrder {
   /// Per-event FX (switch `purchase_event_fx_rates_enabled`): when Xero was last asked for this order's supplier prepayment and held none. A receipt
   /// inside the cache window does not ask again (lib/domain/purchasing/purchase-receipt-fx.ts). NULL = never asked, or one was found since.
   fxNoPrepaymentCheckedAt DateTime? @map("fx_no_prepayment_checked_at")
+  /// Per-event FX (step 3b, MED-5): the remembered refusal of this order's Xero prepayment read (it could not be established), kept in the database so
+  /// every process waits the same window. Ignored once a newer lock (read after it) or a newer "no prepayment" answer exists. NULL = none remembered.
+  fxPrepaymentRefusedAt        DateTime? @map("fx_prepayment_refused_at")
+  fxPrepaymentRefusedUntil     DateTime? @map("fx_prepayment_refused_until")
+  fxPrepaymentRefusedReason    String?   @map("fx_prepayment_refused_reason")
+  fxPrepaymentRefusedTransient Boolean?  @map("fx_prepayment_refused_transient")
 
   @@index([supplierId])
   @@index([createdAt])
@@ -1936,6 +1942,14 @@ model SupplierCreditNote {
   // return-credit top-up net only against prior RETURN credits (not manual
   // allowances), so a manual credit can't silently suppress return credit.
   isReturnGenerated     Boolean                  @default(false)
+  /// Per-event FX (switch `purchase_event_fx_rates_enabled`): which rule set this credit's rate. 'BILL' = the bill it reverses was valued under the
+  /// switch, so the credit takes that bill's exact rate; 'FX_TABLE' = a credit with no bill, at the fx_rates rate on its own date. NULL = as before.
+  fxRateSource          String?                  @map("fx_rate_source")
+  /// Per-event FX: the exact rate the credit is valued and posted at (1 base = rate foreign); `fxRateToBase` keeps its 8dp copy. NULL as above.
+  fxEventRateToBase     Decimal?                 @db.Decimal(28, 12) @map("fx_event_rate_to_base")
+  /// Per-event FX: the base-currency part of the credit coded to the purchase price variance account (a return credit reversing a bill whose price
+  /// difference went there). NULL = the whole credit is on Stock in Transit, as before.
+  ppvBase               Decimal?                 @db.Decimal(18, 4) @map("ppv_base")
   // Accounting-connector credit-note id (Xero ACCPAYCREDIT), set once POSTED.
   //
   // o3d-9kek r6: ONE external credit note ↔ ONE local credit note, globally unique on the value.
@@ -6615,4 +6629,20 @@ model PurchaseOrderFxLock {
   po               PurchaseOrder @relation(fields: [poId], references: [id], onDelete: Restrict)
 
   @@map("purchase_order_fx_locks")
+}
+
+/// Per-event FX (step 3b, MED-2): an exchange-rate difference journal (PURCHASE_FX_VARIANCE) that the producer-side hold recorded as a SHADOW: IMS did
+/// not send it and owes the ledger nothing for it. lib/domain/purchasing/purchase-bill-fx.ts counts these as settled beside the transit sub-ledger rows,
+/// so a difference shadowed while the hold was on is never caught up by a live journal later. Written only by that module, in the event's transaction.
+model PurchaseFxVarianceShadow {
+  id             String   @id @default(cuid())
+  poId           String   @map("po_id")
+  invoiceId      String   @map("invoice_id")
+  idempotencyKey String   @unique @map("idempotency_key")
+  baseDelta      Decimal  @db.Decimal(18, 2) @map("base_delta")
+  journalDate    String   @map("journal_date")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  @@index([poId])
+  @@map("purchase_fx_variance_shadows")
 }

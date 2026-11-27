@@ -232,7 +232,7 @@ test.beforeEach(async () => {
   contactLedger.answer = () => ({ success: true, contactId: null })
   if (RUN) {
     const { clearPurchaseFxRefusalMemoryForTests } = await import('@/lib/domain/purchasing/purchase-receipt-fx')
-    clearPurchaseFxRefusalMemoryForTests()
+    await clearPurchaseFxRefusalMemoryForTests()
     await setSetting('xero_sync_enabled', 'true')
   }
 })
@@ -523,7 +523,7 @@ test('MED-4: a book-in refused only because Xero cannot be read (or a table rate
     assert.deepEqual(await layersOf(po), [])
     // Xero answers: the same event books in (once the remembered refusal has lapsed).
     const { clearPurchaseFxRefusalMemoryForTests } = await import('@/lib/domain/purchasing/purchase-receipt-fx')
-    clearPurchaseFxRefusalMemoryForTests()
+    await clearPurchaseFxRefusalMemoryForTests()
     answerWith([[po, [prepaymentFor(po)]]])
     assert.equal((await event.run()).status, 'processed')
     assert.deepEqual((await layersOf(po)).map((l) => l.rate), ['1.6'])
@@ -550,11 +550,11 @@ test('MED-C: an episode of waits on the purchase rate is capped: the 11th wait c
   await withSwitch(true, async () => {
     ledger.answer = () => ({ ok: false, error: 'HTTP 503' })
     for (let i = 0; i < 10; i += 1) {
-      clearPurchaseFxRefusalMemoryForTests()
+      await clearPurchaseFxRefusalMemoryForTests()
       assert.equal((await event.run()).status, 'failed')
     }
     assert.equal((await event.row()).processingAttempts, 0, 'ten waits are free')
-    clearPurchaseFxRefusalMemoryForTests()
+    await clearPurchaseFxRefusalMemoryForTests()
     assert.equal((await event.run()).status, 'failed')
     assert.equal((await event.row()).processingAttempts, 1, 'the eleventh counts')
     const { db } = await import('@/lib/db')
