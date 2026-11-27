@@ -62,7 +62,7 @@ import { countResumableRefundReservationReleases, resolveRefundReservationReleas
 import { describeRepackReallocation } from '@/lib/domain/sales/repack-recovery-report'
 import { shipmentIsUnreopenableCommitment, summariseRepackBlockers } from '@/lib/domain/sales/repack-recovery-affordance'
 import { describeAllocationAttempt } from '@/lib/domain/sales/allocation-activity'
-import { isQuarantineTargetWarehouse, QUARANTINE_ALLOCATION_REFUSAL } from '@/lib/domain/inventory/quarantine-warehouse'
+import { isQuarantineTargetWarehouse, QUARANTINE_ALLOCATION_REFUSAL, readReturnConditionCheckEnabled } from '@/lib/domain/inventory/quarantine-warehouse'
 import {
   allocationScopeKey,
   dispatchedAllocationLines,
@@ -547,6 +547,14 @@ export async function autoAllocateOrder(
 // Manual allocation update
 // ---------------------------------------------------------------------------
 
+/** The same answer inside the allocation transaction, after a shared lock on the warehouse row (the type change locks it for update). */
+async function quarantineTargetUnderLock(tx: Prisma.TransactionClient, warehouseId: string): Promise<boolean> {
+  // Off: no lock and no read beyond the switch, so the switch-off path is the one of before.
+  if (!(await readReturnConditionCheckEnabled(tx))) return false
+  await tx.$queryRaw`SELECT id FROM warehouses WHERE id = ${warehouseId} FOR SHARE`
+  return isQuarantineTargetWarehouse(tx, warehouseId)
+}
+
 /** True only with the switch on and a QUARANTINE-type target warehouse: then the allocation is refused. */
 async function isQuarantineAllocationTarget(warehouseId: string): Promise<boolean> {
   return isQuarantineTargetWarehouse(db, warehouseId)
@@ -577,6 +585,11 @@ export async function updateAllocation(
 
     await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, alloc.orderId)
+      // Switch return_condition_check_enabled, RE-CHECKED under the warehouse row lock (shared; the type change takes it exclusively), so a
+      // warehouse turned into quarantine between the pre-check and this write is still refused.
+      if (newQty > 0 && (newWarehouseId !== alloc.warehouseId || toDecimal(newQty).gt(toDecimal(alloc.qty))) && await quarantineTargetUnderLock(tx, newWarehouseId)) {
+        throw new Error(QUARANTINE_ALLOCATION_REFUSAL)
+      }
       await assertNotQuoteUnderLock(tx, alloc.orderId, 'stock cannot be allocated to it')
 
       // o3d-4kfh: RE-READ THE ROW UNDER THE ORDER LOCK, and derive EVERYTHING from that read.
@@ -941,6 +954,8 @@ export async function addAllocation(
 
     await db.$transaction(async (tx) => {
       await lockSalesOrder(tx, orderId)
+      // Switch return_condition_check_enabled, re-checked under the warehouse row lock (see updateAllocation).
+      if (await quarantineTargetUnderLock(tx, warehouseId)) throw new Error(QUARANTINE_ALLOCATION_REFUSAL)
       await assertNotQuoteUnderLock(tx, orderId, 'stock cannot be allocated to it')
       await resetAllocationAccountingIfStaged(tx, orderId)
       const graph = await loadFulfillmentProductGraph(tx, [productId])

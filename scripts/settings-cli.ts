@@ -118,6 +118,16 @@ export async function runSettingsCli(options: SettingsCliOptions): Promise<numbe
       const writer = purchaseFxSwitchOnRefusal({ processEnv: options.purchaseFxProcessEnv, installationEnv })
       if (writer) { stderr.error(writer); return 3 }
     }
+    // Turning the condition check on returns ON: refused while any quarantine warehouse still looks sellable, here (the dry run too) and again
+    // inside the write transaction.
+    let turnOnTxCheck: ((tx: unknown) => Promise<string | null>) | undefined
+    if (def.turnOnInterlock === 'quarantine-warehouses' && proposed === 'true' && current.stored !== 'true') {
+      const { quarantineSwitchOnRefusal } = await import('@/lib/domain/inventory/quarantine-warehouse')
+      type InterlockClient = Parameters<typeof quarantineSwitchOnRefusal>[0]
+      const interlock = await quarantineSwitchOnRefusal(db as unknown as InterlockClient)
+      if (interlock) { stderr.error(interlock); return 3 }
+      turnOnTxCheck = (tx) => quarantineSwitchOnRefusal(tx as InterlockClient)
+    }
     if (def.adminOnly && yes && !confirmAdmin) { stderr.error(adminRefusal(def)); return 3 }
     if (!yes) {
       if (def.adminOnly) stdout.log(`${def.key} is an ADMIN switch in the screen; writing it needs --yes --confirm-admin (ADMIN authority is assumed from shell access).`)
@@ -126,7 +136,7 @@ export async function runSettingsCli(options: SettingsCliOptions): Promise<numbe
       stdout.log('Nothing written; add --yes to apply.')
       return 0
     }
-    const result = await writeSwitch(db, { def, value: proposed, by, reason, adminConfirmed: confirmAdmin })
+    const result = await writeSwitch(db, { def, value: proposed, by, reason, adminConfirmed: confirmAdmin, turnOnTxCheck })
     if (!result.ok) { stderr.error(result.error); return 3 }
     if (!result.changed) { stdout.log(`${def.key} is already ${proposed}; nothing written, no audit entry added.`); return 0 }
     const back = await readSwitch(db, def)

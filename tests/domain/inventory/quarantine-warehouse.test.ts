@@ -6,6 +6,7 @@ import {
   isQuarantineWarehouseType,
   WMS_UNSELLABLE_RETURN_REFUSAL,
   wmsReturnRestockRefusal,
+  quarantineLeaveRefusal,
   quarantineTypeChangeRefusal,
   loadQuarantineQtyByProduct,
   parseReturnCondition,
@@ -116,13 +117,29 @@ test('Mintsoft returns inbox: on, an unsellable unit is always refused (quaranti
   assert.match(wmsReturnRestockRefusal({ enabled: true, condition: 'SELLABLE', warehouse: QAR }) ?? '', /quarantine warehouse/)
   assert.equal(wmsReturnRestockRefusal({ enabled: true, condition: null, warehouse: MAIN }), RETURN_CONDITION_MISSING_REFUSAL)
   assert.match(WMS_UNSELLABLE_RETURN_REFUSAL, /at the 3PL/)
-  assert.match(WMS_UNSELLABLE_RETURN_REFUSAL, /mark it sellable/)
+  assert.match(WMS_UNSELLABLE_RETURN_REFUSAL, /Restock it as Sellable into the bound warehouse/)
+  assert.match(WMS_UNSELLABLE_RETURN_REFUSAL, /stock adjustment/)
 })
 
 test('type change into quarantine: refused while any sellable work remains, and each is named', () => {
-  const none = { wmsBindings: 0, allocations: 0, openShipments: 0, openProductionOrders: 0 }
+  const none = { wmsBindings: 0, allocations: 0, openShipments: 0, openProductionOrders: 0, inboundTransfers: 0, openPurchaseOrders: 0 }
   assert.equal(quarantineTypeChangeRefusal(none), null)
-  for (const [key, label] of [['wmsBindings', 'binding'], ['allocations', 'allocation'], ['openShipments', 'shipment'], ['openProductionOrders', 'production order']] as const) {
+  for (const [key, label] of [['wmsBindings', 'binding'], ['allocations', 'allocation'], ['openShipments', 'shipment'], ['openProductionOrders', 'production order'], ['inboundTransfers', 'transfer'], ['openPurchaseOrders', 'purchase order']] as const) {
     assert.match(quarantineTypeChangeRefusal({ ...none, [key]: 2 }) ?? '', new RegExp(`2 [a-z -]*${label}`))
   }
+})
+
+test('leaving quarantine: refused while it holds stock, naming the write-off and transfer routes', () => {
+  assert.equal(quarantineLeaveRefusal(0), null)
+  const refusal = quarantineLeaveRefusal(3) ?? ''
+  assert.match(refusal, /3 unit/)
+  assert.match(refusal, /stock adjustment/)
+  assert.match(refusal, /transfer/)
+})
+
+test('a quarantine warehouse may not be the default return warehouse nor take purchase orders (switch on)', () => {
+  const base = { enabled: true, type: 'QUARANTINE', availableForSale: false, syncToStore: false, isDefault: false }
+  assert.match(quarantineWarehouseSettingsRefusal({ ...base, defaultReturnWarehouse: true }) ?? '', /Default return warehouse/)
+  assert.match(quarantineWarehouseSettingsRefusal({ ...base, availableForPurchaseOrders: true }) ?? '', /Available in purchase orders/)
+  assert.equal(quarantineWarehouseSettingsRefusal({ ...base, enabled: false, defaultReturnWarehouse: true, availableForPurchaseOrders: true }), null)
 })
