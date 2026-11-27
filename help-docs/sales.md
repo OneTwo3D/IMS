@@ -454,6 +454,8 @@ for a person). If the order line cannot be found (the order was edited in IMS af
 **not recorded**: it is parked on Sync > Exceptions with a message, the money has already been returned in the store, and you record it by hand. A refund whose
 only content is such amounts (nothing else on it) is recorded as before, as one money refund at the order's VAT basis.
 
+**A price you type in WooCommerce is treated as including VAT.** WooCommerce fills a line's VAT only when its quantity changes, so a price typed on a line (for example 5.00 on a 20% line) arrives with no VAT. IMS reads that figure as the amount returned **including VAT at the order's VAT rate** (5.00 becomes 4.17 net and 0.83 VAT), so the credit note's VAT is 0.83 and its total matches the store refund to within a penny per line. This relies on the order being taxed at one rate. If the order's rate cannot be established, the refund is parked on Sync > Exceptions (the message says no VAT was stated, and the money has already been returned in the store), and you record it by hand with the gross amount. On an EU-scheme order (IOSS, VOEC or DDP) a typed price is still parked for you to record by hand. A line that states its own VAT and a zero-rated line are unchanged.
+
 ### WooCommerce refund deduplication
 
 Refunds synced from WooCommerce are deduplicated by `externalRefundId`. If a duplicate webhook fires (network retry, race condition), the second delivery is silently absorbed without creating a duplicate refund. A WooCommerce refund that a person made to pay an IMS refund (see below) has a new id, so it is matched by order, currency and amount instead of being imported as a second refund.

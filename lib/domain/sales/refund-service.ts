@@ -4299,7 +4299,7 @@ export async function createSalesOrderRefund(
             // The VAT this line actually bore, as the order recorded it once at creation/import.
             taxForeign: true,
             taxRateId: true,
-            taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
+            taxRate: { select: { accountingTaxType: true, reverseCharge: true, rate: true } },
           },
         },
         shipments: {
@@ -5406,6 +5406,8 @@ export async function createSalesOrderRefund(
           postedRate: priced.vatRate,
           kind: lineKind,
           label,
+          // The Woo sync stated zero VAT on a line whose OWN rate is positive (a typed price): say so, rather than send the operator to map a tax code.
+          taxStatedBySource: stated != null && lineKind === 'sale' && toDecimal(refundLine.lineId ? salesLineTaxById.get(refundLine.lineId)?.rate ?? 0 : 0).gt(0),
           chargedSourceCount: chargedMoney?.sourceCount ?? 1,
         })
         if (!total.ok) return refuse(total.reason)

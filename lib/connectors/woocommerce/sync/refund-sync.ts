@@ -148,9 +148,19 @@ function parseDecimalAbs(value: string | number | null | undefined) {
   return decimal.lt(0) ? decimal.neg() : decimal
 }
 
+const UNDETERMINABLE_PREFIX = 'This refund is monetary-only (not itemised) and '
+const UNDETERMINABLE_SUFFIX = ', so the refunded amount cannot be converted '
+
+/** The cause inside an undeterminableBasisMessage, for a caller that words its own refusal around it. */
+function undeterminableBasisCause(message: string): string {
+  const start = message.startsWith(UNDETERMINABLE_PREFIX) ? UNDETERMINABLE_PREFIX.length : 0
+  const end = message.indexOf(UNDETERMINABLE_SUFFIX)
+  return message.slice(start, end > start ? end : undefined)
+}
+
 function undeterminableBasisMessage(cause: string): string {
   return (
-    `This refund is monetary-only (not itemised) and ${cause}, so the refunded amount cannot be converted ` +
+    `${UNDETERMINABLE_PREFIX}${cause}${UNDETERMINABLE_SUFFIX}` +
     'from gross to net and no credit note has been raised. The money has ALREADY been returned in ' +
     'WooCommerce — do NOT issue another WooCommerce refund. ' +
     REFUND_PARK_MANUAL_RESOLUTION_HINT
@@ -1284,10 +1294,55 @@ export async function syncWcRefund(
         })
         return { outcome: 'quarantined-refusal', error }
       }
+      // A TYPED PRICE REFUND: WooCommerce's refund screen fills a line's tax only when the QUANTITY changes, so an operator who types an amount (5.00 on a 20% line) sends total 5.00 and total_tax 0.
+      // onetwo3D only sells at ONE VAT rate per order, so an amount-only goods line that states NO tax on a line whose own tax identity is taxable is read as GROSS at the ORDER's rate (the same rate source as
+      // the monetary-only fallback): net = typed / (1 + rate), VAT = typed - net. The gross added below stays the typed figure, so the reconciliation against the refund amount is unchanged.
+      // Refused (quarantined) when that rate cannot be established, or the line's own rate disagrees with it. A line that states tax, a zero-rated line, and the rate-182 / IOSS routes (which state their own tax) are untouched.
+      const typedPriceSplit = new Map<(typeof amountOnlyGoods)[number], { net: Decimal; tax: Decimal }>()
+      if (eas182StatedTaxForeign === undefined && so.euVatRegime == null) {
+        let typedPriceRefusal: string | null = null
+        for (const rl of amountOnlyGoods) {
+          if (typedPriceRefusal !== null) break
+          if (parseDecimalAbs(rl.total_tax).gt(0.000001)) continue
+          const imsLine = so.lines.find((l) => l.externalLineItemId === refundedOrderLineId(rl))!
+          const lineRate = imsLine.taxRate?.rate == null ? toDecimal(0) : toDecimal(imsLine.taxRate.rate)
+          if (!(lineRate.gt(0) && imsLine.taxRate?.reverseCharge !== true)) continue
+          const basis = resolveMonetaryRefundVatRate(so)
+          // The line-rate comparison below cannot fire today (the resolver already refuses an order whose lines are not all at the header rate); it is kept as a defensive fence in case that contract changes.
+          const why = !basis.ok
+            ? `the order's VAT rate cannot be established (${undeterminableBasisCause(basis.error)})`
+            : basis.vatRate.lte(0) || basis.vatRate.sub(lineRate).abs().gt(RATE_EPSILON)
+              ? `the line's own VAT rate (${lineRate.toString()}) is not the order's rate (${basis.vatRate.toString()})`
+              : null
+          if (why !== null) {
+            typedPriceRefusal = withLedgerCheck(`WooCommerce refund ${wcRefund.id} returns ${parseDecimalAbs(rl.total).toFixed(2)} on "${rl.name || `item ${refundedOrderLineId(rl)}`}" with no VAT stated (WooCommerce only fills a line's VAT when its quantity changes), and ${why}, so IMS cannot tell how much of it was VAT. The refund was NOT recorded and nothing was sent to Xero. The money has ALREADY been returned in the storefront (refund ${wcRefund.id}) - do NOT issue another storefront refund. ${REFUND_PARK_MANUAL_RESOLUTION_HINT}`)
+            break
+          }
+          const typedGross = parseDecimalAbs(rl.total)
+          const typedNet = roundQuantity(typedGross.div(toDecimal(1).add((basis as { ok: true; vatRate: Decimal }).vatRate)), 4)
+          typedPriceSplit.set(rl, { net: typedNet, tax: typedGross.sub(typedNet) })
+        }
+        if (typedPriceRefusal !== null) {
+          const error = typedPriceRefusal
+          await upsertRefundPark(client, { soId: so.id, externalId: String(wcRefund.id), status: 'QUARANTINED', errorMessage: error, payload: wcRefund })
+          await writeActivity({
+            entityType: 'SALES_ORDER',
+            entityId: so.id,
+            action: 'refund_sync_typed_price_vat_undeterminable',
+            tag: 'sync',
+            level: 'WARNING',
+            description: error,
+            metadata: { externalRefundId: wcRefund.id },
+            resolveUser: false,
+          })
+          return { outcome: 'quarantined-refusal', error }
+        }
+      }
       for (const rl of amountOnlyGoods) {
         const imsLine = so.lines.find((l) => l.externalLineItemId === refundedOrderLineId(rl))!
-        const net = parseDecimalAbs(rl.total)
-        const tax = parseDecimalAbs(rl.total_tax)
+        const split = typedPriceSplit.get(rl)
+        const net = split ? split.net : parseDecimalAbs(rl.total)
+        const tax = split ? split.tax : parseDecimalAbs(rl.total_tax)
         mappedGrossForeign = mappedGrossForeign.add(net).add(tax)
         refundLines.push({
           lineId: imsLine.id,
