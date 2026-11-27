@@ -588,6 +588,15 @@ const xeroDeps = {
     }
   },
 }
+/** The confirmation compares the connected Xero organisation with the one that answered the read (the fake answers as tenant-pfr). */
+async function withXeroToken<T>(fn: () => Promise<T>): Promise<T> {
+  await s.db.accountingToken.upsert({ where: { connector: 'xero' }, create: { connector: 'xero', accessToken: 'x', expiresAt: new Date(Date.now() + 3_600_000), tenantId: 'tenant-pfr' }, update: { tenantId: 'tenant-pfr' } })
+  try {
+    return await fn()
+  } finally {
+    await s.db.accountingToken.deleteMany({ where: { connector: 'xero' } })
+  }
+}
 let guidSeq = 0
 const guid = () => `00000000-0000-4000-8000-${String(++guidSeq).padStart(12, '0')}`
 
@@ -624,7 +633,7 @@ test('MED-C: a bill posted outside IMS is listed with its Xero basis (read once)
     assert.equal(off.confirmable, false)
     assert.match(off.notConfirmableReason ?? '', /not confirmable yet/)
     assert.equal(xeroReads.length, 0, 'no Xero call while it cannot be confirmed')
-    await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'turn-on', all: true, deps: xeroDeps })), NonImsBillsConfirmRefused)
+    await assert.rejects(withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'turn-on', all: true, deps: xeroDeps }))), NonImsBillsConfirmRefused)
   } finally {
     setPurchaseEventFxStepsCompleteForTests(true)
   }
@@ -643,16 +652,16 @@ test('MED-C: a bill posted outside IMS is listed with its Xero basis (read once)
   assert.equal(mine.proposedTransitDelta, '-26.04', 'the Xero bill (104.17 at 1.2) against the receipt (78.125); not -21.88 at the PO rate')
   assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id } }), 0, 'the list writes nothing')
   // Refusals: no who, neither --all nor --bill, no --expect/--digest.
-  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: '', reason: 'x', invoiceIds: [qoblex.id], deps: xeroDeps })), NonImsBillsConfirmRefused)
-  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', deps: xeroDeps })), /--all/)
-  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', invoiceIds: [qoblex.id], deps: xeroDeps })), /--expect/)
+  await assert.rejects(withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: '', reason: 'x', invoiceIds: [qoblex.id], deps: xeroDeps }))), NonImsBillsConfirmRefused)
+  await assert.rejects(withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'x', deps: xeroDeps }))), /--all/)
+  await assert.rejects(withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'x', invoiceIds: [qoblex.id], deps: xeroDeps }))), /--expect/)
   // A wrong expectation is refused under the lock and rolled back.
-  const wrong = await withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '-21.88']]), deps: xeroDeps }))
+  const wrong = await withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'x', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '-21.88']]), deps: xeroDeps })))
   assert.equal(wrong.confirmed.length, 0)
   assert.match(wrong.failed[0]?.error ?? '', /not the -21.88 shown/)
   assert.equal(await s.db.purchaseFxNonImsBillApproval.count({ where: { invoiceId: qoblex.id } }), 0, 'rolled back')
   xeroReads.length = 0
-  const confirmed = await withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'owner ruling: one-off journal', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '-26.04']]), deps: xeroDeps }))
+  const confirmed = await withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'owner ruling: one-off journal', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '-26.04']]), deps: xeroDeps })))
   assert.equal(xeroReads.length, 1, 'the confirmation reads the Xero bill once and stores the answer')
   assert.deepEqual(confirmed.journals.map((j) => j.transitDelta), ['-26.04'])
   const approval = await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })
@@ -660,7 +669,14 @@ test('MED-C: a bill posted outside IMS is listed with its Xero basis (read once)
   assert.equal(await s.db.activityLog.count({ where: { action: 'purchase_fx_non_ims_bill_confirmed', entityId: po.id } }), 1)
   close((await balance(po)).toNumber(), 0, 'GR/IR nets to zero')
   assert.equal((await withXeroPosting(() => rerunPurchaseBillFx(po.id))).journals.length, 0, 'posted once: a re-run queues nothing')
-  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'again', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '0']]), deps: xeroDeps })), /Not a bill awaiting confirmation/)
+  // A named, already confirmed bill is a re-confirmation (after a Xero-side edit): the same basis posts nothing more.
+  const reconfirmed = await withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'again', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '0']]), deps: xeroDeps })))
+  assert.equal(reconfirmed.confirmed.length, 1)
+  assert.equal(reconfirmed.journals.length, 0)
+  assert.equal(await s.db.purchaseFxNonImsBillApproval.count({ where: { invoiceId: qoblex.id } }), 1, 'replaced, not added')
+  assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id } }), 1)
+  // Not in the default list while it holds.
+  assert.ok(!(await withXeroPosting(() => listNonImsBills({ deps: xeroDeps }))).candidates.some((c) => c.invoiceId === qoblex.id))
 })
 
 // [mutation: list a bill with no Xero link, a delete pending or lines off transit as confirmable, or confirm --all without the digest]
@@ -687,8 +703,8 @@ test('MED-C candidates: unlinked, delete-pending and off-transit bills are not c
   const named = await withXeroPosting(() => listNonImsBills({ named: [noLink.id, del.id], deps: xeroDeps }))
   assert.match(named.candidates.find((c) => c.invoiceId === noLink.id)?.problem ?? '', /not linked to a Xero bill/)
   assert.match(named.candidates.find((c) => c.invoiceId === del.id)?.exclusion ?? '', /delete of the bill is pending/)
-  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', all: true, digest: 'deadbeefdeadbeef', deps: xeroDeps })), /changed since the dry run/)
-  const all = await withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', all: true, digest: list.digest, deps: xeroDeps }))
+  await assert.rejects(withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'x', all: true, digest: 'deadbeefdeadbeef', deps: xeroDeps }))), /changed since the dry run/)
+  const all = await withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'x', all: true, digest: list.digest, deps: xeroDeps })))
   assert.ok(all.confirmed.some((c) => c.invoiceId === ok.id) && !all.confirmed.some((c) => c.invoiceId === off.id), '--all confirms only the confirmable default list')
 })
 
@@ -730,8 +746,105 @@ test('MED-C reads: only an AUTHORISED or PAID Xero bill is a basis; the read cap
   assert.match(limited.candidates.find((c) => c.invoiceId === laterId)?.problem ?? '', /^not read: Xero rate-limited/)
   delete xeroBills.get(firstXero)!.httpStatus
   // LOW-9.
-  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', invoiceIds: [second.id], digest: 'abc', deps: xeroDeps })), /--digest goes with --all/)
-  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', invoiceIds: [second.id], expect: new Map([[second.id, '0.00'], ['someone-else', '1']]), deps: xeroDeps })), NonImsBillsConfirmRefused)
+  await assert.rejects(withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'x', invoiceIds: [second.id], digest: 'abc', deps: xeroDeps }))), /--digest goes with --all/)
+  await assert.rejects(withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'x', invoiceIds: [second.id], expect: new Map([[second.id, '0.00'], ['someone-else', '1']]), deps: xeroDeps }))), NonImsBillsConfirmRefused)
+})
+
+// [mutation: measure a confirmed bill on the order's CURRENT cost instead of the frozen basis, or keep adjusting a stale confirmation (MED-5)]
+test('MED-5: the basis is frozen with the confirmation; an IMS bill edit, an order cost edit or a re-link makes it stale (journal held) until it is confirmed again', async () => {
+  const { listNonImsBills, confirmNonImsBills } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
+  const { rerunPurchaseBillFx } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  const po = await seedPo(10)
+  const qoblex = await nonImsBill(po, 10, 12.5, { rate: 1.2 })
+  await lockAt(po)
+  assert.equal((await receive(po, 10)).success, true)
+  const confirmed = await withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'one-off', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '-26.04']]), deps: xeroDeps })))
+  assert.equal(confirmed.confirmed.length, 1)
+  const approval = await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })
+  assert.deepEqual(approval.stockUnits, { [po.lineId]: '12.5' })
+  assert.equal(approval.xeroTenantId, 'tenant-pfr')
+  // The order's cost is edited: the confirmation goes stale and its journal is held (not re-measured on the new cost).
+  await s.db.purchaseOrderLine.update({ where: { id: po.lineId }, data: { unitCostForeign: '13' } })
+  const held = await withXeroPosting(() => rerunPurchaseBillFx(po.id))
+  assert.equal(held.journals.length, 0, 'held where it is')
+  const stale = await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })
+  assert.ok(stale.staleAt)
+  assert.match(stale.staleReason ?? '', /goods cost was edited/)
+  const listed = (await withXeroPosting(() => listNonImsBills({ deps: xeroDeps }))).candidates.find((c) => c.invoiceId === qoblex.id)
+  assert.match(listed?.reconfirmation ?? '', /now stale/, 'listed again for re-confirmation')
+  await s.db.purchaseOrderLine.update({ where: { id: po.lineId }, data: { unitCostForeign: '12.5' } })
+  // Linked to another Xero bill: stale too (once re-confirmed on the restored cost).
+  const again = await withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 're-confirm', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '0.00']]), deps: xeroDeps })))
+  assert.equal(again.confirmed.length, 1, String(again.failed[0]?.error))
+  assert.equal((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).staleAt, null)
+  // The IMS bill is edited (10 -> 8): its journal would change (8 units matched), but the confirmation is stale, so the journal is held.
+  const { updateInvoice } = await import('@/app/actions/purchase-orders')
+  const current = await billOf(po)
+  const edited = await updateInvoice(current.id, {
+    invoiceNumber: current.invoiceNumber, invoiceDate: BILL_DATE, dueDate: null, notes: null, supplierInvoiceUrl: null,
+    lines: [{ id: current.lines[0]!.id, qtyBilled: 8, unitCostForeign: 12.5 }],
+  } as never)
+  assert.equal(edited.success, true, String(edited.error))
+  await withXeroPosting(() => rerunPurchaseBillFx(po.id))
+  assert.match((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).staleReason ?? '', /IMS bill was edited/)
+  assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id } }), 1, 'one journal through all of it: the stale one is held')
+  await s.db.purchaseInvoice.update({ where: { id: qoblex.id }, data: { accountingInvoiceId: guid() } })
+  await s.db.purchaseFxNonImsBillApproval.update({ where: { invoiceId: qoblex.id }, data: { staleAt: null, staleReason: null, billFingerprint: null } })
+  await withXeroPosting(() => rerunPurchaseBillFx(po.id))
+  assert.match((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).staleReason ?? '', /linked to another Xero bill/)
+})
+
+// [mutation: compare only the queued journals under the lock (MED-4): a confirmation whose journal is shadowed would always mismatch]
+test('MED-4: a confirmation whose journal the producer-side hold shadows is confirmed, its journal settled as a shadow', async () => {
+  const { confirmNonImsBills } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
+  const po = await seedPo(10)
+  const qoblex = await nonImsBill(po, 10, 12.5, { rate: 1.2 })
+  await lockAt(po)
+  assert.equal((await receive(po, 10)).success, true)
+  const before = process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+  process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = 'xero'
+  try {
+    const done = await withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'one-off', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '-26.04']]), deps: xeroDeps })))
+    assert.equal(done.failed.length, 0, String(done.failed[0]?.error))
+    assert.equal(done.confirmed.length, 1)
+    assert.equal(done.shadowed, 1)
+  } finally {
+    if (before === undefined) delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+    else process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = before
+  }
+  assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id, status: { not: 'CANCELLED' } } }), 0, 'nothing live')
+  close((await s.db.purchaseFxVarianceShadow.findMany({ where: { poId: po.id } })).reduce((a, r) => a + Number(r.baseDelta), 0), -26.04, 'settled as a shadow')
+})
+
+// [mutation: value a bill under the switch while the producer-side hold shadows supplier bills on its date, or edit such a bill]
+test('bill writer: while the hold shadows supplier bills, a new bill is valued at the PO rate as before and a switch-valued bill is not edited', async () => {
+  const { updateInvoice } = await import('@/app/actions/purchase-orders')
+  const managedPo = await seedPo(10)
+  await lockAt(managedPo)
+  assert.equal((await receive(managedPo, 10)).success, true)
+  assert.equal((await bill(managedPo, 10, 12.5)).success, true)
+  const managed = await billOf(managedPo)
+  assert.equal(managed.fxRateSource, 'XERO_PREPAYMENT')
+  const before = process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+  process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = 'xero'
+  try {
+    const po = await seedPo(10)
+    await lockAt(po)
+    assert.equal((await receive(po, 10)).success, true)
+    assert.equal((await bill(po, 10, 12.5)).success, true)
+    const row = await billOf(po)
+    assert.equal(row.fxRateSource, null, 'shadowed: the PO rate, no per-event valuation')
+    assert.equal(row.fxRateToBase.toString(), PO_RATE)
+    const edited = await updateInvoice(managed.id, {
+      invoiceNumber: managed.invoiceNumber, invoiceDate: BILL_DATE, dueDate: null, notes: null, supplierInvoiceUrl: null,
+      lines: [{ id: managed.lines[0]!.id, qtyBilled: 9, unitCostForeign: 12.5 }],
+    } as never)
+    assert.equal(edited.success, false)
+    assert.match(edited.error ?? '', /shadowed by the producer-side hold/)
+  } finally {
+    if (before === undefined) delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+    else process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = before
+  }
 })
 
 // [mutation: spend a return credit over the order's lines in id order instead of the lines of the return that raised it (o3d-ygc2x)]

@@ -43,9 +43,11 @@ function fakeDb(initial: Record<string, string> = {}, opts: { failAudit?: boolea
   }
 }
 
-async function run(mode: 'get' | 'set', argv: string[], f = fakeDb(), interlock?: Parameters<typeof runSettingsCli>[0]['interlock']) {
+/** The shell the purchase FX bill-writer interlock reads: by default one where the producer-side hold is set and not enforced (IMS writes the bills). */
+const HOLD_NOT_ENFORCED = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: '' }
+async function run(mode: 'get' | 'set', argv: string[], f = fakeDb(), interlock?: Parameters<typeof runSettingsCli>[0]['interlock'], purchaseFxProcessEnv: Record<string, string | undefined> = HOLD_NOT_ENFORCED) {
   const out: string[] = []; const err: string[] = []
-  const code = await runSettingsCli({ mode, argv, db: f.db as never, ...(interlock ? { interlock } : {}), stdout: { log: (m: string) => out.push(m) }, stderr: { error: (m: string) => err.push(m) }, disconnect: async () => {} })
+  const code = await runSettingsCli({ mode, argv, db: f.db as never, ...(interlock ? { interlock } : {}), purchaseFxProcessEnv, stdout: { log: (m: string) => out.push(m) }, stderr: { error: (m: string) => err.push(m) }, disconnect: async () => {} })
   return { code, out: out.join('\n'), err: err.join('\n'), f }
 }
 const SET = ['--by', 'jan', '--reason', 'switchover step M']
@@ -437,3 +439,31 @@ test('refund_returns_in_transit_enabled: an ADMIN switch, off by default, key eq
   const off = await run('set', ['--key', 'refund_returns_in_transit_enabled', '--value', 'false', ...SET, '--yes', '--confirm-admin'], fakeDb({ refund_returns_in_transit_enabled: 'true', xero_sync_enabled: 'true' }))
   assert.equal(off.code, 0, off.err)
 })
+
+test('purchase_event_fx_rates_enabled: BILL-WRITER interlock - refused while the hold shadows supplier bills (judged on the installation env file over the shell), and when the hold variable is in neither (MUTATION: drop the check => red)', () => withStepsInstalled(async () => {
+  const { mkdtempSync, writeFileSync, chmodSync } = await import('node:fs')
+  const { join } = await import('node:path')
+  const { tmpdir } = await import('node:os')
+  const mapped = () => fakeDb({ xero_sync_enabled: 'true', xero_realised_fx_gain_loss_account: '499', xero_purchase_price_variance_account: '510' })
+  const neither = await run('set', FX_ON, mapped(), undefined, {})
+  assert.equal(neither.code, 3)
+  assert.match(neither.err, /in neither the installation env file/)
+  const shadowShell = await run('set', FX_ON, mapped(), undefined, { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' })
+  assert.equal(shadowShell.code, 3)
+  assert.match(shadowShell.err, /shadows supplier bills/)
+  const dir = mkdtempSync(join(tmpdir(), 'pfx-env-'))
+  const file = join(dir, 'ims.env')
+  writeFileSync(file, 'PRODUCER_HOLD_ENFORCED_DESTINATIONS=xero\n')
+  chmodSync(file, 0o600)
+  const fileWins = await run('set', [...FX_ON, '--env-file', file], mapped(), undefined, HOLD_NOT_ENFORCED)
+  assert.equal(fileWins.code, 3, 'the installation file says the hold is enforced, whatever this shell says')
+  assert.match(fileWins.err, /shadows supplier bills/)
+  writeFileSync(file, 'PRODUCER_HOLD_ENFORCED_DESTINATIONS=\n')
+  const fileOff = mapped()
+  assert.equal((await run('set', [...FX_ON, '--env-file', file], fileOff, undefined, {})).code, 0, 'not enforced in the installation file: IMS writes the bills')
+  assert.equal(fileOff.settings.get('purchase_event_fx_rates_enabled')!.value, 'true')
+  chmodSync(file, 0o644)
+  const loose = await run('set', [...FX_ON, '--env-file', file], mapped(), undefined, HOLD_NOT_ENFORCED)
+  assert.equal(loose.code, 3)
+  assert.match(loose.err, /--env-file: .*mode 600/)
+}))

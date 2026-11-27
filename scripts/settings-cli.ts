@@ -37,6 +37,8 @@ export type SettingsCliOptions = {
   disconnect?: () => Promise<void>
   /** Test seam for the storefront e-mail turn-on interlock (environment, clock, the store's native e-mail read). Absent = the live ones. */
   interlock?: import('@/lib/domain/storefront-customer-email/switch-on-interlock').InterlockDeps
+  /** Test seam for the purchase FX bill-writer interlock: this shell's environment. Absent = process.env. */
+  purchaseFxProcessEnv?: Record<string, string | undefined>
 }
 
 export async function runSettingsCli(options: SettingsCliOptions): Promise<number> {
@@ -45,7 +47,7 @@ export async function runSettingsCli(options: SettingsCliOptions): Promise<numbe
   const args = options.argv ?? process.argv.slice(2)
   const usage = options.mode === 'get'
     ? 'Usage: npm run settings:get -- --key <key>'
-    : 'Usage: npm run settings:set -- --key <key> --value <value> --by <name> --reason "<text>" [--yes] [--confirm-admin]'
+    : 'Usage: npm run settings:set -- --key <key> --value <value> --by <name> --reason "<text>" [--env-file <installation env file>] [--yes] [--confirm-admin]'
 
   const values: Record<string, string> = {}
   let yes = false
@@ -54,7 +56,7 @@ export async function runSettingsCli(options: SettingsCliOptions): Promise<numbe
     const arg = args[i]
     if (arg === '--yes' && options.mode === 'set') { yes = true; continue }
     if (arg === '--confirm-admin' && options.mode === 'set') { confirmAdmin = true; continue }
-    const allowed = options.mode === 'get' ? ['--key'] : ['--key', '--value', '--by', '--reason']
+    const allowed = options.mode === 'get' ? ['--key'] : ['--key', '--value', '--by', '--reason', '--env-file']
     if (!allowed.includes(arg)) { stderr.error(usage); return 3 }
     const value = args[i + 1]
     if (value === undefined || (value.startsWith('--') && arg !== '--reason') || arg.slice(2) in values) { stderr.error(usage); return 3 }
@@ -105,7 +107,15 @@ export async function runSettingsCli(options: SettingsCliOptions): Promise<numbe
     }
     if (def.turnOnInterlock === 'purchase-fx-bill-writer' && proposed === 'true' && current.stored !== 'true') {
       const { purchaseFxSwitchOnRefusal } = await import('@/lib/domain/purchasing/purchase-event-fx-switch-on')
-      const writer = purchaseFxSwitchOnRefusal()
+      // Judged on the installation's env file (the one the application runs with), not only this shell.
+      let installationEnv: Record<string, string> | null = null
+      if (values['env-file'] !== undefined) {
+        const { readEnvFile } = await import('./lib/first-load-apply-files')
+        const file = readEnvFile(values['env-file'])
+        if (!file.ok) { stderr.error(`--env-file: ${file.problem}. Nothing was written.`); return 3 }
+        installationEnv = file.env
+      }
+      const writer = purchaseFxSwitchOnRefusal({ processEnv: options.purchaseFxProcessEnv, installationEnv })
       if (writer) { stderr.error(writer); return 3 }
     }
     if (def.adminOnly && yes && !confirmAdmin) { stderr.error(adminRefusal(def)); return 3 }
