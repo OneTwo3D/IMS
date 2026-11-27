@@ -4001,6 +4001,7 @@ const POST_EFFECT: Record<AccountingSyncType, { effect: string; remedy: string }
   UNREALISED_FX_JOURNAL: POST_EFFECT_JOURNAL,
   MANUFACTURING_JOURNAL: POST_EFFECT_JOURNAL,
   MANUFACTURING_RECLASS: POST_EFFECT_JOURNAL,
+  PURCHASE_FX_VARIANCE: POST_EFFECT_JOURNAL,
   CREDIT_NOTE_ALLOCATION: {
     effect: 'SETTLED an existing sales credit note in Xero (applied it to its invoice, or paid it out as a refund against the credit note)',
     remedy: withLedgerCheck('NO document was created - the settlement is an allocation on, or a refund payment against, a credit note that already existed. '
@@ -8038,7 +8039,9 @@ export async function processClaimedEntry(
     // in this group — the amount is decided (and evidenced) at staging time, not here.
     case 'ALLOCATION_REVERSAL':
     case 'MANUFACTURING_JOURNAL':
-    case 'MANUFACTURING_RECLASS': {
+    case 'MANUFACTURING_RECLASS':
+    // Per-event FX for purchasing (step 3): DR/CR Realised FX against Stock in Transit, a plain manual journal decided at staging time.
+    case 'PURCHASE_FX_VARIANCE': {
       const idempotencySource = typeof payload._idempotencyKey === 'string'
         ? payload._idempotencyKey
         : type.startsWith('DAILY_BATCH_')

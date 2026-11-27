@@ -131,6 +131,7 @@ const INLINE_SITES: Array<{ types: string[]; file: string; pattern: RegExp }> = 
   { types: ['ALLOCATION_REVERSAL'], file: 'lib/domain/sales/allocation-service.ts', pattern: /date: businessDateYmd\(new Date\(\)\),\n\s*reference: `Allocation reversal: \$\{orderRef\}`/ },
   { types: ['MANUFACTURING_JOURNAL'], file: 'app/actions/manufacturing.ts', pattern: /date: businessDateYmd\(now\),\n\s*reference,/ },
   { types: ['MANUFACTURING_RECLASS'], file: 'app/actions/manufacturing.ts', pattern: /date: reclassDate,\n\s*reference: `MFG-RECLASS: \$\{po\.reference\}`/ },
+  { types: ['PURCHASE_FX_VARIANCE'], file: 'lib/domain/purchasing/purchase-bill-fx.ts', pattern: /date: businessDateYmd\(params\.at\),\n\s*reference: `FX: \$\{po\.reference\}`/ },
   { types: ['COGS_REVERSAL'], file: 'lib/domain/sales/refund-service.ts', pattern: /date: cogsReversalJournalDate,/ },
   { types: ['UNEARNED_REV_REVERSAL'], file: 'lib/domain/sales/refund-service.ts', pattern: /date: businessDateYmd\(new Date\(\)\),\n\s*reference: hasUnearnedReversal/ },
   { types: ['DAILY_BATCH_INVENTORY_RECONCILIATION'], file: 'lib/connectors/xero/daily-sync.ts', pattern: /date: journal\.date,\n\s*reference: `Inventory reconciliation/ },
@@ -352,7 +353,7 @@ const POSTING_PATH_FIELD: Record<string, 'date' | 'paymentDate'> = {
   INVOICE_PAYMENT: 'paymentDate', CREDIT_NOTE: 'date', CREDIT_NOTE_VOID: 'date', PURCHASE_CREDIT_NOTE: 'date', PURCHASE_CREDIT_NOTE_ALLOCATION: 'date', CREDIT_NOTE_ALLOCATION: 'date', STOCK_IN_TRANSIT: 'date',
   STOCK_RECEIPT: 'date', COGS_REVERSAL: 'date', DAILY_BATCH_REVENUE_DEFERRAL: 'date', DAILY_BATCH_INVENTORY_ALLOC: 'date', DAILY_BATCH_GROUP_B: 'date',
   DAILY_BATCH_INVENTORY_RECONCILIATION: 'date', DAILY_BATCH_COGS_RECONCILIATION: 'date', DAILY_BATCH_TRANSIT_RECONCILIATION: 'date', DAILY_BATCH_GRIR_RECLASS: 'date', UNEARNED_REV_REVERSAL: 'date',
-  ALLOCATION_REVERSAL: 'date', BILL_PAYMENT: 'paymentDate', MANUFACTURING_JOURNAL: 'date', MANUFACTURING_RECLASS: 'date',
+  ALLOCATION_REVERSAL: 'date', BILL_PAYMENT: 'paymentDate', MANUFACTURING_JOURNAL: 'date', MANUFACTURING_RECLASS: 'date', PURCHASE_FX_VARIANCE: 'date',
 }
 
 test('EVERY PAYLOAD-SOURCED TYPE declares the field its posting path dates the Xero document from', () => {

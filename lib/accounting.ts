@@ -136,6 +136,8 @@ const XERO_SYNC_TYPE_SETTING: Partial<Record<AccountingSyncType, string>> = {
   UNREALISED_FX_JOURNAL: 'xero_sync_unrealised_fx_journal',
   MANUFACTURING_JOURNAL: 'xero_sync_manufacturing_journal',
   MANUFACTURING_RECLASS: 'xero_sync_manufacturing_journal',
+  // Per-event FX for purchasing: rides the stock receipt switch, the journal it completes.
+  PURCHASE_FX_VARIANCE: 'xero_sync_stock_receipt',
   TAX_RATE_SYNC: 'xero_sync_tax_rate',
 }
 

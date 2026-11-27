@@ -32,9 +32,8 @@ import { roundQuantity, toDecimal, type Decimal, type DecimalInput } from '@/lib
  *                         debits transit at the billed price, the receipt credits it at the PO valuation), now visible per order instead of buried.
  *   BILL_FX_VARIANCE      per-event FX (switch `purchase_event_fx_rates_enabled`): the base-currency difference between the rate the received
  *                         goods were valued at and the rate the bill is valued at (positive = the bill costs more in base currency). THE FX
- *                         DIFFERENCE. A variance like the price difference: OUTSIDE the balance and outside the reclass. RESERVED: no writer
- *                         yet (the valuation is a later step); every reader already treats it as a variance, so the first row cannot be
- *                         misread as an accrual.
+ *                         DIFFERENCE. A variance like the price difference: OUTSIDE the balance and outside the reclass. Written, with the
+ *                         BILL rows of a bill valued under the switch, by lib/domain/purchasing/purchase-bill-fx.ts (target state per bill).
  *
  * `baseDelta` is written at 6dp; the balance is the sum of the BALANCE source types. Idempotent on `idempotencyKey` (first write wins), so a
  * replayed source event records exactly once. Every writer calls this INSIDE the transaction of its source event, and records whether or not the

@@ -203,6 +203,7 @@ const SCOPE_RULES: Record<AccountingSyncType, ScopeRule> = {
   // Different edits differ. The same edit re-saved hashes the same; a DIFFERENT later edit is a different
   // reclass, and the earlier refused one is not discharged by it (review H4).
   MANUFACTURING_RECLASS: IDEMPOTENCY_KEY,
+  PURCHASE_FX_VARIANCE: IDEMPOTENCY_KEY,
   // DailyBatch/<batch reference>: the reference already names the batch and the journal kind is the type.
   DAILY_BATCH_REVENUE_DEFERRAL: DOCUMENT,
   DAILY_BATCH_INVENTORY_ALLOC: DOCUMENT,
