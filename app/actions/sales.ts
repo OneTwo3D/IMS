@@ -200,6 +200,7 @@ import { deleteSalesOrderAttachmentsInTx, drainOrderAttachmentFileDeletions } fr
 import { recordPegsRemovedWithLines } from '@/lib/domain/sales/peg-service'
 import { SHOP_DESYNC_WARNING, paidOrderTotalChangeRefusal, resolveSalesOrderAddressEditBlock, resolveSalesOrderEditBlock, shopDesyncAcknowledgementRefusal, type SalesOrderEditInput } from '@/lib/domain/sales/order-edit-affordance'
 import { RETURN_EXCHANGE_OFF_REFUSAL, RETURN_EXCHANGE_SETTING_KEY, exchangeRequestRefusal, resolveReturnExchangeBlock, returnExchangeEnabledFromSetting, returnExchangeRefusals } from '@/lib/domain/sales/return-exchange'
+import { parseReturnCondition, readReturnConditionCheckEnabled, returnConditionRestockRefusal, type ReturnCondition } from '@/lib/domain/inventory/quarantine-warehouse'
 import { hasPermission } from '@/lib/permissions'
 import { buildSalesOrderWriteModel, type SalesOrderWriteModel } from '@/lib/domain/sales/sales-order-write-model'
 import { isQuoteExpired, quoteDateToYmd, quoteStatusMoveRefused, quoteYmdToDate, validateQuoteInput } from '@/lib/domain/sales/sales-quote'
@@ -3651,6 +3652,12 @@ export async function createRefund(
      * Operator only (an internal caller is refused). Nothing is charged or refunded for a difference: the order's total simply carries the replacement and the credit note carries the return.
      */
     exchange?: ReturnExchangeRequest
+    /**
+     * Switch `return_condition_check_enabled`: the condition of the returned items, stated by the operator when the refund restocks stock.
+     * UNSELLABLE must go to a quarantine warehouse and SELLABLE to an ordinary one; with the switch on an operator restock without it is refused.
+     * Operator only: an internal caller (the storefront sync) restocks to the default return warehouse and states none. Ignored with the switch off.
+     */
+    returnCondition?: ReturnCondition | null
   },
   // Two independent outcomes ride alongside `error`:
   //   `conflict`   (o3d-6oyu.18) — the refund transaction refused this credit note because the
@@ -3719,6 +3726,17 @@ export async function createRefund(
     // createSalesOrderRefund makes under the order lock (a delete requested between this read and that lock is refused there).
     const deletePendingForRefund = await pendingDeletionError(orderId)
     if (deletePendingForRefund) return { success: false, error: deletePendingForRefund }
+    // THE CONDITION CHECK (switch return_condition_check_enabled): an operator restock states the returned items' condition, and the warehouse must agree with it.
+    // The stock, its cost layer and the journal are exactly those of today; only the warehouse differs. Off, nothing is read beyond the switch.
+    const conditionCheck = !isInternal && await readReturnConditionCheckEnabled(db)
+    const returnCondition = conditionCheck ? parseReturnCondition(options?.returnCondition) : null
+    if (conditionCheck && returnWarehouseId && lines.some((line) => line.qty > 0)) {
+      const returnWarehouse = await db.warehouse.findUnique({ where: { id: returnWarehouseId }, select: { code: true, type: true } })
+      if (returnWarehouse) {
+        const refusal = returnConditionRestockRefusal({ enabled: true, condition: returnCondition, warehouse: returnWarehouse })
+        if (refusal) return { success: false, error: refusal }
+      }
+    }
     let returnReasonId: string | null = null
     if (options?.returnReasonId) {
       const reason = await db.returnReason.findFirst({ where: { id: options.returnReasonId, active: true }, select: { id: true } })
@@ -3811,6 +3829,7 @@ export async function createRefund(
         totalBase: refundResult.totalBase,
         creditNoteNumber: refundResult.creditNoteNumber,
         reason,
+        ...(conditionCheck && returnWarehouseId ? { returnCondition, returnWarehouseId } : {}),
       },
     })
     if (refundResult.accountingWarning) {

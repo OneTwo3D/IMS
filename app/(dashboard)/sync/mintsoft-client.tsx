@@ -188,6 +188,8 @@ export function MintsoftClient({ data, configured }: Props) {
   const [restockItemSku, setRestockItemSku] = useState('')
   const [restockWarehouseId, setRestockWarehouseId] = useState(defaultWarehouseId)
   const [restockReasonId, setRestockReasonId] = useState('')
+  // Switch return_condition_check_enabled: the operator states the returned items' condition; unsellable goes to a quarantine warehouse.
+  const [restockCondition, setRestockCondition] = useState<'' | 'SELLABLE' | 'UNSELLABLE'>('')
   const [error, setError] = useState('')
   const [feedbackMessage, setFeedbackMessage] = useState('')
   const [saved, setSaved] = useState(false)
@@ -524,6 +526,7 @@ export function MintsoftClient({ data, configured }: Props) {
     setRestockItemSku(item.sku ?? '')
     const matchingWarehouse = data.warehouses.find((warehouse) => warehouse.code === item.warehouseCode && warehouse.active)
     setRestockWarehouseId(matchingWarehouse?.id ?? data.warehouses.find((warehouse) => warehouse.active)?.id ?? '')
+    setRestockCondition('')
     setIsRestockDialogOpen(true)
   }
 
@@ -534,6 +537,7 @@ export function MintsoftClient({ data, configured }: Props) {
         id: restockItemId,
         warehouseId: restockWarehouseId,
         adjustmentReasonId: restockReasonId || null,
+        ...(data.returnConditionCheckEnabled ? { condition: restockCondition || null } : {}),
       })
       if (!result.success) {
         setError(result.error ?? 'Failed to restock Mintsoft return')
@@ -1427,12 +1431,39 @@ export function MintsoftClient({ data, configured }: Props) {
             </DialogDescription>
           </DialogHeader>
 
+          {data.returnConditionCheckEnabled && (
+            <div className="space-y-1.5">
+              <Label className="text-xs">Condition of the returned items</Label>
+              <Select
+                value={restockCondition}
+                onChange={(event) => {
+                  const next = event.target.value as '' | 'SELLABLE' | 'UNSELLABLE'
+                  setRestockCondition(next)
+                  // The warehouse must agree with the condition: unsellable goes to a quarantine warehouse, sellable to an ordinary one.
+                  const current = data.warehouses.find((warehouse) => warehouse.id === restockWarehouseId)
+                  const wantQuarantine = next === 'UNSELLABLE'
+                  if (next && (current?.type === 'QUARANTINE') !== wantQuarantine) {
+                    setRestockWarehouseId(data.warehouses.find((warehouse) => warehouse.active && (warehouse.type === 'QUARANTINE') === wantQuarantine)?.id ?? '')
+                  }
+                }}
+              >
+                <option value="">Select the condition</option>
+                <option value="SELLABLE">Sellable: back into stock</option>
+                <option value="UNSELLABLE">Unsellable: into quarantine</option>
+              </Select>
+              <p className="text-xs text-muted-foreground">
+                Unsellable items go into a quarantine warehouse at their cost. They are not sold from there: write them off with an adjustment or transfer them back to stock.
+              </p>
+            </div>
+          )}
+
           <div className="space-y-1.5">
             <Label className="text-xs">Restock Warehouse</Label>
             <Select value={restockWarehouseId} onChange={(event) => setRestockWarehouseId(event.target.value)}>
               <option value="">Select a warehouse</option>
               {data.warehouses
                 .filter((warehouse) => warehouse.active)
+                .filter((warehouse) => !data.returnConditionCheckEnabled || !restockCondition || (warehouse.type === 'QUARANTINE') === (restockCondition === 'UNSELLABLE'))
                 .map((warehouse) => (
                   <option key={warehouse.id} value={warehouse.id}>
                     {warehouse.code} · {warehouse.name}
@@ -1460,7 +1491,7 @@ export function MintsoftClient({ data, configured }: Props) {
             <Button
               type="button"
               onClick={handleRestockReturn}
-              disabled={isPending || !restockItemId || !restockWarehouseId}
+              disabled={isPending || !restockItemId || !restockWarehouseId || (data.returnConditionCheckEnabled && !restockCondition)}
             >
               {isPending ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : null}
               Confirm Restock

@@ -106,6 +106,7 @@ const PREFERENCE_KEYS_BY_SCREEN: Readonly<Record<string, readonly string[]>> = {
   'components/settings/financial-year-start.tsx': ['financial_year_start'],
   'components/settings/invoice-trigger.tsx': ['invoice_trigger'],
   'components/settings/landed-cost-method.tsx': ['default_landed_cost_method'],
+  'components/settings/return-condition-check.tsx': ['return_condition_check_enabled'],
   'components/settings/return-exchange.tsx': ['return_exchange_enabled'],
 }
 

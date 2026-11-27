@@ -3,6 +3,7 @@ import { isKitIgnoredComponentType } from '@/lib/products/kit-component-policy'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { randomUUID } from 'node:crypto'
 import { markWmsScopeDirtyInTx } from '@/lib/domain/wms/scope-dirty'
+import { readReturnConditionCheckEnabled, sellableWarehouseWhere } from '@/lib/domain/inventory/quarantine-warehouse'
 
 import { Prisma } from '@/app/generated/prisma/client'
 import type { db } from '@/lib/db'
@@ -3423,6 +3424,8 @@ export async function allocateSalesOrder(
       active: true,
       availableForSale: true,
       ...(isShoppingOrder ? { syncToStore: true } : {}),
+      // Switch return_condition_check_enabled: quarantine stock is never allocated (an empty filter with the switch off).
+      ...sellableWarehouseWhere(await readReturnConditionCheckEnabled(client)),
     },
     select: { id: true, code: true, name: true, isDefault: true, syncToStore: true },
     orderBy: { isDefault: 'desc' },

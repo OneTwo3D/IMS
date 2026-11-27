@@ -37,6 +37,7 @@ import {
   type MissingTaxRateGenerateResult,
 } from '@/lib/tax/generate-missing-tax-rates'
 import { xeroReportTaxType, XERO_REPORT_TAX_TYPES, isXeroReportTaxType } from '@/lib/connectors/xero/tax-rate-report-type'
+import { quarantineWarehouseSettingsRefusal, readReturnConditionCheckEnabled } from '@/lib/domain/inventory/quarantine-warehouse'
 import {
   effectiveTaxRateFromComponents,
   normalizeTaxRateComponents,
@@ -1558,6 +1559,9 @@ export async function createWarehouse(
   if (!normalizedCountry) {
     return { success: false, error: 'Select a valid country.' }
   }
+  // Switch return_condition_check_enabled: a quarantine warehouse holds unsellable stock, so its sellable flags are refused.
+  const quarantineRefusal = quarantineWarehouseSettingsRefusal({ enabled: await readReturnConditionCheckEnabled(db), ...data })
+  if (quarantineRefusal) return { success: false, error: quarantineRefusal }
   try {
     /**
      * ONE TRANSACTION, NOT THREE COMMITS (o3d-osl8 round 11, finding 3).
@@ -1640,6 +1644,9 @@ export async function updateWarehouse(
   if (!normalizedCountry) {
     return { success: false, error: 'Select a valid country.' }
   }
+  // Switch return_condition_check_enabled: a quarantine warehouse holds unsellable stock, so its sellable flags are refused.
+  const quarantineRefusal = quarantineWarehouseSettingsRefusal({ enabled: await readReturnConditionCheckEnabled(db), ...data })
+  if (quarantineRefusal) return { success: false, error: quarantineRefusal }
   try {
     // Enforce unique code (excluding self)
     const dup = await db.warehouse.findUnique({ where: { code: data.code } })

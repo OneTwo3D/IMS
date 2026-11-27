@@ -62,6 +62,7 @@ import { countResumableRefundReservationReleases, resolveRefundReservationReleas
 import { describeRepackReallocation } from '@/lib/domain/sales/repack-recovery-report'
 import { shipmentIsUnreopenableCommitment, summariseRepackBlockers } from '@/lib/domain/sales/repack-recovery-affordance'
 import { describeAllocationAttempt } from '@/lib/domain/sales/allocation-activity'
+import { isQuarantineWarehouseType, QUARANTINE_ALLOCATION_REFUSAL, readReturnConditionCheckEnabled } from '@/lib/domain/inventory/quarantine-warehouse'
 import {
   allocationScopeKey,
   dispatchedAllocationLines,
@@ -546,6 +547,13 @@ export async function autoAllocateOrder(
 // Manual allocation update
 // ---------------------------------------------------------------------------
 
+/** True only with the switch on and a QUARANTINE-type target warehouse: then the allocation is refused. */
+async function isQuarantineAllocationTarget(warehouseId: string): Promise<boolean> {
+  if (!(await readReturnConditionCheckEnabled(db))) return false
+  const warehouse = await db.warehouse.findUnique({ where: { id: warehouseId }, select: { type: true } })
+  return isQuarantineWarehouseType(warehouse?.type)
+}
+
 export async function updateAllocation(
   allocationId: string,
   newWarehouseId: string,
@@ -559,6 +567,10 @@ export async function updateAllocation(
     })
     if (!alloc) return { success: false, error: 'Allocation not found' }
     if (newQty < 0) return { success: false, error: 'Quantity cannot be negative' }
+    // Switch return_condition_check_enabled: an allocation is never MOVED into a quarantine warehouse (its stock is not sellable).
+    if (newQty > 0 && newWarehouseId !== alloc.warehouseId && await isQuarantineAllocationTarget(newWarehouseId)) {
+      return { success: false, error: QUARANTINE_ALLOCATION_REFUSAL }
+    }
 
     // Assigned inside the transaction; read only after it commits, so a rolled-back edit reports
     // nothing retired.
@@ -919,6 +931,8 @@ export async function addAllocation(
   try {
     await requirePermission('sales.process')
     if (qty <= 0) return { success: false, error: 'Quantity must be positive' }
+    // Switch return_condition_check_enabled: stock in a quarantine warehouse is not sellable and is never allocated.
+    if (await isQuarantineAllocationTarget(warehouseId)) return { success: false, error: QUARANTINE_ALLOCATION_REFUSAL }
 
     // o3d-kouj: the leaves whose reservedQty this action actually moved, carried OUT of the
     // transaction for the storefront sync below. Re-deriving them from the current graph afterwards
