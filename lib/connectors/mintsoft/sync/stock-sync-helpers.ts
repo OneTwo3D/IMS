@@ -439,7 +439,7 @@ export function planMintsoftAlignDown(input: MintsoftAlignDownInput): MintsoftAl
   if (!input.reasonConfigured && input.inventoryAccountMissing) {
     return {
       action: 'hold',
-      reason: 'Align To WMS holds this delta because no inventory account is mapped in the accounting settings and the accounting connector would post this write-off, so the adjustment would be refused. The delta stays a manual discrepancy.',
+      reason: 'Align To WMS holds this delta because no inventory account is mapped in the accounting settings and this write-off carries a ledger value for the connected accounting system, so the adjustment would be refused. The delta stays a manual discrepancy.',
     }
   }
 

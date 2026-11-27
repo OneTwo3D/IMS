@@ -195,7 +195,7 @@ test('mintsoftAlignDownReasonState: switch off never looks at the inventory acco
 test('planMintsoftAlignDown holds naming the inventory account when it is the missing piece', () => {
   const decision = planMintsoftAlignDown(baseInput({ reasonConfigured: false, inventoryAccountMissing: true }))
   assert.equal(decision.action, 'hold')
-  assert.match((decision as { reason: string }).reason, /inventory account is mapped.*would post this write-off/)
+  assert.match((decision as { reason: string }).reason, /inventory account is mapped.*ledger value/)
   // Without the flag the message is the one it always was.
   assert.match((planMintsoftAlignDown(baseInput({ reasonConfigured: false })) as { reason: string }).reason, /adjustment reason/)
 })
