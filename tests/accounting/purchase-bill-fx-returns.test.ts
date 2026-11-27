@@ -572,38 +572,166 @@ async function seedTwoLinePo(qtyA: number, qtyB: number, taxRateId?: string) {
   return { id: row.id, reference, lineA: row.lines.find((l) => l.productId === productId)!.id, lineB: row.lines.find((l) => l.productId === second)!.id }
 }
 
-// [mutation: let the reconciliation owe a journal for a bill posted outside IMS without a confirmation, or let a confirmation post twice]
-test('MED-C: a bill posted to Xero outside IMS is listed with its proposed journal, posts nothing until an admin confirms, then posts once', async () => {
+/** A fake read-only Xero bill read (the network is never reached): answers each InvoiceID from `xeroBills`, and counts the calls. */
+const xeroBills = new Map<string, { CurrencyRate: number; lines: Array<{ AccountCode: string; LineAmount: number; TaxAmount?: number }>; Status?: string; CurrencyCode?: string; httpStatus?: number }>()
+const xeroReads: string[] = []
+const xeroDeps = {
+  get: async <T,>(path: string) => {
+    xeroReads.push(path)
+    const id = decodeURIComponent(path.replace(/^Invoices\//, ''))
+    const bill = xeroBills.get(id)
+    if (!bill) return { ok: false, status: 404, error: 'not found' }
+    if (bill.httpStatus) return { ok: false, status: bill.httpStatus, error: `HTTP ${bill.httpStatus}` }
+    return {
+      ok: true, status: 200, tenantId: 'tenant-pfr',
+      data: { Invoices: [{ InvoiceID: id, Type: 'ACCPAY', Status: bill.Status ?? 'AUTHORISED', CurrencyCode: bill.CurrencyCode ?? CURRENCY, CurrencyRate: bill.CurrencyRate, LineAmountTypes: 'Exclusive', LineItems: bill.lines }] } as T,
+    }
+  },
+}
+let guidSeq = 0
+const guid = () => `00000000-0000-4000-8000-${String(++guidSeq).padStart(12, '0')}`
+
+/** A bill at the PO rate from before switch-on that Qoblex posted (no PURCHASE_BILL transit row), linked to its Xero bill. */
+async function nonImsBill(po: Po, qty: number, unit: number, xero: { rate: number; account?: string } | null): Promise<{ id: string; xeroId: string | null }> {
   const { setPurchaseEventFxStepsCompleteForTests } = await import('@/lib/domain/purchasing/purchase-event-fx-settings')
-  const { listNonImsBills, confirmNonImsBills, NonImsBillsConfirmRefused } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
-  const { rerunPurchaseBillFx } = await import('@/lib/domain/purchasing/purchase-bill-fx')
-  const po = await seedPo(10)
-  setPurchaseEventFxStepsCompleteForTests(false) // before switch-on: the bill is at the PO rate, and Qoblex posted it (no PURCHASE_BILL transit row)
+  setPurchaseEventFxStepsCompleteForTests(false)
   try {
-    assert.equal((await bill(po, 10, 12.5)).success, true)
-    assert.deepEqual(await withXeroPosting(() => listNonImsBills()), [], 'interlock off: nothing is listed')
-    await assert.rejects(confirmNonImsBills({ by: 'Jan', reason: 'turn-on' }), NonImsBillsConfirmRefused)
+    assert.equal((await bill(po, qty, unit)).success, true)
   } finally {
     setPurchaseEventFxStepsCompleteForTests(true)
   }
   const row = await billOf(po)
+  if (!xero) return { id: row.id, xeroId: null }
+  const xeroId = guid()
+  await s.db.purchaseInvoice.update({ where: { id: row.id }, data: { accountingInvoiceId: xeroId, accountingInvoiceConnector: 'xero' } })
+  xeroBills.set(xeroId, { CurrencyRate: xero.rate, lines: [{ AccountCode: xero.account ?? '631', LineAmount: qty * unit, TaxAmount: 0 }] })
+  return { id: row.id, xeroId }
+}
+
+// [mutation: owe a journal for a bill posted outside IMS without a confirmation, measure it at the bill's own GR/IR value instead of the Xero bill's rate,
+//  skip the under-the-lock comparison, read Xero twice, or let a confirmation post twice]
+test('MED-C: a bill posted outside IMS is listed with its Xero basis (read once), confirmed only with the shown journal, measured at the Xero rate, posted once', async () => {
+  const { setPurchaseEventFxStepsCompleteForTests } = await import('@/lib/domain/purchasing/purchase-event-fx-settings')
+  const { listNonImsBills, confirmNonImsBills, NonImsBillsConfirmRefused } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
+  const { rerunPurchaseBillFx } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  const po = await seedPo(10)
+  const qoblex = await nonImsBill(po, 10, 12.5, { rate: 1.2 }) // Qoblex posted it at 1.2: 125 / 1.2 = 104.17 in transit
+  // Interlock off: listed read-only, "not confirmable yet", and Xero is not asked.
+  setPurchaseEventFxStepsCompleteForTests(false)
+  try {
+    xeroReads.length = 0
+    const off = await withXeroPosting(() => listNonImsBills({ deps: xeroDeps }))
+    assert.equal(off.confirmable, false)
+    assert.match(off.notConfirmableReason ?? '', /not confirmable yet/)
+    assert.equal(xeroReads.length, 0, 'no Xero call while it cannot be confirmed')
+    await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'turn-on', all: true, deps: xeroDeps })), NonImsBillsConfirmRefused)
+  } finally {
+    setPurchaseEventFxStepsCompleteForTests(true)
+  }
   await lockAt(po)
   assert.equal((await receive(po, 10)).success, true) // after switch-on, at the lock: 78.125
-  const before = await withXeroPosting(() => rerunPurchaseBillFx(po.id))
-  assert.equal(before.journals.length, 0, 'not posted by IMS: no journal owed')
-  const listed = (await withXeroPosting(() => listNonImsBills())).filter((b) => b.poId === po.id)
-  assert.deepEqual(listed.map((b) => [b.invoiceId, b.proposedTransitDelta]), [[row.id, '-21.88']], 'the bill (100 in transit) against the receipt (78.125): credit transit 21.88')
+  close(await grir(po, 'BILL_FX_VARIANCE'), 100 - 78.125, 'GR/IR is corrected on the bill\'s own value, as before')
+  assert.equal((await withXeroPosting(() => rerunPurchaseBillFx(po.id))).journals.length, 0, 'not posted by IMS: no journal owed before a confirmation')
+  xeroReads.length = 0
+  const list = await withXeroPosting(() => listNonImsBills({ deps: xeroDeps }))
+  const mine = list.candidates.find((c) => c.invoiceId === qoblex.id)!
+  assert.equal(xeroReads.filter((p) => p.includes(qoblex.xeroId!)).length, 1, 'one Xero read per candidate')
+  assert.equal(mine.accountingInvoiceId, qoblex.xeroId)
+  assert.match(mine.noTransitRowReason, /not posted by IMS/)
+  assert.deepEqual([mine.basis.qty, mine.basis.stockForeign, mine.basis.rate, mine.basis.account, mine.basis.stockTransitBase], ['10', '125.00', '1.2', '631', '104.17'])
+  assert.equal(mine.notReceived.qty, '0')
+  assert.equal(mine.proposedTransitDelta, '-26.04', 'the Xero bill (104.17 at 1.2) against the receipt (78.125); not -21.88 at the PO rate')
   assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id } }), 0, 'the list writes nothing')
-  await assert.rejects(confirmNonImsBills({ by: '', reason: 'x' }), NonImsBillsConfirmRefused, 'who is required')
-  const confirmed = await withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'owner ruling: one-off journal', invoiceIds: [row.id] }))
-  assert.equal(confirmed.confirmed.length, 1)
-  assert.deepEqual(confirmed.journals.filter((j) => j.invoiceId === row.id).map((j) => j.transitDelta), ['-21.88'])
-  assert.equal(await s.db.purchaseFxNonImsBillApproval.count({ where: { invoiceId: row.id } }), 1)
+  // Refusals: no who, neither --all nor --bill, no --expect/--digest.
+  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: '', reason: 'x', invoiceIds: [qoblex.id], deps: xeroDeps })), NonImsBillsConfirmRefused)
+  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', deps: xeroDeps })), /--all/)
+  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', invoiceIds: [qoblex.id], deps: xeroDeps })), /--expect/)
+  // A wrong expectation is refused under the lock and rolled back.
+  const wrong = await withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '-21.88']]), deps: xeroDeps }))
+  assert.equal(wrong.confirmed.length, 0)
+  assert.match(wrong.failed[0]?.error ?? '', /not the -21.88 shown/)
+  assert.equal(await s.db.purchaseFxNonImsBillApproval.count({ where: { invoiceId: qoblex.id } }), 0, 'rolled back')
+  xeroReads.length = 0
+  const confirmed = await withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'owner ruling: one-off journal', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '-26.04']]), deps: xeroDeps }))
+  assert.equal(xeroReads.length, 1, 'the confirmation reads the Xero bill once and stores the answer')
+  assert.deepEqual(confirmed.journals.map((j) => j.transitDelta), ['-26.04'])
+  const approval = await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })
+  assert.deepEqual([approval.xeroInvoiceId, approval.xeroCurrencyRate?.toString(), approval.stockTransitBase?.toString()], [qoblex.xeroId, '1.2', '104.17'])
   assert.equal(await s.db.activityLog.count({ where: { action: 'purchase_fx_non_ims_bill_confirmed', entityId: po.id } }), 1)
-  const again = await withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'again' }))
-  assert.equal(again.confirmed.filter((c) => c.invoiceId === row.id).length, 0, 'already confirmed: not a candidate')
+  close((await balance(po)).toNumber(), 0, 'GR/IR nets to zero')
   assert.equal((await withXeroPosting(() => rerunPurchaseBillFx(po.id))).journals.length, 0, 'posted once: a re-run queues nothing')
-  assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id } }), 1)
+  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'again', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '0']]), deps: xeroDeps })), /Not a bill awaiting confirmation/)
+})
+
+// [mutation: list a bill with no Xero link, a delete pending or lines off transit as confirmable, or confirm --all without the digest]
+test('MED-C candidates: unlinked, delete-pending and off-transit bills are not confirmable by default; --all needs the digest; goods not received are shown', async () => {
+  const { listNonImsBills, confirmNonImsBills } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
+  const unlinked = await seedPo(10)
+  const noLink = await nonImsBill(unlinked, 10, 12.5, null)
+  const offTransit = await seedPo(10)
+  const off = await nonImsBill(offTransit, 10, 12.5, { rate: 1.25, account: '300' })
+  const pending = await seedPo(10)
+  const del = await nonImsBill(pending, 10, 12.5, { rate: 1.25 })
+  await s.db.accountingDocumentDeletion.create({
+    data: { kind: 'PURCHASE_INVOICE', referenceType: 'PurchaseInvoice', referenceId: del.id, documentId: del.id, externalDocumentId: del.xeroId!, originalNumber: 'X', releasedNumber: 'X-r', targetStatus: 'VOIDED', snapshot: {} },
+  })
+  const open = await seedPo(10)
+  const ok = await nonImsBill(open, 10, 12.5, { rate: 1.25 })
+  const list = await withXeroPosting(() => listNonImsBills({ deps: xeroDeps }))
+  const ids = list.candidates.map((c) => c.invoiceId)
+  assert.ok(!ids.includes(noLink.id) && !ids.includes(del.id), 'unlinked and delete-pending bills are left out by default')
+  assert.match(list.candidates.find((c) => c.invoiceId === off.id)?.problem ?? '', /coded to 300/)
+  const okRow = list.candidates.find((c) => c.invoiceId === ok.id)!
+  assert.equal(okRow.problem, null)
+  assert.deepEqual([okRow.notReceived.qty, okRow.notReceived.base], ['10', '100.00'], 'nothing received yet: the confirmation covers all of it')
+  const named = await withXeroPosting(() => listNonImsBills({ named: [noLink.id, del.id], deps: xeroDeps }))
+  assert.match(named.candidates.find((c) => c.invoiceId === noLink.id)?.problem ?? '', /not linked to a Xero bill/)
+  assert.match(named.candidates.find((c) => c.invoiceId === del.id)?.exclusion ?? '', /delete of the bill is pending/)
+  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', all: true, digest: 'deadbeefdeadbeef', deps: xeroDeps })), /changed since the dry run/)
+  const all = await withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', all: true, digest: list.digest, deps: xeroDeps }))
+  assert.ok(all.confirmed.some((c) => c.invoiceId === ok.id) && !all.confirmed.some((c) => c.invoiceId === off.id), '--all confirms only the confirmable default list')
+})
+
+// [mutation: accept a DRAFT/SUBMITTED Xero bill as a basis (#1162 HIGH-1), read past the cap or past a 429, read unnamed bills, or take --digest without --all]
+test('MED-C reads: only an AUTHORISED or PAID Xero bill is a basis; the read cap, a 429 and --bill limit the reads; --digest needs --all; --expect must name a chosen bill', async () => {
+  const { listNonImsBills, confirmNonImsBills, NonImsBillsConfirmRefused } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
+  const draftPo = await seedPo(10)
+  const draft = await nonImsBill(draftPo, 10, 12.5, { rate: 1.25 })
+  xeroBills.get(draft.xeroId!)!.Status = 'DRAFT'
+  const named = await withXeroPosting(() => listNonImsBills({ named: [draft.id], deps: xeroDeps }))
+  const row = named.candidates.find((c) => c.invoiceId === draft.id)!
+  assert.equal(row.basis.xeroStatus, 'DRAFT')
+  assert.match(row.problem ?? '', /only an AUTHORISED or PAID bill/)
+  for (const status of ['SUBMITTED', 'AUTHORISED', 'PAID']) {
+    xeroBills.get(draft.xeroId!)!.Status = status
+    const again = (await withXeroPosting(() => listNonImsBills({ named: [draft.id], deps: xeroDeps }))).candidates[0]!
+    assert.equal(again.problem === null, status !== 'SUBMITTED', status)
+  }
+  // --bill reads only the named bill; the cap stops further reads; a 429 stops the rest.
+  const other = await seedPo(10)
+  const second = await nonImsBill(other, 10, 12.5, { rate: 1.25 })
+  xeroReads.length = 0
+  const onlyNamed = await withXeroPosting(() => listNonImsBills({ named: [second.id], deps: xeroDeps }))
+  assert.deepEqual(onlyNamed.candidates.map((c) => c.invoiceId), [second.id])
+  assert.equal(onlyNamed.xeroReads, 1)
+  assert.equal(xeroReads.length, 1, 'only the named bill is read')
+  xeroReads.length = 0
+  const capped = await withXeroPosting(() => listNonImsBills({ maxReads: 1, deps: xeroDeps }))
+  assert.equal(capped.xeroReads, 1)
+  assert.equal(xeroReads.length, 1, 'the cap holds')
+  assert.ok(capped.candidates.some((c) => /cap of 1 Xero reads/.test(c.problem ?? '')))
+  const both = (await withXeroPosting(() => listNonImsBills({ named: [draft.id, second.id], deps: xeroDeps }))).candidates.map((c) => c.invoiceId)
+  const [firstId, laterId] = both as [string, string]
+  const firstXero = [draft, second].find((b) => b.id === firstId)!.xeroId!
+  xeroBills.get(firstXero)!.httpStatus = 429
+  xeroReads.length = 0
+  const limited = await withXeroPosting(() => listNonImsBills({ named: [draft.id, second.id], deps: xeroDeps }))
+  assert.equal(xeroReads.length, 1, 'stopped after the 429')
+  assert.match(limited.candidates.find((c) => c.invoiceId === laterId)?.problem ?? '', /^not read: Xero rate-limited/)
+  delete xeroBills.get(firstXero)!.httpStatus
+  // LOW-9.
+  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', invoiceIds: [second.id], digest: 'abc', deps: xeroDeps })), /--digest goes with --all/)
+  await assert.rejects(withXeroPosting(() => confirmNonImsBills({ by: 'Jan', reason: 'x', invoiceIds: [second.id], expect: new Map([[second.id, '0.00'], ['someone-else', '1']]), deps: xeroDeps })), NonImsBillsConfirmRefused)
 })
 
 // [mutation: spend a return credit over the order's lines in id order instead of the lines of the return that raised it (o3d-ygc2x)]

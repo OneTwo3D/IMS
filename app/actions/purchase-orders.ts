@@ -14,7 +14,7 @@ import { purchaseBillNotSavedRefusal, purchaseDocumentTaxTypeRefusal } from '@/l
 import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
-import { logActivity } from '@/lib/activity-log'
+import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
 import {
   MarginBlockedError,
   assessGuardLines,
@@ -6271,6 +6271,8 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
     let creditPpvSplit: Parameters<typeof buildSupplierCreditNoteSyncPayload>[0]['ppvSplit'] | undefined
     // What the PPV lines actually carry (a reverse-charge plan may leave a residue on transit, o3d-tqs3o).
     let creditPpvPlacedForeign = creditPpvNetForeign
+    // o3d-tqs3o: a residue no plan line could take; its WARNING is written inside the post's transaction (only a post that commits reports it).
+    let creditPpvResidueForeign = new Prisma.Decimal(0)
     if (splitCreditPpv && creditBill) {
       if (reverseChargePlan) {
         // o3d-tqs3o: the plan spreads the credit over the bill's lines pro rata, so the returned line's plan line can carry less than its price variance.
@@ -6302,18 +6304,7 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
           return { ppvNet: ppvNet.toNumber(), ppvVat: ppvVat.toNumber(), stockVat: toDecimal(line.vat).sub(ppvVat).toNumber() }
         })
         creditPpvPlacedForeign = placed.reduce((sum, v) => sum.add(v), new Prisma.Decimal(0))
-        if (!residue.isZero()) {
-          await logActivity({
-            entityType: 'PURCHASE_ORDER',
-            entityId: cn.poId,
-            action: 'supplier_credit_note_ppv_residue',
-            tag: 'accounting',
-            level: 'WARNING',
-            description: `Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference}: ${cn.currency} ${residue.toFixed(2)} of the price variance it reverses `
-              + 'is larger than the credit\'s share of the bill\'s lines, so it stays on Stock in Transit (the GR/IR report shows it). Review it with the accountant.',
-            metadata: { creditNoteId: cn.id, reference: cn.po.reference, residueForeign: residue.toString() },
-          }).catch(() => { /* the post is unaffected */ })
-        }
+        creditPpvResidueForeign = residue
         creditPpvSplit = { account: creditPpvAccount, plan }
       } else {
         const goodsRate = billTreatments.find((t, i) => creditBill.lines[i]?.poLineId)?.rate ?? 0
@@ -6440,6 +6431,19 @@ export async function postSupplierCreditNote(id: string): Promise<{ success: boo
         if (!sameBill || !sameAllocation) throw new SupplierCreditNoteChangedWhilePosting(cn.id)
       }
       if (creditPpvBase) await tx.supplierCreditNote.update({ where: { id: cn.id }, data: { ppvBase: creditPpvBase } })
+      if (!creditPpvResidueForeign.isZero()) {
+        await logActivityInTransaction(tx, {
+          userId: null,
+          entityType: 'PURCHASE_ORDER',
+          entityId: cn.poId,
+          action: 'supplier_credit_note_ppv_residue',
+          tag: 'accounting',
+          level: 'WARNING',
+          description: `Supplier credit note ${cn.creditNoteNumber ?? cn.id} for ${cn.po.reference}: ${cn.currency} ${creditPpvResidueForeign.toFixed(2)} of the price variance it reverses `
+            + 'is larger than the credit\'s share of the bill\'s lines, so it stays on Stock in Transit (the GR/IR report shows it). Review it with the accountant.',
+          metadata: { creditNoteId: cn.id, reference: cn.po.reference, residueForeign: creditPpvResidueForeign.toString() },
+        })
+      }
       if (cn.isReturnGenerated) {
         // Per-event FX (step 3b): a credit reversing a bill valued under the switch clears GR/IR at THAT bill's stock value per unit (what the bill
         // accrued its unreceived quantity at), not at the PO valuation; the rest of its net is the price-variance reversal, as before.

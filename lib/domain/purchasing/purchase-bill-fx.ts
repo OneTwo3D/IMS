@@ -442,8 +442,11 @@ export type ReconcilePurchaseBillFxParams = {
   billEventInvoiceId?: string
   /** LOW: compute what would be queued without queueing it (the caller rolls the transaction back): `journals` lists the deltas. */
   dryRun?: boolean
-  /** MED-C proposal only (with `dryRun`): treat these bills as confirmed by the owner, to show the journal a confirmation would post. */
-  assumeConfirmedInvoiceIds?: ReadonlySet<string>
+  /**
+   * MED-C proposal only (with `dryRun`): treat these bills as confirmed by the owner, each at the CurrencyRate its Xero bill carries (null = its own GR/IR
+   * value), to show the journal a confirmation would post.
+   */
+  assumeConfirmed?: ReadonlyMap<string, Decimal | null>
 }
 
 type Accum = { balQty: Decimal; balBase: Decimal; fx: Decimal; ppv: Decimal; rows: number; journalDate: Date | null }
@@ -464,7 +467,8 @@ export async function reconcilePurchaseBillFx(
   const po = await tx.purchaseOrder.findUnique({
     where: { id: params.poId },
     select: {
-      reference: true, currency: true, supplierId: true,
+      reference: true, currency: true, supplierId: true, subtotalForeign: true,
+      lines: { select: { id: true, unitCostForeign: true, totalForeign: true } },
       freightCostLines: { select: { id: true, amountForeign: true, amountBase: true } },
     },
   })
@@ -532,6 +536,39 @@ export async function reconcilePurchaseBillFx(
       }),
     }
   }), poRateUnitBase)
+  // MED-C: the bills an admin confirmed as posted to Xero OUTSIDE IMS (`purchase_fx_non_ims_bill_approvals`, purchase-fx-non-ims-bills.ts), each with the
+  // CurrencyRate its Xero bill was read at. Their GR/IR is corrected as for any bill from before the switch (above); what sits in Stock in Transit for
+  // them is the Xero bill's goods at the XERO rate, so the exchange-rate journal is measured on that basis: the order's goods cost (after the header
+  // discount) at the Xero rate, matched to the receipts in the same order. The bill's price difference stays on transit (owner ruling 2026-11-26).
+  const confirmedRows = await tx.purchaseFxNonImsBillApproval.findMany({ where: { poId: params.poId }, select: { invoiceId: true, xeroCurrencyRate: true } })
+  const confirmedRate = new Map<string, Decimal | null>(confirmedRows.map((row) => [row.invoiceId, row.xeroCurrencyRate === null ? null : toDecimal(row.xeroCurrencyRate)]))
+  if (params.dryRun) for (const [id, rate] of params.assumeConfirmed ?? []) confirmedRate.set(id, rate)
+  const xeroRated = [...confirmedRate.entries()].filter(([, rate]) => rate !== null)
+  let journalTargets = targets
+  if (xeroRated.length > 0) {
+    const stockUnits = stockUnitsForeign(po)
+    const journalUnitBase = (invoiceId: string, poLineId: string): Decimal | undefined => {
+      const rate = confirmedRate.get(invoiceId)
+      const unit = stockUnits.get(poLineId)
+      if (rate && unit) return unit.div(rate)
+      return poRateUnitBase(invoiceId, poLineId)
+    }
+    journalTargets = matchBillsToReceipts(lotsByLine, bills.map((bill) => {
+      const rate = bill.fxEventRateToBase ? toDecimal(bill.fxEventRateToBase) : null
+      return {
+        invoiceId: bill.id,
+        managed: managed.has(bill.id),
+        rateToBase: rate,
+        lines: bill.lines.flatMap((line) => {
+          if (!line.poLineId) return []
+          const qty = toDecimal(line.qtyBilled)
+          const stockForeign = line.stockUnitForeign !== null ? roundMoney(qty.mul(toDecimal(line.stockUnitForeign)), po.currency) : toDecimal(line.totalForeign)
+          const stockBase4 = rate ? roundQuantity(stockForeign.div(rate), 4) : toDecimal(line.totalBase)
+          return [{ poLineId: line.poLineId, qty, stockForeign, ppvBase: toDecimal(line.totalBase).sub(stockBase4) }]
+        }),
+      }
+    }), journalUnitBase)
+  }
 
   // ── GR/IR: target rows per (bill, line), against what is recorded under this writer's keys (a deleted bill's rows go back to zero). ──
   const recorded = await tx.grirSubledgerMovement.findMany({
@@ -597,7 +634,7 @@ export async function reconcilePurchaseBillFx(
 
   // ── Stock in Transit: one GBP journal per bill for the change in its FX difference (goods lines per receipt, plus freight lines vs the PO rate). ──
   const fxByBill = new Map<string, Decimal>()
-  for (const target of targets) fxByBill.set(target.invoiceId, (fxByBill.get(target.invoiceId) ?? zero()).add(target.fxVarianceBase))
+  for (const target of journalTargets) fxByBill.set(target.invoiceId, (fxByBill.get(target.invoiceId) ?? zero()).add(target.fxVarianceBase))
   const costLineById = new Map(po.freightCostLines.map((line) => [line.id, line]))
   for (const bill of managed.values()) {
     for (const line of bill.lines) {
@@ -640,9 +677,7 @@ export async function reconcilePurchaseBillFx(
   })).map((row) => row.idempotencyKey)
   // MED-C (owner ruling "post a one-off journal"): a bill that reached Xero OUTSIDE IMS has no such row; once an admin has confirmed it
   // (`purchase_fx_non_ims_bill_approvals`, lib/domain/purchasing/purchase-fx-non-ims-bills.ts) it is treated as being in transit at its own GR/IR value.
-  const confirmed = new Set((await tx.purchaseFxNonImsBillApproval.findMany({ where: { poId: params.poId }, select: { invoiceId: true } })).map((row) => row.invoiceId))
-  if (params.dryRun) for (const id of params.assumeConfirmedInvoiceIds ?? []) confirmed.add(id)
-  const billPosted = (invoiceId: string): boolean => confirmed.has(invoiceId) || billTransitKeys.some((key) => key.startsWith(`purchase-invoice:${invoiceId}:`))
+  const billPosted = (invoiceId: string): boolean => confirmedRate.has(invoiceId) || billTransitKeys.some((key) => key.startsWith(`purchase-invoice:${invoiceId}:`))
   const billIds = new Set([...fxByBill.keys(), ...postedByBill.keys()])
   const result: PurchaseBillFxReconcileResult = { journals: [], notQueued: [], shadowed: [] }
   let accounts: { transit: string; realisedFx: string } | null = null

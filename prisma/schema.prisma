@@ -6687,6 +6687,13 @@ model PurchaseFxNonImsBillApproval {
   reason               String
   proposedTransitDelta Decimal  @db.Decimal(18, 2) @map("proposed_transit_delta")
   approvedAt           DateTime @default(now()) @map("approved_at")
+  /// The Xero bill the confirmation was read from (read-only, once), and what it said: its CurrencyRate (1 base = rate foreign; the basis of the journal),
+  /// the base value of its lines on Stock in Transit, and the part of that which is the order's goods cost (the rest is price difference, left on transit).
+  /// NULL = a confirmation recorded before the Xero read existed: measured at the bill's own GR/IR value.
+  xeroInvoiceId        String?  @map("xero_invoice_id")
+  xeroCurrencyRate     Decimal? @db.Decimal(28, 12) @map("xero_currency_rate")
+  xeroTransitBase      Decimal? @db.Decimal(18, 2) @map("xero_transit_base")
+  stockTransitBase     Decimal? @db.Decimal(18, 2) @map("stock_transit_base")
 
   @@index([poId])
   @@map("purchase_fx_non_ims_bill_approvals")

@@ -466,9 +466,13 @@ export function buildSupplierCreditNoteSyncPayload(params: {
       const split = ppvPlan?.[i]
       if (!split || split.ppvNet === 0 || !params.ppvSplit) return [planLine(`${params.reason ?? 'Supplier credit note'} (bill line ${i + 1})`, l.net, params.transitAccount)]
       const stockNet = roundMoney(toDecimal(l.net).sub(split.ppvNet), params.currency).toNumber()
-      // A plan line whose whole net is price variance carries no stock part (no zero line is sent).
+      // A plan line whose whole net is price variance carries no stock part (no zero line is sent); a rounding penny of VAT left on that empty stock part
+      // is folded into the price-variance line's VAT, so the line's VAT still adds up to its own.
+      if (stockNet === 0) {
+        return [planLine(`${params.reason ?? 'Supplier credit note'} (bill line ${i + 1}, purchase price variance)`, split.ppvNet, params.ppvSplit.account, roundMoney(toDecimal(split.ppvVat).add(split.stockVat), params.currency).toNumber())]
+      }
       return [
-        ...(stockNet === 0 && split.stockVat === 0 ? [] : [planLine(`${params.reason ?? 'Supplier credit note'} (bill line ${i + 1})`, stockNet, params.transitAccount, split.stockVat)]),
+        planLine(`${params.reason ?? 'Supplier credit note'} (bill line ${i + 1})`, stockNet, params.transitAccount, split.stockVat),
         planLine(`${params.reason ?? 'Supplier credit note'} (bill line ${i + 1}, purchase price variance)`, split.ppvNet, params.ppvSplit.account, split.ppvVat),
       ]
     })
