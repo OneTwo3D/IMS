@@ -441,7 +441,7 @@ test('refund_returns_in_transit_enabled: an ADMIN switch, off by default, key eq
 })
 
 test('purchase_event_fx_rates_enabled: BILL-WRITER interlock - refused while the hold shadows supplier bills (judged on the installation env file over the shell), and when the hold variable is in neither (MUTATION: drop the check => red)', () => withStepsInstalled(async () => {
-  const { mkdtempSync, writeFileSync, chmodSync } = await import('node:fs')
+  const { mkdtempSync, writeFileSync, chmodSync, rmSync } = await import('node:fs')
   const { join } = await import('node:path')
   const { tmpdir } = await import('node:os')
   const mapped = () => fakeDb({ xero_sync_enabled: 'true', xero_realised_fx_gain_loss_account: '499', xero_purchase_price_variance_account: '510' })
@@ -452,6 +452,7 @@ test('purchase_event_fx_rates_enabled: BILL-WRITER interlock - refused while the
   assert.equal(shadowShell.code, 3)
   assert.match(shadowShell.err, /shadows supplier bills/)
   const dir = mkdtempSync(join(tmpdir(), 'pfx-env-'))
+  try {
   const file = join(dir, 'ims.env')
   writeFileSync(file, 'PRODUCER_HOLD_ENFORCED_DESTINATIONS=xero\n')
   chmodSync(file, 0o600)
@@ -466,4 +467,7 @@ test('purchase_event_fx_rates_enabled: BILL-WRITER interlock - refused while the
   const loose = await run('set', [...FX_ON, '--env-file', file], mapped(), undefined, HOLD_NOT_ENFORCED)
   assert.equal(loose.code, 3)
   assert.match(loose.err, /--env-file: .*mode 600/)
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 }))
