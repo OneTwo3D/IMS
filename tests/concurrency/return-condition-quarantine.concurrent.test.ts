@@ -390,6 +390,44 @@ test('Mintsoft returns inbox: an unsellable unit held at the 3PL is never quaran
   assert.match(row.resolutionNote ?? '', /condition: sellable/)
 })
 
+test('refund dialog: an unsellable return of units shipped from a 3PL (WMS-bound warehouse, or an order the WMS holds) is refused before any write', SKIP, async (t) => {
+  const w = await seedWorld({ orders: 1 })
+  t.after(async () => {
+    const { db } = await loadDeps()
+    await db.wmsOrderPushLink.deleteMany({ where: { orderId: { in: w.orders.map((o) => o.orderId) } } })
+    await w.teardown()
+  })
+  const { db, sales, quarantine } = await loadDeps()
+  await setSwitch(true)
+  const r = returnLine(w, 0)
+  const nothingWritten = async () => {
+    assert.equal(await db.salesOrderRefund.count({ where: { orderId: r.orderId } }), 0, 'refused: no refund')
+    assert.deepEqual(await stockAt(w, w.qar.id), { qty: 0, reserved: 0, layers: [] }, 'refused: nothing in quarantine')
+  }
+
+  // The order shipped from MAIN, and MAIN is bound to the warehouse system (aligned to it).
+  const connection = await db.wmsConnection.create({ data: { connector: 'mintsoft', label: `qc-${w.tag}` }, select: { id: true } })
+  const binding = await db.externalWmsBinding.create({ data: { connectionId: connection.id, warehouseId: w.main.id, connector: 'mintsoft', externalWarehouseId: `qc-ext-${w.tag}`, stockSyncMode: 'ALIGN_TO_WMS', stockMasterSystem: 'WMS' }, select: { id: true } })
+  const bound = await sales.createRefund(r.orderId, r.lines, 'qc return', w.qar.id, { returnCondition: 'UNSELLABLE' })
+  assert.equal(bound.success, false)
+  assert.equal(bound.error, quarantine.WMS_UNSELLABLE_REFUND_REFUSAL)
+  await nothingWritten()
+
+  // No binding, but the warehouse system holds the order (a SYNCED push link): refused the same way.
+  await db.externalWmsBinding.delete({ where: { id: binding.id } })
+  await db.wmsOrderPushLink.create({ data: { orderId: r.orderId, connector: 'mintsoft', state: 'SYNCED' } })
+  const pushed = await sales.createRefund(r.orderId, r.lines, 'qc return', w.qar.id, { returnCondition: 'UNSELLABLE' })
+  assert.equal(pushed.success, false)
+  assert.equal(pushed.error, quarantine.WMS_UNSELLABLE_REFUND_REFUSAL)
+  await nothingWritten()
+
+  // Control: neither, the same unsellable return is quarantined.
+  await db.wmsOrderPushLink.deleteMany({ where: { orderId: r.orderId } })
+  const own = await sales.createRefund(r.orderId, r.lines, 'qc return', w.qar.id, { returnCondition: 'UNSELLABLE' })
+  assert.equal(own.success, true, own.error)
+  assert.equal((await stockAt(w, w.qar.id)).qty, 1)
+})
+
 test('a warehouse with sellable work cannot become a quarantine warehouse; an allocation is never grown in quarantine; forecasts leave quarantine out', SKIP, async (t) => {
   const w = await seedWorld({ orders: 2 })
   t.after(() => w.teardown())

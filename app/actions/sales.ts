@@ -200,7 +200,7 @@ import { deleteSalesOrderAttachmentsInTx, drainOrderAttachmentFileDeletions } fr
 import { recordPegsRemovedWithLines } from '@/lib/domain/sales/peg-service'
 import { SHOP_DESYNC_WARNING, paidOrderTotalChangeRefusal, resolveSalesOrderAddressEditBlock, resolveSalesOrderEditBlock, shopDesyncAcknowledgementRefusal, type SalesOrderEditInput } from '@/lib/domain/sales/order-edit-affordance'
 import { RETURN_EXCHANGE_OFF_REFUSAL, RETURN_EXCHANGE_SETTING_KEY, exchangeRequestRefusal, resolveReturnExchangeBlock, returnExchangeEnabledFromSetting, returnExchangeRefusals } from '@/lib/domain/sales/return-exchange'
-import { parseReturnCondition, readReturnConditionCheckEnabled, returnConditionRestockRefusal, type ReturnCondition } from '@/lib/domain/inventory/quarantine-warehouse'
+import { parseReturnCondition, readReturnConditionCheckEnabled, refundReturnsToWmsWarehouse, returnConditionRestockRefusal, WMS_UNSELLABLE_REFUND_REFUSAL, type ReturnCondition } from '@/lib/domain/inventory/quarantine-warehouse'
 import { hasPermission } from '@/lib/permissions'
 import { buildSalesOrderWriteModel, type SalesOrderWriteModel } from '@/lib/domain/sales/sales-order-write-model'
 import { isQuoteExpired, quoteDateToYmd, quoteStatusMoveRefused, quoteYmdToDate, validateQuoteInput } from '@/lib/domain/sales/sales-quote'
@@ -3735,6 +3735,13 @@ export async function createRefund(
       if (returnWarehouse) {
         const refusal = returnConditionRestockRefusal({ enabled: true, condition: returnCondition, warehouse: returnWarehouse })
         if (refusal) return { success: false, error: refusal }
+      }
+      // Quarantine is IMS-only: units that shipped from a warehouse-system (3PL) warehouse go back there, where the warehouse system counts
+      // them and alignment would book them a second time. Refused before anything is written, as the returns inbox refuses it.
+      if (returnCondition === 'UNSELLABLE') {
+        const refundedLines = lines.filter((line) => line.qty > 0)
+        const lineIds = refundedLines.every((line) => line.lineId) ? refundedLines.map((line) => line.lineId as string) : null
+        if (await refundReturnsToWmsWarehouse(db, { orderId, lineIds })) return { success: false, error: WMS_UNSELLABLE_REFUND_REFUSAL }
       }
     }
     let returnReasonId: string | null = null

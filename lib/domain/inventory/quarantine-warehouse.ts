@@ -241,3 +241,30 @@ export async function listQuarantineWarehouseIssues(
   }
   return issues
 }
+
+export const WMS_UNSELLABLE_REFUND_REFUSAL =
+  'These units shipped from a 3PL warehouse (bound to the warehouse system), so they go back to the 3PL, and quarantine is kept in IMS only: the warehouse system would count them again and stock alignment would book them into the bound warehouse a second time. Record the refund as sellable into that warehouse and handle the unsellable unit at the 3PL, or record it with no stock return. Nothing was recorded.'
+
+/**
+ * The refund dialog's counterpart of the returns-inbox rule: units that shipped from a warehouse bound to a warehouse system (or an
+ * order the warehouse system holds, a SYNCED push link) come back to that 3PL, where the warehouse system counts them again. With the
+ * switch on, such an UNSELLABLE return cannot be quarantined in IMS (quarantine is IMS-only): the same refusal as the inbox.
+ * `lineIds` are the refunded order lines; null means some refund line names no order line, so every shipment of the order counts.
+ */
+export async function refundReturnsToWmsWarehouse(
+  client: Pick<Prisma.TransactionClient, 'wmsOrderPushLink' | 'shipment'>,
+  params: { orderId: string; lineIds: readonly string[] | null },
+): Promise<boolean> {
+  const link = await client.wmsOrderPushLink.findFirst({ where: { orderId: params.orderId, state: 'SYNCED' }, select: { id: true } })
+  if (link) return true
+  const bound = await client.shipment.findFirst({
+    where: {
+      orderId: params.orderId,
+      status: { not: 'PENDING' },
+      warehouse: { wmsBindings: { some: {} } },
+      ...(params.lineIds ? { lines: { some: { lineId: { in: [...params.lineIds] } } } } : {}),
+    },
+    select: { id: true },
+  })
+  return bound != null
+}
