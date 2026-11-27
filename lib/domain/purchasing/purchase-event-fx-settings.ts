@@ -16,7 +16,7 @@ type SettingReadClient = { setting: { findUnique(args: { where: { key: string };
 
 let stepsCompleteOverrideForTests: boolean | null = null
 
-/** TESTS ONLY: exercise the switch-on behaviour of steps that are built but not yet released. `null` restores the real interlock. */
+/** TESTS ONLY: force the interlock (true: installed; false: a build before the last step, so the switch reads off). `null` restores the real interlock. */
 export function setPurchaseEventFxStepsCompleteForTests(value: boolean | null): void {
   stepsCompleteOverrideForTests = value
 }

@@ -92,6 +92,12 @@ type Props = {
   poEmailEnabled: boolean
   /** o3d-ngmt.21: per bill id, whether to offer deleting the synced bill, or why not. */
   billDeleteStates?: Record<string, DocumentDeleteUiState>
+  /**
+   * Per-event FX (step 3b): the unit price a new bill line is prefilled with, per order line, while the switch is on for this foreign order: the PO
+   * goods unit cost after the order's header discount (what the bill's stock part is billed at), so an unchanged bill carries no price variance.
+   * Absent = the line's own unit cost, as before.
+   */
+  billUnitPrefillForeign?: Record<string, number>
   /** May this user write the internal per-line notes (purchasing.create). */
   canEditLineNotes?: boolean
   /** The signed-in user holds `purchasing.approve` (the server re-checks it, and that they are not the order's creator). */
@@ -809,10 +815,12 @@ type BillCostLineState = {
 function BillDialog({
   po,
   currencies,
+  unitPrefillForeign,
   onClose,
 }: {
   po: PoDetail
   currencies: CurrencyRow[]
+  unitPrefillForeign?: Record<string, number>
   onClose: () => void
 }) {
   const baseCurrency = useBaseCurrency()
@@ -855,7 +863,7 @@ function BillDialog({
           qtyReceived: l.qtyReceived,
           alreadyBilled: l.qtyBilled,
           remaining,
-          unitCostForeign: l.unitCostForeign,
+          unitCostForeign: unitPrefillForeign?.[l.id] ?? l.unitCostForeign,
           selected: true,
           qtyBilled,
           // Per-line tax rate: use the saved per-line rate when set (mixed-VAT
@@ -981,6 +989,8 @@ function BillDialog({
         ],
       })
       if (result.success) {
+        // Per-event FX: a bill valued at the exchange-rate table rate while Xero sync is on is saved, and the operator is told why.
+        if (result.warning) window.alert(result.warning)
         router.refresh()
         onClose()
       } else if (result.duplicateInvoiceNumber) {
@@ -2097,7 +2107,7 @@ function RetirePoDialog({
 // Main detail component
 // ---------------------------------------------------------------------------
 
-export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, showMargin, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled, canEditLineNotes = false, canApprove = false, currentUserId, billDeleteStates }: Props) {
+export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, products, warehouses, currencies, taxRates, purchaseUnits, carriers, companyHomeCountry, showMargin, accountingAvailable, accountingBillUrlTemplate, wmsAsnState, rejectedAccountingSyncs, overBilling, prepaidReconciliation, poEmailEnabled, canEditLineNotes = false, canApprove = false, currentUserId, billDeleteStates, billUnitPrefillForeign }: Props) {
   const baseCurrency = useBaseCurrency()
   const formatDateTime = useFormatDateTime()
   const router = useRouter()
@@ -3032,7 +3042,7 @@ export function PoDetailClient({ supplierSkus = {}, po: initialPo, suppliers, pr
 
       {/* Bill dialog */}
       {accountingAvailable && showBill && (
-        <BillDialog po={po} currencies={currencies} onClose={() => setShowBill(false)} />
+        <BillDialog po={po} currencies={currencies} unitPrefillForeign={billUnitPrefillForeign} onClose={() => setShowBill(false)} />
       )}
 
       {/* Pay Bill dialog */}

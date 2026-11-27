@@ -35,7 +35,7 @@ import { PURCHASE_PRICE_VARIANCE_ACCOUNT_KEY, REALISED_FX_ACCOUNT_KEY } from '@/
  * only while it is at most 15 minutes old (`NO_PREPAYMENT_FRESH_MS`): a prepayment recorded since an older read is never missed by a fallback receipt.
  * A manual receipt and a bill always ask (`cache: 'manual'`). The hourly alignment sweep shares one memo across all its products
  * (`PurchaseFxSweepMemo`), so each order is asked at most once per sweep however many products it carries; and an order whose prepayment could not be
- * established is not asked again by an automatic receipt for a while (`REFUSED_RECHECK_MS`). The notice of a fallback receipt says when Xero was asked.
+ * established is not asked again by an automatic receipt for a while (`REFUSED_RECHECK_MS`, remembered on the order, MED-5). The notice of a fallback receipt says when Xero was asked.
  *
  * THE GOODS UNIT COST. `unitCostForeign` (the line's net cost per stock unit: after the line discount and VAT extraction, in the order's currency)
  * x the order's header-discount factor (read from the FOREIGN totals, `subtotalForeign / SUM(line.totalForeign)`, the same function as the base
@@ -187,6 +187,10 @@ type PoForPrepayment = {
   reference: string
   currency: string
   fxNoPrepaymentCheckedAt: Date | null
+  fxPrepaymentRefusedAt: Date | null
+  fxPrepaymentRefusedUntil: Date | null
+  fxPrepaymentRefusedReason: string | null
+  fxPrepaymentRefusedTransient: boolean | null
   supplier: { id: string; name: string; email: string | null; accountingContactId: string | null; accountingContactProvenance: string | null }
 }
 
@@ -195,6 +199,7 @@ async function loadPoForPrepayment(poId: string): Promise<PoForPrepayment | null
     where: { id: poId },
     select: {
       id: true, reference: true, currency: true, fxNoPrepaymentCheckedAt: true,
+      fxPrepaymentRefusedAt: true, fxPrepaymentRefusedUntil: true, fxPrepaymentRefusedReason: true, fxPrepaymentRefusedTransient: true,
       supplier: { select: { id: true, name: true, email: true, accountingContactId: true, accountingContactProvenance: true } },
     },
   })
@@ -290,15 +295,38 @@ export const NO_PREPAYMENT_FRESH_MS = 15 * 60 * 1000
 /** MED-1: a lock read this recently is not read again before its first receipt (an operator's own "Read from Xero" a moment ago counts). */
 export const UNUSED_LOCK_FRESH_MS = 5 * 60 * 1000
 /**
- * MED-B: an order whose prepayment could not be established is not asked again by an AUTOMATIC receipt for this long (process memory; a manual
- * receipt, a bill and "Read from Xero" always ask). A failed read waits less than real ambiguity, which only a person resolves.
+ * MED-B: an order whose prepayment could not be established is not asked again by an AUTOMATIC receipt for this long (a manual receipt, a bill and
+ * "Read from Xero" always ask). A failed read waits less than real ambiguity, which only a person resolves.
+ *
+ * Step 3b, MED-5: the remembered refusal is kept ON THE ORDER (`purchase_orders.fx_prepayment_refused_*`), not in process memory, so every process
+ * (the web app, the cron runner, the WMS worker) waits the same window; and it yields to anything newer: a lock read after it (an operator's "Read
+ * from Xero", another receipt's read) or a newer "no prepayment" answer. It is written and cleared with raw SQL so the order's `updatedAt` does not move.
  */
 export const REFUSED_RECHECK_MS = { transient: 15 * 60 * 1000, ambiguous: 60 * 60 * 1000 } as const
-const refusedAnswers = new Map<string, { check: Extract<PrepaymentCheck, { kind: 'refused' }>; until: number }>()
 
 /** TESTS ONLY: forget the remembered refusals. */
-export function clearPurchaseFxRefusalMemoryForTests(): void {
-  refusedAnswers.clear()
+export async function clearPurchaseFxRefusalMemoryForTests(): Promise<void> {
+  await db.$executeRaw`UPDATE purchase_orders SET fx_prepayment_refused_at = NULL, fx_prepayment_refused_until = NULL, fx_prepayment_refused_reason = NULL, fx_prepayment_refused_transient = NULL WHERE fx_prepayment_refused_at IS NOT NULL`
+}
+
+/** The order's remembered refusal, if it still stands: inside its window, and nothing newer has been learnt about the order since. */
+async function rememberedRefusal(po: PoForPrepayment, now: Date): Promise<Extract<PrepaymentCheck, { kind: 'refused' }> | null> {
+  if (!po.fxPrepaymentRefusedAt || !po.fxPrepaymentRefusedUntil || po.fxPrepaymentRefusedUntil.getTime() <= now.getTime()) return null
+  const refusedAt = po.fxPrepaymentRefusedAt.getTime()
+  if (po.fxNoPrepaymentCheckedAt && po.fxNoPrepaymentCheckedAt.getTime() > refusedAt) return null
+  const lock = await db.purchaseOrderFxLock.findUnique({ where: { poId: po.id }, select: { readAt: true } })
+  if (lock && lock.readAt.getTime() > refusedAt) return null
+  return { kind: 'refused', reason: po.fxPrepaymentRefusedReason ?? 'The Xero supplier prepayment could not be established.', transient: po.fxPrepaymentRefusedTransient === true }
+}
+
+async function rememberRefusal(poId: string, check: Extract<PrepaymentCheck, { kind: 'refused' }>, now: Date): Promise<void> {
+  const until = new Date(now.getTime() + (check.transient ? REFUSED_RECHECK_MS.transient : REFUSED_RECHECK_MS.ambiguous))
+  await db.$executeRaw`UPDATE purchase_orders SET fx_prepayment_refused_at = ${now}, fx_prepayment_refused_until = ${until}, fx_prepayment_refused_reason = ${check.reason}, fx_prepayment_refused_transient = ${check.transient} WHERE id = ${poId}`
+}
+
+async function forgetRefusal(po: PoForPrepayment): Promise<void> {
+  if (!po.fxPrepaymentRefusedAt) return
+  await db.$executeRaw`UPDATE purchase_orders SET fx_prepayment_refused_at = NULL, fx_prepayment_refused_until = NULL, fx_prepayment_refused_reason = NULL, fx_prepayment_refused_transient = NULL WHERE id = ${po.id}`
 }
 
 /** MED-B: one memo per alignment sweep, shared by every product it aligns, so an order is asked at most once per sweep. */
@@ -467,18 +495,18 @@ export async function preparePurchaseReceiptFx(poIds: Iterable<string>, options:
     }
     const po = await loadPoForPrepayment(poId)
     if (!po || po.currency.trim().toUpperCase() === baseCurrency) continue
-    const remembered = manual ? undefined : refusedAnswers.get(poId)
+    const remembered = manual ? null : await rememberedRefusal(po, ctx.now)
     let check: PrepaymentCheck
-    if (remembered && remembered.until > ctx.now.getTime()) {
-      check = remembered.check
+    if (remembered) {
+      check = remembered
     } else {
       try {
         check = await prepareOneOrder(po, ctx)
-        refusedAnswers.delete(poId)
+        await forgetRefusal(po)
       } catch (error) {
         if (!isPurchaseFxRefusalError(error)) throw error
         check = { kind: 'refused', reason: error.message, transient: error.transient }
-        refusedAnswers.set(poId, { check, until: ctx.now.getTime() + (error.transient ? REFUSED_RECHECK_MS.transient : REFUSED_RECHECK_MS.ambiguous) })
+        await rememberRefusal(poId, check, ctx.now)
       }
     }
     options.memo?.set(poId, check)

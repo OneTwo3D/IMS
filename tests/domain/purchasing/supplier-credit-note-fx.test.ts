@@ -125,6 +125,6 @@ test('posting path: the transit base of a credit note is computed with the helpe
   const multiplying = source.match(/Number\(cn\.amountForeign\)\s*\*\s*Number\(cn\.fxRateToBase\)|mul\(fxRateToBase\)/g) ?? []
   const viaHelper = source.match(/supplierCreditNoteAmountBase\(/g) ?? []
   console.log(`source PRECONDITION: multiplying sites=${multiplying.length}, helper call sites=${viaHelper.length}`)
-  assert.equal(viaHelper.length, 3, 'the record action and both posting transit bases (standard and reverse-charge) use the helper')
+  assert.equal(viaHelper.length, 4, 'the record action, both posting transit bases (standard and reverse-charge) and a no-bill credit re-valued at its posting date (per-event FX) use the helper')
   assert.equal(multiplying.length, 0)
 })

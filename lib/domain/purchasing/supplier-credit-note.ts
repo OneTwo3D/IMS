@@ -106,7 +106,8 @@ export function billNetPayable(lines: ReadonlyArray<SupplierCreditBillLine>, cur
 
 export type ReverseChargeCreditPlan = {
   /** One Xero credit line per bill line that carries a share of the credit: exclusive net, the line's own booked code. */
-  lines: Array<{ net: number; vat: number; taxType: string | undefined; taxRateId?: string; reverseCharge: boolean }>
+  /** `billLineIndex`: the bill line (index into the plan's input lines) the credit line carries a share of. */
+  lines: Array<{ net: number; vat: number; taxType: string | undefined; taxRateId?: string; reverseCharge: boolean; billLineIndex: number }>
   /** The credit's net: the sum of the line nets. This is what leaves the transit clearing account. */
   netTotal: number
   /** What Xero will hold as the credit's total (net lines plus the VAT Xero adds on standard lines); never above the credit amount. This is what is allocated to the bill. */
@@ -232,7 +233,7 @@ export function planReverseChargeSupplierCredit(params: { amount: number; lines:
     netSum += nets[i]
     const net = toDecimal(nets[i]).mul(minor)
     const vat = toDecimal(gross(i, nets[i]) - nets[i]).mul(minor)
-    lines.push({ net: net.toNumber(), vat: vat.toNumber(), taxType: l.taxType, ...(l.taxRateId ? { taxRateId: l.taxRateId } : {}), reverseCharge: l.reverseCharge })
+    lines.push({ net: net.toNumber(), vat: vat.toNumber(), taxType: l.taxType, ...(l.taxRateId ? { taxRateId: l.taxRateId } : {}), reverseCharge: l.reverseCharge, billLineIndex: i })
   })
   return { lines, netTotal: toDecimal(netSum).mul(minor).toNumber(), xeroTotal: amount.toNumber() }
 }
@@ -434,30 +435,60 @@ export function buildSupplierCreditNoteSyncPayload(params: {
    * line; the allocation is then `allocateAmount`. `amountForeign`, `taxType` and `lineAmountsIncludeTax` are ignored for the lines.
    */
   reverseChargePlan?: ReverseChargeCreditPlan
+  /**
+   * Per-event FX (step 3b): a return credit reversing a bill whose price difference went to the purchase price variance account is split the same
+   * way, the price-variance part on its own line coded to `account` with the same tax type, every part with an exact LineAmount (net) and TaxAmount:
+   *  - `single`: the one-line credit becomes a stock line on transit and a PPV line, EXCLUSIVE (net + tax per part adding up to the credit);
+   *  - `plan`: per reverse-charge plan line (same index), the part of its net that is price variance (and, for a standard line, the VAT of each part,
+   *    adding up to the line's own VAT); a reverse-charge line carries no TaxAmount (Xero self-accounts it on each part).
+   * Omitted = as before.
+   */
+  ppvSplit?: {
+    account: string
+    single?: { stockNet: number; stockTax: number; ppvNet: number; ppvTax: number }
+    plan?: ReadonlyArray<{ ppvNet: number; stockVat: number; ppvVat: number } | null>
+  }
 }): Record<string, unknown> {
   const planned = params.reverseChargePlan
+  const ppvPlan = planned ? params.ppvSplit?.plan : undefined
   const lines = planned
-    ? planned.lines.map((l, i) => ({
-      description: `${params.reason ?? 'Supplier credit note'} (bill line ${i + 1})`,
-      quantity: 1,
-      unitAmount: l.net,
-      accountCode: params.transitAccount,
-      taxType: l.taxType,
-      ...(noVatRateKind(l.taxType) ? { noTaxKind: noVatRateKind(l.taxType) } : {}),
-      ...(l.taxRateId ? rateBinding(l.taxRateId, 'purchase_line') : {}),
-    }))
-    : [
-      {
-        description: params.reason ?? 'Supplier credit note',
+    ? planned.lines.flatMap((l, i) => {
+      const planLine = (description: string, net: number, accountCode: string, vat?: number) => ({
+        description,
         quantity: 1,
-        unitAmount: params.amountForeign,
-        accountCode: params.transitAccount,
+        unitAmount: net,
+        accountCode,
+        taxType: l.taxType,
+        ...(noVatRateKind(l.taxType) ? { noTaxKind: noVatRateKind(l.taxType) } : {}),
+        ...(l.taxRateId ? rateBinding(l.taxRateId, 'purchase_line') : {}),
+        ...(vat === undefined ? {} : { lineAmount: net, ...(l.reverseCharge ? {} : { taxAmount: vat }) }),
+      })
+      const split = ppvPlan?.[i]
+      if (!split || split.ppvNet === 0 || !params.ppvSplit) return [planLine(`${params.reason ?? 'Supplier credit note'} (bill line ${i + 1})`, l.net, params.transitAccount)]
+      const stockNet = roundMoney(toDecimal(l.net).sub(split.ppvNet), params.currency).toNumber()
+      return [
+        planLine(`${params.reason ?? 'Supplier credit note'} (bill line ${i + 1})`, stockNet, params.transitAccount, split.stockVat),
+        planLine(`${params.reason ?? 'Supplier credit note'} (bill line ${i + 1}, purchase price variance)`, split.ppvNet, params.ppvSplit.account, split.ppvVat),
+      ]
+    })
+    : (() => {
+      const line = (description: string, unitAmount: number, accountCode: string) => ({
+        description,
+        quantity: 1,
+        unitAmount,
+        accountCode,
         taxType: params.taxType,
         // A NONE here is a decision (the offset bill carried no VAT, or the supplier's rate is itself No VAT), so it names its kind.
         ...(noVatRateKind(params.taxType) ? { noTaxKind: noVatRateKind(params.taxType) } : {}),
         ...(params.taxRateBasis ? rateBinding(params.taxRateId, params.taxRateBasis) : {}),
-      },
-    ]
+      })
+      const single = params.ppvSplit?.single
+      if (!params.ppvSplit || !single || single.ppvNet === 0) return [line(params.reason ?? 'Supplier credit note', params.amountForeign, params.transitAccount)]
+      return [
+        { ...line(params.reason ?? 'Supplier credit note', single.stockNet, params.transitAccount), lineAmount: single.stockNet, taxAmount: single.stockTax },
+        { ...line(`${params.reason ?? 'Supplier credit note'} (purchase price variance)`, single.ppvNet, params.ppvSplit.account), lineAmount: single.ppvNet, taxAmount: single.ppvTax },
+      ]
+    })()
   return {
     creditNoteNumber: mintedSupplierCreditNoteNumber(params.creditNoteId),
     contactName: params.supplierName,
@@ -471,7 +502,8 @@ export function buildSupplierCreditNoteSyncPayload(params: {
     // Reverse charge: the amount is NET and posts EXCLUSIVE so Xero applies the
     // notional RC VAT on top, mirroring the net/exclusive RC bill. With a NONE
     // tax type inclusive vs exclusive is identical (no VAT).
-    lineAmountsIncludeTax: planned ? false : (params.lineAmountsIncludeTax ?? true),
+    // A split one-line credit is sent EXCLUSIVE with each part's exact net and tax (the two add up to the credit).
+    lineAmountsIncludeTax: planned || (params.ppvSplit?.single && params.ppvSplit.single.ppvNet !== 0) ? false : (params.lineAmountsIncludeTax ?? true),
     reference: params.reference ?? undefined,
     supplierId: params.supplierId,
     // audit-v08m: only carried when the bill has an external id — the follow-up
@@ -495,6 +527,18 @@ export function buildSupplierCreditNoteSyncPayload(params: {
  * `reason` decides the operator's remedy: a `refused` is a connector-selection/provenance problem that
  * no setting toggle fixes, everything else is a posting setting.
  */
+/**
+ * #1157 LOW-4: the bill a return credit reverses, or the GR/IR allocation its price-variance split was worked out from, changed between the read and the
+ * locks of the post (a bill edit, another return or credit committed meanwhile). Nothing is claimed: the credit stays a draft and posting it again works
+ * the split out afresh.
+ */
+export class SupplierCreditNoteChangedWhilePosting extends Error {
+  constructor(readonly creditNoteId: string) {
+    super(withLedgerCheck('The credit note was NOT posted (it is still a draft): its bill, or what it credits, changed while it was being posted. Post it again.'))
+    this.name = 'SupplierCreditNoteChangedWhilePosting'
+  }
+}
+
 export class SupplierCreditNoteEnqueueDeclined extends Error {
   constructor(
     readonly creditNoteId: string,

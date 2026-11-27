@@ -334,6 +334,9 @@ export function buildXeroPurchaseCreditNote(
         AccountCode: line.accountCode,
         TaxType: line.taxType,
       }
+      // Per-event purchase FX: a return credit split into its stock and price-variance parts carries the exact amount and tax IMS decided for each part.
+      if (typeof line.lineAmount === 'number') xeroLine.LineAmount = line.lineAmount
+      if (typeof line.taxAmount === 'number') xeroLine.TaxAmount = line.taxAmount
       if (line.itemCode) xeroLine.ItemCode = line.itemCode
       return xeroLine
   })

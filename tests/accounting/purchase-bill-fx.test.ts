@@ -284,7 +284,7 @@ test('switch OFF (or the interlock not complete): the bill is exactly as before 
   const { setPurchaseEventFxStepsCompleteForTests } = await import('@/lib/domain/purchasing/purchase-event-fx-settings')
   for (const how of ['switch off', 'interlock'] as const) {
     if (how === 'switch off') await setSettings({ purchase_event_fx_rates_enabled: 'false' })
-    else setPurchaseEventFxStepsCompleteForTests(null)
+    else setPurchaseEventFxStepsCompleteForTests(false)
     try {
       const po = await seedPo(10)
       await lockAt(po)
@@ -325,7 +325,7 @@ test('HIGH-2: a bill at the PO rate before switch-on, goods received at the lock
   const { setPurchaseEventFxStepsCompleteForTests } = await import('@/lib/domain/purchasing/purchase-event-fx-settings')
   const { listPurchaseFxInFlightOrders, rerunPurchaseBillFx } = await import('@/lib/domain/purchasing/purchase-bill-fx')
   const po = await seedPo(10)
-  setPurchaseEventFxStepsCompleteForTests(null) // switch-on has not happened yet: the bill is valued at the PO rate
+  setPurchaseEventFxStepsCompleteForTests(false) // switch-on has not happened yet: the bill is valued at the PO rate
   try {
     assert.equal((await bill(po, 10, 12.5)).success, true)
   } finally {
