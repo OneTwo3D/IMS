@@ -97,9 +97,11 @@ export const PURCHASE_EVENT_FX_SWITCH_KEY = 'purchase_event_fx_rates_enabled'
  * bill at the locked rate, the price-variance line and the FX-difference journal). Steps 1 and 2 alone value the stock at the prepayment rate while the
  * bill still goes to Xero at the PO rate, so turning the switch on before step 3 would leave a foreign purchase half-way through the policy. Turning it on
  * is refused while this is false, and the switch READS off while it is false (purchase-event-fx-settings.ts). Step 3 is installed in two parts (the bill side,
- * then supplier returns and credit notes); the second part flips it to true.
+ * then supplier returns and credit notes); the second part (3b) flipped it to true. The switch itself still needs the owner's go: it stays off until an admin
+ * turns it on with `npm run settings:set`, after the turn-on check (`npm run purchase-fx:reconcile -- --in-flight`) and the demo-tenant probe in
+ * docs/xero-sync.md.
  */
-export const PURCHASE_EVENT_FX_STEPS_COMPLETE = false
+export const PURCHASE_EVENT_FX_STEPS_COMPLETE = true
 export const PURCHASE_PRICE_VARIANCE_ACCOUNT_KEY = 'xero_purchase_price_variance_account'
 export const REALISED_FX_ACCOUNT_KEY = 'xero_realised_fx_gain_loss_account'
 

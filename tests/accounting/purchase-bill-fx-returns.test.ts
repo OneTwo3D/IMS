@@ -181,19 +181,32 @@ test('return then credit note: GR/IR takes back the consumed layers\' goods cost
   close(journal.transitNet, 17.5, 'transit: receipt -100, bill +78.125, return +20, credit -15.625 = -17.5; the journal clears it')
 })
 
-// [mutation: let a return before the bill leave its quantity in the lots]
-test('return before the bill: the returned goods are no longer received, so the bill matches only what is left', async () => {
+// [mutation: value the GR/IR return at the PO goods cost instead of the consumed layers' goods cost]
+test('return of goods valued at the lock: GR/IR takes back the layers\' own goods cost, not the PO cost', async () => {
   const po = await seedPo(10)
-  assert.equal((await receive(po, 10)).success, true) // table 1.25: 100
-  assert.equal((await returnGoods(po, 2)).success, true)
-  close(await grir(po, 'SUPPLIER_RETURN'), -20, 'the return at the layers\' goods cost')
-  assert.equal(await s.db.supplierCreditNote.count({ where: { poId: po.id } }), 0, 'nothing billed yet: no credit')
   await lockAt(po)
+  assert.equal((await receive(po, 10)).success, true) // at the lock: 7.8125 each = 78.125
+  assert.equal((await returnGoods(po, 2)).success, true)
+  close(await grir(po, 'SUPPLIER_RETURN'), -15.625, '2 x 7.8125 (the PO cost would be 2 x 10)')
   assert.equal((await bill(po, 8, 12.5)).success, true) // at the lock: 62.5
-  close(await grir(po, 'BILL_FX_VARIANCE'), 62.5 - 80, 'the 8 left, at the receipt\'s 10')
+  close(await grir(po, 'BILL_FX_VARIANCE'), 0, 'same rate: no difference')
+  close((await balance(po)).toNumber(), 0, 'GR/IR nets to zero')
+})
+
+// [mutation: let a return before the bill leave its quantity in the lots, or take it from the wrong receipt]
+test('return before the bill, mixed rates: the return takes back the receipt it consumed, and the bill matches what is left', async () => {
+  const po = await seedPo(10)
+  assert.equal((await receive(po, 4)).success, true) // table 1.25: 4 x 10 = 40
+  await lockAt(po)
+  assert.equal((await receive(po, 6)).success, true) // lock 1.6: 6 x 7.8125 = 46.875
+  assert.equal((await returnGoods(po, 2)).success, true) // FIFO: 2 of the table-rate layer
+  close(await grir(po, 'SUPPLIER_RETURN'), -20, 'the consumed (table-rate) layer\'s goods cost')
+  assert.equal(await s.db.supplierCreditNote.count({ where: { poId: po.id } }), 0, 'nothing billed yet: no credit')
+  assert.equal((await bill(po, 8, 12.5)).success, true) // at the lock: 62.5
+  close(await grir(po, 'BILL_FX_VARIANCE'), 62.5 - (20 + 46.875), '2 table-rate units left and the 6 lock-rate ones (the first 8 receipts would give -8.75)')
   close((await balance(po)).toNumber(), 0, 'GR/IR nets to zero')
   const journal = await reconcileWithPosting(po)
-  close(journal.transitNet, 17.5, 'transit: -100 + 20 + 62.5 = -17.5, cleared')
+  close(journal.transitNet, 4.38, 'transit: -40 - 46.875 + 20 + 62.5 = -4.375, cleared (rounded half up)')
 })
 
 // [mutation: post a credit with no bill at the PO rate, or at its 8dp record-time rate, or post it with no rate]
@@ -262,7 +275,7 @@ test('MED-A: the re-run refuses an order the switch never touched', async () => 
   const { setPurchaseEventFxStepsCompleteForTests } = await import('@/lib/domain/purchasing/purchase-event-fx-settings')
   const { rerunPurchaseBillFx, PurchaseFxNotReconcilableError } = await import('@/lib/domain/purchasing/purchase-bill-fx')
   const po = await seedPo(10)
-  setPurchaseEventFxStepsCompleteForTests(null)
+  setPurchaseEventFxStepsCompleteForTests(false)
   try {
     assert.equal((await receive(po, 10)).success, true)
     assert.equal((await bill(po, 10, 12.5)).success, true)
@@ -277,7 +290,7 @@ test('MED-A: the re-run refuses an order the switch never touched', async () => 
 test('MED-B: a bill from before the switch is valued at what it debited GR/IR with, even after the order\'s cost is edited', async () => {
   const { setPurchaseEventFxStepsCompleteForTests } = await import('@/lib/domain/purchasing/purchase-event-fx-settings')
   const po = await seedPo(10)
-  setPurchaseEventFxStepsCompleteForTests(null)
+  setPurchaseEventFxStepsCompleteForTests(false)
   try {
     assert.equal((await bill(po, 10, 12.5)).success, true) // PO rate: 100, GR/IR -100
   } finally {
@@ -333,7 +346,7 @@ test('--in-flight: returns count against received, and a bill IMS did not post i
   const { setPurchaseEventFxStepsCompleteForTests } = await import('@/lib/domain/purchasing/purchase-event-fx-settings')
   const { listPurchaseFxInFlightOrders } = await import('@/lib/domain/purchasing/purchase-bill-fx')
   const po = await seedPo(10)
-  setPurchaseEventFxStepsCompleteForTests(null)
+  setPurchaseEventFxStepsCompleteForTests(false)
   try {
     assert.equal((await receive(po, 10)).success, true)
     assert.equal((await bill(po, 10, 12.5)).success, true)
@@ -400,4 +413,28 @@ test('a bill valued at the table rate while Xero sync is on is saved with a warn
   assert.equal(result.success, true, String(result.error))
   assert.match((result as { warning?: string }).warning ?? '', /exchange-rate table rate 1\.2 on 2026-11-10/)
   assert.equal(await s.db.activityLog.count({ where: { action: 'purchase_bill_fx_table_rate', entityId: po.id } }), 1)
+})
+
+// [mutation: date the journal raised by the bill's own create or edit on today instead of the bill date]
+test('the FX journal raised by the bill\'s own create or edit is dated on the bill date; any other event\'s on its own date', async () => {
+  const { reconcilePurchaseBillFx } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  const po = await seedPo(10)
+  assert.equal((await receive(po, 10)).success, true)
+  await lockAt(po)
+  assert.equal((await bill(po, 10, 12.5)).success, true)
+  await markBillsPosted(po)
+  const row = await billOf(po)
+  const at = new Date('2026-11-27T12:00:00Z')
+  await withXeroPosting(async () => {
+    const { db } = await import('@/lib/db')
+    await db.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${po.id} FOR UPDATE`
+      return reconcilePurchaseBillFx(tx, { poId: po.id, connector: 'xero', syncEnabled: true, at, billEventInvoiceId: row.id })
+    })
+  })
+  const logs = await s.db.accountingSyncLog.findMany({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id }, select: { payload: true } })
+  assert.equal(logs.length, 1)
+  assert.equal((logs[0]!.payload as { date: string }).date, BILL_DATE, 'the bill date, as the bill\'s own transit row')
+  const transit = await s.db.transitSubledgerMovement.findFirstOrThrow({ where: { sourceType: 'PURCHASE_FX_VARIANCE', sourceRef: po.id } })
+  assert.equal(transit.journalDate.toISOString().slice(0, 10), BILL_DATE)
 })

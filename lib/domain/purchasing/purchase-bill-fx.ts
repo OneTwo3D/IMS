@@ -48,7 +48,18 @@ import { PURCHASE_PRICE_VARIANCE_ACCOUNT_KEY, REALISED_FX_ACCOUNT_KEY } from '@/
  * stock value for any quantity not received yet, so a foreign order's GR/IR and its transit both net to zero; the FX difference and the price
  * difference are their own variance rows, outside the balance.
  *
- * Bills valued BEFORE the switch (no `fxRateSource`) are left exactly as they are: they only take their receipts first in the matching.
+ * Bills valued BEFORE the switch (no `fxRateSource`) are left exactly as they are: they only take their receipts first in the matching, valued at what
+ * they debited GR/IR with (their own grir:bill rows, MED-B); their price difference stays on transit (owner ruling 2026-11-26).
+ *
+ * STEP 3b: RETURNS AND CREDIT NOTES. What a line has received is its RECEIPT rows and positive OPENING_BALANCE rows less its SUPPLIER_RETURN rows
+ * (`receiptLotsAfterReturns`); a return is valued at the goods cost of the layers it consumed, so the lots keep exactly what is still received. A
+ * supplier credit note reverses its bill at the bill's rate (`billCreditRate`), a credit with no bill at its own date's fx_rates rate
+ * (`resolveNoBillCreditFxRate`). A journal the producer-side hold shadows is SETTLED (`purchase_fx_variance_shadows`, MED-2).
+ *
+ * MED-D, WHY NO TRANSIT ROW IS WRITTEN LATER for a bill whose first posting was declined: IMS never re-queues a declined PURCHASE_INVOICE (re-sending
+ * would be a second bill; its refusal kind is 'manual'), and a refusal marked handled means someone keyed the bill into the ledger by hand. IMS cannot
+ * know what was keyed (which account, which rate, split or not), so a PURCHASE_BILL row asserting it would make this writer clear a difference that may
+ * not be in transit at all. Such a bill is one IMS did not post: `--in-flight` names it (MED-C) and the journal decision is the owner's.
  */
 
 const GRIR_KEY_PREFIX = 'grir:bill-fx:'

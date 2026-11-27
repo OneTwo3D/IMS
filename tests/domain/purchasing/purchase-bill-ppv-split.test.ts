@@ -96,3 +96,65 @@ test('MED-4 on the wire: the Xero bill carries the split lines\' LineAmount and 
   assert.equal('LineAmount' in payload.LineItems[2]!, false)
   assert.equal('TaxAmount' in payload.LineItems[2]!, false)
 })
+
+// ─── Step 3b: returns and supplier credit notes (pure) ───────────────────────────────────────────────────────────────────────────────
+
+// [mutation: take a return from the first receipt whatever its value, or drop the rounding residue]
+test('a return takes back the receipt valued at its own unit value first, then in order; the lots keep receipts less returns exactly', async () => {
+  const { receiptLotsAfterReturns } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  const lots = receiptLotsAfterReturns([
+    { poLineId: 'p', qty: D(4), valueBase: D(40) },
+    { poLineId: 'p', qty: D(6), valueBase: D('46.875') },
+    { poLineId: 'p', qty: D(-2), valueBase: D('-15.625') }, // two lock-rate units (7.8125)
+  ]).get('p')!
+  assert.deepEqual(lots.map((l) => [l.qty.toString(), l.valueBase.toString()]), [['4', '40'], ['4', '31.25']], 'taken from the lock-rate receipt')
+  const fifo = receiptLotsAfterReturns([
+    { poLineId: 'p', qty: D(4), valueBase: D(40) },
+    { poLineId: 'p', qty: D(6), valueBase: D('46.875') },
+    { poLineId: 'p', qty: D(-5), valueBase: D('-47') }, // no receipt at 9.4: in order, and the residue off the first lot left
+  ]).get('p')!
+  assert.equal(fifo.length, 1)
+  assert.equal(fifo[0]!.qty.toString(), '5')
+  assert.equal(fifo[0]!.valueBase.toString(), '39.875', '86.875 - 47')
+  const beyond = receiptLotsAfterReturns([{ poLineId: 'p', qty: D(2), valueBase: D(20) }, { poLineId: 'p', qty: D(-3), valueBase: D(-30) }]).get('p')!
+  assert.deepEqual(beyond, [], 'a return beyond the lots removes what there is')
+})
+
+// [mutation: split a credit by the whole bill instead of its goods lines, or split a bill that was not split]
+test('a return credit reversing a split bill: the price-variance fraction of the bill\'s goods lines', async () => {
+  const { creditPpvFractions } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  const split = creditPpvFractions([
+    { poLineId: 'p', qtyBilled: 10, totalForeign: '135', stockUnitForeign: '12.5' },
+    { poLineId: null, qtyBilled: 1, totalForeign: '50', stockUnitForeign: null },
+  ], 'EUR')
+  assert.equal(split.overall.toString(), D(10).div(135).toString(), '10 of the 135 billed for goods is price variance; the freight line is not in it')
+  assert.equal(split.byLine[1]!.toString(), '0')
+  assert.equal(creditPpvFractions([{ poLineId: 'p', qtyBilled: 10, totalForeign: '135', stockUnitForeign: null }], 'EUR').overall.toString(), '0', 'an unsplit bill: nothing')
+})
+
+// [mutation: put the whole credit on transit, or let the two lines not add up to the credit]
+test('the credit payload carries the stock part on transit and the price variance on the PPV account, adding up to the credit', async () => {
+  const { buildSupplierCreditNoteSyncPayload } = await import('@/lib/domain/purchasing/supplier-credit-note')
+  const base = {
+    creditNoteId: 'cn1', creditNoteNumber: null, reference: 'PO-1', reason: 'Supplier return', supplierName: 'S', supplierId: 's', currency: 'EUR',
+    fxRateToBase: 1.6, amountForeign: 27, transitAccount: '631', taxType: 'NONE', date: '2026-11-27',
+  }
+  const plain = buildSupplierCreditNoteSyncPayload(base) as { lines: Array<{ unitAmount: number; accountCode: string }> }
+  assert.deepEqual(plain.lines.map((l) => [l.accountCode, l.unitAmount]), [['631', 27]], 'no split: one transit line, as before')
+  const split = buildSupplierCreditNoteSyncPayload({ ...base, ppvSplit: { account: '5050', ppvAmount: 2 } }) as { lines: Array<{ unitAmount: number; accountCode: string; taxType: string }>; currencyRateToBase: number }
+  assert.deepEqual(split.lines.map((l) => [l.accountCode, l.unitAmount]), [['631', 25], ['5050', 2]])
+  assert.ok(split.lines.every((l) => l.taxType === 'NONE'), 'the same tax treatment on both parts')
+  assert.equal(split.currencyRateToBase, 1.6)
+})
+
+// [mutation: drop the >4dp quantity guard on a split line]
+test('a split bill line with a quantity finer than 4 decimal places is refused (the ledger keeps 4); an unsplit one is not', async () => {
+  const { PurchaseBillTaxRefusal } = await import('@/lib/domain/purchasing/purchase-invoice-edit')
+  const fine = (split?: number) => calculatePurchaseInvoice({
+    lines: [{ kind: 'product', poLineId: 'p', qtyBilled: 1.23456, unitCostForeign: 12.5 }], fxRateToBase: 1.6, currency: 'EUR', poReference: 'PO-1', transitAccount: '631',
+    poTaxRatePercent: 0.2, poLineById, costLineById: new Map(),
+    ...(split === undefined ? {} : { ppvSplit: { stockUnitForeignByPoLine: new Map([['p', split]]), ppvAccount: '5050' } }),
+  })
+  assert.throws(() => fine(12.5), PurchaseBillTaxRefusal)
+  assert.doesNotThrow(() => fine())
+})
