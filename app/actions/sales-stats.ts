@@ -13,6 +13,7 @@ import { getSalesOrderReference } from '@/lib/sales-order-display'
 import { allocateOrderDiscountBase, normalizeLineDiscountBase } from '@/lib/sales-currency'
 import { marginFigureBound, netLinearFigureBound, netOfRefunds, refundLineBucket, refundPctOfSale, refundTotalsBasis, unplacedCreditBoundFromParts, type DerivedFigureBound, type RefundSetBasis, type RefundTotalsBasis } from '@/lib/domain/sales/refund-basis-analytics'
 import { isFullyPaid, shortfallNow } from '@/lib/domain/sales/paid-state'
+import { loadQuarantineQtyByProduct, readReturnConditionCheckEnabled } from '@/lib/domain/inventory/quarantine-warehouse'
 
 // ---------------------------------------------------------------------------
 // Products tab (line-level)
@@ -137,6 +138,8 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
       stockLevels: { select: { quantity: true, reservedQty: true } } },
   })
   const productInfo = new Map(products.map((p) => [p.id, p]))
+  // Switch return_condition_check_enabled: quarantine stock is on hand but not available (an empty map with the switch off).
+  const quarantineByProduct = await loadQuarantineQtyByProduct(db, await readReturnConditionCheckEnabled(db), null)
   const productMap = new Map<string, SalesStatRow>()
   /**
    * o3d-7jfq: `Σ max(entry, 0)` for the two buckets a NET figure cannot place, recorded HERE
@@ -167,7 +170,7 @@ export async function getProductSalesStats(dateFrom?: string, dateTo?: string): 
           lifecycleStatus: info?.lifecycleStatus ?? 'ACTIVE',
           currentStock: info?.stockLevels.reduce((s, sl) => s + Number(sl.quantity), 0) ?? 0,
           reservedQty: info?.stockLevels.reduce((s, sl) => s + Number(sl.reservedQty), 0) ?? 0,
-          availableStock: info ? info.stockLevels.reduce((s, sl) => s + Number(sl.quantity) - Number(sl.reservedQty), 0) : 0,
+          availableStock: info ? info.stockLevels.reduce((s, sl) => s + Number(sl.quantity) - Number(sl.reservedQty), 0) - (quarantineByProduct.get(pid)?.toNumber() ?? 0) : 0,
           customerName: order.customerName, salesRep: order.salesRep,
           salesPrice: info?.salesPriceBase ? Number(info.salesPriceBase) : null,
           weight: info?.weight ? Number(info.weight) : null,

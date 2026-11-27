@@ -401,6 +401,7 @@ export default async function ProductDetailPage({
                       <div key={s.warehouseId} className="grid grid-cols-3 sm:grid-cols-5 gap-1 py-1.5 text-sm border-b border-border/50 last:border-0">
                         <span className="text-muted-foreground truncate">
                           <span className="font-mono font-medium text-foreground">{s.warehouseCode}</span>
+                          {s.quarantine && <span className="ml-1 rounded bg-amber-100 px-1 text-[10px] font-medium text-amber-800 dark:bg-amber-900/40 dark:text-amber-300" title="Quarantine warehouse: not sellable, never allocated or pushed to the store">Quarantine</span>}
                         </span>
                         <span className="font-mono text-right text-xs">
                           {Number(s.quantity).toLocaleString()}

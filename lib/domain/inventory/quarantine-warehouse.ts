@@ -124,13 +124,14 @@ export const QUARANTINE_WMS_BINDING_REFUSAL =
 export async function loadQuarantineQtyByProduct(
   client: { stockLevel: Prisma.TransactionClient['stockLevel'] },
   enabled: boolean,
-  productIds: readonly string[],
+  /** The products to read, or null for every product. */
+  productIds: readonly string[] | null,
 ): Promise<Map<string, Prisma.Decimal>> {
   const out = new Map<string, Prisma.Decimal>()
-  if (!enabled || productIds.length === 0) return out
+  if (!enabled || productIds?.length === 0) return out
   const rows = await client.stockLevel.groupBy({
     by: ['productId'],
-    where: { productId: { in: [...productIds] }, warehouse: { type: QUARANTINE_WAREHOUSE_TYPE } },
+    where: { ...(productIds ? { productId: { in: [...productIds] } } : {}), warehouse: { type: QUARANTINE_WAREHOUSE_TYPE } },
     _sum: { quantity: true },
   })
   for (const row of rows) {
