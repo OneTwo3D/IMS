@@ -262,7 +262,7 @@ function maxDate(a: Date | null, b: Date | null): Date | null {
   return a.getTime() >= b.getTime() ? a : b
 }
 
-function slowStockMovementWhere(filters: SlowStockFilters, productTypeFilter: ReturnType<typeof directLayerProductTypeFilter>): Prisma.StockMovementWhereInput {
+function slowStockMovementWhere(filters: SlowStockFilters, productTypeFilter: ReturnType<typeof directLayerProductTypeFilter>) {
   return {
     type: StockMovementType.SALE_DISPATCH,
     // Same demand rule as dead stock: warehouse-attributed dispatches, plus warehouse-less rows only when they are
