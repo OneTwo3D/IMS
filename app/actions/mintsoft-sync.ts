@@ -1,7 +1,7 @@
 'use server'
 
 import { netUnpricedReturnRowsAgainstRefunds, priceUnpricedReturnRows, queueReturnRestockValueJournal } from '@/lib/domain/sales/return-restock-cost'
-import { isQuarantineWarehouseType, QUARANTINE_WMS_BINDING_REFUSAL, readReturnConditionCheckEnabled, RETURN_CONDITIONS, mintsoftReturnRestockRefusal, type ReturnCondition } from '@/lib/domain/inventory/quarantine-warehouse'
+import { isQuarantineWarehouseType, QUARANTINE_WMS_BINDING_REFUSAL, readReturnConditionCheckEnabled, RETURN_CONDITIONS, wmsReturnRestockRefusal, type ReturnCondition } from '@/lib/domain/inventory/quarantine-warehouse'
 import { parseShopIossNumber, SHOP_IOSS_NUMBER_SETTING } from '@/lib/domain/accounting/shop-ioss-number'
 import { randomUUID } from 'node:crypto'
 
@@ -5771,7 +5771,7 @@ export async function restockMintsoftReturnInboxItem(
       if (!warehouse || !warehouse.active) {
         throw new Error('Select an active warehouse for restocking.')
       }
-      const conditionRefusal = mintsoftReturnRestockRefusal({ enabled: conditionCheck, condition: data.condition ?? null, warehouse })
+      const conditionRefusal = wmsReturnRestockRefusal({ enabled: conditionCheck, condition: data.condition ?? null, warehouse })
       if (conditionRefusal) throw new Error(conditionRefusal)
       if (!item.productId) {
         throw new Error('This Mintsoft return cannot be restocked because its SKU is not mapped to an IMS product.')

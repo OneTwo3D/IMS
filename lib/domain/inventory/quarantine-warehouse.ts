@@ -157,20 +157,21 @@ export async function isQuarantineTargetWarehouse(client: WarehouseTypeReader, w
 }
 
 /**
- * Owner ruling (2026-11-27): quarantine is kept in IMS only. A Mintsoft (3PL) return is physically at the 3PL, where Mintsoft
- * still counts it: booking it into an IMS-only quarantine warehouse would hold the unit twice once stock alignment (ALIGN_TO_WMS)
- * books Mintsoft's count into the bound warehouse. So with the switch on an UNSELLABLE returns-inbox restock is always refused.
+ * Owner ruling (2026-11-27): quarantine is kept in IMS only. A warehouse-system (3PL) return is physically at the 3PL, where the
+ * warehouse system still counts it: booking it into an IMS-only quarantine warehouse would hold the unit twice once stock alignment
+ * (ALIGN_TO_WMS) books the warehouse system's count into the bound warehouse. So with the switch on an UNSELLABLE returns-inbox restock
+ * is always refused.
  */
-export const MINTSOFT_UNSELLABLE_RETURN_REFUSAL =
-  'This return is at the Mintsoft warehouse (3PL), and quarantine is kept in IMS only: Mintsoft would still count the unit, and stock alignment would book it into the bound warehouse a second time. Handle the unsellable unit at the 3PL (ask the warehouse to write it off or hold it out of sellable stock, then mark this item Refunded only or Dismissed), or mark it sellable and restock it. Nothing was recorded.'
+export const WMS_UNSELLABLE_RETURN_REFUSAL =
+  'This return is at the 3PL warehouse, and quarantine is kept in IMS only: the warehouse system would still count the unit, and stock alignment would book it into the bound warehouse a second time. Handle the unsellable unit at the 3PL (ask the warehouse to write it off or hold it out of sellable stock, then mark this item Refunded only or Dismissed), or mark it sellable and restock it. Nothing was recorded.'
 
-/** The rule for the Mintsoft returns-inbox restock: the general rule, except that an unsellable unit held at the 3PL is never quarantined. Pure. */
-export function mintsoftReturnRestockRefusal(params: {
+/** The rule for the warehouse-system (WMS) returns-inbox restock: the general rule, except that an unsellable unit held at the 3PL is never quarantined. Pure. */
+export function wmsReturnRestockRefusal(params: {
   enabled: boolean
   condition: ReturnCondition | null
   warehouse: { code: string; type: string | null }
 }): string | null {
-  if (params.enabled && params.condition === 'UNSELLABLE') return MINTSOFT_UNSELLABLE_RETURN_REFUSAL
+  if (params.enabled && params.condition === 'UNSELLABLE') return WMS_UNSELLABLE_RETURN_REFUSAL
   return returnConditionRestockRefusal(params)
 }
 

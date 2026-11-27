@@ -373,7 +373,7 @@ test('Mintsoft returns inbox: an unsellable unit held at the 3PL is never quaran
   for (const warehouseId of [w.qar.id, w.main.id]) {
     const unsellable = await mintsoft.restockMintsoftReturnInboxItem({ id: inbox.id, warehouseId, condition: 'UNSELLABLE' })
     assert.equal(unsellable.success, false, 'an unsellable unit at the 3PL is refused into any warehouse')
-    assert.equal(unsellable.error, quarantine.MINTSOFT_UNSELLABLE_RETURN_REFUSAL)
+    assert.equal(unsellable.error, quarantine.WMS_UNSELLABLE_RETURN_REFUSAL)
   }
   assert.equal((await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: inbox.id }, select: { status: true } })).status, 'NEW', 'refused: nothing restocked')
   assert.deepEqual(await stockAt(w, w.qar.id), { qty: 0, reserved: 0, layers: [] }, 'nothing entered quarantine, so Mintsoft\'s count of the unit (aligned into the bound warehouse) is the only one')
