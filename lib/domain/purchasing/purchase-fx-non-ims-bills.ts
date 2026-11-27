@@ -116,8 +116,9 @@ async function noTransitRowReason(db: Db, bill: { id: string; accountingInvoiceI
   })
   if (refusal?.resolution === 'handled_manually') return { reason: 'IMS\'s posting was declined and then marked handled (keyed into Xero by hand)', handled: true }
   if (refusal) return { reason: 'IMS\'s posting was declined', handled: false }
-  const logs = await db.accountingSyncLog.findMany({ where: { type: 'PURCHASE_INVOICE', referenceType: 'PurchaseInvoice', referenceId: bill.id }, select: { status: true } })
-  if (logs.some((log) => log.status === 'CANCELLED')) return { reason: 'IMS\'s posting was not sent (shadowed by the producer-side hold, or cancelled): another system posted it', handled: false }
+  const { LEDGER_STANDING_SELECT, ledgerStanding } = await import('@/lib/domain/accounting/ledger-standing')
+  const logs = await db.accountingSyncLog.findMany({ where: { type: 'PURCHASE_INVOICE', referenceType: 'PurchaseInvoice', referenceId: bill.id }, select: LEDGER_STANDING_SELECT })
+  if (logs.some((log) => ledgerStanding(log) === 'SHADOW_NOT_SENT_BY_IMS')) return { reason: 'IMS\'s posting was shadowed by the producer-side hold (not sent by IMS): another system posted it', handled: false }
   if (logs.length === 0) {
     if (!bill.accountingInvoiceId) return { reason: 'never posted to Xero by IMS (bill sync off, or not posted at all)', handled: false }
     return { reason: bill.accountingInvoiceIdSource === 'MANUAL' ? 'not posted by IMS: linked to its Xero bill by hand' : 'not posted by IMS (Qoblex, the first load or by hand)', handled: false }
