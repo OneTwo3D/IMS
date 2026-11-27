@@ -2,10 +2,14 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
   getLatestLayerUnitCost,
+  defaultCostCapMessage,
+  editChangesValueRefusedMessage,
+  editNotPlainAdjustmentRefusedMessage,
   matchAdjustmentReason,
   missingReasonMessage,
   readStockAdjustmentReasonCostRequired,
   resolveRequiredAdditionUnitCost,
+  splitReasonFromNote,
   STOCK_ADJUSTMENT_REASON_COST_REQUIRED_KEY,
   unmappedReasonMessage,
 } from '@/lib/domain/inventory/stock-adjustment-policy'
@@ -56,13 +60,21 @@ test('latest layer: this warehouse first, then any warehouse, newest first, zero
   const own = await getLatestLayerUnitCost(client('2.100000', '9.000000'), 'p', 'w')
   assert.deepEqual([own?.unitCostBase.toFixed(6), own?.source], ['2.100000', 'warehouse'])
   assert.equal(calls.length, 1, 'the other warehouses are not read when this one has a costed layer')
-  assert.deepEqual(calls[0]!.where, { productId: 'p', warehouseId: 'w', unitCostBase: { gt: 0 } })
-  assert.deepEqual(calls[0]!.orderBy, [{ receivedAt: 'desc' }, { id: 'desc' }])
+  // o3d-jwa8m MED-4: receipt or production layers only; ties by the creation sequence, never the cuid.
+  const qualifying = {
+    unitCostBase: { gt: 0 },
+    adjustmentMovementId: null,
+    returnMovementId: null,
+    isOpeningStock: false,
+    OR: [{ poLineId: { not: null } }, { productionOrderId: { not: null } }],
+  }
+  assert.deepEqual(calls[0]!.where, { productId: 'p', warehouseId: 'w', ...qualifying })
+  assert.deepEqual(calls[0]!.orderBy, [{ receivedAt: 'desc' }, { createdSeq: 'desc' }])
 
   calls.length = 0
   const other = await getLatestLayerUnitCost(client(null, '9.000000'), 'p', 'w')
   assert.deepEqual([other?.unitCostBase.toFixed(6), other?.source], ['9.000000', 'any_warehouse'])
-  assert.deepEqual(calls[1]!.where, { productId: 'p', unitCostBase: { gt: 0 } })
+  assert.deepEqual(calls[1]!.where, { productId: 'p', ...qualifying })
 
   assert.equal(await getLatestLayerUnitCost(client(null, null), 'p', 'w'), null)
 })
@@ -91,4 +103,29 @@ test('the refusal messages name what to fix', () => {
   assert.match(missingReasonMessage('SKU-1'), /Choose an adjustment reason for SKU-1/)
   assert.match(unmappedReasonMessage({ reasonName: 'Damaged', inventoryAccountMapped: true }), /Map an account to "Damaged"/)
   assert.match(unmappedReasonMessage({ reasonName: 'Damaged', inventoryAccountMapped: false }), /Map the inventory account first/)
+})
+
+test('LOW-8: a retired chart is told to re-map for the active connector, not to map an account', () => {
+  const message = unmappedReasonMessage({ reasonName: 'Damaged', inventoryAccountMapped: true, chartRetired: true })
+  assert.match(message, /no longer the active one/)
+  assert.doesNotMatch(message, /Map an account to/)
+  assert.match(message, /Nothing was saved/)
+})
+
+test('LOW-10: the reason is read back from the note prefix (longest name wins) for the adjustments export', () => {
+  const names = ['Damaged', 'Damaged in transit', 'Stock count']
+  assert.deepEqual(splitReasonFromNote('Damaged', names), { reason: 'Damaged', note: '' })
+  assert.deepEqual(splitReasonFromNote('Damaged: forklift', names), { reason: 'Damaged', note: 'forklift' })
+  assert.deepEqual(splitReasonFromNote('Damaged in transit: wet', names), { reason: 'Damaged in transit', note: 'wet' })
+  assert.deepEqual(splitReasonFromNote('Damagedx', names), { reason: '', note: 'Damagedx' })
+  assert.deepEqual(splitReasonFromNote(null, names), { reason: '', note: '' })
+})
+
+test('LOW-12 and MED-3: the cap and edit refusals say what to do', () => {
+  assert.match(defaultCostCapMessage(200), /at most 200 .* batches of 200/)
+  assert.match(editNotPlainAdjustmentRefusedMessage('PurchaseReturn'), /supplier return/)
+  assert.match(editNotPlainAdjustmentRefusedMessage('StockCount'), /stock-count variance/)
+  assert.match(editNotPlainAdjustmentRefusedMessage('WmsSyncJob'), /align-down/)
+  assert.match(editNotPlainAdjustmentRefusedMessage('Other'), /another process/)
+  assert.match(editChangesValueRefusedMessage(), /Reverse this adjustment/)
 })

@@ -37,14 +37,15 @@ onetwo3d-ims/
 │   │   ├── auth/             # NextAuth routes, TOTP, passkey setup
 │   │   ├── cron/             # Scheduled jobs
 │   │   │   ├── fx-rates      # Daily FX rate refresh (source per fx_rate_source: ecb/frankfurter or aelia)
-│   │   │   ├── wc-sync       # WooCommerce polling sync (if webhooks disabled)
+│   │   │   ├── wc-reconcile  # WooCommerce backup reconciliation (orders/products) plus stock retry drain
 │   │   │   ├── accounting-daily-batch # Daily accounting sub-ledger batch sync (Xero)
 │   │   │   ├── accounting-sync # Accounting sync-row processing (Xero)
 │   │   │   ├── accounting-payment-poll # Payment status polling from Xero
 │   │   │   ├── delivery-status # Update delivery status on SalesOrders
 │   │   │   ├── activity-cleanup # Archive old activity logs
-│   │   │   └── backup        # Automated database backups
-│   │   ├── webhooks/woocommerce/ # WC order, product, refund webhooks
+│   │   │   ├── backup        # Automated database backups
+│   │   │   └── ...           # ~40 routes in total; the scheduled ones are registered in lib/cron-jobs/
+│   │   ├── webhooks/         # shopping/[connector] (WooCommerce order, product, refund webhooks) and mintsoft/asn-booked-in
 │   │   ├── export/           # CSV exports (products, sales, POs, stock, etc.)
 │   │   ├── import/           # CSV imports and historical order import
 │   │   ├── invoice/          # Invoice PDF generation and preview
@@ -55,7 +56,8 @@ onetwo3d-ims/
 │   │   ├── upload/           # Avatar, logo, invoice PDF uploads
 │   │   ├── uploads/          # Serve uploaded branding/invoice files
 │   │   ├── backup/           # Manual backup creation and restore
-│   │   ├── xero/             # Xero OAuth callback
+│   │   ├── accounting/       # Accounting connector OAuth callback (Xero)
+│   │   ├── shopping/         # Connector-scoped routes (manual-sync, [connector]/invoice-pdf and credit-note-pdf)
 │   │   ├── notifications/    # Email notification delivery
 │   │   └── preview/          # Document preview (email templates, documents)
 │   └── generated/prisma/     # Auto-generated Prisma client types
@@ -73,7 +75,7 @@ onetwo3d-ims/
 │   ├── auth/                 # NextAuth.js configuration, session helpers
 │   │   ├── config.ts         # NextAuth providers and callbacks
 │   │   ├── server.ts         # requireAuth() helper
-│   ├── db.ts                 # Prisma client singleton
+│   ├── db/                   # Prisma client singleton
 │   ├── permissions.ts        # Role-based access control (RBAC) helpers
 │   ├── activity-log.ts       # Audit trail logging
 │   ├── mailer.ts             # Nodemailer SMTP configuration
@@ -82,31 +84,31 @@ onetwo3d-ims/
 │   ├── utils.ts              # Shared utility functions
 │   ├── connectors/           # Integration modules
 │   │   ├── woocommerce/      # WC sync logic, webhooks, tax mapping
-│   │   │   ├── sync.ts       # Order/product sync engine
+│   │   │   ├── sync/         # Order/product sync engine (order-import.ts, product-sync.ts, reconcile.ts, ...)
 │   │   │   ├── webhooks.ts   # Webhook parsing and validation
-│   │   │   ├── tax-mapping.ts # WC tax rate → Xero tax type mapping
+│   │   │   ├── tax-rate-plan.ts, tax-rate-writer.ts # WC tax rate handling
 │   │   │   └── api.ts        # WC REST API client
-│   │   └── xero/             # Xero API, journal posting, reconciliation
-│   │       ├── api.ts        # Xero OAuth and API client
-│   │       ├── sync.ts       # Journal entry posting
-│   │       ├── batch.ts      # Daily batch sync logic
-│   │       └── reconciliation.ts # Payment/invoice reconciliation
+│   │   ├── xero/             # Xero API, journal posting, reconciliation
+│   │   │   ├── api.ts, auth.ts # Xero API client and OAuth
+│   │   │   ├── sync-processor.ts, queue.ts # Accounting sync queue
+│   │   │   ├── daily-sync.ts # Daily batch sync logic
+│   │   │   └── payment-poller.ts, payment-reconcile.ts # Payment/invoice reconciliation
+│   │   ├── mintsoft/, wms/   # Mintsoft connector and the connector-agnostic WMS boundary
 │   └── [service files]       # Notifications, FX rates, tracking
 ├── prisma/
-│   ├── schema.prisma         # Database schema (59 models, full OTI spec)
+│   ├── schema.prisma         # Database schema (167 models)
 │   ├── migrations/           # Migration history
 │   ├── seed.ts               # Database seeding
-│   └── prod-seed/            # Production data fixtures
+│   └── unsupported-schema-drift-allowlist.json # Intentional DB-native drift
 ├── scripts/
 │   ├── cli.ts                # CLI tool (create-user, etc.)
 │   └── [deployment scripts]
 ├── public/                   # Static assets (favicon, branding)
 ├── docs/                     # Additional documentation
 ├── .env.example              # Template for environment variables
-├── .eslintrc.mjs             # ESLint configuration
+├── eslint.config.mjs         # ESLint configuration
 ├── tsconfig.json             # TypeScript strict mode
-├── next.config.ts            # Next.js config
-├── tailwind.config.ts        # Tailwind CSS config
+├── next.config.ts            # Next.js config (Tailwind 4 is configured in app/globals.css)
 └── package.json              # Dependencies and scripts
 ```
 
@@ -179,7 +181,7 @@ FX rates (daily via frankfurter.dev) → Multi-currency conversions
 
 ## Database
 
-**59 Prisma models** (managed with migrations):
+**167 Prisma models** (managed with migrations). The grouped lists below are a historical sketch: several names no longer exist (for example ProductVariant, Stock, Invoice/CreditNote, ManufacturingOrder, AccountingSync, the WooCommerce* and Xero* config/log models), so use `prisma/schema.prisma` for real names (StockLevel, ProductionOrder, AccountingSyncLog, ShoppingSyncLog, WmsSyncLog, PurchaseInvoice, ...):
 
 **Product & Inventory:**
 - Product, ProductVariant, ProductPrice, ProductBundle
@@ -222,7 +224,7 @@ See `@prisma/schema.prisma` for complete schema with relationships and constrain
 | **Manufacturing** | `app/actions/manufacturing.ts`, `app/(dashboard)/manufacturing/` | Production orders, BOM, component allocation, output | Production team |
 | **WooCommerce Sync** | `lib/connectors/woocommerce/`, `app/actions/wc-sync.ts` | Order/product sync, tax mapping, webhooks, cron polling | Dev team |
 | **Xero Integration** | `lib/connectors/xero/`, `app/actions/xero-sync.ts` | Sub-ledger batch sync, journal posting, COGS, reconciliation | Finance/Dev team |
-| **Authentication** | `lib/auth/`, `app/(auth)/`, `app/actions/auth.ts` | Login, 2FA, passkeys, roles, sessions, RBAC | Dev team |
+| **Authentication** | `lib/auth/`, `app/(auth)/`, `app/actions/passkey.ts`, `app/actions/password-reset.ts`, `app/actions/users.ts` | Login, 2FA, passkeys, roles, sessions, RBAC | Dev team |
 | **PDF Generation** | `lib/pdf.ts`, `app/api/*/[id]/route.ts` | Branded PDFs (order, invoice, RFQ, PO, shipment) | Dev team |
 | **Notifications** | `lib/mailer.ts`, `app/api/notifications/` | Email delivery, notification history, preferences | Dev team |
 | **Activity Log** | `lib/activity-log.ts`, `app/(dashboard)/activity/` | Audit trail, searchable logs, compliance | Compliance team |

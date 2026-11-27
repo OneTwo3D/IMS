@@ -17,7 +17,7 @@ Older notes call it `wc-invoice-handoff`; that name was never the plugin's. It i
 
 | Switch | Where | Default | What it does |
 |---|---|---|---|
-| `invoice_documents` cron | Settings > Cron | off | Runs the fetch: stored documents for new orders, the customer-requested queue, rechecks. Read-only toward Xero and the storefront. |
+| `invoice_documents` cron | Settings > System > Scheduler | off | Runs the fetch: stored documents for new orders, the customer-requested queue, rechecks. Read-only toward Xero and the storefront. |
 | `invoice_documents_sweep_floor` | Settings (date) | none | Orders created on or after this date are fetched by the cron without anyone asking. With no date the cron fetches nothing for new orders. |
 | `invoice_documents_lazy_fetch_enabled` | Settings | off | A customer's first click on an order IMS holds no PDF for **queues** the fetch (historic orders). No bulk backfill. |
 | `invoice_documents_credit_notes_enabled` | Settings | off | Credit note documents are fetched too (swept and on demand). |

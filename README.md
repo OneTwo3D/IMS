@@ -2,7 +2,7 @@
 
 Inventory Management System — built with Next.js 16, TypeScript, Prisma 7, PostgreSQL, and Shadcn/UI.
 
-**Current release: v3.0.0** (2026-11-10) — catch-up release since 2.0.0: stricter sales posting and payments, purchase orders editable, closable and cancellable at every stage, a WooCommerce store fence, VAT/IOSS, Aelia and reconciliation groundwork (built, mostly switched off), and deploy and scheduler hardening. It needs operator action: see the Operator actions list in [CHANGELOG.md](CHANGELOG.md). [GitHub Releases](https://github.com/OneTwo3D/IMS/releases) has the full delta; the in-app **Settings > System** page shows the same notes.
+**Current release: v5.1.0** (2026-11-18). It needs operator action: see the Operator actions list under 5.1.0 in [CHANGELOG.md](CHANGELOG.md). [GitHub Releases](https://github.com/OneTwo3D/IMS/releases) has the full delta; the in-app **Settings > System** page shows the same notes.
 
 ## Features
 
@@ -116,7 +116,7 @@ After the dev server starts, log in as the user you just created. The first visi
 For production deployments, also configure:
 
 - **CRON_SECRET** — required for the scheduled-job endpoints to authenticate (the system fails fast on startup if unset in production).
-- **Backup cron** — schedule `/api/cron/backup` daily; see [Backup & Restore](docs/backup-restore.md).
+- **Backup cron** — schedule `/api/cron/backup` daily (the installer's bootstrap crontab writes it at 02:00; the scheduler default is 01:00 and the job is off until enabled); see [Backup & Restore](docs/backup-restore.md).
 - **Multi-instance rate limits** — set `RATE_LIMIT_BACKEND=redis` and `REDIS_URL` if running multiple replicas.
 
 The [Installation & Deployment](docs/installation.md) guide covers the full deployment surface.
@@ -164,7 +164,8 @@ scripts/
 - [Migration Conventions](docs/migration-conventions.md)
 - [WooCommerce Integration](docs/woocommerce.md) (symlink → user-facing doc)
 - [Xero Accounting Sync](docs/xero-sync.md) (symlink → user-facing doc)
-- [Production Readiness Plan](docs/plan.md) — current roadmap
+- [Agent Workflow](docs/agent-workflow.md) — branching, validation and handoff rules for AI-assisted work
+- [Deployment units and container image](deploy/README.md) — systemd units, container image, production blue/green deploy
 
 ## License
 
