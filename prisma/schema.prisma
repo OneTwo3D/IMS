@@ -6673,3 +6673,21 @@ model PurchaseFxVarianceShadow {
   @@index([poId])
   @@map("purchase_fx_variance_shadows")
 }
+
+/// Per-event FX (MED-C, owner ruling "post a one-off journal"): a bill that reached Xero OUTSIDE IMS (Qoblex in P1, the first load, by hand, bill sync
+/// off), so it has no PURCHASE_BILL transit row, which an admin confirmed with `npm run purchase-fx:non-ims-bills -- --yes --confirm-admin`. From then on
+/// lib/domain/purchasing/purchase-bill-fx.ts treats it as being in Stock in Transit at its own GR/IR value and posts its exchange-rate difference through
+/// the accounting queue (target state: once, a re-run queues nothing). `invoiceId` is not a foreign key: the row outlives a deleted bill, whose journal
+/// the reconciliation then reverses.
+model PurchaseFxNonImsBillApproval {
+  id                   String   @id @default(cuid())
+  poId                 String   @map("po_id")
+  invoiceId            String   @unique @map("invoice_id")
+  approvedBy           String   @map("approved_by")
+  reason               String
+  proposedTransitDelta Decimal  @db.Decimal(18, 2) @map("proposed_transit_delta")
+  approvedAt           DateTime @default(now()) @map("approved_at")
+
+  @@index([poId])
+  @@map("purchase_fx_non_ims_bill_approvals")
+}
