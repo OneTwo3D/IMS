@@ -170,7 +170,7 @@ export const RETURNS_EXCHANGE_NOTICE =
 export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   {
     file: 'lib/domain/erasure/erasure-classification.ts',
-    figures: ['revenueDeferredBatchRef', 'revenueDeferralUnwindReason', 'revenueDeferralUnwindRef'],
+    figures: ['revenueDeferredBatchRef', 'revenueDeferralUnwindReason', 'revenueDeferralUnwindRef', 'revenueDeferralUnwindInvoiceId'],
     treatment: 'not-refund-sensitive',
     reason:
       'A catalogue of column NAMES for the personal-data erasure (one entry is the ledger batch reference column, classified not-personal). It computes and displays no figure.',
@@ -499,14 +499,14 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/connectors/xero/daily-sync.ts',
-    figures: ['shippedRevenue', 'shippedRevenueOf', 'proportionalRevenue', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueProportion', 'revenueRecognizedAmount', 'runningRevenue', 'totalRevenueDeferred', 'groupRevenue', 'groupRevenueRaw', 'unearnedRevenueAmount', 'xero_unearned_revenue_account', 'revenueDeferralEventAt', 'revenueDeferralBasis', 'revenueDeferralUnwindOwedAt', 'revenueDeferralUnwindRef', 'revenueDeferralUnwoundAmount', 'revenueDeferralUnwindReason'],
+    figures: ['shippedRevenue', 'shippedRevenueOf', 'proportionalRevenue', 'revenue', 'revenueDeferredBatchRef', 'revenueDeferredDate', 'revenueProportion', 'revenueRecognizedAmount', 'runningRevenue', 'totalRevenueDeferred', 'groupRevenue', 'groupRevenueRaw', 'unearnedRevenueAmount', 'xero_unearned_revenue_account', 'revenueDeferralEventAt', 'revenueDeferralBasis', 'revenueDeferralUnwindOwedAt', 'revenueDeferralUnwindRef', 'revenueDeferralUnwoundAmount', 'revenueDeferralUnwindReason', 'revenueDeferralUnwindInvoiceId'],
     treatment: 'not-refund-sensitive',
     reason:
       'Revenue deferral/recognition journal amounts. Ledger postings (per event date).',
   },
   {
     file: 'lib/domain/sales/allocation-service.ts',
-    figures: ['revenueDeferralBasis', 'revenueDeferralUnwindOwedAt', 'revenueDeferralUnwoundAmount', 'revenueDeferredDate'],
+    figures: ['revenueDeferralBasis', 'revenueDeferralUnwindOwedAt', 'revenueDeferralUnwoundAmount', 'revenueDeferredDate', 'revenueDeferralUnwindInvoiceId'],
     treatment: 'not-refund-sensitive',
     reason:
       'Unpaid-invoice deferral: the cancel reads the deferral basis and its unwind markers only to tell that the invoice is gone, so the cancel needs no refund and A2\u2019s open debit is reversed. No revenue figure is computed, netted or rendered here.',
@@ -520,7 +520,7 @@ export const REFUND_FIGURE_SURFACES: readonly RefundFigureSurface[] = [
   },
   {
     file: 'lib/domain/accounting/invoice-basis-deferral.ts',
-    figures: ['revenueDeferralBasis', 'revenueDeferralEventAt', 'revenueDeferredDate', 'xero_defer_unpaid_invoiced_revenue_enabled', 'xero_defer_unpaid_invoiced_revenue_enabled_at', 'revenueDeferralUnwindOwedAt', 'revenueDeferralUnwindReason', 'revenueDeferralUnwoundAmount', 'revenueRecognizedAmount', 'unearnedRevenueAmount'],
+    figures: ['revenueDeferralBasis', 'revenueDeferralEventAt', 'revenueDeferredDate', 'xero_defer_unpaid_invoiced_revenue_enabled', 'xero_defer_unpaid_invoiced_revenue_enabled_at', 'revenueDeferralUnwindOwedAt', 'revenueDeferralUnwindReason', 'revenueDeferralUnwoundAmount', 'revenueRecognizedAmount', 'unearnedRevenueAmount', 'revenueDeferralUnwindInvoiceId'],
     treatment: 'not-refund-sensitive',
     reason:
       'unpaid-invoice deferral: decides WHETHER and FROM WHICH DAY Group A1 defers an unpaid order (the switch, its switch-on instant, the invoice proof and the anchor day). It also reckons the deferral still OPEN in Unearned Revenue (stored deferral less shipment recognition, each refund\u2019s recorded reversal and any unwind) to unwind it when the invoice is deleted or voided; that is a ledger posting amount that already nets refunds by their recorded reversal, never a report figure.',

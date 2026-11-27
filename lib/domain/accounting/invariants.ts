@@ -1141,12 +1141,16 @@ export function evaluateAccountingInvariantRows(rows: AccountingInvariantRows): 
       const relieved = [...(order.allocationShipmentRelief ?? []), ...(order.allocationRefundRelief ?? [])]
         .reduce((sum, row) => sum + decimalToNumber(row.allocatedReliefAmount ?? 0), 0)
       const openAllocated = Math.round((decimalToNumber(order.allocationBatchAmount ?? 0) - decimalToNumber(order.allocationReversalAmount ?? 0) - relieved) * 100) / 100
-      if (openAllocated > 0.01) {
+      // Either sign is wrong: open means a debit nothing will relieve; NEGATIVE means more was credited back than A2 debited.
+      if (Math.abs(openAllocated) > 0.01) {
+        const label = order.orderNumber ?? order.externalOrderNumber ?? order.id.slice(0, 8)
         findings.push({
-          severity: 'warning',
+          severity: openAllocated < 0 ? 'critical' : 'warning',
           code: 'invoice_basis_allocation_stranded',
           orderId: order.id,
-          message: withLedgerCheck(`Sales order ${order.orderNumber ?? order.externalOrderNumber ?? order.id.slice(0, 8)} is cancelled and the invoice its revenue was deferred from is gone, but £${openAllocated.toFixed(2)} of Group A2's Allocated Inventory debit is still open; nothing will relieve it. Post DR Inventory / CR Allocated Inventory by hand if the debit is real.`),
+          message: withLedgerCheck(openAllocated > 0
+            ? `Sales order ${label} is cancelled and the invoice its revenue was deferred from is gone, but £${openAllocated.toFixed(2)} of Group A2's Allocated Inventory debit is still open; nothing will relieve it. Post DR Inventory / CR Allocated Inventory by hand if the debit is real.`
+            : `Sales order ${label} is cancelled and the invoice its revenue was deferred from is gone, but £${(-openAllocated).toFixed(2)} MORE has been credited out of Allocated Inventory than Group A2 debited for it (reversals plus shipment and refund reliefs). Post DR Allocated Inventory / CR Inventory by hand for the excess.`),
           details: { status: order.status, openAllocated, allocationBatchAmount: decimalToNumber(order.allocationBatchAmount ?? 0), allocationReversalAmount: decimalToNumber(order.allocationReversalAmount ?? 0) },
         })
       }

@@ -87,7 +87,7 @@ import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-
 import { GRIR_BALANCE_SOURCE_TYPES } from '@/lib/domain/accounting/grir-subledger-movement'
 import { buildGrirReclassJournal, buildGrirReclassReferenceId, netGrirMovements } from '@/lib/domain/accounting/grir-reclass-journal'
 import { loadUnjournaledReturnCredits, unjournaledReturnKey } from '@/lib/domain/accounting/unjournaled-return-cogs'
-import { clampRecreateWindowToCutoff, recreateRetentionCutoff, recreateRetentionWindow } from '@/lib/domain/accounting/daily-batch-retention'
+import { clampRecreateWindowToCutoff, recreateRetentionWindow } from '@/lib/domain/accounting/daily-batch-retention'
 import { dailyBatchReferenceDate } from '@/lib/domain/accounting/daily-batch-reference'
 import { isOperatorAssertedSettlement } from '@/lib/domain/accounting/sync-row-settlement'
 import { cancelledClaimIsResolved } from '@/lib/domain/accounting/unresolved-abandoned-claim'
@@ -2947,12 +2947,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
           },
         })
         const refs = orders.map((order) => order.revenueDeferredBatchRef).filter((ref): ref is string => !!ref)
-        // A deferral journal older than sync-log retention has no row left to ask; the order's own A1 stamp from
-        // before the cutoff is then taken as the evidence it posted (the recreate sweep never rebuilt it either).
-        const postedRefs = await deferralJournalsThatMayHavePosted(tx, refs, {
-          retentionCutoff: await recreateRetentionCutoff(),
-          stampedAtByRef: new Map(orders.flatMap((order) => (order.revenueDeferredBatchRef && order.revenueDeferredDate ? [[order.revenueDeferredBatchRef, order.revenueDeferredDate] as const] : []))),
-        })
+        const postedRefs = await deferralJournalsThatMayHavePosted(tx, refs)
         const ready: Array<{ orderId: string; amount: string; day: string | null; cancelled: boolean }> = []
         for (const order of orders) {
           const label = order.orderNumber ?? order.externalOrderNumber ?? order.id.slice(0, 8)
@@ -3093,6 +3088,7 @@ export async function runDailyBatchSync(): Promise<XeroDailyBatchResult> {
                 revenueDeferralUnwindReason: null,
                 revenueDeferralUnwoundAmount: null,
                 revenueDeferralUnwindRef: null,
+                revenueDeferralUnwindInvoiceId: null,
                 revenueDeferralEventAt: row.eventAt,
               },
             })

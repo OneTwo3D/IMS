@@ -471,7 +471,7 @@ export async function completeAccountingDocumentDeletion(externalDocumentId: str
         // recorded HERE, in the transaction that unwinds the document, and the daily batch posts DR Unearned / CR Sales for
         // what is still open. A PAID-basis deferral is not touched (the refund and chargeback paths own it).
         unwound.deferralUnwindOwed = cleared.count === 1
-          ? (await markInvoiceBasisDeferralUnwindOwed(tx, { orderIds: [order.id] }, 'INVOICE_DELETED')) === 1
+          ? (await markInvoiceBasisDeferralUnwindOwed(tx, { orders: [{ orderId: order.id, invoiceId: externalDocumentId }] }, 'INVOICE_DELETED')) === 1
           : false
         const withdrawn = await tx.salesOrderInvoiceDocument.updateMany({
           where: { orderId: order.id, externalDocumentId, withdrawnAt: null },

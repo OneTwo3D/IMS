@@ -117,6 +117,8 @@ test('the stranded-Allocated invariant: a CANCELLED INVOICE-basis order with its
   }).filter((f) => f.code === 'invoice_basis_allocation_stranded')
   assert.equal(codes({}).length, 1, 'open A2 debit on a cancelled, invoice-gone order')
   assert.equal(codes({ allocationReversalAmount: '40' }).length, 0, 'reversed')
+  assert.equal(codes({ allocationReversalAmount: '40', allocationRefundRelief: [{ allocatedReliefAmount: '10' }] }).length, 1, 'over-relieved: a NEGATIVE open balance is flagged too')
+  assert.equal(codes({ allocationReversalAmount: '30', allocationRefundRelief: [{ allocatedReliefAmount: '10' }] }).length, 0, 'reversal plus refund relief exactly cover the debit')
   assert.equal(codes({ status: 'ALLOCATED' }).length, 0, 'not cancelled: it can still ship')
   assert.equal(codes({ accountingInvoiceId: 'INV-1', revenueDeferralUnwoundAmount: null, revenueDeferralUnwindOwedAt: null }).length, 0, 'invoice still standing: the refund owns it')
   assert.equal(codes({ revenueDeferralBasis: 'PAID' }).length, 0)

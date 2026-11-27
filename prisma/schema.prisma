@@ -2411,6 +2411,9 @@ model SalesOrder {
   revenueDeferralUnwindReason  String?              @map("accounting_revenue_deferral_unwind_reason")
   revenueDeferralUnwoundAmount Decimal?             @db.Decimal(18, 4) @map("accounting_revenue_deferral_unwound_amount")
   revenueDeferralUnwindRef     String?              @map("accounting_revenue_deferral_unwind_ref")
+  // The invoice whose deletion or void the unwind is owed for. A cancel needs no refund only while the order still names
+  // THAT invoice, or none: a re-issued, live invoice is credited by a refund as any other.
+  revenueDeferralUnwindInvoiceId String?            @map("accounting_revenue_deferral_unwind_invoice_id")
   inventoryAllocatedDate DateTime?              @map("accounting_inventory_allocated_date") // Set by Group A2 — inventory reclassified to Allocated
   allocationBatchAmount  Decimal?  @db.Decimal(18, 4) @map("accounting_allocation_batch_amount") // Cost value reclassified
   // o3d-0qoo: the EXACT AccountingSyncLog.referenceId of the batch this row was staged into,

@@ -1001,6 +1001,38 @@ async function recordStandingAllocationDebitOnCancel(
 }
 
 /**
+ * Unpaid-invoice deferral: everything already relieved from an order's Group A2 debit OTHER than allocation reversals —
+ * each journaled shipment's and each refund's recorded `allocatedReliefAmount` (soft-deleted refunds included: their
+ * journals stay in the ledger). Refused when a relief cannot be read: a journaled shipment with no recorded relief (a
+ * row from before the column), or a refund with none that still owes its accounting or whose staging is not proved
+ * NOT_STAGED.
+ */
+async function wholeOrderAllocatedRelief(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+): Promise<{ ok: true; total: Prisma.Decimal } | { ok: false; reason: string }> {
+  const [shipments, refunds] = await Promise.all([
+    tx.shipment.findMany({ where: { orderId, shipmentJournalDate: { not: null } }, select: { id: true, allocatedReliefAmount: true } }),
+    // soft-delete exception (ledger cascade): a deleted refund's relief journal is still in the ledger.
+    tx.salesOrderRefund.findMany({ where: { orderId }, select: { id: true, allocatedReliefAmount: true, accountingRetryRequired: true, reversalStagingState: true } }),
+  ])
+  let total = toDecimal(0)
+  for (const shipment of shipments) {
+    if (shipment.allocatedReliefAmount == null) return { ok: false, reason: `journaled shipment ${shipment.id} records no Allocated Inventory relief` }
+    total = addMoney(total, shipment.allocatedReliefAmount)
+  }
+  for (const refund of refunds) {
+    if (refund.accountingRetryRequired) return { ok: false, reason: `refund ${refund.id} still owes its accounting` }
+    if (refund.allocatedReliefAmount != null) {
+      total = addMoney(total, refund.allocatedReliefAmount)
+    } else if (refund.reversalStagingState !== 'NOT_STAGED') {
+      return { ok: false, reason: `refund ${refund.id} records no Allocated Inventory relief` }
+    }
+  }
+  return { ok: true, total }
+}
+
+/**
  * REVERSE THE PART OF GROUP A2'S DEBIT THIS REWRITE ORPHANED (o3d-0i5y r9).
  *
  * Group A2 posts DR Allocated Inventory / CR Inventory for the units an order has allocated. Before
@@ -1266,10 +1298,35 @@ export async function reverseOrphanedAllocationPosting(
   // crediting more than A2 ever debited. The bound is the order's own record: what A2 posted, less
   // what earlier reversals have already credited back out. Read under the same order row lock as the
   // running total it is netted against, so the cap and the increment cannot see different states.
-  const openAllocatedContra = roundQuantity(
+  let openAllocatedContra = roundQuantity(
     subtractMoney(toDecimal(proof.recordedDebit), toDecimal(order?.allocationReversalAmount ?? 0)),
     2,
   ).toNumber()
+  // Unpaid-invoice deferral: the WHOLE open debit is reckoned against every relief, not only earlier reversals — each
+  // journaled shipment's and each refund's recorded `allocatedReliefAmount` (the refund path's own two sources). A
+  // relief that cannot be read refuses: crediting the whole recorded debit over a relief already taken would drive
+  // Allocated Inventory below zero. (A trim's own snapshot amount needs none of this: it names only its own units.)
+  if (wholeOpenDebit) {
+    const relief = await wholeOrderAllocatedRelief(tx, orderId)
+    if (!relief.ok) {
+      await tx.activityLog.create({
+        data: {
+          entityType: 'SALES_ORDER',
+          entityId: orderId,
+          action: 'allocation_reversal_unproved',
+          tag: 'accounting',
+          level: 'ERROR',
+          description: withLedgerCheck(
+            `Order ${orderRef}: ${wholeOpenDebit.why}, but NO Allocated Inventory reversal was raised: ${relief.reason}, so how much of `
+            + `the £${proof.recordedDebit.toFixed(2)} Group A2 debited is still open cannot be established. Post CR ${settings.allocatedInventoryAccount} / `
+            + `DR ${settings.inventoryAccount} by hand for what is still open.`,
+          ),
+        },
+      })
+      return
+    }
+    openAllocatedContra = roundQuantity(subtractMoney(toDecimal(openAllocatedContra), relief.total), 2).toNumber()
+  }
   if (openAllocatedContra <= 0 && wholeOpenDebit) return
   if (openAllocatedContra <= 0) {
     await tx.activityLog.create({
@@ -2554,7 +2611,7 @@ export async function cancelSalesOrderFulfillmentState(
   await lockSalesOrder(tx, input.orderId)
   const lockedOrder = await tx.salesOrder.findUnique({
     where: { id: input.orderId },
-    select: { status: true, refundStatus: true, revenueDeferralBasis: true, revenueDeferredDate: true, revenueDeferralUnwindOwedAt: true, revenueDeferralUnwoundAmount: true },
+    select: { status: true, refundStatus: true, accountingInvoiceId: true, revenueDeferralBasis: true, revenueDeferredDate: true, revenueDeferralUnwindOwedAt: true, revenueDeferralUnwoundAmount: true, revenueDeferralUnwindInvoiceId: true },
   })
   if (!lockedOrder) throw new Error('Order not found')
   // Unpaid-invoice deferral: the invoice an INVOICE-basis deferral came from is PROVEN gone (IMS deleted it, or Xero
@@ -2564,6 +2621,9 @@ export async function cancelSalesOrderFulfillmentState(
   const invoiceGoneDeferral = lockedOrder.revenueDeferralBasis === 'INVOICE'
     && lockedOrder.revenueDeferredDate !== null
     && (lockedOrder.revenueDeferralUnwindOwedAt !== null || lockedOrder.revenueDeferralUnwoundAmount !== null)
+    // ...and the order still names THAT invoice (voided in Xero) or none (deleted through IMS). A re-issued, live invoice
+    // is credited by a refund like any other, so the ordinary posted-invoice check applies to it.
+    && (lockedOrder.accountingInvoiceId === null || lockedOrder.accountingInvoiceId === lockedOrder.revenueDeferralUnwindInvoiceId)
 
   // o3d-hqvrp.41: an invoice that already reached the ledger is not voided or credited by a cancellation,
   // and the deferral and allocation journals behind it stay too. A manual cancel is refused until the order

@@ -128,6 +128,7 @@ async function clean(rig: Rig, fixtures: Fixture[]) {
   for (const fx of fixtures) {
     await db.accountingSyncLog.deleteMany({ where: { referenceType: 'SalesOrder', referenceId: fx.orderId } }).catch(() => {})
     await db.wmsOperatorTask.deleteMany({ where: { orderId: fx.orderId } }).catch(() => {})
+    await db.accountingSyncLog.deleteMany({ where: { referenceType: 'SalesOrderRefund', referenceId: { in: (await db.salesOrderRefund.findMany({ where: { orderId: fx.orderId }, select: { id: true } })).map((r) => r.id) } } }).catch(() => {})
     await db.accountingDocumentDeletion.deleteMany({ where: { documentId: fx.orderId } }).catch(() => {})
     await db.activityLog.deleteMany({ where: { entityId: fx.orderId } }).catch(() => {})
     await db.integrationOutbox.deleteMany({ where: { operation: 'refund.reservation-release', payloadJson: { path: ['orderId'], equals: fx.orderId } } }).catch(() => {})
@@ -790,6 +791,93 @@ test('unpaid-invoice deferral: deleted and then RE-ISSUED: the new invoice re-de
     assert.equal(net(all, '1210'), 0)
     order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
     assert.equal(order.revenueDeferralBasis, 'INVOICE')
+  } finally {
+    await clean(rig, fixtures)
+    await close(rig)
+  }
+})
+
+test('unpaid-invoice deferral: refund, then Xero void, then the REAL cancel: the A2 reversal is capped by the refund relief; 1210, 1200, 2100 and 4000 all net to zero', { skip }, async () => {
+  const rig = await openRig()
+  const fixtures: Fixture[] = []
+  try {
+    await clean(rig, [])
+    await setup(rig, { since: new Date(Date.now() - 10 * DAY) })
+    const suffix = suffixOf()
+    const fx = await seed(rig, suffix, { allocatedAt: noonDaysAgo(4), invoice: { mode: 'submitted', docDay: ymd(noonDaysAgo(4)), syncedAt: new Date(Date.now() - 4 * DAY) } })
+    fixtures.push(fx)
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    await settleBatchJournals(rig, suffix)
+
+    // A refund of one (unshipped) unit after the deferral: its reversal takes 100 out of Unearned and 10 out of Allocated.
+    await rig.db.setting.upsert({ where: { key: 'plugin_xero_enabled' }, create: { key: 'plugin_xero_enabled', value: 'true' }, update: { value: 'true' } })
+    const refund = await rig.createSalesOrderRefund(rig.db, {
+      orderId: fx.orderId,
+      lines: [{ lineId: fx.lineId, productId: fx.productId, description: 'ib', qty: 1, totalBase: 100 }],
+      reason: 'Line cancelled', creditNotePrefix: `IB${suffix.slice(0, 6)}r-`,
+      accountingSettings, activeAccountingConnector: 'xero',
+    })
+    assert.equal(refund.success, true, `refund (${refund.success ? '' : refund.error})`)
+    if (!refund.success) return
+    const refundJournals: Journal[] = (refund.accountingSyncs as unknown as Array<{ type: string; payload: { lines: Line[] } }>)
+      .filter((sync) => sync.type === 'UNEARNED_REV_REVERSAL' || sync.type === 'ALLOCATION_REVERSAL')
+      .map((sync) => ({ type: sync.type, date: '', narration: '', lines: sync.payload.lines }))
+    // The refund service RETURNS its syncs; the action queues them and clears the retry flag. Stand in for that hand-off.
+    await rig.db.salesOrderRefund.update({ where: { id: refund.createdRefund.id }, data: { accountingRetryRequired: false } })
+    const refundRow = await rig.db.salesOrderRefund.findUniqueOrThrow({ where: { id: refund.createdRefund.id } })
+    assert.equal(Number(refundRow.allocatedReliefAmount), 10, 'the refund relieved 10 of Allocated Inventory')
+    assert.equal(net(refundJournals, '1210'), -10)
+    assert.equal(net(refundJournals, '2100'), 100)
+
+    // Xero voids the invoice; the batch unwinds what is still open (300).
+    assert.equal(await rig.markInvoiceBasisDeferralUnwindOwed(rig.db, { accountingInvoiceIds: [`INV-${suffix}`] }, 'INVOICE_VOIDED'), 1)
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    assert.equal(net((await journals(rig)).filter((j) => /unwind/i.test(j.narration)), '2100'), 300)
+
+    // A manual cancel needs no refund: the order still names only the voided invoice. The A2 reversal is 40 - 10 = 30.
+    await cancelOrder(rig, fx.orderId)
+    const order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+    assert.equal(order.status, 'CANCELLED')
+    assert.equal(Number(order.allocationReversalAmount), 30, 'capped by the refund relief, not the whole recorded debit')
+    const all = [...await journals(rig), ...refundJournals]
+    assertBalanced(all, 'refund, void, cancel')
+    assert.equal(net(all, '1210'), 0, 'Allocated Inventory nets to zero, never below')
+    assert.equal(net(all, '1200'), 0, 'Inventory nets to zero')
+    assert.equal(net(all, '2100'), 0, 'Unearned Revenue nets to zero')
+    assert.equal(net(all, '4000'), 0, 'Sales: the deferral, the refund reversal and the unwind cancel out (the credit note and the void are Xero documents)')
+    assert.deepEqual(allocStranded(rig, await rig.collectAccountingInvariantRows(rig.db as never), fx.orderId), [])
+  } finally {
+    await clean(rig, fixtures)
+    await close(rig)
+  }
+})
+
+test('unpaid-invoice deferral: a RE-ISSUED live invoice cannot be cancelled without a refund, even while the old unwind is recorded', { skip }, async () => {
+  const rig = await openRig()
+  const fixtures: Fixture[] = []
+  try {
+    await clean(rig, [])
+    await setup(rig, { since: new Date(Date.now() - 10 * DAY) })
+    const suffix = suffixOf()
+    const fx = await seed(rig, suffix, { allocatedAt: noonDaysAgo(4), invoice: { mode: 'submitted', docDay: ymd(noonDaysAgo(4)), syncedAt: new Date(Date.now() - 4 * DAY) } })
+    fixtures.push(fx)
+    assert.deepEqual((await rig.runDailyBatchSync()).errors, [])
+    await settleBatchJournals(rig, suffix)
+    await rig.db.accountingDocumentDeletion.create({
+      data: { kind: 'SALES_INVOICE', referenceType: 'SalesOrder', referenceId: fx.orderId, documentId: fx.orderId, externalDocumentId: `INV-${suffix}`, originalNumber: `INV-${suffix}`, releasedNumber: `INV-${suffix}-X`, targetStatus: 'VOIDED' },
+    })
+    assert.equal(await rig.completeAccountingDocumentDeletion(`INV-${suffix}`), 'completed')
+    let order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+    assert.equal(order.revenueDeferralUnwindInvoiceId, `INV-${suffix}`, 'the unwind names the invoice it is for')
+    // Re-issued before the batch has run: a new, live AUTHORISED invoice.
+    await rig.db.salesOrder.update({ where: { id: fx.orderId }, data: { accountingInvoiceId: `INV2-${suffix}` } })
+    await rig.db.accountingSyncLog.create({
+      data: { type: 'SALES_INVOICE', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: fx.orderId, externalTransactionId: `INV2-${suffix}`, syncedAt: new Date(), payload: { _postingMode: 'submitted', date: ymd(noonDaysAgo(1)) } },
+    })
+    await assert.rejects(cancelOrder(rig, fx.orderId), /invoice/i, 'the live re-issued invoice must be credited by a refund')
+    order = await rig.db.salesOrder.findUniqueOrThrow({ where: { id: fx.orderId } })
+    assert.notEqual(order.status, 'CANCELLED')
+    assert.equal(order.allocationReversalAmount, null, 'no A2 reversal was raised')
   } finally {
     await clean(rig, fixtures)
     await close(rig)
