@@ -11,6 +11,7 @@
 import { roundQuantity, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { discountSplitKey, type DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split-plan'
 import { resolveSalesLineTaxType } from '@/lib/accounting/reverse-charge'
+import { isNoTaxType } from '@/lib/domain/accounting/sales-document-tax-types'
 
 export { discountSplitKey, type DiscountTaxSplitEntry }
 
@@ -122,22 +123,41 @@ export function discountSplitEntryTaxType(
   return resolveSalesLineTaxType({ baseTaxType: entry.accountingTaxType ?? ctx.orderDefaultTaxType ?? null, reverseCharge: entry.reverseCharge, reverseChargeSalesTaxType: ctx.reverseChargeSalesTaxType }) ?? null
 }
 
+/**
+ * THE SPLIT WITH EACH GROUP'S CODE READ FROM ITS RATE NOW. An entry's `accountingTaxType` is a snapshot taken when the order was saved, so a draft saved while its rate had no accounting tax code
+ * would stay refused after the operator mapped the rate. The goods lines read their rate's code live (queueSalesInvoiceForOrder), so the finalisation check and the invoice build read the split's
+ * the same way: `codeByRateId` holds the current code of every rate id the split names (a rate absent from the map keeps its stored code; an entry with no rate id, the no-rate lines, has none to refresh).
+ */
+export function refreshDiscountSplitCodes(split: ReadonlyArray<DiscountTaxSplitEntry>, codeByRateId: ReadonlyMap<string, string | null>): DiscountTaxSplitEntry[] {
+  return split.map((entry) => (entry.taxRateId !== null && codeByRateId.has(entry.taxRateId) ? { ...entry, accountingTaxType: codeByRateId.get(entry.taxRateId) ?? null } : entry))
+}
+
 const pct = (rate: number): string => `${toDecimal(rate).mul(100).toDecimalPlaces(4).toString()}%`
 
+/** Where a refusal is shown: it decides how the message ends (what the operator can do next), never what it says is wrong. */
+export type DiscountSplitRefusalContext = 'live-save' | 'finalise' | 'invoice'
+
 /**
- * The refusal of a split with a group that has NO tax code to post its share of the discount on (discountSplitEntryTaxType answers null), or null. Such a group is, in practice, the
- * lines with no tax rate of a discounted order whose default rate does not resolve to a rate with a code: its invoice would carry a discount part (and goods lines) with no tax code
- * and be refused at the sync processor ("NOTHING WAS SENT"), so a live order is refused when it is saved or finalised instead. Stricter than the invoice (which drops a part that rounds
- * to nothing), never weaker.
+ * The refusal of a split with a group that has NO tax code to post its share of the discount on (discountSplitEntryTaxType answers null, or the explicit `NONE` code, which no discount part may carry),
+ * or null. Such a group is, in practice, the lines with no tax rate of a discounted order whose default rate does not resolve to a rate with a code, or lines at a rate nobody has mapped yet: its
+ * invoice would carry a discount part (and goods lines) with no tax code and be refused at the sync processor ("NOTHING WAS SENT"), so a live order is refused when it is saved or finalised instead.
+ * Stricter than the invoice (which drops a part that rounds to nothing), never weaker. `context` picks the ending: a live save can fall back to a draft, a finalisation to fixing the mapping, and the
+ * invoice build (whose error adds its own ending) to none.
  */
 export function discountSplitTaxCodeRefusal(
   split: ReadonlyArray<DiscountTaxSplitEntry> | null,
   ctx: { orderDefaultTaxType: string | null | undefined; reverseChargeSalesTaxType: string | null | undefined },
+  context: DiscountSplitRefusalContext = 'invoice',
 ): string | null {
   if (!split) return null
-  const uncoded = split.filter((entry) => discountSplitEntryTaxType(entry, ctx) === null)
+  const uncoded = split.filter((entry) => {
+    const code = discountSplitEntryTaxType(entry, ctx)
+    return code === null || isNoTaxType(code)
+  })
   if (uncoded.length === 0) return null
   const groups = [...new Set(uncoded.map((entry) => (entry.taxRateId ? `the lines at ${pct(entry.rate)}` : `the lines with no tax rate (${pct(entry.rate)})`)))]
-  return `The order discount is taxed per line rate, but ${groups.join(' and ')} have no accounting tax code, so the invoice could not post their share of the discount (or the lines) and would be refused when it is sent. `
-    + 'Choose an order default VAT rate that has an accounting tax code, or give those lines a tax rate that has one, and try again. A draft can still be saved.'
+  const problem = `The order discount is taxed per line rate, but ${groups.join(' and ')} have no accounting tax code, so the invoice could not post their share of the discount (or the lines) and would be refused when it is sent.`
+  if (context === 'live-save') return `${problem} Choose an order default VAT rate that has an accounting tax code, or give those lines a tax rate that has one, and try again. A draft can still be saved.`
+  if (context === 'finalise') return `${problem} Map the tax rate to an accounting tax code (the draft is read again when it is finalised, so it need not be re-saved), or edit the draft to choose an order default VAT rate that has a code, then finalise it again.`
+  return problem
 }
