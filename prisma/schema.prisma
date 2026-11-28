@@ -6694,6 +6694,15 @@ model PurchaseFxNonImsBillApproval {
   xeroCurrencyRate     Decimal? @db.Decimal(28, 12) @map("xero_currency_rate")
   xeroTransitBase      Decimal? @db.Decimal(18, 2) @map("xero_transit_base")
   stockTransitBase     Decimal? @db.Decimal(18, 2) @map("stock_transit_base")
+  /// The basis FROZEN with the confirmation: the order's goods unit cost per order line it was measured on, the IMS bill as confirmed, and the Xero
+  /// organisation that answered. NULL = a confirmation from before these were kept (measured on the current order).
+  stockUnits           Json?    @map("stock_units")
+  billFingerprint      String?  @map("bill_fingerprint")
+  xeroTenantId         String?  @map("xero_tenant_id")
+  /// When and why the confirmation stopped holding (the IMS bill or the order's cost edited, the bill linked to another Xero bill). Its journal is held
+  /// where it is until the bill is confirmed again. NULL = it holds.
+  staleAt              DateTime? @map("stale_at")
+  staleReason          String?   @map("stale_reason")
 
   @@index([poId])
   @@map("purchase_fx_non_ims_bill_approvals")

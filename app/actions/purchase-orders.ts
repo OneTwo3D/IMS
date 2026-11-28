@@ -15,6 +15,7 @@ import { revalidatePath } from 'next/cache'
 import { z } from 'zod'
 import { db } from '@/lib/db'
 import { logActivity, logActivityInTransaction } from '@/lib/activity-log'
+import { purchaseFxBillWriterShadowed } from '@/lib/domain/purchasing/purchase-event-fx-switch-on'
 import {
   MarginBlockedError,
   assessGuardLines,
@@ -4926,6 +4927,19 @@ export async function updateInvoice(
     // when it was created); each line's stock part stays at the PO goods unit cost it was billed at. Its GR/IR rows and FX-difference journal are
     // brought to the edited bill by `reconcilePurchaseBillFx` in the transaction below.
     const billFxManaged = Boolean(invoice.fxRateSource && invoice.fxEventRateToBase)
+    // The bill-writer check, on the edited bill's date: while the producer-side hold shadows supplier bills (a rollback to P1, a date before the cut-over)
+    // a bill valued under the switch is not edited, since Xero holds another system's bill (lib/domain/purchasing/purchase-event-fx-switch-on.ts).
+    // #1164 MED-2: judged on the bill's stored date and on the new one, as the producer judges them (the start of the day).
+    const storedBillDay = invoice.invoiceDate.toISOString().slice(0, 10)
+    const shadowedDay = [storedBillDay, input.invoiceDate.slice(0, 10)].find((day) => purchaseFxBillWriterShadowed(day))
+    if (billFxManaged && shadowedDay) {
+      return {
+        success: false,
+        error: withLedgerCheck(`Bill ${invoice.invoiceNumber ?? invoice.id} is IMS's own bill in Xero, valued under per-event FX rates, but supplier bills dated ${shadowedDay} are now shadowed `
+          + 'by the producer-side hold (another system is the bill writer again), so IMS cannot send the edit and does not make it. Nothing was changed. Edit it once IMS writes the bills '
+          + 'again; until then leave it unchanged here and in Xero (Xero Accounting Sync > Per-event FX rates explains why).'),
+      }
+    }
     const fxRate = billFxManaged ? Number(invoice.fxEventRateToBase) : Number(invoice.fxRateToBase)
     if (!Number.isFinite(fxRate) || fxRate <= 0) {
       return { success: false, error: `Invalid FX rate on bill ${invoice.invoiceNumber ?? invoice.id}` }

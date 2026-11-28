@@ -3,7 +3,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { roundMoney, roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import {
-  purchaseFxOrdersToReconcile, reconcilePurchaseBillFx, reportPurchaseFxVarianceNotQueued, stockUnitsForeign, type PurchaseBillFxReconcileResult,
+  nonImsBillFingerprint, purchaseFxOrdersToReconcile, reconcilePurchaseBillFx, reportPurchaseFxVarianceNotQueued, stockUnitsForeign, type PurchaseBillFxReconcileResult,
 } from '@/lib/domain/purchasing/purchase-bill-fx'
 import { isPurchaseEventFxEnabled } from '@/lib/domain/purchasing/purchase-event-fx-settings'
 import type { XeroBill, XeroBillReadDeps } from '@/lib/connectors/xero/bill-read'
@@ -49,6 +49,11 @@ export type NonImsBillCandidate = {
   noTransitRowReason: string
   /** Why it is left out of the default list (shown when named): no Xero link, a delete pending, declined and marked handled. */
   exclusion: string | null
+  /**
+   * MED-5: the bill is already confirmed: listed because its confirmation went stale (shown by default) or because it was named (a re-confirmation, e.g.
+   * after the Xero bill was edited, which IMS does not see). Confirming it again replaces the basis; null = not confirmed yet.
+   */
+  reconfirmation: string | null
   /** Why it cannot be confirmed (null = confirmable). */
   problem: string | null
   basis: {
@@ -108,7 +113,7 @@ class Rollback extends Error {
 }
 
 type Db = typeof import('@/lib/db')['db']
-type Prepared = NonImsBillCandidate & { xero: XeroBill | null }
+type Prepared = NonImsBillCandidate & { xero: XeroBill | null; xeroTenantId: string | null; stockUnits: Record<string, string>; billFingerprint: string }
 
 const zero = (): Decimal => new Prisma.Decimal(0)
 
@@ -150,7 +155,7 @@ async function prepare(db: Db, options: { named: ReadonlySet<string>; readXero: 
         orderBy: [{ invoiceDate: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
         select: {
           id: true, invoiceNumber: true, fxRateSource: true, subtotalForeign: true, accountingInvoiceId: true, accountingInvoiceIdSource: true,
-          lines: { select: { poLineId: true, qtyBilled: true } },
+          lines: { select: { poLineId: true, qtyBilled: true, totalForeign: true } },
         },
       },
     },
@@ -181,11 +186,17 @@ async function prepare(db: Db, options: { named: ReadonlySet<string>; readXero: 
     }
     const inFlight = [...unreceivedByBill.values()].some((perLine) => [...perLine.values()].some((qty) => qty.gt(0)))
     const billKeys = (await db.transitSubledgerMovement.findMany({ where: { sourceType: 'PURCHASE_BILL', sourceRef: order.id }, select: { idempotencyKey: true } })).map((row) => row.idempotencyKey)
-    const confirmed = new Set((await db.purchaseFxNonImsBillApproval.findMany({ where: { poId: order.id }, select: { invoiceId: true } })).map((row) => row.invoiceId))
+    const confirmedRows = new Map((await db.purchaseFxNonImsBillApproval.findMany({ where: { poId: order.id }, select: { invoiceId: true, staleAt: true, staleReason: true, approvedAt: true } })).map((row) => [row.invoiceId, row]))
     for (const invoice of order.invoices) {
       if (invoice.fxRateSource !== null) continue
-      if (confirmed.has(invoice.id) || billKeys.some((key) => key.startsWith(`purchase-invoice:${invoice.id}:`))) continue
+      if (billKeys.some((key) => key.startsWith(`purchase-invoice:${invoice.id}:`))) continue
       const named = options.named.has(invoice.id)
+      const already = confirmedRows.get(invoice.id)
+      // A confirmed bill is listed again only when its confirmation went stale, or when it is named (a re-confirmation).
+      if (already && !already.staleAt && !named) continue
+      const reconfirmation = already
+        ? (already.staleAt ? `confirmed on ${already.approvedAt.toISOString().slice(0, 10)}, now stale: ${already.staleReason ?? 'stale'}; confirming again replaces the basis` : `confirmed on ${already.approvedAt.toISOString().slice(0, 10)}; confirming again replaces the basis (after an edit of the Xero bill)`)
+        : null
       // MED-6: with bills named, only those are listed (and read).
       if (options.named.size > 0 && !named) continue
       if (!named && !inFlight && !touched.has(order.id)) continue
@@ -212,11 +223,14 @@ async function prepare(db: Db, options: { named: ReadonlySet<string>; readXero: 
       }
       const candidate: Prepared = {
         poId: order.id, poReference: order.reference, currency: order.currency, invoiceId: invoice.id, invoiceNumber: invoice.invoiceNumber,
-        accountingInvoiceId: invoice.accountingInvoiceId, noTransitRowReason: why.reason, exclusion, problem: null,
+        accountingInvoiceId: invoice.accountingInvoiceId, noTransitRowReason: why.reason, exclusion, reconfirmation, problem: null,
         basis: { qty: qty.toString(), stockForeign: stockForeign.toFixed(2), xeroStatus: null, rate: null, account: null, stockTransitBase: null, xeroTransitBase: null, priceDifferenceBase: null },
         notReceived: { qty: unreceivedQty.toString(), base: null },
         proposedTransitDelta: null,
         xero: null,
+        xeroTenantId: null,
+        stockUnits: Object.fromEntries(invoice.lines.flatMap((line) => (line.poLineId && stockUnits.has(line.poLineId) ? [[line.poLineId, stockUnits.get(line.poLineId)!.toString()]] : []))),
+        billFingerprint: nonImsBillFingerprint(invoice),
       }
       if (!invoice.accountingInvoiceId) candidate.problem = 'not linked to a Xero bill: there is no basis for a journal'
       else if (!transitAccount) candidate.problem = 'the Stock in Transit account is not mapped'
@@ -231,6 +245,7 @@ async function prepare(db: Db, options: { named: ReadonlySet<string>; readXero: 
         } else {
           const bill = answer.bill
           candidate.xero = bill
+          candidate.xeroTenantId = answer.tenantId
           const accounts = [...new Set(bill.lines.map((line) => line.accountCode ?? '(none)'))]
           candidate.basis.account = accounts.join(', ')
           candidate.basis.rate = bill.currencyRate.toString()
@@ -276,7 +291,10 @@ async function proposeForOrder(db: Db, poId: string, rates: ReadonlyMap<string, 
   }
   const out = new Map<string, string>()
   for (const id of rates.keys()) out.set(id, '0.00')
-  for (const journal of result?.journals ?? []) if (rates.has(journal.invoiceId)) out.set(journal.invoiceId, journal.transitDelta)
+  // #1164 LOW-4: the journal and any take-back of an earlier shadow, as the confirmation will compare them.
+  for (const entry of [...(result?.journals ?? []), ...(result?.shadowed ?? []).filter((x) => x.reversal)]) {
+    if (rates.has(entry.invoiceId)) out.set(entry.invoiceId, toDecimal(out.get(entry.invoiceId) ?? '0').add(entry.transitDelta).toFixed(2))
+  }
   return out
 }
 
@@ -305,6 +323,9 @@ async function listPrepared(db: Db, options: { named?: ReadonlyArray<string>; ma
   const candidates: NonImsBillCandidate[] = prepared.map((c) => {
     const rest: Partial<Prepared> = { ...c }
     delete rest.xero
+    delete rest.xeroTenantId
+    delete rest.stockUnits
+    delete rest.billFingerprint
     return rest as NonImsBillCandidate
   })
   return {
@@ -346,6 +367,13 @@ export async function confirmNonImsBills(params: {
   if (Boolean(params.all) === (named.length > 0)) throw new NonImsBillsConfirmRefused('Name the bills to confirm with --bill <id>, or pass --all for every bill listed (not both).')
   // LOW-9: the digest covers the whole default list, so it goes with --all only.
   if (params.digest && !params.all) throw new NonImsBillsConfirmRefused('--digest goes with --all (it covers the whole default list); for named bills pass --expect <id>=<amount>. Nothing was confirmed.')
+  // #1164 MED-1: a journal the hold would shadow today is lost for good (the bill would then be settled with nothing in the ledger), so the confirmation
+  // is refused up front, before any Xero read, while PURCHASE_FX_VARIANCE journals are shadowed.
+  const { purchaseFxJournalShadowed } = await import('@/lib/domain/purchasing/purchase-event-fx-switch-on')
+  const { businessDateYmd } = await import('@/lib/business-date')
+  if (purchaseFxJournalShadowed(businessDateYmd(new Date()))) {
+    throw new NonImsBillsConfirmRefused('Nothing was confirmed: the producer-side hold shadows exchange-rate difference journals today (IMS is not yet the writer of these journals), so the journal would never reach Xero. Confirm once IMS writes them.')
+  }
   const { list, prepared, settings } = await listPrepared(db, { named, maxReads: params.maxReads, deps: params.deps })
   if (!list.confirmable) throw new NonImsBillsConfirmRefused(`Nothing was confirmed: ${list.notConfirmableReason}.`)
   let chosen: Prepared[]
@@ -378,12 +406,25 @@ export async function confirmNonImsBills(params: {
     try {
       result = await db.$transaction(async (tx) => {
         await tx.$queryRaw`SELECT id FROM purchase_orders WHERE id = ${poId} FOR UPDATE`
+        // LOW-8: the Xero organisation connected now is the one that answered the read.
+        const token = await tx.accountingToken.findUnique({ where: { connector: 'xero' }, select: { tenantId: true } })
         for (const bill of bills) {
-          // The Xero answer read in this run is stored with the confirmation (it is not read again).
+          if (!token?.tenantId || token.tenantId !== bill.xeroTenantId) throw new ConfirmMismatch(`bill ${bill.invoiceNumber ?? bill.invoiceId}: the Xero bill was read from organisation ${bill.xeroTenantId ?? '?'}, the connected one is ${token?.tenantId ?? 'none'}`)
+          // LOW-7: still a candidate under the lock (not posted by IMS meanwhile, not re-linked, not on its way out, not re-valued).
+          const now = await tx.purchaseInvoice.findUnique({ where: { id: bill.invoiceId }, select: { fxRateSource: true, accountingInvoiceId: true, subtotalForeign: true, lines: { select: { poLineId: true, qtyBilled: true, totalForeign: true } } } })
+          const posted = await tx.transitSubledgerMovement.findFirst({ where: { sourceType: 'PURCHASE_BILL', sourceRef: poId, idempotencyKey: { startsWith: `purchase-invoice:${bill.invoiceId}:` } }, select: { id: true } })
+          const deleting = await tx.accountingDocumentDeletion.findFirst({ where: { documentId: bill.invoiceId, state: { in: ['PENDING', 'NEEDS_REVIEW'] } }, select: { id: true } })
+          if (!now || now.fxRateSource !== null || now.accountingInvoiceId !== bill.xero!.invoiceId || posted || (deleting && !bill.exclusion) || nonImsBillFingerprint(now) !== bill.billFingerprint) {
+            throw new ConfirmMismatch(`bill ${bill.invoiceNumber ?? bill.invoiceId}: it changed since it was listed (posted, re-linked, edited or being deleted); run the dry run again`)
+          }
+          // A re-confirmation replaces the earlier confirmation and its basis (MED-5).
+          if (bill.reconfirmation) await tx.purchaseFxNonImsBillApproval.deleteMany({ where: { invoiceId: bill.invoiceId } })
+          // The Xero answer read in this run is stored with the confirmation (it is not read again), with the basis frozen.
           await tx.purchaseFxNonImsBillApproval.create({
             data: {
               poId, invoiceId: bill.invoiceId, approvedBy: params.by.trim(), reason: params.reason.trim(), proposedTransitDelta: expected(bill),
               xeroInvoiceId: bill.xero!.invoiceId, xeroCurrencyRate: bill.xero!.currencyRate, xeroTransitBase: bill.basis.xeroTransitBase, stockTransitBase: bill.basis.stockTransitBase,
+              stockUnits: bill.stockUnits, billFingerprint: bill.billFingerprint, xeroTenantId: bill.xeroTenantId,
             },
           })
           await logActivityInTransaction(tx, {
@@ -402,7 +443,10 @@ export async function confirmNonImsBills(params: {
         // Under the lock: what the reconciliation queues for these bills must be what the admin was shown.
         const reconciled = await reconcilePurchaseBillFx(tx, { poId, connector: settings.connector, syncEnabled: settings.syncEnabled, at: new Date() })
         for (const bill of bills) {
-          const actual = reconciled.journals.filter((j) => j.invoiceId === bill.invoiceId).reduce((sum, j) => sum.add(j.transitDelta), zero()).toFixed(2)
+          // MED-4: what the reconciliation settled for the bill: queued, declined (still owed), or the take-back of an earlier shadow. A NEW shadow is not
+          // settled (#1164 MED-1: that journal would be lost), so it mismatches and rolls the order back.
+          const settled = [...reconciled.journals, ...(reconciled.shadowed ?? []).filter((x) => x.reversal), ...reconciled.notQueued].filter((j) => j.invoiceId === bill.invoiceId)
+          const actual = settled.reduce((sum, j) => sum.add(j.transitDelta), zero()).toFixed(2)
           if (actual !== toDecimal(expected(bill)).toFixed(2)) {
             throw new ConfirmMismatch(`bill ${bill.invoiceNumber ?? bill.invoiceId}: the journal under the lock is ${actual}, not the ${expected(bill)} shown`)
           }

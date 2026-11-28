@@ -11,6 +11,7 @@ import { recordTransitSubledgerMovement } from '@/lib/domain/accounting/transit-
 import { isShadowedOutcome, postingIsOwed, reportPostingNotQueued, type EnqueueOutcomeLike } from '@/lib/domain/accounting/enqueue-outcome'
 import { headerDiscountFactorForPo } from '@/lib/domain/purchasing/landed-cost-allocation'
 import { isPurchaseEventFxEnabled } from '@/lib/domain/purchasing/purchase-event-fx-settings'
+import { purchaseFxBillWriterShadowed } from '@/lib/domain/purchasing/purchase-event-fx-switch-on'
 import {
   PURCHASE_FX_SOURCE_FX_TABLE, PURCHASE_FX_SOURCE_XERO_PREPAYMENT, PurchaseFxRefusalError, purchaseFxAccountsRefusal,
   type PrepaymentChecks, type PurchaseFxSource,
@@ -93,6 +94,9 @@ export async function resolveBillFxRate(
   const currency = po.currency.trim().toUpperCase()
   if (currency === baseCurrency) return null
 
+  // The bill-writer check, on the bill's own date (a bill dated before the cut-over, or a rollback to P1): while the producer-side hold shadows the bill,
+  // Xero holds another system's bill, so this one is valued at the PO rate exactly as before (purchase-event-fx-switch-on.ts).
+  if (purchaseFxBillWriterShadowed(params.invoiceDate.slice(0, 10))) return null
   const accountsRefusal = await purchaseFxAccountsRefusal(client)
   if (accountsRefusal) throw new PurchaseFxRefusalError(accountsRefusal.replace('Nothing was received.', 'The bill was not saved.'))
   const check = params.checks.get(params.poId)
@@ -267,6 +271,12 @@ export function planCreditPpvSplit(params: { grossForeign: DecimalInput; taxRate
   return { stockNet: gross.sub(tax).sub(ppvNet), stockTax: tax.sub(ppvTax), ppvNet, ppvTax }
 }
 
+/** MED-5: the IMS bill as a confirmation saw it (its goods lines' quantities and amounts, and its net), to tell a later edit. Pure. */
+export function nonImsBillFingerprint(bill: { subtotalForeign: DecimalInput; lines: ReadonlyArray<{ poLineId: string | null; qtyBilled: DecimalInput; totalForeign: DecimalInput }> }): string {
+  const lines = bill.lines.map((line) => `${line.poLineId ?? '-'}:${toDecimal(line.qtyBilled).toString()}:${toDecimal(line.totalForeign).toString()}`).sort()
+  return `${toDecimal(bill.subtotalForeign).toString()}|${lines.join(',')}`
+}
+
 // ─── THE MATCHING (pure) ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** One receipt of one order line, in receipt order: its quantity and the goods value it credited (GR/IR RECEIPT row). */
@@ -426,9 +436,10 @@ export type PurchaseBillFxReconcileResult = {
   /** The FX journals queued by this run (bill id and number, signed transit movement). In a dry run: the journals it WOULD queue. */
   journals: Array<{ invoiceId: string; invoiceNumber: string | null; transitDelta: string }>
   /** Journals the queue declined while owed: the caller reports them after its commit (`reportPurchaseFxVarianceNotQueued`). */
-  notQueued: Array<{ invoiceId: string; invoiceNumber: string | null; outcome: EnqueueOutcomeLike }>
+  notQueued: Array<{ invoiceId: string; invoiceNumber: string | null; outcome: EnqueueOutcomeLike; transitDelta: string }>
   /** MED-2: journals the producer-side hold recorded as a shadow; settled (never caught up later). */
-  shadowed?: Array<{ invoiceId: string; transitDelta: string }>
+  /** `reversal`: the take-back of an amount settled as a shadow before (LOW-2); otherwise a new journal the hold recorded as a shadow. */
+  shadowed?: Array<{ invoiceId: string; transitDelta: string; reversal?: boolean }>
 }
 
 export const NO_BILL_FX_RECONCILE: PurchaseBillFxReconcileResult = { journals: [], notQueued: [] }
@@ -480,7 +491,7 @@ export async function reconcilePurchaseBillFx(
     where: { poId: params.poId },
     orderBy: [{ invoiceDate: 'asc' }, { createdAt: 'asc' }, { id: 'asc' }],
     select: {
-      id: true, invoiceNumber: true, invoiceDate: true, fxRateSource: true, fxEventRateToBase: true,
+      id: true, invoiceNumber: true, invoiceDate: true, fxRateSource: true, fxEventRateToBase: true, accountingInvoiceId: true, subtotalForeign: true,
       lines: { select: { poLineId: true, costLineId: true, qtyBilled: true, totalForeign: true, totalBase: true, stockUnitForeign: true } },
     },
   })
@@ -540,16 +551,39 @@ export async function reconcilePurchaseBillFx(
   // CurrencyRate its Xero bill was read at. Their GR/IR is corrected as for any bill from before the switch (above); what sits in Stock in Transit for
   // them is the Xero bill's goods at the XERO rate, so the exchange-rate journal is measured on that basis: the order's goods cost (after the header
   // discount) at the Xero rate, matched to the receipts in the same order. The bill's price difference stays on transit (owner ruling 2026-11-26).
-  const confirmedRows = await tx.purchaseFxNonImsBillApproval.findMany({ where: { poId: params.poId }, select: { invoiceId: true, xeroCurrencyRate: true } })
+  const confirmedRows = await tx.purchaseFxNonImsBillApproval.findMany({
+    where: { poId: params.poId },
+    select: { id: true, invoiceId: true, xeroCurrencyRate: true, xeroInvoiceId: true, stockUnits: true, billFingerprint: true, staleAt: true, staleReason: true },
+  })
   const confirmedRate = new Map<string, Decimal | null>(confirmedRows.map((row) => [row.invoiceId, row.xeroCurrencyRate === null ? null : toDecimal(row.xeroCurrencyRate)]))
-  if (params.dryRun) for (const [id, rate] of params.assumeConfirmed ?? []) confirmedRate.set(id, rate)
+  const currentStockUnits = stockUnitsForeign(po)
+  // MED-5: the basis is FROZEN with the confirmation (the order's goods unit costs it was measured on). A confirmation whose basis no longer holds (the IMS
+  // bill edited, the order's cost edited, the bill linked to another Xero bill) is STALE: marked so, and its journal is held where it is until the bill
+  // is confirmed again (an edit in Xero is not seen here: it needs a re-confirmation, see purchase-fx-non-ims-bills.ts).
+  const frozenUnits = new Map<string, Map<string, Decimal>>()
+  const stale = new Map<string, string>()
+  for (const row of confirmedRows) {
+    const bill = billById.get(row.invoiceId)
+    if (row.stockUnits && typeof row.stockUnits === 'object') {
+      frozenUnits.set(row.invoiceId, new Map(Object.entries(row.stockUnits as Record<string, string>).map(([lineId, unit]) => [lineId, toDecimal(unit)])))
+    }
+    if (!bill) continue
+    let reason: string | null = row.staleAt ? (row.staleReason ?? 'stale') : null
+    if (!reason && row.xeroInvoiceId && bill.accountingInvoiceId !== row.xeroInvoiceId) reason = `the bill is linked to another Xero bill (${bill.accountingInvoiceId ?? 'none'}, confirmed on ${row.xeroInvoiceId})`
+    if (!reason && row.billFingerprint && row.billFingerprint !== nonImsBillFingerprint(bill)) reason = 'the IMS bill was edited after it was confirmed'
+    const frozen = frozenUnits.get(row.invoiceId)
+    if (!reason && frozen && [...frozen].some(([lineId, unit]) => !(currentStockUnits.get(lineId)?.eq(unit) ?? false))) reason = 'the order\'s goods cost was edited after the bill was confirmed'
+    if (!reason) continue
+    stale.set(row.invoiceId, reason)
+    if (!row.staleAt && !params.dryRun) await tx.purchaseFxNonImsBillApproval.update({ where: { id: row.id }, data: { staleAt: params.at, staleReason: reason } })
+  }
+  if (params.dryRun) for (const [id, rate] of params.assumeConfirmed ?? []) { confirmedRate.set(id, rate); stale.delete(id); frozenUnits.delete(id) }
   const xeroRated = [...confirmedRate.entries()].filter(([, rate]) => rate !== null)
   let journalTargets = targets
   if (xeroRated.length > 0) {
-    const stockUnits = stockUnitsForeign(po)
     const journalUnitBase = (invoiceId: string, poLineId: string): Decimal | undefined => {
       const rate = confirmedRate.get(invoiceId)
-      const unit = stockUnits.get(poLineId)
+      const unit = (frozenUnits.get(invoiceId) ?? currentStockUnits).get(poLineId)
       if (rate && unit) return unit.div(rate)
       return poRateUnitBase(invoiceId, poLineId)
     }
@@ -682,6 +716,8 @@ export async function reconcilePurchaseBillFx(
   const result: PurchaseBillFxReconcileResult = { journals: [], notQueued: [], shadowed: [] }
   let accounts: { transit: string; realisedFx: string } | null = null
   for (const invoiceId of billIds) {
+    // MED-5: a stale confirmation holds its journal where it is.
+    if (stale.has(invoiceId)) continue
     const owed = billById.has(invoiceId) && billPosted(invoiceId)
     const targetTransit = owed ? roundQuantity((fxByBill.get(invoiceId) ?? zero()).neg(), 2) : zero()
     const posted = postedByBill.get(invoiceId) ?? { sum: zero(), rows: 0 }
@@ -699,8 +735,9 @@ export async function reconcilePurchaseBillFx(
           create: { poId: params.poId, invoiceId, idempotencyKey: key, baseDelta: back, journalDate: businessDateYmd(params.at) },
           update: {},
         })
-        result.shadowed!.push({ invoiceId, transitDelta: back.toFixed(2) })
       }
+      // Reported in a dry run as well (#1164 LOW-4), so a proposal shows the part a confirmation settles as a shadow reversal.
+      result.shadowed!.push({ invoiceId, transitDelta: back.toFixed(2), reversal: true })
       delta = roundQuantity(delta.sub(back), 2)
       if (delta.isZero()) continue
     }
@@ -763,7 +800,7 @@ export async function reconcilePurchaseBillFx(
       })
       result.shadowed!.push({ invoiceId, transitDelta: delta.toFixed(2) })
     } else if (answered.outcome && postingIsOwed(answered.outcome)) {
-      result.notQueued.push({ invoiceId, invoiceNumber, outcome: answered.outcome })
+      result.notQueued.push({ invoiceId, invoiceNumber, outcome: answered.outcome, transitDelta: delta.toFixed(2) })
     }
   }
   return result

@@ -77,6 +77,7 @@ async function main(): Promise<number> {
     for (const c of list.candidates) {
       console.log(`  ${c.poReference} (${c.currency}) bill ${c.invoiceNumber ?? c.invoiceId} [${c.invoiceId}], Xero ${c.accountingInvoiceId ?? '(not linked)'}${c.basis.xeroStatus ? ` (${c.basis.xeroStatus})` : ''}`)
       console.log(`    no transit row: ${c.noTransitRowReason}${c.exclusion ? `; left out unless named: ${c.exclusion}` : ''}`)
+      if (c.reconfirmation) console.log(`    already ${c.reconfirmation}`)
       console.log(`    basis: ${c.basis.qty} units, goods ${c.currency} ${c.basis.stockForeign} at ${c.basis.rate ?? '?'} = ${c.basis.stockTransitBase ?? '?'} in transit on ${c.basis.account ?? '?'}`
         + `${c.basis.xeroTransitBase ? ` (the Xero bill has ${c.basis.xeroTransitBase} there; its price difference ${c.basis.priceDifferenceBase} stays on transit)` : ''}`)
       console.log(`    not received yet: ${c.notReceived.qty} units${c.notReceived.base ? ` (${c.notReceived.base} in base)` : ''}: a confirmation covers them too, their receipts adjust the journal later`)
