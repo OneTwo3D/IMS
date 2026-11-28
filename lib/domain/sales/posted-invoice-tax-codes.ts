@@ -15,10 +15,29 @@
  * mapped on both sides to different rates still reads as ambiguous.
  */
 import type { db } from '@/lib/db'
-import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
+import type { Prisma } from '@/app/generated/prisma/client'
+import { ledgerStanding, PROVEN_LEDGER_FACT_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import type { DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
 import { buildTaxTypeRateIndex, type TaxTypeRateIndex } from '@/lib/domain/sales/refund-posted-tax-identity'
+
+/**
+ * THE ROWS THIS RECORD IS READ FROM, WHICH SYNC-LOG RETENTION MUST NEVER DELETE OR COMPACT (owner ruling 2026-11-28: keep posted invoice records).
+ *
+ * The connector-confirmed SALES_INVOICE / SALES_INVOICE_UPDATE rows of an order that name the ledger document (the rows `readPostedInvoiceTaxCodes` reads the payload of). Retention's payload compaction
+ * blanks the payload of an old posted row (customer names, addresses and line text expire on schedule); for these rows the payload is the only record of the codes the invoice was posted with, so
+ * they are exempt from both the delete and the compaction (data-retention.ts). Every other row keeps today's retention.
+ *
+ * Why no "newest row per document" exemption: the walk in `readPostedInvoiceTaxCodes` stops at the newest row that is not provably unsent. A newer row that is unproven (a claimed failure, PENDING or PROCESSING work,
+ * an operator assertion, a cancellation not proven absent) is already kept by retention's own exemptions (POSTABLE statuses, the unresolved abandoned claim, asserted evidence) and the walk reads only its columns,
+ * which compaction keeps; a newer row that provably sent nothing (a shadow, a proven-absent cancellation) is skipped by the walk, so deleting it changes nothing.
+ */
+export const POSTED_INVOICE_RECORD_WHERE: Prisma.AccountingSyncLogWhereInput = {
+  AND: [
+    PROVEN_LEDGER_FACT_WHERE,
+    { connector: 'xero', type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] }, referenceType: 'SalesOrder', externalTransactionId: { not: null } },
+  ],
+}
 
 export type PostedInvoiceTaxCodes = {
   /** rate id -> the (post reverse-charge-swap) code its goods lines were posted on. */

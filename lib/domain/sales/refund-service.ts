@@ -5797,6 +5797,34 @@ export async function createSalesOrderRefund(
     // fresher cost-layer snapshot; if that later step fails, the persisted
     // refund is retained and marked for accounting retry like other post-refund
     // side-effect failures.
+    // A refund of an order whose invoice WAS posted that had to read the rates' CURRENT codes for some line (no readable record of the posted codes, an update still in flight, a line with no rate or an unbound
+    // shipping / discount): the credit note may then sit on another code than the invoice. Flagged once for the refund, naming the lines and the codes used; the refund itself is not refused.
+    if (so.accountingInvoiceId) {
+      const fellBack = createdRefundLines.flatMap((createdLine, index) => {
+        const requested = refundLines[index]
+        let usedPosted: boolean
+        if (createdLine.lineKind === 'shipping') usedPosted = postedShippingTaxType(postedInvoiceCodes) !== null
+        else if (createdLine.lineKind === 'discount') {
+          usedPosted = requested?.discountTaxIdentity
+            ? postedDiscountTaxType(postedInvoiceCodes, { taxRateId: requested.discountTaxIdentity.taxRateId || null }) !== null
+            : postedHeaderDiscountTaxType(postedInvoiceCodes) !== null
+        } else usedPosted = createdLine.lineId != null && postedCodeByLineId.has(createdLine.lineId)
+        return usedPosted ? [] : [{ lineId: createdLine.lineId, lineKind: createdLine.lineKind, description: createdLine.description, accountingTaxType: createdLine.accountingTaxType }]
+      })
+      if (fellBack.length > 0) {
+        await tx.activityLog.create({
+          data: {
+            entityType: 'SALES_ORDER',
+            entityId: input.orderId,
+            action: 'refund_used_current_tax_codes',
+            tag: 'sales',
+            level: 'WARNING',
+            description: `Refund ${creditNoteNumber ?? createdRefund.id} of an invoiced order used the tax rates' CURRENT codes, not the codes the invoice was posted with, for: ${fellBack.map((l) => `${l.description || l.lineKind} (${l.accountingTaxType ?? 'no code'})`).join(', ')}. IMS holds no usable record of the posted codes for those lines (no record, an invoice update still in flight, or a line that names no tax rate). If a tax rate was re-mapped since the invoice was posted, check the credit note's VAT against the invoice.`,
+            metadata: { orderId: input.orderId, refundId: createdRefund.id, accountingInvoiceId: so.accountingInvoiceId, lines: fellBack },
+          },
+        })
+      }
+    }
     if (parkedForUnknownCost.length > 0) {
       await tx.activityLog.create({
         data: {

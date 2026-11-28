@@ -1,0 +1,3 @@
+### Fix: posted invoice records are kept, and a refund that falls back to current tax codes is flagged (sales)
+- Sync-log retention no longer deletes or compacts the connector-confirmed sales invoice and invoice-update rows of an order: a refund reads the tax codes the invoice was posted with from their payload, so the record now outlives `retention_sync_logs_months`. Every other row keeps today's retention.
+- A refund of an invoiced order that has to read the tax rates' current codes for some line (no readable posted record, an update still in flight, or a line that names no rate) writes one activity WARNING on the order, `refund_used_current_tax_codes`, naming the lines and the codes used. The refund is not refused.

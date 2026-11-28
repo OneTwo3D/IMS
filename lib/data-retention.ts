@@ -13,6 +13,7 @@ import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/posta
 import { WC_REFUND_PARK_RECOVERED_ACTION, WC_REFUND_PARK_VERIFICATION_MIGRATION } from '@/lib/domain/sales/refund-park-recovery'
 import { openWcCompletionRefusalRowSql, openWcOrderEditDriftRowSql, pendingAdmissionRefusalRowSql, recoveryAccusedRowSql, unresolvedWcOrderRowSql } from '@/lib/domain/sales/wc-sync-row-families'
 import { EXTERNAL_DOCUMENT_EVIDENCE_WHERE } from '@/lib/domain/accounting/external-document-evidence'
+import { POSTED_INVOICE_RECORD_WHERE } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
 import { UNRESOLVED_ABANDONED_CLAIM_WHERE } from '@/lib/domain/accounting/unresolved-abandoned-claim'
 import {
@@ -413,6 +414,8 @@ export async function purgeExpiredData(): Promise<{
             { NOT: UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE },
             { NOT: UNRESOLVED_ABANDONED_CLAIM_WHERE },
             { NOT: EXTERNAL_DOCUMENT_EVIDENCE_WHERE },
+            // Owner ruling 2026-11-28: the posted invoice records (the rows a refund reads the posted tax codes from) are kept, stated here rather than left to the exemption above.
+            { NOT: POSTED_INVOICE_RECORD_WHERE },
           ],
         },
       }),
@@ -542,6 +545,8 @@ export async function purgeExpiredData(): Promise<{
       backReferenceEvidenceCompactedAt: null,
       type: { notIn: [...REMOTE_MONEY_EVIDENCE_TYPES] },
       AND: [
+        // The posted invoice records are neither deleted nor compacted: their payload is the record of the codes the invoice was posted with.
+        { NOT: POSTED_INVOICE_RECORD_WHERE },
         { OR: [{ syncedAt: null }, { syncedAt: { lt: cutoff } }] },
         {
           OR: [
