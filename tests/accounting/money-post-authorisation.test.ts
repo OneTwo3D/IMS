@@ -385,10 +385,27 @@ test('CREDIT_NOTE_ALLOCATION posts inside the fence, dated and fenced like the o
   const pinnedAt = body.indexOf('const pinnedWrite = await db.accountingSyncLog.updateMany(')
   assert.notEqual(pinnedAt, -1, 'the decision is pinned before the fence')
   assert.ok(pinnedAt < guardAt, 'the pin precedes the fence')
-  assert.equal(/\bsettlementDate = (?!posting\.date)/.test(body.slice(pinnedAt)), false, 'settlementDate is never reassigned after the decision is pinned')
-  for (const m of body.matchAll(/\bsettlementDate = (?!posting\.date)([^\n]+)/g)) {
-    assert.ok(/^(cashOut\.date|payload\.creditNoteDate)$/.test(m[1]!.trim()), `settlementDate is only ever re-dated to a value pinned as the row's date: ${m[1]}`)
-  }
+  // #1130 review MED-2: EVERY FORM OF ASSIGNMENT is found (plain, compound or logical, and destructuring), not only `settlementDate = `. Outside the
+  // declaration from posting.date there is exactly one, and it is paired with the pin of the SAME value as the row's date on the line before it.
+  const assignment = /\bsettlementDate\s*(?:\+|-|\*|\/|%|\*\*|<<|>>>?|&|\||\^|&&|\|\||\?\?)?=(?!=)/g
+  const destructuring = /[{[][^{}[\]]*\bsettlementDate\b[^{}[\]]*[}\]]\s*=(?!=)/g
+  assert.deepEqual([...body.matchAll(destructuring)].map((m) => m[0]), [], 'settlementDate is never assigned by destructuring')
+  const assigned = [...body.matchAll(assignment)].filter((m) => !/(?:const|let) $/.test(body.slice(Math.max(0, m.index! - 6), m.index!)))
+  assert.equal(assigned.length, 1, `settlementDate is re-dated in exactly one place: ${assigned.map((m) => body.slice(m.index!, body.indexOf('\n', m.index!))).join(' | ')}`)
+  const redateAt = assigned[0]!.index!
+  assert.ok(redateAt < pinnedAt, 'settlementDate is never reassigned after the decision is pinned')
+  const redateLine = body.slice(redateAt, body.indexOf('\n', redateAt)).trim()
+  const value = /^settlementDate = (.+)$/.exec(redateLine)?.[1]
+  assert.equal(value, 'cashOut.date', `the one re-date is to the cash-out day: ${redateLine}`)
+  const before = body.slice(body.lastIndexOf('\n', body.lastIndexOf('\n', redateAt) - 1) + 1, body.lastIndexOf('\n', redateAt)).trim()
+  assert.equal(before, `pin.date = ${value}`, 'the re-date is paired with the pin of the same value as the row\'s date, on the line before it')
+  // #1130 review MED-1: the re-date is taken only for a row that never attempted a call.
+  assert.ok(/const cashOut = !reading\.attempted && /.test(body), 'only a never-attempted row is re-dated to its cash-out day')
+  // #1130 review LOW-1: the restore to the credit note's date is made on the payload inside the never-attempted unpin, before the date is read.
+  const unpinAt = body.indexOf('if (!reading.attempted) {')
+  const restoreAt = body.indexOf('date: creditNoteDate }')
+  const postingAt = body.indexOf('moneyPostDateToSend(type, payload')
+  assert.ok(unpinAt !== -1 && restoreAt > unpinAt && postingAt > restoreAt, 'the credit note date is restored in the never-attempted unpin, before the settlement date is read')
   assert.ok(body.slice(guardAt, callbackAt).includes('postingDate: settlementDate,'), 'the fence is handed the very date the request carries')
 })
 

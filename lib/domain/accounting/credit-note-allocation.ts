@@ -197,7 +197,11 @@ export function planCreditNoteSettlement(facts: CreditNoteSettlementFacts): Cred
  * refund payments the LATEST is the day the refund was completed (the one Xero payment carries their sum).
  *
  * Null (the credit note's date stands, as before) for a GATEWAY refund (no Payment row: the storefront refund is the credit note's own day), for no recorded
- * payment date, and for a payment dated BEFORE the credit note: Xero's payment is never dated before the document it settles.
+ * payment date, for a payment dated BEFORE the credit note (Xero's payment is never dated before the document it settles), and (#1130 review MED-3) for a
+ * payment dated AFTER today (`now`, business date): cash that has not gone out yet is not booked as gone out, and no rate exists for a future day.
+ *
+ * TIES. The facts carry the refund payments in `paidAt` order, then `id` (the reader's ORDER BY), so of two payments with the same `paidAt` the one with the
+ * greater id is "the latest"; both are on the same day, so the date is the same either way, and only the as-of instant of the rate can differ.
  *
  * `explicitInstant` is the stored `paidAtExplicitInstant`, for the rate's as-of (lib/accounting-fx.ts settlementAsOfFromStored). Pure.
  */
@@ -205,12 +209,14 @@ export function refundCashOutDate(
   facts: Pick<CreditNoteSettlementFacts, 'refundPaymentPaidAt' | 'refundPaymentPaidAtExplicitInstant'>,
   plan: CreditNoteSettlementPlan | null,
   creditNoteDate: string,
+  now: Date = new Date(),
 ): { date: string; paidAt: Date; explicitInstant: Date | null } | null {
   if (!plan || plan.kind !== 'REFUND_PAYMENT' || plan.cashEvidence !== 'RECORDED') return null
   const paidAt = facts.refundPaymentPaidAt
   if (!(paidAt instanceof Date) || !Number.isFinite(paidAt.getTime())) return null
   const date = businessDateYmd(paidAt)
   if (/^\d{4}-\d{2}-\d{2}$/.test(creditNoteDate) && date < creditNoteDate) return null
+  if (date > businessDateYmd(now)) return null
   return { date, paidAt, explicitInstant: facts.refundPaymentPaidAtExplicitInstant ?? null }
 }
 
