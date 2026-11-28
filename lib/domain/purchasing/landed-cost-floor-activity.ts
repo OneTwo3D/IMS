@@ -14,7 +14,11 @@ export async function logFlooredLandedCredit(params: {
   context: string
   entries: FlooredLandedCreditEntry[]
 }): Promise<string> {
-  const description = describeFlooredLandedCredit({ context: params.context, entries: params.entries })
+  // Read after the commit (this runs on its own connection by design): with the switch on the sentence says the amount is posted.
+  const { db } = await import('@/lib/db')
+  const { readLandedFloorCogsEnabled } = await import('@/lib/domain/purchasing/landed-floor-cogs')
+  const floorCogs = await readLandedFloorCogsEnabled(db).catch(() => false)
+  const description = describeFlooredLandedCredit({ context: params.context, entries: params.entries, floorCogs })
   await logActivity({
     entityType: 'PURCHASE_ORDER',
     entityId: params.purchaseOrderId,

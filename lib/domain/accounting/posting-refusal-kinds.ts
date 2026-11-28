@@ -67,7 +67,7 @@ export const POSTING_REFUSAL_KINDS = {
   },
   landed_cost_cogs_journal: {
     type: 'COGS_JOURNAL', referenceType: 'PurchaseOrder', clearing: 'retried',
-    how: 'The landed-cost journal outbox retries it, but gives up after a fixed number of attempts.',
+    how: 'A retrospective landed-cost COGS adjustment is retried by the landed-cost journal outbox, which gives up after a fixed number of attempts. A floored supplier credit to cost of sales (switch landed_cost_floor_cogs_enabled) is target-state: the next receipt or landed-cost recalculation of the order queues what is still owed; nothing retries it in between.',
   },
   landed_cost_transit_journal: {
     type: 'STOCK_IN_TRANSIT', referenceType: 'PurchaseOrder', clearing: 'retried',

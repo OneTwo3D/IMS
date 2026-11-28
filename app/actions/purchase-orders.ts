@@ -141,6 +141,7 @@ import {
   recalculateLandedCosts,
 } from '@/lib/domain/purchasing/landed-cost-service'
 import { headerDiscountFactorForPo, unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
+import { LandedFloorCogsRefusal, readLandedFloorCogsEnabled, reconcileLandedFloorCogsTx, reportLandedFloorCogsResults, type LandedFloorCogsResult } from '@/lib/domain/purchasing/landed-floor-cogs'
 import {
   isPurchaseFxRefusalError, markPurchaseFxLockUsed, preparePurchaseReceiptFx, purchaseFxLayerFields, readPurchaseOrderPrepaymentOnDemand, PURCHASE_FX_SOURCE_FX_TABLE,
   reportPurchaseFxFallback, resolveReceiptFxValuation,
@@ -1077,6 +1078,8 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
   const landedQtyByLine = landedAllocation.floors.length > 0
     ? await loadPurchaseOrderLineLandedQty(db, po.lines.map((line) => ({ id: line.id, qtyReceived: line.qtyReceived })))
     : new Map()
+  // Switch landed_cost_floor_cogs_enabled: the badge says the unabsorbed amount is posted to cost of sales (read only when something is floored).
+  const floorCogs = landedAllocation.floors.length > 0 && await readLandedFloorCogsEnabled(db)
   const landedCostFloors = landedAllocation.floors.map((floor) => {
     const poLine = po.lines.find((line) => line.id === floor.lineId)
     const label = poLine?.product?.sku ?? floor.lineId
@@ -1091,10 +1094,10 @@ export async function getPurchaseOrder(id: string): Promise<PoDetail | null> {
     })
     const parts: string[] = []
     if (received.gt(0)) {
-      parts.push(describeFlooredLandedCredit({ context: `PO ${po.reference} (${received.toString()} received)`, entries: [entryFor(received)], tense: 'applied' }))
+      parts.push(describeFlooredLandedCredit({ context: `PO ${po.reference} (${received.toString()} received)`, entries: [entryFor(received)], tense: 'applied', floorCogs }))
     }
     if (outstanding.gt(0)) {
-      parts.push(describeFlooredLandedCredit({ context: `PO ${po.reference} (${outstanding.toString()} not yet received)`, entries: [entryFor(outstanding)], tense: 'pending' }))
+      parts.push(describeFlooredLandedCredit({ context: `PO ${po.reference} (${outstanding.toString()} not yet received)`, entries: [entryFor(outstanding)], tense: 'pending', floorCogs }))
     }
     return {
       lineId: floor.lineId,
@@ -2933,6 +2936,8 @@ export async function receivePurchaseOrder(
     // unaffected, which is exactly what makes it dangerous: the guard still works and the types stop
     // being able to say so. A property of an object is re-widened by the intervening call.
     const receiptPostingOutcome: { outcome?: EnqueueOutcomeLike } = {}
+    // Switch landed_cost_floor_cogs_enabled: the floored-credit journal's answer, reported after the commit (a holder, for the reason above).
+    const floorCogsOutcome: { result?: LandedFloorCogsResult } = {}
     // Per-event FX (o3d-hqvrp.51 step 2): ask Xero for the order's supplier prepayment where the answer is not already known (a used lock, a recent read,
     // a "no prepayment" answer inside its cache window), BEFORE the transaction (a network call never runs inside it). A no-op while the switch is off or
     // for a base-currency order. A refusal (ambiguous prepayment, failed read) returns here, unwritten, and is logged (LOW-8). A retry that carries an
@@ -3357,6 +3362,10 @@ export async function receivePurchaseOrder(
         }
       }
 
+      // Switch landed_cost_floor_cogs_enabled: the part of a supplier credit these units' zero floor could not absorb is cleared from Stock in
+      // Transit to COGS (target-state; with the switch off: the switch and one indexed lookup of the order's own rows).
+      floorCogsOutcome.result = await reconcileLandedFloorCogsTx(tx, { poId: id, poReference: po.reference, at: new Date(), chart: accountingSettings })
+
       // Per-event FX (step 3): a receipt that arrives after the order's bill settles that bill's FX difference against it (per receipt).
       // MED-3: also after a switch-off rollback, for an order whose bills the switch still manages (its receipts are then at the PO rate).
       const billFx = fxValuation || await purchaseFxOrderHasHistory(tx, id)
@@ -3374,6 +3383,7 @@ export async function receivePurchaseOrder(
       }
     }, STOCK_TX_OPTIONS)
     if ('billFx' in receiptResult && receiptResult.billFx) await reportPurchaseFxVarianceNotQueued(id, po.reference, receiptResult.billFx)
+    await reportLandedFloorCogsResults([floorCogsOutcome.result])
 
     // o3d-j625 r3 (Codex HIGH 1 family): the enqueue declined and the local state committed anyway.
     if (receiptPostingOutcome.outcome && postingIsOwed(receiptPostingOutcome.outcome)) {
@@ -3507,7 +3517,7 @@ export async function receivePurchaseOrder(
       metadata: null,
     })
     // Per-event FX refusals carry an operator remedy: return the message itself, not the error's class name.
-    if (isPurchaseFxRefusalError(e) || isMissingFxRateError(e)) return { success: false, error: e.message }
+    if (isPurchaseFxRefusalError(e) || isMissingFxRateError(e) || e instanceof LandedFloorCogsRefusal) return { success: false, error: e.message }
     return { success: false, error: String(e) }
   }
 }

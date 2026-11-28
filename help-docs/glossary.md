@@ -17,7 +17,7 @@ The accounting rule for which units leave stock first. The unit you sell today i
 The accounting value of stock that has been dispatched to a customer. The system books COGS at shipment time by consuming FIFO cost layers oldest-first. COGS is what your profit-and-loss reports use for the "cost" side of margin.
 
 **Landed cost**
-The all-in cost of getting a unit of stock into your warehouse, including the supplier price plus freight, customs, duties, and other inbound charges. The system distributes landed-cost POs across the underlying goods POs so the cost layers reflect the true unit cost, not just the supplier invoice. A credit (negative) cost line reduces the cost, but a unit is never valued below zero.
+The all-in cost of getting a unit of stock into your warehouse, including the supplier price plus freight, customs, duties, and other inbound charges. The system distributes landed-cost POs across the underlying goods POs so the cost layers reflect the true unit cost, not just the supplier invoice. A credit (negative) cost line reduces the cost, but a unit is never valued below zero. The part of a credit the stock cannot carry is reported; with the administrator switch `landed_cost_floor_cogs_enabled` on (off by default) it is also posted to cost of sales (FRS 102 s13.6), see *Recalculation after receipt* in [Purchasing](purchasing.md).
 
 **Stock unit**
 The unit of measure a product is counted in (pcs, kg, m, etc.). Distinct from `Purchase unit` — e.g. you might count a fabric in metres internally but buy it from the supplier as 100-metre rolls.

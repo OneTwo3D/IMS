@@ -128,6 +128,11 @@ export const REFUND_RETURNS_IN_TRANSIT_SWITCH_KEY = 'refund_returns_in_transit_e
 // RETURN_CONDITION_CHECK_SETTING_KEY. ADMIN: it changes which stock is sellable (allocation, available stock, the storefront push) on the LIVE system.
 export const RETURN_CONDITION_CHECK_SWITCH_KEY = 'return_condition_check_enabled'
 
+// FRS 102 s13.6: the part of a supplier credit the zero landed-cost floor cannot absorb is cleared from Stock in Transit to COGS. The reader is
+// readLandedFloorCogsEnabled in lib/domain/purchasing/landed-floor-cogs.ts (`=== 'true'`); a literal here for the same reason as the others, and
+// tests/settings-cli.test.ts holds it equal to LANDED_FLOOR_COGS_SWITCH_KEY. ADMIN: it posts journals to the LIVE ledger.
+export const LANDED_FLOOR_COGS_SWITCH_KEY = 'landed_cost_floor_cogs_enabled'
+
 export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   booleanSwitch('trackship_refire_enabled'),
   booleanSwitch('wc_withdrawal_outcome_enabled'),
@@ -165,6 +170,19 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   // (it imports the database client); tests hold them equal to its keys.
   { ...booleanSwitch(INVOICE_BASIS_DEFERRAL_SWITCH_KEY, undefined, true), stampOnKey: INVOICE_BASIS_DEFERRAL_ENABLED_AT_KEY },
   booleanSwitch(REFUND_DELETE_SWITCH_KEY, undefined, true),
+  {
+    ...booleanSwitch(LANDED_FLOOR_COGS_SWITCH_KEY, undefined, true),
+    requiresMappedSettings: {
+      whenKey: 'xero_sync_enabled',
+      whenValue: 'true',
+      settings: [
+        { key: 'xero_cogs_account', label: 'COGS' },
+        { key: 'xero_transit_account', label: 'Stock in Transit' },
+        { key: 'xero_sync_cogs_journal', label: 'COGS journal sync type (xero_sync_cogs_journal)' },
+      ],
+      why: 'the floored supplier credit is journalled DR Stock in Transit / CR COGS as a COGS journal; with either account unmapped the receipt or recalculation that owes it is refused, and with the COGS journal sync type unset nothing would be posted',
+    },
+  },
   // Turning it ON is refused while any QUARANTINE warehouse still looks sellable (flags, allocations, bindings, open work): the command runs the
   // interlock in the dry run and again inside the write transaction (lib/domain/inventory/quarantine-warehouse.ts quarantineSwitchOnRefusal).
   { ...booleanSwitch(RETURN_CONDITION_CHECK_SWITCH_KEY, undefined, true), turnOnInterlock: 'quarantine-warehouses' },

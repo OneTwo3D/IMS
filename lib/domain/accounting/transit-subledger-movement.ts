@@ -30,7 +30,10 @@ import { roundQuantity, type DecimalInput } from '@/lib/domain/math/decimal'
  *   - STOCK_RECEIPT              — receipt DR inventory / CR transit; − receipt value.
  *   - LANDED_COST_RECLASS        — on-hand landed-cost reclass DR/CR transit; signed.
  *   - LANDED_COST_CONSUMED_OFFSET— consumed-qty COGS adjustment offset to transit;
- *                                  signed (drains the sold units' freight share).
+ *                                  signed (drains the sold units' freight share). Also the
+ *                                  floored supplier credit's COGS_JOURNAL (switch
+ *                                  `landed_cost_floor_cogs_enabled`, key prefix `landed-floor-cogs:`,
+ *                                  lib/domain/purchasing/landed-floor-cogs.ts): DR transit / CR COGS, +.
  *   - PURCHASE_ORDER_CANCEL      — cancel reversal DR transit / CR inventory; +.
  *   - SUPPLIER_RETURN            — return reversal DR transit / CR inventory; +.
  *   - CUSTOMER_RETURN_IN_TRANSIT — a refund of shipped goods not yet back: the COGS reversal

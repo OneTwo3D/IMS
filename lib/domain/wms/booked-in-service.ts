@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { reconcileLandedFloorCogsForWmsTx, reportLandedFloorCogsResults, type LandedFloorCogsResult } from '@/lib/domain/purchasing/landed-floor-cogs'
 import {
   WMS_INBOUND_EVENT_PROCESSING_STATUS,
   type WmsInboundEventProcessingStatus,
@@ -463,6 +464,8 @@ export async function processBookedInEvent(
     // app/actions/purchase-orders.ts: an activity-log write uses its own connection, so logging inside
     // this transaction would leave the report standing if the transaction later rolled back — and this
     // transaction still has the transfer loop and the ASN updates to run, either of which can throw.
+    // Switch landed_cost_floor_cogs_enabled: the floored-credit journal's answers, one per order, reported after the commit.
+    const floorCogsResults: LandedFloorCogsResult[] = []
     const receiptPostingDeclines: Array<{
       poId: string
       poReference: string
@@ -1560,6 +1563,10 @@ export async function processBookedInEvent(
             receiptPostingDeclines.push({ poId, poReference: po.reference, outcome: enqueued })
           }
         }
+        // Switch landed_cost_floor_cogs_enabled: the floored supplier credit's journal follows these layers (target-state; see landed-floor-cogs.ts).
+        // A book-in is never refused for it: with an account unmapped the credit stays in transit (reported after the commit) and a later receipt or
+        // recalculation posts it.
+        floorCogsResults.push(await reconcileLandedFloorCogsForWmsTx(tx, { poId, poReference: po.reference, at: new Date(), chart: accountingSettings }))
       }
 
       for (const [transferId, receiptLines] of receiptLinesByTransferId) {
@@ -1918,6 +1925,7 @@ export async function processBookedInEvent(
     // GATED ON `postingIsOwed`, so a `not-configured` answer stays silent: with no connector that posts
     // this type there is no GL counterpart to owe. `refused` and `hand-post-deferred` are owed and are
     // reported.
+    await reportLandedFloorCogsResults(floorCogsResults)
     for (const decline of receiptPostingDeclines) {
       if (!postingIsOwed(decline.outcome)) continue
       await reportPostingNotQueued({

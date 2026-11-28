@@ -63,10 +63,7 @@ const SET = ['--by', 'jan', '--reason', 'switchover step M']
 
 test('allowlist contains exactly the switches that exist on development, and none is a credential', () => {
   assert.deepEqual([...SYSTEM_SWITCH_KEYS].sort(), [
-    'first_load_mintsoft_archive_enabled', 'mintsoft_asn_send_supplier_enabled', 'mintsoft_asn_supplier_required', 'mintsoft_parent_sku_delete_enabled',
-    'mintsoft_product_parity_enabled', 'mintsoft_supplier_create_enabled', 'purchase_event_fx_rates_enabled', 'refund_delete_enabled', 'refund_returns_in_transit_enabled', 'return_condition_check_enabled', 'sales_order_discount_tax_apportion_enabled', 'storefront_customer_email_enabled', 'trackship_refire_enabled', 'wc_invoice_document_enabled',
-    'wc_invoice_note_enabled', 'wc_order_amendment_unpaid_rewrite_enabled', 'wc_order_amendment_write_enabled', 'wc_refund_credit_note_parity_enabled', 'wc_withdrawal_outcome_enabled', 'wms_despatch_date_enabled', 'wms_despatch_quantity_check_enabled', 'wms_merge_candidate_mode',
-    'wms_merge_hold_enabled', 'wms_mixed_warehouse_push_enabled', 'wms_refund_remainder_task_enabled', 'wms_sku_rename_remap_enabled', 'xero_credit_note_allocation_enabled', 'xero_credit_note_duplicate_check_enabled', 'xero_defer_unpaid_invoiced_revenue_enabled', 'xero_refund_payment_cash_out_date_enabled',
+    'first_load_mintsoft_archive_enabled', 'landed_cost_floor_cogs_enabled', 'mintsoft_asn_send_supplier_enabled', 'mintsoft_asn_supplier_required', 'mintsoft_parent_sku_delete_enabled', 'mintsoft_product_parity_enabled', 'mintsoft_supplier_create_enabled', 'purchase_event_fx_rates_enabled', 'refund_delete_enabled', 'refund_returns_in_transit_enabled', 'return_condition_check_enabled', 'sales_order_discount_tax_apportion_enabled', 'storefront_customer_email_enabled', 'trackship_refire_enabled', 'wc_invoice_document_enabled', 'wc_invoice_note_enabled', 'wc_order_amendment_unpaid_rewrite_enabled', 'wc_order_amendment_write_enabled', 'wc_refund_credit_note_parity_enabled', 'wc_withdrawal_outcome_enabled', 'wms_despatch_date_enabled', 'wms_despatch_quantity_check_enabled', 'wms_merge_candidate_mode', 'wms_merge_hold_enabled', 'wms_mixed_warehouse_push_enabled', 'wms_refund_remainder_task_enabled', 'wms_sku_rename_remap_enabled', 'xero_credit_note_allocation_enabled', 'xero_credit_note_duplicate_check_enabled', 'xero_defer_unpaid_invoiced_revenue_enabled', 'xero_refund_payment_cash_out_date_enabled',
   ])
   for (const k of SYSTEM_SWITCH_KEYS) assert.equal(SENSITIVE_SETTING_KEYS.has(k), false)
 })
@@ -528,4 +525,18 @@ test('return_condition_check_enabled: the quarantine interlock refuses in the dr
   state.dirtyInside = true
   const off = await run('set', ['--key', def.key, '--value', 'false', ...SET, '--yes', '--confirm-admin'], withInterlock(ok.f))
   assert.equal(off.code, 0, `turning it off is never refused (${off.err})`)
+})
+
+test('landed_cost_floor_cogs_enabled: an ADMIN switch, off by default, key equal to the reader\'s, refused on while Xero sync is on and COGS or transit is unmapped', async () => {
+  const def = findSwitch('landed_cost_floor_cogs_enabled')!
+  assert.equal(def.adminOnly, true)
+  assert.equal(def.defaultValue, 'false')
+  const reader = await import('../lib/domain/purchasing/landed-floor-cogs')
+  assert.equal(def.key, reader.LANDED_FLOOR_COGS_SWITCH_KEY)
+  assert.deepEqual(def.requiresMappedSettings?.settings.map((s) => s.key), ['xero_cogs_account', 'xero_transit_account', 'xero_sync_cogs_journal'])
+  const refused = await run('set', ['--key', def.key, '--value', 'true', ...SET, '--yes', '--confirm-admin'], fakeDb({ xero_sync_enabled: 'true', xero_transit_account: '1300' }))
+  assert.equal(refused.code, 3)
+  assert.match(refused.err, /COGS/)
+  const ok = await run('set', ['--key', def.key, '--value', 'true', ...SET, '--yes', '--confirm-admin'], fakeDb({ xero_sync_enabled: 'true', xero_transit_account: '1300', xero_cogs_account: '5000', xero_sync_cogs_journal: 'submitted' }))
+  assert.equal(ok.code, 0, ok.err)
 })

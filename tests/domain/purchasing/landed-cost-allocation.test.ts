@@ -368,6 +368,9 @@ test('census: every writer of a PO-derived layer cost takes it from the one allo
     ['lib/connectors/mintsoft/sync/stock-sync.ts', /\bcomputeLandedCostForPendingLines\(/g, 1],
     // The wrapper plus both revaluation paths.
     ['lib/domain/purchasing/landed-cost-service.ts', /\ballocateLandedCost\(/g, 3],
+    // A READER, writing no layer cost: the floored-credit COGS journal's target (switch landed_cost_floor_cogs_enabled) is what the same allocation
+    // leaves unabsorbed on the order's receipt layers, computed exactly as the recalculation computes the layers.
+    ['lib/domain/purchasing/landed-floor-cogs.ts', /\ballocateLandedCost\(/g, 1],
   ]
   for (const [file, pattern, want] of expected) {
     const got = count(read(file), pattern)
@@ -381,6 +384,7 @@ test('census: every writer of a PO-derived layer cost takes it from the one allo
     'app/actions/purchase-orders.ts',
     'lib/connectors/mintsoft/sync/stock-sync.ts',
     'lib/domain/purchasing/landed-cost-service.ts',
+    'lib/domain/purchasing/landed-floor-cogs.ts',
     'lib/domain/wms/booked-in-service.ts',
   ])
 })
