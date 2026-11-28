@@ -10,6 +10,7 @@
  * posted invoice does. Pure apart from the one read in `readPostedInvoiceTaxCodes`.
  */
 import type { db } from '@/lib/db'
+import { PROVEN_LEDGER_FACT_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import type { DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
 
 export type PostedInvoiceTaxCodes = {
@@ -67,7 +68,7 @@ export function postedTaxCodesFromPayload(payload: unknown): PostedInvoiceTaxCod
 
 /**
  * The tax codes the order's posted invoice carries, or null when the order has no posted invoice (`accountingInvoiceId` null) or no readable record of it (a Xeroom-posted or hand-linked invoice has
- * no row here): the caller then reads the rates' current codes, as before. Only a SYNCED row counts (a shadow or failed one posted nothing); the latest wins, because an update replaces the
+ * no row here): the caller then reads the rates' current codes, as before. Only a row the ledger holds counts (PROVEN_LEDGER_FACT_WHERE: a shadow or failed one posted nothing); the latest synced wins, because an update replaces the
  * document's lines.
  */
 export async function readPostedInvoiceTaxCodes(
@@ -77,7 +78,8 @@ export async function readPostedInvoiceTaxCodes(
 ): Promise<PostedInvoiceTaxCodes | null> {
   if (!accountingInvoiceId) return null
   const rows = await client.accountingSyncLog.findMany({
-    where: { type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] }, referenceType: 'SalesOrder', referenceId: orderId, externalTransactionId: accountingInvoiceId, status: 'SYNCED' },
+    // A row the ledger holds (ledger-standing.ts: the connector's own basis, naming the document): never a shadow or an operator-asserted one.
+    where: { AND: [PROVEN_LEDGER_FACT_WHERE, { type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] }, referenceType: 'SalesOrder', referenceId: orderId, externalTransactionId: accountingInvoiceId }] },
     orderBy: [{ syncedAt: { sort: 'desc', nulls: 'last' } }, { createdAt: 'desc' }],
     select: { payload: true },
     take: 5,
