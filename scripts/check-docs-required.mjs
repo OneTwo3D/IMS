@@ -11,10 +11,15 @@
 //       Docs: none — <reason of at least 20 characters>
 //   The separator may be an em dash, an en dash, `-`, `--` or `:`. It sits in the reviewed diff, next to the
 //   change it excuses, and the release cut carries it into CHANGELOG.md, so it stays auditable. A bare
-//   `Docs: none`, or a placeholder reason, fails. The check prints every reason it accepted.
+//   `Docs: none`, or a placeholder or junk reason, fails. Only a fragment the PR ADDS counts (an edit of an
+//   older fragment cannot carry one). `Docs: none — revert of #<n>` is accepted as is, and a range whose every
+//   commit is a git revert (`Revert "…"`) passes. The check prints every reason it accepted.
 // - The comparison is merge-base(base, head)..head, as in check-migration-conventions.mjs: a pull request
-//   compares against origin/<base branch>; a push compares the event's `before` SHA. In CI an empty range
-//   (base == head) fails loudly instead of passing without looking at anything.
+//   compares against origin/<base branch>; a push compares the event's `before` SHA (or HEAD^, with a
+//   warning, when that SHA is not in the clone). In CI an empty range (base == head, or a head that is an
+//   ancestor of the base, as after a backwards force-push) fails loudly instead of passing without looking at
+//   anything. Outside CI the uncommitted working tree is included, and a missing base or a shallow clone is
+//   warned about and skipped rather than failing `check:all`.
 //
 // Node built-ins only, so the CI job needs no `npm ci`.
 import { execFileSync } from 'node:child_process'
@@ -22,6 +27,7 @@ import { readFileSync } from 'node:fs'
 import { pathToFileURL } from 'node:url'
 
 export const MIN_REASON_LENGTH = 20
+export const MIN_REASON_WORDS = 3
 
 /** Paths whose change can alter what the system does. */
 export const BEHAVIOUR_PATHS = [
@@ -73,7 +79,7 @@ export const BEHAVIOUR_EXCLUSIONS = [
   { re: /(^|\/)__(tests|mocks)__\//, why: 'test and mock directories' },
   { re: /^deploy\/tests\//, why: 'deploy script tests and their stubs' },
   { re: /\.d\.[cm]?ts$/, why: 'type-only declarations' },
-  { re: /\.md$/, why: 'Markdown next to code is documentation, not behaviour' },
+  { re: /(^|\/)README\.md$|(^|\/)docs\/.+\.md$/, why: 'a README.md or a docs/ page next to code is documentation, not behaviour (other Markdown may be read at run time)' },
   { re: /^lib\/releases\.ts$/, why: 'release notes data, written by the release cut' },
   { re: CI_ONLY_GUARD_RE, why: 'CI-only guard scripts (repo tooling; see CI_ONLY_GUARDS)' },
   { re: /^scripts\/[^/]+-declarations\.(ts|mjs)$/, why: 'guard declaration tables (repo tooling)' },
@@ -97,7 +103,15 @@ export const DOC_EXCLUSIONS = [
 ]
 
 const PLACEHOLDER_REASON_RE = /^(<[^>]*>|n\/?a|none|tbd|todo|nothing|no docs?|-+|\.+)$/i
-const MARKER_PREFIX_RE = /^\s*(?:[-*]\s+)?docs\s*:\s*none\b/i
+/** A run of five or more of the same character ("xxxxx", "....."): filler, not a reason. */
+const REPEATED_RUN_RE = /(\S)\1{4,}/
+/** `Docs: none — revert of #123`: a revert restores the docs of the change it undoes. */
+const REVERT_REASON_RE = /^revert of #\d+$/i
+/** A git revert's default subject. */
+const REVERT_SUBJECT_RE = /^Revert "/
+// A marker is `Docs: none` followed by a separator or the end of the line, so prose such as "Docs: none of the
+// help pages changed" is not mistaken for a malformed marker.
+const MARKER_PREFIX_RE = /^\s*(?:[-*]\s+)?docs\s*:\s*none\s*(?:[—–:-]|$)/i
 const MARKER_RE = /^\s*(?:[-*]\s+)?docs\s*:\s*none\s*(?:—|–|--|-|:)\s*(.*?)\s*$/i
 const FRAGMENT_RE = /^changelog\.d\/[^/]+\.md$/
 
@@ -116,41 +130,62 @@ export function isFragmentPath(path) {
 }
 
 /**
- * The lines a unified diff ADDS, with the file each belongs to. Input is `git diff -U0` output; `+++ b/<path>`
- * names the file (`+++ /dev/null` is a deletion and adds nothing).
+ * The lines a unified diff ADDS, with the file each belongs to and whether that file is new in the diff. Input is
+ * `git diff -U0` output; `+++ b/<path>` names the file (`+++ /dev/null` is a deletion and adds nothing), and
+ * `--- /dev/null` marks a file the diff adds.
  */
 export function parseAddedLines(patch) {
   const added = []
   let file = null
+  let newFile = false
   let inHeader = false
   for (const line of patch.split(/\r?\n/)) {
     if (line.startsWith('diff --git ')) {
       file = null
+      newFile = false
       inHeader = true
+    } else if (inHeader && line.startsWith('--- ')) {
+      newFile = line.slice(4) === '/dev/null'
     } else if (inHeader && line.startsWith('+++ ')) {
       const target = line.slice(4)
       file = target === '/dev/null' ? null : target.replace(/^b\//, '')
     } else if (line.startsWith('@@')) {
       inHeader = false
     } else if (file && !inHeader && line.startsWith('+')) {
-      added.push({ file, line: line.slice(1) })
+      added.push({ file, line: line.slice(1), newFile })
     }
   }
   return added
+}
+
+/** Why a reason is not acceptable, or null. A revert reference is accepted whatever its length. */
+export function reasonProblem(reason) {
+  if (REVERT_REASON_RE.test(reason)) return null
+  if (PLACEHOLDER_REASON_RE.test(reason) || reason.length < MIN_REASON_LENGTH) {
+    return `needs a real reason of at least ${MIN_REASON_LENGTH} characters, not a placeholder`
+  }
+  if (reason.split(/\s+/).filter((w) => /[\p{L}\p{N}]/u.test(w)).length < MIN_REASON_WORDS) {
+    return `needs a reason of at least ${MIN_REASON_WORDS} words`
+  }
+  if (REPEATED_RUN_RE.test(reason)) return 'needs a real reason, not a run of repeated characters'
+  return null
 }
 
 /** Opt-out markers among added fragment lines: accepted ones, and malformed ones (always an error). */
 export function findOptOuts(addedLines) {
   const accepted = []
   const errors = []
-  for (const { file, line } of addedLines) {
+  for (const { file, line, newFile } of addedLines) {
+    // Only a fragment this change ADDS carries an opt-out: a line added to an older fragment does not.
+    if (newFile === false) continue
     if (!isFragmentPath(file) || !MARKER_PREFIX_RE.test(line)) continue
     const m = MARKER_RE.exec(line)
     const reason = m ? m[1].trim() : ''
+    const problem = m && reason ? reasonProblem(reason) : null
     if (!m || !reason) {
       errors.push(`${file}: "${line.trim()}" has no reason. Write "Docs: none — <why this change needs no documentation>".`)
-    } else if (PLACEHOLDER_REASON_RE.test(reason) || reason.length < MIN_REASON_LENGTH) {
-      errors.push(`${file}: "${line.trim()}" needs a real reason of at least ${MIN_REASON_LENGTH} characters, not a placeholder.`)
+    } else if (problem) {
+      errors.push(`${file}: "${line.trim()}" ${problem}.`)
     } else {
       accepted.push({ file, reason })
     }
@@ -158,8 +193,13 @@ export function findOptOuts(addedLines) {
   return { accepted, errors }
 }
 
-/** The decision. Pure: the changed paths and the added lines in, a verdict and its explanation out. */
-export function evaluateDocsRequired({ changedFiles, addedLines }) {
+/** Every commit of the range is a git revert (`Revert "…"`): it restores the documentation of what it undoes. */
+export function isRevertOnly(commitSubjects) {
+  return Array.isArray(commitSubjects) && commitSubjects.length > 0 && commitSubjects.every((s) => REVERT_SUBJECT_RE.test(s))
+}
+
+/** The decision. Pure: the changed paths, the added lines and (optionally) the commit subjects in, a verdict and its explanation out. */
+export function evaluateDocsRequired({ changedFiles, addedLines, commitSubjects }) {
   const behaviour = changedFiles.filter(isBehaviourPath)
   const docs = changedFiles.filter(isDocPath)
   const { accepted, errors } = findOptOuts(addedLines)
@@ -181,6 +221,10 @@ export function evaluateDocsRequired({ changedFiles, addedLines }) {
   if (accepted.length > 0) {
     lines.push(`Docs-required check passed by opt-out: ${behaviour.length} behaviour-bearing file(s) changed and no documentation file.`)
     for (const a of accepted) lines.push(`Accepted reason (${a.file}): ${a.reason}`)
+    return { ok: true, behaviour, docs, accepted, lines }
+  }
+  if (isRevertOnly(commitSubjects)) {
+    lines.push(`Docs-required check passed: every commit is a revert (${commitSubjects.length}); a revert restores the documentation of what it undoes.`)
     return { ok: true, behaviour, docs, accepted, lines }
   }
   lines.push(
@@ -206,6 +250,20 @@ function fail(message) {
   process.exit(1)
 }
 
+/** Outside CI only: say why nothing was compared and pass, so a local `check:all` is not blocked by the clone. */
+function skipLocally(message) {
+  console.warn(`Docs-required check SKIPPED (not in CI): ${message}`)
+  process.exit(0)
+}
+
+function resolves(ref) {
+  try {
+    return git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`]).trim()
+  } catch {
+    return ''
+  }
+}
+
 export function baseFromGithubEvent(env = process.env) {
   if (env.GITHUB_EVENT_NAME !== 'push' || !env.GITHUB_EVENT_PATH) return undefined
   try {
@@ -216,19 +274,29 @@ export function baseFromGithubEvent(env = process.env) {
   }
 }
 
-function resolveRange(baseRef, headRef, { ci }) {
+function resolveRange(baseRef, headRef, { ci, pushEvent }) {
   let base = baseRef
   if (/^0{7,40}$/.test(base)) {
     base = `${headRef}^`
     console.warn(`Base ref is the all-zero SHA (new branch or force push); comparing against ${base}.`)
   }
-  let baseCommit = ''
-  let headCommit = ''
-  try {
-    baseCommit = git(['rev-parse', '--verify', '--quiet', `${base}^{commit}`]).trim()
-    headCommit = git(['rev-parse', '--verify', '--quiet', `${headRef}^{commit}`]).trim()
-  } catch {
-    baseCommit = ''
+  if (!ci) {
+    let shallow = false
+    try {
+      shallow = git(['rev-parse', '--is-shallow-repository']).trim() === 'true'
+    } catch {
+      shallow = false
+    }
+    if (shallow) skipLocally('this is a shallow clone, so the merge-base cannot be computed. Run `git fetch --unshallow origin` to check.')
+    if (!resolves(base)) skipLocally(`the base ${base} is not in this clone. Run \`git fetch origin\` (or pass the base as the first argument) to check.`)
+  }
+  let baseCommit = resolves(base)
+  const headCommit = resolves(headRef)
+  if (!baseCommit && headCommit && pushEvent && base !== `${headRef}^`) {
+    // The push's `before` SHA is not in the clone (a force push dropped it): compare the pushed commit alone.
+    console.warn(`The push's before SHA ${base} is not in this clone (force push?); comparing against ${headRef}^ instead.`)
+    base = `${headRef}^`
+    baseCommit = resolves(base)
   }
   if (!baseCommit || !headCommit) fail(`Cannot resolve the comparison range ${base}..${headRef}; refusing to pass without comparing anything.`)
   if (ci && baseCommit === headCommit) {
@@ -240,24 +308,47 @@ function resolveRange(baseRef, headRef, { ci }) {
   } catch (error) {
     fail(`Unable to compute merge-base between ${base} and ${headRef}: ${error instanceof Error ? error.message : String(error)}`)
   }
+  if (ci && mergeBase === headCommit) {
+    fail(`The comparison range merge-base(${base}, ${headRef})..${headRef} is empty: ${headRef} is an ancestor of ${base} (a backwards force push?), so nothing would be examined.`)
+  }
   return { base, mergeBase }
 }
 
+/** Untracked files outside .gitignore (a local run includes them). */
+function untrackedFiles() {
+  return git(['ls-files', '--others', '--exclude-standard', '-z']).split('\0').filter(Boolean)
+}
+
 function main() {
+  const ci = Boolean(process.env.CI)
   const baseRef =
     process.argv[2]
     ?? process.env.DOCS_REQUIRED_BASE_REF
     ?? baseFromGithubEvent()
     ?? (process.env.GITHUB_BASE_REF ? `origin/${process.env.GITHUB_BASE_REF}` : 'origin/development')
-  const headRef = process.argv[3] ?? process.env.DOCS_REQUIRED_HEAD_REF ?? 'HEAD'
-  const { base, mergeBase } = resolveRange(baseRef, headRef, { ci: Boolean(process.env.CI) })
+  const explicitHead = process.argv[3] ?? process.env.DOCS_REQUIRED_HEAD_REF
+  const headRef = explicitHead ?? 'HEAD'
+  const { base, mergeBase } = resolveRange(baseRef, headRef, { ci, pushEvent: process.env.GITHUB_EVENT_NAME === 'push' })
 
-  const common = ['--no-renames', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', mergeBase, headRef]
+  // Outside CI, with no explicit head, the uncommitted working tree is part of the change: tracked edits are compared
+  // against the working tree (`git diff <merge-base>`), and untracked files are added on top.
+  const local = !ci && explicitHead === undefined
+  const target = local ? [mergeBase] : [mergeBase, headRef]
+  const common = ['--no-renames', '--no-ext-diff', '--no-textconv', '--ignore-submodules=none', ...target]
   const changedFiles = git(['diff', '--name-only', '-z', ...common]).split('\0').filter(Boolean)
-  const patch = git(['diff', '-U0', '--no-color', '--src-prefix=a/', '--dst-prefix=b/', ...common, '--', 'changelog.d/'])
-  const result = evaluateDocsRequired({ changedFiles, addedLines: parseAddedLines(patch) })
+  let addedLines = parseAddedLines(git(['diff', '-U0', '--no-color', '--src-prefix=a/', '--dst-prefix=b/', ...common, '--', 'changelog.d/']))
+  if (local) {
+    const untracked = untrackedFiles()
+    for (const file of untracked) if (!changedFiles.includes(file)) changedFiles.push(file)
+    for (const file of untracked.filter(isFragmentPath)) {
+      addedLines = addedLines.concat(readFileSync(file, 'utf8').split(/\r?\n/).map((line) => ({ file, line, newFile: true })))
+    }
+  }
+  const commitSubjects = git(['log', '--no-merges', '--format=%s', `${mergeBase}..${headRef}`]).split(/\r?\n/).filter(Boolean)
+  const result = evaluateDocsRequired({ changedFiles, addedLines, commitSubjects })
 
-  const out = [...result.lines, `(Compared merge-base(${base}, ${headRef}) = ${mergeBase.slice(0, 12)}..${headRef}.)`].join('\n')
+  const range = local ? `${mergeBase.slice(0, 12)}..working tree (uncommitted and untracked files included)` : `${mergeBase.slice(0, 12)}..${headRef}`
+  const out = [...result.lines, `(Compared merge-base(${base}, ${headRef}) = ${range}.)`].join('\n')
   if (!result.ok) fail(out)
   console.log(out)
 }
