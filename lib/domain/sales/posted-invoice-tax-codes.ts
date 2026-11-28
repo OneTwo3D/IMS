@@ -18,6 +18,7 @@ import type { db } from '@/lib/db'
 import type { Prisma } from '@/app/generated/prisma/client'
 import { ACCOUNTING_PAYLOAD_CONNECTION_KEY } from '@/lib/connectors/accounting-connection-provenance'
 import { ledgerStanding, NAMES_A_DOCUMENT_WHERE, PROVEN_LEDGER_FACT_WHERE } from '@/lib/domain/accounting/ledger-standing'
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import type { DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
 import { buildTaxTypeRateIndex, type TaxTypeRateIndex } from '@/lib/domain/sales/refund-posted-tax-identity'
@@ -318,7 +319,7 @@ export function postedCodesAmbiguityRefusal(posted: PostedInvoiceTaxCodes | null
   if (!posted || posted.ambiguousRateIds.size === 0) return null
   for (const id of rateIds) {
     if (id && posted.ambiguousRateIds.has(id)) {
-      return 'The invoice was posted with two different tax codes for one VAT rate, so IMS cannot tell which code a credit note (or an update) of those lines must use, and nothing was created. Correct the invoice in the accounting system first, or record the credit note by hand.'
+      return withLedgerCheck('The invoice was posted with two different tax codes for one VAT rate, so IMS cannot tell which code a credit note (or an update) of those lines must use, and nothing was created. Correct the invoice in the accounting system first, or record the credit note by hand.')
     }
   }
   return null
