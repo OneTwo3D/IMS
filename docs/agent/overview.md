@@ -135,14 +135,15 @@ onetwo3d-ims/
    - PDF generation and email delivery
 
 3. **Procure-to-Pay** — Purchase order full lifecycle:
-   - Workflow: DRAFT → RFQ_SENT → PO_SENT → PARTIALLY_RECEIVED → RECEIVED → INVOICED
-   - Multi-currency with live FX rates (frankfurter.dev ECB data)
+   - Workflow: DRAFT → RFQ_SENT → QUOTE_RECEIVED → PO_SENT → SHIPPED → PARTIALLY_RECEIVED → RECEIVED → INVOICED, plus CLOSED (including closed short), PARTIALLY_RETURNED, RETURNED and CANCELLED (`PurchaseOrderStatus` in `prisma/schema.prisma`)
+   - Multi-currency at the `fx_rates` table rate (fed per `fx_rate_source`: Aelia, or ECB via frankfurter.dev); per-event FX for receipts and bills is behind `purchase_event_fx_rates_enabled` (off, interlocked)
    - RFQ PDF generation and supplier management
    - Goods receipt with FIFO costing integration
    - Landed cost distribution (by value/weight/quantity/equal split)
    - Freight/cost POs linked to primary POs
-   - Retrospective landed cost recalculation (updates FIFO layers and COGS)
-   - Supplier returns and billing workflow
+   - Retrospective landed cost recalculation (updates FIFO layers and COGS); zero floor for supplier credits (floored part to COGS behind `landed_cost_floor_cogs_enabled`)
+   - Receipts by hand, by WMS book-in and by Mintsoft align-up; GR/IR sub-ledger
+   - Supplier bills (three-way match, net payable for reverse charge), supplier credit notes, returns to supplier
 
 4. **Manufacturing** — Production order management:
    - Production order types: ASSEMBLY, DISASSEMBLY
