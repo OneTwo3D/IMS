@@ -22,7 +22,8 @@ async function load() {
   const { Prisma } = await import('../../app/generated/prisma/client')
   const { createSalesOrderRefund } = await import('../../lib/domain/sales/refund-service')
   const { readPostedInvoiceTaxCodes } = await import('../../lib/domain/sales/posted-invoice-tax-codes')
-  return { db, Prisma, createSalesOrderRefund, readPostedInvoiceTaxCodes }
+  const { raiseShopRefundTask } = await import('../../lib/domain/sales/shop-refund-tasks')
+  return { db, Prisma, createSalesOrderRefund, readPostedInvoiceTaxCodes, raiseShopRefundTask }
 }
 
 test('[db] a refund of a posted invoice credits goods and discount on the codes it posted with, after the rate was remapped; before posting it reads the current mapping', { skip }, async (t) => {
@@ -218,4 +219,156 @@ test('[db] which sync row speaks for the posted invoice: the newest one that nam
   // A newest row whose payload was compacted (unreadable): no record.
   await row({ type: 'SALES_INVOICE_UPDATE', status: 'SYNCED', externalTransactionId: invoiceId, syncedAt: at(4), createdAt: at(4), payload: { compacted: true } })
   assert.equal(await codeOf(), null, 'an unreadable newest row: no record')
+  await db.accountingSyncLog.deleteMany({ where: { referenceType: 'SalesOrder', referenceId: order.id, createdAt: at(4) } })
+  // A newest update that is a SHADOW (CANCELLED, held-shadow basis, no document id; it names the document only in its payload) sent nothing: the next row speaks.
+  await row({ type: 'SALES_INVOICE_UPDATE', status: 'CANCELLED', settlementBasis: 'HELD_SHADOW', createdAt: at(5), payload: payload('V5', { accountingInvoiceId: invoiceId }) })
+  assert.equal(await codeOf(), 'V2', 'a shadow newest update is skipped')
+  // A newest update that FAILED before ever being claimed (no document id, no attempt) sent nothing either.
+  await row({ type: 'SALES_INVOICE_UPDATE', status: 'FAILED', createdAt: at(6), payload: payload('V6', { accountingInvoiceId: invoiceId }) })
+  assert.equal(await codeOf(), 'V2', 'a never-claimed failed newest update is skipped')
+  // A FAILED update that WAS attempted may have reached the ledger: no record.
+  await row({ type: 'SALES_INVOICE_UPDATE', status: 'FAILED', attemptRevision: 1, processingStartedAt: at(7), createdAt: at(7), payload: payload('V7', { accountingInvoiceId: invoiceId }) })
+  assert.equal(await codeOf(), null, 'a claimed failed newest update is unproven: no record')
+})
+
+test('[db] a reverse-charge default-rate order: after an in-place remap, shipping and the header discount are credited on the code they posted with', { skip }, async (t) => {
+  const { db, Prisma, createSalesOrderRefund } = await load()
+  const sfx = randomUUID().slice(0, 8)
+  const D = (v: string) => new Prisma.Decimal(v)
+  const swap = `RCSWAP-${sfx}`
+  const zero = await db.taxRate.create({ data: { name: `RZ-${sfx}`, rate: '0', accountingTaxType: swap, countryCode: 'ZZ' }, select: { id: true } })
+  const rc = await db.taxRate.create({ data: { name: `RC-${sfx}`, rate: '0.2', accountingTaxType: `RCOLD-${sfx}`, reverseCharge: true, countryCode: 'ZZ' }, select: { id: true, name: true } })
+  const orderIds: string[] = []
+  t.after(async () => {
+    for (const orderId of orderIds) {
+      await db.accountingSyncLog.deleteMany({ where: { referenceType: 'SalesOrder', referenceId: orderId } }).catch(() => {})
+      await db.salesOrderRefundLine.deleteMany({ where: { refund: { orderId } } }).catch(() => {})
+      await db.salesOrderRefund.deleteMany({ where: { orderId } }).catch(() => {})
+      await db.salesOrderLine.deleteMany({ where: { orderId } }).catch(() => {})
+      await db.salesOrder.delete({ where: { id: orderId } }).catch(() => {})
+    }
+    await db.taxRate.deleteMany({ where: { id: { in: [zero.id, rc.id] } } }).catch(() => {})
+  })
+  const mk = async (extra: Record<string, unknown>, payloadExtra: Record<string, unknown>) => {
+    const o = await db.salesOrder.create({
+      data: {
+        orderNumber: `RCO-${randomUUID().slice(0, 8)}`, status: 'SHIPPED', currency: 'GBP', fxRateToBase: D('1'), pricesIncludeVat: false, taxRateName: rc.name, taxRatePercent: D('0.2'),
+        subtotalForeign: D('100'), subtotalBase: D('100'), accountingInvoiceId: `inv-${randomUUID()}`, accountingInvoiceConnector: 'xero',
+        lines: { create: [{ description: 'l', qty: D('1'), unitPriceForeign: D('100'), unitPriceBase: D('100'), taxForeign: D('0'), taxBase: D('0'), totalForeign: D('100'), totalBase: D('100'), taxRateId: rc.id }] },
+        ...extra,
+      } as never,
+      select: { id: true, accountingInvoiceId: true, lines: { select: { id: true } } },
+    })
+    orderIds.push(o.id)
+    await db.accountingSyncLog.create({
+      data: {
+        connector: 'xero', type: 'SALES_INVOICE', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: o.id, externalTransactionId: o.accountingInvoiceId, syncedAt: new Date(),
+        payload: { lines: [{ description: 'l', quantity: 1, unitAmount: 100, taxType: swap, taxRateId: rc.id, taxRateBasis: 'sales_line' }], ...payloadExtra },
+      },
+    })
+    return o
+  }
+  const withShipping = await mk(
+    { shippingForeign: D('10'), shippingBase: D('10'), taxForeign: D('2'), taxBase: D('2'), totalForeign: D('112'), totalBase: D('112') },
+    { shippingAmount: 10, shippingTaxType: `RCOLD-${sfx}`, shippingTaxRateId: rc.id, shippingTaxRateBasis: 'plain' },
+  )
+  const withDiscount = await mk(
+    { discountAmount: D('10'), taxForeign: D('0'), taxBase: D('0'), totalForeign: D('90'), totalBase: D('90') },
+    { discountAmount: 10, discountTaxType: `RCOLD-${sfx}`, discountTaxRateId: rc.id, discountTaxRateBasis: 'plain' },
+  )
+  // The in-place remap: the old code is on no rate row afterwards.
+  await db.taxRate.update({ where: { id: rc.id }, data: { accountingTaxType: `RCNEW-${sfx}` } })
+  const accountingSettings = { reverseChargeSalesTaxType: swap } as never
+  const refund = (o: { id: string; lines: { id: string }[] }, lines: Record<string, unknown>[]) => createSalesOrderRefund(db, {
+    orderId: o.id,
+    lines: [{ lineId: o.lines[0]!.id, productId: null, description: 'l', qty: 1, totalForeign: 99, totalBase: 99, lineKind: 'sale' }, ...lines] as never,
+    reason: 'rc', creditNotePrefix: `CNRC${sfx}-`, enforcePerTargetBalances: true, deriveSaleLineNetsFromStoredBalance: true, creditNotePostingEnabled: true, accountingSettings,
+  })
+  const codes = async (orderId: string) => (await db.salesOrderRefundLine.findMany({ where: { refund: { orderId } }, select: { lineKind: true, accountingTaxType: true } })).map((r) => [r.lineKind, r.accountingTaxType]).sort()
+  const r1 = await refund(withShipping, [{ lineId: null, productId: null, description: 'Shipping', qty: 0, totalForeign: 10, totalBase: 10, lineKind: 'shipping' }])
+  assert.equal(r1.success, true, r1.success ? '' : r1.error)
+  assert.deepEqual(await codes(withShipping.id), [['sale', swap], ['shipping', `RCOLD-${sfx}`]].sort())
+  const r2 = await refund(withDiscount, [])
+  assert.equal(r2.success, true, r2.success ? '' : r2.error)
+  assert.deepEqual(await codes(withDiscount.id), [['discount', `RCOLD-${sfx}`], ['sale', swap]].sort())
+})
+
+test('[db] a rate with no accounting code of its own does not make the order default code ambiguous', { skip }, async (t) => {
+  const { db, Prisma, createSalesOrderRefund } = await load()
+  const sfx = randomUUID().slice(0, 8)
+  const D = (v: string) => new Prisma.Decimal(v)
+  const def = await db.taxRate.create({ data: { name: `LD-${sfx}`, rate: '0.2', accountingTaxType: `DEFX-${sfx}`, countryCode: 'ZZ' }, select: { id: true, name: true } })
+  const codeless = await db.taxRate.create({ data: { name: `LC-${sfx}`, rate: '0.05', accountingTaxType: null, countryCode: 'ZZ' }, select: { id: true } })
+  const line = (taxRateId: string, tax: string) => ({ description: 'l', qty: D('1'), unitPriceForeign: D('100'), unitPriceBase: D('100'), taxForeign: D(tax), taxBase: D(tax), totalForeign: D('100'), totalBase: D('100'), taxRateId })
+  const o = await db.salesOrder.create({
+    data: {
+      orderNumber: `LC-${randomUUID().slice(0, 8)}`, status: 'SHIPPED', currency: 'GBP', fxRateToBase: D('1'), pricesIncludeVat: false, taxRateName: def.name, taxRatePercent: D('0.2'),
+      subtotalForeign: D('200'), subtotalBase: D('200'), taxForeign: D('25'), taxBase: D('25'), totalForeign: D('225'), totalBase: D('225'),
+      accountingInvoiceId: `inv-${randomUUID()}`, accountingInvoiceConnector: 'xero',
+      lines: { create: [line(def.id, '20'), line(codeless.id, '5')] },
+    },
+    select: { id: true, accountingInvoiceId: true, lines: { select: { id: true, taxRateId: true } } },
+  })
+  t.after(async () => {
+    await db.accountingSyncLog.deleteMany({ where: { referenceType: 'SalesOrder', referenceId: o.id } }).catch(() => {})
+    await db.salesOrderRefundLine.deleteMany({ where: { refund: { orderId: o.id } } }).catch(() => {})
+    await db.salesOrderRefund.deleteMany({ where: { orderId: o.id } }).catch(() => {})
+    await db.salesOrderLine.deleteMany({ where: { orderId: o.id } }).catch(() => {})
+    await db.salesOrder.delete({ where: { id: o.id } }).catch(() => {})
+    await db.taxRate.deleteMany({ where: { id: { in: [def.id, codeless.id] } } }).catch(() => {})
+  })
+  // The invoice posted both lines on the default code (the code-less rate fell back to it), each bound to its own rate.
+  await db.accountingSyncLog.create({
+    data: {
+      connector: 'xero', type: 'SALES_INVOICE', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: o.id, externalTransactionId: o.accountingInvoiceId, syncedAt: new Date(),
+      payload: { lines: [
+        { description: 'l', quantity: 1, unitAmount: 100, taxType: `DEFX-${sfx}`, taxRateId: def.id, taxRateBasis: 'sales_line' },
+        { description: 'l', quantity: 1, unitAmount: 100, taxType: `DEFX-${sfx}`, taxRateId: codeless.id, taxRateBasis: 'sales_line' },
+      ] },
+    },
+  })
+  await db.taxRate.update({ where: { id: def.id }, data: { accountingTaxType: `DEFNEW-${sfx}` } })
+  const r = await createSalesOrderRefund(db, {
+    orderId: o.id,
+    lines: [{ lineId: o.lines.find((l) => l.taxRateId === def.id)!.id, productId: null, description: 'l', qty: 1, totalForeign: 99, totalBase: 99, lineKind: 'sale' }],
+    reason: 'lc', creditNotePrefix: `CNLC${sfx}-`, enforcePerTargetBalances: true, deriveSaleLineNetsFromStoredBalance: true, creditNotePostingEnabled: true,
+  })
+  assert.equal(r.success, true, r.success ? '' : r.error)
+  const rows = await db.salesOrderRefundLine.findMany({ where: { refund: { orderId: o.id } }, select: { accountingTaxType: true } })
+  assert.deepEqual(rows.map((x) => x.accountingTaxType), [`DEFX-${sfx}`])
+})
+
+test('[db] the shop refund task keeps the gross figure after a remap: the posted code is priced at the rate it was posted at', { skip }, async (t) => {
+  const { db, Prisma, readPostedInvoiceTaxCodes, raiseShopRefundTask } = await load()
+  const sfx = randomUUID().slice(0, 8)
+  const D = (v: string) => new Prisma.Decimal(v)
+  const rate = await db.taxRate.create({ data: { name: `SR-${sfx}`, rate: '0.05', accountingTaxType: `SROLD-${sfx}`, countryCode: 'ZZ' }, select: { id: true } })
+  const o = await db.salesOrder.create({
+    data: {
+      orderNumber: `SR-${randomUUID().slice(0, 8)}`, status: 'SHIPPED', currency: 'GBP', fxRateToBase: D('1'), subtotalForeign: D('100'), subtotalBase: D('100'), taxForeign: D('5'), taxBase: D('5'), totalForeign: D('105'), totalBase: D('105'),
+      accountingInvoiceId: `inv-${randomUUID()}`, accountingInvoiceConnector: 'xero',
+    },
+    select: { id: true, accountingInvoiceId: true },
+  })
+  t.after(async () => {
+    await db.wmsOperatorTask.deleteMany({ where: { orderId: o.id } }).catch(() => {})
+    await db.accountingSyncLog.deleteMany({ where: { referenceType: 'SalesOrder', referenceId: o.id } }).catch(() => {})
+    await db.salesOrder.delete({ where: { id: o.id } }).catch(() => {})
+    await db.taxRate.delete({ where: { id: rate.id } }).catch(() => {})
+  })
+  await db.accountingSyncLog.create({
+    data: {
+      connector: 'xero', type: 'SALES_INVOICE', status: 'SYNCED', referenceType: 'SalesOrder', referenceId: o.id, externalTransactionId: o.accountingInvoiceId, syncedAt: new Date(),
+      payload: { lines: [{ description: 'l', quantity: 1, unitAmount: 100, taxType: `SROLD-${sfx}`, taxRateId: rate.id, taxRateBasis: 'sales_line' }] },
+    },
+  })
+  await db.taxRate.update({ where: { id: rate.id }, data: { accountingTaxType: `SRNEW-${sfx}` } })
+  const raise = async (postedCodes: Awaited<ReturnType<typeof readPostedInvoiceTaxCodes>>, refundId: string) => {
+    await raiseShopRefundTask(db, { orderId: o.id, orderNumber: 'SR', refundId, creditNoteNumber: 'CN', currency: 'GBP', postedCodes, lines: [{ totalForeign: 100, qty: 1, accountingTaxType: `SROLD-${sfx}`, reverseCharge: false }] })
+    return (await db.wmsOperatorTask.findFirst({ where: { orderId: o.id, externalOrderId: refundId }, select: { queryText: true } }))!.queryText
+  }
+  const withPosted = await raise(await readPostedInvoiceTaxCodes(db, o.id, o.accountingInvoiceId), 'r1')
+  assert.match(withPosted, /105\.00 GBP including tax/, 'priced at the posted code\'s rate')
+  const without = await raise(null, 'r2')
+  assert.match(without, /could not work out the tax-inclusive figure/, 'without the posted codes the remapped code cannot be priced (the failure this fixes)')
 })

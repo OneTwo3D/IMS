@@ -4357,7 +4357,7 @@ export async function createSalesOrderRefund(
 
     // THE CODES THE ORDER'S POSTED INVOICE WAS SENT WITH (null: no posted invoice, or no readable record of it, and then every derivation below reads the rates' current codes, as before). Owner ruling: after posting, a refund
     // reverses the invoice's goods lines and discount on the codes it posted with; a rate remapped since only affects invoices not yet posted.
-    const postedInvoiceCodes = await readPostedInvoiceTaxCodes(tx, so.id, so.accountingInvoiceId)
+    const postedInvoiceCodes = await readPostedInvoiceTaxCodes(tx, so.id, so.accountingInvoiceId, { reverseChargeSalesTaxType: input.accountingSettings?.reverseChargeSalesTaxType })
     const postedCodeByLineId = postedTaxTypeByLineId(so.lines, postedInvoiceCodes)
     // The shipping line and the single (header-rate) discount line were posted on the order default rate's code as it was THEN, which the record states when it names the rate it was read from; else the current default.
     const shippingTaxType = postedShippingTaxType(postedInvoiceCodes) ?? orderDefaultTaxType
@@ -5786,6 +5786,7 @@ export async function createSalesOrderRefund(
         refundId: createdRefund.id,
         creditNoteNumber,
         currency: so.currency,
+        postedCodes: postedInvoiceCodes,
         lines: createdRefundLines,
       })
     }

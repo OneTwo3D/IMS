@@ -107,3 +107,11 @@ test('the posted code\'s rate is unioned into the index: a code on no row is pri
   const untouched = buildTaxTypeRateIndex([{ accountingTaxType: 'NEW', rate: '0.05' }])
   assert.equal(withPostedCodeRates(untouched, null), untouched)
 })
+
+test('the record keeps the basis each code was bound on: goods and discount parts are sales_line, shipping and the header discount are plain', () => {
+  const posted = postedTaxCodesFromPayload({
+    lines: [{ taxType: 'L', taxRateId: 'R' }], shippingTaxType: 'S', shippingTaxRateId: 'R', discountTaxType: 'S', discountTaxRateId: 'R',
+  })!
+  assert.deepEqual(posted.rateIdsByCode.get('L'), [{ rateId: 'R', basis: 'sales_line' }])
+  assert.deepEqual(posted.rateIdsByCode.get('S'), [{ rateId: 'R', basis: 'plain' }], 'bound once on the plain basis')
+})

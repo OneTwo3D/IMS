@@ -5,7 +5,7 @@
  * accounting code afterwards (an in-place edit of the rate: no row keeps the old code) only affects invoices not yet posted; a credit note that read the rate's current code instead would move VAT
  * between codes (and VAT boxes) in the ledger.
  *
- * The record is the payload of the order's NEWEST sync row of type SALES_INVOICE / SALES_INVOICE_UPDATE that names the document (what was sent). Each goods line, each part of a per-rate discount, the
+ * The record is the payload of the order's newest usable sync row of type SALES_INVOICE / SALES_INVOICE_UPDATE that names the document (what was sent; see readPostedInvoiceTaxCodes). Each goods line, each part of a per-rate discount, the
  * header discount and the shipping carry the id of the tax rate their code was read from (`taxRateId`, `discountTaxRateId`, `shippingTaxRateId`: bindings the ledger never sees), so a code is looked up by rate id,
  * never by position. A code is returned only when the record states it unambiguously AND binds it to a rate (a payload the EU treatment retyped has lost its bindings): anything else answers null and the
  * caller keeps its existing derivation (the rate's current code), which is also what an order with no posted invoice does.
@@ -15,7 +15,7 @@
  * mapped on both sides to different rates still reads as ambiguous.
  */
 import type { db } from '@/lib/db'
-import { PROVEN_LEDGER_FACT_WHERE } from '@/lib/domain/accounting/ledger-standing'
+import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import type { DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
 import { buildTaxTypeRateIndex, type TaxTypeRateIndex } from '@/lib/domain/sales/refund-posted-tax-identity'
@@ -33,8 +33,11 @@ export type PostedInvoiceTaxCodes = {
   headerDiscountCode: string | null
   /** The code the shipping line was posted on, when it names the rate it was read from; else null. */
   shippingCode: string | null
-  /** code -> the ids of the rates the record bound it to (every goods line, discount part, header discount and shipping). */
-  rateIdsByCode: ReadonlyMap<string, ReadonlySet<string>>
+  /**
+   * code -> the rates the record bound it to, each with the BASIS it was bound on: `sales_line` for a goods line or a discount part (a reverse-charged rate's code there is the swap code), `plain` for the
+   * header discount and shipping (posted on the rate's own code, reverse-charged or not).
+   */
+  rateIdsByCode: ReadonlyMap<string, ReadonlyArray<{ rateId: string; basis: 'sales_line' | 'plain' }>>
   /** code -> the normalised percentages of those rates, filled by the reader (empty from the pure parse). */
   ratesByCode: ReadonlyMap<string, ReadonlySet<string>>
 }
@@ -77,17 +80,17 @@ export function postedTaxCodesFromPayload(payload: unknown): PostedInvoiceTaxCod
   const discountCodeByRateId = codesByRate(parts)
   const headerDiscountCode = text(record.discountTaxRateId) ? text(record.discountTaxType) : null
   const shippingCode = text(record.shippingTaxRateId) ? text(record.shippingTaxType) : null
-  const rateIdsByCode = new Map<string, Set<string>>()
-  const bind = (code: string | null, rateId: string | null) => {
+  const rateIdsByCode = new Map<string, Array<{ rateId: string; basis: 'sales_line' | 'plain' }>>()
+  const bind = (code: string | null, rateId: string | null, basis: 'sales_line' | 'plain') => {
     if (!code || !rateId) return
-    const set = rateIdsByCode.get(code) ?? new Set<string>()
-    set.add(rateId)
-    rateIdsByCode.set(code, set)
+    const list = rateIdsByCode.get(code) ?? []
+    if (!list.some((b) => b.rateId === rateId && b.basis === basis)) list.push({ rateId, basis })
+    rateIdsByCode.set(code, list)
   }
-  for (const [rateId, code] of lineCodeByRateId) bind(code, rateId)
-  for (const [rateId, code] of discountCodeByRateId) bind(code, rateId)
-  bind(headerDiscountCode, text(record.discountTaxRateId))
-  bind(shippingCode, text(record.shippingTaxRateId))
+  for (const [rateId, code] of lineCodeByRateId) bind(code, rateId, 'sales_line')
+  for (const [rateId, code] of discountCodeByRateId) bind(code, rateId, 'sales_line')
+  bind(headerDiscountCode, text(record.discountTaxRateId), 'plain')
+  bind(shippingCode, text(record.shippingTaxRateId), 'plain')
   return {
     lineCodeByRateId,
     discountCodeByRateId,
@@ -102,20 +105,25 @@ export function postedTaxCodesFromPayload(payload: unknown): PostedInvoiceTaxCod
 
 /**
  * The tax codes the order's posted invoice carries, or null when the order has no posted invoice (`accountingInvoiceId` null) or no usable record of it (a Xeroom-posted or hand-linked invoice has no row
- * here): the caller then reads the rates' current codes, as before.
+ * here, and the record lasts only while the sync log is retained): the caller then reads the rates' current codes, as before.
  *
- * WHICH ROW. The NEWEST row (createdAt, then id) of type SALES_INVOICE / SALES_INVOICE_UPDATE that names the document, by its `externalTransactionId` or, for an update not yet confirmed, by the
- * `accountingInvoiceId` in its payload. It must be a row the ledger holds (PROVEN_LEDGER_FACT_WHERE: the connector's own basis, never a shadow or an operator assertion) with a readable payload. If the newest
- * row is anything else (an accepted update still in flight, an asserted one, a compacted payload) the answer is null: the record is not trusted to say what the document carries, and an OLDER version is never
- * read in its place.
+ * WHICH ROW. Walking the xero SALES_INVOICE / SALES_INVOICE_UPDATE rows that name the document (by `externalTransactionId`, or for an unconfirmed update by the `accountingInvoiceId` in its payload),
+ * NEWEST first (createdAt, then id): a row that PROVABLY sent nothing is skipped (a shadow IMS recorded instead of queuing, a CANCELLED row proven not to have reached the ledger, a FAILED row with no
+ * document id that was never claimed, so no request was made) and the next row is considered; the first other row decides. It speaks only if the connector confirmed it (ledgerStanding CONFIRMED_POSTED:
+ * never an operator assertion) and its payload is readable. Anything else as the newest candidate (an accepted update still PENDING or PROCESSING, an asserted row, a CANCELLED row not proven absent, a
+ * compacted payload) answers null: the record is not trusted to say what the document carries, and an OLDER version is never read in its place.
+ *
+ * PRICING PAIRS. A posted code's rate is the percentage of the rate the record binds it to, except: a `sales_line` binding of a reverse-charged rate (its code is the swap code, priced from its own mapping),
+ * a code equal to `reverseChargeSalesTaxType`, and a rate that currently has no accounting code (its fallback code is the order default's, which that rate's percentage must not price).
  */
 export async function readPostedInvoiceTaxCodes(
   client: Pick<typeof db, 'accountingSyncLog' | 'taxRate'>,
   orderId: string,
   accountingInvoiceId: string | null | undefined,
+  options: { reverseChargeSalesTaxType?: string | null } = {},
 ): Promise<PostedInvoiceTaxCodes | null> {
   if (!accountingInvoiceId) return null
-  const newest = await client.accountingSyncLog.findFirst({
+  const candidates = await client.accountingSyncLog.findMany({
     where: {
       connector: 'xero',
       type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] },
@@ -124,21 +132,38 @@ export async function readPostedInvoiceTaxCodes(
       OR: [{ externalTransactionId: accountingInvoiceId }, { payload: { path: ['accountingInvoiceId'], equals: accountingInvoiceId } }],
     },
     orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-    select: { id: true },
+    select: { id: true, status: true, externalTransactionId: true, abandonedBeforeRemoteCall: true, settlementBasis: true, attemptRevision: true, processingStartedAt: true },
+    take: 25,
   })
-  if (!newest) return null
-  const proven = await client.accountingSyncLog.findFirst({ where: { AND: [PROVEN_LEDGER_FACT_WHERE, { id: newest.id }] }, select: { payload: true } })
-  const codes = proven ? postedTaxCodesFromPayload(proven.payload) : null
+  let chosen: string | null = null
+  for (const row of candidates) {
+    // A failure that was never claimed made no request (no claim, no document id): the only "no remote attempt" evidence the row carries.
+    const neverSent = row.status === 'FAILED' && row.attemptRevision === 0 && row.processingStartedAt === null
+    const standing = ledgerStanding(row, { couldHaveReachedLedger: neverSent ? false : undefined })
+    if (standing === 'PROVEN_NOT_POSTED' || standing === 'SHADOW_NOT_SENT_BY_IMS') continue
+    if (standing !== 'CONFIRMED_POSTED') return null
+    chosen = row.id
+    break
+  }
+  if (chosen === null) return null
+  const body = await client.accountingSyncLog.findUnique({ where: { id: chosen }, select: { payload: true } })
+  const codes = body ? postedTaxCodesFromPayload(body.payload) : null
   if (!codes) return null
-  const rateIds = [...new Set([...codes.rateIdsByCode.values()].flatMap((ids) => [...ids]))]
+  const rateIds = [...new Set([...codes.rateIdsByCode.values()].flatMap((bound) => bound.map((b) => b.rateId)))]
   if (rateIds.length === 0) return codes
-  // A reverse-charged rate is not priced from its own percentage: its posted code is the swap code.
-  const rates = await client.taxRate.findMany({ where: { id: { in: rateIds }, reverseCharge: false }, select: { id: true, rate: true } })
-  const pctById = new Map(rates.map((r) => [r.id, toDecimal(r.rate).toString()] as const))
+  const rates = await client.taxRate.findMany({ where: { id: { in: rateIds } }, select: { id: true, rate: true, reverseCharge: true, accountingTaxType: true } })
+  const byId = new Map(rates.map((r) => [r.id, r] as const))
   const ratesByCode = new Map<string, Set<string>>()
-  for (const [code, ids] of codes.rateIdsByCode) {
+  for (const [code, bound] of codes.rateIdsByCode) {
+    if (options.reverseChargeSalesTaxType && code === options.reverseChargeSalesTaxType) continue
     const pcts = new Set<string>()
-    for (const id of ids) { const pct = pctById.get(id); if (pct !== undefined) pcts.add(pct) }
+    for (const { rateId, basis } of bound) {
+      const r = byId.get(rateId)
+      if (!r) continue
+      if (basis === 'sales_line' && r.reverseCharge) continue
+      if (!r.accountingTaxType || r.accountingTaxType.trim() === '') continue
+      pcts.add(toDecimal(r.rate).toString())
+    }
     if (pcts.size > 0) ratesByCode.set(code, pcts)
   }
   return { ...codes, ratesByCode }
