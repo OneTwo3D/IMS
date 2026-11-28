@@ -303,7 +303,9 @@ export function nonImsApprovalStanding(
   connectedTenantId: string | null,
 ): { kind: 'ok' } | { kind: 'stale'; reason: string } | { kind: 'held'; reason: string } {
   if (row.staleAt) return { kind: 'stale', reason: row.staleReason ?? 'marked stale' }
-  if (!row.stockUnits || typeof row.stockUnits !== 'object' || !row.billFingerprint || !row.xeroInvoiceId || !row.xeroTenantId) {
+  // #1167 LOW-4: an empty frozen basis (`{}`) is no basis.
+  if (!row.stockUnits || typeof row.stockUnits !== 'object' || Array.isArray(row.stockUnits) || Object.keys(row.stockUnits).length === 0
+    || !row.billFingerprint || !row.xeroInvoiceId || !row.xeroTenantId) {
     return { kind: 'stale', reason: 'confirmed before its basis was frozen with it; confirm it again' }
   }
   if (bill.accountingInvoiceId !== row.xeroInvoiceId) return { kind: 'stale', reason: `the bill is linked to another Xero bill (${bill.accountingInvoiceId ?? 'none'}, confirmed on ${row.xeroInvoiceId})` }
@@ -594,7 +596,7 @@ export async function reconcilePurchaseBillFx(
   const staleReport: Array<{ invoiceId: string; reason: string; held: boolean }> = []
   const confirmedRows = await tx.purchaseFxNonImsBillApproval.findMany({
     where: { poId: params.poId },
-    select: { id: true, invoiceId: true, xeroCurrencyRate: true, xeroInvoiceId: true, xeroTenantId: true, stockUnits: true, billFingerprint: true, staleAt: true, staleReason: true },
+    select: { id: true, invoiceId: true, xeroCurrencyRate: true, xeroInvoiceId: true, xeroTenantId: true, stockUnits: true, billFingerprint: true, staleAt: true, staleReason: true, heldSince: true },
   })
   const confirmedRate = new Map<string, Decimal | null>(confirmedRows.map((row) => [row.invoiceId, row.xeroCurrencyRate === null ? null : toDecimal(row.xeroCurrencyRate)]))
   const currentStockUnits = stockUnitsForeign(po)
@@ -608,18 +610,42 @@ export async function reconcilePurchaseBillFx(
     : (await tx.accountingToken.findUnique({ where: { connector: 'xero' }, select: { tenantId: true } }))?.tenantId ?? null
   for (const row of confirmedRows) {
     const bill = billById.get(row.invoiceId)
-    if (row.stockUnits && typeof row.stockUnits === 'object') {
+    if (row.stockUnits && typeof row.stockUnits === 'object' && !Array.isArray(row.stockUnits) && Object.keys(row.stockUnits).length > 0) {
       frozenUnits.set(row.invoiceId, new Map(Object.entries(row.stockUnits as Record<string, string>).map(([lineId, unit]) => [lineId, toDecimal(unit)])))
     }
     if (!bill) continue
     const standing = nonImsApprovalStanding(row, bill, currentStockUnits, connectedTenantId)
+    // #1167 MED-1: a hold ends as soon as the organisation can be compared again; its journal then catches up in this same run.
+    if (standing.kind !== 'held' && row.heldSince && !params.dryRun) await tx.purchaseFxNonImsBillApproval.updateMany({ where: { id: row.id, heldSince: { not: null } }, data: { heldSince: null } })
     if (standing.kind === 'ok') continue
     stale.set(row.invoiceId, standing.reason)
-    if (standing.kind === 'held') { staleReport.push({ invoiceId: row.invoiceId, reason: standing.reason, held: true }); continue }
+    const { logActivityInTransaction } = await import('@/lib/activity-log')
+    if (standing.kind === 'held') {
+      staleReport.push({ invoiceId: row.invoiceId, reason: standing.reason, held: true })
+      // Reported once, when the journal is first held (the order stays in the re-run's list, so `purchase-fx:reconcile` catches it up after reconnecting).
+      if (!row.heldSince && !params.dryRun) {
+        const marked = await tx.purchaseFxNonImsBillApproval.updateMany({ where: { id: row.id, heldSince: null }, data: { heldSince: params.at } })
+        if (marked.count === 1) {
+          await logActivityInTransaction(tx, {
+            userId: null,
+            entityType: 'PURCHASE_ORDER',
+            entityId: params.poId,
+            action: 'purchase_fx_non_ims_bill_held',
+            tag: 'accounting',
+            level: 'WARNING',
+            description: withLedgerCheck(`The exchange-rate difference journal of bill ${bill.invoiceNumber ?? bill.id} of ${po.reference} (posted to Xero outside IMS) is held: no Xero organisation `
+              + 'is connected, so the one the bill was confirmed on cannot be compared. Once the same organisation is connected again, the next receipt, return or bill change of the order, '
+              + `or \`npm run purchase-fx:reconcile -- --po ${params.poId} --apply\`, catches it up. Connecting a different organisation makes the confirmation stale.`),
+            metadata: { invoiceId: bill.id, reason: standing.reason },
+          })
+        }
+      }
+      continue
+    }
     staleReport.push({ invoiceId: row.invoiceId, reason: standing.reason, held: false })
-    if (!row.staleAt && !params.dryRun) {
-      await tx.purchaseFxNonImsBillApproval.update({ where: { id: row.id }, data: { staleAt: params.at, staleReason: standing.reason } })
-      const { logActivityInTransaction } = await import('@/lib/activity-log')
+    // #1167 LOW-1: marked (and warned) by exactly one run.
+    const marked = row.staleAt || params.dryRun ? { count: 0 } : await tx.purchaseFxNonImsBillApproval.updateMany({ where: { id: row.id, staleAt: null }, data: { staleAt: params.at, staleReason: standing.reason } })
+    if (marked.count === 1) {
       await logActivityInTransaction(tx, {
         userId: null,
         entityType: 'PURCHASE_ORDER',

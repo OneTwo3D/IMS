@@ -6703,6 +6703,8 @@ model PurchaseFxNonImsBillApproval {
   /// where it is until the bill is confirmed again. NULL = it holds.
   staleAt              DateTime? @map("stale_at")
   staleReason          String?   @map("stale_reason")
+  /// When its journal was first HELD because no Xero organisation was connected (cleared once it is compared again). NULL = not held.
+  heldSince            DateTime? @map("held_since")
 
   @@index([poId])
   @@map("purchase_fx_non_ims_bill_approvals")
@@ -6721,5 +6723,6 @@ model PurchaseFxNonImsBillApprovalHistory {
   supersededBy String   @map("superseded_by")
 
   @@index([invoiceId])
+  @@index([poId])
   @@map("purchase_fx_non_ims_bill_approval_history")
 }

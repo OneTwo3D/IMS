@@ -54,6 +54,9 @@ async function main() {
       const verb = apply ? 'queued' : 'would be queued'
       console.log(`  ${poId}: ${result.journals.length} journal(s) ${verb}${result.journals.map((j) => ` [bill ${j.invoiceNumber ?? j.invoiceId}: transit ${j.transitDelta}]`).join('')}`
         + `${result.notQueued.length ? `; ${result.notQueued.length} declined (reported)` : ''}${result.shadowed?.length ? `; ${result.shadowed.length} settled as a shadow` : ''}`)
+      // #1167 MED-1: confirmations of bills posted outside IMS whose journal is held (it catches up once the same Xero organisation is connected again)
+      // or stale (it needs a new confirmation: npm run purchase-fx:non-ims-bills).
+      for (const entry of result.stale ?? []) console.log(`    bill ${entry.invoiceId}: ${entry.held ? 'held: no Xero connection' : 'stale'}: ${entry.reason}`)
     } catch (error) {
       failed += 1
       console.error(`  ${poId}: FAILED, nothing written for this order: ${error instanceof Error ? error.message : String(error)}`)

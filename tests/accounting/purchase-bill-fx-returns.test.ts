@@ -686,8 +686,9 @@ test('MED-C: a bill posted outside IMS is listed with its Xero basis (read once)
   assert.equal(reconfirmed.journals.length, 0)
   assert.equal(await s.db.purchaseFxNonImsBillApproval.count({ where: { invoiceId: qoblex.id } }), 1, 'replaced, not added')
   assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id } }), 1)
-  // Not in the default list while it holds.
-  assert.ok(!(await withXeroPosting(() => listNonImsBills({ deps: xeroDeps }))).candidates.some((c) => c.invoiceId === qoblex.id))
+  // Not in the default list while it holds (the organisation it was read from connected); with none connected it is listed, held, not re-confirmable.
+  assert.ok(!(await withXeroPosting(() => withXeroToken(() => listNonImsBills({ deps: xeroDeps })))).candidates.some((c) => c.invoiceId === qoblex.id))
+  assert.match((await withXeroPosting(() => listNonImsBills({ deps: xeroDeps }))).candidates.find((c) => c.invoiceId === qoblex.id)?.problem ?? '', /^held: no Xero connection/)
 })
 
 // [mutation: list a bill with no Xero link, a delete pending or lines off transit as confirmable, or confirm --all without the digest]
@@ -899,6 +900,53 @@ test('bill writer: while the hold shadows supplier bills, a new bill is valued a
   }
 })
 
+// [mutation: post while held, never catch up after reconnecting, warn more than once, or let a tenant-stale confirmation post (#1167 MED-1 / LOW-2)]
+test('held journal (#1167): a real difference while no Xero organisation is connected posts nothing, is reported once, and catches up when the same one reconnects; a tenant-stale one never does', async () => {
+  const { listNonImsBills, confirmNonImsBills } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
+  const { rerunPurchaseBillFx, purchaseFxOrdersToReconcile } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  const po = await seedPo(10)
+  const qoblex = await nonImsBill(po, 10, 12.5, { rate: 1.2 })
+  await lockAt(po)
+  assert.equal((await receive(po, 10)).success, true)
+  assert.equal((await withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'one-off', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '-26.04']]), deps: xeroDeps })))).confirmed.length, 1)
+  const journals = () => s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id } })
+  assert.equal(await journals(), 1)
+  // A real difference arises while no Xero organisation is connected: 2 returned, so 2 of the bill are no longer matched.
+  assert.equal((await returnGoods(po, 2)).success, true)
+  const dry = await withXeroPosting(() => withXeroToken(() => rerunPurchaseBillFx(po.id, { dryRun: true })))
+  assert.equal(dry.journals.length, 1, 'there IS a difference to post (seen with the right organisation, rolled back)')
+  const owed = dry.journals[0]!.transitDelta
+  for (let i = 0; i < 2; i += 1) {
+    const held = await withXeroPosting(() => rerunPurchaseBillFx(po.id))
+    assert.equal(held.journals.length, 0)
+    assert.deepEqual((held.stale ?? []).map((x) => [x.invoiceId, x.held]), [[qoblex.id, true]])
+  }
+  assert.equal(await journals(), 1, 'nothing posted while held')
+  assert.ok((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).heldSince)
+  assert.equal(await s.db.activityLog.count({ where: { action: 'purchase_fx_non_ims_bill_held', entityId: po.id } }), 1, 'reported once')
+  assert.ok((await purchaseFxOrdersToReconcile(s.db as never)).includes(po.id), 'the order stays in the re-run\'s list')
+  const listed = (await withXeroPosting(() => listNonImsBills({ named: [qoblex.id], deps: xeroDeps }))).candidates.find((c) => c.invoiceId === qoblex.id)
+  assert.match(listed?.problem ?? '', /^held: no Xero connection/)
+  // The same organisation reconnects: the re-run catches the journal up.
+  const caught = await withXeroPosting(() => withXeroToken(() => rerunPurchaseBillFx(po.id)))
+  assert.deepEqual(caught.journals.map((j) => j.transitDelta), [owed])
+  assert.equal(await journals(), 2)
+  assert.equal((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).heldSince, null)
+  // Another organisation connected, briefly: stale for good; a further difference posts nothing, even after the right one is back.
+  await s.db.accountingToken.upsert({ where: { connector: 'xero' }, create: { connector: 'xero', accessToken: 'x', expiresAt: new Date(Date.now() + 3_600_000), tenantId: 'other-org' }, update: { tenantId: 'other-org' } })
+  try {
+    await withXeroPosting(() => rerunPurchaseBillFx(po.id))
+  } finally {
+    await s.db.accountingToken.deleteMany({ where: { connector: 'xero' } })
+  }
+  assert.equal((await returnGoods(po, 1)).success, true)
+  const after = await withXeroPosting(() => withXeroToken(() => rerunPurchaseBillFx(po.id)))
+  assert.equal(after.journals.length, 0)
+  assert.deepEqual((after.stale ?? []).map((x) => x.held), [false])
+  assert.equal(await journals(), 2, 'a tenant-stale confirmation posts nothing until it is confirmed again')
+  assert.equal(await s.db.activityLog.count({ where: { action: 'purchase_fx_non_ims_bill_stale', entityId: po.id } }), 1, 'stale warned once')
+})
+
 // [mutation: let a tenant mismatch, a NULL tenant or a pre-freeze row hold; mark a missing connection stale; warn on every run; drop the superseded row]
 test('staleness (#1164 LOW-5..11): tenant mismatch, NULL tenant and pre-freeze rows are stale (listed before any reconcile), no connection only holds; one WARNING on the transition; the superseded row is kept', async () => {
   const { listNonImsBills, confirmNonImsBills } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
@@ -937,7 +985,7 @@ test('staleness (#1164 LOW-5..11): tenant mismatch, NULL tenant and pre-freeze r
   assert.equal(history[0]!.supersededBy, 'Ann')
   assert.equal((history[0]!.snapshot as { approvedBy: string; staleReason: string }).approvedBy, 'Jan')
   // A NULL tenant, and a row confirmed before the basis was frozen, are stale.
-  for (const [label, data] of [['tenant', { xeroTenantId: null }], ['pre-freeze', { stockUnits: Prisma.DbNull, billFingerprint: null }]] as const) {
+  for (const [label, data] of [['tenant', { xeroTenantId: null }], ['pre-freeze', { stockUnits: Prisma.DbNull, billFingerprint: null }], ['empty basis', { stockUnits: {} }]] as const) {
     const reset: Record<string, unknown> = { staleAt: null, staleReason: null, xeroTenantId: 'tenant-pfr', billFingerprint: first.billFingerprint, stockUnits: first.stockUnits }
     await s.db.purchaseFxNonImsBillApproval.update({ where: { invoiceId: qoblex.id }, data: Object.assign(reset, data) as never })
     const r = await withXeroPosting(() => withXeroToken(() => rerunPurchaseBillFx(po.id)))
