@@ -2404,12 +2404,12 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
         // chartConnector RESTATED (not merely spread): the census of transactional enqueues reads own properties of the argument object.
         const outcome = await queueAccountingSyncTxWithOutcome(tx, { ...queueParams, chartConnector: queueParams.chartConnector })
         options.onUpdateOutcome?.(outcome)
-        if (outcome.queued && fallbackWarning) await fallbackWarning()
         return outcome
       },
       logActivity,
       // The date-unknown warning of a shadowed update commits or rolls back with the edit.
       logShadowWarning: (params) => logActivityInTransaction(tx, { ...params, userId: null }),
+      onEnqueued: async (outcome) => { if (outcome.queued && fallbackWarning) await fallbackWarning() },
       recordPostingRefusal: async ({ posting, ...record }) => { await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, posting, record) },
     })
     return
@@ -2456,8 +2456,9 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
       documentConnector: asRoutableAccountingConnector(so.accountingInvoiceConnector),
     }, {
       getActiveAccountingConnectorInfo,
-      queueAccountingSync: fallbackWarning ? async (queueParams: Parameters<typeof queueUpdate>[0]) => { const outcome = await queueUpdate(queueParams); if (outcome.queued) await fallbackWarning(); return outcome } : queueUpdate,
+      queueAccountingSync: queueUpdate,
       logActivity,
+      onEnqueued: async (outcome) => { if (outcome.queued && fallbackWarning) await fallbackWarning() },
       // o3d-j625 r4: the refusal lands in the exception inbox, where an operator will find it.
       // r10: the outcome is deliberately dropped here — this site reports the refusal and has nothing
       // to retry with, unlike the reconciler, which is the caller the return value exists for.
