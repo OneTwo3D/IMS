@@ -13,5 +13,5 @@ import './wms-order-reconcile'
 import './wms-watchdog' // connector-agnostic (module 'wms')
 // The cron registry loads each connector's own job module; a registry that could not name what it
 // registers would not be one.
-// wms-connector-boundary-ok: PR #680 (WMS connector removal): per-connector job module load, at the registry.
+// wms-connector-boundary-ok: pr-680-wms-connector-removal: per-connector job module load, at the registry.
 import './wms-mintsoft' // Mintsoft connector jobs

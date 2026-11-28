@@ -159,7 +159,7 @@ export function Topbar({ userName, userEmail, userPictureUrl, onMenuClick }: Top
   // Prefer client-side session pictureUrl (updates instantly after upload)
   const pictureUrl = (session?.user as { pictureUrl?: string | null } | undefined)?.pictureUrl ?? userPictureUrl
 
-  // wms-connector-boundary-ok: PR #680 (WMS connector removal): joins first characters of the user's own name.
+  // wms-connector-boundary-ok: pr-680-wms-connector-removal: joins first characters of the user's own name.
   const initials = userName
     .split(' ')
     .map((n) => n[0])
