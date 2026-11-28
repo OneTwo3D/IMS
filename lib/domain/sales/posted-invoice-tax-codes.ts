@@ -22,15 +22,15 @@ import type { DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-spli
 import { buildTaxTypeRateIndex, type TaxTypeRateIndex } from '@/lib/domain/sales/refund-posted-tax-identity'
 
 /**
- * THE ROWS THIS RECORD IS READ FROM, WHICH SYNC-LOG RETENTION MUST NEVER DELETE OR COMPACT (owner ruling 2026-11-28: keep posted invoice records).
+ * THE ROWS THIS RECORD IS READ FROM, WHICH SYNC-LOG RETENTION MUST NEVER DELETE (owner ruling 2026-11-28: keep the posted tax codes, not the whole payload).
  *
- * The connector-confirmed SALES_INVOICE / SALES_INVOICE_UPDATE rows of an order that name the ledger document (the rows `readPostedInvoiceTaxCodes` reads the payload of). Retention's payload compaction
- * blanks the payload of an old posted row (customer names, addresses and line text expire on schedule); for these rows the payload is the only record of the codes the invoice was posted with, so
- * they are exempt from both the delete and the compaction (data-retention.ts). Every other row keeps today's retention.
+ * The connector-confirmed SALES_INVOICE / SALES_INVOICE_UPDATE rows of an order that name the ledger document (the rows `readPostedInvoiceTaxCodes` reads the payload of). Retention never deletes them (data-retention.ts),
+ * and at the normal window it compacts their payload to `postedInvoicePayloadProjection`: the posted codes and the non-personal fields stay, customer names, emails, line text and the reference go. Every other row keeps today's retention.
  *
  * Why no "newest row per document" exemption: the walk in `readPostedInvoiceTaxCodes` stops at the newest row that is not provably unsent. A newer row that is unproven (a claimed failure, PENDING or PROCESSING work,
- * an operator assertion, a cancellation not proven absent) is already kept by retention's own exemptions (POSTABLE statuses, the unresolved abandoned claim, asserted evidence) and the walk reads only its columns,
- * which compaction keeps; a newer row that provably sent nothing (a shadow, a proven-absent cancellation) is skipped by the walk, so deleting it changes nothing.
+ * an operator assertion, a cancellation not proven absent) is already kept by retention's own exemptions (POSTABLE statuses, the unresolved abandoned claim, asserted evidence), and when retention compacts it, it keeps the
+ * `accountingInvoiceId` it names (`invoiceRowTombstonePayload`), so it stays a candidate of the walk and the reader answers "no record" rather than reading an older version. A newer row that provably sent nothing (a shadow,
+ * a proven-absent cancellation) is skipped by the walk, so deleting it changes nothing.
  */
 export const POSTED_INVOICE_RECORD_WHERE: Prisma.AccountingSyncLogWhereInput = {
   AND: [
@@ -38,6 +38,45 @@ export const POSTED_INVOICE_RECORD_WHERE: Prisma.AccountingSyncLogWhereInput = {
     NAMES_A_DOCUMENT_WHERE,
     { connector: 'xero', type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] }, referenceType: 'SalesOrder' },
   ],
+}
+
+const PROJECTED_LINE_KEYS = ['taxRateId', 'taxRateBasis', 'taxType', 'quantity', 'unitAmount', 'discountAmount', 'accountCode', 'itemCode'] as const
+const PROJECTED_PART_KEYS = ['taxRateId', 'taxRateBasis', 'taxType', 'amount'] as const
+const PROJECTED_SCALAR_KEYS = [
+  'accountingInvoiceId', 'invoiceNumber', 'date', 'dateUnknown', 'dueDate', 'currency', 'currencyRateToBase', 'lineAmountsIncludeTax', 'orderTotal',
+  'shippingAmount', 'shippingAccountCode', 'shippingTaxType', 'shippingTaxRateId', 'shippingTaxRateBasis',
+  'discountAmount', 'discountAccountCode', 'discountTaxType', 'discountTaxRateId', 'discountTaxRateBasis',
+] as const
+
+function pick(source: unknown, keys: readonly string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {}
+  if (typeof source !== 'object' || source === null) return out
+  const record = source as Record<string, unknown>
+  for (const key of keys) if (record[key] !== undefined && record[key] !== null) out[key] = record[key]
+  return out
+}
+
+/**
+ * WHAT RETENTION LEAVES OF A POSTED INVOICE RECORD (owner ruling: keep the tax codes, not the whole payload). After the retention window the payload of a POSTED_INVOICE_RECORD_WHERE row is reduced to this
+ * projection: the posted tax codes and the rate each was read from (lines, per-rate discount parts, header discount, shipping), the document's id, number, date, currency and amounts, and the quantities and
+ * account codes of its lines (what the posted-date and invoicing-state readers use). Customer name and email, line descriptions and the reference are removed. `postedTaxCodesFromPayload` reads a projection exactly
+ * as it reads the original, and `_compactedProjection` marks it. Pure.
+ */
+export function postedInvoicePayloadProjection(payload: unknown): Record<string, unknown> {
+  if (typeof payload !== 'object' || payload === null) return {}
+  const record = payload as Record<string, unknown>
+  const out: Record<string, unknown> = pick(record, PROJECTED_SCALAR_KEYS)
+  if (Array.isArray(record.lines)) out.lines = record.lines.map((line) => pick(line, PROJECTED_LINE_KEYS))
+  if (Array.isArray(record.discountParts)) out.discountParts = record.discountParts.map((part) => pick(part, PROJECTED_PART_KEYS))
+  out._compactedProjection = true
+  return out
+}
+
+/** What retention leaves of ANY sales invoice / update row it compacts that is not a posted record: the document id it names (so a compacted newer update stays a candidate of the reader's walk), nothing else. */
+export function invoiceRowTombstonePayload(type: string, payload: unknown): Record<string, unknown> | null {
+  if (type !== 'SALES_INVOICE' && type !== 'SALES_INVOICE_UPDATE') return null
+  const id = typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>).accountingInvoiceId : undefined
+  return typeof id === 'string' && id.trim() !== '' ? { accountingInvoiceId: id } : null
 }
 
 export type PostedInvoiceTaxCodes = {
@@ -136,13 +175,29 @@ export function postedTaxCodesFromPayload(payload: unknown): PostedInvoiceTaxCod
  * PRICING PAIRS. A posted code's rate is the percentage of the rate the record binds it to, except: a `sales_line` binding of a reverse-charged rate (its code is the swap code, priced from its own mapping),
  * a code equal to `reverseChargeSalesTaxType`, and a rate that currently has no accounting code (its fallback code is the order default's, which that rate's percentage must not price).
  */
+export type PostedRecordAbsence = 'no-record' | 'in-flight' | 'unusable'
+
 export async function readPostedInvoiceTaxCodes(
   client: Pick<typeof db, 'accountingSyncLog' | 'taxRate'>,
   orderId: string,
   accountingInvoiceId: string | null | undefined,
   options: { reverseChargeSalesTaxType?: string | null } = {},
 ): Promise<PostedInvoiceTaxCodes | null> {
-  if (!accountingInvoiceId) return null
+  return (await readPostedInvoiceRecord(client, orderId, accountingInvoiceId, options)).codes
+}
+
+/**
+ * `readPostedInvoiceTaxCodes` with the REASON when there is no record: `no-record` (no sync row speaks for the document: Xeroom-posted, hand-linked or none left), `in-flight` (the newest row is an update still
+ * PENDING or PROCESSING) or `unusable` (the newest row is not a connector-confirmed fact, or its payload is unreadable).
+ */
+export async function readPostedInvoiceRecord(
+  client: Pick<typeof db, 'accountingSyncLog' | 'taxRate'>,
+  orderId: string,
+  accountingInvoiceId: string | null | undefined,
+  options: { reverseChargeSalesTaxType?: string | null } = {},
+): Promise<{ codes: PostedInvoiceTaxCodes | null; reason: PostedRecordAbsence | null }> {
+  const none = (reason: PostedRecordAbsence) => ({ codes: null, reason })
+  if (!accountingInvoiceId) return none('no-record')
   const candidates = await client.accountingSyncLog.findMany({
     where: {
       connector: 'xero',
@@ -161,16 +216,16 @@ export async function readPostedInvoiceTaxCodes(
     const neverSent = row.status === 'FAILED' && row.attemptRevision === 0 && row.processingStartedAt === null
     const standing = ledgerStanding(row, { couldHaveReachedLedger: neverSent ? false : undefined })
     if (standing === 'PROVEN_NOT_POSTED' || standing === 'SHADOW_NOT_SENT_BY_IMS') continue
-    if (standing !== 'CONFIRMED_POSTED') return null
+    if (standing !== 'CONFIRMED_POSTED') return none(standing === 'LIVE_WORK' ? 'in-flight' : 'unusable')
     chosen = row.id
     break
   }
-  if (chosen === null) return null
+  if (chosen === null) return none('no-record')
   const body = await client.accountingSyncLog.findUnique({ where: { id: chosen }, select: { payload: true } })
   const codes = body ? postedTaxCodesFromPayload(body.payload) : null
-  if (!codes) return null
+  if (!codes) return none('unusable')
   const rateIds = [...new Set([...codes.rateIdsByCode.values()].flatMap((bound) => bound.map((b) => b.rateId)))]
-  if (rateIds.length === 0) return codes
+  if (rateIds.length === 0) return { codes, reason: null }
   const rates = await client.taxRate.findMany({ where: { id: { in: rateIds } }, select: { id: true, rate: true, reverseCharge: true, accountingTaxType: true } })
   const byId = new Map(rates.map((r) => [r.id, r] as const))
   const ratesByCode = new Map<string, Set<string>>()
@@ -186,7 +241,7 @@ export async function readPostedInvoiceTaxCodes(
     }
     if (pcts.size > 0) ratesByCode.set(code, pcts)
   }
-  return { ...codes, ratesByCode }
+  return { codes: { ...codes, ratesByCode }, reason: null }
 }
 
 /** The rate index with the posted codes' rates unioned in (a code the table no longer maps is priced at the rate it was posted at; one mapped to a different rate stays ambiguous). */

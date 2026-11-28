@@ -38,7 +38,7 @@ import { findGrossOverPaidBalance, findOverAllocatedRefundTarget, invalidQuantit
 import { orderDiscountReversal, refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
 import { discountSplitEntryTaxType, parseDiscountTaxSplit } from '@/lib/domain/sales/discount-tax-split'
 import { refreshedDiscountSplit } from '@/lib/domain/sales/discount-tax-split-codes'
-import { postedAwareRateIndex, postedDiscountTaxType, postedHeaderDiscountTaxType, postedShippingTaxType, postedTaxTypeByLineId, readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
+import { postedAwareRateIndex, postedDiscountTaxType, postedHeaderDiscountTaxType, postedShippingTaxType, postedTaxTypeByLineId, readPostedInvoiceRecord, readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { planSplitDiscountReversal } from '@/lib/domain/sales/discount-tax-split-plan'
 import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basis'
 import { resolveSchemePostingSnapshot } from '@/lib/domain/sales/refund-scheme-posting'
@@ -4357,7 +4357,8 @@ export async function createSalesOrderRefund(
 
     // THE CODES THE ORDER'S POSTED INVOICE WAS SENT WITH (null: no posted invoice, or no readable record of it, and then every derivation below reads the rates' current codes, as before). Owner ruling: after posting, a refund
     // reverses the invoice's goods lines and discount on the codes it posted with; a rate remapped since only affects invoices not yet posted.
-    const postedInvoiceCodes = await readPostedInvoiceTaxCodes(tx, so.id, so.accountingInvoiceId, { reverseChargeSalesTaxType: input.accountingSettings?.reverseChargeSalesTaxType })
+    const postedInvoiceRecord = await readPostedInvoiceRecord(tx, so.id, so.accountingInvoiceId, { reverseChargeSalesTaxType: input.accountingSettings?.reverseChargeSalesTaxType })
+    const postedInvoiceCodes = postedInvoiceRecord.codes
     const postedCodeByLineId = postedTaxTypeByLineId(so.lines, postedInvoiceCodes)
     // The shipping line and the single (header-rate) discount line were posted on the order default rate's code as it was THEN, which the record states when it names the rate it was read from; else the current default.
     const shippingTaxType = postedShippingTaxType(postedInvoiceCodes) ?? orderDefaultTaxType
@@ -5809,7 +5810,8 @@ export async function createSalesOrderRefund(
             ? postedDiscountTaxType(postedInvoiceCodes, { taxRateId: requested.discountTaxIdentity.taxRateId || null }) !== null
             : postedHeaderDiscountTaxType(postedInvoiceCodes) !== null
         } else usedPosted = createdLine.lineId != null && postedCodeByLineId.has(createdLine.lineId)
-        return usedPosted ? [] : [{ lineId: createdLine.lineId, lineKind: createdLine.lineKind, description: createdLine.description, accountingTaxType: createdLine.accountingTaxType }]
+        const reason = postedInvoiceRecord.reason === 'in-flight' ? 'newest invoice update in flight' : postedInvoiceRecord.reason === 'unusable' ? 'newest invoice record not usable' : postedInvoiceRecord.reason === 'no-record' ? 'no record of the posted invoice' : 'line not bound to a posted code'
+        return usedPosted ? [] : [{ lineId: createdLine.lineId, lineKind: createdLine.lineKind, description: createdLine.description, accountingTaxType: createdLine.accountingTaxType, reason }]
       })
       if (fellBack.length > 0) {
         await tx.activityLog.create({
