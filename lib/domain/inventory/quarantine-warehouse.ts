@@ -22,7 +22,7 @@
  */
 import type { Prisma } from '@/app/generated/prisma/client'
 import { RESERVATION_RELEASING_SHIPMENT_STATUS, residualAllocationRows } from '@/lib/domain/inventory/reservation-residual'
-import { wmsStockModeFromSyncMode, wmsUnsellableReturnRefusal, type WmsStockMode } from '@/lib/domain/inventory/wms-unsellable-advice'
+import { wmsUnsellableReturnRefusal, type WmsWriteOffRoute } from '@/lib/domain/inventory/wms-unsellable-advice'
 
 export const RETURN_CONDITION_CHECK_SETTING_KEY = 'return_condition_check_enabled'
 
@@ -190,27 +190,19 @@ export async function isQuarantineTargetWarehouse(client: WarehouseTypeReader, w
  * (ALIGN_TO_WMS) books the warehouse system's count into the bound warehouse. So with the switch on an UNSELLABLE returns-inbox restock
  * is always refused.
  */
-/** Which write-off route applies at a warehouse: its warehouse-system binding's stock mode (UNKNOWN when it has none). */
-export async function loadWmsStockMode(
-  client: Pick<Prisma.TransactionClient, 'externalWmsBinding'>,
-  warehouseId: string | null | undefined,
-): Promise<WmsStockMode> {
-  if (!warehouseId) return 'UNKNOWN'
-  const binding = await client.externalWmsBinding.findFirst({ where: { warehouseId }, select: { stockSyncMode: true } })
-  return wmsStockModeFromSyncMode(binding?.stockSyncMode)
-}
 
 /**
  * The rule for the warehouse-system (WMS) returns-inbox restock: the general rule, except that an unsellable unit held at the 3PL is never
- * quarantined; the refusal gives the write-off route for `stockMode`, the binding of the warehouse the return arrived at. Pure.
+ * quarantined; the refusal gives the write-off route of the warehouse the return arrived at. Pure.
  */
 export function wmsReturnRestockRefusal(params: {
   enabled: boolean
   condition: ReturnCondition | null
   warehouse: { code: string; type: string | null }
-  stockMode?: WmsStockMode
+  /** The write-off route of the warehouse the return arrived at (loadWmsWriteOffRoute). */
+  route?: WmsWriteOffRoute
 }): string | null {
-  if (params.enabled && params.condition === 'UNSELLABLE') return wmsUnsellableReturnRefusal(params.stockMode ?? 'UNKNOWN')
+  if (params.enabled && params.condition === 'UNSELLABLE') return wmsUnsellableReturnRefusal(params.route ?? { mode: 'UNKNOWN' })
   return returnConditionRestockRefusal(params)
 }
 
@@ -342,7 +334,7 @@ export async function quarantineSwitchOnRefusal(
   return `return_condition_check_enabled cannot be turned on while a quarantine warehouse still looks sellable: ${issues.map((i) => `${i.code} (${i.problems.join('; ')})`).join(' | ')}. Fix them (Inventory Settings, Warehouses; release or move the work) and try again. Nothing was written.`
 }
 
-export { wmsUnsellableRefundRefusal, wmsUnsellableReturnRefusal, wmsUnsellableWriteOffAdvice, type WmsStockMode } from '@/lib/domain/inventory/wms-unsellable-advice'
+export { wmsUnsellableRefundRefusal, wmsUnsellableReturnRefusal, wmsUnsellableWriteOffAdvice, type WmsStockMode, type WmsWriteOffRoute } from '@/lib/domain/inventory/wms-unsellable-advice'
 
 /**
  * The refund dialog's counterpart of the returns-inbox rule: units that shipped from a warehouse bound to a warehouse system (or an
@@ -353,9 +345,9 @@ export { wmsUnsellableRefundRefusal, wmsUnsellableReturnRefusal, wmsUnsellableWr
 export async function refundReturnsToWmsWarehouse(
   client: Pick<Prisma.TransactionClient, 'wmsOrderPushLink' | 'shipment'>,
   params: { orderId: string; lineIds: readonly string[] | null },
-): Promise<{ stockMode: WmsStockMode } | null> {
-  // The bound warehouses the refunded units shipped from decide the write-off route; when they disagree (or only a SYNCED push link says the
-  // warehouse system holds the order) the route is UNKNOWN and the refusal gives both.
+): Promise<{ warehouseIds: string[] } | null> {
+  // The bound warehouses the refunded units shipped from decide the write-off route (loadWmsWriteOffRoute); a SYNCED push link with no bound
+  // shipment refuses too, with no warehouse to read a route from (UNKNOWN: both routes are given).
   const bound = await client.shipment.findMany({
     where: {
       orderId: params.orderId,
@@ -363,12 +355,9 @@ export async function refundReturnsToWmsWarehouse(
       warehouse: { wmsBindings: { some: {} } },
       ...(params.lineIds ? { lines: { some: { lineId: { in: [...params.lineIds] } } } } : {}),
     },
-    select: { warehouse: { select: { wmsBindings: { select: { stockSyncMode: true } } } } },
+    select: { warehouseId: true },
   })
-  if (bound.length > 0) {
-    const modes = new Set(bound.flatMap((s) => s.warehouse.wmsBindings.map((b) => wmsStockModeFromSyncMode(b.stockSyncMode))))
-    return { stockMode: modes.size === 1 ? [...modes][0] : 'UNKNOWN' }
-  }
+  if (bound.length > 0) return { warehouseIds: [...new Set(bound.map((s) => s.warehouseId))] }
   const link = await client.wmsOrderPushLink.findFirst({ where: { orderId: params.orderId, state: 'SYNCED' }, select: { id: true } })
-  return link ? { stockMode: 'UNKNOWN' } : null
+  return link ? { warehouseIds: [] } : null
 }

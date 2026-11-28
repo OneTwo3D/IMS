@@ -1,62 +1,117 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
-  wmsStockModeFromSyncMode,
+  combineWmsWriteOffRoutes,
   wmsUnsellableRefundRefusal,
   wmsUnsellableReturnRefusal,
   wmsUnsellableWriteOffAdvice,
+  wmsWriteOffRoute,
+  type WmsBindingWriteOffFacts,
 } from '@/lib/domain/inventory/wms-unsellable-advice'
+import { bindingWriteOffFacts, thresholdsConfigured } from '@/lib/domain/inventory/wms-write-off-route'
 
 /**
- * The write-off route for an unsellable unit held at the 3PL depends on the binding's stock mode. Aligned: the 3PL writes it off and
- * align-down books it; an IMS adjustment as well would write it off twice. IMS master: a real write-off in the warehouse system AND an IMS
- * stock adjustment. Unknown: both, keyed on the mode.
+ * The write-off route for an unsellable unit held at the 3PL. ALIGNED only when align-down can really write it off; aligned but blocked is
+ * ALIGNED_MANUAL (adjust in IMS too) naming why; notification-only, disabled or inactive is IMS_MASTER; nothing known, or disagreeing
+ * bindings, is UNKNOWN.
  */
 
-test('the stock mode follows the binding\'s stock sync mode', () => {
-  assert.equal(wmsStockModeFromSyncMode('ALIGN_TO_WMS'), 'ALIGNED')
-  assert.equal(wmsStockModeFromSyncMode('NOTIFICATION_ONLY'), 'IMS_MASTER')
-  assert.equal(wmsStockModeFromSyncMode('DISABLED'), 'IMS_MASTER')
-  for (const value of [null, undefined, '', 'align_to_wms']) assert.equal(wmsStockModeFromSyncMode(value), 'UNKNOWN')
+const READY: WmsBindingWriteOffFacts = {
+  stockSyncMode: 'ALIGN_TO_WMS',
+  active: true,
+  connectionActive: true,
+  alignmentConfirmed: true,
+  alignDownReason: { active: true, accountCode: '5150' },
+  thresholdsConfigured: true,
+  inventoryAccountMissing: false,
+}
+
+test('aligned only when align-down can run; otherwise ALIGNED_MANUAL with the reason', () => {
+  assert.deepEqual(wmsWriteOffRoute(READY), { mode: 'ALIGNED' })
+  const cases: Array<[Partial<WmsBindingWriteOffFacts>, RegExp]> = [
+    [{ alignmentConfirmed: false }, /not confirmed/],
+    [{ alignDownReason: null }, /no align-down reason/],
+    [{ alignDownReason: { active: false, accountCode: '5150' } }, /reason is inactive/],
+    [{ alignDownReason: { active: true, accountCode: null } }, /reason has no account/],
+    [{ thresholdsConfigured: false }, /no discrepancy thresholds/],
+    [{ inventoryAccountMissing: true }, /no inventory account/],
+  ]
+  for (const [patch, why] of cases) {
+    const route = wmsWriteOffRoute({ ...READY, ...patch })
+    assert.equal(route.mode, 'ALIGNED_MANUAL', JSON.stringify(patch))
+    assert.match(route.why ?? '', why)
+  }
 })
 
-test('aligned: the 3PL writes it off and align-down books it; no IMS adjustment', () => {
-  const advice = wmsUnsellableWriteOffAdvice('ALIGNED')
-  assert.match(advice, /write the unit off there/)
+test('notification only, disabled or an inactive binding or connection: IMS_MASTER; nothing known: UNKNOWN', () => {
+  assert.equal(wmsWriteOffRoute({ ...READY, stockSyncMode: 'NOTIFICATION_ONLY' }).mode, 'IMS_MASTER')
+  assert.equal(wmsWriteOffRoute({ ...READY, stockSyncMode: 'DISABLED' }).mode, 'IMS_MASTER')
+  assert.equal(wmsWriteOffRoute({ ...READY, active: false }).mode, 'IMS_MASTER', 'an inactive binding aligns nothing')
+  assert.equal(wmsWriteOffRoute({ ...READY, connectionActive: false }).mode, 'IMS_MASTER', 'an inactive connection aligns nothing')
+  assert.equal(wmsWriteOffRoute(null).mode, 'UNKNOWN')
+  assert.equal(wmsWriteOffRoute({ ...READY, stockSyncMode: 'something_else' }).mode, 'UNKNOWN')
+})
+
+test('several bindings: their route when they agree, UNKNOWN when they disagree or none', () => {
+  assert.deepEqual(combineWmsWriteOffRoutes([{ mode: 'ALIGNED' }, { mode: 'ALIGNED' }]), { mode: 'ALIGNED' })
+  assert.deepEqual(combineWmsWriteOffRoutes([{ mode: 'ALIGNED' }, { mode: 'IMS_MASTER' }]), { mode: 'UNKNOWN' })
+  assert.deepEqual(combineWmsWriteOffRoutes([{ mode: 'ALIGNED_MANUAL', why: 'a' }, { mode: 'ALIGNED_MANUAL', why: 'b' }]), { mode: 'UNKNOWN' })
+  assert.deepEqual(combineWmsWriteOffRoutes([]), { mode: 'UNKNOWN' })
+})
+
+test('the server facts: a binding of a disabled connector counts as inactive; thresholds need a number', () => {
+  const row = { connector: 'wms-x', active: true, stockSyncMode: 'ALIGN_TO_WMS', alignmentConfirmedAt: new Date(), discrepancyThresholds: { absoluteDelta: 5 }, alignDownReason: { active: true, accountCode: '5150' }, connection: { active: true } }
+  assert.equal(wmsWriteOffRoute(bindingWriteOffFacts(row, ['wms-x'], false)).mode, 'ALIGNED')
+  assert.equal(wmsWriteOffRoute(bindingWriteOffFacts(row, [], false)).mode, 'IMS_MASTER')
+  assert.equal(wmsWriteOffRoute(bindingWriteOffFacts({ ...row, connection: { active: false } }, ['wms-x'], false)).mode, 'IMS_MASTER')
+  assert.equal(thresholdsConfigured({ absoluteDelta: 5 }), true)
+  assert.equal(thresholdsConfigured({ percentDelta: '2.5' }), true)
+  for (const value of [null, {}, { absoluteDelta: null, percentDelta: null }, [], 'x']) assert.equal(thresholdsConfigured(value as never), false)
+})
+
+test('ALIGNED: the 3PL writes it off, a later sync books it; no IMS adjustment (it would be booked back as a gain); holds are named', () => {
+  const advice = wmsUnsellableWriteOffAdvice({ mode: 'ALIGNED' })
+  assert.match(advice, /once it has seen the same difference twice/)
   assert.match(advice, /align-down reason/)
-  assert.match(advice, /Do not also make a stock adjustment in IMS: that would write the unit off twice/)
+  assert.match(advice, /Do not also make a stock adjustment in IMS: the next sync would book it back as a stock gain/)
+  assert.match(advice, /check the open discrepancies/)
+  assert.match(advice, /or confirm the warehouse system does not count it/)
   assert.doesNotMatch(advice, /write it off in IMS with a stock adjustment/)
   assert.doesNotMatch(advice, /hold it out of sellable stock/)
 })
 
-test('IMS master: a real write-off in the warehouse system and an IMS stock adjustment; never "hold it"', () => {
-  const advice = wmsUnsellableWriteOffAdvice('IMS_MASTER')
-  assert.match(advice, /a real write-off/)
-  assert.match(advice, /write it off in IMS with a stock adjustment/)
-  assert.doesNotMatch(advice, /align-down/)
-  assert.doesNotMatch(advice, /hold it out of sellable stock/)
+test('ALIGNED_MANUAL and IMS_MASTER: a real write-off at the 3PL and an IMS stock adjustment', () => {
+  const manual = wmsUnsellableWriteOffAdvice({ mode: 'ALIGNED_MANUAL', why: 'it has no align-down reason' })
+  assert.match(manual, /cannot write the unit off by itself \(it has no align-down reason\)/)
+  assert.match(manual, /write it off in IMS with a stock adjustment/)
+  assert.match(manual, /clears the discrepancy/)
+  const master = wmsUnsellableWriteOffAdvice({ mode: 'IMS_MASTER' })
+  assert.match(master, /a real write-off/)
+  assert.match(master, /write it off in IMS with a stock adjustment/)
+  assert.doesNotMatch(master, /align-down/)
+  for (const advice of [manual, master]) assert.doesNotMatch(advice, /hold it out of sellable stock/)
 })
 
-test('unknown: both routes, keyed on the binding', () => {
-  const advice = wmsUnsellableWriteOffAdvice('UNKNOWN')
-  assert.match(advice, /if its stock is aligned/)
-  assert.match(advice, /do not also adjust in IMS/)
-  assert.match(advice, /otherwise .* stock adjustment/)
+test('UNKNOWN gives both routes; every route says FIFO, "not necessarily", and promptly', () => {
+  const unknown = wmsUnsellableWriteOffAdvice({ mode: 'UNKNOWN' })
+  assert.match(unknown, /if its stock is aligned/)
+  assert.match(unknown, /do not also adjust in IMS/)
+  for (const mode of ['ALIGNED', 'ALIGNED_MANUAL', 'IMS_MASTER', 'UNKNOWN'] as const) {
+    const advice = wmsUnsellableWriteOffAdvice({ mode })
+    assert.match(advice, /FIFO/)
+    assert.match(advice, /not necessarily at the returned unit's own layer/)
+    assert.match(advice, /promptly/)
+  }
 })
 
-test('every route says the write-off is valued at FIFO, not at the returned unit\'s layer', () => {
-  for (const mode of ['ALIGNED', 'IMS_MASTER', 'UNKNOWN'] as const) assert.match(wmsUnsellableWriteOffAdvice(mode), /FIFO/)
-})
-
-test('both refusals carry the route of their mode, after restocking as Sellable', () => {
-  for (const mode of ['ALIGNED', 'IMS_MASTER', 'UNKNOWN'] as const) {
-    const inbox = wmsUnsellableReturnRefusal(mode)
-    const refund = wmsUnsellableRefundRefusal(mode)
-    assert.ok(inbox.includes(wmsUnsellableWriteOffAdvice(mode)))
-    assert.ok(refund.includes(wmsUnsellableWriteOffAdvice(mode)))
+test('both refusals carry the route\'s advice after restocking as Sellable', () => {
+  for (const route of [{ mode: 'ALIGNED' }, { mode: 'ALIGNED_MANUAL', why: 'x' }, { mode: 'IMS_MASTER' }, { mode: 'UNKNOWN' }] as const) {
+    const inbox = wmsUnsellableReturnRefusal(route)
+    const refund = wmsUnsellableRefundRefusal(route)
+    assert.ok(inbox.includes(wmsUnsellableWriteOffAdvice(route)))
+    assert.ok(refund.includes(wmsUnsellableWriteOffAdvice(route)))
     assert.match(inbox, /Restock it as Sellable into the bound warehouse/)
     assert.match(refund, /Record the refund as Sellable/)
     assert.match(inbox, /Nothing was recorded\.$/)
-    assert.match(refund, /Nothing was recorded\.$/)
   }
 })

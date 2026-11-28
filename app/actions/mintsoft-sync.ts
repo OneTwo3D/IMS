@@ -1,7 +1,9 @@
 'use server'
 
 import { netUnpricedReturnRowsAgainstRefunds, priceUnpricedReturnRows, queueReturnRestockValueJournal } from '@/lib/domain/sales/return-restock-cost'
-import { isQuarantineWarehouseType, QUARANTINE_WMS_BINDING_REFUSAL, readReturnConditionCheckEnabled, RETURN_CONDITIONS, loadWmsStockMode, wmsReturnRestockRefusal, type ReturnCondition } from '@/lib/domain/inventory/quarantine-warehouse'
+import { loadWmsWriteOffRoute } from '@/lib/domain/inventory/wms-write-off-route'
+import type { WmsWriteOffRoute } from '@/lib/domain/inventory/wms-unsellable-advice'
+import { isQuarantineWarehouseType, QUARANTINE_WMS_BINDING_REFUSAL, readReturnConditionCheckEnabled, RETURN_CONDITIONS, wmsReturnRestockRefusal, type ReturnCondition } from '@/lib/domain/inventory/quarantine-warehouse'
 import { parseShopIossNumber, SHOP_IOSS_NUMBER_SETTING } from '@/lib/domain/accounting/shop-ioss-number'
 import { randomUUID } from 'node:crypto'
 
@@ -462,6 +464,8 @@ export type MintsoftDashboardData = {
   adjustmentReasons: MintsoftAdjustmentReasonOption[]
   /** The switch return_condition_check_enabled: the restock dialog asks for the returned items' condition. */
   returnConditionCheckEnabled: boolean
+  /** The 3PL write-off route per bound warehouse code, as the server's refusal computes it (loadWmsWriteOffRoute); a code not listed is UNKNOWN. */
+  writeOffRouteByWarehouseCode: Record<string, WmsWriteOffRoute>
 }
 
 export type MintsoftAdjustmentReasonOption = {
@@ -1700,6 +1704,10 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
       hasAccountCode: Boolean(reason.accountCode),
     })),
     returnConditionCheckEnabled: await readReturnConditionCheckEnabled(db),
+    writeOffRouteByWarehouseCode: Object.fromEntries(await Promise.all(
+      [...new Map(bindings.map((binding) => [binding.warehouse.code, binding.warehouseId])).entries()]
+        .map(async ([code, warehouseId]) => [code, await loadWmsWriteOffRoute(db, [warehouseId])] as const),
+    )),
   }
 }
 
@@ -5774,8 +5782,8 @@ export async function restockMintsoftReturnInboxItem(
       }
       // The write-off route of an unsellable unit depends on the binding of the warehouse the return arrived at (the inbox row's own warehouse,
       // set from the binding when it was polled); only read when that refusal can fire.
-      const stockMode = conditionCheck && data.condition === 'UNSELLABLE' ? await loadWmsStockMode(tx, item.warehouseId) : undefined
-      const conditionRefusal = wmsReturnRestockRefusal({ enabled: conditionCheck, condition: data.condition ?? null, warehouse, ...(stockMode ? { stockMode } : {}) })
+      const route = conditionCheck && data.condition === 'UNSELLABLE' ? await loadWmsWriteOffRoute(tx, [item.warehouseId]) : undefined
+      const conditionRefusal = wmsReturnRestockRefusal({ enabled: conditionCheck, condition: data.condition ?? null, warehouse, ...(route ? { route } : {}) })
       if (conditionRefusal) throw new Error(conditionRefusal)
       if (!item.productId) {
         throw new Error('This Mintsoft return cannot be restocked because its SKU is not mapped to an IMS product.')

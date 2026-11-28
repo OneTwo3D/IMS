@@ -110,15 +110,15 @@ test('the switch is an ADMIN system switch (command line, --confirm-admin), keye
 
 test('Mintsoft returns inbox: on, an unsellable unit is always refused (quarantine is IMS-only); off, nothing is refused', () => {
   for (const warehouse of [QAR, MAIN]) {
-    assert.equal(wmsReturnRestockRefusal({ enabled: true, condition: 'UNSELLABLE', warehouse }), wmsUnsellableReturnRefusal('UNKNOWN'))
-    assert.equal(wmsReturnRestockRefusal({ enabled: true, condition: 'UNSELLABLE', warehouse, stockMode: 'ALIGNED' }), wmsUnsellableReturnRefusal('ALIGNED'))
+    assert.equal(wmsReturnRestockRefusal({ enabled: true, condition: 'UNSELLABLE', warehouse }), wmsUnsellableReturnRefusal({ mode: 'UNKNOWN' }))
+    assert.equal(wmsReturnRestockRefusal({ enabled: true, condition: 'UNSELLABLE', warehouse, route: { mode: 'ALIGNED' } }), wmsUnsellableReturnRefusal({ mode: 'ALIGNED' }))
     assert.equal(wmsReturnRestockRefusal({ enabled: false, condition: 'UNSELLABLE', warehouse }), null)
   }
   assert.equal(wmsReturnRestockRefusal({ enabled: true, condition: 'SELLABLE', warehouse: MAIN }), null)
   assert.match(wmsReturnRestockRefusal({ enabled: true, condition: 'SELLABLE', warehouse: QAR }) ?? '', /quarantine warehouse/)
   assert.equal(wmsReturnRestockRefusal({ enabled: true, condition: null, warehouse: MAIN }), RETURN_CONDITION_MISSING_REFUSAL)
-  assert.match(wmsUnsellableReturnRefusal('UNKNOWN'), /at the 3PL/)
-  assert.match(wmsUnsellableReturnRefusal('UNKNOWN'), /Restock it as Sellable into the bound warehouse/)
+  assert.match(wmsUnsellableReturnRefusal({ mode: 'UNKNOWN' }), /at the 3PL/)
+  assert.match(wmsUnsellableReturnRefusal({ mode: 'UNKNOWN' }), /Restock it as Sellable into the bound warehouse/)
 })
 
 test('type change into quarantine: refused while any sellable work remains, and each is named', () => {
