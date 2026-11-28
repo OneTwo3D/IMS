@@ -584,6 +584,7 @@ test('stock_adjustment_reason_cost_required: an ADMIN switch, off by default, ke
   state.reasonsInside = []
   const inside = await run('set', on, withReasons(fakeDb({ xero_sync_enabled: 'true', xero_inventory_account: '630' })))
   assert.equal(inside.code, 3, 'refused inside the write transaction')
+  assert.match(inside.err, /no active adjustment reason exists/, 'with the interlock\'s own message')
   assert.equal(inside.f.settings.get(def.key), undefined)
 
   state.reasonsInside = [{ name: 'Damaged', accountCode: '7000' }]
@@ -616,6 +617,7 @@ test('stock_adjustment_release_reserved and mintsoft_align_up_requires_receipt_e
     assert.equal(validateSwitchValue(def, 'TRUE').ok, false)
     const adminless = await run('set', ['--key', key, '--value', 'true', ...SET, '--yes'], fakeDb())
     assert.equal(adminless.code, 3, `${key}: --yes alone is refused`)
+    assert.match(adminless.err, /--confirm-admin/, `${key}: the refusal names the missing flag`)
     assert.equal(adminless.f.settings.get(key), undefined)
     const on = await run('set', ['--key', key, '--value', 'true', ...SET, '--yes', '--confirm-admin'], fakeDb())
     assert.equal(on.code, 0, `${key}: ${on.err}`)
