@@ -406,8 +406,24 @@ If a freight PO is added or updated after goods have already been received, the 
   stock is reported, not redistributed onto other lines and not posted by IMS: the purchase order detail shows a
   warning beside the line, the receipt result lists it, the recalculation's audit run records it (the
   `landed_cost_credit_floored` warning, with the unfloored unit cost and the amount per layer), and a **WARNING** entry
-  (`landed_cost_credit_floored`) is written to the activity log whenever the unit cost or the unabsorbed amount changes. IMS queues no journal for that amount, so it is for
-  you to establish what it corresponds to in the ledger. Because a purchase order's own layers can no longer go below zero from landed cost,
+  (`landed_cost_credit_floored`) is written to the activity log whenever the unit cost or the unabsorbed amount changes. With the switch below off (the default) IMS queues no journal for that amount, so it is for
+  you to establish what it corresponds to in the ledger: it is a credit left on **Stock in Transit** (the bills put the credit
+  line in transit, and the receipt takes out only the floored value).
+- **Posting the unabsorbed credit to cost of sales (switched off by default).** Under FRS 102 s13.6 a supplier credit or rebate
+  reduces the cost of purchase, and the part the stock cannot carry belongs in cost of sales. With the administrator switch
+  `landed_cost_floor_cogs_enabled` on (set with `npm run settings:set ... --yes --confirm-admin`; turning it on is refused while
+  Xero sync is on and the COGS or Stock in Transit account is unmapped), IMS posts that part as a journal **DR Stock in Transit /
+  CR COGS** whenever the floor applies: at a receipt (manual, the warehouse book-in, or the Mintsoft alignment) and at a
+  landed-cost recalculation. It is worked out from the order as it stands: what the floor leaves unabsorbed on the order's
+  receipt layers now, less what was already posted, so receiving again or saving the same costs posts nothing, a larger or
+  smaller credit posts only the difference, and **cancelling the freight order reverses it** (DR COGS / CR Stock in Transit). The
+  zero floor and the warning above are unchanged. The journal goes through the normal accounting queue and producer hold
+  (while the hold is on it is recorded as held and nothing is sent), and is recorded in the transit and COGS sub-ledgers so the
+  transit reconciliation ties. If it is owed and the COGS or Stock in Transit account is not mapped, a manual receipt or a
+  recalculation is refused with a message naming the account (nothing is changed); a warehouse book-in or alignment is never
+  refused for it, and the journal is posted by the next receipt or recalculation once the account is mapped. Only an order whose
+  receipts were journalled is covered (otherwise nothing was taken out of transit). A supplier return of floored units does not
+  reverse it, and an order closed short is valued on its ordered quantities. Because a purchase order's own layers can no longer go below zero from landed cost,
   a freight change no longer revalues an already-journaled shipment of those layers below zero. (Manufactured goods
   built from a floored layer are not covered by the floor; see the safeguard below.)
 - **Freight orders accept an individual credit line, but not a net credit.** A freight order whose cost lines total
