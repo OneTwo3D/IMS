@@ -622,7 +622,8 @@ export async function reconcilePurchaseBillFx(
     const { logActivityInTransaction } = await import('@/lib/activity-log')
     if (standing.kind === 'held') {
       staleReport.push({ invoiceId: row.invoiceId, reason: standing.reason, held: true })
-      // Reported once, when the journal is first held (the order stays in the re-run's list, so `purchase-fx:reconcile` catches it up after reconnecting).
+      // Reported once, when the journal is first held. Reconnecting catches nothing up by itself: the next order event or a reconcile run does
+      // (`purchase-fx:reconcile` lists the order as owed a held catch-up until then).
       if (!row.heldSince && !params.dryRun) {
         const marked = await tx.purchaseFxNonImsBillApproval.updateMany({ where: { id: row.id, heldSince: null }, data: { heldSince: params.at } })
         if (marked.count === 1) {
@@ -634,8 +635,10 @@ export async function reconcilePurchaseBillFx(
             tag: 'accounting',
             level: 'WARNING',
             description: withLedgerCheck(`The exchange-rate difference journal of bill ${bill.invoiceNumber ?? bill.id} of ${po.reference} (posted to Xero outside IMS) is held: no Xero organisation `
-              + 'is connected, so the one the bill was confirmed on cannot be compared. Once the same organisation is connected again, the next receipt, return or bill change of the order, '
-              + `or \`npm run purchase-fx:reconcile -- --po ${params.poId} --apply\`, catches it up. Connecting a different organisation makes the confirmation stale.`),
+              + 'is connected, so the one the bill was confirmed on cannot be compared. Reconnecting does not catch it up by itself: once the same organisation is '
+              + 'connected again, the next receipt or return of the order, or another bill\'s change, catches it up, or run '
+              + `\`npm run purchase-fx:reconcile -- --po ${params.poId} --apply\` (or \`-- --held --apply\` for every order held so). If any reconciliation of the `
+              + 'order runs while a different organisation is connected, the confirmation goes stale and the bill has to be confirmed again.'),
             metadata: { invoiceId: bill.id, reason: standing.reason },
           })
         }
@@ -1000,6 +1003,95 @@ export async function rerunPurchaseBillFx(poId: string, options: { at?: Date; dr
   }, { timeout: 60_000, maxWait: 10_000 })
   await reportPurchaseFxVarianceNotQueued(poId, po.reference, result)
   return result
+}
+
+/**
+ * #1169 LOW-3: the orders still owed a held catch-up. A confirmation of a bill posted outside IMS has `held_since` set while its journal is held for
+ * want of a Xero connection; the hold is cleared only by a reconciliation that runs (not a dry run) once the organisation can be compared again.
+ * Reconnecting Xero does not by itself catch anything up: the next receipt or return of the order, or another bill's change, does, or a reconcile run
+ * (`purchase-fx:reconcile --held --apply` for all of these). Read-only.
+ */
+export async function purchaseFxHeldOrders(client: Pick<Prisma.TransactionClient, 'purchaseFxNonImsBillApproval'>): Promise<string[]> {
+  const rows = await client.purchaseFxNonImsBillApproval.findMany({ where: { heldSince: { not: null } }, select: { poId: true }, distinct: ['poId'] })
+  return rows.map((row) => row.poId).sort()
+}
+
+export type PurchaseFxHeldCatchUp = {
+  poId: string
+  /** What a reconcile run would queue for the order now (empty while it is still held). */
+  owed: PurchaseBillFxReconcileResult['journals']
+  /** Bills whose journal is still held: no Xero organisation connected, so what they owe is known only once it is. */
+  stillHeld: string[]
+  /** Bills whose confirmation is already marked stale (`stale_at` set): they need a new confirmation, not a catch-up. */
+  alreadyStale: string[]
+  /**
+   * #1171 MED-1: bills not marked stale yet that the next run (not a dry run) WOULD mark stale because the connected Xero organisation is not the one
+   * they were confirmed on. Reconnect the right organisation before any `--apply`: a run now makes them stale for good.
+   */
+  wouldGoStaleTenant: string[]
+  /** Bills not marked stale yet that the next run would mark stale for another reason (an edit of the bill or of the order's cost, a re-link). */
+  wouldGoStaleOther: string[]
+}
+
+export type PurchaseFxHeldCatchUpListing = {
+  /** The Xero organisation connected when the listing was made (null: none). */
+  connectedTenantId: string | null
+  entries: PurchaseFxHeldCatchUp[]
+  /** #1171 LOW-1: orders whose dry run failed; the listing is incomplete for them. */
+  incomplete: Array<{ poId: string; error: string }>
+}
+
+/**
+ * #1169 LOW-3: per order with a held confirmation, a dry run (rolled back, writes nothing) of what it is still owed. An order whose hold has ended
+ * and that owes nothing is left out (the next reconcile run clears its `held_since`). One order's failure is reported in `incomplete` and the
+ * listing goes on (#1171 LOW-1).
+ */
+export async function listPurchaseFxHeldCatchUps(options: { at?: Date } = {}): Promise<PurchaseFxHeldCatchUpListing> {
+  const { db } = await import('@/lib/db')
+  const connectedTenantId = (await db.accountingToken.findUnique({ where: { connector: 'xero' }, select: { tenantId: true } }))?.tenantId ?? null
+  const listing: PurchaseFxHeldCatchUpListing = { connectedTenantId, entries: [], incomplete: [] }
+  for (const poId of await purchaseFxHeldOrders(db)) {
+    try {
+      const result = await rerunPurchaseBillFx(poId, { at: options.at, dryRun: true })
+      const approvals = new Map((await db.purchaseFxNonImsBillApproval.findMany({ where: { poId }, select: { invoiceId: true, staleAt: true, xeroTenantId: true } }))
+        .map((row) => [row.invoiceId, row]))
+      const entry: PurchaseFxHeldCatchUp = { poId, owed: result.journals, stillHeld: [], alreadyStale: [], wouldGoStaleTenant: [], wouldGoStaleOther: [] }
+      for (const item of result.stale ?? []) {
+        const row = approvals.get(item.invoiceId)
+        if (item.held) entry.stillHeld.push(item.invoiceId)
+        else if (!row || row.staleAt) entry.alreadyStale.push(item.invoiceId)
+        else if (connectedTenantId !== null && row.xeroTenantId !== null && row.xeroTenantId !== connectedTenantId) entry.wouldGoStaleTenant.push(item.invoiceId)
+        else entry.wouldGoStaleOther.push(item.invoiceId)
+      }
+      if (entry.owed.length > 0 || (result.stale ?? []).length > 0) listing.entries.push(entry)
+    } catch (error) {
+      listing.incomplete.push({ poId, error: error instanceof Error ? error.message : String(error) })
+    }
+  }
+  return listing
+}
+
+/**
+ * #1171 MED-1 / LOW-3: why `purchase-fx:reconcile --held --apply` must not run now, or null. Pure.
+ *  - No Xero organisation connected: nothing can catch up (every journal stays held).
+ *  - The listing is incomplete: an order could not be checked.
+ *  - An order would go stale through a tenant mismatch (the connected organisation is not the one its bills were confirmed on): a run makes those
+ *    confirmations stale for good. Allowed only with `acceptStale`.
+ */
+export function purchaseFxHeldApplyRefusal(listing: PurchaseFxHeldCatchUpListing, options: { acceptStale?: boolean } = {}): string | null {
+  if (listing.connectedTenantId === null) {
+    return 'No Xero organisation is connected, so no held journal can catch up (they all stay held). Connect the organisation the bills were confirmed on, then run again.'
+  }
+  if (listing.incomplete.length > 0) {
+    return `The held orders could not all be checked (${listing.incomplete.map((x) => `${x.poId}: ${x.error}`).join('; ')}). Nothing was run; fix that and run again.`
+  }
+  const mismatched = listing.entries.filter((entry) => entry.wouldGoStaleTenant.length > 0)
+  if (mismatched.length > 0 && !options.acceptStale) {
+    return `The connected Xero organisation (${listing.connectedTenantId}) is not the one the bills of ${mismatched.map((x) => x.poId).join(', ')} were confirmed on: `
+      + 'a run now would make those confirmations stale for good. Reconnect the right organisation and run again, or pass --accept-stale to run anyway '
+      + '(each such bill then has to be confirmed again with `npm run purchase-fx:non-ims-bills`).'
+  }
+  return null
 }
 
 export type PurchaseFxInFlightOrder = {

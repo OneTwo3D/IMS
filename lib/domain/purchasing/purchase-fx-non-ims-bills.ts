@@ -244,7 +244,7 @@ async function prepare(db: Db, options: { named: ReadonlySet<string>; readXero: 
         stockUnits: Object.fromEntries(invoice.lines.flatMap((line) => (line.poLineId && stockUnits.has(line.poLineId) ? [[line.poLineId, stockUnits.get(line.poLineId)!.toString()]] : []))),
         billFingerprint: nonImsBillFingerprint(invoice),
       }
-      if (standing?.kind === 'held') candidate.problem = 'held: no Xero connection; not re-confirmable until a Xero organisation is connected (the journal catches up once the same one is)'
+      if (standing?.kind === 'held') candidate.problem = 'held: no Xero connection; not re-confirmable until a Xero organisation is connected (once the same one is, the journal catches up on the next order event or `purchase-fx:reconcile --held --apply`)'
       else if (!invoice.accountingInvoiceId) candidate.problem = 'not linked to a Xero bill: there is no basis for a journal'
       else if (!transitAccount) candidate.problem = 'the Stock in Transit account is not mapped'
       else if (options.readXero && stopped) candidate.problem = `not read: ${stopped}`

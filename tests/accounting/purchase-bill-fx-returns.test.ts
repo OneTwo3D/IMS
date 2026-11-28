@@ -947,6 +947,112 @@ test('held journal (#1167): a real difference while no Xero organisation is conn
   assert.equal(await s.db.activityLog.count({ where: { action: 'purchase_fx_non_ims_bill_stale', entityId: po.id } }), 1, 'stale warned once')
 })
 
+// [mutation: keep held_since when the hold ends on a tenant mismatch; post the held journal on the wrong tenant]
+test('held, then a different organisation (#1169 LOW-1): the hold ends as stale, held_since cleared, stale_at set, no journal', async () => {
+  const { confirmNonImsBills } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
+  const { rerunPurchaseBillFx, purchaseFxHeldOrders } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  const po = await seedPo(10)
+  const qoblex = await nonImsBill(po, 10, 12.5, { rate: 1.2 })
+  await lockAt(po)
+  assert.equal((await receive(po, 10)).success, true)
+  assert.equal((await withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'one-off', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '-26.04']]), deps: xeroDeps })))).confirmed.length, 1)
+  const journals = () => s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id } })
+  assert.equal(await journals(), 1)
+  assert.equal((await returnGoods(po, 2)).success, true)
+  await withXeroPosting(() => rerunPurchaseBillFx(po.id))
+  assert.ok((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).heldSince, 'held first')
+  assert.deepEqual(await purchaseFxHeldOrders(s.db as never), [po.id])
+  await s.db.accountingToken.upsert({ where: { connector: 'xero' }, create: { connector: 'xero', accessToken: 'x', expiresAt: new Date(Date.now() + 3_600_000), tenantId: 'other-org' }, update: { tenantId: 'other-org' } })
+  try {
+    const wrong = await withXeroPosting(() => rerunPurchaseBillFx(po.id))
+    assert.equal(wrong.journals.length, 0)
+    assert.deepEqual((wrong.stale ?? []).map((x) => [x.invoiceId, x.held]), [[qoblex.id, false]])
+  } finally {
+    await s.db.accountingToken.deleteMany({ where: { connector: 'xero' } })
+  }
+  const row = await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })
+  assert.equal(row.heldSince, null, 'the hold ended')
+  assert.ok(row.staleAt, 'stale instead')
+  assert.match(row.staleReason ?? '', /other-org/)
+  assert.equal(await journals(), 1, 'no journal on the wrong organisation')
+  assert.deepEqual(await purchaseFxHeldOrders(s.db as never), [], 'no longer listed as owed a held catch-up')
+})
+
+// [mutation: list a held order as caught up on reconnect without a run; let the banner's dry run write; leave held_since set after --held --apply]
+test('held catch-up surfacing (#1169 LOW-3): listed while held and after reconnecting (dry runs write nothing), caught up only by a run', async () => {
+  const { confirmNonImsBills } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
+  const { rerunPurchaseBillFx, purchaseFxHeldOrders, listPurchaseFxHeldCatchUps, purchaseFxHeldApplyRefusal } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  const po = await seedPo(10)
+  const qoblex = await nonImsBill(po, 10, 12.5, { rate: 1.2 })
+  await lockAt(po)
+  assert.equal((await receive(po, 10)).success, true)
+  assert.equal((await withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'one-off', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '-26.04']]), deps: xeroDeps })))).confirmed.length, 1)
+  const journals = () => s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id } })
+  assert.deepEqual((await withXeroPosting(() => listPurchaseFxHeldCatchUps())).entries, [], 'nothing held yet')
+  assert.equal((await returnGoods(po, 2)).success, true)
+  await withXeroPosting(() => rerunPurchaseBillFx(po.id))
+  // Still disconnected: listed as still held.
+  const whileHeld = (await withXeroPosting(() => listPurchaseFxHeldCatchUps())).entries
+  assert.deepEqual(whileHeld.map((x) => [x.poId, x.owed.length, x.stillHeld, x.alreadyStale, x.wouldGoStaleTenant]), [[po.id, 0, [qoblex.id], [], []]])
+  // The same organisation reconnects: nothing catches up by itself; the banner shows what is owed and writes nothing.
+  const reconnectedListing = await withXeroPosting(() => withXeroToken(() => listPurchaseFxHeldCatchUps()))
+  assert.equal(purchaseFxHeldApplyRefusal(reconnectedListing), null, 'the right organisation: --held --apply may run')
+  const reconnected = reconnectedListing.entries
+  assert.equal(reconnected.length, 1)
+  assert.equal(reconnected[0]!.owed.length, 1)
+  assert.deepEqual(reconnected[0]!.stillHeld, [])
+  assert.equal(await journals(), 1, 'the dry run queued nothing')
+  assert.ok((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).heldSince, 'still marked held until a run')
+  // `--held --apply`: a run over exactly the held orders catches it up.
+  const held = await purchaseFxHeldOrders(s.db as never)
+  assert.deepEqual(held, [po.id])
+  for (const poId of held) await withXeroPosting(() => withXeroToken(() => rerunPurchaseBillFx(poId)))
+  assert.equal(await journals(), 2)
+  assert.equal((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).heldSince, null)
+  assert.deepEqual(await purchaseFxHeldOrders(s.db as never), [])
+  assert.deepEqual((await withXeroPosting(() => withXeroToken(() => listPurchaseFxHeldCatchUps()))).entries, [])
+})
+
+// [mutation: classify a would-go-stale tenant mismatch as already stale; let --held --apply run on the wrong organisation or with none; let the listing write]
+test('held catch-up on the wrong organisation (#1171 MED-1, LOW-3): "would go stale now", --held --apply refused unless --accept-stale; none connected refused', async () => {
+  const { confirmNonImsBills } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
+  const { rerunPurchaseBillFx, listPurchaseFxHeldCatchUps, purchaseFxHeldApplyRefusal } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  const po = await seedPo(10)
+  const qoblex = await nonImsBill(po, 10, 12.5, { rate: 1.2 })
+  await lockAt(po)
+  assert.equal((await receive(po, 10)).success, true)
+  assert.equal((await withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'one-off', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '-26.04']]), deps: xeroDeps })))).confirmed.length, 1)
+  assert.equal((await returnGoods(po, 2)).success, true)
+  await withXeroPosting(() => rerunPurchaseBillFx(po.id))
+  const approval = () => s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })
+  // None connected: refused, the bill still held.
+  const none = await withXeroPosting(() => listPurchaseFxHeldCatchUps())
+  assert.match(purchaseFxHeldApplyRefusal(none, { acceptStale: true }) ?? '', /^No Xero organisation is connected/)
+  await s.db.accountingToken.upsert({ where: { connector: 'xero' }, create: { connector: 'xero', accessToken: 'x', expiresAt: new Date(Date.now() + 3_600_000), tenantId: 'other-org' }, update: { tenantId: 'other-org' } })
+  try {
+    const wrong = await withXeroPosting(() => listPurchaseFxHeldCatchUps())
+    assert.equal(wrong.connectedTenantId, 'other-org')
+    assert.deepEqual(wrong.entries.map((x) => [x.poId, x.wouldGoStaleTenant, x.alreadyStale, x.stillHeld, x.owed.length]), [[po.id, [qoblex.id], [], [], 0]])
+    assert.match(purchaseFxHeldApplyRefusal(wrong) ?? '', /is not the one the bills of .* were confirmed on: a run now would make those confirmations stale for good/)
+    assert.equal(purchaseFxHeldApplyRefusal(wrong, { acceptStale: true }), null, '--accept-stale lets it run')
+    assert.equal((await approval()).staleAt, null, 'the listing marks nothing')
+    assert.ok((await approval()).heldSince)
+    // A run on the wrong organisation (what --accept-stale allows): now ALREADY stale, no longer held.
+    await withXeroPosting(() => rerunPurchaseBillFx(po.id))
+  } finally {
+    await s.db.accountingToken.deleteMany({ where: { connector: 'xero' } })
+  }
+  assert.ok((await approval()).staleAt)
+  assert.equal((await approval()).heldSince, null)
+  assert.deepEqual((await withXeroPosting(() => withXeroToken(() => listPurchaseFxHeldCatchUps()))).entries, [], 'no longer held: not listed as owed a held catch-up')
+})
+
+test('purchaseFxHeldApplyRefusal (#1171 LOW-1): an incomplete listing refuses, even with --accept-stale', async () => {
+  const { purchaseFxHeldApplyRefusal } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  assert.match(purchaseFxHeldApplyRefusal({ connectedTenantId: 't', entries: [], incomplete: [{ poId: 'po-x', error: 'lock timeout' }] }, { acceptStale: true }) ?? '', /po-x: lock timeout/)
+  assert.equal(purchaseFxHeldApplyRefusal({ connectedTenantId: 't', entries: [], incomplete: [] }), null)
+})
+
 // [mutation: let a tenant mismatch, a NULL tenant or a pre-freeze row hold; mark a missing connection stale; warn on every run; drop the superseded row]
 test('staleness (#1164 LOW-5..11): tenant mismatch, NULL tenant and pre-freeze rows are stale (listed before any reconcile), no connection only holds; one WARNING on the transition; the superseded row is kept', async () => {
   const { listNonImsBills, confirmNonImsBills } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
