@@ -212,7 +212,27 @@ When stock is received:
 
 The unit cost is validated as finite and non-negative before stock movements are written. A landed-cost recalculation that produces a NaN or infinite cost is rejected at the receipt boundary, before any stock or cost layer is created.
 
-**Foreign-currency orders while per-event FX rates are switched on** (`purchase_event_fx_rates_enabled`, off by default; see Xero Accounting Sync). With the switch off, a foreign order's goods are received at the order's own rate, as always. With it on, the goods are received at the rate of the order's supplier prepayment in Xero (Spend Money > Prepayment, Reference = the PO number), and, when Xero holds none, at the exchange-rate table rate on the day of the receipt. The order page then shows a **Xero prepayment exchange rate** panel: the locked rate, the Xero prepayment and its date, and **Read from Xero** to read it now (finance permission). It is read when a receipt needs it, by hand, by the warehouse book-in or by an alignment: an unused stored rate is re-read once before its first receipt, a receipt by hand and a bill always ask, the warehouse relies on a "no prepayment" answer only while it is at most 15 minutes old, and **Read from Xero** always asks. If Xero sync is on and Xero holds no prepayment with the PO number as its Reference, the receipt goes through at the table rate and you are warned (and it is logged). **A prepayment recorded after earlier receipts applies to later receipts only**: the earlier ones keep the table rate, and the panel lists every receipt with the rate it was valued at and how many used the table rate. A receipt is refused, and nothing is booked, when the prepayment is ambiguous (several with the same reference, another currency, another contact, the supplier not linked to its Xero contact), when Xero cannot be read, or when there is no prepayment and no table rate. Once a receipt has used the rate it stays fixed for the order. Later landed-cost changes add the new freight share to each stock layer without changing the rate its goods were received at. **Bills** of a foreign order are then valued at the prepayment rate (or the table rate on the bill date), keep each line's stock part at the order's cost, and put any price difference on a separate Purchase Price Variance line; an exchange difference against the receipts is posted to Realised FX by IMS (see Xero Accounting Sync). **Returns** take back the cost the returned stock was received at, and **supplier credit notes** reverse their bill at the bill's rate (a credit with no bill at the table rate on the day it is posted).
+**Foreign-currency orders while per-event FX rates are switched on** (`purchase_event_fx_rates_enabled`, off by default; see Xero Accounting Sync). **It cannot be switched on yet**: the switch reads off, and turning it on is refused, until a later release completes its last step (the owner's ruling on bills IMS did not post, and a probe against the Xero demo company). With the switch off, a foreign order's goods are received at the order's own rate, as always. Once it is on:
+
+- **Receipts.** The goods are received at the rate of the order's supplier prepayment in Xero (Spend Money > Prepayment, Reference = the PO number), and, when Xero holds none, at the exchange-rate table rate at the moment of the receipt. All three receipt routes work this way: Receive Goods, the warehouse book-in and the Mintsoft alignment.
+- **The panel.** The order page shows a **Xero prepayment exchange rate** panel: the locked rate, the Xero prepayment and its date, and **Read from Xero** to read it now (the bill permission: Admin, Manager or Finance).
+- **When Xero is asked.** It is read when a receipt needs it: an unused stored rate is read again once before its first receipt (unless it was read in the last five minutes), a receipt by hand and a bill always ask, the warehouse relies on a "no prepayment" answer only while it is at most 15 minutes old, and **Read from Xero** always asks.
+- **No prepayment.** If Xero sync is on and Xero holds no prepayment with the PO number as its Reference, the receipt goes through at the table rate, and you are warned (it is also logged).
+- **A prepayment that does not match the order.** If the prepayment's total differs by more than one minor unit of the currency from what the order says is owed to the supplier (its total with additional costs, less any reverse-charge VAT), a WARNING is written to the activity log. The rate is locked from it all the same; ignore the warning for a deposit or part payment.
+- **A prepayment recorded after earlier receipts applies to later receipts only.** The earlier receipts keep the table rate, and the panel lists every receipt with the rate it was valued at and how many used the table rate.
+- **Refusals.** A receipt is refused, and nothing is booked:
+  - when the prepayment is ambiguous (several with the same reference, another currency, another contact, or the supplier not linked to its Xero contact);
+  - when Xero cannot be read;
+  - when there is no prepayment and no table rate.
+- **The rate stays fixed.** Once a receipt has used the rate, it stays fixed for the order. Later landed-cost changes add the new freight share to each stock layer without changing the rate its goods were received at.
+- **Bills.** Bills of a foreign order are valued at the prepayment rate (or at the table rate on the bill date) and keep each line's stock part at the order's cost. Any price difference goes on a separate Purchase Price Variance line. IMS then posts the exchange difference against the receipts as a journal between Realised FX and Stock in Transit (see Xero Accounting Sync).
+  - It does this only for bills IMS itself posted to Xero (a journal the hold records instead of sending is never posted later).
+  - A bill posted outside IMS (for example by Qoblex) gets no such journal unless an administrator confirms it, against its Xero bill, with `npm run purchase-fx:non-ims-bills`.
+  - While another system is still the bill writer (the producer-side hold shadows supplier bills), new bills stay at the order's rate.
+- **Returns and credit notes.**
+  - **Returns** take back the cost the returned stock was received at.
+  - **Supplier credit notes** reverse their bill at the bill's own rate, and a return credit against a bill with a price-variance line is split the same way.
+  - A credit with no bill is valued at the table rate on the day it is posted, but only on an order the switch has already valued something on. On other orders the old rule applies.
 
 
 ### Sales orders pegged to this purchase order
@@ -288,8 +308,10 @@ For **prepaid / deposit suppliers**, tick **Prepaid / deposit supplier** on the 
 full **ordered** quantity before anything is received — the deposit / pro-forma flow. The ordered
 quantity remains a hard cap either way.
 
-Note: if a prepaid PO is later received short (paid 100, received 90), the over-paid delta is not
-yet flagged automatically — reconcile manually until the prepaid reconciliation alert ships.
+If a prepaid PO is billed for more than has been received (paid 100, received 90), the PO page shows a
+**Prepaid reconciliation** banner with the units and value billed but not delivered, per line: chase the
+delivery or claim a supplier credit for the shortfall. It is a warning, not a block. When more has been
+received than billed, the banner says a balancing (final) bill may still be due.
 
 ### Which orders can be billed
 
@@ -314,8 +336,8 @@ A bill with no invoice number is never checked. Editing an existing bill's numbe
 
 Every receipt, bill, bill edit, supplier return and return-generated supplier credit note also writes a row in IMS's **GR/IR sub-ledger**, in the same step as the event itself, so a receipt is never recorded without its accrual and a failed receipt leaves none:
 
-- **Receiving goods** raises GR/IR by the received quantity at the purchase order's unit cost (the goods part of the value the stock layer carries; freight is not included).
-- **Billing** lowers it by the billed quantity at the **same purchase-order unit cost**. If the supplier charges a different price, the difference is recorded as its own **price difference** and never touches the GR/IR balance; it stays on Stock in Transit as it always has, and is shown per order in **Analytics > GR/IR**.
+- **Receiving goods** raises GR/IR by the received quantity at the purchase order's unit cost (with per-event FX rates on, at the rate the goods were received at) (the goods part of the value the stock layer carries; freight is not included).
+- **Billing** lowers it by the billed quantity at the **same purchase-order unit cost** (with per-event FX rates on, at the value the matched receipts accrued, and any quantity billed before it was received at the bill's own value; the difference from the bill's own rate is the **FX difference** below). If the supplier charges a different price, the difference is recorded as its own **price difference** and never touches the GR/IR balance; with per-event FX rates off it stays on Stock in Transit as it always has, and with them on it goes on the bill's Purchase Price Variance line. It is shown per order in **Analytics > GR/IR**.
 - **Editing a bill** moves it by the change in the billed quantity.
 - **A supplier return** lowers it by the returned quantity at the order's unit cost. If those goods were already billed, the order shows as billed-not-received until the return-generated supplier credit note is posted. The credit note clears it at the same order unit cost as the return (per line, for the quantity billed and returned), so a returned-and-credited line nets to zero whatever price the bill carried; the difference between the credit and that value is a price-difference reversal, not GR/IR.
 
@@ -324,8 +346,11 @@ Receiving and billing the same quantity nets to zero whichever comes first. The 
 ### Editing an unpaid bill
 
 Unpaid bills can be edited from the PO detail page. Headers (number, dates, notes, supplier
-invoice URL) and per-line quantities or amounts can be updated. The edit recomputes totals on the
-original PO FX rate and is wrapped in a single transaction that:
+invoice URL) and per-line quantities or amounts can be updated. The edit recomputes totals at the
+bill's own stored rate: the order's rate the bill was created at, or, for a bill valued under per-event FX
+rates, its exact rate and its price-variance split (see [Receiving a Purchase Order](#receiving-a-purchase-order)).
+Such a bill is not edited while supplier bills on its date are shadowed by the producer-side hold. The edit
+is wrapped in a single transaction that:
 
 - Locks the bill, its lines, the parent PO, PO lines, and freight cost lines via row-level locks.
 - Re-validates editability **inside** the transaction (a concurrent "mark paid" between page load
@@ -456,7 +481,10 @@ If a freight PO is added or updated after goods have already been received, the 
 - **A supplier credit note converts to your base currency by dividing by the exchange rate.** The rate is stored as
   foreign units per one base unit, so a credit note of EUR 100.00 at 1.17 is recorded as 85.47 in base currency, the
   same conversion a purchase order uses. The bill's rate is used when the credit note is against a bill, otherwise the
-  order's rate.
+  order's rate. With per-event FX rates on, the exceptions are:
+  - a bill valued under them gives its exact rate;
+  - a credit with no bill, on an order the switch has valued something on, takes the table rate on the day it is posted (see
+    [Receiving a Purchase Order](#receiving-a-purchase-order)).
   Credit notes drafted automatically from a goods return convert the same way. Credit notes recorded before this
   was corrected keep their stored base amount (nothing is rewritten), but the freight-order cancellation check no
   longer trusts it: it recomputes each credit note's base amount from its foreign amount and rate.
