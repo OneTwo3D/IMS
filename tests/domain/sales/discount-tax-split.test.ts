@@ -255,7 +255,7 @@ test('the invoice\'s discount parts, the refund\'s per-rate reversal and the sav
   assert.match(sales, /if \(!syncEnabled\) return null/, 'no refusal while accounting sync is off (no invoice is queued)')
   const refund = readFileSync('lib/domain/sales/refund-service.ts', 'utf8')
   assert.match(refund, /split: await refreshedDiscountSplit\(tx, discountSplit\)/, 'the refund reads the codes from the rates now')
-  assert.match(refund, /accountingTaxType: discountSplitEntryTaxType\(part\.entry, \{ orderDefaultTaxType,/)
+  assert.match(refund, /accountingTaxType: postedDiscountTaxType\(postedInvoiceCodes, part\.entry\)\s*\?\? discountSplitEntryTaxType\(part\.entry, \{ orderDefaultTaxType,/, 'a posted invoice\'s discount part is reversed on the code it posted with; otherwise the one derivation')
   assert.equal((refund.match(/where: \{ name: so\.taxRateName, active: true \}/g) ?? []).length, 1, 'the order default rate is looked up once in the refund')
   assert.doesNotMatch(refund, /baseTaxType: part\.entry\.accountingTaxType \?\? null/, 'the refund no longer drops the order default fallback')
 })
