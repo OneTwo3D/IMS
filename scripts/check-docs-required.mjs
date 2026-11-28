@@ -198,8 +198,11 @@ export function isRevertOnly(commitSubjects) {
   return Array.isArray(commitSubjects) && commitSubjects.length > 0 && commitSubjects.every((s) => REVERT_SUBJECT_RE.test(s))
 }
 
-/** The decision. Pure: the changed paths, the added lines and (optionally) the commit subjects in, a verdict and its explanation out. */
-export function evaluateDocsRequired({ changedFiles, addedLines, commitSubjects }) {
+/**
+ * The decision. Pure: the changed paths, the added lines and (optionally) the commit subjects in, a verdict and its explanation out.
+ * @param {{ changedFiles: string[], addedLines: Array<{ file: string, line: string, newFile?: boolean }>, commitSubjects?: string[] }} input
+ */
+export function evaluateDocsRequired({ changedFiles, addedLines, commitSubjects = [] }) {
   const behaviour = changedFiles.filter(isBehaviourPath)
   const docs = changedFiles.filter(isDocPath)
   const { accepted, errors } = findOptOuts(addedLines)
