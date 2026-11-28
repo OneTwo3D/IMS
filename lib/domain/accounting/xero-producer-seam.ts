@@ -54,7 +54,7 @@ const DATE_RE = /^\d{4}-\d{2}-\d{2}(?:[T ].*)?$/
  * the earlier reading, so a posting dated on the live-from day itself is the safe side of the line. Undefined when that field is absent or
  * unreadable, whatever other dates the payload carries: the decision then treats an operation that requires the time as SHADOW.
  */
-export function xeroObligationAt(payload: unknown, field: ObligationDateField): Date | undefined {
+export function xeroObligationAt(payload: unknown, field: ObligationDateField | 'creditNoteDate'): Date | undefined {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return undefined
   const value = (payload as Record<string, unknown>)[field]
   if (typeof value !== 'string' || !DATE_RE.test(value)) return undefined
@@ -89,7 +89,15 @@ export function xeroObligationAt(payload: unknown, field: ObligationDateField): 
  *                by tests/accounting/xero-obligation-sources.test.ts, so the two tables cannot drift.
  */
 export type XeroObligationSource =
-  | { kind: 'payload'; field: (typeof OBLIGATION_DATE_FIELDS)[number] }
+  | {
+      kind: 'payload'
+      field: (typeof OBLIGATION_DATE_FIELDS)[number]
+      /**
+       * A field that, WHEN THE PAYLOAD CARRIES IT, is the obligation date instead of `field` (read strictly: present but unreadable is undefined, never a fall
+       * through). For a row whose posting date can be moved after it was raised while the business event stays where it was.
+       */
+      documentField?: 'creditNoteDate'
+    }
   | { kind: 'parent'; via: ReadonlyArray<readonly AccountingSyncType[]> }
   | { kind: 'not-applicable' }
   | { kind: 'excluded' }
@@ -118,7 +126,9 @@ export const XERO_OBLIGATION_SOURCES: Readonly<Record<AccountingSyncType, XeroOb
   PURCHASE_CREDIT_NOTE: { kind: 'payload', field: 'date' },
   PURCHASE_CREDIT_NOTE_ALLOCATION: { kind: 'payload', field: 'date' },
   // o3d-hqvrp.39: dated from the credit note's own date, carried on the payload by the producer (the settlement follows the document it settles).
-  CREDIT_NOTE_ALLOCATION: { kind: 'payload', field: 'date' },
+  // #1130 review LOW-2: a refund payment re-dated to its cash-out day (o3d-l9gej) keeps the credit note's date in `creditNoteDate`, and that is the
+  // obligation (creditNoteDate ?? date): the re-date moves the bank date, not the business event, so it cannot carry a settlement across the cut-off.
+  CREDIT_NOTE_ALLOCATION: { kind: 'payload', field: 'date', documentField: 'creditNoteDate' },
   STOCK_IN_TRANSIT: { kind: 'payload', field: 'date' },
   STOCK_RECEIPT: { kind: 'payload', field: 'date' },
   COGS_REVERSAL: { kind: 'payload', field: 'date' },
@@ -154,7 +164,12 @@ export type ObligationParentReader = {
 /** The declared payload field of a type, or undefined when the type is not payload-sourced. */
 function declaredObligationAt(type: string, payload: unknown): Date | undefined {
   const source = (XERO_OBLIGATION_SOURCES as Readonly<Record<string, XeroObligationSource>>)[type]
-  return source?.kind === 'payload' ? xeroObligationAt(payload, source.field) : undefined
+  if (source?.kind !== 'payload') return undefined
+  if (source.documentField && typeof payload === 'object' && payload !== null && !Array.isArray(payload)
+    && (payload as Record<string, unknown>)[source.documentField] !== undefined) {
+    return xeroObligationAt(payload, source.documentField)
+  }
+  return xeroObligationAt(payload, source.field)
 }
 
 /**

@@ -48,6 +48,20 @@ test('[l9gej] the credit note\'s date stands: a gateway refund, an allocation, n
   assert.equal(refundCashOutDate({ refundPaymentPaidAt: new Date('2026-11-02T00:00:00Z') }, recorded, '2026-11-02')?.date, '2026-11-02')
 })
 
+test('[#1130 MED-3] a payment dated AFTER today is not a cash-out: the credit note\'s date stands (today itself is not "after")', () => {
+  const now = new Date('2026-11-28T12:00:00Z')
+  assert.equal(refundCashOutDate({ refundPaymentPaidAt: new Date('2026-11-29T00:00:00Z') }, recorded, '2026-11-02', now), null, 'tomorrow')
+  assert.equal(refundCashOutDate({ refundPaymentPaidAt: new Date('2027-01-05T00:00:00Z') }, recorded, '2026-11-02', now), null, 'next year')
+  assert.equal(refundCashOutDate({ refundPaymentPaidAt: new Date('2026-11-28T00:00:00Z') }, recorded, '2026-11-02', now)?.date, '2026-11-28', 'today')
+  // The business day is London's: 23:30 UTC on 28 November is still the 28th at 23:45 UTC, so it is today, not after.
+  assert.equal(refundCashOutDate({ refundPaymentPaidAt: new Date('2026-11-28T23:30:00Z') }, recorded, '2026-11-02', new Date('2026-11-28T23:45:00Z'))?.date, '2026-11-28')
+})
+
+test('[#1130 LOW-6] the switch requires xero_credit_note_allocation_enabled: it only re-dates settlements that switch posts', () => {
+  const def = findSwitch(REFUND_CASH_OUT_DATE_SETTING_KEY)
+  assert.deepEqual(def?.requires?.map((r) => [r.key, r.value]), [['xero_credit_note_allocation_enabled', 'true']])
+})
+
 test('[l9gej] the switch is a registered boolean system switch, OFF by default, held equal to the literal in the registry; ON only for exactly "true"', async () => {
   assert.equal(REFUND_CASH_OUT_DATE_SETTING_KEY, 'xero_refund_payment_cash_out_date_enabled')
   const def = findSwitch(REFUND_CASH_OUT_DATE_SETTING_KEY)

@@ -6669,9 +6669,14 @@ async function processCreditNoteAllocation(args: {
   const replay = pinnedOperation === operation && typeof payload.amount === 'number' && reading.attempted
   if (!reading.attempted) {
     // Everything a previous never-sent decision pinned is dropped with it, including the stored Idempotency-Key (it is derived from the amount).
+    // #1130 review LOW-1: and so is a cash-out re-date (o3d-l9gej). The credit note's own date (`creditNoteDate`, written once with the re-date) is restored
+    // HERE, before the operation is decided, so a stale cash-out date can carry neither into an ALLOCATE nor into a refund payment decided afresh (with the
+    // switch on, the re-date below is taken again from it). A row that may have left (`reading.attempted`) is never re-dated or restored: it replays as it is.
+    const creditNoteDate = typeof payload.creditNoteDate === 'string' ? payload.creditNoteDate : null
     payload = {
       ...payload, amount: undefined, bankAccountId: undefined, paymentMethod: undefined, cashEvidence: undefined, rateDecided: undefined,
       settlementRateToBase: undefined, [MONEY_POST_KEY_FIELD]: undefined,
+      ...(creditNoteDate !== null ? { date: creditNoteDate } : {}),
     } as SyncPayload
   }
   // o3d-0lpnb / #1127 R1 H1: A WAIT hands the row back unsent without spending a retry (handBackSettlementWait), on a BOUNDED backoff. Each wait of one reason in a
@@ -6861,19 +6866,18 @@ async function processCreditNoteAllocation(args: {
     pin.rateDecided = true
     // o3d-l9gej (switch xero_refund_payment_cash_out_date_enabled, default off): a RECORDED refund payment is dated, and rated, on the day its cash went out
     // (the refund Payment's paidAt), not the credit note's day. The credit note's date is kept on the row (`creditNoteDate`, written once) so that with the switch
-    // turned off again an UNSENT row goes back to it; a row that may have left is replayed above and never re-dated. Off, nothing here changes the payload.
+    // turned off again an UNSENT row goes back to it (restored where the never-sent decision is dropped, above). Off, nothing here changes the payload.
+    // #1130 review MED-1: ONLY A ROW THAT NEVER ATTEMPTED A CALL is re-dated. An ATTEMPTED row reaches here when its pin predates `rateDecided` (so it is not
+    // replayed above): its call may have landed under its stored date, and re-dating it would move the date the ledger fence looks for, miss the landed
+    // payment and pay the customer twice. It keeps its stored date.
     const creditNoteDate = typeof payload.creditNoteDate === 'string' ? payload.creditNoteDate : settlementDate
-    const cashOut = (await isRefundCashOutDateEnabled(db)) ? refundCashOutDate(facts, refundPlan, creditNoteDate) : null
+    const cashOut = !reading.attempted && (await isRefundCashOutDateEnabled(db)) ? refundCashOutDate(facts, refundPlan, creditNoteDate) : null
     let rateAsOf = settlementAsOfFromInput(settlementDate, new Date())
     if (cashOut) {
       pin.creditNoteDate = creditNoteDate
       pin.date = cashOut.date
       settlementDate = cashOut.date
       rateAsOf = settlementAsOfFromStored(cashOut.paidAt, cashOut.explicitInstant)
-    } else if (typeof payload.creditNoteDate === 'string' && payload.creditNoteDate !== settlementDate) {
-      pin.date = payload.creditNoteDate
-      settlementDate = payload.creditNoteDate
-      rateAsOf = settlementAsOfFromInput(settlementDate, new Date())
     }
     // IMS's settlement rate for the cash-out, resolved ONCE here and carried on the row: the realised FX is booked by Xero at this rate (as for a receipt).
     const baseCurrency = await getBaseCurrencyCode()
