@@ -379,6 +379,7 @@ async function applyPrepaymentAnswerUnderLock(
     if (po.fxNoPrepaymentCheckedAt) await tx.$executeRaw`UPDATE purchase_orders SET fx_no_prepayment_checked_at = NULL WHERE id = ${po.id}`
     if (!existing) {
       await tx.purchaseOrderFxLock.create({ data: { poId: po.id, source: PURCHASE_FX_SOURCE_XERO_PREPAYMENT, ...found, readAt: ctx.now, readById: ctx.userId } })
+      await warnOnPrepaymentTotalMismatch(tx, po, found, ctx.userId)
       return { kind: 'locked', changed: true, replaced: false, lock: found } as const
     }
     const same = existing.xeroPrepaymentId === found.xeroPrepaymentId && new Prisma.Decimal(existing.rateToBase).eq(found.rateToBase)
@@ -395,7 +396,50 @@ async function applyPrepaymentAnswerUnderLock(
       } as const
     }
     await tx.purchaseOrderFxLock.update({ where: { id: existing.id }, data: { ...found, readAt: ctx.now, readById: ctx.userId } })
+    // Warned when the stored prepayment (or its total) is new, not on every re-read of the same one.
+    if (existing.xeroPrepaymentId !== found.xeroPrepaymentId || !new Prisma.Decimal(existing.prepaymentTotal).eq(found.prepaymentTotal)) {
+      await warnOnPrepaymentTotalMismatch(tx, po, found, ctx.userId)
+    }
     return { kind: 'locked', changed: !same, replaced: !same, lock: found } as const
+  })
+}
+
+/**
+ * #1142 LOW-2: the prepayment total and the order's total (foreign, net of discount, with VAT) may differ by at most this much before IMS warns.
+ * It only absorbs rounding; a deposit or a part payment is warned about too (the rate is still locked from it: nothing else changes).
+ */
+export const PREPAYMENT_TOTAL_TOLERANCE = new Prisma.Decimal('0.01')
+
+/**
+ * #1142 LOW-2: when a prepayment is stored as the order's lock, a WARNING (console and activity log, in the lock's transaction) if its total is not the
+ * order's totalForeign. Advisory only: the lock, the rate and every receipt are exactly as without it.
+ */
+async function warnOnPrepaymentTotalMismatch(
+  tx: Prisma.TransactionClient,
+  po: PoForPrepayment,
+  found: PrepaymentLockData,
+  userId: string | null,
+): Promise<void> {
+  const order = await tx.purchaseOrder.findUnique({ where: { id: po.id }, select: { totalForeign: true } })
+  if (!order) return
+  const poTotal = new Prisma.Decimal(order.totalForeign)
+  const difference = found.prepaymentTotal.minus(poTotal)
+  if (difference.abs().lte(PREPAYMENT_TOTAL_TOLERANCE)) return
+  const description = `The Xero prepayment ${found.xeroPrepaymentId} locked for ${po.reference} totals ${found.prepaymentTotal.toFixed(2)} ${found.currency}, but the order `
+    + `totals ${poTotal.toFixed(2)} ${po.currency} (difference ${difference.toFixed(2)}). The goods rate is locked from it all the same. If it is not a `
+    + 'deposit or part payment, check its amount and reference in Xero.'
+  console.warn(`[purchase-fx] ${description}`)
+  const { logActivityInTransaction } = await import('@/lib/activity-log')
+  // Like the lock's own activity entry, not tied to a user row (the reader is in the metadata, as on the lock's read_by_id).
+  await logActivityInTransaction(tx, {
+    userId: null,
+    entityType: 'PURCHASE_ORDER',
+    entityId: po.id,
+    action: 'xero_prepayment_total_mismatch',
+    tag: 'purchase',
+    level: 'WARNING',
+    description,
+    metadata: { readById: userId, xeroPrepaymentId: found.xeroPrepaymentId, prepaymentTotal: found.prepaymentTotal.toString(), poTotalForeign: poTotal.toString(), difference: difference.toString() },
   })
 }
 

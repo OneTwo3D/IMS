@@ -788,6 +788,36 @@ test('LOW-11: the lock is marked used only when goods are laid at its rate, not 
   assert.equal((await lockOf(po))?.firstUsedAt?.toISOString(), '2026-11-26T10:00:00.000Z')
 })
 
+// [mutation: drop the total check; warn within the rounding tolerance; warn on every re-read of the same prepayment; let the warning change the lock]
+test('LOW-2: a prepayment whose total is not the order\'s totalForeign is locked all the same, with ONE WARNING activity; a rounding difference and a re-read of the same prepayment warn nothing', SKIP, async () => {
+  const { db } = await import('@/lib/db')
+  const po = await seedForeignPo('low2', [4])
+  const total = (await db.purchaseOrder.findUniqueOrThrow({ where: { id: po.poId }, select: { totalForeign: true } })).totalForeign
+  const exact = prepaymentFor(po, { total: new Prisma.Decimal(total).plus('0.005') })
+  answerWith([[po, [exact]]])
+  await withSwitch(true, async () => {
+    assert.equal((await onDemand(po.poId)).success, true)
+    assert.equal((await activitiesOf(po, 'xero_prepayment_total_mismatch')).length, 0, 'within the rounding tolerance')
+    // Replaced in Xero by a deposit of half the order: locked from it (same rate rule), and warned once.
+    const deposit = prepaymentFor(po, { total: new Prisma.Decimal(total).div(2).toDecimalPlaces(2) })
+    answerWith([[po, [deposit]]])
+    assert.equal((await onDemand(po.poId)).success, true)
+    const lock = await lockOf(po)
+    assert.equal(lock?.xeroPrepaymentId, deposit.prepaymentId)
+    assert.equal(lock?.rateToBase.toString(), '1.6', 'the warning changes nothing')
+    const warned = await activitiesOf(po, 'xero_prepayment_total_mismatch')
+    assert.equal(warned.length, 1)
+    assert.equal(warned[0]!.level, 'WARNING')
+    assert.match(warned[0]!.description, new RegExp(`${deposit.prepaymentId}.*but the order totals`))
+    // A re-read of the same prepayment (and the receipt it values) warns nothing more.
+    assert.equal((await onDemand(po.poId)).success, true)
+    const received = await receive(po, po.lines[0]!, 4)
+    assert.equal(received.success, true, received.error)
+    assert.deepEqual(await receiptsOf(po), [{ rate: '1.6', source: 'XERO_PREPAYMENT' }])
+    assert.equal((await activitiesOf(po, 'xero_prepayment_total_mismatch')).length, 1)
+  })
+})
+
 test('OFF: everything above is inert while the switch is off (no Xero read, no stamp, no lock, no warning)', SKIP, async () => {
   const po = await seedForeignPo('off', [4])
   answerWith([[po, [prepaymentFor(po)]]])
