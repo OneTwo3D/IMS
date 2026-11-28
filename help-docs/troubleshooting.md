@@ -81,9 +81,10 @@ When something goes wrong, three places hold the information you need:
 - Allocate stock first (from the order detail page).
 - If you allocated but still see this error, refresh the page. The PICKING guard re-reads allocations under a transaction lock; a stale page state can show wrong data momentarily.
 
-### Refund failed with "no shipped stock source exists"
-- The refund line refers to a product that was allocated but never shipped. The system refuses to restock from an allocation-only source.
-- Either: refund as cash-only (set return warehouse to none), or wait until shipment lands, or correct the refund to reference a shipped line.
+### Refund failed with "Cannot return refunded stock before the order has shipped"
+- The refund names a return warehouse, but the order has no shipment yet: nothing has left the warehouse, so there is no stock movement to reverse. IMS never restocks from an allocation.
+- Either: refund as cash-only (set the return warehouse to none), which releases the reserved stock; or wait until the order has shipped and refund the shipped units with a return warehouse.
+- On a partly shipped order a refund with a return warehouse is accepted: units that never shipped only release their reservation (see *Refunds on a partly shipped order* in Sales Orders).
 
 ### Invoice number out of sequence
 - The system uses a per-prefix counter. Manual invoice creation may have skipped a number if a previous attempt errored mid-create. The activity log shows the gap.

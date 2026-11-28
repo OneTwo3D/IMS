@@ -1,0 +1,2 @@
+### Docs: inventory, FIFO and warehouse documentation synced with the code (docsync A4)
+- `help-docs/stock-control.md`, `inventory.md`, `warehouse.md`, `docs/architecture.md`, `docs/installation.md` and `docs/agent/overview.md` now describe FIFO layer sources and consumption, adjustment cost defaults, the Mintsoft align-up and align-down rules and cron, in-transit value in the snapshot, stock value by role and kit components that are not stock-tracked. Docs only; nothing changes at run time.
