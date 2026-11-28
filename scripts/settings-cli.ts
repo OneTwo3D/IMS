@@ -37,8 +37,6 @@ export type SettingsCliOptions = {
   disconnect?: () => Promise<void>
   /** Test seam for the storefront e-mail turn-on interlock (environment, clock, the store's native e-mail read). Absent = the live ones. */
   interlock?: import('@/lib/domain/storefront-customer-email/switch-on-interlock').InterlockDeps
-  /** Test seam for the purchase FX bill-writer interlock: this shell's environment. Absent = process.env. */
-  purchaseFxProcessEnv?: Record<string, string | undefined>
 }
 
 export async function runSettingsCli(options: SettingsCliOptions): Promise<number> {
@@ -107,7 +105,7 @@ export async function runSettingsCli(options: SettingsCliOptions): Promise<numbe
     }
     if (def.turnOnInterlock === 'purchase-fx-bill-writer' && proposed === 'true' && current.stored !== 'true') {
       const { purchaseFxSwitchOnRefusal } = await import('@/lib/domain/purchasing/purchase-event-fx-switch-on')
-      // Judged on the installation's env file (the one the application runs with), not only this shell.
+      // Judged on the installation's env file (the one the application's service runs with) only; --env-file is mandatory here.
       let installationEnv: Record<string, string> | null = null
       if (values['env-file'] !== undefined) {
         const { readEnvFile } = await import('./lib/first-load-apply-files')
@@ -115,7 +113,7 @@ export async function runSettingsCli(options: SettingsCliOptions): Promise<numbe
         if (!file.ok) { stderr.error(`--env-file: ${file.problem}. Nothing was written.`); return 3 }
         installationEnv = file.env
       }
-      const writer = purchaseFxSwitchOnRefusal({ processEnv: options.purchaseFxProcessEnv, installationEnv })
+      const writer = purchaseFxSwitchOnRefusal({ installationEnv })
       if (writer) { stderr.error(writer); return 3 }
     }
     // Turning the condition check on returns ON: refused while any quarantine warehouse still looks sellable, here (the dry run too) and again

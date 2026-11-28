@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { after } from 'node:test'
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import { runSettingsCli } from '../scripts/settings-cli'
 import { SYSTEM_SWITCH_KEYS, validateSwitchValue, findSwitch } from '../lib/domain/settings/system-switches'
@@ -43,11 +46,17 @@ function fakeDb(initial: Record<string, string> = {}, opts: { failAudit?: boolea
   }
 }
 
-/** The shell the purchase FX bill-writer interlock reads: by default one where the producer-side hold is set and not enforced (IMS writes the bills). */
-const HOLD_NOT_ENFORCED = { PRODUCER_HOLD_ENFORCED_DESTINATIONS: '' }
-async function run(mode: 'get' | 'set', argv: string[], f = fakeDb(), interlock?: Parameters<typeof runSettingsCli>[0]['interlock'], purchaseFxProcessEnv: Record<string, string | undefined> = HOLD_NOT_ENFORCED) {
+/**
+ * The installation env file the purchase FX bill-writer interlock reads (mandatory): by default one where the producer-side hold is set and not enforced
+ * (IMS writes the bills). Mode 600, owned by the running account; removed after the file.
+ */
+const ENV_DIR = mkdtempSync(join(tmpdir(), 'pfx-envfile-'))
+const HOLD_NOT_ENFORCED_FILE = join(ENV_DIR, 'ims.env')
+writeFileSync(HOLD_NOT_ENFORCED_FILE, 'PRODUCER_HOLD_ENFORCED_DESTINATIONS=\n', { mode: 0o600 })
+after(() => rmSync(ENV_DIR, { recursive: true, force: true }))
+async function run(mode: 'get' | 'set', argv: string[], f = fakeDb(), interlock?: Parameters<typeof runSettingsCli>[0]['interlock']) {
   const out: string[] = []; const err: string[] = []
-  const code = await runSettingsCli({ mode, argv, db: f.db as never, ...(interlock ? { interlock } : {}), purchaseFxProcessEnv, stdout: { log: (m: string) => out.push(m) }, stderr: { error: (m: string) => err.push(m) }, disconnect: async () => {} })
+  const code = await runSettingsCli({ mode, argv, db: f.db as never, ...(interlock ? { interlock } : {}), stdout: { log: (m: string) => out.push(m) }, stderr: { error: (m: string) => err.push(m) }, disconnect: async () => {} })
   return { code, out: out.join('\n'), err: err.join('\n'), f }
 }
 const SET = ['--by', 'jan', '--reason', 'switchover step M']
@@ -297,7 +306,8 @@ test('purchase_event_fx_rates_enabled: off by default and ADMIN; its account key
   }
 })
 
-const FX_ON = ['--key', 'purchase_event_fx_rates_enabled', '--value', 'true', ...SET, '--yes', '--confirm-admin']
+const FX_ON = ['--key', 'purchase_event_fx_rates_enabled', '--value', 'true', ...SET, '--env-file', HOLD_NOT_ENFORCED_FILE, '--yes', '--confirm-admin']
+const FX_ON_NO_FILE = ['--key', 'purchase_event_fx_rates_enabled', '--value', 'true', ...SET, '--yes', '--confirm-admin']
 
 /** The interlock (LOW-18) is on until step 3 installs the bill side; the account/mapping rules below are proved with it opened, on the real definition, restored after. */
 async function withStepsInstalled<T>(fn: () => Promise<T>): Promise<T> {
@@ -440,33 +450,39 @@ test('refund_returns_in_transit_enabled: an ADMIN switch, off by default, key eq
   assert.equal(off.code, 0, off.err)
 })
 
-test('purchase_event_fx_rates_enabled: BILL-WRITER interlock - refused while the hold shadows supplier bills (judged on the installation env file over the shell), and when the hold variable is in neither (MUTATION: drop the check => red)', () => withStepsInstalled(async () => {
-  const { mkdtempSync, writeFileSync, chmodSync, rmSync } = await import('node:fs')
-  const { join } = await import('node:path')
-  const { tmpdir } = await import('node:os')
+test('purchase_event_fx_rates_enabled: BILL-WRITER interlock - --env-file is mandatory and must set the hold variable; refused while the installation file says the hold shadows supplier bills; the shell is not consulted (MUTATION: drop the check => red)', () => withStepsInstalled(async () => {
   const mapped = () => fakeDb({ xero_sync_enabled: 'true', xero_realised_fx_gain_loss_account: '499', xero_purchase_price_variance_account: '510' })
-  const neither = await run('set', FX_ON, mapped(), undefined, {})
-  assert.equal(neither.code, 3)
-  assert.match(neither.err, /in neither the installation env file/)
-  const shadowShell = await run('set', FX_ON, mapped(), undefined, { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' })
-  assert.equal(shadowShell.code, 3)
-  assert.match(shadowShell.err, /shadows supplier bills/)
+  const before = process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+  process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = ''
+  try {
+    const noFile = await run('set', FX_ON_NO_FILE, mapped())
+    assert.equal(noFile.code, 3, 'no --env-file: refused, whatever this shell says')
+    assert.match(noFile.err, /without --env-file/)
+  } finally {
+    if (before === undefined) delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
+    else process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = before
+  }
   const dir = mkdtempSync(join(tmpdir(), 'pfx-env-'))
   try {
-  const file = join(dir, 'ims.env')
-  writeFileSync(file, 'PRODUCER_HOLD_ENFORCED_DESTINATIONS=xero\n')
-  chmodSync(file, 0o600)
-  const fileWins = await run('set', [...FX_ON, '--env-file', file], mapped(), undefined, HOLD_NOT_ENFORCED)
-  assert.equal(fileWins.code, 3, 'the installation file says the hold is enforced, whatever this shell says')
-  assert.match(fileWins.err, /shadows supplier bills/)
-  writeFileSync(file, 'PRODUCER_HOLD_ENFORCED_DESTINATIONS=\n')
-  const fileOff = mapped()
-  assert.equal((await run('set', [...FX_ON, '--env-file', file], fileOff, undefined, {})).code, 0, 'not enforced in the installation file: IMS writes the bills')
-  assert.equal(fileOff.settings.get('purchase_event_fx_rates_enabled')!.value, 'true')
-  chmodSync(file, 0o644)
-  const loose = await run('set', [...FX_ON, '--env-file', file], mapped(), undefined, HOLD_NOT_ENFORCED)
-  assert.equal(loose.code, 3)
-  assert.match(loose.err, /--env-file: .*mode 600/)
+    const file = join(dir, 'ims.env')
+    const on = (): string[] => ['--key', 'purchase_event_fx_rates_enabled', '--value', 'true', ...SET, '--env-file', file, '--yes', '--confirm-admin']
+    writeFileSync(file, 'XERO_WRITES_LIVE_FROM=2026-12-12T09:00:00Z\n')
+    chmodSync(file, 0o600)
+    const missing = await run('set', on(), mapped())
+    assert.equal(missing.code, 3)
+    assert.match(missing.err, /does not set PRODUCER_HOLD_ENFORCED_DESTINATIONS/)
+    writeFileSync(file, 'PRODUCER_HOLD_ENFORCED_DESTINATIONS=xero\n')
+    const shadowed = await run('set', on(), mapped())
+    assert.equal(shadowed.code, 3)
+    assert.match(shadowed.err, /shadows supplier bills/)
+    writeFileSync(file, 'PRODUCER_HOLD_ENFORCED_DESTINATIONS=\n')
+    const fileOff = mapped()
+    assert.equal((await run('set', on(), fileOff)).code, 0, 'not enforced in the installation file: IMS writes the bills')
+    assert.equal(fileOff.settings.get('purchase_event_fx_rates_enabled')!.value, 'true')
+    chmodSync(file, 0o644)
+    const loose = await run('set', on(), mapped())
+    assert.equal(loose.code, 3)
+    assert.match(loose.err, /--env-file: .*mode 600/)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

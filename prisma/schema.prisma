@@ -6707,3 +6707,19 @@ model PurchaseFxNonImsBillApproval {
   @@index([poId])
   @@map("purchase_fx_non_ims_bill_approvals")
 }
+
+/// Per-event FX (MED-C): a confirmation of a bill posted outside IMS that a re-confirmation REPLACED, kept as it was (`snapshot`: the whole row), with when
+/// and by whom it was superseded. The live table holds one confirmation per bill; this is its history. Written only by
+/// lib/domain/purchasing/purchase-fx-non-ims-bills.ts, in the confirmation's transaction.
+model PurchaseFxNonImsBillApprovalHistory {
+  id           String   @id @default(cuid())
+  approvalId   String   @map("approval_id")
+  poId         String   @map("po_id")
+  invoiceId    String   @map("invoice_id")
+  snapshot     Json
+  supersededAt DateTime @default(now()) @map("superseded_at")
+  supersededBy String   @map("superseded_by")
+
+  @@index([invoiceId])
+  @@map("purchase_fx_non_ims_bill_approval_history")
+}

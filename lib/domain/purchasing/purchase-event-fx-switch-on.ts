@@ -32,31 +32,30 @@ export function purchaseFxJournalShadowed(ymd: string, env: Record<string, strin
 }
 
 /**
- * THE TURN-ON CHECK (the settings command's `purchase-fx-bill-writer` interlock). Judged on the INSTALLATION's environment: the env file the application
- * runs with (`--env-file`, read with the first-load `readEnvFile`), whose values win over this shell's; a shell that only happens to carry (or lack) the
- * variable is not the installation. Refused when the hold's variable is in neither (nothing says whether the hold is enforced), and when, so judged, the
- * hold shadows supplier bills now. Null = no refusal.
+ * THE TURN-ON CHECK (the settings command's `purchase-fx-bill-writer` interlock). Judged on the INSTALLATION's environment ONLY: the env file the
+ * application's service runs with (`--env-file`, read with the first-load `readEnvFile`), which is mandatory, and which must itself carry the hold's
+ * variable. A shell that only happens to carry (or lack) it is not the installation, so the shell is not consulted. That file must be the single source the
+ * service takes its environment from: a variable the service gets from anywhere else (a unit drop-in, a second file) is not seen here. Null = no refusal.
  *
  * The check runs only when the switch is turned on. The release that enables the interlock must therefore also check the STORED value: a `true` stored
  * before (by a database edit or a restore) is not turned on again, so it would never meet this check.
  */
 export function purchaseFxSwitchOnRefusal(options: {
-  processEnv?: Record<string, string | undefined>
+  /** The installation env file's values; null = no --env-file was given. */
   installationEnv?: Record<string, string> | null
   now?: Date
 } = {}): string | null {
-  const processEnv = options.processEnv ?? process.env
   const installationEnv = options.installationEnv ?? null
-  const inFile = installationEnv ? Object.prototype.hasOwnProperty.call(installationEnv, HOLD_ENV) : false
-  const inShell = Object.prototype.hasOwnProperty.call(processEnv, HOLD_ENV) && processEnv[HOLD_ENV] !== undefined
-  if (!inFile && !inShell) {
-    return `purchase_event_fx_rates_enabled cannot be turned on: ${HOLD_ENV} is in neither the installation env file (pass it with --env-file) nor this shell, so `
-      + 'it is not known whether the producer-side hold shadows supplier bills. Run with --env-file <the env file the application uses>. (An empty value means '
-      + 'the hold is not enforced, which this check takes as IMS writing the bills.)'
+  if (!installationEnv) {
+    return 'purchase_event_fx_rates_enabled cannot be turned on without --env-file <the env file the application\'s service runs with>: the bill-writer check is judged '
+      + 'on the installation\'s own environment, not on this shell.'
   }
-  const env = { ...processEnv, ...(installationEnv ?? {}) }
+  if (!Object.prototype.hasOwnProperty.call(installationEnv, HOLD_ENV)) {
+    return `purchase_event_fx_rates_enabled cannot be turned on: the installation env file does not set ${HOLD_ENV}, so it is not known whether the producer-side hold `
+      + 'shadows supplier bills. Set it there (an empty value means the hold is not enforced, which this check takes as IMS writing the bills).'
+  }
   const now = options.now ?? new Date()
-  if (!purchaseFxBillWriterShadowed(businessDateYmd(now), env, now)) return null
+  if (!purchaseFxBillWriterShadowed(businessDateYmd(now), installationEnv, now)) return null
   return 'purchase_event_fx_rates_enabled cannot be turned on while the producer-side hold shadows supplier bills (PURCHASE_INVOICE) to Xero: another '
     + 'system writes the bills (phase P1), so the bills IMS would value under the switch would not be the ones in Xero. Turn it on once IMS is the bill writer (P2).'
 }
