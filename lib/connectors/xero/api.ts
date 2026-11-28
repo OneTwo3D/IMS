@@ -11,6 +11,7 @@ import { outboundWriteRefusal, OutboundWriteHeldError } from '@/lib/security/out
 import { recordOutboundWriteRefusal } from '@/lib/security/outbound-write-refusal-log'
 import { XERO_IDEMPOTENCY_KEY_RETENTION_MS } from '@/lib/domain/accounting/idempotency-retention'
 import { persistDayLimitObservation } from './day-limit-observation'
+import { describeLocalBudgetRefusal } from './deferral'
 
 const XERO_BASE_URL = 'https://api.xero.com/api.xro/2.0'
 const XERO_CONNECTOR = 'xero'
@@ -635,7 +636,7 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
         return markNotSent('rate-budget-refused', {
           ok: false,
           status: 429,
-          text: async () => `Rate limited; Xero's minute budget for this organisation is spent (the next slot is in ${Math.round(budget.waitMs / 1000)}s), and this call does not wait for it because it is made while holding database locks. Not sent; the work is retried from the queue.`,
+          text: async () => `Rate limited; Xero's minute budget for this organisation is spent (the next slot is in ${Math.round(budget.waitMs / 1000)}s), and this call does not wait for it because it is made while holding database locks. Not sent; the work is retried from the queue. ${describeLocalBudgetRefusal('minute', budget.waitMs)}`,
         } as Response)
       }
       if (budget.reason === 'budget') return outOfBudgetResponse(budget.waitMs, XERO_IN_REQUEST_RETRY_BUDGET_MS - remainingBeforeCall)
@@ -645,7 +646,8 @@ async function performRequest(auth: { accessToken: string; tenantId: string }, i
         text: async () =>
           `Xero day budget exhausted for this tenant: ${XERO_DAY_LIMIT} calls used within the rolling ` +
           `24h window, oldest falls out in ${Math.round(budget.waitMs / 60_000)} min. Not waiting — ` +
-          `the work must be deferred. (Xero's real cap is 1,000/org/rolling-24h since 2026-03-02.)`,
+          `the work must be deferred. (Xero's real cap is 1,000/org/rolling-24h since 2026-03-02.) ` +
+          describeLocalBudgetRefusal('day', budget.waitMs),
       } as Response)
     }
 
