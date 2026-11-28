@@ -168,6 +168,8 @@ export type LandedFloorCogsResult = {
   shadowed?: { transitDelta: string }
   /** A WMS path that must not refuse its book-in: the refusal it would have raised, reported after the commit. */
   refused?: string
+  /** The connector whose chart the journal was built for (named on the posting refusal). */
+  chartConnector?: string | null
 }
 
 /** The accounting chart the caller read BEFORE its transaction (`getAccountingSettings()`); undefined = read here, lazily, over the pool. */
@@ -263,8 +265,8 @@ export async function reconcileLandedFloorCogsTx(
   }
   // A shadow leaves no row: the next event of the order computes the same difference again and, once the hold has lifted, queues it (the shadow's
   // own row is CANCELLED, so it does not dedupe a live one); while the hold stays, the credit remains in transit as a residue.
-  if (answered.outcome && isShadowedOutcome(answered.outcome)) return { ...none, shadowed: { transitDelta: delta.toFixed(2) } }
-  if (answered.outcome && postingIsOwed(answered.outcome)) return { ...none, notQueued: answered.outcome }
+  if (answered.outcome && isShadowedOutcome(answered.outcome)) return { ...none, chartConnector: connector, shadowed: { transitDelta: delta.toFixed(2) } }
+  if (answered.outcome && postingIsOwed(answered.outcome)) return { ...none, chartConnector: connector, notQueued: answered.outcome }
   return none
 }
 
@@ -298,7 +300,7 @@ export async function reportLandedFloorCogsResults(results: ReadonlyArray<Landed
         remedy: 'Stock in Transit still holds that credit. Leave the ledger as it is (a copy keyed in by hand would be booked twice): the next receipt or '
           + 'landed-cost recalculation of the order queues only what is still owed, then mark this row handled.',
         outcome: result.notQueued,
-        metadata: { reference: result.poReference },
+        metadata: { reference: result.poReference, chartConnector: result.chartConnector ?? null },
       })
     }
     if (result.shadowed) {
