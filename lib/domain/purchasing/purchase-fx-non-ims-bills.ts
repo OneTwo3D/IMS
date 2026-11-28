@@ -3,7 +3,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { roundMoney, roundQuantity, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
 import {
-  nonImsBillFingerprint, purchaseFxOrdersToReconcile, reconcilePurchaseBillFx, reportPurchaseFxVarianceNotQueued, stockUnitsForeign, type PurchaseBillFxReconcileResult,
+  nonImsApprovalStanding, nonImsBillFingerprint, purchaseFxOrdersToReconcile, reconcilePurchaseBillFx, reportPurchaseFxVarianceNotQueued, stockUnitsForeign, type PurchaseBillFxReconcileResult,
 } from '@/lib/domain/purchasing/purchase-bill-fx'
 import { isPurchaseEventFxEnabled } from '@/lib/domain/purchasing/purchase-event-fx-settings'
 import type { XeroBill, XeroBillReadDeps } from '@/lib/connectors/xero/bill-read'
@@ -161,6 +161,7 @@ async function prepare(db: Db, options: { named: ReadonlySet<string>; readXero: 
     },
   })
   const { pendingDeletionError } = await import('@/lib/domain/accounting/document-delete-pending')
+  const connectedTenantId = (await db.accountingToken.findUnique({ where: { connector: 'xero' }, select: { tenantId: true } }))?.tenantId ?? null
   const read = options.readXero ? (options.deps ? options.deps : undefined) : undefined
   const { readXeroBillById } = await import('@/lib/connectors/xero/bill-read')
   const out: Prepared[] = []
@@ -186,16 +187,23 @@ async function prepare(db: Db, options: { named: ReadonlySet<string>; readXero: 
     }
     const inFlight = [...unreceivedByBill.values()].some((perLine) => [...perLine.values()].some((qty) => qty.gt(0)))
     const billKeys = (await db.transitSubledgerMovement.findMany({ where: { sourceType: 'PURCHASE_BILL', sourceRef: order.id }, select: { idempotencyKey: true } })).map((row) => row.idempotencyKey)
-    const confirmedRows = new Map((await db.purchaseFxNonImsBillApproval.findMany({ where: { poId: order.id }, select: { invoiceId: true, staleAt: true, staleReason: true, approvedAt: true } })).map((row) => [row.invoiceId, row]))
+    const confirmedRows = new Map((await db.purchaseFxNonImsBillApproval.findMany({
+      where: { poId: order.id },
+      select: { invoiceId: true, staleAt: true, staleReason: true, approvedAt: true, xeroInvoiceId: true, xeroTenantId: true, stockUnits: true, billFingerprint: true },
+    })).map((row) => [row.invoiceId, row]))
     for (const invoice of order.invoices) {
       if (invoice.fxRateSource !== null) continue
       if (billKeys.some((key) => key.startsWith(`purchase-invoice:${invoice.id}:`))) continue
       const named = options.named.has(invoice.id)
       const already = confirmedRows.get(invoice.id)
-      // A confirmed bill is listed again only when its confirmation went stale, or when it is named (a re-confirmation).
-      if (already && !already.staleAt && !named) continue
+      // #1164 LOW-5: a confirmed bill is listed again when its confirmation does not hold NOW (judged as the reconciliation judges it, whether or not a
+      // reconciliation has marked it yet), or when it is named (a re-confirmation, e.g. after an edit of the Xero bill).
+      const standing = already ? nonImsApprovalStanding(already, invoice, stockUnits, connectedTenantId) : null
+      if (already && standing?.kind !== 'stale' && !named) continue
       const reconfirmation = already
-        ? (already.staleAt ? `confirmed on ${already.approvedAt.toISOString().slice(0, 10)}, now stale: ${already.staleReason ?? 'stale'}; confirming again replaces the basis` : `confirmed on ${already.approvedAt.toISOString().slice(0, 10)}; confirming again replaces the basis (after an edit of the Xero bill)`)
+        ? (standing?.kind === 'stale'
+          ? `confirmed on ${already.approvedAt.toISOString().slice(0, 10)}, now stale: ${standing.reason}; confirming again replaces the basis`
+          : `confirmed on ${already.approvedAt.toISOString().slice(0, 10)}; confirming again replaces the basis (after an edit of the Xero bill)`)
         : null
       // MED-6: with bills named, only those are listed (and read).
       if (options.named.size > 0 && !named) continue
@@ -418,7 +426,16 @@ export async function confirmNonImsBills(params: {
             throw new ConfirmMismatch(`bill ${bill.invoiceNumber ?? bill.invoiceId}: it changed since it was listed (posted, re-linked, edited or being deleted); run the dry run again`)
           }
           // A re-confirmation replaces the earlier confirmation and its basis (MED-5).
-          if (bill.reconfirmation) await tx.purchaseFxNonImsBillApproval.deleteMany({ where: { invoiceId: bill.invoiceId } })
+          if (bill.reconfirmation) {
+            // #1164 LOW-10: the confirmation it replaces is kept, as it was, in the history (the live table holds one per bill).
+            const previous = await tx.purchaseFxNonImsBillApproval.findUnique({ where: { invoiceId: bill.invoiceId } })
+            if (previous) {
+              await tx.purchaseFxNonImsBillApprovalHistory.create({
+                data: { approvalId: previous.id, poId: previous.poId, invoiceId: previous.invoiceId, snapshot: JSON.parse(JSON.stringify(previous)) as Prisma.InputJsonValue, supersededBy: params.by.trim() },
+              })
+              await tx.purchaseFxNonImsBillApproval.delete({ where: { id: previous.id } })
+            }
+          }
           // The Xero answer read in this run is stored with the confirmation (it is not read again), with the basis frozen.
           await tx.purchaseFxNonImsBillApproval.create({
             data: {

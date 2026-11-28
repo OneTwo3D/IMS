@@ -12,6 +12,7 @@ import { isShadowedOutcome, postingIsOwed, reportPostingNotQueued, type EnqueueO
 import { headerDiscountFactorForPo } from '@/lib/domain/purchasing/landed-cost-allocation'
 import { isPurchaseEventFxEnabled } from '@/lib/domain/purchasing/purchase-event-fx-settings'
 import { purchaseFxBillWriterShadowed } from '@/lib/domain/purchasing/purchase-event-fx-switch-on'
+import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import {
   PURCHASE_FX_SOURCE_FX_TABLE, PURCHASE_FX_SOURCE_XERO_PREPAYMENT, PurchaseFxRefusalError, purchaseFxAccountsRefusal,
   type PrepaymentChecks, type PurchaseFxSource,
@@ -277,6 +278,43 @@ export function nonImsBillFingerprint(bill: { subtotalForeign: DecimalInput; lin
   return `${toDecimal(bill.subtotalForeign).toString()}|${lines.join(',')}`
 }
 
+/** The confirmation fields its staleness is judged on. */
+export type NonImsApprovalBasis = {
+  xeroInvoiceId: string | null
+  xeroTenantId: string | null
+  stockUnits: unknown
+  billFingerprint: string | null
+  staleAt: Date | null
+  staleReason: string | null
+}
+
+/**
+ * MED-5 / #1164 LOW-5..8: WHETHER A CONFIRMATION OF A BILL POSTED OUTSIDE IMS STILL HOLDS, judged the same way by the reconciliation and by the list. Pure.
+ *  - `stale` (persistent; the bill needs confirming again): marked stale before; confirmed before its basis was frozen (no frozen units or bill
+ *    fingerprint, no Xero bill or organisation recorded); the bill linked to another Xero bill; the IMS bill edited; the order's goods cost edited; or the
+ *    connected Xero organisation not the one the bill was read from.
+ *  - `held` (transient): no Xero organisation is connected, so the tenant cannot be compared; the journal is held, nothing is marked.
+ *  - `ok`.
+ */
+export function nonImsApprovalStanding(
+  row: NonImsApprovalBasis,
+  bill: { accountingInvoiceId: string | null; subtotalForeign: DecimalInput; lines: ReadonlyArray<{ poLineId: string | null; qtyBilled: DecimalInput; totalForeign: DecimalInput }> },
+  currentStockUnits: ReadonlyMap<string, Decimal>,
+  connectedTenantId: string | null,
+): { kind: 'ok' } | { kind: 'stale'; reason: string } | { kind: 'held'; reason: string } {
+  if (row.staleAt) return { kind: 'stale', reason: row.staleReason ?? 'marked stale' }
+  if (!row.stockUnits || typeof row.stockUnits !== 'object' || !row.billFingerprint || !row.xeroInvoiceId || !row.xeroTenantId) {
+    return { kind: 'stale', reason: 'confirmed before its basis was frozen with it; confirm it again' }
+  }
+  if (bill.accountingInvoiceId !== row.xeroInvoiceId) return { kind: 'stale', reason: `the bill is linked to another Xero bill (${bill.accountingInvoiceId ?? 'none'}, confirmed on ${row.xeroInvoiceId})` }
+  if (row.billFingerprint !== nonImsBillFingerprint(bill)) return { kind: 'stale', reason: 'the IMS bill was edited after it was confirmed' }
+  const frozen = Object.entries(row.stockUnits as Record<string, string>)
+  if (frozen.some(([lineId, unit]) => !(currentStockUnits.get(lineId)?.eq(toDecimal(unit)) ?? false))) return { kind: 'stale', reason: 'the order\'s goods cost was edited after the bill was confirmed' }
+  if (connectedTenantId === null) return { kind: 'held', reason: 'no Xero organisation is connected, so the one the bill was read from cannot be confirmed; held until it is' }
+  if (connectedTenantId !== row.xeroTenantId) return { kind: 'stale', reason: `the connected Xero organisation (${connectedTenantId}) is not the one the bill was read from (${row.xeroTenantId})` }
+  return { kind: 'ok' }
+}
+
 // ─── THE MATCHING (pure) ──────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 /** One receipt of one order line, in receipt order: its quantity and the goods value it credited (GR/IR RECEIPT row). */
@@ -438,6 +476,8 @@ export type PurchaseBillFxReconcileResult = {
   /** Journals the queue declined while owed: the caller reports them after its commit (`reportPurchaseFxVarianceNotQueued`). */
   notQueued: Array<{ invoiceId: string; invoiceNumber: string | null; outcome: EnqueueOutcomeLike; transitDelta: string }>
   /** MED-2: journals the producer-side hold recorded as a shadow; settled (never caught up later). */
+  /** #1164 LOW-6: the confirmations of bills posted outside IMS that do not hold (stale) or are held (no Xero organisation connected); their journals are held. */
+  stale?: Array<{ invoiceId: string; reason: string; held: boolean }>
   /** `reversal`: the take-back of an amount settled as a shadow before (LOW-2); otherwise a new journal the hold recorded as a shadow. */
   shadowed?: Array<{ invoiceId: string; transitDelta: string; reversal?: boolean }>
 }
@@ -551,33 +591,50 @@ export async function reconcilePurchaseBillFx(
   // CurrencyRate its Xero bill was read at. Their GR/IR is corrected as for any bill from before the switch (above); what sits in Stock in Transit for
   // them is the Xero bill's goods at the XERO rate, so the exchange-rate journal is measured on that basis: the order's goods cost (after the header
   // discount) at the Xero rate, matched to the receipts in the same order. The bill's price difference stays on transit (owner ruling 2026-11-26).
+  const staleReport: Array<{ invoiceId: string; reason: string; held: boolean }> = []
   const confirmedRows = await tx.purchaseFxNonImsBillApproval.findMany({
     where: { poId: params.poId },
-    select: { id: true, invoiceId: true, xeroCurrencyRate: true, xeroInvoiceId: true, stockUnits: true, billFingerprint: true, staleAt: true, staleReason: true },
+    select: { id: true, invoiceId: true, xeroCurrencyRate: true, xeroInvoiceId: true, xeroTenantId: true, stockUnits: true, billFingerprint: true, staleAt: true, staleReason: true },
   })
   const confirmedRate = new Map<string, Decimal | null>(confirmedRows.map((row) => [row.invoiceId, row.xeroCurrencyRate === null ? null : toDecimal(row.xeroCurrencyRate)]))
   const currentStockUnits = stockUnitsForeign(po)
-  // MED-5: the basis is FROZEN with the confirmation (the order's goods unit costs it was measured on). A confirmation whose basis no longer holds (the IMS
-  // bill edited, the order's cost edited, the bill linked to another Xero bill) is STALE: marked so, and its journal is held where it is until the bill
-  // is confirmed again (an edit in Xero is not seen here: it needs a re-confirmation, see purchase-fx-non-ims-bills.ts).
+  // MED-5: the basis is FROZEN with the confirmation (the order's goods unit costs it was measured on). A confirmation whose basis no longer holds is STALE
+  // (`nonImsApprovalStanding`): marked so, with a WARNING once, on the transition, and its journal is held where it is until the bill is confirmed again
+  // (an edit in Xero is not seen here: it needs a re-confirmation, see purchase-fx-non-ims-bills.ts). A HELD one (no Xero organisation connected) only
+  // holds its journal.
   const frozenUnits = new Map<string, Map<string, Decimal>>()
   const stale = new Map<string, string>()
+  const connectedTenantId = confirmedRows.length === 0 ? null
+    : (await tx.accountingToken.findUnique({ where: { connector: 'xero' }, select: { tenantId: true } }))?.tenantId ?? null
   for (const row of confirmedRows) {
     const bill = billById.get(row.invoiceId)
     if (row.stockUnits && typeof row.stockUnits === 'object') {
       frozenUnits.set(row.invoiceId, new Map(Object.entries(row.stockUnits as Record<string, string>).map(([lineId, unit]) => [lineId, toDecimal(unit)])))
     }
     if (!bill) continue
-    let reason: string | null = row.staleAt ? (row.staleReason ?? 'stale') : null
-    if (!reason && row.xeroInvoiceId && bill.accountingInvoiceId !== row.xeroInvoiceId) reason = `the bill is linked to another Xero bill (${bill.accountingInvoiceId ?? 'none'}, confirmed on ${row.xeroInvoiceId})`
-    if (!reason && row.billFingerprint && row.billFingerprint !== nonImsBillFingerprint(bill)) reason = 'the IMS bill was edited after it was confirmed'
-    const frozen = frozenUnits.get(row.invoiceId)
-    if (!reason && frozen && [...frozen].some(([lineId, unit]) => !(currentStockUnits.get(lineId)?.eq(unit) ?? false))) reason = 'the order\'s goods cost was edited after the bill was confirmed'
-    if (!reason) continue
-    stale.set(row.invoiceId, reason)
-    if (!row.staleAt && !params.dryRun) await tx.purchaseFxNonImsBillApproval.update({ where: { id: row.id }, data: { staleAt: params.at, staleReason: reason } })
+    const standing = nonImsApprovalStanding(row, bill, currentStockUnits, connectedTenantId)
+    if (standing.kind === 'ok') continue
+    stale.set(row.invoiceId, standing.reason)
+    if (standing.kind === 'held') { staleReport.push({ invoiceId: row.invoiceId, reason: standing.reason, held: true }); continue }
+    staleReport.push({ invoiceId: row.invoiceId, reason: standing.reason, held: false })
+    if (!row.staleAt && !params.dryRun) {
+      await tx.purchaseFxNonImsBillApproval.update({ where: { id: row.id }, data: { staleAt: params.at, staleReason: standing.reason } })
+      const { logActivityInTransaction } = await import('@/lib/activity-log')
+      await logActivityInTransaction(tx, {
+        userId: null,
+        entityType: 'PURCHASE_ORDER',
+        entityId: params.poId,
+        action: 'purchase_fx_non_ims_bill_stale',
+        tag: 'accounting',
+        level: 'WARNING',
+        description: withLedgerCheck(`The confirmation of bill ${bill.invoiceNumber ?? bill.id} of ${po.reference} (posted to Xero outside IMS) no longer holds: ${standing.reason}. Its exchange-rate `
+          + 'difference journal is held where it is until the bill is confirmed again with `npm run purchase-fx:non-ims-bills` (the dry run lists it as stale).'),
+        metadata: { invoiceId: bill.id, reason: standing.reason },
+      })
+    }
   }
   if (params.dryRun) for (const [id, rate] of params.assumeConfirmed ?? []) { confirmedRate.set(id, rate); stale.delete(id); frozenUnits.delete(id) }
+  const staleAfterAssumed = staleReport.filter((entry) => !(params.dryRun && params.assumeConfirmed?.has(entry.invoiceId)))
   const xeroRated = [...confirmedRate.entries()].filter(([, rate]) => rate !== null)
   let journalTargets = targets
   if (xeroRated.length > 0) {
@@ -713,7 +770,7 @@ export async function reconcilePurchaseBillFx(
   // (`purchase_fx_non_ims_bill_approvals`, lib/domain/purchasing/purchase-fx-non-ims-bills.ts) it is treated as being in transit at its own GR/IR value.
   const billPosted = (invoiceId: string): boolean => confirmedRate.has(invoiceId) || billTransitKeys.some((key) => key.startsWith(`purchase-invoice:${invoiceId}:`))
   const billIds = new Set([...fxByBill.keys(), ...postedByBill.keys()])
-  const result: PurchaseBillFxReconcileResult = { journals: [], notQueued: [], shadowed: [] }
+  const result: PurchaseBillFxReconcileResult = { journals: [], notQueued: [], shadowed: [], stale: staleAfterAssumed }
   let accounts: { transit: string; realisedFx: string } | null = null
   for (const invoiceId of billIds) {
     // MED-5: a stale confirmation holds its journal where it is.

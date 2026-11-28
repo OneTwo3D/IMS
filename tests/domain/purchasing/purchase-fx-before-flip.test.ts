@@ -51,10 +51,10 @@ test('the Xero bill read is one GET of Invoices/<id>, fail-closed on an incomple
 // [mutation: let the switch turn on while the producer-side hold shadows supplier bills]
 test('turning the switch on is refused while PURCHASE_INVOICE is shadowed (Qoblex writes bills); without the hold there is no refusal', async () => {
   const { purchaseFxSwitchOnRefusal } = await import('@/lib/domain/purchasing/purchase-event-fx-switch-on')
-  assert.equal(purchaseFxSwitchOnRefusal({ processEnv: { PRODUCER_HOLD_ENFORCED_DESTINATIONS: '' } }), null, 'the hold not enforced: IMS writes the bills')
-  assert.match(purchaseFxSwitchOnRefusal({ processEnv: { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' } }) ?? '', /shadows supplier bills/)
-  assert.match(purchaseFxSwitchOnRefusal({ processEnv: {} }) ?? '', /in neither/, 'unknown: refused')
-  assert.match(purchaseFxSwitchOnRefusal({ processEnv: { PRODUCER_HOLD_ENFORCED_DESTINATIONS: '' }, installationEnv: { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' } }) ?? '', /shadows/, 'the installation file wins')
+  assert.equal(purchaseFxSwitchOnRefusal({ installationEnv: { PRODUCER_HOLD_ENFORCED_DESTINATIONS: '' } }), null, 'the hold not enforced: IMS writes the bills')
+  assert.match(purchaseFxSwitchOnRefusal({ installationEnv: { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero' } }) ?? '', /shadows supplier bills/)
+  assert.match(purchaseFxSwitchOnRefusal({ installationEnv: {} }) ?? '', /does not set PRODUCER_HOLD_ENFORCED_DESTINATIONS/, 'the file must set it')
+  assert.match(purchaseFxSwitchOnRefusal({ installationEnv: null }) ?? '', /without --env-file/, 'the file is mandatory')
 })
 
 // [mutation: send a zero stock line, or drop its rounding penny of VAT]

@@ -7,6 +7,7 @@
  * Every arm names the mutation that turns it red.
  */
 import assert from 'node:assert/strict'
+import { Prisma } from '@/app/generated/prisma/client'
 import test, { after, before, mock } from 'node:test'
 import { startScratch, type Scratch } from '../first-load/apply-scratch'
 
@@ -799,7 +800,9 @@ test('MED-5: the basis is frozen with the confirmation; an IMS bill edit, an ord
   assert.match((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).staleReason ?? '', /IMS bill was edited/)
   assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id } }), 1, 'one journal through all of it: the stale one is held')
   await s.db.purchaseInvoice.update({ where: { id: qoblex.id }, data: { accountingInvoiceId: guid() } })
-  await s.db.purchaseFxNonImsBillApproval.update({ where: { invoiceId: qoblex.id }, data: { staleAt: null, staleReason: null, billFingerprint: null } })
+  const { nonImsBillFingerprint } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  const edited8 = await s.db.purchaseInvoice.findUniqueOrThrow({ where: { id: qoblex.id }, include: { lines: true } })
+  await s.db.purchaseFxNonImsBillApproval.update({ where: { invoiceId: qoblex.id }, data: { staleAt: null, staleReason: null, billFingerprint: nonImsBillFingerprint(edited8) } })
   await withXeroPosting(() => rerunPurchaseBillFx(po.id))
   assert.match((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).staleReason ?? '', /linked to another Xero bill/)
 })
@@ -894,6 +897,53 @@ test('bill writer: while the hold shadows supplier bills, a new bill is valued a
     if (before === undefined) delete process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS
     else process.env.PRODUCER_HOLD_ENFORCED_DESTINATIONS = before
   }
+})
+
+// [mutation: let a tenant mismatch, a NULL tenant or a pre-freeze row hold; mark a missing connection stale; warn on every run; drop the superseded row]
+test('staleness (#1164 LOW-5..11): tenant mismatch, NULL tenant and pre-freeze rows are stale (listed before any reconcile), no connection only holds; one WARNING on the transition; the superseded row is kept', async () => {
+  const { listNonImsBills, confirmNonImsBills } = await import('@/lib/domain/purchasing/purchase-fx-non-ims-bills')
+  const { rerunPurchaseBillFx } = await import('@/lib/domain/purchasing/purchase-bill-fx')
+  const po = await seedPo(10)
+  const qoblex = await nonImsBill(po, 10, 12.5, { rate: 1.2 })
+  await lockAt(po)
+  assert.equal((await receive(po, 10)).success, true)
+  const confirmed = await withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Jan', reason: 'one-off', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '-26.04']]), deps: xeroDeps })))
+  assert.equal(confirmed.confirmed.length, 1)
+  const first = await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })
+  // No Xero organisation connected: held, not marked stale, no warning.
+  const held = await withXeroPosting(() => rerunPurchaseBillFx(po.id))
+  assert.deepEqual((held.stale ?? []).map((x) => [x.invoiceId, x.held]), [[qoblex.id, true]])
+  assert.equal((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).staleAt, null)
+  // Another organisation connected: listed as stale by the dry run before any reconcile, then marked by the reconcile with ONE warning.
+  await s.db.accountingToken.upsert({ where: { connector: 'xero' }, create: { connector: 'xero', accessToken: 'x', expiresAt: new Date(Date.now() + 3_600_000), tenantId: 'other-org' }, update: { tenantId: 'other-org' } })
+  try {
+    const listed = (await withXeroPosting(() => listNonImsBills({ named: [qoblex.id], deps: xeroDeps }))).candidates.find((c) => c.invoiceId === qoblex.id)
+    assert.match(listed?.reconfirmation ?? '', /now stale: the connected Xero organisation \(other-org\)/)
+    assert.equal((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).staleAt, null, 'the list marks nothing')
+    const a = await withXeroPosting(() => rerunPurchaseBillFx(po.id))
+    assert.deepEqual((a.stale ?? []).map((x) => [x.invoiceId, x.held]), [[qoblex.id, false]])
+    await withXeroPosting(() => rerunPurchaseBillFx(po.id))
+  } finally {
+    await s.db.accountingToken.deleteMany({ where: { connector: 'xero' } })
+  }
+  assert.match((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).staleReason ?? '', /other-org/)
+  assert.equal(await s.db.activityLog.count({ where: { action: 'purchase_fx_non_ims_bill_stale', entityId: po.id } }), 1, 'one WARNING, on the transition')
+  // Re-confirmation: the superseded row is kept in the history.
+  const again = await withXeroPosting(() => withXeroToken(() => confirmNonImsBills({ by: 'Ann', reason: 're-confirm', invoiceIds: [qoblex.id], expect: new Map([[qoblex.id, '0.00']]), deps: xeroDeps })))
+  assert.equal(again.confirmed.length, 1, String(again.failed[0]?.error))
+  const history = await s.db.purchaseFxNonImsBillApprovalHistory.findMany({ where: { invoiceId: qoblex.id } })
+  assert.equal(history.length, 1)
+  assert.equal(history[0]!.approvalId, first.id)
+  assert.equal(history[0]!.supersededBy, 'Ann')
+  assert.equal((history[0]!.snapshot as { approvedBy: string; staleReason: string }).approvedBy, 'Jan')
+  // A NULL tenant, and a row confirmed before the basis was frozen, are stale.
+  for (const [label, data] of [['tenant', { xeroTenantId: null }], ['pre-freeze', { stockUnits: Prisma.DbNull, billFingerprint: null }]] as const) {
+    await s.db.purchaseFxNonImsBillApproval.update({ where: { invoiceId: qoblex.id }, data: { staleAt: null, staleReason: null, xeroTenantId: 'tenant-pfr', billFingerprint: first.billFingerprint, stockUnits: first.stockUnits as never, ...data } as never })
+    const r = await withXeroPosting(() => withXeroToken(() => rerunPurchaseBillFx(po.id)))
+    assert.deepEqual((r.stale ?? []).map((x) => x.held), [false], label)
+    assert.match((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).staleReason ?? '', /before its basis was frozen/, label)
+  }
+  assert.equal(await s.db.accountingSyncLog.count({ where: { type: 'PURCHASE_FX_VARIANCE', referenceId: po.id } }), 1, 'one journal through all of it')
 })
 
 // [mutation: spend a return credit over the order's lines in id order instead of the lines of the return that raised it (o3d-ygc2x)]

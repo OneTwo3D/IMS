@@ -161,6 +161,7 @@ async function clearTransactionScope(guards: ResetGuards) {
   await db.purchaseOrderFxLock.deleteMany({})
   await db.purchaseFxVarianceShadow.deleteMany({})
   await db.purchaseFxNonImsBillApproval.deleteMany({})
+  await db.purchaseFxNonImsBillApprovalHistory.deleteMany({})
   await db.purchaseOrderLine.deleteMany({})
   // Purchase-order attachment rows cascade with the orders; their files are queued in the same transaction as the delete. Then every queued file is drained.
   await db.$transaction(async (tx) => {
