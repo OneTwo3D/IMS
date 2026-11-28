@@ -119,8 +119,11 @@ onetwo3d-ims/
 ### Core Modules
 
 1. **Inventory Module** — Product master data with:
-   - FIFO costing with multi-layer cost tracking per warehouse
-   - Multi-warehouse stock with available/reserved/on-hand tracking
+   - FIFO costing with multi-layer cost tracking per product and warehouse (`lib/cost-layers.ts`): layers come from purchase receipts, production output, opening stock, adjustments, transfer receipts and refund restocks; stock-outs take the oldest layer first, except a supplier return, which takes its own PO line's layers; landed cost is floored at 0.00 per layer
+   - Multi-warehouse stock with available/reserved/on-hand tracking; a reservation is the order's allocation less what has shipped (`reservation-residual.ts`); warehouses of type QUARANTINE (only with the `return_condition_check_enabled` switch) hold unsellable returns that are never allocated, available or pushed to the store
+   - Stock control: adjustments (reason with a GL account, unit cost rules and the opening-stock fallback behind `stock_adjustment_reason_cost_required`), stock counts with variance triage, and warehouse transfers (`lib/domain/inventory/`, `app/actions/stock.ts`, `stock-counts.ts`, `transfers.ts`)
+   - Stock value and unit cost are returned only to roles holding `inventory.prices` (Admin, Manager, Finance); the server omits them for Warehouse and Read-only (`canViewStockValue`)
+   - Stock reports (`/analytics/stock-on-hand`, `inventory-aging`, `dead-stock`, `slow-stock`, and the movement, adjustment, transfer and count ledgers) on London business days; a daily inventory snapshot (off by default) including a per-transfer in-transit line
    - Product types: SIMPLE, VARIABLE (parent), VARIANT (child), KIT (virtual bundle), BOM (manufactured), NON_INVENTORY (service)
    - Real-time COGS calculation on stock movements
    - CSV import/export with BOM and variant support
@@ -153,6 +156,7 @@ onetwo3d-ims/
 5. **Integrations** — Connector modules for data sync:
    - **WooCommerce** — Order sync via webhooks (or polling), product sync, tax rate mapping to Xero
    - **Xero** — Daily batch journal entry posting, sub-ledger sync, COGS calculation, payment reconciliation
+   - **Mintsoft** — The one warehouse (WMS) connector (`lib/connectors/mintsoft/`, behind `lib/connectors/wms/`): order push and despatch poll, ASNs for purchase orders and transfers, product and bundle sync, a returns inbox, and per-warehouse stock sync in NOTIFICATION_ONLY or ALIGN_TO_WMS mode (hourly `mintsoft-stock-sync` job, off by default; align-up needs an open ASN line, align-down is gated by a reason, thresholds and persistence). See `docs/mintsoft.md`
 
 6. **Financial Module** — Multi-currency and reporting:
    - Daily FX rates auto-fetch from frankfurter.dev (ECB data)

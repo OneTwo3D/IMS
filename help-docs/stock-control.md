@@ -11,7 +11,8 @@ Use stock adjustments to correct stock levels when physical counts differ from t
 
 On a product's page, use the stock adjustment form: choose the warehouse, enter the quantity change (positive to add, negative to remove), choose the **Reason** (required when reasons are configured), and optionally add a note. Click **Apply Adjustment**.
 
-- **Unit cost** (base currency). Leave blank to use the product's average cost. It is **required for an addition when the product has no existing cost** at all, because stock booked at zero would be sold later at zero cost; the form then refuses with a message asking for a unit cost. Enter **0** only for genuinely free stock such as samples.
+- **Unit cost** (base currency). Leave blank to use the product's average cost: the average of the open layers in that warehouse, or, when that warehouse holds none, the average across the product's layers in every warehouse. It is **required for an addition when the product has no existing cost** at all, because stock booked at zero would be sold later at zero cost; the form then refuses with a message asking for a unit cost. Enter **0** only for genuinely free stock such as samples. (With the reason-and-unit-cost setting on, a blank cost is not an average at all; see below.)
+- **A value that rounds to 0.00 posts no journal** and raises nothing in the exception inbox, whether the stock is free (unit cost 0) or the removal consumed layers that cost nothing. The stock movement and the cost layers are still written.
 - Removals always take the cost of the oldest layers (FIFO), so no cost is asked for.
 
 **Removing stock that is reserved for orders.** A removal that is larger than the available stock (on hand minus reserved) is refused, with a message to release the reservations first. An administrator can switch on the setting `stock_adjustment_release_reserved` (off by default): a single removal, or a bulk batch of one line, then releases the allocations of the newest orders first, as far as the removal needs, in the same step, and records each release on the order. Allocations that a picked, packed or shipped shipment already covers, or that have already been posted to the accounts, are not released, and the removal is refused as before if that leaves too little. Transfers and purchase-order returns are not affected.
@@ -145,6 +146,8 @@ Click **Dispatch** on a draft to confirm that stock has left the source warehous
 
 Between dispatch and receipt, the stock is **in transit**. It is no longer available at the source warehouse and not yet available at the destination. In-transit stock does not count towards available stock at either location.
 
+Its **value** stays on the books: the daily inventory snapshot records one **in transit** line per transfer (the cost dispatched, plus any landed-cost revaluation while it was on the way, less the cost already received by any route), and the inventory ledger reconciliation compares the ledger with the stock on hand plus that line. A transfer still in transit therefore does not show as a gap between dispatch and receipt. Runs from before this was added are compared on stock on hand alone.
+
 ### Receiving
 
 An in-transit transfer has two ways to receive:
@@ -222,14 +225,25 @@ A return with some sellable and some unsellable items: record it with the condit
 
 ## FIFO and Cost Layers
 
-Every stock-in (purchase receipt, manufacturing output, transfer-in) creates a **cost layer** — a record of how much stock arrived at what unit cost, per warehouse. Every stock-out (sale, transfer-out, negative adjustment) consumes from the **oldest layer first** — strict FIFO. The system never picks layers out of order, and never lets a layer's remaining quantity go negative.
+A **cost layer** records how many units arrived in one warehouse, when, and at what unit cost (base currency). Layers belong to a product **and** a warehouse. They are laid by:
+
+- a purchase receipt, whether you receive it, the warehouse books it in, or a Mintsoft **Align To WMS** increase absorbs it against an open ASN (see [Warehouse (Mintsoft)](warehouse.md));
+- manufacturing output (a build order);
+- opening stock and any plain stock addition, at the unit cost described above;
+- a transfer receipt, which recreates the dispatched layers at the destination;
+- units restocked by a refund, at the cost of the units that shipped.
+
+Every stock-out takes from the **oldest layer first** in that warehouse (by the time the layer was received, then its internal id): a sale dispatch, a transfer dispatch, a negative adjustment, a stock-count shortage and a build order's components. The one exception is a **supplier return**, which takes only the layers of the purchase-order line being returned. A removal never takes more than the layers hold, and a layer's remaining quantity never goes negative.
 
 This means:
 
 - **COGS is deterministic**: the same set of movements always produces the same COGS values, regardless of when reports are run.
 - **Negative adjustments consume cost layers**: a write-off removes stock from the oldest layers and posts COGS at those layers' unit costs, not at today's price.
+- **Layers at zero cost are real layers.** Stock added at an entered cost of 0 (samples) or received at 0 is laid at 0 and later sells at 0. They are skipped only when IMS looks for a *default* cost for a blank addition (see above).
 - **Landed-cost edits update historical layers**: when you edit a freight PO weeks after receipt, the affected layers' unit costs are recalculated and the COGS already booked on prior shipments is reversed/re-posted via balanced journal entries.
-- **Transfers preserve cost layers**: when stock moves between warehouses, the cost layers move with it — the destination warehouse inherits the source's per-layer unit costs, not an averaged figure.
+- **Landed cost never takes a layer below zero.** A supplier credit or rebate (a negative landed-cost line) lowers the landed unit cost but the layer is floored at 0.00 per purchase-order line. What the floor cannot absorb is reported on the order and in the activity log (`landed_cost_credit_floored`); it stays a credit on Stock in Transit unless the administrator switch `landed_cost_floor_cogs_enabled` (off by default) is on, when it is cleared to cost of sales. See [Purchasing](purchasing.md).
+- **Transfers preserve cost layers**: when stock moves between warehouses, the cost layers move with it — the destination warehouse inherits the source's per-layer unit costs, not an averaged figure. A transfer layer is a copy of an old cost stamped as received now, so it is never used as the default cost for a blank addition.
+- **Reports**: **Inventory Aging** and **Slow Stock** read the open layers (see [Analytics](analytics.md)); the value columns are shown only to roles holding `inventory.prices`.
 
 If you ever see a cost-layer invariant failure in the activity log or the inventory invariant report (e.g. `cost_layer_negative_remaining_quantity`), that's a data-integrity issue requiring repair — never normal operation. See [Troubleshooting](troubleshooting.md).
 
