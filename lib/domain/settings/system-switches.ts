@@ -141,10 +141,10 @@ export const STOCK_ADJUSTMENT_REASON_COST_SWITCH_KEY = 'stock_adjustment_reason_
 // A removal larger than the available stock releases the newest orders' reservations (app/actions/stock.ts reads `=== 'true'`). ADMIN: it takes stock away from open orders. No prerequisite: the
 // release is decided case by case at the removal and refused when it cannot be done.
 export const STOCK_ADJUSTMENT_RELEASE_RESERVED_SWITCH_KEY = 'stock_adjustment_release_reserved'
-// Align-up books a rise in Mintsoft stock as a receipt only against an ASN the warehouse has touched (lib/connectors/mintsoft/settings/align-up-receipt-evidence.ts, `=== 'true'`). ADMIN: it changes
+// Align-up books a rise in the warehouse stock as a receipt only against an ASN the warehouse has touched (the connector settings module, `=== 'true'`). ADMIN: it changes
 // what align-up books on a LIVE warehouse. No prerequisite is encoded: the evidence is the ASN's own status or callback, which exists only once receipts have been reported, so there is nothing
 // to configure first (with it on and no evidence a rise stays a discrepancy for the operator).
-export const MINTSOFT_ALIGN_UP_EVIDENCE_SWITCH_KEY = 'mintsoft_align_up_requires_receipt_evidence' // wms-connector-boundary-ok: 2026-11-28: operator switch registry names the setting key
+export const WMS_ALIGN_UP_EVIDENCE_SWITCH_KEY = 'mintsoft_align_up_requires_receipt_evidence' // wms-connector-boundary-ok: 2026-11-28: operator switch registry names the setting key
 
 export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   booleanSwitch('trackship_refire_enabled'),
@@ -227,7 +227,7 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
     },
   },
   booleanSwitch(STOCK_ADJUSTMENT_RELEASE_RESERVED_SWITCH_KEY, undefined, true),
-  booleanSwitch(MINTSOFT_ALIGN_UP_EVIDENCE_SWITCH_KEY, undefined, true),
+  booleanSwitch(WMS_ALIGN_UP_EVIDENCE_SWITCH_KEY, undefined, true),
   booleanSwitch(SUPPLIER_CREATE_KEY, undefined, true),
   booleanSwitch(ASN_SEND_SUPPLIER_KEY, undefined, true),
   booleanSwitch(ASN_SUPPLIER_REQUIRED_KEY, [ASN_REQUIRED_NEEDS_SEND], true),
