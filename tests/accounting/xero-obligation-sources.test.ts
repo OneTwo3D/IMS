@@ -361,3 +361,20 @@ test('EVERY PAYLOAD-SOURCED TYPE declares the field its posting path dates the X
   assert.deepEqual([...declared].sort(), Object.keys(POSTING_PATH_FIELD).sort(), 'the independent table covers exactly the payload-sourced types')
   for (const type of declared) assert.equal(fieldOf(type), POSTING_PATH_FIELD[type], type)
 })
+
+/**
+ * #1130 review LOW-2: A RE-DATED SETTLEMENT KEEPS ITS DOCUMENT'S OBLIGATION. A refund payment moved to its cash-out day (o3d-l9gej) carries the credit note's
+ * own date in `creditNoteDate`; that is its business event (creditNoteDate ?? date), so a credit note raised before the cut-off and paid out after it stays on
+ * the before side. Present but unreadable does not fall through to `date`. Only CREDIT_NOTE_ALLOCATION declares such a field.
+ */
+test('CREDIT_NOTE_ALLOCATION: the obligation is creditNoteDate when the payload carries it, else date', async () => {
+  // Xeroom owns the settlement at P2, so the verdict alone cannot show the date; the resolved obligation time is what the decision is asked with.
+  const at = (payload: Record<string, unknown>) => xeroResolveObligationAt({} as ObligationParentReader, {
+    type: 'CREDIT_NOTE_ALLOCATION', payload, connector: 'xero', referenceType: 'SalesOrderRefund', referenceId: 'r1', env: XERO_ENV,
+  }).then((d) => d?.toISOString())
+  assert.equal(await at({ date: '2026-11-09', creditNoteDate: '2026-11-02' }), '2026-11-02T00:00:00.000Z', 'the credit note day decides, not the later cash-out day')
+  assert.equal(await at({ date: '2026-11-09' }), '2026-11-09T00:00:00.000Z', 'no creditNoteDate: date, as before')
+  assert.equal(await at({ date: '2026-11-09', creditNoteDate: 'soon' }), undefined, 'an unreadable creditNoteDate does not fall through')
+  const declaring = ALL_TYPES.filter((type) => { const s = XERO_OBLIGATION_SOURCES[type as AccountingSyncType]; return s.kind === 'payload' && s.documentField !== undefined })
+  assert.deepEqual(declaring, ['CREDIT_NOTE_ALLOCATION'])
+})

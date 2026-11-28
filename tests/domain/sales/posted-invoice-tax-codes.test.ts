@@ -143,3 +143,27 @@ test('every other invoice row retention compacts keeps only the document id it n
   assert.equal(invoiceRowTombstonePayload({ connector: 'qoblex', referenceType: 'SalesOrder', type: 'SALES_INVOICE_UPDATE', payload: { accountingInvoiceId: 'inv-1' } }), null, 'another connector compacts to {}')
   assert.equal(invoiceRowTombstonePayload({ connector: 'xero', referenceType: 'PurchaseOrder', type: 'SALES_INVOICE_UPDATE', payload: { accountingInvoiceId: 'inv-1' } }), null, 'another reference type compacts to {}')
 })
+
+test('shipping, the header discount and the no-rate part keep their posted code only while the order default is still the rate they were read from', () => {
+  const posted = postedTaxCodesFromPayload({ lines: [], shippingTaxType: 'S', shippingTaxRateId: 'D', discountTaxType: 'H', discountTaxRateId: 'D' })!
+  assert.equal(postedShippingTaxType(posted, 'D'), 'S')
+  assert.equal(postedShippingTaxType(posted, 'Z'), null, 'the default rate changed: the current code')
+  assert.equal(postedShippingTaxType(posted), 'S', 'no current default given: the refund reads the record as posted')
+  assert.equal(postedHeaderDiscountTaxType(posted, 'D'), 'H')
+  assert.equal(postedHeaderDiscountTaxType(posted, 'Z'), null)
+  const parts = postedTaxCodesFromPayload({ lines: [], discountTaxRateId: 'D', discountTaxType: 'H', discountParts: [{ amount: 1, taxType: 'P' }] })!
+  assert.equal(postedDiscountTaxType(parts, { taxRateId: null }, 'D'), 'P')
+  assert.equal(postedDiscountTaxType(parts, { taxRateId: null }, 'Z'), null)
+  // A WooCommerce zero-rated postage names its OWN rate, not the default.
+  assert.equal(postedShippingTaxType(postedTaxCodesFromPayload({ lines: [], shippingTaxType: 'ZERO', shippingTaxRateId: 'ZR' })!, 'D'), null)
+})
+
+test('a posted code re-sent by an update is read from the `…FromRateId` key the retired-code guard does not scan', () => {
+  const posted = postedTaxCodesFromPayload({
+    lines: [{ taxType: 'OLD', postedFromRateId: 'R', postedFromRateBasis: 'sales_line' }],
+    shippingTaxType: 'S', shippingPostedFromRateId: 'D', shippingPostedFromRateBasis: 'plain',
+  })!
+  assert.equal(postedLineTaxType(posted, 'R'), 'OLD')
+  assert.equal(postedShippingTaxType(posted, 'D'), 'S')
+  assert.deepEqual(posted.rateIdsByCode.get('OLD'), [{ rateId: 'R', basis: 'sales_line' }])
+})

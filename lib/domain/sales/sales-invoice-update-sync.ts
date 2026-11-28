@@ -100,6 +100,8 @@ export type QueueSalesInvoiceUpdateDeps = {
    * warning then commits or rolls back with the edit. Defaults to `logActivity`.
    */
   logShadowWarning?: LogActivity
+  /** Called with the enqueue's answer right after it is made (awaited): the caller's record that it only wants to write once the update is really queued. */
+  onEnqueued?: (outcome: { queued: boolean; reason?: string }) => Promise<void>
   /**
    * o3d-j625 r4 — the refusal, as OUTSTANDING work in the exception inbox rather than a log line an
    * operator has to already be reading. Injected like everything else this module uses.
@@ -245,6 +247,7 @@ export async function queueSalesInvoiceUpdateForExistingAccountingInvoice(
     chartConnector: params.chartConnector,
     documentConnector: params.documentConnector,
   })
+  await deps.onEnqueued?.(enqueued)
 
   // o3d-j625 r4 (Codex HIGH 4) — THE ANSWER DECIDES WHAT IS RECORDED.
   if (!enqueued.queued && enqueued.reason === 'not-configured') {

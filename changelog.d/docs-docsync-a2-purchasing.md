@@ -1,0 +1,2 @@
+### Purchasing docs synced with the code (docs)
+- `help-docs/purchasing.md`, `docs/architecture.md`, `docs/agent/overview.md` and the purchase-FX entry of `docs/installation.md` corrected against the code (per-event FX interlock, bills posted outside IMS, prepayment total warning, credit-note rates, prepaid reconciliation banner, bill-edit rate, AP aging net payable, PO statuses, FX source). Docs only; nothing changes at run time.

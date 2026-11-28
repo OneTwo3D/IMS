@@ -16,7 +16,7 @@ import {
   priceSnapshottedTaxIdentity,
   type PostedRefundTaxRate,
 } from '@/lib/domain/sales/refund-posted-tax-identity'
-import { postedAwareRateIndex, postedTaxTypeByLineId, type PostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
+import { postedAwareRateIndex, postedHeaderDiscountTaxType, postedShippingTaxType, postedTaxTypeByLineId, type PostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export function creditNoteLineFacts(input: {
@@ -31,6 +31,8 @@ export function creditNoteLineFacts(input: {
   taxRates: readonly { accountingTaxType?: string | null; rate?: DecimalInput }[]
   refundLines: readonly {
     salesOrderLineId: string | null
+    /** 'sale' | 'shipping' | 'discount': a no-snapshot shipping or discount line is read on the posted shipping / header discount code. */
+    lineKind?: string | null
     accountingTaxType?: string | null
     /** The rate (a fraction) the line's tax code carried when the refund was created (`SalesOrderRefundLine.postedTaxRate`); NULL on an older row. */
     postedTaxRate?: DecimalInput | null
@@ -43,10 +45,12 @@ export function creditNoteLineFacts(input: {
     reverseChargeSalesTaxType: input.reverseChargeSalesTaxType,
     orderDefaultTaxType: input.orderDefaultTaxType,
     postedTaxTypeByLineId: postedTaxTypeByLineId(input.orderLines, input.postedCodes ?? null),
+    shippingTaxType: postedShippingTaxType(input.postedCodes ?? null),
+    headerDiscountTaxType: postedHeaderDiscountTaxType(input.postedCodes ?? null),
   })
   const rateByTaxType = postedAwareRateIndex(input.taxRates, input.postedCodes ?? null)
   return input.refundLines.map((line) => {
-    const taxType = taxTypeOf({ accountingTaxType: line.accountingTaxType, lineId: line.salesOrderLineId })
+    const taxType = taxTypeOf({ accountingTaxType: line.accountingTaxType, lineId: line.salesOrderLineId, lineKind: line.lineKind })
     // o3d-hqvrp.321: the rate STORED at creation wins, so a tax mapping edited since cannot change a posted credit note's VAT or gross. Only a refund with none stored (older rows) is priced from the current table, and says so.
     const stored = line.postedTaxRate == null ? null : toDecimal(line.postedTaxRate)
     const priced = stored === null && taxType ? priceSnapshottedTaxIdentity({ accountingTaxType: taxType, rateByTaxType, label: 'credit note line' }) : null

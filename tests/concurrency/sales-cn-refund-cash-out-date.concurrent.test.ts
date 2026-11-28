@@ -24,6 +24,8 @@ const RATE_CASH_DAY = 1.2
 
 type Refund = { creditNoteId: string; accountId: string; amount: number; date: string; currencyRate?: number; reference: string }
 const refunds: Refund[] = []
+const allocations: Array<{ creditNoteId: string; amount: number; date: string }> = []
+let amountDue = 0
 const creditNotes = new Map<string, { remaining: number; payments: Array<{ PaymentID: string; Amount: number; Status: string; PaymentType: string }> }>()
 
 async function load() {
@@ -51,7 +53,11 @@ async function load() {
       ...credit,
       readCreditNoteSettlementBalances: async (creditNoteId: string) => {
         const cn = creditNotes.get(creditNoteId)
-        return { ok: true, remainingCredit: cn?.remaining ?? 0, amountDue: 0, amountPaid: 50, creditNoteStatus: 'AUTHORISED', creditNoteTotal: 40, invoiceStatus: 'PAID' }
+        return { ok: true, remainingCredit: cn?.remaining ?? 0, amountDue, amountPaid: 50, creditNoteStatus: 'AUTHORISED', creditNoteTotal: 40, invoiceStatus: 'PAID' }
+      },
+      allocatePurchaseCreditNote: async (params: { creditNoteId: string; amount: number; date: string }) => {
+        allocations.push(params)
+        return { success: true }
       },
       refundSalesCreditNote: async (params: Refund) => {
         refunds.push(params)
@@ -95,7 +101,7 @@ test.after(() => { if (OUTBOX_BEFORE_THIS_FILE === undefined) delete process.env
 type Seeded = { orderId: string; refundId: string; creditNoteId: string; invoiceId: string; accountId: string }
 
 /** One XFX order (booked at 1.05), its paid invoice (50 received), one refund of 40 with its posted credit note, and the refund payment the operator recorded. */
-async function seed(d: Deps, t: { after: (fn: () => Promise<void>) => void }, opts: { cashOutFlag: string | null; refundPaidAt: Date; gateway?: boolean }): Promise<Seeded> {
+async function seed(d: Deps, t: { after: (fn: () => Promise<void>) => void }, opts: { cashOutFlag: string | null; refundPaidAt: Date; gateway?: boolean; refundPayments?: Array<{ amount: number; paidAt: Date }> }): Promise<Seeded> {
   process.env.XERO_ACCOUNTING_OUTBOX_ENABLED = 'true'
   await d.db.$executeRaw`DELETE FROM "xero_settlement_call_budget"`
   const tag = `cnd${randomUUID().slice(0, 8)}`
@@ -137,7 +143,9 @@ async function seed(d: Deps, t: { after: (fn: () => Promise<void>) => void }, op
   })
   if (!opts.gateway) {
     // The refund payment as the Payments dialog records a picked date: midnight UTC, no explicit instant.
-    await d.db.payment.create({ data: { orderId: order.id, refundId: refund.id, amount: 40, currency: CCY, method: 'stripe', paidAt: opts.refundPaidAt, paidAtExplicitInstant: null } })
+    for (const p of opts.refundPayments ?? [{ amount: 40, paidAt: opts.refundPaidAt }]) {
+      await d.db.payment.create({ data: { orderId: order.id, refundId: refund.id, amount: p.amount, currency: CCY, method: 'stripe', paidAt: p.paidAt, paidAtExplicitInstant: null } })
+    }
   }
   await d.db.accountingSyncLog.create({
     data: { connector: 'xero', type: 'CREDIT_NOTE', status: 'SYNCED', referenceType: 'SalesOrderRefund', referenceId: refund.id, externalTransactionId: creditNoteId, payload: { date: CN_DATE }, attemptStampingCustodyAt: new Date() } as never,
@@ -162,9 +170,10 @@ async function seed(d: Deps, t: { after: (fn: () => Promise<void>) => void }, op
 }
 
 /** The settlement row as the sweep raises it (no decision yet), or with an earlier, unsent decision of its own (`extra`). */
-async function writeRow(d: Deps, s: Seeded, extra: Record<string, unknown> = {}) {
+async function writeRow(d: Deps, s: Seeded, extra: Record<string, unknown> = {}, row: { remoteAttemptedAt?: Date } = {}) {
   const created = await d.db.accountingSyncLog.create({
     data: {
+      ...row,
       connector: 'xero', type: 'CREDIT_NOTE_ALLOCATION', status: 'PENDING', referenceType: 'SalesOrderRefund', referenceId: s.refundId,
       payload: { creditNoteId: s.creditNoteId, accountingInvoiceId: s.invoiceId, refundId: s.refundId, orderId: s.orderId, date: CN_DATE, sourceEntryId: `test-${randomUUID().slice(0, 6)}`, ...extra },
       attemptStampingCustodyAt: new Date(), createdAt: ancient(),
@@ -177,6 +186,8 @@ async function writeRow(d: Deps, s: Seeded, extra: Record<string, unknown> = {})
 
 function reset() {
   refunds.length = 0
+  allocations.length = 0
+  amountDue = 0
   creditNotes.clear()
 }
 
@@ -254,3 +265,114 @@ test('[l9gej] switched OFF again: an UNSENT row that was re-dated goes back to t
   assert.equal(payload.date, CN_DATE)
   assert.equal(payload.settlementRateToBase, RATE_CN_DAY)
 })
+
+// ─── #1130 review MED-4 ───────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+
+/** A full decision as a claim under the switch pinned it (`date` and the rate of that day), for a row replayed as it is. */
+const fullPin = (s: Seeded, date: string, rate: number, extra: Record<string, unknown> = {}) => ({
+  date, operation: 'REFUND_PAYMENT', amount: 40, currency: CCY, bankAccountId: s.accountId, paymentMethod: 'stripe', cashEvidence: 'RECORDED', rateDecided: true,
+  settlementRateToBase: rate, ...extra,
+})
+const ATTEMPTED = { remoteAttemptedAt: new Date('2026-11-10T10:00:00Z') }
+
+test('[#1130 MED-4] an ATTEMPTED row decided with the switch ON, then the switch turned OFF: replayed exactly on its cash-out date, never restored', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  const s = await seed(d, t, { cashOutFlag: 'false', refundPaidAt: new Date(`${CASH_DATE}T00:00:00Z`) })
+  const row = await writeRow(d, s, fullPin(s, CASH_DATE, RATE_CASH_DAY, { creditNoteDate: CN_DATE }), ATTEMPTED)
+  const { sent, row: after, payload } = await sentFor(d, s, row.id)
+  assert.equal(sent.length, 1, `the replay went out (${after.errorMessage ?? ''})`)
+  assert.equal(sent[0]!.date, CASH_DATE, 'its call may have landed on that date: the ledger fence and the replay keep it')
+  assert.equal(payload.date, CASH_DATE)
+  assert.equal(payload.settlementRateToBase, RATE_CASH_DAY)
+})
+
+test('[#1130 MED-4] an ATTEMPTED row decided with the switch OFF, then the switch turned ON: replayed exactly on the credit note\'s date, never re-dated', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  const s = await seed(d, t, { cashOutFlag: 'true', refundPaidAt: new Date(`${CASH_DATE}T00:00:00Z`) })
+  const row = await writeRow(d, s, fullPin(s, CN_DATE, RATE_CN_DAY), ATTEMPTED)
+  const { sent, row: after, payload } = await sentFor(d, s, row.id)
+  assert.equal(sent.length, 1, `the replay went out (${after.errorMessage ?? ''})`)
+  assert.equal(sent[0]!.date, CN_DATE)
+  assert.equal(payload.date, CN_DATE)
+  assert.equal(payload.settlementRateToBase, RATE_CN_DAY)
+  assert.equal('creditNoteDate' in payload, false)
+})
+
+test('[#1130 MED-1] an ATTEMPTED row pinned before rateDecided existed (so not replayed), switch ON: decided again but NOT re-dated', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  const s = await seed(d, t, { cashOutFlag: 'true', refundPaidAt: new Date(`${CASH_DATE}T00:00:00Z`) })
+  const row = await writeRow(d, s, { operation: 'REFUND_PAYMENT', amount: 40, currency: CCY, bankAccountId: s.accountId, paymentMethod: 'stripe' }, ATTEMPTED)
+  const { sent, row: after, payload } = await sentFor(d, s, row.id)
+  assert.equal(sent.length, 1, `one refund payment went out (${after.errorMessage ?? ''})`)
+  assert.equal(sent[0]!.date, CN_DATE, 'the date its earlier call may have landed on: the ledger fence looks there')
+  assert.equal(payload.date, CN_DATE)
+  assert.equal('creditNoteDate' in payload, false, 'no re-date was pinned')
+})
+
+test('[#1130 MED-4] switch ON, the cash-out day\'s rate is unusable: refused, nothing pinned, nothing sent', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  const s = await seed(d, t, { cashOutFlag: 'true', refundPaidAt: new Date(`${CASH_DATE}T00:00:00Z`) })
+  // The latest row as of the cash-out day is a bad one (zero): the lookup refuses rather than fall back to an older rate.
+  await d.db.fxRate.create({ data: { fromCurrency: 'GBP', toCurrency: CCY, rate: 0, fetchedAt: new Date(`${CASH_DATE}T10:00:00Z`), source: 'manual', manualOverride: true } })
+  const row = await writeRow(d, s)
+  const { sent, row: after, payload } = await sentFor(d, s, row.id)
+  assert.equal(sent.length, 0, 'nothing went out')
+  assert.notEqual(after.status, 'SYNCED')
+  // The refusal is the outbox delivery's error (retried later), not a decision written on the row.
+  const delivery = await d.db.integrationOutbox.findMany({ where: { idempotencyKey: { contains: row.id } }, select: { lastError: true } })
+  assert.ok(delivery.some((o) => /Refund payment not sent: .*FX rate/.test(o.lastError ?? '')), `refused on the cash-out day's rate: ${JSON.stringify(delivery)}`)
+  assert.equal(payload.date, CN_DATE, 'the row keeps the credit note\'s date')
+  for (const key of ['creditNoteDate', 'rateDecided', 'amount', 'settlementRateToBase']) assert.equal(key in payload, false, `${key} is not pinned`)
+})
+
+test('[#1130 MED-4] several recorded refund payments: the LATEST paidAt is the cash-out day', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  const s = await seed(d, t, {
+    cashOutFlag: 'true', refundPaidAt: new Date(`${CASH_DATE}T00:00:00Z`),
+    refundPayments: [{ amount: 20, paidAt: new Date(`${CASH_DATE}T00:00:00Z`) }, { amount: 20, paidAt: new Date('2026-11-05T00:00:00Z') }],
+  })
+  const row = await writeRow(d, s)
+  const { sent, row: after, payload } = await sentFor(d, s, row.id)
+  assert.equal(sent.length, 1, `one refund payment went out (${after.errorMessage ?? ''})`)
+  assert.equal(sent[0]!.amount, 40, 'their sum')
+  assert.equal(sent[0]!.date, CASH_DATE, 'the later of the two, whatever order they were recorded in')
+  assert.equal(payload.settlementRateToBase, RATE_CASH_DAY)
+})
+
+test('[#1130 MED-4] the refund payment\'s paidAt is edited after an unsent decision: the row is decided again on the new day', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  const s = await seed(d, t, { cashOutFlag: 'true', refundPaidAt: new Date(`${CASH_DATE}T00:00:00Z`) })
+  const row = await writeRow(d, s, fullPin(s, CASH_DATE, RATE_CASH_DAY, { creditNoteDate: CN_DATE }))
+  await d.db.payment.updateMany({ where: { refundId: s.refundId }, data: { paidAt: new Date('2026-11-12T00:00:00Z') } })
+  const { sent, row: after, payload } = await sentFor(d, s, row.id)
+  assert.equal(sent.length, 1, `one refund payment went out (${after.errorMessage ?? ''})`)
+  assert.equal(sent[0]!.date, '2026-11-12')
+  assert.equal(payload.date, '2026-11-12')
+  assert.equal(payload.creditNoteDate, CN_DATE)
+})
+
+test('[#1130 LOW-1] an unsent row re-dated under the switch that now needs an ALLOCATE goes back to the credit note\'s date', { skip }, async (t) => {
+  const d = await deps()
+  reset()
+  const s = await seed(d, t, { cashOutFlag: 'true', refundPaidAt: new Date(`${CASH_DATE}T00:00:00Z`) })
+  // The receipts are removed after the decision: IMS now holds no receipt evidence for the invoice, so the settlement is an ALLOCATE.
+  await d.db.payment.deleteMany({ where: { orderId: s.orderId } })
+  await d.db.salesOrder.update({ where: { id: s.orderId }, data: { paidAt: null } })
+  amountDue = 40
+  const row = await writeRow(d, s, fullPin(s, CASH_DATE, RATE_CASH_DAY, { creditNoteDate: CN_DATE }))
+  await d.processor.processPendingXeroSync()
+  const after = await d.db.accountingSyncLog.findUniqueOrThrow({ where: { id: row.id }, select: { payload: true, errorMessage: true } })
+  const payload = after.payload as Record<string, unknown>
+  assert.equal(payload.operation, 'ALLOCATE', `decided again as an allocation (${after.errorMessage ?? ''})`)
+  const sent = allocations.filter((a) => a.creditNoteId === s.creditNoteId)
+  assert.equal(sent.length, 1, 'the allocation went out')
+  assert.equal(sent[0]!.date, CN_DATE, 'the stale cash-out date did not carry into the allocation')
+  assert.equal(payload.date, CN_DATE)
+})
+

@@ -163,7 +163,12 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   booleanSwitch('xero_credit_note_duplicate_check_enabled'),
   // o3d-l9gej: a recorded refund payment against a sales credit note is dated and rated on the day its cash went out, not the credit note's day. Literal, not an
   // import of lib/domain/accounting/credit-note-allocation.ts; tests hold it equal to REFUND_CASH_OUT_DATE_SETTING_KEY.
-  booleanSwitch('xero_refund_payment_cash_out_date_enabled'),
+  // #1130 review LOW-6: it re-dates only the settlement rows that `xero_credit_note_allocation_enabled` posts, so that switch is its prerequisite.
+  booleanSwitch('xero_refund_payment_cash_out_date_enabled', [{
+    key: 'xero_credit_note_allocation_enabled',
+    value: 'true',
+    why: 'the cash-out date applies to the refund payments the credit-note settlement posts; with settlement off there is nothing for it to date',
+  }]),
   // Unpaid-invoice deferral (FRS 102 s23.10): Group A1 also defers the unshipped revenue of an UNPAID order whose AUTHORISED invoice IMS posted after the switch went on, from
   // the invoice's document day. ADMIN: it changes the journals IMS posts to the LIVE ledger. Turning it ON stamps the instant (`stampOnKey`): only invoices posted
   // at or after it are deferred, so invoices already open stay in Sales (no backfill). Literals, not imports of lib/domain/accounting/invoice-basis-deferral.ts
