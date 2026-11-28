@@ -938,7 +938,8 @@ test('staleness (#1164 LOW-5..11): tenant mismatch, NULL tenant and pre-freeze r
   assert.equal((history[0]!.snapshot as { approvedBy: string; staleReason: string }).approvedBy, 'Jan')
   // A NULL tenant, and a row confirmed before the basis was frozen, are stale.
   for (const [label, data] of [['tenant', { xeroTenantId: null }], ['pre-freeze', { stockUnits: Prisma.DbNull, billFingerprint: null }]] as const) {
-    await s.db.purchaseFxNonImsBillApproval.update({ where: { invoiceId: qoblex.id }, data: { staleAt: null, staleReason: null, xeroTenantId: 'tenant-pfr', billFingerprint: first.billFingerprint, stockUnits: first.stockUnits as never, ...data } as never })
+    const reset: Record<string, unknown> = { staleAt: null, staleReason: null, xeroTenantId: 'tenant-pfr', billFingerprint: first.billFingerprint, stockUnits: first.stockUnits }
+    await s.db.purchaseFxNonImsBillApproval.update({ where: { invoiceId: qoblex.id }, data: Object.assign(reset, data) as never })
     const r = await withXeroPosting(() => withXeroToken(() => rerunPurchaseBillFx(po.id)))
     assert.deepEqual((r.stale ?? []).map((x) => x.held), [false], label)
     assert.match((await s.db.purchaseFxNonImsBillApproval.findUniqueOrThrow({ where: { invoiceId: qoblex.id } })).staleReason ?? '', /before its basis was frozen/, label)
