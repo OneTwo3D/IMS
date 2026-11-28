@@ -44,7 +44,7 @@ onetwo3d-ims/
 │   │   │   ├── delivery-status # Update delivery status on SalesOrders
 │   │   │   ├── activity-cleanup # Archive old activity logs
 │   │   │   ├── backup        # Automated database backups
-│   │   │   └── ...           # ~40 routes in total; the scheduled ones are registered in lib/cron-jobs/
+│   │   │   └── ...           # 38 routes in total; the scheduled ones are registered in lib/cron-jobs/
 │   │   ├── webhooks/         # shopping/[connector] (WooCommerce order, product, refund webhooks) and mintsoft/asn-booked-in
 │   │   ├── export/           # CSV exports (products, sales, POs, stock, etc.)
 │   │   ├── import/           # CSV imports and historical order import
@@ -152,11 +152,13 @@ onetwo3d-ims/
    - Links to sales orders for made-to-order workflows
 
 5. **Integrations** — Connector modules for data sync:
-   - **WooCommerce** — Order sync via webhooks (or polling), product sync, tax rate mapping to Xero
-   - **Xero** — Daily batch journal entry posting, sub-ledger sync, COGS calculation, payment reconciliation
+   - **WooCommerce** — Order sync via webhooks (or polling), refund sync, product sync, IMS-to-store stock push, tax rate mapping to Xero
+   - **Xero** — Daily batch journal entry posting, sales invoices, credit notes and bills, sub-ledger sync, COGS calculation, payment reconciliation; rate-limited at 950 calls per rolling 24 hours
+   - **Mintsoft** (warehouse / 3PL, behind the connector-agnostic `lib/connectors/wms/` boundary) — order push, despatch poll, ASNs, returns inbox, stock sync and align
+   - Every write toward these systems passes the outbound-write hold and the producer-side hold (`PRODUCER_HOLD_ENFORCED_DESTINATIONS`); the QuickBooks, Shopify and ShipHero connectors have been removed
 
 6. **Financial Module** — Multi-currency and reporting:
-   - Daily FX rates auto-fetch from frankfurter.dev (ECB data)
+   - Daily FX rates into `fx_rates`, from the source `fx_rate_source` selects (ECB via frankfurter.dev, or Aelia)
    - VAT handling (inclusive/exclusive) with named tax rates
    - Xero account mapping for stock, COGS, and revenue recognition
    - COGS/margin analytics and reporting
@@ -182,7 +184,7 @@ FX rates (daily via frankfurter.dev) → Multi-currency conversions
 
 ## Database
 
-**167 Prisma models** (managed with migrations). The grouped lists below are a historical sketch: several names no longer exist (for example ProductVariant, Stock, Invoice/CreditNote, ManufacturingOrder, AccountingSync, the WooCommerce* and Xero* config/log models), so use `prisma/schema.prisma` for real names (StockLevel, ProductionOrder, AccountingSyncLog, ShoppingSyncLog, WmsSyncLog, PurchaseInvoice, ...):
+**170 Prisma models** (managed with migrations). The grouped lists below are a historical sketch: several names no longer exist (for example ProductVariant, Stock, Invoice/CreditNote, ManufacturingOrder, AccountingSync, the WooCommerce* and Xero* config/log models), so use `prisma/schema.prisma` for real names (StockLevel, ProductionOrder, AccountingSyncLog, ShoppingSyncLog, WmsSyncLog, PurchaseInvoice, ...):
 
 **Product & Inventory:**
 - Product, ProductVariant, ProductPrice, ProductBundle
@@ -204,8 +206,9 @@ FX rates (daily via frankfurter.dev) → Multi-currency conversions
 - AccountingSync (journal entries, COGS tracking)
 
 **Integrations:**
-- WooCommerceConfig, WooCommerceProduct, WooCommerceSyncJob, WooCommerceTaxMap
-- XeroMapping, XeroSyncLog, XeroPaymentPoll
+- Shopping (WooCommerce): ShoppingSyncLog, ShoppingWebhookEvent, ShoppingOrderLink, ShoppingProductLink, ShoppingCustomerLink, ShoppingTaxRateMapping, ShoppingStatusMapping
+- Accounting (Xero): AccountingSyncLog, AccountingEvent, AccountingToken, AccountingAccount, XeroTaxRate, XeroPaymentMatch
+- Warehouse (Mintsoft): WmsConnection, ExternalWmsBinding, WmsOrderPushLink, WmsAsnMap, WmsProductLink, WmsReturnsInbox, WmsStockDiscrepancy, WmsSyncJob
 
 **Administration:**
 - User, Role, Session (NextAuth)

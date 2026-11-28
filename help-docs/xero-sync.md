@@ -435,7 +435,7 @@ permission:
   when the recorded grant lacks the trial-balance permission. **Installations connected before this
   permission was added must reconnect once** to grant it; until then no balance snapshot is stored.
 - The fix is always the same: **Reconnect** on the Connection tab and approve the consent screen. Then
-  retry the failed rows from the **Logs** tab.
+  retry the failed rows from the **Sync Log** on the **Sync** tab.
 
 A connection made before IMS started recording grants has no record of its permissions. Those are
 treated as *unknown*, not as *missing* — nothing is blocked, and the record fills in on the next
@@ -872,7 +872,7 @@ document IMS cannot recognise and refuses. Open the invoice in Xero, confirm it 
 order, link it to the order, and the next retry updates it instead of replacing it.
 
 And the check costs one extra Xero API call per sales-invoice create, which counts against the
-1,000-call rolling daily limit.
+rolling daily call limit (see *Call budget* under Cron Endpoints).
 
 > **Cutover note.** Xeroom posts the *same* numbers to the *same* Xero organisation, and it is being
 > removed rather than run alongside IMS — so the check above is not there to referee two live
@@ -2437,6 +2437,8 @@ It is **compacted** instead: at the retention cutoff the row keeps its connector
 external id, and loses its payload and error message — the parts holding customer details, addresses
 and financial lines. Nothing is retained past the retention period in full.
 
+The one exception to "loses its payload" is a **posted invoice record**. The connector-confirmed Xero sales invoice and invoice-update rows of an order are never deleted, and past the window their payload is reduced to a projection instead of being emptied: the tax codes the invoice was posted with and the rate each was read from, the document's id, number, date, currency and amounts, the line quantities and account codes, and the origin stamp and posting mode. Customer name and email, line descriptions and the reference are removed. Any other Xero invoice or update row of an order that names its document keeps only that document id and the origin stamp when it is compacted, so a compacted newer update still counts as the newest row for that document. Every other row compacts to an empty payload as described above.
+
 A compacted row is **still a repair candidate**, and the split is by what each piece of work needs
 rather than by the row as a whole. Everything the id write reads — the reference and the external
 id — survives compaction, so the sweep can still link the order or bill, including one whose
@@ -2504,6 +2506,13 @@ settles expire normally.
 | `/api/cron/xero-chart-sync` | Daily (00:30 by default) | Refresh the stored Xero chart of accounts (read-only) before the balance snapshot |
 | `/api/cron/account-balance-snapshot` | Daily (01:00 by default) | Snapshot Xero account balances for period reporting |
 | `/api/cron/xero-tax-rate-drift` | Hourly | Read the full Xero tax-rate list into the tax-rate master store (rows, header and read-sync stamp in one transaction) and record IMS-vs-Xero tax-rate drift |
+
+### Call budget and run budget
+
+Two different limits apply, and they are not the same thing:
+
+- **Xero's call limit.** Xero allows 1,000 API calls per organisation per **rolling** 24 hours (not a midnight reset) and 60 per minute. IMS counts its own calls per organisation and stops at **950 per rolling day and 55 per minute**, leaving a reserve. A call that would pass the daily cap is refused before it is sent and costs no budget. A posting refused that way does not fail the row or spend a retry: it is handed back and re-run once calls have fallen out of the window, and leaves the Activity-log warning `xero_sync_transport_refused_before_post` (see the retry notes below). A minute-cap hit waits out the minute, up to 60 seconds, instead. A Xero 429 that asks for a wait longer than 90 seconds is not slept on: the work is deferred instead. Checks such as the invoice-number ownership check cost one call each.
+- **The cron run budget.** The seven jobs that call Xero (`accounting-sync`, `accounting-daily-batch`, `accounting-payment-poll`, `accounting-payment-reconcile`, `xero-tax-rate-drift`, `account-balance-snapshot`, `xero-chart-sync`) are also held to a rolling daily number of **runs** per job (its scheduled runs per day plus a quarter and two spare, never above 500), whatever address the request comes from, so a leaked `CRON_SECRET` cannot multiply runs. A refused run answers `429` with `Retry-After`. This limits runs, not Xero calls.
 
 All cron endpoints require the `CRON_SECRET` bearer header in production. These jobs are switched on and timed on **Settings > System > Scheduler**; after an upgrade that adds or retimes one (the chart refresh is new, the tax-rate drift check is hourly), press **Save & Apply** there once so it reaches the crontab. See [Settings](settings.md#cron-jobs).
 
@@ -2585,12 +2594,13 @@ The sync log at **Integrations → Xero** shows queued transactions for the **cu
 
 - **Pending** — Queued, waiting for next cron run
 - **Synced** — Successfully pushed to Xero (shows Xero transaction ID)
+- **Processing** — Claimed by a run that is posting it now
 - **Failed** — Failed after 5 retries (shows error message)
 
 - **Cancelled** (shown as **Retired**) — the row was taken out of the queue rather than completed. Usually nothing was posted (a sales order cancelled before its invoice went out, an orphaned queue row swept up). **Sometimes something was**: when the repair sweep retires a row because the sale is not live, the Xero document it names is real and is kept on the row on purpose. No sweep re-queues a retired row.
 - **Cancelled, with the reason "Not sent by IMS: writes to Xero are held on this installation (…)"** — a *shadow*. A held WooCommerce sales invoice whose release the hold shadowed is closed (its queue row reads "Closed as a shadow") and raises no posting refusal; the daily-batch rebuild sweep blocks quietly over a shadowed batch rather than reporting it every run. The producer-side hold recorded what IMS would have queued instead of queuing it (see "Producer-side hold" in the installation guide). It has no Xero document id, was never claimable, has no outbox job and no accounting event, and carries a **shadow** badge on this page whose tooltip says IMS did not send it. It says nothing about whether the owner it names (Xeroom, Qoblex's own Xero integration, an operator working by hand) wrote the document to Xero, so it counts as **unproven**, not as absent: deleting an order, deleting a payment receipt, reversing or re-posting over a shadow is refused until Xero itself has been checked. A queued entry that already existed when the hold was switched on is not changed, but it is handed back unsent (activity `xero_sync_producer_held_before_post`) instead of being posted while the hold says it may not be. An entry that is only waiting for the owner's confirmation (Qoblex has not been confirmed stopped, or the confirmation has not been read yet) is not claimed at all: it stays Pending, its queue job is offered again every minute or two with no attempt spent and its last error shows the same sentence, and it goes out once the confirmation is recorded. Shadows exist only on an installation that names Xero in `PRODUCER_HOLD_ENFORCED_DESTINATIONS`; the same piece of work produced again is counted on one shadow record rather than added as another row, and Retry and Retry All never touch a shadow (they only touch Failed rows). A Failed entry that the hold would now shadow is not retried either (Retry and Retry All leave it Failed and name the hold), and neither the automatic follow-up revival nor the daily-batch reset turns it back into queued work. **The shadow row expires with the sync-log retention period, the shadow record does not.** Once the row has been deleted, deleting an order, correcting a stored invoice number and editing a posted stock adjustment are still refused, from the persistent shadow record, with the same unproven wording. One gap is known and tracked: deleting a payment receipt after the shadow row has expired is not yet refused on the shadow record, because that record does not yet carry the payment it was for.
 
-Failed entries can be investigated via the error message and retried by resetting their status in the database.
+Failed entries can be investigated via the error message and retried from the log itself: each failed row has a **Retry this entry** control, and **Retry All Failed…** at the top re-queues every failed row after a confirmation that explains the cost if the first attempt had actually landed. **Process Pending Now** runs the queue without waiting for the next cron run. Retrying a payment is checked against the ledger first (see *When a Retry Is Refused*).
 
 #### Releasing a retired row after the sale comes back
 
