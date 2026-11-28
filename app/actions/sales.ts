@@ -141,7 +141,7 @@ import { NO_TAX_TYPE, connectorEmitsDiscount, connectorEmitsShipping, droppedExt
 import { describeAllocationAttempt } from '@/lib/domain/sales/allocation-activity'
 import { matchContinuedOrderLines } from '@/lib/domain/sales/order-edit-lines'
 import { resolveOrderEditWmsGate } from '@/lib/domain/sales/order-edit-wms-gate'
-import { SalesInvoiceDoesNotReconcileError, SalesInvoiceOriginalDateUnknownError, SalesInvoiceExtraNotMappedError, SalesInvoiceDiscountSplitError, SalesInvoiceDiscountSplitTaxCodeError, SalesInvoiceNotQueuedError, SalesInvoiceReverseChargeSwapNotSetError, reverseChargeSwapMissing, assertInvoiceQueuedOrNotOwed, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
+import { SalesInvoiceDoesNotReconcileError, SalesInvoiceOriginalDateUnknownError, SalesInvoiceExtraNotMappedError, SalesInvoiceDiscountSplitError, SalesInvoiceDiscountSplitTaxCodeError, SalesInvoicePostedCodesAmbiguousError, SalesInvoiceNotQueuedError, SalesInvoiceReverseChargeSwapNotSetError, reverseChargeSwapMissing, assertInvoiceQueuedOrNotOwed, invoiceReconciliationProblem } from '@/lib/domain/sales/sales-invoice-reconciliation'
 import {
   INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
   STORED_INCLUSIVE_PRICES_WITHOUT_ORDER_RATE_MESSAGE,
@@ -150,7 +150,7 @@ import {
 } from '@/lib/domain/sales/sales-order-vat-basis'
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import { refreshedDiscountSplit } from '@/lib/domain/sales/discount-tax-split-codes'
-import { postedAwareRateIndex, postedShippingTaxType, postedTaxTypeByLineId, readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
+import { postedAwareRateIndex, postedCodesAmbiguityRefusal, postedDiscountTaxType, postedHeaderDiscountTaxType, readPostedInvoiceRecord, updateLineTaxType, postedShippingTaxType, postedTaxTypeByLineId, readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { discountSplitEntryTaxType, discountSplitTaxCodeRefusal, invoiceDiscountParts, parseDiscountTaxSplit, type DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
 import { decideChargebackOrderDiscount, resolvePostedOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
 import { claimDocumentNumber, mintCommittedDocumentNumber, retryWhenNumberTaken } from '@/lib/domain/numbering/mint'
@@ -2185,18 +2185,25 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   // Each group's code is read from its rate now (refreshedDiscountSplit), as the goods lines' codes are and as the finalisation check reads it, so the two cannot disagree.
   const storedDiscountSplit = discountForeign > 0 ? parseDiscountTaxSplit(so.discountTaxSplit) : null
   const discountSplit = storedDiscountSplit ? await refreshedDiscountSplit(reader, storedDiscountSplit) : null
+  // AN UPDATE OF A POSTED INVOICE KEEPS ITS POSTED CODES (owner ruling: a later remap only affects new invoices). Each line whose VAT rate the posted record names is sent on the code that rate's lines were posted
+  // on; a new rate, a line with no rate and the no-tax fee take the current code. The same for the discount's per-rate parts, the single header-rate discount and shipping. With no usable record (none, an update in
+  // flight, an unreadable one) every code is the current one, as before, and the update writes an activity WARNING saying so (below). A first post has no accounting invoice id and reads nothing.
+  const postedRecord = so.accountingInvoiceId ? await readPostedInvoiceRecord(reader, so.id, so.accountingInvoiceId, { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }) : null
+  const posted = postedRecord?.codes ?? null
+  const postedAmbiguity = postedCodesAmbiguityRefusal(posted, [...so.lines.map((l) => l.taxRateId), ...(storedDiscountSplit ?? []).map((entry) => entry.taxRateId)])
+  if (postedAmbiguity) throw new SalesInvoicePostedCodesAmbiguousError(postedAmbiguity, so.currency)
   const discountPartsOrNull = discountSplit
     ? invoiceDiscountParts({
         split: discountSplit,
         lineAmountsIncludeTax,
         totalAmount: discountForeign,
-        taxTypeOf: (entry) => discountSplitEntryTaxType(entry, { orderDefaultTaxType, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }),
+        taxTypeOf: (entry) => postedDiscountTaxType(posted, entry) ?? discountSplitEntryTaxType(entry, { orderDefaultTaxType, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }),
       })
     : []
   if (discountPartsOrNull === null) throw new SalesInvoiceDiscountSplitError(discountForeign, so.currency)
   // A group with no tax code would reach the sync processor and be refused there ("NOTHING WAS SENT"): refused here, so the create, edit or finalisation that queues it is rolled back with a reason.
   // The same rule the save and the finalisation ask first (discountSplitTaxCodeRefusalFor); this is the backstop under the order's own transaction.
-  const discountSplitCodeRefusal = discountSplit ? discountSplitTaxCodeRefusal(discountSplit, { orderDefaultTaxType, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }, 'invoice') : null
+  const discountSplitCodeRefusal = discountSplit ? discountSplitTaxCodeRefusal(discountSplit.filter((entry) => postedDiscountTaxType(posted, entry) === null), { orderDefaultTaxType, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }, 'invoice') : null
   if (discountSplitCodeRefusal) throw new SalesInvoiceDiscountSplitTaxCodeError(discountSplitCodeRefusal, so.currency)
   const discountParts = discountPartsOrNull
 
@@ -2249,11 +2256,11 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
       // It is sent on the explicit no-tax code, naming why, as the importer's own invoice sends it: left to the fall-through it takes the order's TAXABLE
       // default code and the ledger adds VAT to a fee nobody charged VAT on. Derived from the stored line, so a clone carries it with the line.
       const isNoTaxFee = isStoredUntaxedFee(l)
-      const taxType = isNoTaxFee ? NO_TAX_TYPE : resolveSalesLineTaxType({
+      const taxType = isNoTaxFee ? NO_TAX_TYPE : updateLineTaxType(posted, l.taxRateId, resolveSalesLineTaxType({
         baseTaxType: l.taxRate?.accountingTaxType ?? orderDefaultTaxType,
         reverseCharge: l.taxRate?.reverseCharge,
         reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
-      })
+      }))
       return {
         itemCode: l.sku ?? undefined,
         description: l.description ?? l.sku ?? 'Item',
@@ -2271,11 +2278,11 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     shippingAmount: shippingSendForeign > 0 ? shippingSendForeign : undefined,
     shippingDescription: 'Shipping',
     shippingAccountCode: settings.shippingAccount || undefined,
-    shippingTaxType: orderDefaultTaxType ?? undefined,
+    shippingTaxType: postedShippingTaxType(posted) ?? orderDefaultTaxType ?? undefined,
     ...rateBinding(orderDefaultRate?.id, 'plain', 'shipping'),
     discountAmount: discountForeign > 0 ? discountForeign : undefined,
     discountAccountCode: settings.discountAccount || undefined,
-    discountTaxType: orderDefaultTaxType ?? undefined,
+    discountTaxType: postedHeaderDiscountTaxType(posted) ?? orderDefaultTaxType ?? undefined,
     ...rateBinding(orderDefaultRate?.id, 'plain', 'discount'),
     ...(discountParts.length > 0
       ? { discountParts: discountParts.map((part) => ({ amount: part.amount, taxType: part.taxType ?? undefined, ...rateBinding(part.taxRateId, 'sales_line') })) }
@@ -2292,6 +2299,8 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     if (typeof code !== 'string' || code.trim() === '') return null
     if (isNoTaxType(code)) return 0
     const rates = new Set(codeRates.filter((r) => r.accountingTaxType === code).map((r) => Number(r.rate)))
+    // A posted code a remap left on no active rate is priced at the rate the record bound it to.
+    if (rates.size === 0) for (const pct of posted?.ratesByCode.get(code) ?? []) rates.add(Number(pct))
     return rates.size === 1 ? [...rates][0]! : null
   }
   // The invoice must book to the order's own total (lib/domain/sales/sales-invoice-reconciliation.ts): refused here rather than queued.
@@ -2314,6 +2323,21 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   }, Number(so.totalForeign))
   if (reconciliation) throw new SalesInvoiceDoesNotReconcileError(reconciliation, so.currency)
   if (options?.checkOnly) return
+
+  // An UPDATE of a posted invoice with no usable record of the codes it was posted with falls back to the rates' CURRENT codes (a remap since posting would move the invoice's lines onto new codes): flagged, once per queued update.
+  if (so.accountingInvoiceId && posted === null) {
+    await (reader as unknown as { activityLog: Pick<typeof db.activityLog, 'create'> }).activityLog.create({
+      data: {
+        entityType: 'SALES_ORDER',
+        entityId: so.id,
+        action: 'sales_invoice_update_used_current_tax_codes',
+        tag: 'sales',
+        level: 'WARNING',
+        description: `The update of invoice ${accountingInvoiceNumber} was built on the tax rates' CURRENT codes, not the codes the invoice was posted with, because IMS holds no usable record of them (${postedRecord?.reason === 'in-flight' ? 'an earlier update is still in flight' : postedRecord?.reason === 'unusable' ? 'the newest invoice record is not usable' : 'no record of the posted invoice'}). If a tax rate was re-mapped since the invoice was posted, check the invoice's VAT in the accounting system after the update.`,
+        metadata: { orderId: so.id, accountingInvoiceId: so.accountingInvoiceId, reason: postedRecord?.reason ?? 'no-record', lines: so.lines.map((l, i) => ({ description: l.description, taxRateId: l.taxRateId, accountingTaxType: payload.lines[i]?.taxType ?? null })) },
+      },
+    })
+  }
 
   if (options?.updateInTx) {
     // AN EDIT OF A CONFIRMED ORDER WITH A POSTED INVOICE: the update of that document is queued INSIDE the edit's transaction (the caller holds the order row lock and has already rewritten the lines, which `reader` -- the same
@@ -3076,7 +3100,9 @@ async function queueRefundAccountingActions(input: {
   const creditNoteTaxTypeOf = creditNoteLineTaxTypeResolver({
     orderLines: orderForCN?.lines ?? [],
     reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
-    orderDefaultTaxType: postedShippingTaxType(postedCnCodes) ?? cnTaxRate?.accountingTaxType ?? null,
+    orderDefaultTaxType: cnTaxRate?.accountingTaxType ?? null,
+    shippingTaxType: postedShippingTaxType(postedCnCodes),
+    headerDiscountTaxType: postedHeaderDiscountTaxType(postedCnCodes),
     postedTaxTypeByLineId: postedTaxTypeByLineId(orderForCN?.lines ?? [], postedCnCodes),
   })
 

@@ -107,6 +107,15 @@ export class SalesInvoiceDiscountSplitTaxCodeError extends SalesInvoiceDoesNotRe
   }
 }
 
+/** An update of a posted invoice touches a VAT rate the posted record gives two different codes: refused rather than guessed (postedCodesAmbiguityRefusal). */
+export class SalesInvoicePostedCodesAmbiguousError extends SalesInvoiceDoesNotReconcileError {
+  constructor(message: string, currency: string) {
+    super({ expected: 0, orderTotal: 0, difference: 0 }, currency)
+    this.message = `${message} It was not queued and the order was not moved or saved.`
+    this.name = 'SalesInvoicePostedCodesAmbiguousError'
+  }
+}
+
 /**
  * A positive shipping or order-discount amount the connector would DROP because its account is not mapped: the invoice would book short of (or over) that
  * money. Named so the message says which mapping is missing; still a reconciliation refusal, so every caller that refuses a mismatch refuses this.

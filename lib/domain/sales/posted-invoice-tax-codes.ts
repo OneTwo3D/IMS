@@ -108,12 +108,14 @@ export type PostedInvoiceTaxCodes = {
   rateIdsByCode: ReadonlyMap<string, ReadonlyArray<{ rateId: string; basis: 'sales_line' | 'plain' }>>
   /** code -> the normalised percentages of those rates, filled by the reader (empty from the pure parse). */
   ratesByCode: ReadonlyMap<string, ReadonlySet<string>>
+  /** Rates the record gives two different codes (in its goods lines or its discount parts): never guessed, and a refund of such a rate is refused (`postedCodesAmbiguityRefusal`). */
+  ambiguousRateIds: ReadonlySet<string>
 }
 
 const text = (value: unknown): string | null => (typeof value === 'string' && value.trim() !== '' ? value : null)
 
-/** rate id -> code over a list of payload objects; a rate the record gives two different codes is left out (ambiguous, never guessed). */
-function codesByRate(items: unknown): Map<string, string> {
+/** rate id -> code over a list of payload objects; a rate the record gives two different codes is left out of the map (ambiguous, never guessed) and named in `ambiguousInto`, where the refund refuses it. */
+function codesByRate(items: unknown, ambiguousInto?: Set<string>): Map<string, string> {
   const out = new Map<string, string>()
   const ambiguous = new Set<string>()
   if (!Array.isArray(items)) return out
@@ -127,7 +129,7 @@ function codesByRate(items: unknown): Map<string, string> {
     if (known !== undefined && known !== code) ambiguous.add(rateId)
     out.set(rateId, code)
   }
-  for (const id of ambiguous) out.delete(id)
+  for (const id of ambiguous) { out.delete(id); ambiguousInto?.add(id) }
   return out
 }
 
@@ -144,8 +146,9 @@ export function postedTaxCodesFromPayload(payload: unknown): PostedInvoiceTaxCod
     const code = text(p.taxType)
     if (code && !text(p.taxRateId)) noRateCodes.add(code)
   }
-  const lineCodeByRateId = codesByRate(record.lines)
-  const discountCodeByRateId = codesByRate(parts)
+  const ambiguousRateIds = new Set<string>()
+  const lineCodeByRateId = codesByRate(record.lines, ambiguousRateIds)
+  const discountCodeByRateId = codesByRate(parts, ambiguousRateIds)
   const headerDiscountCode = text(record.discountTaxRateId) ? text(record.discountTaxType) : null
   const shippingCode = text(record.shippingTaxRateId) ? text(record.shippingTaxType) : null
   const rateIdsByCode = new Map<string, Array<{ rateId: string; basis: 'sales_line' | 'plain' }>>()
@@ -168,6 +171,7 @@ export function postedTaxCodesFromPayload(payload: unknown): PostedInvoiceTaxCod
     shippingCode,
     rateIdsByCode,
     ratesByCode: new Map(),
+    ambiguousRateIds,
   }
 }
 
@@ -307,4 +311,23 @@ export function postedTaxTypeByLineId(
     if (code) out.set(line.id, code)
   }
   return out
+}
+
+/** The refusal for a refund (or an update) that touches a rate the posted record gives two different codes, or null. Refused rather than falling back to the rate's current code, which would be a guess. */
+export function postedCodesAmbiguityRefusal(posted: PostedInvoiceTaxCodes | null, rateIds: Iterable<string | null | undefined>): string | null {
+  if (!posted || posted.ambiguousRateIds.size === 0) return null
+  for (const id of rateIds) {
+    if (id && posted.ambiguousRateIds.has(id)) {
+      return 'The invoice was posted with two different tax codes for one VAT rate, so IMS cannot tell which code a credit note (or an update) of those lines must use, and nothing was created. Correct the invoice in the accounting system first, or record the credit note by hand.'
+    }
+  }
+  return null
+}
+
+/**
+ * The code each posted-invoice UPDATE line, shipping and discount is built on (owner ruling: a later remap only affects new invoices). A line whose rate the record names keeps the code that rate's lines were posted
+ * on; a new rate, a line with no rate or an unreadable record takes the current code (`current`). Pure: the builder passes the code it derived from the rates now.
+ */
+export function updateLineTaxType(posted: PostedInvoiceTaxCodes | null, taxRateId: string | null | undefined, current: string | null | undefined): string | null | undefined {
+  return postedLineTaxType(posted, taxRateId) ?? current
 }
