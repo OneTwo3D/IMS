@@ -1,4 +1,5 @@
 import { db } from '@/lib/db'
+import { LandedFloorCogsRefusal, reconcileLandedFloorCogsTx } from '@/lib/domain/purchasing/landed-floor-cogs'
 import {
   WMS_INBOUND_EVENT_PROCESSING_STATUS,
   type WmsInboundEventProcessingStatus,
@@ -1560,6 +1561,11 @@ export async function processBookedInEvent(
             receiptPostingDeclines.push({ poId, poReference: po.reference, outcome: enqueued })
           }
         }
+        // Switch landed_cost_floor_cogs_enabled: the floored supplier credit's journal follows these layers (target-state; see landed-floor-cogs.ts).
+        // A book-in is never refused for it: with an account unmapped the credit stays in transit and a later receipt or recalculation posts it.
+        await reconcileLandedFloorCogsTx(tx, { poId, poReference: po.reference, at: new Date() }).catch((error: unknown) => {
+          if (!(error instanceof LandedFloorCogsRefusal)) throw error
+        })
       }
 
       for (const [transferId, receiptLines] of receiptLinesByTransferId) {

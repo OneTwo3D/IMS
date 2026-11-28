@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto'
+import { reconcileLandedFloorCogsTx } from '@/lib/domain/purchasing/landed-floor-cogs'
 import { MARK_REMEDY_TAIL } from '@/lib/domain/accounting/hand-post-instruction'
 import { Prisma } from '@/app/generated/prisma/client'
 import { getAccountingSettings, queueAccountingSync, queueAccountingSyncTx, type AccountingSettings } from '@/lib/accounting'
@@ -1711,6 +1712,9 @@ export async function recalculateLandedCosts(
       select: { id: true },
     })
     result.auditRunIds.push(auditRun.id)
+    // Switch landed_cost_floor_cogs_enabled: the floored credit's journal follows the new allocation (a cancelled freight order's credit drops out
+    // and the journal is reversed). Target-state; nothing is read beyond the switch while it is off and the order has no such journal.
+    await reconcileLandedFloorCogsTx(tx, { poId: primaryPoId, poReference: primaryPo.reference, at: revaluedAt })
   }
   // audit-grob: durably enqueue the adjustment journals IN this tx (backstop).
   if (options.scheduleAdjustmentJournals) {
@@ -2050,6 +2054,8 @@ export async function recalculateDirectLandedCosts(
     select: { id: true },
   })
   result.auditRunIds.push(auditRun.id)
+  // Switch landed_cost_floor_cogs_enabled: see recalculateLandedCosts.
+  await reconcileLandedFloorCogsTx(tx, { poId, poReference: po.reference, at: revaluedAt })
   // audit-grob: durably enqueue the adjustment journals IN this tx (backstop).
   if (options.scheduleAdjustmentJournals) {
     await scheduleLandedCostJournalOutbox(tx, result)

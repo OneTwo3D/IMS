@@ -1,4 +1,5 @@
 import { asnHasReceiptEvidence, readAlignUpReceiptEvidenceEnabled } from '@/lib/connectors/mintsoft/settings/align-up-receipt-evidence'
+import { LandedFloorCogsRefusal, reconcileLandedFloorCogsTx } from '@/lib/domain/purchasing/landed-floor-cogs'
 import { alignmentThresholdsKey } from '@/lib/domain/wms/alignment-dry-run'
 import { randomUUID } from 'crypto'
 import { Prisma } from '@/app/generated/prisma/client'
@@ -2222,6 +2223,11 @@ export async function applyMintsoftAlignmentForProduct(params: {
               journalDate: payload.date,
             })
           }
+          // Switch landed_cost_floor_cogs_enabled: the floored supplier credit's journal follows the new layer (target-state; see
+          // landed-floor-cogs.ts). Never refuses an alignment: with an account unmapped the credit stays in transit for a later event.
+          await reconcileLandedFloorCogsTx(tx, { poId: purchaseCost.poId, poReference: purchaseCost.poReference, at: new Date() }).catch((error: unknown) => {
+            if (!(error instanceof LandedFloorCogsRefusal)) throw error
+          })
         }
       } else {
         // TRANSFER-BACKED ALLOCATIONS GET NO JOURNAL, DELIBERATELY (o3d-6nd55). A transfer moves

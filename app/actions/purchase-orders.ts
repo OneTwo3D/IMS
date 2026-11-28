@@ -141,6 +141,7 @@ import {
   recalculateLandedCosts,
 } from '@/lib/domain/purchasing/landed-cost-service'
 import { headerDiscountFactorForPo, unabsorbedBaseForQty } from '@/lib/domain/purchasing/landed-cost-allocation'
+import { LandedFloorCogsRefusal, reconcileLandedFloorCogsTx } from '@/lib/domain/purchasing/landed-floor-cogs'
 import {
   isPurchaseFxRefusalError, markPurchaseFxLockUsed, preparePurchaseReceiptFx, purchaseFxLayerFields, readPurchaseOrderPrepaymentOnDemand, PURCHASE_FX_SOURCE_FX_TABLE,
   reportPurchaseFxFallback, resolveReceiptFxValuation,
@@ -3357,6 +3358,10 @@ export async function receivePurchaseOrder(
         }
       }
 
+      // Switch landed_cost_floor_cogs_enabled: the part of a supplier credit these units' zero floor could not absorb is cleared from Stock in
+      // Transit to COGS (target-state; nothing is read beyond the switch while it is off and the order has no such journal).
+      await reconcileLandedFloorCogsTx(tx, { poId: id, poReference: po.reference, at: new Date() })
+
       // Per-event FX (step 3): a receipt that arrives after the order's bill settles that bill's FX difference against it (per receipt).
       // MED-3: also after a switch-off rollback, for an order whose bills the switch still manages (its receipts are then at the PO rate).
       const billFx = fxValuation || await purchaseFxOrderHasHistory(tx, id)
@@ -3507,7 +3512,7 @@ export async function receivePurchaseOrder(
       metadata: null,
     })
     // Per-event FX refusals carry an operator remedy: return the message itself, not the error's class name.
-    if (isPurchaseFxRefusalError(e) || isMissingFxRateError(e)) return { success: false, error: e.message }
+    if (isPurchaseFxRefusalError(e) || isMissingFxRateError(e) || e instanceof LandedFloorCogsRefusal) return { success: false, error: e.message }
     return { success: false, error: String(e) }
   }
 }
