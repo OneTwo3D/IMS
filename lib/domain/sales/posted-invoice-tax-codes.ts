@@ -16,7 +16,7 @@
  */
 import type { db } from '@/lib/db'
 import type { Prisma } from '@/app/generated/prisma/client'
-import { ledgerStanding, PROVEN_LEDGER_FACT_WHERE } from '@/lib/domain/accounting/ledger-standing'
+import { ledgerStanding, NAMES_A_DOCUMENT_WHERE, PROVEN_LEDGER_FACT_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import type { DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
 import { buildTaxTypeRateIndex, type TaxTypeRateIndex } from '@/lib/domain/sales/refund-posted-tax-identity'
@@ -35,7 +35,8 @@ import { buildTaxTypeRateIndex, type TaxTypeRateIndex } from '@/lib/domain/sales
 export const POSTED_INVOICE_RECORD_WHERE: Prisma.AccountingSyncLogWhereInput = {
   AND: [
     PROVEN_LEDGER_FACT_WHERE,
-    { connector: 'xero', type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] }, referenceType: 'SalesOrder', externalTransactionId: { not: null } },
+    NAMES_A_DOCUMENT_WHERE,
+    { connector: 'xero', type: { in: ['SALES_INVOICE', 'SALES_INVOICE_UPDATE'] }, referenceType: 'SalesOrder' },
   ],
 }
 
