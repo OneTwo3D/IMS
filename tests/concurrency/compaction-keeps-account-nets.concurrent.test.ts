@@ -122,7 +122,8 @@ test('compaction writes the summary with the payload drop; the A2 proof is uncha
   const illegible = await seedJournal('bad', 'DAILY_BATCH_GROUP_B', { narration: 'no lines here', lines: 'corrupt' })
   const nonJournal = await deps.db.accountingSyncLog.create({
     data: {
-      connector: 'xero', type: 'SALES_INVOICE', status: 'SYNCED', referenceType: 'SalesOrder',
+      // A non-journal, non-invoice type: a confirmed xero sales invoice of an order is the one posted-record shape retention now compacts to a projection (tests/db/posted-invoice-records-kept.test.ts), not to {}.
+      connector: 'xero', type: 'CREDIT_NOTE', status: 'SYNCED', referenceType: 'SalesOrderRefund',
       referenceId: `OYUR-${RUN_ID}-inv`, externalTransactionId: `INV-${RUN_ID}`,
       payload: { contact: { name: 'Jane Doe' }, lines: [{ description: 'x', unitAmount: 5 }] }, createdAt: OLD, syncedAt: OLD,
     },
