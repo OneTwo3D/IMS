@@ -226,7 +226,7 @@ The unit cost is validated as finite and non-negative before stock movements are
   - when there is no prepayment and no table rate.
 - **The rate stays fixed.** Once a receipt has used the rate, it stays fixed for the order. Later landed-cost changes add the new freight share to each stock layer without changing the rate its goods were received at.
 - **Bills.** Bills of a foreign order are valued at the prepayment rate (or at the table rate on the bill date) and keep each line's stock part at the order's cost. Any price difference goes on a separate Purchase Price Variance line. IMS then posts the exchange difference against the receipts as a journal between Realised FX and Stock in Transit (see Xero Accounting Sync).
-  - It does this only for bills IMS itself posted to Xero.
+  - It does this only for bills IMS itself posted to Xero (a journal the hold records instead of sending is never posted later).
   - A bill posted outside IMS (for example by Qoblex) gets no such journal unless an administrator confirms it, against its Xero bill, with `npm run purchase-fx:non-ims-bills`.
   - While another system is still the bill writer (the producer-side hold shadows supplier bills), new bills stay at the order's rate.
 - **Returns and credit notes.**
@@ -336,8 +336,8 @@ A bill with no invoice number is never checked. Editing an existing bill's numbe
 
 Every receipt, bill, bill edit, supplier return and return-generated supplier credit note also writes a row in IMS's **GR/IR sub-ledger**, in the same step as the event itself, so a receipt is never recorded without its accrual and a failed receipt leaves none:
 
-- **Receiving goods** raises GR/IR by the received quantity at the purchase order's unit cost (the goods part of the value the stock layer carries; freight is not included).
-- **Billing** lowers it by the billed quantity at the **same purchase-order unit cost** (with per-event FX rates on, at the value the matched receipts accrued; the difference from the bill's own rate is the **FX difference** below). If the supplier charges a different price, the difference is recorded as its own **price difference** and never touches the GR/IR balance; it stays on Stock in Transit as it always has, and is shown per order in **Analytics > GR/IR**.
+- **Receiving goods** raises GR/IR by the received quantity at the purchase order's unit cost (with per-event FX rates on, at the rate the goods were received at) (the goods part of the value the stock layer carries; freight is not included).
+- **Billing** lowers it by the billed quantity at the **same purchase-order unit cost** (with per-event FX rates on, at the value the matched receipts accrued, and any quantity billed before it was received at the bill's own value; the difference from the bill's own rate is the **FX difference** below). If the supplier charges a different price, the difference is recorded as its own **price difference** and never touches the GR/IR balance; with per-event FX rates off it stays on Stock in Transit as it always has, and with them on it goes on the bill's Purchase Price Variance line. It is shown per order in **Analytics > GR/IR**.
 - **Editing a bill** moves it by the change in the billed quantity.
 - **A supplier return** lowers it by the returned quantity at the order's unit cost. If those goods were already billed, the order shows as billed-not-received until the return-generated supplier credit note is posted. The credit note clears it at the same order unit cost as the return (per line, for the quantity billed and returned), so a returned-and-credited line nets to zero whatever price the bill carried; the difference between the credit and that value is a price-difference reversal, not GR/IR.
 
