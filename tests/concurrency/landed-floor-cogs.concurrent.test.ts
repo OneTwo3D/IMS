@@ -18,6 +18,9 @@ import { enableStockReceiptPosting, loadEnv, uid } from './po-landed-fixtures'
  *  Throughout: the transit sub-ledger of the order (receipt, landed-cost reclasses and this journal) equals minus what the bills put in transit
  *  (goods 440.00 plus the credit), so R11 ties.
  *  5. Unmapped COGS account: the receipt that owes the journal is refused and nothing is written.
+ *  6. Only layers whose receipt journal reached the ledger count: a floored-only (0.00) receipt, a receipt made with sync off (then sync on), a
+ *     receipt shadowed by the outbound write hold (P1, then P2), and a journalled receipt whose date the seam now shadows, all post nothing,
+ *     and no shadow warning is raised.
  */
 
 const RUN = process.env.RUN_DB_CONCURRENCY_TESTS === '1'
@@ -115,7 +118,9 @@ async function receiveAll(w: World) {
 async function recalc(w: World, reason: 'freight_purchase_order_costs_updated' | 'freight_purchase_order_cancelled') {
   const { db } = await import('@/lib/db')
   const { recalculateLandedCosts, queueLandedCostAdjustmentJournals } = await import('@/lib/domain/purchasing/landed-cost-service')
-  const result = await db.$transaction((tx) => recalculateLandedCosts(tx, w.freightId, undefined, { triggeredById: null, reason, scheduleAdjustmentJournals: true }), { timeout: 60_000, maxWait: 10_000 })
+  const { readLandedCostChartBeforeTx } = await import('@/lib/domain/purchasing/landed-cost-service')
+  const accountingSettings = await readLandedCostChartBeforeTx()
+  const result = await db.$transaction((tx) => recalculateLandedCosts(tx, w.freightId, undefined, { triggeredById: null, reason, scheduleAdjustmentJournals: true, accountingSettings }), { timeout: 60_000, maxWait: 10_000 })
   await queueLandedCostAdjustmentJournals(result)
   return result
 }
@@ -147,8 +152,7 @@ async function layer(lineId: string) {
 async function accounting(t: { after: (fn: () => Promise<void>) => void }, extra: Record<string, string | null> = {}) {
   loadEnv()
   await enableStockReceiptPosting()
-  // The transit sub-ledger covers today (the migration seeds tomorrow on a fresh database): the coverage rule counts these receipts.
-  await setSettings(t, { xero_cogs_account: '500', xero_sync_cogs_journal: 'submitted', transit_ledger_coverage_start_date: '2000-01-01', ...extra })
+  await setSettings(t, { xero_cogs_account: '500', xero_sync_cogs_journal: 'submitted', ...extra })
 }
 
 test('switch off: receipt and recalculation post exactly what they did before (no floored-credit journal or row)', SKIP, async (t) => {
@@ -235,7 +239,31 @@ async function landedBilled(w: World, landedValue: number) {
   return landedValue + Number((await db.freightCostLine.aggregate({ where: { poId: w.freightId }, _sum: { amountBase: true } }))._sum.amountBase ?? 0)
 }
 
-test('a receipt of floored units only (worth 0.00, no receipt journal) still journals the unabsorbed credit', SKIP, async (t) => {
+const HOLD_ENV_KEYS = ['PRODUCER_HOLD_ENFORCED_DESTINATIONS', 'XERO_WRITE_ALLOWED_TENANT', 'XERO_WRITES_LIVE_FROM'] as const
+const TENANT = '4f7f0c6e-1111-4222-8333-944455556666'
+const DAY = 86_400_000
+const isoInstant = (date: Date) => date.toISOString().replace(/\.\d+Z$/, 'Z')
+
+/** The outbound write hold for Xero, enforced, with its live-from instant at `liveFrom` (the environment before the FIRST call is restored after the test). */
+const holdRestoring = new WeakSet<object>()
+function holdXero(t: { after: (fn: () => void) => void }, liveFrom: Date) {
+  if (!holdRestoring.has(t)) {
+    holdRestoring.add(t)
+    const saved = HOLD_ENV_KEYS.map((key) => [key, process.env[key]] as const)
+    t.after(() => {
+      for (const key of HOLD_ENV_KEYS) delete process.env[key]
+      for (const [key, value] of saved) if (value !== undefined) process.env[key] = value
+    })
+  }
+  Object.assign(process.env, { PRODUCER_HOLD_ENFORCED_DESTINATIONS: 'xero', XERO_WRITE_ALLOWED_TENANT: TENANT, XERO_WRITES_LIVE_FROM: isoInstant(liveFrom) })
+}
+
+async function shadowWarnings(poId: string) {
+  const { db } = await import('@/lib/db')
+  return db.activityLog.count({ where: { entityId: poId, action: 'landed_floor_cogs_shadowed' } })
+}
+
+test('a receipt of floored units only (worth 0.00, no receipt journal, so no evidence) is not counted: conservative, the credit stays on transit', SKIP, async (t) => {
   await accounting(t)
   await setSettings(t, { [SWITCH]: 'true' })
   const { db } = await import('@/lib/db')
@@ -244,16 +272,47 @@ test('a receipt of floored units only (worth 0.00, no receipt journal) still jou
   assert.equal(received.success, true, received.error)
   assert.equal(await layer(w.lineA), 0)
   assert.equal(await db.transitSubledgerMovement.count({ where: { sourceRef: w.poId, sourceType: 'STOCK_RECEIPT' } }), 0, 'PRECONDITION: the receipt was worth 0.00 and wrote no receipt row')
-  const j = await floorJournals(w)
-  assert.deepEqual(j.transit, [10], 'A (4 x 2.50) is cleared all the same')
+  assert.deepEqual((await floorJournals(w)).transit, [], 'no durable evidence the receipt reached the ledger: nothing journalled')
 })
 
-test('a layer received before the transit coverage watermark is not counted', SKIP, async (t) => {
-  await accounting(t, { transit_ledger_coverage_start_date: '2999-01-01' })
-  await setSettings(t, { [SWITCH]: 'true' })
-  const w = await seedWorld('uncovered')
+test('a receipt made with accounting sync off, then sync turned on: the next event posts nothing for it', SKIP, async (t) => {
+  await accounting(t)
+  await setSettings(t, { [SWITCH]: 'true', xero_sync_enabled: 'false' })
+  const { db } = await import('@/lib/db')
+  const w = await seedWorld('syncoff')
   assert.equal((await receiveAll(w)).success, true)
-  assert.deepEqual((await floorJournals(w)).transit, [], 'not covered: nothing journalled')
+  assert.equal(await db.transitSubledgerMovement.count({ where: { sourceRef: w.poId, sourceType: 'STOCK_RECEIPT' } }), 0, 'PRECONDITION: no receipt journal with sync off')
+  await db.setting.update({ where: { key: 'xero_sync_enabled' }, data: { value: 'true' } })
+  await recalc(w, 'freight_purchase_order_costs_updated')
+  assert.deepEqual((await floorJournals(w)).transit, [], 'the receipt never drained transit through the ledger: nothing is owed for it')
+})
+
+test('a receipt shadowed by the outbound write hold (P1), then a P2 event: posts nothing, and no shadow warning is raised', SKIP, async (t) => {
+  await accounting(t)
+  await setSettings(t, { [SWITCH]: 'true' })
+  const { db } = await import('@/lib/db')
+  const w = await seedWorld('p1shadow')
+  holdXero(t, new Date(Date.now() + 2 * DAY)) // P1: today's receipt is before the live-from instant, so it is shadowed
+  assert.equal((await receiveAll(w)).success, true)
+  assert.equal(await db.transitSubledgerMovement.count({ where: { sourceRef: w.poId, sourceType: 'STOCK_RECEIPT' } }), 0, 'PRECONDITION: the shadowed receipt wrote no receipt row')
+  holdXero(t, new Date(Date.now() - 2 * DAY)) // P2: live from two days ago
+  await recalc(w, 'freight_purchase_order_costs_updated')
+  assert.deepEqual((await floorJournals(w)).transit, [], 'nothing posted for a receipt Xero never saw')
+  assert.equal(await shadowWarnings(w.poId), 0, 'and no shadow warning noise while the receipt was held')
+})
+
+test('a journalled receipt whose date the seam shadows (hold enforced later, live from after it) is not counted', SKIP, async (t) => {
+  await accounting(t)
+  await setSettings(t, { [SWITCH]: 'false' })
+  const { db } = await import('@/lib/db')
+  const w = await seedWorld('seamshadow')
+  assert.equal((await receiveAll(w)).success, true)
+  assert.equal(await db.transitSubledgerMovement.count({ where: { sourceRef: w.poId, sourceType: 'STOCK_RECEIPT' } }), 1, 'PRECONDITION: the receipt was journalled (no hold yet)')
+  await db.setting.update({ where: { key: SWITCH }, data: { value: 'true' } })
+  holdXero(t, new Date(Date.now() + 2 * DAY))
+  await recalc(w, 'freight_purchase_order_costs_updated')
+  assert.deepEqual((await floorJournals(w)).transit, [], 'the seam would shadow the receipt date: not counted')
+  assert.equal(await shadowWarnings(w.poId), 0, 'nothing owed, so nothing shadowed and no warning')
 })
 
 test('close-short: the target follows the landed-quantity basis, so neither under- nor over-clears (BY_QUANTITY credit, and mixed methods)', SKIP, async (t) => {

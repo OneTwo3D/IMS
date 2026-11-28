@@ -33,16 +33,25 @@ import {
  * the COGS cross-check and the transit reconciliation (R11) tie by construction. The landed-cost revaluation journals of the ABSORBED part are
  * untouched (they carry only the floored delta), and the per-event FX variance journals ignore non-positive cost lines, so nothing is counted twice.
  *
- * WHICH LAYERS COUNT (the coverage rule). The journal is the missing half of the RECEIPT's own transit drain: the receipt credits transit with the
- * floored value, and the floor stopped it crediting the unabsorbed part as well. It is therefore owed exactly where the receipt journal is, by the
- * same accrual (independently of when the bills post, as the receipt is), and a receipt of floored units only is worth 0.00 and writes no
- * receipt row but still owes it. So a layer counts when the transit sub-ledger covers its receipt day (`transit_ledger_coverage_start_date`, the
- * watermark from which IMS records every transit posting; unset = nothing counts) and IMS posts stock receipts now (accounting sync on). The layers
- * counted are the order's own receipt layers (not refund returns, adjustments or production outputs).
+ * WHICH LAYERS COUNT. The journal is the missing half of the RECEIPT's own transit drain: the receipt credits transit with the floored value, and
+ * the floor stopped it crediting the unabsorbed part as well. It is therefore owed exactly where that receipt journal actually reached the ledger,
+ * and nowhere else. A layer counts only when BOTH hold:
+ *  - the producer seam would have produced the receipt's own journal live: `xeroProducerSeamVerdict` for STOCK_RECEIPT on the layer's receipt
+ *    business date is not `shadow` (a receipt shadowed by the outbound write hold, phase P1, sent nothing, so there is no floored drain to
+ *    complete; counting it would post a COGS credit against a transit debit that Xero never saw);
+ *  - there is DURABLE evidence the receipt journal was queued: a STOCK_RECEIPT row of this order in the transit sub-ledger on that business date.
+ *    The row is written only when the queue accepted the journal, so a receipt made with accounting sync off, or shadowed, or declined, has
+ *    none, and turning sync on later does not make its layers count.
+ * THE LIMITS, accepted and conservative (they leave the credit on transit, never post one that is not owed): a receipt of floored units only is
+ * worth 0.00, writes no receipt journal and so no row, and IMS records no receipt-time sync state, so its layers do not count; the evidence is
+ * matched by order and business date, not per receipt, so on a day with two receipts of the same order of which only one was journalled, both
+ * count. The layers considered are the order's own receipt layers, the WMS alignment's included (not refund returns, opening stock or production
+ * outputs).
  *
  * THE QUANTITY BASIS. Normally the allocation divides the cost lines over the ordered quantities. An order CLOSED SHORT spreads its freight over the
- * units that landed (po-close-short.ts, recalculateDirectLandedCosts with `landedQtyBasis`), so the close-short passes that basis in, and for an
- * order already CLOSED it is derived the same way (loadPurchaseOrderLineLandedQty), so later events agree with the layers.
+ * units that landed (po-close-short.ts, recalculateDirectLandedCosts with `landedQtyBasis`), and the close-short passes that basis in, before its
+ * status write, whenever it revalues. AN ORDER ALREADY CLOSED IS OUT OF SCOPE: nothing reconciles it afterwards (a recalculation refuses a CLOSED
+ * order and a CLOSED order takes no receipt), so an order closed before the switch was turned on keeps any floored credit on transit.
  *
  * COST. With the switch off: one read of the switch and one indexed lookup of this order's own rows (source_ref, source_type); nothing else. Once
  * this writer has journalled an order, the order keeps being reconciled even if the switch is turned off later, so a cancellation still reverses
@@ -54,8 +63,6 @@ export const LANDED_FLOOR_COGS_KEY_PREFIX = 'landed-floor-cogs:'
 
 /** Same predicate as landed-cost-service.ts CONTRIBUTING_LANDED_COST_LINK_WHERE (a literal here to keep this module out of that one's import graph). */
 const CONTRIBUTING_LINK_WHERE = { freightPO: { status: { not: 'CANCELLED' as const } } }
-
-const TRANSIT_COVERAGE_KEY = 'transit_ledger_coverage_start_date'
 
 export class LandedFloorCogsRefusal extends Error {}
 
@@ -72,18 +79,18 @@ export async function readLandedFloorCogsEnabled(client: Pick<Client, 'setting'>
 export type LandedQtyBasis = ReadonlyMap<string, Prisma.Decimal | number | string>
 
 /**
- * What the zero floor leaves unabsorbed on the order's own receipt layers NOW, exact Decimal (never negative). `coveredFrom` is the transit coverage
- * watermark (YYYY-MM-DD): a layer received before it is not counted. `landedQtyBasis` is the close-short basis (see the header).
+ * What the zero floor leaves unabsorbed on the order's own receipt layers NOW, exact Decimal (never negative), counting only the layers whose
+ * receipt journal reached the ledger (see WHICH LAYERS COUNT in the header). `connector` is the chart's connector (the seam question);
+ * `landedQtyBasis` is the close-short basis.
  */
 export async function computeLandedFloorUnabsorbedTx(
   tx: Client,
   poId: string,
-  options: { coveredFrom: string; landedQtyBasis?: LandedQtyBasis } = { coveredFrom: '0000-00-00' },
+  options: { connector: string; landedQtyBasis?: LandedQtyBasis; env?: Record<string, string | undefined> },
 ): Promise<Decimal> {
   const po = await tx.purchaseOrder.findUnique({
     where: { id: poId },
     select: {
-      status: true,
       subtotalBase: true,
       freightCostLines: { select: { id: true, amountBase: true, distributionMethod: true } },
       lines: {
@@ -91,12 +98,12 @@ export async function computeLandedFloorUnabsorbedTx(
         select: {
           id: true,
           qty: true,
-          qtyReceived: true,
           unitCostBase: true,
           totalBase: true,
           product: { select: { weight: true } },
           costLayers: {
-            where: { returnMovementId: null, adjustmentMovementId: null, productionOrderId: null, isOpeningStock: false },
+            // The WMS alignment's layer carries its adjustment movement, so adjustmentMovementId is not a filter (no other writer sets it with a PO line).
+            where: { returnMovementId: null, productionOrderId: null, isOpeningStock: false },
             select: { goodsUnitCostBase: true, receivedQty: true, receivedAt: true },
           },
         },
@@ -109,13 +116,29 @@ export async function computeLandedFloorUnabsorbedTx(
     where: { primaryPoId: poId, ...CONTRIBUTING_LINK_WHERE },
     select: { freightPO: { select: { freightCostLines: { select: { id: true, amountBase: true, distributionMethod: true } } } } },
   })
-  // The close-short basis: passed by the close-short itself (before the status write), derived for an order already CLOSED.
-  let basis: LandedQtyBasis | undefined = options.landedQtyBasis
-  if (!basis && po.status === 'CLOSED') {
-    const { loadPurchaseOrderLineLandedQty } = await import('@/lib/domain/inventory/po-line-landed-quantity')
-    const landed = await loadPurchaseOrderLineLandedQty(tx, po.lines.map((line) => ({ id: line.id, qtyReceived: line.qtyReceived })))
-    basis = new Map(po.lines.map((line) => [line.id, landed.get(line.id)?.qtyNumber ?? 0]))
+  // The evidence: the business dates on which this order's receipt journal was queued (journal dates are stored as UTC midnight of the date).
+  const receiptRows = await tx.transitSubledgerMovement.findMany({
+    where: { sourceRef: poId, sourceType: 'STOCK_RECEIPT' },
+    select: { journalDate: true },
+  })
+  const journalledDays = new Set(receiptRows.map((row) => row.journalDate.toISOString().slice(0, 10)))
+  if (journalledDays.size === 0) return zero
+  const { xeroProducerSeamVerdict } = await import('@/lib/domain/accounting/xero-producer-seam')
+  const verdictByDay = new Map<string, boolean>()
+  const counts = (receivedAt: Date): boolean => {
+    const day = businessDateYmd(receivedAt)
+    if (!journalledDays.has(day)) return false
+    let live = verdictByDay.get(day)
+    if (live === undefined) {
+      live = xeroProducerSeamVerdict({
+        connector: options.connector, type: 'STOCK_RECEIPT', payload: { date: day }, ...(options.env ? { env: options.env } : {}),
+      }).kind !== 'shadow'
+      verdictByDay.set(day, live)
+    }
+    return live
   }
+  // The close-short basis, passed by the close-short itself (before its status write); see THE QUANTITY BASIS.
+  const basis: LandedQtyBasis | undefined = options.landedQtyBasis
   const allocQty = (line: { id: string; qty: Prisma.Decimal }): Decimal => (basis ? toDecimal(basis.get(line.id) ?? 0) : toDecimal(line.qty))
   const headerDiscountFactor = headerDiscountFactorForPo(po)
   const allocation = allocateLandedCost(
@@ -145,7 +168,7 @@ export async function computeLandedFloorUnabsorbedTx(
     const lineFloor = floorByLine.get(line.id)
     const landed = toDecimal(allocation.landedAmountByLine.get(line.id) ?? 0)
     for (const layer of line.costLayers) {
-      if (businessDateYmd(layer.receivedAt) < options.coveredFrom) continue
+      if (!counts(layer.receivedAt)) continue
       // The same per-layer rule the recalculation applies (landed-cost-service.ts layerUnitCostAfterRecalc): a legacy layer takes the line's
       // floor, a layer laid at its own goods cost (per-event FX) takes the line's landed share on its own goods cost.
       const unfloored = layer.goodsUnitCostBase == null
@@ -172,8 +195,8 @@ export type LandedFloorCogsResult = {
   chartConnector?: string | null
 }
 
-/** The accounting chart the caller read BEFORE its transaction (`getAccountingSettings()`); undefined = read here, lazily, over the pool. */
-type Chart = Pick<AccountingSettings, 'connector' | 'syncEnabled' | 'cogsAccount'> | null | undefined
+/** The accounting chart the caller read BEFORE its transaction (`getAccountingSettings()`); `null` = it could not be read. Required: no pooled read here. */
+type Chart = Pick<AccountingSettings, 'connector' | 'syncEnabled' | 'cogsAccount'> | null
 
 /**
  * Reconcile the floored-credit journal of one order to its target. Runs inside the caller's transaction (a receipt, a landed-cost recalculation),
@@ -183,7 +206,7 @@ type Chart = Pick<AccountingSettings, 'connector' | 'syncEnabled' | 'cogsAccount
  */
 export async function reconcileLandedFloorCogsTx(
   tx: Client,
-  params: { poId: string; poReference: string; at: Date; chart?: Chart; landedQtyBasis?: LandedQtyBasis },
+  params: { poId: string; poReference: string; at: Date; chart: Chart; landedQtyBasis?: LandedQtyBasis },
 ): Promise<LandedFloorCogsResult> {
   const none: LandedFloorCogsResult = { poId: params.poId, poReference: params.poReference, transitDelta: null }
   const enabled = await readLandedFloorCogsEnabled(tx)
@@ -196,26 +219,24 @@ export async function reconcileLandedFloorCogsTx(
   })
   if (!enabled && rows.length === 0) return none
 
-  let chart: Chart = params.chart
-  if (chart === undefined) {
-    const { getAccountingSettings } = await import('@/lib/accounting')
-    chart = await getAccountingSettings()
-  }
+  const chart = params.chart
   if (chart && (!chart.syncEnabled || !chart.connector)) return none
-
-  const coverage = (await tx.setting.findUnique({ where: { key: TRANSIT_COVERAGE_KEY }, select: { value: true } }))?.value?.trim() ?? ''
-  const target = /^\d{4}-\d{2}-\d{2}$/.test(coverage)
-    ? roundQuantity(await computeLandedFloorUnabsorbedTx(tx, params.poId, { coveredFrom: coverage, landedQtyBasis: params.landedQtyBasis }), 2)
-    : new Prisma.Decimal(0)
   const posted = rows.reduce((sum, row) => sum.add(toDecimal(row.baseDelta)), new Prisma.Decimal(0))
-  const delta = roundQuantity(target.sub(posted), 2)
-  if (delta.isZero()) return none
   if (!chart || !chart.connector) {
+    // Unreadable chart: the seam question needs the connector, so the exact target is unknown. Refuse only when something may be owed: rows to
+    // reconcile, or an unabsorbed amount on journalled layers before the seam is asked (a non-Xero connector name never shadows).
+    const owed = enabled ? await computeLandedFloorUnabsorbedTx(tx, params.poId, { connector: 'unreadable-chart', landedQtyBasis: params.landedQtyBasis }) : null
+    if (posted.isZero() && (!owed || roundQuantity(owed, 2).isZero())) return none
     throw new LandedFloorCogsRefusal(
-      `The accounting settings could not be read, so the supplier credit on ${params.poReference} that the stock cannot carry (${delta.abs().toFixed(2)}) `
-      + 'was not posted and nothing was changed. Try again; if it persists check the database connection.',
+      `The accounting settings could not be read, so the supplier credit on ${params.poReference} that the stock cannot carry `
+      + 'was not reconciled and nothing was changed. Try again; if it persists check the database connection.',
     )
   }
+  const target = roundQuantity(
+    await computeLandedFloorUnabsorbedTx(tx, params.poId, { connector: chart.connector, landedQtyBasis: params.landedQtyBasis }), 2,
+  )
+  const delta = roundQuantity(target.sub(posted), 2)
+  if (delta.isZero()) return none
   const connector = chart.connector
 
   const { queueAccountingSyncTx, readStockReceiptAccountsTx } = await import('@/lib/accounting')

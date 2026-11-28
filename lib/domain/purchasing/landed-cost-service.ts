@@ -1725,7 +1725,9 @@ export async function recalculateLandedCosts(
     result.auditRunIds.push(auditRun.id)
     // Switch landed_cost_floor_cogs_enabled: the floored credit's journal follows the new allocation (a cancelled freight order's credit drops out
     // and the journal is reversed). Target-state; with the switch off: the switch and one indexed lookup of the order's own rows.
-    collectFloorCogsResult(result, await reconcileLandedFloorCogsTx(tx, { poId: primaryPoId, poReference: primaryPo.reference, at: revaluedAt, chart: options.accountingSettings }))
+    // The chart is required (no pooled read inside the transaction): every production caller passes the one it read first; one left undefined
+    // is treated as unreadable, which refuses only a journal that may be owed.
+    collectFloorCogsResult(result, await reconcileLandedFloorCogsTx(tx, { poId: primaryPoId, poReference: primaryPo.reference, at: revaluedAt, chart: options.accountingSettings ?? null }))
   }
   // audit-grob: durably enqueue the adjustment journals IN this tx (backstop).
   if (options.scheduleAdjustmentJournals) {
@@ -2067,7 +2069,7 @@ export async function recalculateDirectLandedCosts(
   result.auditRunIds.push(auditRun.id)
   // Switch landed_cost_floor_cogs_enabled: see recalculateLandedCosts.
   // A close-short passes its landed-quantity basis, so the target is spread over the units that landed exactly as the layers were.
-  collectFloorCogsResult(result, await reconcileLandedFloorCogsTx(tx, { poId, poReference: po.reference, at: revaluedAt, chart: options.accountingSettings, ...(options.landedQtyBasis ? { landedQtyBasis: options.landedQtyBasis } : {}) }))
+  collectFloorCogsResult(result, await reconcileLandedFloorCogsTx(tx, { poId, poReference: po.reference, at: revaluedAt, chart: options.accountingSettings ?? null, ...(options.landedQtyBasis ? { landedQtyBasis: options.landedQtyBasis } : {}) }))
   // audit-grob: durably enqueue the adjustment journals IN this tx (backstop).
   if (options.scheduleAdjustmentJournals) {
     await scheduleLandedCostJournalOutbox(tx, result)

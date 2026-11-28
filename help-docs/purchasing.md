@@ -414,14 +414,19 @@ If a freight PO is added or updated after goods have already been received, the 
   `landed_cost_floor_cogs_enabled` on (set with `npm run settings:set ... --yes --confirm-admin`; turning it on is refused while
   Xero sync is on and the COGS account, the Stock in Transit account or the COGS journal sync type is not set), IMS posts that part
   as a journal **DR Stock in Transit / CR COGS** whenever the floor applies: at a receipt (manual, the warehouse book-in, or the
-  Mintsoft alignment, including a receipt of floored units only, which is worth 0.00) and at a landed-cost recalculation. It is
+  Mintsoft alignment) and at a landed-cost recalculation. It is
   worked out from the order as it stands: what the floor leaves unabsorbed on the order's receipt layers now, less what was already
   posted, so receiving again or saving the same costs posts nothing, a larger or smaller credit posts only the difference, and
-  **cancelling the freight order reverses it** (DR COGS / CR Stock in Transit). An order **closed short** is worked out on the
-  quantities that landed, the same basis the close-short uses to spread its freight, so the journal matches the layers. The zero
-  floor and the warning above are unchanged (with the switch on the warning says the amount is posted).
-  - **Which receipts count.** A receipt counts when the transit sub-ledger covers its day (from the transit coverage date, from which
-    IMS records every transit posting) and IMS is posting to Xero. Receipts from before that date are left as they are.
+  **cancelling the freight order reverses it** (DR COGS / CR Stock in Transit). When an order is **closed short** and the close
+  re-spreads its freight, the journal is worked out on the quantities that landed, the same basis the close-short uses, so it
+  matches the layers. The zero floor and the warning above are unchanged (with the switch on the warning says the amount is posted).
+  - **Which receipts count.** Only receipts whose own stock receipt journal actually went to Xero: IMS recorded that receipt
+    journal in the transit sub-ledger, and the outbound write hold would have sent it live on that day (not held as a shadow).
+    So nothing is posted for a receipt made while accounting sync was off (turning sync on later does not change that) or while
+    the hold was recording Xero writes instead of sending them.
+  - **Cautious by design.** A receipt of floored units only is worth 0.00, so it writes no receipt journal and IMS has no record that
+    it reached Xero; its share is not posted and stays on Stock in Transit. Receipts are matched to their journals by order and
+    day, so if an order has two receipts on one day and only one was journalled, both count.
   - **The queue and the hold.** The journal goes through the normal accounting queue and producer hold, and is recorded in the
     transit and COGS sub-ledgers so the transit reconciliation ties. A journal the queue declines is reported on the order and in
     the posting refusals; a journal the hold records instead of sending is reported as a WARNING on the order. Either way the next
@@ -431,7 +436,9 @@ If a freight PO is added or updated after goods have already been received, the 
     refused with a message naming the account (nothing is changed). A warehouse book-in or alignment is never refused for it: it is
     recorded and a WARNING on the order says the journal was not posted. Switching the setting off does not stop this for an order
     that already has such a journal; it keeps being reconciled, so a later cancellation still reverses it.
-  - **Not covered.** A supplier return of floored units does not reverse it.
+  - **Not covered.** A supplier return of floored units does not reverse it. An order that is already **Closed** when the switch
+    is turned on is not covered either: nothing works out a closed order again (a closed order takes no receipt and its landed
+    cost cannot be recalculated), so any credit it left on Stock in Transit stays there.
 - **Freight orders accept an individual credit line, but not a net credit.** A freight order whose cost lines total
   less than zero, or whose total including VAT is less than zero (VAT is charged on a negative vatable line too), is
   refused with a message that a net credit from the supplier belongs on a supplier credit note. A zero line, a zero
