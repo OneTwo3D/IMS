@@ -309,7 +309,7 @@ export type MintsoftConnectionSettingsMasked = {
 
 /**
  * WHAT THE MINTSOFT SCREENS SHOW ABOUT THE CONNECTION — AND NOT WHETHER IT IS CONFIGURED
- * (wms-neutral-refactor round 14, Codex HIGH 2).
+ * (PR #680 (WMS connector removal) round 14, Codex HIGH 2).
  *
  * `configured` USED TO BE THE FIRST FIELD HERE, and both builders below recomputed it as
  * `Boolean(connection.baseUrl.trim() && mintsoftHasAuthMaterial(settings))`. That is a SECOND
@@ -1661,7 +1661,7 @@ export async function getMintsoftDashboardData(): Promise<MintsoftDashboardData>
 
   let externalWarehouses: MintsoftExternalWarehouseOption[] = []
   let warehouseLookupError: string | null = null
-  // WAREHOUSE DISCOVERY IS GATED ON THE ONE VERDICT TOO (wms-neutral-refactor round 14, Codex HIGH 2).
+  // WAREHOUSE DISCOVERY IS GATED ON THE ONE VERDICT TOO (PR #680 (WMS connector removal) round 14, Codex HIGH 2).
   //
   // This gate was the same expression the deleted `configured` field was, and it drifted the same
   // way: with a malformed stored base URL it said "go", and discovery then built a request from a

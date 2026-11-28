@@ -1,5 +1,7 @@
 # Detailed Implementation Plan — Mintsoft WMS Connector
 
+> **Historical.** Written when the Shopify and QuickBooks connectors still existed. Those connectors have since been removed (the code is archived under `archive/connectors/`); read every mention of them below as history. The shipped design is `docs/mintsoft.md` and `docs/wms-connector-boundary.md`.
+
 ## Context
 
 The existing `docs/mintsoft-wms-connector-plan.md` is a good architectural design but is too abstract for direct implementation. This plan restates it as a concrete, file-by-file build plan keyed to the real OTI codebase so that Codex (or any other agent) can implement it with minimal guesswork.

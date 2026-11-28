@@ -6,7 +6,7 @@ import * as realTypes from '../lib/connectors/wms/types.ts'
 
 /**
  * A SECOND REGISTERED CONNECTOR, because the predicate's claim is about REGISTRY MEMBERSHIP
- * (wms-neutral-refactor round 10). `shouldPushStorefrontCompletion` reads `isWmsConnectorId(source)`,
+ * (PR #680 (WMS connector removal) round 10). `shouldPushStorefrontCompletion` reads `isWmsConnectorId(source)`,
  * and with one shipped connector every assertion below passes identically against a hardcoded
  * `source === 'mintsoft'` — so nothing could tell the two apart. The branch DELETED the
  * second-WMS case that used to make that distinction and replaced it with a comment asserting the

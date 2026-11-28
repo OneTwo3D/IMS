@@ -1,5 +1,7 @@
 # Mintsoft WMS Connector Plan
 
+> **Historical.** Written when the Shopify and QuickBooks connectors still existed. Those connectors have since been removed (the code is archived under `archive/connectors/`); read every mention of them below as history. The shipped design is `docs/mintsoft.md` and `docs/wms-connector-boundary.md`.
+
 ## Goal
 
 Add a Mintsoft warehouse management system (WMS) integration to One Two Inventory as a **replaceable, plugin-style connector**. The design must:

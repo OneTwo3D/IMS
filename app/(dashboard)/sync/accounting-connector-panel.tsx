@@ -21,7 +21,7 @@ type AccountingConnectorUi = {
 //
 // TOTAL over the id union (`Record`, not `Partial<Record>`), so a registered accounting connector
 // with no panel is a `tsc` error rather than a blank screen under a header naming it — the
-// wms-neutral-refactor round 6 lesson, applied here. One entry ships today. `XeroClient` is the
+// PR #680 (WMS connector removal) round 6 lesson, applied here. One entry ships today. `XeroClient` is the
 // component behind it, which is worth knowing before the next connector assumes the panel is
 // generic — it is the SLOT that is generic, not the component.
 const ACCOUNTING_CONNECTOR_UI: Record<AccountingConnectorUiId, AccountingConnectorUi> = {

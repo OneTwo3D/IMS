@@ -890,12 +890,12 @@ test('every read is made with the arguments it claims, and every result reaches 
     'accountingReadiness', 'accountingSettings',
     'accountingTaxRates', 'accountingTenantName', 'ambiguousWmsConnectorIds', 'availableWmsConnectorIds',
     'currencies', 'imsTaxRates', 'paymentAccountMap',
-      'paymentMethodCombos', 'pluginState',
+    'paymentMethodCombos', 'pluginState',
     'shoppingCredentials', 'shoppingLogs', 'shoppingPaymentMethods', 'shoppingSettings',
     'shoppingStatusMappings', 'shoppingTaxMappings', 'taxRates', 'wmsData',
   ], 'the dashboard prop set is pinned: a new prop must be wired here deliberately')
 
-  // wms-neutral-refactor round 12. Both are facts the CLIENT grid cannot read for itself — the WMS
+  // PR #680 (WMS connector removal) round 12. Both are facts the CLIENT grid cannot read for itself — the WMS
   // registry statically imports the shipped connector (and Prisma behind it) — so the page is where
   // they are resolved, and both used to be written by the grid: `available: true` on every WMS card,
   // and "another connector currently does" inferred from a missing DTO.

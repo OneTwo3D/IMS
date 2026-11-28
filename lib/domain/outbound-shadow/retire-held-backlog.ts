@@ -3,7 +3,7 @@ import { lockOrderForRow, recomputeInvoicingStateForRow } from '@/lib/domain/sal
 import { db } from '@/lib/db'
 import { HELD_SHADOW_VOID_BASIS } from '@/lib/domain/accounting/accounting-event-void-basis'
 import { updateMirroredAccountingEventStatus } from '@/lib/domain/accounting/accounting-event-mirror'
-import { attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
+import { REVISION_BUMPING_CONNECTOR_WHERE, attemptProvenNeverMade } from '@/lib/domain/accounting/money-attempt-provenance'
 import { MONEY_MOVING_SYNC_TYPES } from '@/lib/domain/accounting/followup-retry-guard'
 import { HELD_SHADOW_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
@@ -470,6 +470,8 @@ async function retireXeroSyncLog(tx: Prisma.TransactionClient, item: RetirementI
   const guard: Prisma.AccountingSyncLogWhereInput = {
     id: row.id,
     connector: 'xero',
+    // The retirement stamps `abandonedBeforeRemoteCall`: only for a connector this build registers (a revision-bumping processor wrote the row).
+    AND: [REVISION_BUMPING_CONNECTOR_WHERE],
     createdAt: row.createdAt,
     status: row.status,
     attemptRevision: row.attemptRevision,

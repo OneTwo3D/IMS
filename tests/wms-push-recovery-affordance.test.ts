@@ -23,7 +23,7 @@ const AMBIGUOUS = { attempts: 3, externalOrderId: null, pushedAt: null }
 const NOTHING_SENT = { attempts: 0, externalOrderId: null, pushedAt: null }
 
 /**
- * wms-neutral-refactor: `acme-wms` stands in for the connector whose create cannot be repeated. It is
+ * PR #680 (WMS connector removal): `acme-wms` stands in for the connector whose create cannot be repeated. It is
  * NOT in the shipped registry, so these calls refuse it as "no policy" rather than as
  * `client-side-dedupe-only` — the same refusal, reached by the adjacent route. That is adequate for
  * what this file measures (which affordance the inbox renders, and what the guidance says), and it

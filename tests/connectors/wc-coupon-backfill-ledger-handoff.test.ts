@@ -392,7 +392,13 @@ test('a remedy for a system this build does not know gets neutral wording, never
   for (const remedy of [tooLittle.remedy, tooMuch.remedy]) {
     const text = wcCouponRemedySteps({ ...(remedy as object), externalSystem: 'retired-ledger' } as never).join('\n')
     assert.doesNotMatch(text, /Remove & Redo|Add Credit Note|Invoice ▸ Options|re-approve/, 'no Xero-only UI wording for another system')
-    assert.match(text, /the accounting system/)
+    assert.match(text, /retired-ledger|the accounting system/, 'a system this build does not know is named by its raw id (or neutrally), never as Xero')
+  }
+  // A remedy whose derivation named NO system at all (externalSystem null): neutral wording, never Xero's UI path, and never the string "null".
+  for (const remedy of [tooLittle.remedy, tooMuch.remedy]) {
+    const text = wcCouponRemedySteps({ ...(remedy as object), externalSystem: null } as never).join('\n')
+    assert.doesNotMatch(text, /Remove & Redo|Add Credit Note|Invoice ▸ Options|re-approve/, 'no Xero-only UI wording when no system is named')
+    assert.doesNotMatch(text, /\bnull\b/, 'the missing system is never printed')
   }
 })
 
@@ -1328,7 +1334,7 @@ test('a Xero invoice is NOT netted against a retired-ledger credit note (o3d-y14
   const text = split.lines.join('\n')
   assert.doesNotMatch(text, /THE POSITION NETS/)
   assert.doesNotMatch(text, /THE TWO ERRORS CANCEL/)
-  assert.match(text, /posted to Xero and this order's credit note\(s\) to the accounting system — TWO SEPARATE LEDGERS/)
+  assert.match(text, /posted to Xero and this order's credit note\(s\) to retired-ledger — TWO SEPARATE LEDGERS/)
   assert.match(text, /IMS CANNOT NET THE TWO FOR YOU here/)
   // The invoice finding itself is still reported — it is a fact about the invoice either way.
   assert.match(text, /carries an order-level discount of 10 GBP/)

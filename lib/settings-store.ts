@@ -73,6 +73,24 @@ export const SETTING_ENV_FALLBACKS: Partial<Record<string, string>> = {
 // operator's value), exactly like the SMTP_* variables. After that the Settings
 // UI is the single source of truth.
 
+/**
+ * CREDENTIAL KEYS OF CONNECTORS THAT HAVE BEEN REMOVED (QuickBooks, Shopify, ShipHero), kept here as literals and spread into SENSITIVE_SETTING_KEYS.
+ *
+ * Nothing in this build reads or writes them, and the forward migrations `20261122140000_purge_retired_accounting_settings` and `20261126120000_purge_retired_storefront_wms_settings`
+ * delete their rows. But a restore of a pre-purge dump (the restore has no migration-level gate: lib/backup-manifest.ts) brings the rows back until the next `migrate deploy` re-runs the
+ * purge, and a row whose key is not in the sensitive set is readable unmasked through `getSetting` by every role that may read a generic setting. Keeping the literals here costs nothing
+ * at run time and keeps such a row masked (and encrypted by the legacy-row path) in that window. tests/settings-store-retired-credential-keys.test.ts pins the literals.
+ */
+export const RETIRED_CREDENTIAL_SETTING_KEYS: readonly string[] = [
+  'quickbooks_client_secret',
+  'shiphero_access_token',
+  'shiphero_refresh_token',
+  'shiphero_webhook_secret',
+  'shopify_admin_api_access_token',
+  'shopify_invoice_pdf_secret',
+  'shopify_webhook_secret',
+]
+
 export const SENSITIVE_SETTING_KEYS = new Set([
   'backup_s3_secret_key',
   'backup_sftp_password',
@@ -100,6 +118,7 @@ export const SENSITIVE_SETTING_KEYS = new Set([
   // The rotated-out webhook secret kept for the grace window (o3d-hqvrp.91): still a bearer credential.
   'wc_webhook_secret_previous',
   'xero_client_secret',
+  ...RETIRED_CREDENTIAL_SETTING_KEYS,
 ])
 
 export type EncryptedSettingMigrationResult = 'skipped' | 'migrated' | 'raced' | 'failed'

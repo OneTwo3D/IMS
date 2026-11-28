@@ -12,6 +12,7 @@ import {
   type RegisteredPaymentVerdict,
 } from '@/lib/connectors/xero/invoice-delta'
 import { UNCLAIMED_ATTEMPT_REVISION } from '@/lib/domain/accounting/sync-log-attempt'
+import { REVISION_BUMPING_CONNECTOR_WHERE } from '@/lib/domain/accounting/money-attempt-provenance'
 import { LEDGER_STANDING_SELECT, MAY_HAVE_REACHED_LEDGER_WHERE, ledgerStanding, type LedgerStandingRow } from '@/lib/domain/accounting/ledger-standing'
 import { VERIFIED_REVERSAL_SETTLEMENT_BASIS } from '@/lib/domain/accounting/sync-row-settlement'
 import { storedBodyMayHaveReachedTheLedger } from '@/lib/domain/accounting/followup-idempotency'
@@ -1024,6 +1025,8 @@ export async function markBillPaidSupersedingStaleRegistrations(
       status: { in: [...SUPERSEDABLE_BILL_PAYMENT_STATUSES] },
       attemptRevision: UNCLAIMED_ATTEMPT_REVISION,
       externalTransactionId: null,
+      // The pre-call proof written below is only true of a row a revision-bumping processor wrote: a retired connector's history is left to the caller's refusal (the count falls short).
+      ...REVISION_BUMPING_CONNECTOR_WHERE,
     },
     data: { status: 'CANCELLED', errorMessage: BILL_PAYMENT_SUPERSEDED_REASON, abandonedBeforeRemoteCall: true },
   })

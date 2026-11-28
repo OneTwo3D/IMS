@@ -2530,7 +2530,7 @@ test('the webhook fencing claim is measured FROM THE ROUTES, not from the flag r
   // because a route that does not contains nothing to grep for. The unfenced WMS
   // webhook entry points were invisible to it by construction, and the operator message told
   // whoever read it that they were stopped. (The second WMS's route is gone as of
-  // wms-neutral-refactor; the enumeration below is what makes its absence a fact rather than a
+  // PR #680 (WMS connector removal); the enumeration below is what makes its absence a fact rather than a
   // memory, because a re-added unfenced route would fail here.)
   //
   // So this test starts from the ROUTE FILES and classifies every one of them. A new webhook route

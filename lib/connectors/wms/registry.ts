@@ -49,7 +49,7 @@ import { getSettingValue } from '@/lib/settings-store'
  */
 /**
  * A CONNECTOR THAT MAY BE REGISTERED — the contract plus the one coupling `WmsConnector` cannot
- * state on its own (wms-neutral-refactor round 2, Codex HIGH 4).
+ * state on its own (PR #680 (WMS connector removal) round 2, Codex HIGH 4).
  *
  * `WmsConnector` makes `needsVerification` and `verifyPushedOrder` independently optional, so it
  * admits a connector that mints ids it declares UNPROVED and offers no way to prove them. There is
@@ -79,7 +79,7 @@ export type WmsRegistrableConnector<Id extends string> = WmsConnector<Id> &
   )
   & (
     /**
-     * THE SECOND PAIRING THE CONTRACT CANNOT STATE ALONE (wms-neutral-refactor round 4, Codex HIGH 1).
+     * THE SECOND PAIRING THE CONTRACT CANNOT STATE ALONE (PR #680 (WMS connector removal) round 4, Codex HIGH 1).
      *
      * `WmsConnector` makes `fetchOrderDelta` and `deltaCursorTimeZone` independently optional, so it
      * admits a connector with a bulk delta and no statement of the zone its cursor is a wall-clock
@@ -146,7 +146,7 @@ export type WmsConnectorRegistry<Id extends string = WmsConnectorId> = {
 }
 
 /**
- * A CONNECTOR MUST BE THE CONNECTOR THAT WAS ASKED FOR (wms-neutral-refactor round 14, Codex HIGH 1).
+ * A CONNECTOR MUST BE THE CONNECTOR THAT WAS ASKED FOR (PR #680 (WMS connector removal) round 14, Codex HIGH 1).
  *
  * {@link WmsConnectorRegistrations} makes a mismatched factory uncompilable, and that is where this
  * is meant to be caught. This is the backstop for the callers the compiler never sees: a JavaScript registration,
@@ -211,7 +211,7 @@ export type WmsConnectorRegistration<Id extends string = WmsConnectorId> = Omit<
 
 /**
  * THE REGISTRATION RECORD — every entry constrained to ITS OWN KEY, which is a MAPPED TYPE and not
- * a `Record` over the union (wms-neutral-refactor round 14, Codex HIGH 1).
+ * a `Record` over the union (PR #680 (WMS connector removal) round 14, Codex HIGH 1).
  *
  * WHAT WENT WRONG. Round 12 made the record TOTAL over `WmsConnectorId`, which is what makes a
  * registered id with no definition uncompilable, and that half was right. But it spelled the
@@ -243,7 +243,7 @@ export type WmsConnectorRegistrations<Id extends string> = {
 
 /**
  * THE ONE DERIVATION: a registry is the canonical id list crossed with one definition per id
- * (wms-neutral-refactor round 12, Codex HIGH 1).
+ * (PR #680 (WMS connector removal) round 12, Codex HIGH 1).
  *
  * WHAT WENT WRONG. `BUILT_IN_WMS_CONNECTORS` was a hand-written array typed
  * `readonly WmsConnectorDef[]`. Rounds 6 and 8 made the PANELS and the plugin TOGGLES total over
@@ -283,7 +283,7 @@ export function createRegisteredWmsConnectorRegistry<Id extends string>(
         + ' every id in WMS_CONNECTOR_IDS must have an entry in the registration record',
       )
     }
-    // `id` LAST (wms-neutral-refactor round 14, Codex HIGH 1). Spread first and the key wins; spread
+    // `id` LAST (PR #680 (WMS connector removal) round 14, Codex HIGH 1). Spread first and the key wins; spread
     // last — as this read `{ id, ...registration }` until round 14 — and a registration carrying an
     // `id` of its own OVERWRITES the key it was filed under. `WmsConnectorRegistration` omits `id`,
     // so `tsc` refuses to write one; a JavaScript caller, a `JSON.parse`d registration or a test
@@ -345,10 +345,10 @@ export const BUILT_IN_WMS_CONNECTOR_REGISTRATIONS: WmsConnectorRegistrations<Wms
           syncBundle: async (productId, triggeredBy) => outcome.mintsoftBundleOutcome(await bundle.runBundleSyncForProduct(productId, triggeredBy)),
         }
       },
-      // The /sync WMS panel and the onboarding connection step (wms-neutral-refactor round 4,
+      // The /sync WMS panel and the onboarding connection step (PR #680 (WMS connector removal) round 4,
       // Codex HIGH 2). Both used to be an `if (connectorId === 'mintsoft')` inside the generic
       // facade, with the connector's payload returned under a literal `mintsoft:` member.
-      // NEITHER HOOK STATES `configured` (wms-neutral-refactor round 8, Codex HIGH 1). A hook
+      // NEITHER HOOK STATES `configured` (PR #680 (WMS connector removal) round 8, Codex HIGH 1). A hook
       // supplies the PAYLOAD its own screen renders; whether the connection is set up is
       // `isConfigured()`, which every connector must implement, and the facades read it there. A
       // second source for one fact is what let the no-hook branch answer `false` on its own.
@@ -445,7 +445,7 @@ export type WmsConnectorInstanceSource = {
  * holding an id that came out of plugin state or a link row, and an id from a connector this build
  * no longer ships must degrade rather than throw from inside a read.
  *
- * WHAT THIS EXISTS FOR (wms-neutral-refactor round 8, Codex HIGH 1). `isConfigured()` is the one
+ * WHAT THIS EXISTS FOR (PR #680 (WMS connector removal) round 8, Codex HIGH 1). `isConfigured()` is the one
  * MANDATORY statement a connector makes about its own connection. The two UI facades used to
  * answer `configured: false` from their own no-hook branch instead of asking it, which conflated
  * "this connector ships no panel" (a CAPABILITY) with "this connector is not set up" (its STATE) —
@@ -480,7 +480,7 @@ export function findWmsConnectorLabel(
 
 /**
  * WHETHER THIS CONNECTOR'S CONNECTION IS SET UP — and the ONE place `isConfigured()` may be called
- * from a read (wms-neutral-refactor round 10, Codex HIGH 2).
+ * from a read (PR #680 (WMS connector removal) round 10, Codex HIGH 2).
  *
  * THE DEFECT THIS CLOSES. Round 8 moved `configured` onto `WmsConnector.isConfigured()`, correctly:
  * it is the one MANDATORY statement a connector makes about its own connection, and the hooks had
@@ -519,7 +519,7 @@ export function findWmsConnectorLabel(
  * `findWmsConnector`, so an id left behind by a connector this build no longer ships is
  * unconfigurable rather than a throw from inside a read.
  *
- * RESOLUTION IS INSIDE THE TRY, not just the predicate (wms-neutral-refactor round 14, Codex HIGH 1).
+ * RESOLUTION IS INSIDE THE TRY, not just the predicate (PR #680 (WMS connector removal) round 14, Codex HIGH 1).
  * `findWmsConnector` can now throw on its own account — a registration whose factory builds another
  * warehouse's connector is refused there — and the round-10 rule covers that throw for exactly the
  * same reason it covers the predicate's: these are the reads `/onboarding` gathers with

@@ -22,7 +22,7 @@ type ShoppingLookupConnector = 'woocommerce'
  * THE WMS CONNECTION-FORM REGISTRY — the onboarding wizard's setup step for whichever WMS
  * connector is active. Connector-agnostic above this file; connector-specific inside it.
  *
- * wms-neutral-refactor round 6 (Codex HIGH 1) — WHY THIS IS A TOTAL RECORD AND NOT AN `if`.
+ * PR #680 (WMS connector removal) round 6 (Codex HIGH 1) — WHY THIS IS A TOTAL RECORD AND NOT AN `if`.
  * Round 4 fixed the FACADE (app/actions/wms-onboarding.ts) so a second registered connector is
  * reported with its own label and its own `configured`, under a DTO keyed by connector. This file
  * — the one that renders it — still asked `connectorId === 'mintsoft'` and rendered `null`
@@ -45,7 +45,7 @@ export type WmsConnectionFormProps = {
   payload: unknown
   connectorLabel: string
   /**
-   * WHETHER THE CONNECTION IS SET UP, from the envelope (wms-neutral-refactor round 14, Codex HIGH 2).
+   * WHETHER THE CONNECTION IS SET UP, from the envelope (PR #680 (WMS connector removal) round 14, Codex HIGH 2).
    *
    * A connector's form used to receive only its payload, so Mintsoft's read `data.status.configured`
    * — a value its own DTO builder recomputed from the raw stored base URL. An unparseable base URL

@@ -743,13 +743,13 @@ Before engineering starts, confirm:
 2. whether refund credits always create new vouchers or may top up existing customer credit instruments
 3. whether marketing stored-value vouchers are always contra-revenue or allow profile overrides
 4. whether any channels cannot support reserve / commit / release semantics for stored value
-6. whether encrypted full voucher-code storage is operationally required
-7. which jurisdictions require SPV / MPV support in the first release
-8. confirm the default MPV treatment for multi-jurisdiction tenants with external accountant review
-9. confirm refund-posting FX policy as current rate plus explicit variance account
-10. confirm loyalty mismatch resolution as source-wins plus reconciliation adjustment entries
-11. confirm customer identity model and whether any manual cross-platform merges are permitted
-12. confirm chargeback policy for gift-card-funded orders, gift-card purchases, and refund credits
+5. whether encrypted full voucher-code storage is operationally required
+6. which jurisdictions require SPV / MPV support in the first release
+7. confirm the default MPV treatment for multi-jurisdiction tenants with external accountant review
+8. confirm refund-posting FX policy as current rate plus explicit variance account
+9. confirm loyalty mismatch resolution as source-wins plus reconciliation adjustment entries
+10. confirm customer identity model and whether any manual cross-platform merges are permitted
+11. confirm chargeback policy for gift-card-funded orders, gift-card purchases, and refund credits
 
 ## Status
 

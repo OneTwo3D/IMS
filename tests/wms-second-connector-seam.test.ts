@@ -1,5 +1,5 @@
 /**
- * THE SECOND-CONNECTOR SEAM (wms-neutral-refactor).
+ * THE SECOND-CONNECTOR SEAM (PR #680 (WMS connector removal)).
  *
  * WHAT THIS FILE IS FOR. Until the second WMS was removed there were two WMS connectors, and
  * the generic WMS layer was kept honest by the ordinary fact that both had to work.
@@ -131,7 +131,7 @@ test('seam/policy: a REGISTERED unsafe connector is distinguishable from an unkn
 
 /**
  * THE SHIPPED REGISTRY IS EXHAUSTIVE OVER THE CANONICAL ID LIST
- * (wms-neutral-refactor round 12, Codex HIGH 1).
+ * (PR #680 (WMS connector removal) round 12, Codex HIGH 1).
  *
  * `BUILT_IN_WMS_CONNECTORS` was a hand-written array typed `readonly WmsConnectorDef[]` while the
  * panels (round 6) and the plugin toggles (round 8) had both been made total over
@@ -444,7 +444,7 @@ test('seam/asn: the ASN view-model is labelled from the registry, not from a lit
 })
 
 test('seam/asn: a registered connector with no ASN support is named, not anonymised', () => {
-  // wms-neutral-refactor: the facade used to hardcode 'WMS' on this arm, so an operator
+  // PR #680 (WMS connector removal): the facade used to hardcode 'WMS' on this arm, so an operator
   // running a registered connector that simply cannot do ASNs was told an unnamed
   // system was unavailable.
   const label = makeSeamRegistry().getDef(ACME_WMS_ID).label
@@ -564,7 +564,7 @@ test('seam/verify: a connector that asserts an unresolvable doubt CANNOT BE REGI
     label: ACME_WMS_LABEL,
     available: true,
     createReplayPolicy: 'client-side-dedupe-only',
-    // @ts-expect-error wms-neutral-refactor r2 (Codex HIGH 4): `needsVerification: true` with no
+    // @ts-expect-error PR #680 (WMS connector removal) r2 (Codex HIGH 4): `needsVerification: true` with no
     // `verifyPushedOrder` is not a registrable connector. Deleting the union in
     // WmsRegistrableConnector makes this line compile, and THAT is what this test detects.
     create: () => new UnverifiableAcmeWmsConnector(warehouse),
@@ -575,7 +575,7 @@ test('seam/verify: a connector that asserts an unresolvable doubt CANNOT BE REGI
 })
 
 /**
- * THE SECOND UNREGISTRABLE COMBINATION (wms-neutral-refactor round 4, Codex HIGH 1).
+ * THE SECOND UNREGISTRABLE COMBINATION (PR #680 (WMS connector removal) round 4, Codex HIGH 1).
  *
  * `fetchOrderDelta` without `deltaCursorTimeZone`. The cursor a delta is asked for is a WALL-CLOCK
  * string the warehouse compares against its own `LastUpdated`, so a connector that has a delta and
@@ -594,7 +594,7 @@ test('seam/delta: a connector with a bulk delta and NO cursor timezone CANNOT BE
     label: ACME_WMS_LABEL,
     available: true,
     createReplayPolicy: 'client-side-dedupe-only',
-    // @ts-expect-error wms-neutral-refactor r4 (Codex HIGH 1): `fetchOrderDelta` with no
+    // @ts-expect-error PR #680 (WMS connector removal) r4 (Codex HIGH 1): `fetchOrderDelta` with no
     // `deltaCursorTimeZone` is not a registrable connector. Deleting the delta/timezone union in
     // WmsRegistrableConnector makes this line compile, and THAT is what this test detects.
     create: () => new ZonelessDeltaAcmeWmsConnector(),

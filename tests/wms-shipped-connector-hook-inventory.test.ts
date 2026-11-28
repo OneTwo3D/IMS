@@ -56,7 +56,7 @@ function hookNamesFromContract(): string[] {
       ts.isTypeAliasDeclaration(statement) && statement.name.text === 'WmsConnectorHooks',
   )
   // A HARD FAILURE, never a silently shorter list — the same rule the boundary guard learned in
-  // wms-neutral-refactor round 4. A guard that cannot resolve its subject has not checked anything.
+  // PR #680 (WMS connector removal) round 4. A guard that cannot resolve its subject has not checked anything.
   assert.ok(alias, `could not find the WmsConnectorHooks type alias in ${HOOKS_CONTRACT}`)
   assert.ok(
     ts.isTypeLiteralNode(alias.type),

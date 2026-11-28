@@ -1,7 +1,7 @@
 /**
  * A FICTITIOUS SECOND WMS CONNECTOR — the fixture that keeps the WMS abstraction honest.
  *
- * WHY IT EXISTS. Until wms-neutral-refactor there were two WMS connectors, and the
+ * WHY IT EXISTS. Until PR #680 (WMS connector removal) there were two WMS connectors, and the
  * generic layer (registry, create-replay policy, dispatch sweep, ASN facade, order
  * lookup, error mapping) had a real second implementation keeping it honest. Removing
  * the second WMS left Mintsoft alone, and a one-implementation abstraction is the classic
@@ -64,7 +64,7 @@ export type SeamWmsConnectorId = 'mintsoft' | typeof ACME_WMS_ID
 
 /**
  * THE ID LIST A SEAM BUILD REGISTERS — ONE constant, for BOTH halves
- * (wms-neutral-refactor round 12, Codex HIGH 1).
+ * (PR #680 (WMS connector removal) round 12, Codex HIGH 1).
  *
  * WHY THIS IS A CONSTANT AND NOT TWO LITERALS. Every seam file used to widen `WMS_CONNECTOR_IDS`
  * with its own inline `['mintsoft', ACME_WMS_ID]` and, separately, hand-build a registry from a
@@ -115,7 +115,7 @@ export type AcmeWarehouse = {
   cancelResult: (id: string) => WmsOrderCancelResult
   /**
    * What `isConfigured()` answers — MUTABLE, and that is the point
-   * (wms-neutral-refactor round 8, Codex HIGH 1).
+   * (PR #680 (WMS connector removal) round 8, Codex HIGH 1).
    *
    * It used to be hard-coded `true` while the seam tests asserted that a hook-less connector was
    * reported `configured: false`. The fixture and the assertions therefore disagreed about the same
@@ -243,7 +243,7 @@ export class AcmeWmsConnector implements WmsConnector<typeof ACME_WMS_ID> {
    * Called twice for one order number, it mints two warehouse orders — which is why
    * the registry definition below declares `client-side-dedupe-only`.
    *
-   * The result is a PROVEN one (wms-neutral-refactor round 2, Codex HIGH 4). Acme has no
+   * The result is a PROVEN one (PR #680 (WMS connector removal) round 2, Codex HIGH 4). Acme has no
    * `verifyPushedOrder`, and `WmsRegistrableConnector` will not register a connector that both
    * asserts `needsVerification: true` and offers no verifier — the combination the push sweep used
    * to resolve to SYNCED. Acme reads the created order back, so its id is proved on the way out;
@@ -277,7 +277,7 @@ export class AcmeWmsConnector implements WmsConnector<typeof ACME_WMS_ID> {
 
 /**
  * THE ZONE ACME'S WAREHOUSE COMPARES ITS DELTA CURSOR IN — deliberately NOT Mintsoft's, and
- * deliberately not UTC (wms-neutral-refactor round 4, Codex HIGH 1).
+ * deliberately not UTC (PR #680 (WMS connector removal) round 4, Codex HIGH 1).
  *
  * `America/Los_Angeles` is 8 hours BEHIND `Europe/London`. Send Acme a London wall-clock string and
  * it reads it as a Los Angeles wall clock, so the window it actually applies starts EIGHT HOURS
@@ -353,7 +353,7 @@ export class ZonelessDeltaAcmeWmsConnector extends AcmeWmsConnector {
 /**
  * Acme's registration — the definition MINUS its id, which the registry supplies from the key.
  *
- * TYPED TO ACME'S OWN ID, not to the seam union (wms-neutral-refactor round 14, Codex HIGH 1).
+ * TYPED TO ACME'S OWN ID, not to the seam union (PR #680 (WMS connector removal) round 14, Codex HIGH 1).
  * This fixture used to be `WmsConnectorRegistration<SeamWmsConnectorId>`, which is the very
  * looseness the round-14 fix removed from production: with the union in the type parameter, `create`
  * was `() => WmsRegistrableConnector<'mintsoft' | 'acme-wms'>` and this helper would happily have

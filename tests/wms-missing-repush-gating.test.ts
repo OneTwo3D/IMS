@@ -135,7 +135,7 @@ mock.module('@/lib/connectors/wms/registry', {
   },
 })
 /**
- * wms-neutral-refactor: a build in which a SECOND WMS connector is registered.
+ * PR #680 (WMS connector removal): a build in which a SECOND WMS connector is registered.
  *
  * These cases contrast a replay-safe connector with one whose create cannot be repeated. That used
  * to be Mintsoft vs a second WMS. With one connector shipping, the second id is not in

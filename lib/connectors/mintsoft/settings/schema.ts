@@ -222,7 +222,7 @@ export async function getMintsoftSettings(): Promise<MintsoftSettings> {
 }
 
 /*
- * `mintsoftHasAuthMaterial` WAS HERE, and is deleted (wms-neutral-refactor round 14, Codex HIGH 2).
+ * `mintsoftHasAuthMaterial` WAS HERE, and is deleted (PR #680 (WMS connector removal) round 14, Codex HIGH 2).
  *
  * Its own docstring said what it was for: "shared by the dashboard and onboarding status so they
  * cannot drift apart". Those two status builders were its ONLY callers, and both have stopped
@@ -263,7 +263,7 @@ export async function getMintsoftSettings(): Promise<MintsoftSettings> {
 export const MINTSOFT_DELTA_GENERATION_KEY = 'mintsoft_order_delta_generation'
 
 /**
- * wms-neutral-refactor round 2 (Codex HIGH 2) — THE CURSOR MACHINERY MOVED OUT, THE NAMES STAYED.
+ * PR #680 (WMS connector removal) round 2 (Codex HIGH 2) — THE CURSOR MACHINERY MOVED OUT, THE NAMES STAYED.
  *
  * `parse`/`next` generation and `encode`/`decode` cursor were never Mintsoft-specific; they were
  * Mintsoft-NAMED, and living here is what let the generic dispatch sweep import a connector module

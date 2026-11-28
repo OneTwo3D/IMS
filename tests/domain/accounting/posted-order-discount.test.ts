@@ -403,6 +403,25 @@ test('and a credit note is NOT auto-raised for the discount that invoice never c
   assert.equal(decision.action === 'MANUAL' && decision.postedAmount, 0)
 })
 
+test('two AGREEING documents tied on both columns report the same document whichever order they arrive in (o3d-y14 r13 F2)', async () => {
+  // The success variant names the newest document's id, and the compared position decides which of two tied documents that is. Two tied Xero documents (an invoice re-raised, ids INV-A and
+  // INV-B) must report the same document, id list and detail whichever way the rows are read.
+  const TIED = { businessDate: '2026-05-02', createdAt: '2026-05-02T09:00:00.000Z' }
+  const a = () => postedInvoice({ ...TIED, externalId: 'INV-A' })
+  const b = () => postedInvoice({ ...TIED, externalId: 'INV-B' })
+  const oneWay = makeClient({ events: [a(), b()] })
+  const otherWay = makeClient({ events: [b(), a()] })
+
+  const first = await readPostedInvoiceOrderDiscount(oneWay.client, { id: 'order-1', currency: 'GBP' })
+  const second = await readPostedInvoiceOrderDiscount(otherWay.client, { id: 'order-1', currency: 'GBP' })
+
+  assert.equal(first.ok && second.ok, true)
+  assert.equal(first.ok && first.externalId, second.ok && second.externalId)
+  assert.equal(first.ok && first.externalSystem, second.ok && second.externalSystem)
+  assert.deepEqual(first.ok ? first.externalIds : null, second.ok ? second.externalIds : null)
+  assert.equal(first.ok && first.detail, second.ok && second.detail)
+})
+
 test('a mirrored event naming no connector, or one this build cannot replay, is refused — no posting rule can be replayed (o3d-y14 r4 F3)', async () => {
   for (const externalSystem of [null, 'sage', 'retired-ledger']) {
     const { client } = makeClient({

@@ -72,7 +72,7 @@ export const WMS_CREATE_REPLAY_POLICY: Record<WmsConnectorId, WmsCreateReplayPol
   // This IS the id→policy table, and a `Record<WmsConnectorId, …>` precisely so a new connector
   // fails `tsc` here until its answer is written down. It cannot import the registry (see the note
   // above on WmsCreateReplayPolicySource), so the key has to be spelled out.
-  // wms-connector-boundary-ok: wms-neutral-refactor: the id→policy table's own key.
+  // wms-connector-boundary-ok: PR #680 (WMS connector removal): the id→policy table's own key.
   mintsoft: 'remote-refuses-duplicate',
 }
 

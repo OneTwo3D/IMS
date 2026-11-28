@@ -4,7 +4,7 @@ import type { IntegrationPluginState } from '@/lib/integration-plugin-keys'
 
 /**
  * WHETHER THE ONBOARDING WIZARD'S INTEGRATIONS STEP MAY BE LEFT — and why it is a function rather
- * than an expression inside the step (wms-neutral-refactor round 8, Codex HIGH 1, one layer out).
+ * than an expression inside the step (PR #680 (WMS connector removal) round 8, Codex HIGH 1, one layer out).
  *
  * Round 8 fixed `configured` in the two WMS UI facades: a connector with a live connection and no
  * panel of its own was being reported as not set up. The re-audit asked what READS that value, and

@@ -20,6 +20,7 @@
  * "do not post again" branch, and Mark as handled waits for the CURRENT version.
  */
 import type { LedgerStanding } from '@/lib/domain/accounting/ledger-standing'
+import { ACCOUNTING_CONNECTORS } from '@/lib/connectors/accounting-registry'
 
 export type EarlierPosting = { ref: string; standing: LedgerStanding }
 
@@ -444,8 +445,12 @@ export function renderHandPostSettlementDoc(): string {
 // ---------------------------------------------------------------------------------------------------------------------------------------------
 
 /** An imperative to post, re-post, re-save, re-send, retry, reset, raise, enter or register something, or to do anything "by hand" / "yourself". */
-export const HAND_POST_INSTRUCTION_PATTERN =
-  /\b(post|re-?post|repost|re-?send|resend|retry|reset|re-?save|resave|raise|re-?raise|enter|register|record|book|apply|allocate|settle|reconcile|journal|credit|refund|void|correct)\b[^.]{0,80}\b(by hand|yourself|manually|again|in the ledger|in the accounting system|from (its|the) source document|in Xero)\b|\bpost (it|this|that|the current (version|payment)|its current version)\b|\byourself\b|\bre-?save\b|\bre-?post\b|\bresend\b|\bre-?raise\b/i
+/** The accounting connectors' display names as a regex alternation ("Xero"), from the registry so a connector registered later is covered by registering it. */
+const CONNECTOR_LABEL_ALTERNATION = ACCOUNTING_CONNECTORS
+  .map((connector) => connector.label.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))
+  .join('|')
+
+export const HAND_POST_INSTRUCTION_PATTERN = new RegExp(String.raw`\b(post|re-?post|repost|re-?send|resend|retry|reset|re-?save|resave|raise|re-?raise|enter|register|record|book|apply|allocate|settle|reconcile|journal|credit|refund|void|correct)\b[^.]{0,80}\b(by hand|yourself|manually|again|in the ledger|in the accounting system|from (its|the) source document|in (?:${CONNECTOR_LABEL_ALTERNATION}))\b|\bpost (it|this|that|the current (version|payment)|its current version)\b|\byourself\b|\bre-?save\b|\bre-?post\b|\bresend\b|\bre-?raise\b`, 'i')
 
 export const HAND_POST_SAFETY =
   'BEFORE any hand posting, re-post or re-save: take the posting for hand posting on this row and hold that claim (so IMS does not queue it while you work), '

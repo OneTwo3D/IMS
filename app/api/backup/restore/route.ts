@@ -597,7 +597,7 @@ export type RestoreLockContext = {
  *   app/api/webhooks/mintsoft/asn-booked-in            → FENCED as of o3d-hl8l. The route consults
  *       the flag as its FIRST statement, before the body is read and before the signature is
  *       verified, so nothing on the persist path runs during a held restore.
- *       (wms-neutral-refactor: a second WMS's webhook route was the one WMS ingress that stayed
+ *       (PR #680 (WMS connector removal): a second WMS's webhook route was the one WMS ingress that stayed
  *       UNFENCED — an owner-scoped gap in o3d-hl8l. Removing the connector removed the route, so
  *       every WMS webhook entry point this build has now consults the flag. That is a smaller
  *       claim than "the gap was fixed", and it is the only one the code supports.)

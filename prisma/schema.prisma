@@ -1804,7 +1804,7 @@ model PurchaseInvoice {
   // collision would move to the ~190 call sites that read a naked accountingInvoiceId, on models
   // (SalesOrder, SalesOrderRefund, SupplierCreditNote) that have no provenance column to consult
   // even in principle. Globally unique, the same situation is a BLOCKED WRITE with a loud error
-  // naming a realm switch as the likely cause (see applyBackReference). Failing to repair is
+  // naming an organisation switch as the likely cause (see applyBackReference). Failing to repair is
   // acceptable; repairing onto the wrong bill is not. o3d-gt8r carries the tenant-isolation work
   // that would be needed before namespacing this is safe.
   //
@@ -3609,9 +3609,9 @@ model AccountingSyncLog {
   // (connector, type, status, referenceType, referenceId, externalTransactionId) evidence that stops
   // an ambiguity silently becoming a certainty, but drop the payload and errorMessage, which are
   // where the customer names, emails, addresses and financial lines live. (An earlier revision of
-  // this comment listed a `provenance` column: that exact column was part of the per-realm
+  // this comment listed a `provenance` column: that exact column was part of the per-organisation
   // namespacing work, which was tried and REVERTED — see o3d-gt8r / o3d-s36z. It is NOT a statement
-  // that this model records no realm: `connectionProvenance` below does, and o3d-r948 r5 misread
+  // that this model records no organisation: `connectionProvenance` below does, and o3d-r948 r5 misread
   // this parenthesis as saying otherwise and left a money guard scoped to the connector TYPE. A
   // reverted design is not an absent capability; read the column list, not the history.)
   //
@@ -3758,7 +3758,7 @@ model AccountingSyncLog {
   /// o3d-dzip — WHICH ACCOUNTING ORGANISATION THIS ROW WAS RAISED AGAINST, in a place retention
   /// cannot reach. o3d-s36z records the same fact in the payload (`_connectionProvenance`), and
   /// `backReferenceEvidenceTombstone` compacts an expired-but-unresolved row to `payload: {}` while
-  /// KEEPING `externalTransactionId` — so the rows whose realm is least knowable are precisely the
+  /// KEEPING `externalTransactionId` — so the rows whose organisation is least knowable are precisely the
   /// ones that lose the stamp. This column is MINTED FROM that stamp, in the same INSERT statement,
   /// so the two cannot disagree at birth.
   ///
@@ -5837,7 +5837,7 @@ model WmsInboundReceiptEvent {
 /// with idempotent dedupe on (connector, externalEventId), retry/dead-letter state, and
 /// a monotonic status rank guarding the writeback against out-of-order delivery.
 ///
-/// NO CONNECTOR WRITES TO THIS TABLE TODAY (wms-neutral-refactor). A removed WMS was the only
+/// NO CONNECTOR WRITES TO THIS TABLE TODAY (PR #680 (WMS connector removal)). A removed WMS was the only
 /// push-primary one; Mintsoft is poll-primary and uses
 /// wms_inbound_receipt_events. The table and its generic READERS are kept deliberately:
 ///  - the `connector` column, the dedupe key and the status-rank guard are not

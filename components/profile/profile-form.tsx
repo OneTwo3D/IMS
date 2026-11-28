@@ -56,7 +56,7 @@ export function ProfileForm({ user }: { user: UserData }) {
   // Read from the DOM with useSyncExternalStore: null on the server and during hydration, the slot element afterwards.
   const headerSlot = useSyncExternalStore(subscribeNever, () => document.getElementById('profile-actions'), () => null)
 
-  // wms-connector-boundary-ok: wms-neutral-refactor: joins first characters of the user's own name.
+  // wms-connector-boundary-ok: PR #680 (WMS connector removal): joins first characters of the user's own name.
   const initials = name
     .split(' ')
     .map((n) => n[0])

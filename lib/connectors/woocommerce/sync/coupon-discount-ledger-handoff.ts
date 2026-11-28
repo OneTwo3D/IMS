@@ -1120,10 +1120,14 @@ export function classifyWcCouponInvoiceHandoff(input: {
   return { case: 'NO_INVOICE_IN_LEDGER' }
 }
 
-/** Xero's UI, or neither when the derivation never named a system (or named one this build does not know). */
+/**
+ * Xero's name; `the accounting system` when the derivation never named a system; and the RAW id when it named one this build does not know (a retired connector's history), so an operator
+ * reading "posted to quickbooks" is told which ledger the document is in rather than an anonymous one. The step wording (editInvoiceStep, creditNoteStep) is Xero-specific only for 'xero'.
+ */
 function systemName(externalSystem: string | null): string {
+  if (externalSystem === null) return 'the accounting system'
   if (externalSystem === 'xero') return 'Xero'
-  return 'the accounting system'
+  return externalSystem
 }
 
 // ---------------------------------------------------------------------------

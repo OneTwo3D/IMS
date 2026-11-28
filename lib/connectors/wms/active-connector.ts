@@ -19,7 +19,7 @@ export async function getActiveWmsConnectorId(): Promise<WmsConnectorId | null> 
 }
 
 /**
- * The same resolution, with the REASON kept (wms-neutral-refactor round 10, Codex HIGH 1).
+ * The same resolution, with the REASON kept (PR #680 (WMS connector removal) round 10, Codex HIGH 1).
  *
  * `getActiveWmsConnectorId` collapses two very different states to `null`, and after this round
  * that is actively misleading: the legacy fallback means "nothing enabled" resolves to the first
@@ -56,7 +56,7 @@ export async function getEnabledWmsConnectorId(): Promise<WmsConnectorId | null>
 }
 
 /**
- * The same answer, WITH ITS REASON (wms-neutral-refactor round 12, Codex MEDIUM).
+ * The same answer, WITH ITS REASON (PR #680 (WMS connector removal) round 12, Codex MEDIUM).
  *
  * `getEnabledWmsConnectorId` returns `null` for BOTH "none enabled" and "more than one enabled",
  * and round 10 gave the resolver a three-valued answer only to have its callers collapse it back to

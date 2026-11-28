@@ -1,7 +1,7 @@
 /**
  * The one genuinely connector-agnostic stock-sync primitive.
  *
- * WHAT THIS MODULE USED TO BE, AND WHY IT SHRANK (wms-neutral-refactor). It was
+ * WHAT THIS MODULE USED TO BE, AND WHY IT SHRANK (PR #680 (WMS connector removal)). It was
  * created as a "connector-agnostic" mirror of Mintsoft's connector-local
  * lib/connectors/mintsoft/sync/stock-sync-helpers.ts so a second WMS's stock sync
  * had something generic to call — but Mintsoft was never migrated onto it, so

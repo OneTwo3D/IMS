@@ -1,6 +1,6 @@
 /**
  * THE SECOND-CONNECTOR SEAM, DRIVEN THROUGH THE TWO SCREENS THAT TURN A CONNECTOR ON
- * (o3d-m0ad / wms-neutral-refactor round 8, Codex HIGH 2).
+ * (o3d-m0ad / PR #680 (WMS connector removal) round 8, Codex HIGH 2).
  *
  * WHY THIS FILE EXISTS SEPARATELY AGAIN. The other two seam files prove that a registered
  * connector is DISPATCHED to and RENDERED. Round 7's finding was that both of those are downstream

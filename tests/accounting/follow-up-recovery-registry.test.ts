@@ -605,7 +605,12 @@ test("[o3d-0bfh r6] a consumer: 'none' declaration has neither, and says why and
       /exception inbox|\/sync\/exceptions/i,
       'the remedy must name the operational backlog, not a column an operator cannot query',
     )
-    assert.match(recovery.blockedBy, /nothing/i, 'and name the blocker')
+    // The blocker is NAMED, not merely worded: an unregistered (retired) id says it has no registry entry (the registry's own fail-safe text), a declared connector names the missing sweep.
+    assert.match(
+      recovery.blockedBy,
+      connector === RETIRED_CONNECTOR ? new RegExp(`no entry for connector "${connector}" in ACCOUNTING_FOLLOW_UP_RECOVERY`) : /\b(sweep|re-?drives?|consumer)\b/i,
+      'and name the blocker',
+    )
 
     if (connector === RETIRED_CONNECTOR) {
       // A retired connector has no module, which is a STRONGER statement than "its module exports

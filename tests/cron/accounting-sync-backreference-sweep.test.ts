@@ -85,6 +85,16 @@ test('[o3d-9kek] the Xero cron branch DOES run it (its ids are GUIDs, so it has 
   assert.deepEqual(body.backReferenceRepair, REPAIR_RESULT)
 })
 
+test('[o3d-9kek] a connector with NO binding does NOT run the repair sweep, and nothing else is processed for it', async () => {
+  // The ABSENCE is asserted as firmly as the presence: re-adding a binding for a connector whose external ids could collide across tenants is one line, and no other test would go red.
+  // Any enabled plugin that is not Xero reaches no accounting branch, so neither the processor nor the repair is called, and no repair result is reported.
+  for (const plugin of ['retired-ledger', 'sage']) {
+    const body = await runCron(plugin)
+    assert.deepEqual(calls, [], `${plugin}: no connector branch may run (no processing and no back-reference repair)`)
+    assert.equal(body.backReferenceRepair, undefined, `${plugin}: no repair is reported`)
+  }
+})
+
 // ---------------------------------------------------------------------------
 // THE CONTRACT, DRIVEN BY THE REGISTRY (o3d-0bfh r8, Codex MEDIUM).
 //

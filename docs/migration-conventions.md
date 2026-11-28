@@ -86,3 +86,7 @@ Never drop a column in the same deploy that removes the last app-code reference 
 3. Drop the column in a later migration.
 
 For historical connector fields, keep generic selectors/view models in app code so future connector work does not reintroduce direct dependency on deprecated column names.
+
+## `LIKE ... ESCAPE '\'` and `standard_conforming_strings`
+
+A migration that matches a literal underscore with `LIKE 'prefix\_%' ESCAPE '\'` (the two connector-purge migrations `20261122140000_purge_retired_accounting_settings` and `20261126120000_purge_retired_storefront_wms_settings`, and `20261107150000_erasure_raw_payload_projection`) reads `'\'` as a single backslash **only while `standard_conforming_strings` is `on`**. That is PostgreSQL's default since 9.1 and what every supported server (16 and 17) ships with. With it `off`, a backslash inside a plain string literal is an escape character, so `'\'` would swallow the closing quote and the statement would fail to parse (a loud failure, not a silent mis-match); `prisma migrate deploy` and the installer's own SQL (`scripts/install.sh` sets it `on`) run with it on. Applied migrations are not edited. A new migration that needs the pattern should either rely on the default as these do, or use `ESCAPE E'\\'`, which means the same under both settings.

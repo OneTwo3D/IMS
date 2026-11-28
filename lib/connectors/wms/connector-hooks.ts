@@ -1,5 +1,5 @@
 /**
- * PER-CONNECTOR WIRING THE GENERIC LAYER DISPATCHES TO BY CAPABILITY (wms-neutral-refactor round 2).
+ * PER-CONNECTOR WIRING THE GENERIC LAYER DISPATCHES TO BY CAPABILITY (PR #680 (WMS connector removal) round 2).
  *
  * WHY THIS EXISTS. `WmsConnector` covers what a WAREHOUSE can do — push an order, read its status,
  * create an ASN. It does not cover the SERVER-SIDE FLOWS built around those calls: the PO/transfer
@@ -88,7 +88,7 @@ export type WmsBookedInRecheckActions = {
 export type WmsDispatchPrecondition = () => Promise<{ ok: true } | { ok: false; reason: string }>
 
 /**
- * THE TWO UI READS, AND WHY THEIR PAYLOAD IS `unknown` (wms-neutral-refactor round 4, Codex HIGH 2).
+ * THE TWO UI READS, AND WHY THEIR PAYLOAD IS `unknown` (PR #680 (WMS connector removal) round 4, Codex HIGH 2).
  *
  * `app/actions/wms-sync.ts` and `app/actions/wms-onboarding.ts` were the last two one-arm
  * dispatchers: each compared the active connector to a literal and fell off the end of the `if`, so
@@ -106,7 +106,7 @@ export type WmsDispatchPrecondition = () => Promise<{ ok: true } | { ok: false; 
  * compile error in the generic layer, which is the coupling this file exists to remove.
  */
 /**
- * A HOOK STATES A PAYLOAD AND NEVER A STATE (wms-neutral-refactor round 8, Codex HIGH 1).
+ * A HOOK STATES A PAYLOAD AND NEVER A STATE (PR #680 (WMS connector removal) round 8, Codex HIGH 1).
  *
  * These two carried `configured` until round 8, which gave the fact two sources: the hook's, and
  * `WmsConnector.isConfigured()` — the one MANDATORY statement a connector makes about its own

@@ -1,6 +1,6 @@
 import { getEnvFallback } from '@/lib/settings-store'
 /**
- * wms-neutral-refactor round 2: the materialise-then-`FOR UPDATE` primitive moved to the generic WMS
+ * PR #680 (WMS connector removal) round 2: the materialise-then-`FOR UPDATE` primitive moved to the generic WMS
  * layer, because the DEFAULT inbound-delta scope lock (for a connector with no configured scope)
  * needs exactly the same three statements in exactly the same canonical order. Two copies of a lock
  * that establishes an ordering is how two orderings appear.

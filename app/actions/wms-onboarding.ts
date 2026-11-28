@@ -8,7 +8,7 @@ import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '@/lib/connectors/wms/typ
 /**
  * Connector-agnostic onboarding connection-data envelope.
  *
- * wms-neutral-refactor round 4 (Codex HIGH 2) — WHY THIS IS NOT AN `id === 'mintsoft'` CHECK.
+ * PR #680 (WMS connector removal) round 4 (Codex HIGH 2) — WHY THIS IS NOT AN `id === 'mintsoft'` CHECK.
  * The fall-through arm here returned `configured: false` for any other registered connector. That
  * is not an empty answer, it is a WRONG one: the wizard shows an unticked setup step for a
  * connection that is already live, and an operator who "fixes" it re-enters credentials that were
@@ -18,7 +18,7 @@ import { WMS_CONNECTOR_IDS, type WmsConnectorId } from '@/lib/connectors/wms/typ
  * It now routes on CAPABILITY: does the active connector declare an onboarding step? A connector
  * with no setup form of its own renders no form.
  *
- * wms-neutral-refactor round 8 (Codex HIGH 1) — AND IT NO LONGER ANSWERS `configured: false` WHILE
+ * PR #680 (WMS connector removal) round 8 (Codex HIGH 1) — AND IT NO LONGER ANSWERS `configured: false` WHILE
  * DOING SO. Round 4 replaced one wrong answer with a narrower one: the no-hook arm still reported
  * an unset connection for a connector whose connection is live and merely has no setup form in this
  * build. The wizard therefore showed an unticked step, and the operator's remedy for an unticked

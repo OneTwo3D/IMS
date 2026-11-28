@@ -1,6 +1,6 @@
 /**
  * A WHITESPACE-ONLY TOKEN IS NOT A CREDENTIAL, AND MUST NOT READ AS "CONFIGURED"
- * (o3d-pow3 / wms-neutral-refactor round 12, Codex HIGH 3).
+ * (o3d-pow3 / PR #680 (WMS connector removal) round 12, Codex HIGH 3).
  *
  * THE DEFECT. Round 8 moved the `configured` flag on the /sync WMS panel and the onboarding wizard
  * off the connector's own hooks and onto `WmsConnector.isConfigured()`; round 10 made that path
@@ -183,7 +183,7 @@ test('[round 12 HIGH 3] an unparseable stored base URL is NOT configured either,
 
 /**
  * FIXED-KEY MODE, MOVED HERE WHEN `mintsoftHasAuthMaterial` WAS DELETED
- * (wms-neutral-refactor round 14, Codex HIGH 2).
+ * (PR #680 (WMS connector removal) round 14, Codex HIGH 2).
  *
  * The deleted helper had its own mode-awareness test (tests/mintsoft-auth-mode.test.ts). The
  * predicate that SURVIVES — and that everything now reads — had no case for its `api_key` arm at

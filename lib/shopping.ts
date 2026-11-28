@@ -665,7 +665,7 @@ export async function handleShoppingWebhook(
     }
   }
 
-  // DEFAULT-DENY for an id with no webhook arm Archiving the second storefront
+  // DEFAULT-DENY for an id with no webhook arm. Archiving the second storefront
   // removed the second `case`, and without this the switch would fall off its end and the function
   // would return `undefined` — which is a runtime crash in the route, not a refusal. A registered
   // connector that has not wired a webhook handler gets a named 501 instead.

@@ -240,7 +240,7 @@ test('o3d-2k5r r3 replay: a dead letter belonging to a connector that is not act
   // mintsoft's create IS replay-safe, so the only thing that can refuse here is the active-connector
   // check — which is what keeps this test about that check rather than about the replay policy.
   //
-  // wms-neutral-refactor: with one shipped connector, enabling a plugin the registered-id list does
+  // PR #680 (WMS connector removal): with one shipped connector, enabling a plugin the registered-id list does
   // not contain resolves to NO active connector rather than to a different one. Same door, same
   // refusal, narrower premise — stated so a later reader does not mistake it for the two-connector
   // case it was originally written as.
