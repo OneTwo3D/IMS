@@ -154,8 +154,12 @@ type MintsoftBindingSelect = {
   alignDownReason: {
     select: {
       name: true
+      active: true
+      accountCode: true
     }
   }
+  connector: true
+  connection: { select: { active: true } }
   lastStockSyncAt: true
   lastStockSyncStatus: true
   warehouse: {
