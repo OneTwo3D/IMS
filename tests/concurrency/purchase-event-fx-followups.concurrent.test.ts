@@ -808,7 +808,7 @@ test('LOW-2: a prepayment whose total is not the order\'s totalForeign is locked
     const warned = await activitiesOf(po, 'xero_prepayment_total_mismatch')
     assert.equal(warned.length, 1)
     assert.equal(warned[0]!.level, 'WARNING')
-    assert.match(warned[0]!.description, new RegExp(`${deposit.prepaymentId}.*but the order totals`))
+    assert.match(warned[0]!.description, new RegExp(`${deposit.prepaymentId}.*but the order says`))
     // A re-read of the same prepayment (and the receipt it values) warns nothing more.
     assert.equal((await onDemand(po.poId)).success, true)
     const received = await receive(po, po.lines[0]!, 4)
@@ -816,6 +816,48 @@ test('LOW-2: a prepayment whose total is not the order\'s totalForeign is locked
     assert.deepEqual(await receiptsOf(po), [{ rate: '1.6', source: 'XERO_PREPAYMENT' }])
     assert.equal((await activitiesOf(po, 'xero_prepayment_total_mismatch')).length, 1)
   })
+})
+
+// [mutation: skip the warning on the create branch; skip it when only the total of the same prepayment changes]
+test('#1173 LOW-2: the FIRST lock of a fresh order with a mismatch writes exactly one WARNING; the same prepayment id with a changed total warns again', SKIP, async () => {
+  const po = await seedForeignPo('low2-first', [4])
+  const first = prepaymentFor(po, { total: new Prisma.Decimal('1') })
+  answerWith([[po, [first]]])
+  await withSwitch(true, async () => {
+    assert.equal(await lockOf(po), null)
+    assert.equal((await onDemand(po.poId)).success, true)
+    assert.equal((await activitiesOf(po, 'xero_prepayment_total_mismatch')).length, 1, 'the create branch warns once')
+    answerWith([[po, [{ ...first, total: new Prisma.Decimal('2') }]]])
+    assert.equal((await onDemand(po.poId)).success, true)
+    assert.equal((await lockOf(po))?.prepaymentTotal.toString(), '2')
+    assert.equal((await activitiesOf(po, 'xero_prepayment_total_mismatch')).length, 2, 'same id, changed total: warned again')
+  })
+})
+
+// [mutation: compare the prepayment with totalForeign (gross of self-accounted VAT)]
+test('#1173 MED-1: a reverse-charge supplier whose prepayment is the NET payable (no self-accounted VAT) is not warned; one paying the gross is', SKIP, async () => {
+  const { db } = await import('@/lib/db')
+  const po = await seedForeignPo('rc', [4])
+  const rate = await db.taxRate.create({ data: { name: `rc-${uid()}`, rate: '0.2', usedFor: 'PURCHASE', reverseCharge: true, reportingCategory: 'REVERSE_CHARGE' } })
+  const row = await db.purchaseOrder.findUniqueOrThrow({ where: { id: po.poId }, select: { supplierId: true, subtotalForeign: true, lines: { select: { id: true, totalForeign: true } } } })
+  await db.purchaseOrderLine.updateMany({ where: { poId: po.poId }, data: { taxRateId: rate.id } })
+  await db.supplier.update({ where: { id: row.supplierId }, data: { taxRateId: rate.id } })
+  await db.freightCostLine.create({ data: { poId: po.poId, description: 'freight', amountForeign: '10', amountBase: '10', vatable: true } })
+  const net = new Prisma.Decimal(row.subtotalForeign).plus(10)
+  const vat = row.lines.reduce((sum, line) => sum.plus(new Prisma.Decimal(line.totalForeign).mul('0.2')), new Prisma.Decimal(0)).plus(2)
+  await db.purchaseOrder.update({ where: { id: po.poId }, data: { taxRatePercent: '0.2', taxForeign: vat, directFreightForeign: '10', totalForeign: net.plus(vat) } })
+  try {
+    answerWith([[po, [prepaymentFor(po, { total: net })]]])
+    await withSwitch(true, async () => {
+      assert.equal((await onDemand(po.poId)).success, true)
+      assert.equal((await activitiesOf(po, 'xero_prepayment_total_mismatch')).length, 0, 'the net payable is what the supplier is paid')
+      answerWith([[po, [prepaymentFor(po, { total: net.plus(vat) })]]])
+      assert.equal((await onDemand(po.poId)).success, true)
+      assert.equal((await activitiesOf(po, 'xero_prepayment_total_mismatch')).length, 1, 'the gross (with self-accounted VAT) is not')
+    })
+  } finally {
+    await db.supplier.update({ where: { id: row.supplierId }, data: { taxRateId: null } })
+  }
 })
 
 test('OFF: everything above is inert while the switch is off (no Xero read, no stamp, no lock, no warning)', SKIP, async () => {

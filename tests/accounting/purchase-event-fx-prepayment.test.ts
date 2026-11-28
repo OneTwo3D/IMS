@@ -9,7 +9,8 @@ import {
   type PrepaymentReadDeps,
   type XeroSupplierPrepayment,
 } from '@/lib/connectors/xero/prepayments'
-import { PurchaseFxRefusalError, goodsUnitCostsAtRate, isTransientPurchaseFxRefusal, matchSupplierPrepayment } from '@/lib/domain/purchasing/purchase-receipt-fx'
+import { PurchaseFxRefusalError, goodsUnitCostsAtRate, isTransientPurchaseFxRefusal, matchSupplierPrepayment, purchaseOrderNetPayableForeign } from '@/lib/domain/purchasing/purchase-receipt-fx'
+import { currencyMinorUnit } from '@/lib/domain/math/decimal'
 import { MissingFxRateError } from '@/lib/currencies/fx-select'
 import { allocateLandedCost, grossUnitCostForGoods } from '@/lib/domain/purchasing/landed-cost-allocation'
 import { layerUnitCostAfterRecalc } from '@/lib/domain/purchasing/landed-cost-service'
@@ -224,4 +225,26 @@ test('MED-6: the unlinked-supplier refusal names the real remedy (there is no sc
     assert.match(out.reason, /exactly the supplier's name \(or email\)/)
     assert.doesNotMatch(out.reason, /or set the contact/)
   }
+})
+
+// [mutation: compare with totalForeign; skip the header-discount factor; drop the reverse-charge VAT of additional costs; count a non-RC line]
+test('#1173 MED-1: the order\'s net payable is its total less self-accounted reverse-charge VAT (goods after the header discount, and vatable additional costs)', () => {
+  const rc = { rate: '0.2', reverseCharge: true }
+  // Two RC lines of 100 and 50, a 10% header discount (subtotal 135), RC VAT 27, a vatable cost of 10 (+2 RC VAT): total 135 + 27 + 10 + 2 = 174.
+  const po = {
+    currency: 'EUR', totalForeign: '174', subtotalForeign: '135', taxRatePercent: '0.2',
+    lines: [{ totalForeign: '100', taxRate: rc }, { totalForeign: '50', taxRate: rc }],
+    freightCostLines: [{ amountForeign: '10', vatable: true }, { amountForeign: '5', vatable: false }],
+    supplierRateReverseCharge: true,
+  }
+  assert.equal(purchaseOrderNetPayableForeign(po).toString(), '145')
+  // A domestic (not reverse-charge) order: the supplier is paid the VAT, the net payable is the total.
+  assert.equal(purchaseOrderNetPayableForeign({ ...po, lines: po.lines.map((l) => ({ ...l, taxRate: { rate: '0.2', reverseCharge: false } })), supplierRateReverseCharge: false }).toString(), '174')
+  // A line with no rate counts at its total.
+  assert.equal(purchaseOrderNetPayableForeign({ ...po, lines: [{ totalForeign: '100', taxRate: null }], subtotalForeign: '100', supplierRateReverseCharge: false }).toString(), '174')
+})
+
+test('#1173 LOW-4: the rounding tolerance is one minor unit of the currency', () => {
+  assert.equal(currencyMinorUnit('GBP').toString(), '0.01')
+  assert.equal(currencyMinorUnit('JPY').toString(), '1')
 })
