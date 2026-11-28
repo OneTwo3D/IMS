@@ -1,6 +1,7 @@
 import type { Prisma } from '@/app/generated/prisma/client'
 import { currencyMinorUnits, toDecimal, type Decimal } from '@/lib/domain/math/decimal'
-import { buildTaxTypeRateIndex, priceSnapshottedTaxIdentity, type TaxTypeRateIndex } from '@/lib/domain/sales/refund-posted-tax-identity'
+import { postedAwareRateIndex, type PostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
+import { priceSnapshottedTaxIdentity, type TaxTypeRateIndex } from '@/lib/domain/sales/refund-posted-tax-identity'
 import { raiseWmsOperatorTask, type WmsOperatorTaskPayload } from '@/lib/domain/wms/operator-tasks'
 
 /**
@@ -75,10 +76,12 @@ export async function raiseShopRefundTask(
     refundId: string
     creditNoteNumber: string | null
     currency: string
+    /** The codes the order's posted invoice carried: a refund line's snapshotted (posted) code is priced at the rate it was posted at even when a remap left it on no rate row. */
+    postedCodes?: PostedInvoiceTaxCodes | null
     lines: ReadonlyArray<{ totalForeign: Money; qty: number; accountingTaxType?: string | null; reverseCharge?: boolean | null }>
   },
 ): Promise<boolean> {
-  const rates = buildTaxTypeRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))
+  const rates = postedAwareRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }), input.postedCodes ?? null)
   const gross = refundGrossForeign(input.lines, rates, input.currency)
   const net = input.lines.reduce((sum, line) => sum.plus(toDecimal(line.totalForeign)), toDecimal(0)).toDecimalPlaces(currencyMinorUnits(input.currency))
   const reasonKind: 'GOODS_RETURNED' | 'AMOUNT_ONLY' = input.lines.some((line) => line.qty > 0) ? 'GOODS_RETURNED' : 'AMOUNT_ONLY'

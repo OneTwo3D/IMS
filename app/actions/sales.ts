@@ -84,7 +84,7 @@ import {
 import { dischargeRefundAccountingObligation } from '@/lib/domain/sales/refund-accounting-discharge'
 import { accountingPayloadKey } from '@/lib/accounting/payload-key'
 import { rateBinding, resolveSalesLineTaxType, taxTypeForBasis } from '@/lib/accounting/reverse-charge'
-import { buildTaxTypeRateIndex, creditNoteLineTaxTypeResolver, priceSnapshottedTaxIdentity } from '@/lib/domain/sales/refund-posted-tax-identity'
+import { creditNoteLineTaxTypeResolver, priceSnapshottedTaxIdentity } from '@/lib/domain/sales/refund-posted-tax-identity'
 import { refusedCreditNotePayload } from '@/lib/domain/accounting/eu-vat-credit-note'
 import { recordCreditNoteTreatmentRefusal, treatCreditNotePayload } from '@/lib/domain/sales/eu-vat-credit-note-treatment'
 import { multiComponentTaxRateNames } from '@/lib/accounting/multi-component-warning'
@@ -150,6 +150,7 @@ import {
 } from '@/lib/domain/sales/sales-order-vat-basis'
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import { refreshedDiscountSplit } from '@/lib/domain/sales/discount-tax-split-codes'
+import { postedAwareRateIndex, postedShippingTaxType, postedTaxTypeByLineId, readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { discountSplitEntryTaxType, discountSplitTaxCodeRefusal, invoiceDiscountParts, parseDiscountTaxSplit, type DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
 import { decideChargebackOrderDiscount, resolvePostedOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
 import { claimDocumentNumber, mintCommittedDocumentNumber, retryWhenNumberTaken } from '@/lib/domain/numbering/mint'
@@ -1115,7 +1116,9 @@ export async function getSalesOrder(id: string): Promise<SoDetail | null> {
     db.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }),
     so.taxRateName ? db.taxRate.findFirst({ where: { name: so.taxRateName, active: true }, select: { accountingTaxType: true } }) : Promise.resolve(null),
   ])
+  const postedCodesForCn = await readPostedInvoiceTaxCodes(db, so.id, so.accountingInvoiceId)
   const creditFactsByRefund = new Map(so.refunds.map((r) => [r.id, creditNoteLineFacts({
+    postedCodes: postedCodesForCn,
     orderCurrency: so.currency,
     baseCurrency: baseCurrencyCode,
     orderLines: so.lines,
@@ -3027,6 +3030,7 @@ async function queueRefundAccountingActions(input: {
         customer: { select: { firstName: true, lastName: true, email: true } },
         currency: true,
         taxRateName: true,
+        accountingInvoiceId: true,
         refundStatus: true,
         refunds: { select: { id: true, chargeback: true } },
         lines: {
@@ -3043,7 +3047,9 @@ async function queueRefundAccountingActions(input: {
     // The credit note's OWN document day: the refund's creation, on the first hand-off and on every retry (a retry rebuilds the credit note, and must not re-date it to the retry day).
     readCreditNoteDocumentDay(db, input.refundId),
   ])
-  const salesRateByTaxType = buildTaxTypeRateIndex(salesTaxRatesForCn)
+  // The codes the order's posted invoice carried: a credit note line is priced at the rate its (posted) code was charged at, even when a remap left that code on no rate row.
+  const postedCnCodes = await readPostedInvoiceTaxCodes(db, input.orderId, orderForCN?.accountingInvoiceId)
+  const salesRateByTaxType = postedAwareRateIndex(salesTaxRatesForCn, postedCnCodes)
   const cnContactName = orderForCN?.customer
     ? `${orderForCN.customer.firstName} ${orderForCN.customer.lastName}`.trim()
     : 'Walk-in Customer'
@@ -3065,10 +3071,12 @@ async function queueRefundAccountingActions(input: {
   // exactly how the invoice posts its shipping/discount lines (shippingTaxType = orderDefaultTaxType, no
   // swap): swapping there would post credit-note shipping under the reverse-charge code while the
   // invoice posted it under the standard code — an asymmetry the VAT return would flag.
+  // A line with no snapshot is credited on the code the order's POSTED invoice carried it on (a credit note reverses the invoice as posted), else on its rate's code now (no posted invoice).
   const creditNoteTaxTypeOf = creditNoteLineTaxTypeResolver({
     orderLines: orderForCN?.lines ?? [],
     reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
-    orderDefaultTaxType: cnTaxRate?.accountingTaxType ?? null,
+    orderDefaultTaxType: postedShippingTaxType(postedCnCodes) ?? cnTaxRate?.accountingTaxType ?? null,
+    postedTaxTypeByLineId: postedTaxTypeByLineId(orderForCN?.lines ?? [], postedCnCodes),
   })
 
   // THE RECORDED OBLIGATIONS OF THIS HAND-OFF: the credit note, plus every sync staging recorded.

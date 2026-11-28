@@ -7,6 +7,7 @@ import { formatCountryDisplay } from '@/lib/countries'
 import { getBranding, createPdfDocument, drawHeader, drawTable, drawFooter, drawTemplateNotes, pdfToBuffer, type PdfTableColumn } from '@/lib/pdf'
 import { drawTotalsRows } from '@/lib/pdf-order-money'
 import { creditNoteLineFacts } from '@/lib/domain/sales/credit-note-display'
+import { readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { type CreditNoteDocumentModel, CreditNoteDocumentRefusedError, draftCreditNoteModel, postedCreditNoteModel, postedLineVatRate } from '@/lib/domain/sales/credit-note-document'
 import { EU_VAT_TREATMENT_PAYLOAD_KEY } from '@/lib/domain/accounting/eu-vat-treatment'
 import { refusedCreditNoteError } from '@/lib/domain/accounting/eu-vat-credit-note'
@@ -42,7 +43,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
         include: {
           lines: {
             select: {
-              id: true, qty: true, unitPriceForeign: true, discountAmount: true, totalForeign: true, taxForeign: true,
+              id: true, qty: true, unitPriceForeign: true, discountAmount: true, totalForeign: true, taxForeign: true, taxRateId: true,
               taxRate: { select: { id: true, rate: true, accountingTaxType: true } },
             },
           },
@@ -98,6 +99,7 @@ export async function GET(_req: Request, { params }: { params: Promise<{ id: str
     }
   } else {
     const facts = creditNoteLineFacts({
+      postedCodes: await readPostedInvoiceTaxCodes(db, so.id, so.accountingInvoiceId),
       orderCurrency: so.currency,
       baseCurrency: baseCurrencyCode,
       orderLines: so.lines,
