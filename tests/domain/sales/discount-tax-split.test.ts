@@ -245,9 +245,9 @@ test('refreshDiscountSplitCodes: a group\'s code is its rate\'s code now (mapped
 test('the invoice\'s discount parts, the refund\'s per-rate reversal and the save / finalise refusal all derive a group\'s code through discountSplitEntryTaxType, from the split refreshed from its rates', async () => {
   const { readFileSync } = await import('node:fs')
   const sales = readFileSync('app/actions/sales.ts', 'utf8')
-  assert.match(sales, /taxTypeOf: \(entry\) => postedDiscountTaxType\(posted, entry\) \?\? discountSplitEntryTaxType\(entry, \{ orderDefaultTaxType, reverseChargeSalesTaxType: settings\.reverseChargeSalesTaxType \}\)/, 'an update of a posted invoice keeps the part\'s posted code, else the one derivation')
+  assert.match(sales, /taxTypeOf: \(entry\) => postedDiscountTaxType\(posted, entry, orderDefaultRate\?\.id \?\? null\) \?\? discountSplitEntryTaxType\(entry, \{ orderDefaultTaxType, reverseChargeSalesTaxType: settings\.reverseChargeSalesTaxType \}\)/, 'an update of a posted invoice keeps the part\'s posted code, else the one derivation')
   assert.match(sales, /const discountSplit = storedDiscountSplit \? await refreshedDiscountSplit\(reader, storedDiscountSplit\) : null/, 'the invoice reads the codes from the rates now')
-  assert.match(sales, /discountSplitTaxCodeRefusal\(discountSplit\.filter\(\(entry\) => postedDiscountTaxType\(posted, entry\) === null\), \{ orderDefaultTaxType, reverseChargeSalesTaxType: settings\.reverseChargeSalesTaxType \}, 'invoice'\)/, 'the invoice build backstop')
+  assert.match(sales, /discountSplitTaxCodeRefusal\(discountSplit\.filter\(\(entry\) => postedDiscountTaxType\(posted, entry, orderDefaultRate\?\.id \?\? null\) === null\), \{ orderDefaultTaxType, reverseChargeSalesTaxType: settings\.reverseChargeSalesTaxType \}, 'invoice'\)/, 'the invoice build backstop')
   assert.match(sales, /discountSplitTaxCodeRefusal\(await refreshedDiscountSplit\(reader, split\)/, 'the finalisation check reads the codes from the rates now')
   assert.match(sales, /prepareSalesOrderWrite\(input, \{ liveOrder: !input\.isDraft \}\)/, 'create: live orders only')
   assert.match(sales, /liveOrder: true \} : undefined\)/, 'edit: confirmed orders only')
