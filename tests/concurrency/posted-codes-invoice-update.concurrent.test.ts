@@ -344,3 +344,26 @@ test('a posted code the tenant has archived: the update falls back to the curren
   const warn = await f.db.activityLog.findFirst({ where: { entityId: id, action: 'sales_invoice_update_used_current_tax_codes' } })
   assert.equal((warn?.metadata as { reason?: string } | null)?.reason, 'archived-code')
 })
+
+test('a kept posted code that a tax re-key RETIRED does not block the edit: the update falls back to the current code and warns (retired-code); an already-queued update writes no warning', SKIP, async (t) => {
+  const f = await postedFixture(t)
+  const posted = `TAX7${f.w.tag.slice(0, 3).toUpperCase()}`
+  const current = `TAX8${f.w.tag.slice(0, 3).toUpperCase()}`
+  const rate = await f.mkRate('R', '0.2', posted)
+  const id = await f.make([{ p: 'p1', qty: 1, rate: rate.id }])
+  await postInvoice(f.w, id)
+  // The re-key: the rate now carries the new code and the posted one is in the retired list (bound to the rate that replaced it).
+  await f.db.taxRate.update({ where: { id: rate.id }, data: { accountingTaxType: current } })
+  const retired = JSON.stringify({ [posted]: { rateId: rate.id, newCode: current, at: new Date().toISOString() } })
+  await f.db.setting.upsert({ where: { key: 'tax_rekey_retired_codes' }, create: { key: 'tax_rekey_retired_codes', value: retired }, update: { value: retired } })
+  f.w.settingKeys.push('tax_rekey_retired_codes')
+  const r = await f.edit(id, [{ p: 'p1', qty: 2, rate: rate.id }])
+  assert.equal(r.success, true, `the retired posted code is not re-sent, so the guard does not refuse the edit: ${r.error}`)
+  assert.equal((await updatePayloadOf(id)).lines[0]!.taxType, current)
+  const warn = await f.db.activityLog.findFirst({ where: { entityId: id, action: 'sales_invoice_update_used_current_tax_codes' } })
+  assert.equal((warn?.metadata as { reason?: string } | null)?.reason, 'retired-code')
+  // The identical edit again: the update is already queued (same idempotency key), so nothing new is queued and no second warning is written.
+  const again = await f.edit(id, [{ p: 'p1', qty: 2, rate: rate.id }])
+  assert.equal(again.success, true, again.error)
+  assert.equal(await f.db.activityLog.count({ where: { entityId: id, action: 'sales_invoice_update_used_current_tax_codes' } }), 1, 'an already-queued update writes no warning')
+})

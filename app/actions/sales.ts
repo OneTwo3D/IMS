@@ -150,8 +150,8 @@ import {
 } from '@/lib/domain/sales/sales-order-vat-basis'
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import { refreshedDiscountSplit } from '@/lib/domain/sales/discount-tax-split-codes'
-import { validLiveCodes } from '@/lib/tax/retired-tax-code-guard'
-import { postedAwareRateIndex, postedCodesAmbiguityRefusal, postedDiscountTaxType, postedHeaderDiscountTaxType, readPostedInvoiceRecord, updateLineTaxType, postedShippingTaxType, postedTaxTypeByLineId, readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
+import { parseRetiredCodes, RETIRED_CODES_SETTING, validLiveCodes } from '@/lib/tax/retired-tax-code-guard'
+import { postedAwareRateIndex, postedCodesAmbiguityRefusal, postedDiscountTaxType, postedHeaderDiscountTaxType, postedLineTaxType, readPostedInvoiceRecord, updateLineTaxType, postedShippingTaxType, postedTaxTypeByLineId, readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { discountSplitEntryTaxType, discountSplitTaxCodeRefusal, invoiceDiscountParts, parseDiscountTaxSplit, type DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
 import { decideChargebackOrderDiscount, resolvePostedOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
 import { claimDocumentNumber, mintCommittedDocumentNumber, retryWhenNumberTaken } from '@/lib/domain/numbering/mint'
@@ -2194,14 +2194,21 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   let posted = postedRecord?.codes ?? null
   // The reason the update falls back to the current codes (the warning's), when it does.
   let postedFallbackReason: string | null = postedRecord && posted === null ? (postedRecord.reason ?? 'no-record') : null
-  // A posted code the tenant has since ARCHIVED (the organisation-specific codes of the active Xero tenant, as the retired-code guard reads them) would be refused by the ledger: the update falls back to the current codes.
+  // THE POSTED CODES THIS BUILD WOULD KEEP: those of the lines' rates the record names, shipping and the header discount (only while the default rate is the one they were read from), and the discount parts of the split.
+  // A kept code the tenant has since ARCHIVED (the organisation-specific codes of the active Xero tenant, as the retired-code guard reads them) would be refused by the ledger, and one a tax re-key RETIRED is refused by the
+  // retired-code guard at the enqueue (so every retry would rebuild the same refused payload): either way the update falls back to the current codes, with the warning.
   if (posted) {
-    const postedCodes = [...new Set([...posted.rateIdsByCode.keys(), ...(posted.orderDefaultDiscountCode ? [posted.orderDefaultDiscountCode] : [])])]
-    // Only checked when the active tenant's tax list is known: with no stored tenant nothing can be said about a code, and the posted code stays.
-    const tenant = await reader.accountingToken.findUnique({ where: { connector: 'xero' }, select: { tenantId: true } })
-    if (tenant) {
-      const live = await validLiveCodes(reader as never, postedCodes)
-      if (postedCodes.some((code) => !live.has(code) && !isNoTaxType(code))) { posted = null; postedFallbackReason = 'archived-code' }
+    const defaultRateId = orderDefaultRate?.id ?? null
+    const keptCodes = new Set<string>()
+    for (const l of so.lines) { const code = postedLineTaxType(posted, l.taxRateId); if (code) keptCodes.add(code) }
+    for (const code of [postedShippingTaxType(posted, defaultRateId), postedHeaderDiscountTaxType(posted, defaultRateId), ...(storedDiscountSplit ?? []).map((entry) => postedDiscountTaxType(posted, entry, defaultRateId))]) if (code) keptCodes.add(code)
+    const kept = [...keptCodes]
+    const retired = parseRetiredCodes((await reader.setting.findUnique({ where: { key: RETIRED_CODES_SETTING }, select: { value: true } }))?.value)
+    if (kept.some((code) => Object.prototype.hasOwnProperty.call(retired, code))) { posted = null; postedFallbackReason = 'retired-code' }
+    // The archive check only runs when the active tenant's tax list is known: with no stored tenant nothing can be said about a code, and the posted code stays.
+    else if (kept.length > 0 && await reader.accountingToken.findUnique({ where: { connector: 'xero' }, select: { tenantId: true } })) {
+      const live = await validLiveCodes(reader as never, kept)
+      if (kept.some((code) => !live.has(code) && !isNoTaxType(code))) { posted = null; postedFallbackReason = 'archived-code' }
     }
   }
   // A record that names no line's rate (an older WooCommerce invoice, a scheme-retyped one) cannot keep any line's code: flagged like a missing record, though the update still builds.
@@ -2362,7 +2369,8 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
           'in-flight': 'an earlier update is still in flight and no confirmed record sits behind it',
           unusable: 'the newest invoice record is not usable',
           'archived-code': 'a posted tax code has since been archived in the accounting system',
-          'record-names-no-line-rates': 'the posted record names no VAT rate for its lines',
+          'retired-code': 'a posted tax code was retired by a tax re-key',
+          'record-names-no-line-rates': 'the posted record names no VAT rate for its lines, so the update\'s lines were built on the current codes',
         }
         await (reader as unknown as { activityLog: Pick<typeof db.activityLog, 'create'> }).activityLog.create({
           data: {
@@ -2409,7 +2417,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
       logActivity,
       // The date-unknown warning of a shadowed update commits or rolls back with the edit.
       logShadowWarning: (params) => logActivityInTransaction(tx, { ...params, userId: null }),
-      onEnqueued: async (outcome) => { if (outcome.queued && fallbackWarning) await fallbackWarning() },
+      onEnqueued: async (outcome) => { if (outcome.queued && outcome.reason !== 'already-queued' && fallbackWarning) await fallbackWarning() },
       recordPostingRefusal: async ({ posting, ...record }) => { await recordAccountingPostingRefusal(db as unknown as PostingRefusalClient, posting, record) },
     })
     return
@@ -2458,7 +2466,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
       getActiveAccountingConnectorInfo,
       queueAccountingSync: queueUpdate,
       logActivity,
-      onEnqueued: async (outcome) => { if (outcome.queued && fallbackWarning) await fallbackWarning() },
+      onEnqueued: async (outcome) => { if (outcome.queued && outcome.reason !== 'already-queued' && fallbackWarning) await fallbackWarning() },
       // o3d-j625 r4: the refusal lands in the exception inbox, where an operator will find it.
       // r10: the outcome is deliberately dropped here — this site reports the refusal and has nothing
       // to retry with, unlike the reconciler, which is the caller the return value exists for.

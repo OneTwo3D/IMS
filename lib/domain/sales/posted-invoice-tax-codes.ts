@@ -210,8 +210,9 @@ export type PostedRecordAbsence = 'no-record' | 'in-flight' | 'unusable'
 export type PostedRecordReadOptions = {
   reverseChargeSalesTaxType?: string | null
   /**
-   * For the UPDATE builder only: when the newest row is IMS's own SALES_INVOICE_UPDATE still PENDING or PROCESSING, read ITS payload (it was built from the confirmed record behind it, which must exist: the walk
-   * still requires a connector-confirmed row further back) instead of answering "in flight". A refund never sets it: it reverses what the ledger holds.
+   * For the UPDATE builder only: when the newest row is IMS's own SALES_INVOICE_UPDATE still PENDING or PROCESSING, read ITS payload instead of answering "in flight". The pending update is read because it reaches
+   * the ledger FIRST (it will replace the confirmed document's lines), so a further edit must build on the codes it carries, not because its codes were proven: a confirmed connector row must still sit behind it in the walk
+   * (else the answer is "no record"), and if the pending update is later refused or cancelled the next edit rebuilds from the then-newest row. A refund never sets it: it reverses what the ledger holds.
    */
   allowPendingUpdate?: boolean
 }
@@ -261,7 +262,8 @@ export async function readPostedInvoiceRecord(
     chosen = row.id
     break
   }
-  if (chosen === null) return none(pendingUpdate ? 'in-flight' : 'no-record')
+  // No confirmed row anywhere in the walk (a Xeroom-posted or hand-linked invoice, or nothing left): there is no record, whatever sits unconfirmed in front of it.
+  if (chosen === null) return none('no-record')
   const body = await client.accountingSyncLog.findUnique({ where: { id: chosen }, select: { payload: true } })
   const pendingBody = pendingUpdate ? await client.accountingSyncLog.findUnique({ where: { id: pendingUpdate }, select: { payload: true } }) : null
   const codes = (pendingBody ? postedTaxCodesFromPayload(pendingBody.payload) : null) ?? (body ? postedTaxCodesFromPayload(body.payload) : null)
