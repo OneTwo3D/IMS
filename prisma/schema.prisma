@@ -1152,6 +1152,7 @@ model TransitSubledgerMovement {
   createdAt      DateTime @default(now())
 
   @@index([journalDate])
+  @@index([sourceRef, sourceType])
   @@map("transit_subledger_movements")
 }
 

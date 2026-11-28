@@ -412,20 +412,26 @@ If a freight PO is added or updated after goods have already been received, the 
 - **Posting the unabsorbed credit to cost of sales (switched off by default).** Under FRS 102 s13.6 a supplier credit or rebate
   reduces the cost of purchase, and the part the stock cannot carry belongs in cost of sales. With the administrator switch
   `landed_cost_floor_cogs_enabled` on (set with `npm run settings:set ... --yes --confirm-admin`; turning it on is refused while
-  Xero sync is on and the COGS or Stock in Transit account is unmapped), IMS posts that part as a journal **DR Stock in Transit /
-  CR COGS** whenever the floor applies: at a receipt (manual, the warehouse book-in, or the Mintsoft alignment) and at a
-  landed-cost recalculation. It is worked out from the order as it stands: what the floor leaves unabsorbed on the order's
-  receipt layers now, less what was already posted, so receiving again or saving the same costs posts nothing, a larger or
-  smaller credit posts only the difference, and **cancelling the freight order reverses it** (DR COGS / CR Stock in Transit). The
-  zero floor and the warning above are unchanged. The journal goes through the normal accounting queue and producer hold
-  (while the hold is on it is recorded as held and nothing is sent), and is recorded in the transit and COGS sub-ledgers so the
-  transit reconciliation ties. If it is owed and the COGS or Stock in Transit account is not mapped, a manual receipt or a
-  recalculation is refused with a message naming the account (nothing is changed); a warehouse book-in or alignment is never
-  refused for it, and the journal is posted by the next receipt or recalculation once the account is mapped. Only an order whose
-  receipts were journalled is covered (otherwise nothing was taken out of transit). A supplier return of floored units does not
-  reverse it, and an order closed short is valued on its ordered quantities. Because a purchase order's own layers can no longer go below zero from landed cost,
-  a freight change no longer revalues an already-journaled shipment of those layers below zero. (Manufactured goods
-  built from a floored layer are not covered by the floor; see the safeguard below.)
+  Xero sync is on and the COGS account, the Stock in Transit account or the COGS journal sync type is not set), IMS posts that part
+  as a journal **DR Stock in Transit / CR COGS** whenever the floor applies: at a receipt (manual, the warehouse book-in, or the
+  Mintsoft alignment, including a receipt of floored units only, which is worth 0.00) and at a landed-cost recalculation. It is
+  worked out from the order as it stands: what the floor leaves unabsorbed on the order's receipt layers now, less what was already
+  posted, so receiving again or saving the same costs posts nothing, a larger or smaller credit posts only the difference, and
+  **cancelling the freight order reverses it** (DR COGS / CR Stock in Transit). An order **closed short** is worked out on the
+  quantities that landed, the same basis the close-short uses to spread its freight, so the journal matches the layers. The zero
+  floor and the warning above are unchanged (with the switch on the warning says the amount is posted).
+  - **Which receipts count.** A receipt counts when the transit sub-ledger covers its day (from the transit coverage date, from which
+    IMS records every transit posting) and IMS is posting to Xero. Receipts from before that date are left as they are.
+  - **The queue and the hold.** The journal goes through the normal accounting queue and producer hold, and is recorded in the
+    transit and COGS sub-ledgers so the transit reconciliation ties. A journal the queue declines is reported on the order and in
+    the posting refusals; a journal the hold records instead of sending is reported as a WARNING on the order. Either way the next
+    receipt or recalculation of the order works out the difference again and queues it once it can; until then the credit stays in
+    transit.
+  - **Refusals.** If a journal is owed and the COGS or Stock in Transit account is not mapped, a manual receipt or a recalculation is
+    refused with a message naming the account (nothing is changed). A warehouse book-in or alignment is never refused for it: it is
+    recorded and a WARNING on the order says the journal was not posted. Switching the setting off does not stop this for an order
+    that already has such a journal; it keeps being reconciled, so a later cancellation still reverses it.
+  - **Not covered.** A supplier return of floored units does not reverse it.
 - **Freight orders accept an individual credit line, but not a net credit.** A freight order whose cost lines total
   less than zero, or whose total including VAT is less than zero (VAT is charged on a negative vatable line too), is
   refused with a message that a net credit from the supplier belongs on a supplier credit note. A zero line, a zero

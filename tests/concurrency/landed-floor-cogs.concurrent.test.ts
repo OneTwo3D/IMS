@@ -50,15 +50,16 @@ async function setSettings(t: { after: (fn: () => Promise<void>) => void }, valu
   }
 }
 
-async function seedWorld(label: string) {
+async function seedWorld(label: string, options: { weights?: [number, number]; costLines?: Array<{ amount: number; method: 'BY_QUANTITY' | 'BY_WEIGHT' }> } = {}) {
   const { db } = await import('@/lib/db')
   const { createPurchaseOrder } = await import('@/app/actions/purchase-orders')
   const tag = `${uid()}-lfc-${label}`
   const warehouse = await db.warehouse.create({ data: { code: `${uid()}-W`, name: `${tag} wh`, type: 'STANDARD' }, select: { id: true } })
   const supplier = await db.supplier.create({ data: { name: `${tag} supplier`, currency: 'GBP' }, select: { id: true } })
   const products: string[] = []
-  for (const suffix of ['a', 'b']) {
-    const p = await db.product.create({ data: { sku: `${tag}-${suffix}`, name: `lfc ${suffix}`, type: 'SIMPLE', countryOfOrigin: 'CN' }, select: { id: true } })
+  for (const [index, suffix] of (['a', 'b'] as const).entries()) {
+    const weight = options.weights ? String(options.weights[index]) : undefined
+    const p = await db.product.create({ data: { sku: `${tag}-${suffix}`, name: `lfc ${suffix}`, type: 'SIMPLE', countryOfOrigin: 'CN', ...(weight ? { weight } : {}) }, select: { id: true } })
     await db.stockLevel.create({ data: { productId: p.id, warehouseId: warehouse.id, quantity: '0', reservedQty: '0' } })
     products.push(p.id)
   }
@@ -77,11 +78,13 @@ async function seedWorld(label: string) {
   assert.equal(created.success, true, `PRECONDITION: createPurchaseOrder: ${created.error}`)
   const po = await db.purchaseOrder.findUniqueOrThrow({ where: { reference: tag }, select: { id: true, lines: { orderBy: { sortOrder: 'asc' }, select: { id: true, productId: true } } } })
   await db.purchaseOrder.update({ where: { id: po.id }, data: { status: 'PO_SENT' } })
+  const costLines = options.costLines ?? [{ amount: -100, method: 'BY_QUANTITY' as const }]
+  const net = costLines.reduce((sum, line) => sum + line.amount, 0)
   const freight = await db.purchaseOrder.create({
     data: {
       reference: `${tag}-F`, supplierId: supplier.id, status: 'PO_SENT', type: 'FREIGHT', currency: 'GBP', fxRateToBase: '1',
-      subtotalForeign: -100, subtotalBase: -100, totalForeign: -100, totalBase: -100,
-      freightCostLines: { create: [{ description: 'supplier rebate', amountForeign: '-100.0000', amountBase: '-100.0000', vatable: false, distributionMethod: 'BY_QUANTITY', sortOrder: 0 }] },
+      subtotalForeign: net, subtotalBase: net, totalForeign: net, totalBase: net,
+      freightCostLines: { create: costLines.map((line, index) => ({ description: `cost ${index}`, amountForeign: line.amount.toFixed(4), amountBase: line.amount.toFixed(4), vatable: false, distributionMethod: line.method, sortOrder: index })) },
     },
     select: { id: true, freightCostLines: { select: { id: true } } },
   })
@@ -92,6 +95,14 @@ async function seedWorld(label: string) {
 }
 
 type World = Awaited<ReturnType<typeof seedWorld>>
+
+async function receive(w: World, a: number, b: number) {
+  const { receivePurchaseOrder } = await import('@/app/actions/purchase-orders')
+  return receivePurchaseOrder(w.poId, [
+    ...(a > 0 ? [{ poLineId: w.lineA, qtyReceived: a, warehouseId: w.warehouseId }] : []),
+    ...(b > 0 ? [{ poLineId: w.lineB, qtyReceived: b, warehouseId: w.warehouseId }] : []),
+  ])
+}
 
 async function receiveAll(w: World) {
   const { receivePurchaseOrder } = await import('@/app/actions/purchase-orders')
@@ -136,7 +147,8 @@ async function layer(lineId: string) {
 async function accounting(t: { after: (fn: () => Promise<void>) => void }, extra: Record<string, string | null> = {}) {
   loadEnv()
   await enableStockReceiptPosting()
-  await setSettings(t, { xero_cogs_account: '500', xero_sync_cogs_journal: 'submitted', ...extra })
+  // The transit sub-ledger covers today (the migration seeds tomorrow on a fresh database): the coverage rule counts these receipts.
+  await setSettings(t, { xero_cogs_account: '500', xero_sync_cogs_journal: 'submitted', transit_ledger_coverage_start_date: '2000-01-01', ...extra })
 }
 
 test('switch off: receipt and recalculation post exactly what they did before (no floored-credit journal or row)', SKIP, async (t) => {
@@ -215,4 +227,59 @@ test('an unmapped COGS account refuses the receipt that owes the journal, and no
   assert.match(received.error ?? '', /COGS account is not mapped/)
   assert.equal(await db.costLayer.count({ where: { poLineId: { in: [w.lineA, w.lineB] } } }), 0, 'the receipt was rolled back')
   assert.equal(await db.accountingSyncLog.count({ where: { referenceId: w.poId, type: { in: ['STOCK_RECEIPT', 'COGS_JOURNAL'] } } }), 0, 'and no journal was queued')
+})
+
+/** What the bills put in transit for the units that LANDED: their goods value plus every contributing cost line. */
+async function landedBilled(w: World, landedValue: number) {
+  const { db } = await import('@/lib/db')
+  return landedValue + Number((await db.freightCostLine.aggregate({ where: { poId: w.freightId }, _sum: { amountBase: true } }))._sum.amountBase ?? 0)
+}
+
+test('a receipt of floored units only (worth 0.00, no receipt journal) still journals the unabsorbed credit', SKIP, async (t) => {
+  await accounting(t)
+  await setSettings(t, { [SWITCH]: 'true' })
+  const { db } = await import('@/lib/db')
+  const w = await seedWorld('flooredonly')
+  const received = await receive(w, 4, 0)
+  assert.equal(received.success, true, received.error)
+  assert.equal(await layer(w.lineA), 0)
+  assert.equal(await db.transitSubledgerMovement.count({ where: { sourceRef: w.poId, sourceType: 'STOCK_RECEIPT' } }), 0, 'PRECONDITION: the receipt was worth 0.00 and wrote no receipt row')
+  const j = await floorJournals(w)
+  assert.deepEqual(j.transit, [10], 'A (4 x 2.50) is cleared all the same')
+})
+
+test('a layer received before the transit coverage watermark is not counted', SKIP, async (t) => {
+  await accounting(t, { transit_ledger_coverage_start_date: '2999-01-01' })
+  await setSettings(t, { [SWITCH]: 'true' })
+  const w = await seedWorld('uncovered')
+  assert.equal((await receiveAll(w)).success, true)
+  assert.deepEqual((await floorJournals(w)).transit, [], 'not covered: nothing journalled')
+})
+
+test('close-short: the target follows the landed-quantity basis, so neither under- nor over-clears (BY_QUANTITY credit, and mixed methods)', SKIP, async (t) => {
+  await accounting(t)
+  await setSettings(t, { [SWITCH]: 'true' })
+  const { advancePoStatus } = await import('@/app/actions/purchase-orders')
+
+  // UNDER-CLEAR CASE: receive A 4 and B 1, then close. Over the 5 landed units the -100 is -20 a unit: A 10 - 20 = -10 floored, 4 x 10 = 40.
+  const w = await seedWorld('closeq')
+  assert.equal((await receive(w, 4, 1)).success, true)
+  assert.deepEqual((await floorJournals(w)).transit, [10], 'before the close: over the ordered 8 units, 4 x 2.50')
+  const closed = await advancePoStatus(w.poId, 'CLOSED')
+  assert.equal(closed.success, true, closed.error)
+  const j = await floorJournals(w)
+  assert.deepEqual(j.transit, [10, 30], 'the close-short raises it to 40')
+  assert.equal(await layer(w.lineB), 80)
+  assert.equal(await transitNet(w.poId), -(await landedBilled(w, 4 * 10 + 1 * 100)), 'transit ties with what the bills of the landed units put in')
+
+  // OVER-CLEAR CASE: +200 BY_QUANTITY and -300 BY_WEIGHT (A 10 kg, B 1 kg). On the ordered basis A would leave 132.73 unabsorbed; on the landed
+  // basis (A 4, B 1) only 92.68. Using the ordered basis would over-credit COGS by the difference.
+  const m = await seedWorld('closemixed', { weights: [10, 1], costLines: [{ amount: 200, method: 'BY_QUANTITY' }, { amount: -300, method: 'BY_WEIGHT' }] })
+  assert.equal((await receive(m, 4, 1)).success, true)
+  assert.equal((await advancePoStatus(m.poId, 'CLOSED')).success, true)
+  const mj = await floorJournals(m)
+  assert.equal(Math.round(mj.transit.reduce((a, b) => a + b, 0) * 100) / 100, 92.68, 'the landed-basis target')
+  assert.equal(await layer(m.lineA), 0)
+  const tie = Math.round((await transitNet(m.poId) + await landedBilled(m, 4 * 10 + 1 * 100)) * 100) / 100
+  assert.ok(Math.abs(tie) <= 0.02, `transit ties within rounding (gap ${tie})`)
 })

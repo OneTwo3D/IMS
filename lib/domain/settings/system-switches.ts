@@ -178,8 +178,9 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
       settings: [
         { key: 'xero_cogs_account', label: 'COGS' },
         { key: 'xero_transit_account', label: 'Stock in Transit' },
+        { key: 'xero_sync_cogs_journal', label: 'COGS journal sync type (xero_sync_cogs_journal)' },
       ],
-      why: 'the floored supplier credit is journalled DR Stock in Transit / CR COGS; with either account unmapped the receipt or recalculation that owes it is refused',
+      why: 'the floored supplier credit is journalled DR Stock in Transit / CR COGS as a COGS journal; with either account unmapped the receipt or recalculation that owes it is refused, and with the COGS journal sync type unset nothing would be posted',
     },
   },
   // Turning it ON is refused while any QUARANTINE warehouse still looks sellable (flags, allocations, bindings, open work): the command runs the

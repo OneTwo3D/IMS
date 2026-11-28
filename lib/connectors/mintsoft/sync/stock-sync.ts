@@ -1,5 +1,5 @@
 import { asnHasReceiptEvidence, readAlignUpReceiptEvidenceEnabled } from '@/lib/connectors/mintsoft/settings/align-up-receipt-evidence'
-import { LandedFloorCogsRefusal, reconcileLandedFloorCogsTx } from '@/lib/domain/purchasing/landed-floor-cogs'
+import { reconcileLandedFloorCogsForWmsTx, reportLandedFloorCogsResults, type LandedFloorCogsResult } from '@/lib/domain/purchasing/landed-floor-cogs'
 import { alignmentThresholdsKey } from '@/lib/domain/wms/alignment-dry-run'
 import { randomUUID } from 'crypto'
 import { Prisma } from '@/app/generated/prisma/client'
@@ -1662,6 +1662,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
   // The valuations this alignment laid goods at, reported after the commit (MED-5).
   const purchaseFxValuations = new Map<string, ReceiptFxValuation>()
   const purchaseBillFxResults: Array<{ poId: string; poReference: string; result: PurchaseBillFxReconcileResult }> = []
+  const floorCogsResults: LandedFloorCogsResult[] = []
   // MED-3: every order this alignment laid goods for, so an order whose bills the switch manages still reconciles after a switch-off rollback.
   const purchaseFxReceivedOrders = new Map<string, string>()
 
@@ -2223,12 +2224,10 @@ export async function applyMintsoftAlignmentForProduct(params: {
               journalDate: payload.date,
             })
           }
-          // Switch landed_cost_floor_cogs_enabled: the floored supplier credit's journal follows the new layer (target-state; see
-          // landed-floor-cogs.ts). Never refuses an alignment: with an account unmapped the credit stays in transit for a later event.
-          await reconcileLandedFloorCogsTx(tx, { poId: purchaseCost.poId, poReference: purchaseCost.poReference, at: new Date() }).catch((error: unknown) => {
-            if (!(error instanceof LandedFloorCogsRefusal)) throw error
-          })
         }
+        // Switch landed_cost_floor_cogs_enabled: the floored supplier credit's journal follows the new layer (target-state; see landed-floor-cogs.ts),
+        // also for a layer worth 0.00 that owed no receipt journal. Never refuses an alignment: a refusal is reported after the commit.
+        floorCogsResults.push(await reconcileLandedFloorCogsForWmsTx(tx, { poId: purchaseCost.poId, poReference: purchaseCost.poReference, at: new Date(), chart: accountingSettings }))
       } else {
         // TRANSFER-BACKED ALLOCATIONS GET NO JOURNAL, DELIBERATELY (o3d-6nd55). A transfer moves
         // units the business already owns between its own warehouses: their value never left
@@ -2431,6 +2430,7 @@ export async function applyMintsoftAlignmentForProduct(params: {
     // MED-5: an order whose goods were laid at the table rate while Xero sync is on and Xero holds no prepayment with its reference.
     for (const valuation of purchaseFxValuations.values()) await reportPurchaseFxFallback(valuation, 'Mintsoft alignment')
     for (const entry of purchaseBillFxResults) await reportPurchaseFxVarianceNotQueued(entry.poId, entry.poReference, entry.result)
+    await reportLandedFloorCogsResults(floorCogsResults)
     // A negative landed cost larger than the goods cost was held at zero for some of these layers: the
     // durable WARNING is written now, AFTER the commit, one entry per purchase order.
     const floorReportsByPo = new Map<string, { poReference: string; entries: FlooredLandedCreditEntry[] }>()

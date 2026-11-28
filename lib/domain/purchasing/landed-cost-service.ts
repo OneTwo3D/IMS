@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { reconcileLandedFloorCogsTx } from '@/lib/domain/purchasing/landed-floor-cogs'
+import { readLandedFloorCogsEnabled, reconcileLandedFloorCogsTx, reportLandedFloorCogsResults, type LandedFloorCogsResult } from '@/lib/domain/purchasing/landed-floor-cogs'
 import { MARK_REMEDY_TAIL } from '@/lib/domain/accounting/hand-post-instruction'
 import { Prisma } from '@/app/generated/prisma/client'
 import { getAccountingSettings, queueAccountingSync, queueAccountingSyncTx, type AccountingSettings } from '@/lib/accounting'
@@ -72,6 +72,8 @@ export type PendingGrossCostLineSource = {
 }
 
 export type LandedCostRecalcResult = {
+  /** Switch landed_cost_floor_cogs_enabled: the floored-credit journal's answer per order, reported after the commit by queueLandedCostAdjustmentJournals. */
+  floorCogsResults?: LandedFloorCogsResult[]
   revalidatePoIds: string[]
   auditRunIds: string[]
   warnings: LandedCostRevaluationWarning[]
@@ -855,9 +857,10 @@ function recordFlooredLandedCredit(
   purchaseOrderId: string,
   context: string,
   footprint: FloorFootprint,
+  floorCogs = false,
 ): void {
   if (footprint.entries.length === 0) return
-  const message = describeFlooredLandedCredit({ context, entries: footprint.entries })
+  const message = describeFlooredLandedCredit({ context, entries: footprint.entries, floorCogs })
   const warning: LandedCostRevaluationWarning = { code: 'landed_cost_credit_floored', context, message }
   result.warnings.push(warning)
   runWarnings.push(warning)
@@ -1214,6 +1217,8 @@ export type LandedCostJournalRunOutcome = { owed: number }
 export async function queueLandedCostAdjustmentJournals(
   adjustments: LandedCostRecalcResult,
 ): Promise<LandedCostJournalRunOutcome> {
+  // The floored-credit journals were queued in the recalculation's own transaction; their declines and shadows are reported here, after it.
+  await reportLandedFloorCogsResults(adjustments.floorCogsResults ?? [])
   const settings = await getAccountingSettings()
   let owed = 0
 
@@ -1371,6 +1376,11 @@ export async function queueLandedCostAdjustmentJournals(
  * Recalculate landed cost on all primary POs linked to this freight PO.
  * Updates PO line `landedUnitCostBase`, CostLayer `unitCostBase`, and CogsEntry costs.
  */
+/** Keep only an answer that has something to report (a decline, a shadow), so a recalculation that owes nothing returns the result it always did. */
+function collectFloorCogsResult(result: LandedCostRecalcResult, floor: LandedFloorCogsResult): void {
+  if (floor.notQueued || floor.shadowed || floor.refused) (result.floorCogsResults ??= []).push(floor)
+}
+
 export async function recalculateLandedCosts(
   tx: Prisma.TransactionClient,
   freightPoId: string,
@@ -1654,6 +1664,7 @@ export async function recalculateLandedCosts(
     }
     recordFlooredLandedCredit(
       result, runWarnings, primaryPoId, `recalculateLandedCosts:${primaryPo.reference}`, floorFootprint,
+      floorFootprint.entries.length > 0 && await readLandedFloorCogsEnabled(tx),
     )
     result.revalidatePoIds.push(primaryPoId)
     const eventKey = landedCostAdjustmentEventKey(primaryPoId, adjustmentLayers, recalcRunId)
@@ -1713,8 +1724,8 @@ export async function recalculateLandedCosts(
     })
     result.auditRunIds.push(auditRun.id)
     // Switch landed_cost_floor_cogs_enabled: the floored credit's journal follows the new allocation (a cancelled freight order's credit drops out
-    // and the journal is reversed). Target-state; nothing is read beyond the switch while it is off and the order has no such journal.
-    await reconcileLandedFloorCogsTx(tx, { poId: primaryPoId, poReference: primaryPo.reference, at: revaluedAt })
+    // and the journal is reversed). Target-state; with the switch off: the switch and one indexed lookup of the order's own rows.
+    collectFloorCogsResult(result, await reconcileLandedFloorCogsTx(tx, { poId: primaryPoId, poReference: primaryPo.reference, at: revaluedAt, chart: options.accountingSettings }))
   }
   // audit-grob: durably enqueue the adjustment journals IN this tx (backstop).
   if (options.scheduleAdjustmentJournals) {
@@ -2006,7 +2017,7 @@ export async function recalculateDirectLandedCosts(
     const residueNow = floorFootprint.entries.reduce((sum, entry) => sum.add(entry.unabsorbedBase), new Prisma.Decimal(0))
     if (!(await previousFloorResidue(tx, poId)).eq(residueNow)) floorFootprint.activityDue = true
   }
-  recordFlooredLandedCredit(result, runWarnings, poId, `recalculateDirectLandedCosts:${po.reference}`, floorFootprint)
+  recordFlooredLandedCredit(result, runWarnings, poId, `recalculateDirectLandedCosts:${po.reference}`, floorFootprint, floorFootprint.entries.length > 0 && await readLandedFloorCogsEnabled(tx))
   result.revalidatePoIds.push(poId)
   const eventKey = landedCostAdjustmentEventKey(poId, adjustmentLayers, recalcRunId)
   if (totalInventoryDelta.abs().gt(LANDED_COST_JOURNAL_EPSILON)) {
@@ -2055,7 +2066,8 @@ export async function recalculateDirectLandedCosts(
   })
   result.auditRunIds.push(auditRun.id)
   // Switch landed_cost_floor_cogs_enabled: see recalculateLandedCosts.
-  await reconcileLandedFloorCogsTx(tx, { poId, poReference: po.reference, at: revaluedAt })
+  // A close-short passes its landed-quantity basis, so the target is spread over the units that landed exactly as the layers were.
+  collectFloorCogsResult(result, await reconcileLandedFloorCogsTx(tx, { poId, poReference: po.reference, at: revaluedAt, chart: options.accountingSettings, ...(options.landedQtyBasis ? { landedQtyBasis: options.landedQtyBasis } : {}) }))
   // audit-grob: durably enqueue the adjustment journals IN this tx (backstop).
   if (options.scheduleAdjustmentJournals) {
     await scheduleLandedCostJournalOutbox(tx, result)

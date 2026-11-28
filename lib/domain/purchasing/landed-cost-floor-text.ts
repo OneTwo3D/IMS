@@ -37,6 +37,8 @@ export function describeFlooredLandedCredit(params: {
    * been received yet (the read-only PO preview), so it says what IMS WILL do and claims nothing happened.
    */
   tense?: 'applied' | 'pending'
+  /** Switch landed_cost_floor_cogs_enabled: IMS posts the unabsorbed amount from Stock in Transit to cost of sales, so the sentence says so. */
+  floorCogs?: boolean
 }): string {
   const { context, entries } = params
   const detail = entries
@@ -46,9 +48,9 @@ export function describeFlooredLandedCredit(params: {
   const total = money(totalUnabsorbedBase(entries))
   if (params.tense === 'pending') {
     return `${lead}, so IMS will value those units at 0.00 each when they are received and cannot absorb ${total} of it into stock `
-      + `[${detail}]. IMS will queue no journal for that amount.`
+      + `[${detail}]. ${params.floorCogs ? 'IMS will queue a journal moving that amount from Stock in Transit to cost of sales.' : 'IMS will queue no journal for that amount.'}`
   }
   return `${lead.replace(' is larger', ' was larger')}, `
     + `so IMS valued those units at 0.00 each and could not absorb ${total} of it into stock `
-    + `[${detail}]. IMS queued no journal for that amount.`
+    + `[${detail}]. ${params.floorCogs ? 'IMS posts that amount from Stock in Transit to cost of sales (a journal per change, queued with the receipt or recalculation).' : 'IMS queued no journal for that amount.'}`
 }
