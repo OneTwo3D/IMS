@@ -129,23 +129,25 @@ onetwo3d-ims/
    - CSV import/export with BOM and variant support
 
 2. **Order-to-Cash** — Sales order full lifecycle:
-   - Workflow: DRAFT → PENDING_PAYMENT → ON_HOLD → PROCESSING → ALLOCATED → PICKING → PACKING → SHIPPED → COMPLETED/DELIVERED
+   - Workflow: DRAFT → PENDING_PAYMENT → ON_HOLD → PROCESSING → ALLOCATED → PICKING → PACKING → SHIPPED → COMPLETED/DELIVERED, or CANCELLED (`SalesOrderStatus`); the refund state (`SalesOrder.refundStatus`) and the invoicing state are separate from the status
    - Multi-warehouse auto-allocation with intelligent allocation rules
    - Shipment management with tracking
-   - Auto/manual invoice generation (configurable trigger)
+   - The accounting invoice is queued at order creation or draft finalisation; the IMS invoice number follows `invoice_trigger` (manual, on shipment, on payment)
+   - Refunds (credit notes, return stock at the originally posted cost, WooCommerce refund import), and behind switches: returns in transit, the return condition check with quarantine warehouses, exchanges inside a return, refund delete
    - Payment tracking against invoices and credit notes
    - Multi-currency with VAT handling and order/line discounts
    - PDF generation and email delivery
 
 3. **Procure-to-Pay** — Purchase order full lifecycle:
-   - Workflow: DRAFT → RFQ_SENT → PO_SENT → PARTIALLY_RECEIVED → RECEIVED → INVOICED
-   - Multi-currency with live FX rates (frankfurter.dev ECB data)
+   - Workflow: DRAFT → RFQ_SENT → QUOTE_RECEIVED → PO_SENT → SHIPPED → PARTIALLY_RECEIVED → RECEIVED → INVOICED, plus CLOSED (including closed short), PARTIALLY_RETURNED, RETURNED and CANCELLED (`PurchaseOrderStatus` in `prisma/schema.prisma`)
+   - Multi-currency at the order's stored rate (taken from the `fx_rates` table, fed per `fx_rate_source`: Aelia, or ECB via frankfurter.dev); per-event FX for receipts and bills is behind `purchase_event_fx_rates_enabled` (off, interlocked)
    - RFQ PDF generation and supplier management
    - Goods receipt with FIFO costing integration
    - Landed cost distribution (by value/weight/quantity/equal split)
    - Freight/cost POs linked to primary POs
-   - Retrospective landed cost recalculation (updates FIFO layers and COGS)
-   - Supplier returns and billing workflow
+   - Retrospective landed cost recalculation (updates FIFO layers and COGS); zero floor for supplier credits (floored part to COGS behind `landed_cost_floor_cogs_enabled`)
+   - Receipts by hand, by WMS book-in and by Mintsoft align-up; GR/IR sub-ledger
+   - Supplier bills (three-way match, net payable for reverse charge), supplier credit notes, returns to supplier
 
 4. **Manufacturing** — Production order management:
    - Production order types: ASSEMBLY, DISASSEMBLY

@@ -422,11 +422,9 @@ stock held until someone reconciled it by hand.
 
 A refund of units that never shipped only releases the demand: the stock was never taken out of the warehouse, so there is nothing to put back and no stock is returned for those units. The refund button is available once an order has shipped, or to top up an order that is already partly refunded.
 
-### Refund-time cost revaluation
+### Refund-time cost
 
-When a refund processes returned stock, the system uses the **current** cost-layer unit cost — not the snapshot recorded at shipment time. This means if a landed-cost revaluation has changed the unit cost since the original shipment, the refund's COGS reversal uses the up-to-date value. The returned stock is also valued at the current cost.
-
-This keeps the returned-stock balance sheet entry aligned with the live cost layers. Note that the COGS reversal amount may differ from the originally-posted COGS amount by the revaluation delta — this is the expected behaviour for single-snapshot accounting.
+When a refund returns stock, the COGS reversal and the returned stock are valued at the cost **originally posted when the units shipped** (the shipment's own COGS records), not at the cost layer's current value. The refund reverses exactly the cost originally posted at dispatch, and the returned stock re-enters at that cost. A landed-cost revaluation posted to COGS after the shipment is not reversed: by design, that difference stays in COGS for the refunded units. Do not journal it out. Only an old shipment with no posted cost on record (a dispatch from before FIFO snapshots and COGS records existed) falls back to the cost recorded on the shipment.
 
 ### Refunds that return no stock, and returns whose cost is unknown
 
@@ -436,9 +434,7 @@ Every unit that is restocked carries a cost layer at the **issued cost** of the 
 
 ### Refunds without a shipment source
 
-If a sales order line was allocated but never shipped, the refund rejects with a clear message: *"Cannot return refunded stock for product X: no shipped stock source exists"*. The system refuses to silently restock from an allocation-only source — there's no actual stock movement to reverse.
-
-You can still process the refund as cash-only by leaving the return warehouse unset.
+A refund you record by hand with a return warehouse on an order that has **no shipment at all** is refused with *"Cannot return refunded stock before the order has shipped"*: there is no stock movement to reverse, and IMS never restocks from an allocation. Process it as cash-only by leaving the return warehouse unset (on a partly shipped order, the units that never shipped only release their reservation; see *Refunds on a partly shipped order*). A WooCommerce refund cannot be refused: units that never shipped are not restocked, and if nothing it refunds has shipped, no return warehouse is recorded at all.
 
 ### Warehouse-scoped idempotency
 
@@ -630,11 +626,15 @@ Two cases are refused instead of posting wrongly. Both show as a failed entry un
 
 ## Invoice Generation
 
-Invoices can be generated either manually or automatically. The trigger for automatic invoice generation is configurable in **Settings > Sales Settings**. Options include:
+**The accounting (Xero) invoice and the IMS invoice number are separate.** The sales invoice is queued to the accounting system (while sales-invoice sync is on) when the order is created, or when a draft is finalised, whatever the setting below (posted as AUTHORISED, or DRAFT while the *Sales invoices* posting mode is `draft`; see [Xero sync](xero-sync.md)).
 
-- **Manual** — you generate the invoice yourself when ready
-- **On ship** — invoice is created automatically when the order is shipped
-- **On paid** — invoice is created automatically when payment is received in full
+The setting in **Settings > Sales Settings** (`invoice_trigger`) only decides when IMS gives the order its **invoice number** (and invoice date):
+
+- **Manual only** (the default): you generate the number yourself from the order detail page.
+- **On shipment**: the number is generated when the order is shipped (not for an order held short).
+- **On payment**: the number is generated when the order becomes paid (marked as paid, or a payment brings it to fully paid; not for a cancelled order).
+
+An invoice number already queued with the accounting invoice is adopted rather than a second one minted. A WooCommerce order (its invoice number comes from the storefront's PDF Invoices plugin) is never given one by IMS; the number appears once WooCommerce has created the invoice.
 
 ### Deleting an invoice that has synced to Xero
 
@@ -662,7 +662,7 @@ payload is constructed by the same builder used for the original push, so what X
 fresh post would have sent. A payload-derived idempotency key prevents duplicates if you re-save
 without any content change. (This is not an operator Edit: see **Editing an order** above.)
 
-The update keeps the invoice's **original date**: it is read from the invoice IMS posted, then from the order's storefront creation day, then from the invoice stamp on the order, and an edit never moves the invoice to the day of the edit. If none of these can be read (an invoice whose date IMS never recorded), the edit is **refused** with a message saying the original date is unknown and nothing is saved; IMS does not send today's date instead. Repair the invoice date (the accounting back-reference repair) or amend the invoice in the accounting system by hand.
+The update also keeps the invoice's **tax codes**: a line whose VAT rate the posted invoice carried is sent again on the code it was posted with (a VAT rate you re-mapped to another accounting tax code since only affects new invoices), and the discount's per-rate parts, the single discount line and shipping likewise; a line at a VAT rate the invoice never carried takes the rate's current code. Shipping and the single discount line keep their posted code only while the order's default VAT rate is still the one they were posted on (an edit that changes the order's VAT rate, or a WooCommerce zero-rated postage with its own rate, takes the current code). An update still waiting to be sent does not lose the codes: the next edit reads that pending update's codes. If IMS holds no usable record of how the invoice was posted (a hand-linked invoice, a posted code the accounting system has archived, an invoice record that names no VAT rate for its lines, or an earlier update in flight with no confirmed record behind it), the update is built on the current codes and, once it is queued, IMS writes a warning on the order (`sales_invoice_update_used_current_tax_codes`, naming the reason): check the invoice's VAT in the accounting system afterwards. An invoice that was posted with two different codes for one VAT rate refuses the edit. After a tax **re-key** the retired-code guard still wins for a code the re-key RETIRED: a credit note on that code is refused, and an edit does not re-send it: the update falls back to the rate's current codes and IMS writes the warning (reason: a posted tax code was retired by a tax re-key), so the edit is not blocked. A pending update is read because it reaches the accounting system first, not because its codes were proven; if it is later refused or cancelled, the next edit rebuilds from the then-newest invoice record. A rate a re-key CLEARED (left with no code) does not block an edit: the update re-sends the posted code without binding it to that rate. The update keeps the invoice's **original date**: it is read from the invoice IMS posted, then from the order's storefront creation day, then from the invoice stamp on the order, and an edit never moves the invoice to the day of the edit. If none of these can be read (an invoice whose date IMS never recorded), the edit is **refused** with a message saying the original date is unknown and nothing is saved; IMS does not send today's date instead. Repair the invoice date (the accounting back-reference repair) or amend the invoice in the accounting system by hand.
 
 If the accounting connector rejects the update (e.g. the external invoice is locked, paid, or
 voided), an amber **rejected sync** alert appears at the top of the sales order detail page with
