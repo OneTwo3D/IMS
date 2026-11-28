@@ -19,6 +19,7 @@ import { databaseLedgerFence } from '@/lib/connectors/xero/invoice-delta'
 import { MAY_HAVE_REACHED_LEDGER_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { ledgerStanding } from '@/lib/domain/accounting/ledger-standing'
 import { matchesWhere } from '@/tests/helpers/shopping-sync-log-fake'
+import { REVISION_BUMPING_CONNECTOR_WHERE } from '@/lib/domain/accounting/money-attempt-provenance'
 
 /**
  * o3d-a3wx. BILL_PAYMENT joined accounting_sync_logs_followup_live_unique. markBillPaid only wins the
@@ -235,7 +236,7 @@ type SyncRow = {
 
 /** A survey row with the ledger columns defaulted to what Prisma returns for an untouched row. */
 function full(row: SyncRow): Record<string, unknown> {
-  return { externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: null, attemptRevision: 0, ...row }
+  return { connector: 'xero', externalTransactionId: null, settlementBasis: null, abandonedBeforeRemoteCall: null, attemptRevision: 0, ...row }
 }
 
 function mockTx(rows: SyncRow[], options: { paidCount?: number; retiredCount?: number; afterRetire?: SyncRow[] } = {}) {
@@ -331,6 +332,8 @@ test('with nothing claimed or posted, the bill is marked paid and the PENDING ro
     status: { in: ['PENDING'] },
     attemptRevision: 0,
     externalTransactionId: null,
+    // The pre-call proof is only true of a row a revision-bumping processor wrote: registered connectors only.
+    ...REVISION_BUMPING_CONNECTOR_WHERE,
   })
   assert.equal((calls.syncUpdateMany[0].data as { status: string }).status, 'CANCELLED')
   assert.equal((calls.syncUpdateMany[0].data as { abandonedBeforeRemoteCall: boolean }).abandonedBeforeRemoteCall, true,
