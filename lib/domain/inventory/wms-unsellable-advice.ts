@@ -4,7 +4,7 @@
  *
  * Quarantine is kept in IMS only, so a unit held at the 3PL is never quarantined: it is restocked as Sellable into the bound warehouse (which
  * also clears a refund's return in transit) and written off, promptly. WHO books the write-off depends on the binding:
- *  - ALIGNED: the binding aligns IMS to the warehouse system (ALIGN_TO_WMS) AND align-down can run (binding and connection active, alignment
+ *  - ALIGNED: the binding aligns IMS to the warehouse system (ALIGN_TO_WMS) AND align-down can run (its stock-sync cron enabled, binding and connection active, alignment
  *    confirmed, an active align-down reason with an account, thresholds set, the inventory account mapped where the reason-cost rule needs
  *    it). The 3PL writes the unit off there; a later stock sync, once it has seen the same difference twice, aligns IMS down under the
  *    align-down reason. An IMS adjustment as well would be undone: the next sync books it back as a stock gain.
@@ -30,6 +30,8 @@ export type WmsBindingWriteOffFacts = {
   thresholdsConfigured: boolean
   /** True when the reason-cost rule is on and no inventory account is mapped: align-down would hold the write-off. */
   inventoryAccountMissing: boolean
+  /** The connector's stock-sync cron is enabled: align-down runs only from it (or a manual Run now). */
+  stockSyncScheduled: boolean
 }
 
 /** The route for one binding. Pure. */
@@ -38,7 +40,9 @@ export function wmsWriteOffRoute(facts: WmsBindingWriteOffFacts | null | undefin
   if (!facts.active || !facts.connectionActive) return { mode: 'IMS_MASTER' }
   if (facts.stockSyncMode === 'NOTIFICATION_ONLY' || facts.stockSyncMode === 'DISABLED') return { mode: 'IMS_MASTER' }
   if (facts.stockSyncMode !== 'ALIGN_TO_WMS') return { mode: 'UNKNOWN' }
-  const why = !facts.alignmentConfirmed
+  const why = !facts.stockSyncScheduled
+    ? 'its stock sync is not scheduled'
+    : !facts.alignmentConfirmed
     ? 'its alignment is not confirmed yet (dry run)'
     : !facts.alignDownReason
       ? 'it has no align-down reason'

@@ -8,7 +8,7 @@ import {
   wmsWriteOffRoute,
   type WmsBindingWriteOffFacts,
 } from '@/lib/domain/inventory/wms-unsellable-advice'
-import { bindingWriteOffFacts, thresholdsConfigured } from '@/lib/domain/inventory/wms-write-off-route'
+import { routeForBinding, stockSyncCronSlug, thresholdsConfigured, type WriteOffRouteContext } from '@/lib/domain/inventory/wms-write-off-route'
 
 /**
  * The write-off route for an unsellable unit held at the 3PL. ALIGNED only when align-down can really write it off; aligned but blocked is
@@ -24,11 +24,13 @@ const READY: WmsBindingWriteOffFacts = {
   alignDownReason: { active: true, accountCode: '5150' },
   thresholdsConfigured: true,
   inventoryAccountMissing: false,
+  stockSyncScheduled: true,
 }
 
 test('aligned only when align-down can run; otherwise ALIGNED_MANUAL with the reason', () => {
   assert.deepEqual(wmsWriteOffRoute(READY), { mode: 'ALIGNED' })
   const cases: Array<[Partial<WmsBindingWriteOffFacts>, RegExp]> = [
+    [{ stockSyncScheduled: false }, /its stock sync is not scheduled/],
     [{ alignmentConfirmed: false }, /not confirmed/],
     [{ alignDownReason: null }, /no align-down reason/],
     [{ alignDownReason: { active: false, accountCode: '5150' } }, /reason is inactive/],
@@ -59,11 +61,14 @@ test('several bindings: their route when they agree, UNKNOWN when they disagree 
   assert.deepEqual(combineWmsWriteOffRoutes([]), { mode: 'UNKNOWN' })
 })
 
-test('the server facts: a binding of a disabled connector counts as inactive; thresholds need a number', () => {
+test('the server facts: a binding of a disabled connector counts as inactive; the cron must be on; thresholds need a number', () => {
   const row = { connector: 'wms-x', active: true, stockSyncMode: 'ALIGN_TO_WMS', alignmentConfirmedAt: new Date(), discrepancyThresholds: { absoluteDelta: 5 }, alignDownReason: { active: true, accountCode: '5150' }, connection: { active: true } }
-  assert.equal(wmsWriteOffRoute(bindingWriteOffFacts(row, ['wms-x'], false)).mode, 'ALIGNED')
-  assert.equal(wmsWriteOffRoute(bindingWriteOffFacts(row, [], false)).mode, 'IMS_MASTER')
-  assert.equal(wmsWriteOffRoute(bindingWriteOffFacts({ ...row, connection: { active: false } }, ['wms-x'], false)).mode, 'IMS_MASTER')
+  const ctx = (over: Partial<WriteOffRouteContext> = {}): WriteOffRouteContext => ({ enabledConnectors: ['wms-x'], inventoryAccountMissing: false, stockSyncScheduled: { 'wms-x': true }, ...over })
+  assert.equal(routeForBinding(row, ctx()).mode, 'ALIGNED')
+  assert.equal(routeForBinding(row, ctx({ enabledConnectors: [] })).mode, 'IMS_MASTER')
+  assert.equal(routeForBinding({ ...row, connection: { active: false } }, ctx()).mode, 'IMS_MASTER')
+  assert.deepEqual(routeForBinding(row, ctx({ stockSyncScheduled: {} })), { mode: 'ALIGNED_MANUAL', why: 'its stock sync is not scheduled' }, 'a cron that is off (or not registered) aligns nothing')
+  assert.equal(stockSyncCronSlug('wms-x'), 'wms-x-stock-sync')
   assert.equal(thresholdsConfigured({ absoluteDelta: 5 }), true)
   assert.equal(thresholdsConfigured({ percentDelta: '2.5' }), true)
   for (const value of [null, {}, { absoluteDelta: null, percentDelta: null }, [], 'x']) assert.equal(thresholdsConfigured(value as never), false)

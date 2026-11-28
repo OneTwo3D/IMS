@@ -71,16 +71,17 @@ async function setSwitch(on: boolean) {
   await db.setting.upsert({ where: { key: SWITCH }, create: { key: SWITCH, value: on ? 'true' : 'false' }, update: { value: on ? 'true' : 'false' } })
 }
 
-/** The warehouse-system plugin switched on for this test (a binding of a disabled connector aligns nothing), restored afterwards. */
+/** The warehouse-system plugin and its stock-sync cron switched on for this test (align-down runs only from that cron), restored afterwards. */
 async function enableWmsPlugin(t: { after: (fn: () => Promise<void>) => void }) {
   const { db } = await loadDeps()
-  const key = 'plugin_mintsoft_enabled'
-  const saved = await db.setting.findUnique({ where: { key } })
-  await db.setting.upsert({ where: { key }, create: { key, value: 'true' }, update: { value: 'true' } })
-  t.after(async () => {
-    await db.setting.deleteMany({ where: { key } })
-    if (saved) await db.setting.create({ data: { key, value: saved.value } })
-  })
+  for (const key of ['plugin_mintsoft_enabled', 'cron_mintsoft_stock_sync_enabled']) {
+    const saved = await db.setting.findUnique({ where: { key } })
+    await db.setting.upsert({ where: { key }, create: { key, value: 'true' }, update: { value: 'true' } })
+    t.after(async () => {
+      await db.setting.deleteMany({ where: { key } })
+      if (saved) await db.setting.create({ data: { key, value: saved.value } })
+    })
+  }
 }
 
 /** A binding whose align-down can run: confirmed, an active reason with an account, thresholds. */
@@ -427,8 +428,21 @@ test('Mintsoft returns inbox: an unsellable unit held at the 3PL is never quaran
     assert.equal(unsellable.error, quarantine.wmsUnsellableReturnRefusal({ mode: 'ALIGNED' }))
     assert.match(unsellable.error ?? '', /Do not also make a stock adjustment in IMS/)
   }
-  // The dialog's hint is computed by the same reader the refusal uses (the dashboard's route per warehouse).
-  assert.equal(await refusalNow(), quarantine.wmsUnsellableReturnRefusal(await loadWmsWriteOffRoute(db, [w.main.id])))
+  // The dialog's hint: the dashboard hands it the same route the refusal uses, for the bound warehouse's code.
+  const serverRoute = await loadWmsWriteOffRoute(db, [w.main.id])
+  assert.deepEqual(serverRoute, { mode: 'ALIGNED' })
+  assert.equal(await refusalNow(), quarantine.wmsUnsellableReturnRefusal(serverRoute))
+  const dashboard = await mintsoft.getMintsoftDashboardData()
+  assert.deepEqual(dashboard.writeOffRouteByWarehouseCode[w.main.code], serverRoute, 'dialog = server')
+  await setSwitch(false)
+  assert.deepEqual((await mintsoft.getMintsoftDashboardData()).writeOffRouteByWarehouseCode, {}, 'switch off: no route work on the dashboard')
+  await setSwitch(true)
+
+  // The stock-sync cron is off: align-down never runs, so the IMS adjustment route.
+  await db.setting.update({ where: { key: 'cron_mintsoft_stock_sync_enabled' }, data: { value: 'false' } })
+  assert.equal(await refusalNow(), quarantine.wmsUnsellableReturnRefusal({ mode: 'ALIGNED_MANUAL', why: 'its stock sync is not scheduled' }))
+  assert.deepEqual((await mintsoft.getMintsoftDashboardData()).writeOffRouteByWarehouseCode[w.main.code], { mode: 'ALIGNED_MANUAL', why: 'its stock sync is not scheduled' })
+  await db.setting.update({ where: { key: 'cron_mintsoft_stock_sync_enabled' }, data: { value: 'true' } })
 
   // Nothing aligns: an inactive binding, an inactive connection, notification-only or disabled sync.
   await db.externalWmsBinding.update({ where: { id: binding.id }, data: { active: false } })
