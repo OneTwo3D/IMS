@@ -126,6 +126,13 @@ export async function runSettingsCli(options: SettingsCliOptions): Promise<numbe
       if (interlock) { stderr.error(interlock); return 3 }
       turnOnTxCheck = (tx) => quarantineSwitchOnRefusal(tx as InterlockClient)
     }
+    if (def.turnOnInterlock === 'stock-adjustment-reasons' && proposed === 'true' && current.stored !== 'true') {
+      const { stockAdjustmentSwitchOnRefusal } = await import('@/lib/domain/inventory/stock-adjustment-switch-on')
+      type ReasonClient = Parameters<typeof stockAdjustmentSwitchOnRefusal>[0]
+      const interlock = await stockAdjustmentSwitchOnRefusal(db as unknown as ReasonClient)
+      if (interlock) { stderr.error(interlock); return 3 }
+      turnOnTxCheck = (tx) => stockAdjustmentSwitchOnRefusal(tx as ReasonClient)
+    }
     if (def.adminOnly && yes && !confirmAdmin) { stderr.error(adminRefusal(def)); return 3 }
     if (!yes) {
       if (def.adminOnly) stdout.log(`${def.key} is an ADMIN switch in the screen; writing it needs --yes --confirm-admin (ADMIN authority is assumed from shell access).`)

@@ -42,7 +42,7 @@ export type SwitchDefinition = {
   /** A row stamped with the ISO instant, in the same transaction, whenever the switch changes to ON (not when it is left as it is); the row is deleted when the switch changes to OFF. */
   readonly stampOnKey?: string
   /** Turning ON is refused by this interlock (run by the command, which may read the store; the registry stays free of the database client). */
-  readonly turnOnInterlock?: 'storefront-customer-email' | 'quarantine-warehouses' | 'purchase-fx-bill-writer'
+  readonly turnOnInterlock?: 'storefront-customer-email' | 'quarantine-warehouses' | 'purchase-fx-bill-writer' | 'stock-adjustment-reasons'
   /**
    * Turning ON is refused while `whenKey` is `whenValue` and any of `settings` is blank (unset or only spaces). Settings rows only, so it is checked here,
    * in the dry run and again inside the write transaction.
@@ -133,6 +133,19 @@ export const RETURN_CONDITION_CHECK_SWITCH_KEY = 'return_condition_check_enabled
 // tests/settings-cli.test.ts holds it equal to LANDED_FLOOR_COGS_SWITCH_KEY. ADMIN: it posts journals to the LIVE ledger.
 export const LANDED_FLOOR_COGS_SWITCH_KEY = 'landed_cost_floor_cogs_enabled'
 
+// FRS 102 stock adjustments (owner-approved 2026-11-22): every adjustment needs an active reason with an account and a unit cost that is never an average. The readers are
+// readStockAdjustmentReasonCostRequired (lib/domain/inventory/stock-adjustment-policy.ts, `row?.value === 'true'`) and the import / stock-count writers; a literal here for the same reason
+// as the others, and tests/settings-cli.test.ts holds it equal to STOCK_ADJUSTMENT_REASON_COST_REQUIRED_KEY. ADMIN: it adds refusals to every live stock-adjustment flow. Turning it ON is
+// refused while Xero sync is on and the inventory account is unmapped, and (interlock) while no active reason exists, or, with Xero sync on, none has an account.
+export const STOCK_ADJUSTMENT_REASON_COST_SWITCH_KEY = 'stock_adjustment_reason_cost_required'
+// A removal larger than the available stock releases the newest orders' reservations (app/actions/stock.ts reads `=== 'true'`). ADMIN: it takes stock away from open orders. No prerequisite: the
+// release is decided case by case at the removal and refused when it cannot be done.
+export const STOCK_ADJUSTMENT_RELEASE_RESERVED_SWITCH_KEY = 'stock_adjustment_release_reserved'
+// Align-up books a rise in Mintsoft stock as a receipt only against an ASN the warehouse has touched (lib/connectors/mintsoft/settings/align-up-receipt-evidence.ts, `=== 'true'`). ADMIN: it changes
+// what align-up books on a LIVE warehouse. No prerequisite is encoded: the evidence is the ASN's own status or callback, which exists only once receipts have been reported, so there is nothing
+// to configure first (with it on and no evidence a rise stays a discrepancy for the operator).
+export const MINTSOFT_ALIGN_UP_EVIDENCE_SWITCH_KEY = 'mintsoft_align_up_requires_receipt_evidence' // wms-connector-boundary-ok: 2026-11-28: operator switch registry names the setting key
+
 export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
   booleanSwitch('trackship_refire_enabled'),
   booleanSwitch('wc_withdrawal_outcome_enabled'),
@@ -203,6 +216,18 @@ export const SYSTEM_SWITCHES: readonly SwitchDefinition[] = [
       why: 'a refund that returns stock in transit debits Stock in Transit on its COGS reversal, and the parcel\'s arrival moves it to Inventory; with either account unmapped the journal fails closed and the refund stays on the accounting retry list',
     },
   },
+  {
+    ...booleanSwitch(STOCK_ADJUSTMENT_REASON_COST_SWITCH_KEY, undefined, true),
+    turnOnInterlock: 'stock-adjustment-reasons',
+    requiresMappedSettings: {
+      whenKey: 'xero_sync_enabled',
+      whenValue: 'true',
+      settings: [{ key: 'xero_inventory_account', label: 'Inventory' }],
+      why: 'with the switch on, a valued adjustment whose journal would post is refused when no inventory account is mapped, instead of changing stock the ledger never sees',
+    },
+  },
+  booleanSwitch(STOCK_ADJUSTMENT_RELEASE_RESERVED_SWITCH_KEY, undefined, true),
+  booleanSwitch(MINTSOFT_ALIGN_UP_EVIDENCE_SWITCH_KEY, undefined, true),
   booleanSwitch(SUPPLIER_CREATE_KEY, undefined, true),
   booleanSwitch(ASN_SEND_SUPPLIER_KEY, undefined, true),
   booleanSwitch(ASN_SUPPLIER_REQUIRED_KEY, [ASN_REQUIRED_NEEDS_SEND], true),

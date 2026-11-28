@@ -63,7 +63,7 @@ const SET = ['--by', 'jan', '--reason', 'switchover step M']
 
 test('allowlist contains exactly the switches that exist on development, and none is a credential', () => {
   assert.deepEqual([...SYSTEM_SWITCH_KEYS].sort(), [
-    'first_load_mintsoft_archive_enabled', 'landed_cost_floor_cogs_enabled', 'mintsoft_asn_send_supplier_enabled', 'mintsoft_asn_supplier_required', 'mintsoft_parent_sku_delete_enabled', 'mintsoft_product_parity_enabled', 'mintsoft_supplier_create_enabled', 'purchase_event_fx_rates_enabled', 'refund_delete_enabled', 'refund_returns_in_transit_enabled', 'return_condition_check_enabled', 'sales_order_discount_tax_apportion_enabled', 'storefront_customer_email_enabled', 'trackship_refire_enabled', 'wc_invoice_document_enabled', 'wc_invoice_note_enabled', 'wc_order_amendment_unpaid_rewrite_enabled', 'wc_order_amendment_write_enabled', 'wc_refund_credit_note_parity_enabled', 'wc_withdrawal_outcome_enabled', 'wms_despatch_date_enabled', 'wms_despatch_quantity_check_enabled', 'wms_merge_candidate_mode', 'wms_merge_hold_enabled', 'wms_mixed_warehouse_push_enabled', 'wms_refund_remainder_task_enabled', 'wms_sku_rename_remap_enabled', 'xero_credit_note_allocation_enabled', 'xero_credit_note_duplicate_check_enabled', 'xero_defer_unpaid_invoiced_revenue_enabled', 'xero_refund_payment_cash_out_date_enabled',
+    'first_load_mintsoft_archive_enabled', 'landed_cost_floor_cogs_enabled', 'mintsoft_align_up_requires_receipt_evidence', 'mintsoft_asn_send_supplier_enabled', 'mintsoft_asn_supplier_required', 'mintsoft_parent_sku_delete_enabled', 'mintsoft_product_parity_enabled', 'mintsoft_supplier_create_enabled', 'purchase_event_fx_rates_enabled', 'refund_delete_enabled', 'refund_returns_in_transit_enabled', 'return_condition_check_enabled', 'sales_order_discount_tax_apportion_enabled', 'stock_adjustment_reason_cost_required', 'stock_adjustment_release_reserved', 'storefront_customer_email_enabled', 'trackship_refire_enabled', 'wc_invoice_document_enabled', 'wc_invoice_note_enabled', 'wc_order_amendment_unpaid_rewrite_enabled', 'wc_order_amendment_write_enabled', 'wc_refund_credit_note_parity_enabled', 'wc_withdrawal_outcome_enabled', 'wms_despatch_date_enabled', 'wms_despatch_quantity_check_enabled', 'wms_merge_candidate_mode', 'wms_merge_hold_enabled', 'wms_mixed_warehouse_push_enabled', 'wms_refund_remainder_task_enabled', 'wms_sku_rename_remap_enabled', 'xero_credit_note_allocation_enabled', 'xero_credit_note_duplicate_check_enabled', 'xero_defer_unpaid_invoiced_revenue_enabled', 'xero_refund_payment_cash_out_date_enabled',
   ])
   for (const k of SYSTEM_SWITCH_KEYS) assert.equal(SENSITIVE_SETTING_KEYS.has(k), false)
 })
@@ -539,4 +539,89 @@ test('landed_cost_floor_cogs_enabled: an ADMIN switch, off by default, key equal
   assert.match(refused.err, /COGS/)
   const ok = await run('set', ['--key', def.key, '--value', 'true', ...SET, '--yes', '--confirm-admin'], fakeDb({ xero_sync_enabled: 'true', xero_transit_account: '1300', xero_cogs_account: '5000', xero_sync_cogs_journal: 'submitted' }))
   assert.equal(ok.code, 0, ok.err)
+})
+
+test('stock_adjustment_reason_cost_required: an ADMIN switch, off by default, key equal to the reader\'s, refused on while Xero sync is on and the inventory account is unmapped, and while no suitable reason exists (dry run and inside the write)', async () => {
+  const def = findSwitch('stock_adjustment_reason_cost_required')!
+  assert.ok(def)
+  assert.equal(def.adminOnly, true)
+  assert.equal(def.defaultValue, 'false')
+  assert.equal(def.turnOnInterlock, 'stock-adjustment-reasons')
+  const policy = await import('../lib/domain/inventory/stock-adjustment-policy')
+  assert.equal(def.key, policy.STOCK_ADJUSTMENT_REASON_COST_REQUIRED_KEY)
+  assert.equal(validateSwitchValue(def, 'TRUE').ok, false, 'the reader is === \'true\'')
+  assert.deepEqual(def.requiresMappedSettings?.settings.map((s) => s.key), ['xero_inventory_account'])
+  const state = { reasons: [{ name: 'Damaged', accountCode: '7000' }] as Array<{ name: string; accountCode: string | null }>, reasonsInside: [{ name: 'Damaged', accountCode: '7000' }] as Array<{ name: string; accountCode: string | null }> }
+  const withReasons = (f: ReturnType<typeof fakeDb>) => {
+    Object.assign(f.db, { adjustmentReason: { findMany: async () => state.reasons } })
+    const realTx = f.db.$transaction.bind(f.db)
+    ;(f.db as { $transaction: unknown }).$transaction = (fn: (tx: unknown) => Promise<unknown>) => realTx((tx) => fn({ ...tx, adjustmentReason: { findMany: async () => state.reasonsInside } }))
+    return f
+  }
+  const on = ['--key', def.key, '--value', 'true', ...SET, '--yes', '--confirm-admin']
+
+  const unmapped = withReasons(fakeDb({ xero_sync_enabled: 'true' }))
+  const r1 = await run('set', on, unmapped)
+  assert.equal(r1.code, 3)
+  assert.match(r1.err, /Inventory \(xero_inventory_account\) is not mapped/)
+  assert.equal(r1.f.settings.get(def.key), undefined)
+  assert.equal(r1.f.audits.length, 0)
+
+  state.reasons = []
+  const none = await run('set', on, withReasons(fakeDb({ xero_sync_enabled: 'false' })))
+  assert.equal(none.code, 3, 'no active reason: refused even with Xero sync off')
+  assert.match(none.err, /no active adjustment reason exists/)
+
+  state.reasons = [{ name: 'Free text', accountCode: ' ' }]
+  const noAccount = await run('set', on, withReasons(fakeDb({ xero_sync_enabled: 'true', xero_inventory_account: '630' })))
+  assert.equal(noAccount.code, 3)
+  assert.match(noAccount.err, /no active adjustment reason has an account/)
+  const syncOffNoAccount = await run('set', on, withReasons(fakeDb({ xero_sync_enabled: 'false' })))
+  assert.equal(syncOffNoAccount.code, 0, `with Xero sync off no account is needed, only an active reason (${syncOffNoAccount.err})`)
+
+  // The write transaction re-checks: a reason removed after the dry run still refuses.
+  state.reasons = [{ name: 'Damaged', accountCode: '7000' }]
+  state.reasonsInside = []
+  const inside = await run('set', on, withReasons(fakeDb({ xero_sync_enabled: 'true', xero_inventory_account: '630' })))
+  assert.equal(inside.code, 3, 'refused inside the write transaction')
+  assert.equal(inside.f.settings.get(def.key), undefined)
+
+  state.reasonsInside = [{ name: 'Damaged', accountCode: '7000' }]
+  const ok = await run('set', on, withReasons(fakeDb({ xero_sync_enabled: 'true', xero_inventory_account: '630' })))
+  assert.equal(ok.code, 0, ok.err)
+  assert.equal(ok.f.settings.get(def.key)!.value, 'true')
+
+  // Turning off, and a value already stored as 'true', are never refused (an installation that set it by SQL keeps working).
+  state.reasons = []; state.reasonsInside = []
+  const off = await run('set', ['--key', def.key, '--value', 'false', ...SET, '--yes', '--confirm-admin'], withReasons(fakeDb({ [def.key]: 'true', xero_sync_enabled: 'true' })))
+  assert.equal(off.code, 0, off.err)
+  const unchanged = await run('set', on, withReasons(fakeDb({ [def.key]: 'true', xero_sync_enabled: 'true', xero_inventory_account: '630' })))
+  assert.equal(unchanged.code, 0, 'the reason interlock does not re-run for an already-on switch')
+  assert.match(unchanged.out, /already true/)
+})
+
+test('stock_adjustment_release_reserved and mintsoft_align_up_requires_receipt_evidence: ADMIN switches, off by default, keys equal to the readers\', no turn-on prerequisite, turning off never refused', async () => {
+  const stock = await import('node:fs').then((fs) => fs.readFileSync('app/actions/stock.ts', 'utf8'))
+  assert.match(stock, /getSettingValue\('stock_adjustment_release_reserved'\)\) === 'true'/, 'the reader reads exactly true')
+  const evidence = await import('../lib/connectors/mintsoft/settings/align-up-receipt-evidence')
+  for (const [key, reader] of [['stock_adjustment_release_reserved', 'stock_adjustment_release_reserved'], ['mintsoft_align_up_requires_receipt_evidence', evidence.MINTSOFT_ALIGN_UP_RECEIPT_EVIDENCE_SETTING]] as const) {
+    const def = findSwitch(key)!
+    assert.ok(def, key)
+    assert.equal(def.key, reader)
+    assert.equal(def.adminOnly, true)
+    assert.equal(def.defaultValue, 'false')
+    assert.equal(def.requires, undefined)
+    assert.equal(def.requiresMappedSettings, undefined)
+    assert.equal(def.turnOnInterlock, undefined)
+    assert.equal(validateSwitchValue(def, 'TRUE').ok, false)
+    const adminless = await run('set', ['--key', key, '--value', 'true', ...SET, '--yes'], fakeDb())
+    assert.equal(adminless.code, 3, `${key}: --yes alone is refused`)
+    assert.equal(adminless.f.settings.get(key), undefined)
+    const on = await run('set', ['--key', key, '--value', 'true', ...SET, '--yes', '--confirm-admin'], fakeDb())
+    assert.equal(on.code, 0, `${key}: ${on.err}`)
+    assert.equal(on.f.settings.get(key)!.value, 'true')
+    assert.equal(on.f.audits.length, 1)
+    const off = await run('set', ['--key', key, '--value', 'false', ...SET, '--yes', '--confirm-admin'], fakeDb({ [key]: 'true' }))
+    assert.equal(off.code, 0, `${key}: ${off.err}`)
+  }
 })
