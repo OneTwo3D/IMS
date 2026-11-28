@@ -845,7 +845,7 @@ Helper plugin 1.3.0 does not feed exchange rates to any currency plugin on the s
 The **Sync Log** tab shows the last 100 synchronisation events. Each entry includes:
 
 - **Direction** — From store (import) or To store (push)
-- **Type** — SalesOrder, Product, or StockLevel (the entity the row is about)
+- **Type** — the entity the row is about: for example SalesOrder, Product, StockLevel (older rows and a few flows use ORDER or SalesOrderEdit)
 - **External ID** — the storefront entity ID
 - **Status** — PENDING (queued or in flight), SYNCED, FAILED, or QUARANTINED (a refund IMS parked on purpose until a person resolves it)
 - **Error** — details if the sync failed

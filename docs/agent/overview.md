@@ -179,7 +179,7 @@ WooCommerce → IMS (allocate stock, reserve) → Shipments (track)
   ↓
 Xero sub-ledger (batch sync daily) → Accounts (GL posting)
   ↓
-FX rates (daily via frankfurter.dev) → Multi-currency conversions
+FX rates (daily into `fx_rates`, per `fx_rate_source`: ECB via frankfurter.dev, or Aelia) → Multi-currency conversions
 ```
 
 ## Database
