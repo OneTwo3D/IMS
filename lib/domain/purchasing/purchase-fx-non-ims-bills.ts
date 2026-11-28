@@ -199,9 +199,13 @@ async function prepare(db: Db, options: { named: ReadonlySet<string>; readXero: 
       // #1164 LOW-5: a confirmed bill is listed again when its confirmation does not hold NOW (judged as the reconciliation judges it, whether or not a
       // reconciliation has marked it yet), or when it is named (a re-confirmation, e.g. after an edit of the Xero bill).
       const standing = already ? nonImsApprovalStanding(already, invoice, stockUnits, connectedTenantId) : null
-      if (already && standing?.kind !== 'stale' && !named) continue
+      // #1167 MED-1: a HELD confirmation (no Xero connection) is listed too, so it is visible, but it cannot be confirmed again until the organisation can be
+      // compared (it catches up by itself once the same one is connected).
+      if (already && standing?.kind === 'ok' && !named) continue
       const reconfirmation = already
-        ? (standing?.kind === 'stale'
+        ? (standing?.kind === 'held'
+          ? `confirmed on ${already.approvedAt.toISOString().slice(0, 10)}; held: no Xero connection (${standing.reason})`
+          : standing?.kind === 'stale'
           ? `confirmed on ${already.approvedAt.toISOString().slice(0, 10)}, now stale: ${standing.reason}; confirming again replaces the basis`
           : `confirmed on ${already.approvedAt.toISOString().slice(0, 10)}; confirming again replaces the basis (after an edit of the Xero bill)`)
         : null
@@ -240,7 +244,8 @@ async function prepare(db: Db, options: { named: ReadonlySet<string>; readXero: 
         stockUnits: Object.fromEntries(invoice.lines.flatMap((line) => (line.poLineId && stockUnits.has(line.poLineId) ? [[line.poLineId, stockUnits.get(line.poLineId)!.toString()]] : []))),
         billFingerprint: nonImsBillFingerprint(invoice),
       }
-      if (!invoice.accountingInvoiceId) candidate.problem = 'not linked to a Xero bill: there is no basis for a journal'
+      if (standing?.kind === 'held') candidate.problem = 'held: no Xero connection; not re-confirmable until a Xero organisation is connected (the journal catches up once the same one is)'
+      else if (!invoice.accountingInvoiceId) candidate.problem = 'not linked to a Xero bill: there is no basis for a journal'
       else if (!transitAccount) candidate.problem = 'the Stock in Transit account is not mapped'
       else if (options.readXero && stopped) candidate.problem = `not read: ${stopped}`
       else if (options.readXero && reads >= options.maxReads) candidate.problem = `not read: this run's cap of ${options.maxReads} Xero reads was reached (--max-reads); name the bills, or run again later`
