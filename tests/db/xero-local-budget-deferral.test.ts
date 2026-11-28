@@ -134,3 +134,21 @@ for (const outbox of ['true', 'false']) {
     })
   }
 }
+
+test('FOLLOW-UP failure that carries the budget refusal spends no retry (and is never FAILED at the last one); an ordinary follow-up failure still does', { skip }, async (t) => {
+  const d = await deps()
+  const tag = tagOf()
+  t.after(() => cleanup(d, tag))
+  const { describeLocalBudgetRefusal } = await import('../../lib/connectors/xero/deferral.ts')
+  const budgetError = new Error(`Xero day budget exhausted. ${describeLocalBudgetRefusal('day', WAIT_MS)}`)
+  const row = await seed(d, `${tag}-fu`, 'taxrate')
+  await d.db.accountingSyncLog.update({ where: { id: row.id }, data: { status: 'SYNCED', retryCount: 4, attemptRevision: 1 } })
+  const budget = await d.processor.markSyncLogForFollowUpRetry({ id: row.id, attemptRevision: 1 }, { retryCount: 4 }, budgetError)
+  assert.deepEqual([budget.finalFailure, budget.deferredMs != null && budget.deferredMs >= WAIT_MS], [false, true])
+  assert.deepEqual(await syncOf(d, row.id).then((r) => [r?.status, r?.retryCount]), ['PENDING', 4], 'not FAILED, no retry spent, even at the last one')
+  // CONTROL: the same call with an ordinary error spends the retry and fails the row.
+  await d.db.accountingSyncLog.update({ where: { id: row.id }, data: { status: 'SYNCED', retryCount: 4 } })
+  const ordinary = await d.processor.markSyncLogForFollowUpRetry({ id: row.id, attemptRevision: 1 }, { retryCount: 4 }, new Error('boom'))
+  assert.equal(ordinary.finalFailure, true)
+  assert.deepEqual(await syncOf(d, row.id).then((r) => [r?.status, r?.retryCount]), ['FAILED', 5])
+})

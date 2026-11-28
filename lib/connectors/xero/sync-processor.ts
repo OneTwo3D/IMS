@@ -1084,20 +1084,11 @@ export async function markSyncLogForFollowUpRetry(
   const errorMessage = `Xero follow-up work failed after connector post: ${String(error)}`
   const conn = client ?? db
   // IMS's own call budget (day or minute cap) refused the follow-up's Xero call: nothing is wrong with the work, so no retry is spent and the
-  // row is not failed; it is offered again once calls fall out of the window. Xero's own 429 keeps its existing handling.
+  // row is not failed. The row has no gate column, so the WAIT is the outbox job's (deferred by `deferredMs`); on the direct runner the row is
+  // offered again at the next tick, which costs no Xero call (the budget refuses locally). Xero's own 429 keeps its existing handling.
   const budgetDeferMs = localBudgetDeferMs(String(error))
-  if (budgetDeferMs != null) {
-    const deferred = await conn.accountingSyncLog.updateMany({
-      where: { id: attempt.id, attemptRevision: attempt.attemptRevision, retryCount: entry.retryCount },
-      // Same write as the spending path below minus the retry: the row has no gate column, so the WAIT is the outbox job's (deferred by `deferredMs`);
-      // on the direct runner the row is offered again at the next tick, which costs no Xero call (the budget refuses locally).
-      data: { status: 'PENDING', errorMessage, processingStartedAt: null },
-    })
-    if (deferred.count > 0) return { errorMessage, finalFailure: false, deferredMs: budgetDeferMs }
-    // Lost the race: another worker moved the row. Fall through to the ordinary re-read below via the normal path.
-  }
-  const retryCount = entry.retryCount + 1
-  const finalFailure = retryCount >= MAX_RETRIES
+  const retryCount = budgetDeferMs != null ? entry.retryCount : entry.retryCount + 1
+  const finalFailure = budgetDeferMs == null && retryCount >= MAX_RETRIES
   // Optimistic-concurrency guard: only advance from the retryCount we observed.
   // Two workers handling the same sync log (e.g. duplicate outbox jobs pointing
   // at one AccountingSyncLog) must not both increment from a stale value and
@@ -1117,7 +1108,7 @@ export async function markSyncLogForFollowUpRetry(
     },
   })
   if (updated.count > 0) {
-    return { errorMessage, finalFailure }
+    return { errorMessage, finalFailure, ...(budgetDeferMs != null ? { deferredMs: budgetDeferMs } : {}) }
   }
   // Lost the race: another worker already advanced this row. Reflect the
   // PERSISTED state so the caller's outbox decision (permanent vs retry) acts on
