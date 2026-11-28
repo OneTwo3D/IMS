@@ -22,6 +22,7 @@
  */
 import type { Prisma } from '@/app/generated/prisma/client'
 import { RESERVATION_RELEASING_SHIPMENT_STATUS, residualAllocationRows } from '@/lib/domain/inventory/reservation-residual'
+import { wmsUnsellableReturnRefusal, type WmsWriteOffRoute } from '@/lib/domain/inventory/wms-unsellable-advice'
 
 export const RETURN_CONDITION_CHECK_SETTING_KEY = 'return_condition_check_enabled'
 
@@ -163,7 +164,7 @@ export async function loadQuarantineQtyByProduct(
 }
 
 export const QUARANTINE_IN_TRANSIT_EXPECTED_REFUSAL =
-  'Returns in transit are on, so this refund restocks nothing now: the units come back when the parcel is restocked from the returns inbox, and that is where their condition is asked. Choose an ordinary return warehouse (not a quarantine one). Nothing was recorded.'
+  'Returns in transit are on, so this refund restocks nothing now: the units come back when the parcel is restocked from the returns inbox, and that is where their condition is asked. A returned parcel is at the 3PL, so an unsellable unit is never quarantined: it is restocked as Sellable when it arrives and then written off. Choose an ordinary return warehouse (not a quarantine one). Nothing was recorded.'
 
 export const QUARANTINE_PRODUCTION_REFUSAL =
   'That warehouse is a quarantine warehouse: its stock is not sellable and cannot be used in a production order. Transfer the units to a sellable warehouse first if they can be used.'
@@ -189,16 +190,19 @@ export async function isQuarantineTargetWarehouse(client: WarehouseTypeReader, w
  * (ALIGN_TO_WMS) books the warehouse system's count into the bound warehouse. So with the switch on an UNSELLABLE returns-inbox restock
  * is always refused.
  */
-export const WMS_UNSELLABLE_RETURN_REFUSAL =
-  'This return is at the 3PL warehouse, and quarantine is kept in IMS only: the warehouse system would still count the unit, and stock alignment would book it into the bound warehouse a second time. Restock it as Sellable into the bound warehouse instead (that also clears a return in transit), ask the 3PL to write it off or hold it out of sellable stock, then write it off in IMS with a stock adjustment in that warehouse (a reason mapped to your write-off account). Nothing was recorded.'
 
-/** The rule for the warehouse-system (WMS) returns-inbox restock: the general rule, except that an unsellable unit held at the 3PL is never quarantined. Pure. */
+/**
+ * The rule for the warehouse-system (WMS) returns-inbox restock: the general rule, except that an unsellable unit held at the 3PL is never
+ * quarantined; the refusal gives the write-off route of the warehouse the return arrived at. Pure.
+ */
 export function wmsReturnRestockRefusal(params: {
   enabled: boolean
   condition: ReturnCondition | null
   warehouse: { code: string; type: string | null }
+  /** The write-off route of the warehouse the return arrived at (loadWmsWriteOffRoute). */
+  route?: WmsWriteOffRoute
 }): string | null {
-  if (params.enabled && params.condition === 'UNSELLABLE') return WMS_UNSELLABLE_RETURN_REFUSAL
+  if (params.enabled && params.condition === 'UNSELLABLE') return wmsUnsellableReturnRefusal(params.route ?? { mode: 'UNKNOWN' })
   return returnConditionRestockRefusal(params)
 }
 
@@ -330,8 +334,7 @@ export async function quarantineSwitchOnRefusal(
   return `return_condition_check_enabled cannot be turned on while a quarantine warehouse still looks sellable: ${issues.map((i) => `${i.code} (${i.problems.join('; ')})`).join(' | ')}. Fix them (Inventory Settings, Warehouses; release or move the work) and try again. Nothing was written.`
 }
 
-export const WMS_UNSELLABLE_REFUND_REFUSAL =
-  'These units shipped from a 3PL warehouse (bound to the warehouse system), so they go back to the 3PL, and quarantine is kept in IMS only: the warehouse system would count them again and stock alignment would book them into the bound warehouse a second time. Record the refund as Sellable into that warehouse, ask the 3PL to write the unit off or hold it out of sellable stock, then write it off in IMS with a stock adjustment there (a reason mapped to your write-off account); or record the refund with no stock return. Nothing was recorded.'
+export { wmsUnsellableRefundRefusal, wmsUnsellableReturnRefusal, wmsUnsellableWriteOffAdvice, type WmsStockMode, type WmsWriteOffRoute } from '@/lib/domain/inventory/wms-unsellable-advice'
 
 /**
  * The refund dialog's counterpart of the returns-inbox rule: units that shipped from a warehouse bound to a warehouse system (or an
@@ -342,17 +345,19 @@ export const WMS_UNSELLABLE_REFUND_REFUSAL =
 export async function refundReturnsToWmsWarehouse(
   client: Pick<Prisma.TransactionClient, 'wmsOrderPushLink' | 'shipment'>,
   params: { orderId: string; lineIds: readonly string[] | null },
-): Promise<boolean> {
-  const link = await client.wmsOrderPushLink.findFirst({ where: { orderId: params.orderId, state: 'SYNCED' }, select: { id: true } })
-  if (link) return true
-  const bound = await client.shipment.findFirst({
+): Promise<{ warehouseIds: string[] } | null> {
+  // The bound warehouses the refunded units shipped from decide the write-off route (loadWmsWriteOffRoute); a SYNCED push link with no bound
+  // shipment refuses too, with no warehouse to read a route from (UNKNOWN: both routes are given).
+  const bound = await client.shipment.findMany({
     where: {
       orderId: params.orderId,
       status: { not: 'PENDING' },
       warehouse: { wmsBindings: { some: {} } },
       ...(params.lineIds ? { lines: { some: { lineId: { in: [...params.lineIds] } } } } : {}),
     },
-    select: { id: true },
+    select: { warehouseId: true },
   })
-  return bound != null
+  if (bound.length > 0) return { warehouseIds: [...new Set(bound.map((s) => s.warehouseId))] }
+  const link = await client.wmsOrderPushLink.findFirst({ where: { orderId: params.orderId, state: 'SYNCED' }, select: { id: true } })
+  return link ? { warehouseIds: [] } : null
 }

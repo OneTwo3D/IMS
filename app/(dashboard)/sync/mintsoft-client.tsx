@@ -46,6 +46,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@
 import { MintsoftCourierMapSection, MintsoftOrderDispatchSection, MintsoftSendIossNumberSection } from './mintsoft-courier-map'
 import { Textarea } from '@/components/ui/textarea'
 import { MergeCandidatesSection } from './merge-candidates-section'
+import { wmsUnsellableWriteOffAdvice } from '@/lib/domain/inventory/wms-unsellable-advice'
 
 type Props = {
   data: MintsoftDashboardData
@@ -186,6 +187,8 @@ export function MintsoftClient({ data, configured }: Props) {
   const [reportRecipients, setReportRecipients] = useState('')
   const [restockItemId, setRestockItemId] = useState('')
   const [restockItemSku, setRestockItemSku] = useState('')
+  // The warehouse the return arrived at (its binding decides how an unsellable unit is written off).
+  const [restockItemWarehouseCode, setRestockItemWarehouseCode] = useState<string | null>(null)
   const [restockWarehouseId, setRestockWarehouseId] = useState(defaultWarehouseId)
   const [restockReasonId, setRestockReasonId] = useState('')
   // Switch return_condition_check_enabled: the operator states the returned items' condition; unsellable goes to a quarantine warehouse.
@@ -524,6 +527,7 @@ export function MintsoftClient({ data, configured }: Props) {
   function handleOpenRestockDialog(item: { id: string; sku: string | null; warehouseCode: string | null }) {
     setRestockItemId(item.id)
     setRestockItemSku(item.sku ?? '')
+    setRestockItemWarehouseCode(item.warehouseCode)
     const matchingWarehouse = data.warehouses.find((warehouse) => warehouse.code === item.warehouseCode && warehouse.active)
     setRestockWarehouseId(matchingWarehouse?.id ?? data.warehouses.find((warehouse) => warehouse.active)?.id ?? '')
     setRestockCondition('')
@@ -1441,7 +1445,7 @@ export function MintsoftClient({ data, configured }: Props) {
               </Select>
               <p className="text-xs text-muted-foreground">
                 {restockCondition === 'UNSELLABLE'
-                  ? 'An unsellable unit at the Mintsoft warehouse cannot be quarantined in IMS (quarantine is IMS-only, and Mintsoft would still count it). Restock it as Sellable into the bound warehouse (this clears a return in transit), ask the warehouse to write it off or hold it out of sellable stock, then write it off with a stock adjustment.'
+                  ? `An unsellable unit at the Mintsoft warehouse cannot be quarantined in IMS (quarantine is IMS-only, and Mintsoft would still count it). Restock it as Sellable into the bound warehouse (this clears a return in transit). ${wmsUnsellableWriteOffAdvice((restockItemWarehouseCode ? data.writeOffRouteByWarehouseCode[restockItemWarehouseCode] : undefined) ?? { mode: 'UNKNOWN' })}`
                   : 'Quarantine is kept in IMS only, so a return held at the Mintsoft warehouse is restocked here only when it is sellable.'}
               </p>
             </div>

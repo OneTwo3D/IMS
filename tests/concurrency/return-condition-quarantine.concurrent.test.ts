@@ -71,6 +71,28 @@ async function setSwitch(on: boolean) {
   await db.setting.upsert({ where: { key: SWITCH }, create: { key: SWITCH, value: on ? 'true' : 'false' }, update: { value: on ? 'true' : 'false' } })
 }
 
+/** The warehouse-system plugin and its stock-sync cron switched on for this test (align-down runs only from that cron), restored afterwards. */
+async function enableWmsPlugin(t: { after: (fn: () => Promise<void>) => void }) {
+  const { db } = await loadDeps()
+  for (const key of ['plugin_mintsoft_enabled', 'cron_mintsoft_stock_sync_enabled']) {
+    const saved = await db.setting.findUnique({ where: { key } })
+    await db.setting.upsert({ where: { key }, create: { key, value: 'true' }, update: { value: 'true' } })
+    t.after(async () => {
+      await db.setting.deleteMany({ where: { key } })
+      if (saved) await db.setting.create({ data: { key, value: saved.value } })
+    })
+  }
+}
+
+/** A binding whose align-down can run: confirmed, an active reason with an account, thresholds. */
+async function readyAlignDown(w: World, bindingId: string) {
+  const { db } = await loadDeps()
+  const reason = await db.adjustmentReason.create({ data: { name: `QC align-down ${w.tag}`, accountCode: '5150', active: true }, select: { id: true } })
+  w.reasonIds.push(reason.id)
+  await db.externalWmsBinding.update({ where: { id: bindingId }, data: { alignmentConfirmedAt: new Date(), alignDownReasonId: reason.id, discrepancyThresholds: { absoluteDelta: 5 } } })
+  return reason.id
+}
+
 /** A product shipped on `orders` orders (2 units each, at 45 a unit), a sellable warehouse and a quarantine warehouse. */
 async function seedWorld(options: { orders?: number; journaled?: boolean } = {}) {
   const { db } = await loadDeps()
@@ -373,23 +395,69 @@ test('Mintsoft returns inbox: an unsellable unit held at the 3PL is never quaran
   t.after(() => w.teardown())
   const { db, mintsoft, quarantine } = await loadDeps()
   await setSwitch(true)
+  await enableWmsPlugin(t)
+  const { loadWmsWriteOffRoute } = await import('@/lib/domain/inventory/wms-write-off-route')
   // The bound warehouse is aligned to Mintsoft (Mintsoft is the stock master): Mintsoft's count of the returned unit is booked into it.
   const connection = await db.wmsConnection.create({ data: { connector: 'mintsoft', label: `qc-${w.tag}` }, select: { id: true } })
-  await db.externalWmsBinding.create({ data: { connectionId: connection.id, warehouseId: w.main.id, connector: 'mintsoft', externalWarehouseId: `qc-ext-${w.tag}`, stockSyncMode: 'ALIGN_TO_WMS', stockMasterSystem: 'WMS' } })
+  const binding = await db.externalWmsBinding.create({ data: { connectionId: connection.id, warehouseId: w.main.id, connector: 'mintsoft', externalWarehouseId: `qc-ext-${w.tag}`, stockSyncMode: 'ALIGN_TO_WMS', stockMasterSystem: 'WMS' }, select: { id: true } })
   // A costed unit elsewhere, so the unpriced inbox row is valued at an average (orderless return).
   await db.costLayer.create({ data: { productId: w.product.id, warehouseId: w.main.id, receivedQty: '1', remainingQty: '1', unitCostBase: '45' } })
   await db.stockLevel.update({ where: { productId_warehouseId: { productId: w.product.id, warehouseId: w.main.id } }, data: { quantity: '1' } })
-  const inbox = await db.wmsReturnsInbox.create({ data: { connector: 'mintsoft', externalReturnId: `QC-RET-${w.tag}`, productId: w.product.id, sku: w.product.sku, qty: 1, status: 'NEW' } as never, select: { id: true } })
+  // The poller sets the row's warehouse from the binding; that binding picks the write-off route in the refusal.
+  const inbox = await db.wmsReturnsInbox.create({ data: { connector: 'mintsoft', externalReturnId: `QC-RET-${w.tag}`, productId: w.product.id, sku: w.product.sku, qty: 1, status: 'NEW', warehouseId: w.main.id } as never, select: { id: true } })
   w.inboxIds.push(inbox.id)
+  const refusalNow = async () => (await mintsoft.restockMintsoftReturnInboxItem({ id: inbox.id, warehouseId: w.main.id, condition: 'UNSELLABLE' })).error
 
   const noCondition = await mintsoft.restockMintsoftReturnInboxItem({ id: inbox.id, warehouseId: w.main.id })
   assert.equal(noCondition.success, false)
   assert.match(noCondition.error ?? '', /condition/)
+
+  // Aligned, but align-down cannot run (the fixture's binding is a dry run with no reason): the IMS adjustment route, naming why.
+  assert.equal(await refusalNow(), quarantine.wmsUnsellableReturnRefusal({ mode: 'ALIGNED_MANUAL', why: 'its alignment is not confirmed yet (dry run)' }))
+  await db.externalWmsBinding.update({ where: { id: binding.id }, data: { alignmentConfirmedAt: new Date() } })
+  assert.equal(await refusalNow(), quarantine.wmsUnsellableReturnRefusal({ mode: 'ALIGNED_MANUAL', why: 'it has no align-down reason' }))
+  const reasonId = await readyAlignDown(w, binding.id)
+  await db.adjustmentReason.update({ where: { id: reasonId }, data: { active: false } })
+  assert.equal(await refusalNow(), quarantine.wmsUnsellableReturnRefusal({ mode: 'ALIGNED_MANUAL', why: 'its align-down reason is inactive' }))
+  await db.adjustmentReason.update({ where: { id: reasonId }, data: { active: true } })
+
+  // Align-down can run: the 3PL writes it off and a later sync books it; no IMS adjustment.
   for (const warehouseId of [w.qar.id, w.main.id]) {
     const unsellable = await mintsoft.restockMintsoftReturnInboxItem({ id: inbox.id, warehouseId, condition: 'UNSELLABLE' })
     assert.equal(unsellable.success, false, 'an unsellable unit at the 3PL is refused into any warehouse')
-    assert.equal(unsellable.error, quarantine.WMS_UNSELLABLE_RETURN_REFUSAL)
+    assert.equal(unsellable.error, quarantine.wmsUnsellableReturnRefusal({ mode: 'ALIGNED' }))
+    assert.match(unsellable.error ?? '', /Do not also make a stock adjustment in IMS/)
   }
+  // The dialog's hint: the dashboard hands it the same route the refusal uses, for the bound warehouse's code.
+  const serverRoute = await loadWmsWriteOffRoute(db, [w.main.id])
+  assert.deepEqual(serverRoute, { mode: 'ALIGNED' })
+  assert.equal(await refusalNow(), quarantine.wmsUnsellableReturnRefusal(serverRoute))
+  const dashboard = await mintsoft.getMintsoftDashboardData()
+  assert.deepEqual(dashboard.writeOffRouteByWarehouseCode[w.main.code], serverRoute, 'dialog = server')
+  await setSwitch(false)
+  assert.deepEqual((await mintsoft.getMintsoftDashboardData()).writeOffRouteByWarehouseCode, {}, 'switch off: no route work on the dashboard')
+  await setSwitch(true)
+
+  // The stock-sync cron is off: align-down never runs, so the IMS adjustment route.
+  await db.setting.update({ where: { key: 'cron_mintsoft_stock_sync_enabled' }, data: { value: 'false' } })
+  assert.equal(await refusalNow(), quarantine.wmsUnsellableReturnRefusal({ mode: 'ALIGNED_MANUAL', why: 'its stock sync is not scheduled' }))
+  assert.deepEqual((await mintsoft.getMintsoftDashboardData()).writeOffRouteByWarehouseCode[w.main.code], { mode: 'ALIGNED_MANUAL', why: 'its stock sync is not scheduled' })
+  await db.setting.update({ where: { key: 'cron_mintsoft_stock_sync_enabled' }, data: { value: 'true' } })
+
+  // Nothing aligns: an inactive binding, an inactive connection, notification-only or disabled sync.
+  await db.externalWmsBinding.update({ where: { id: binding.id }, data: { active: false } })
+  assert.equal(await refusalNow(), quarantine.wmsUnsellableReturnRefusal({ mode: 'IMS_MASTER' }))
+  await db.externalWmsBinding.update({ where: { id: binding.id }, data: { active: true } })
+  await db.wmsConnection.update({ where: { id: connection.id }, data: { active: false } })
+  assert.equal(await refusalNow(), quarantine.wmsUnsellableReturnRefusal({ mode: 'IMS_MASTER' }))
+  await db.wmsConnection.update({ where: { id: connection.id }, data: { active: true } })
+  for (const stockSyncMode of ['NOTIFICATION_ONLY', 'DISABLED'] as const) {
+    await db.externalWmsBinding.update({ where: { id: binding.id }, data: { stockSyncMode, stockMasterSystem: 'IMS' } })
+    assert.equal(await refusalNow(), quarantine.wmsUnsellableReturnRefusal({ mode: 'IMS_MASTER' }), stockSyncMode)
+  }
+  // A row with no warehouse (no binding resolved when it was polled): both routes.
+  await db.wmsReturnsInbox.update({ where: { id: inbox.id }, data: { warehouseId: null } })
+  assert.equal(await refusalNow(), quarantine.wmsUnsellableReturnRefusal({ mode: 'UNKNOWN' }))
   assert.equal((await db.wmsReturnsInbox.findUniqueOrThrow({ where: { id: inbox.id }, select: { status: true } })).status, 'NEW', 'refused: nothing restocked')
   assert.deepEqual(await stockAt(w, w.qar.id), { qty: 0, reserved: 0, layers: [] }, 'nothing entered quarantine, so Mintsoft\'s count of the unit (aligned into the bound warehouse) is the only one')
   assert.equal(await db.stockMovement.count({ where: { productId: w.product.id, toWarehouseId: w.qar.id } }), 0)
@@ -420,20 +488,39 @@ test('refund dialog: an unsellable return of units shipped from a 3PL (WMS-bound
     assert.deepEqual(await stockAt(w, w.qar.id), { qty: 0, reserved: 0, layers: [] }, 'refused: nothing in quarantine')
   }
 
-  // The order shipped from MAIN, and MAIN is bound to the warehouse system (aligned to it).
+  await enableWmsPlugin(t)
+  // The order shipped from MAIN, and MAIN is bound to the warehouse system (aligned to it, align-down ready).
   const connection = await db.wmsConnection.create({ data: { connector: 'mintsoft', label: `qc-${w.tag}` }, select: { id: true } })
   const binding = await db.externalWmsBinding.create({ data: { connectionId: connection.id, warehouseId: w.main.id, connector: 'mintsoft', externalWarehouseId: `qc-ext-${w.tag}`, stockSyncMode: 'ALIGN_TO_WMS', stockMasterSystem: 'WMS' }, select: { id: true } })
+  await readyAlignDown(w, binding.id)
   const bound = await sales.createRefund(r.orderId, r.lines, 'qc return', w.qar.id, { returnCondition: 'UNSELLABLE' })
   assert.equal(bound.success, false)
-  assert.equal(bound.error, quarantine.WMS_UNSELLABLE_REFUND_REFUSAL)
+  assert.equal(bound.error, quarantine.wmsUnsellableRefundRefusal({ mode: 'ALIGNED' }), 'aligned binding: the 3PL writes it off and align-down books it')
   await nothingWritten()
+  // The same binding in notification-only mode (IMS is the stock master): the IMS stock adjustment route.
+  await db.externalWmsBinding.update({ where: { id: binding.id }, data: { stockSyncMode: 'NOTIFICATION_ONLY', stockMasterSystem: 'IMS' } })
+  const notification = await sales.createRefund(r.orderId, r.lines, 'qc return', w.qar.id, { returnCondition: 'UNSELLABLE' })
+  assert.equal(notification.error, quarantine.wmsUnsellableRefundRefusal({ mode: 'IMS_MASTER' }))
+  await nothingWritten()
+  // The refunded units shipped from two bound warehouses that disagree: both routes.
+  await db.externalWmsBinding.update({ where: { id: binding.id }, data: { stockSyncMode: 'ALIGN_TO_WMS', stockMasterSystem: 'WMS' } })
+  const other = await db.warehouse.create({ data: { code: `QO${w.tag.slice(0, 8)}`, name: `qc other ${w.tag}` }, select: { id: true } })
+  const otherBinding = await db.externalWmsBinding.create({ data: { connectionId: connection.id, warehouseId: other.id, connector: 'mintsoft', externalWarehouseId: `qc-ext2-${w.tag}`, stockSyncMode: 'NOTIFICATION_ONLY' }, select: { id: true } })
+  const otherShipment = await db.shipment.create({ data: { orderId: r.orderId, warehouseId: other.id, status: 'SHIPPED', shippedAt: new Date(), lines: { create: [{ lineId: w.orders[0].lineId, productId: w.product.id, qty: '0' }] } }, select: { id: true } })
+  const disagreeing = await sales.createRefund(r.orderId, r.lines, 'qc return', w.qar.id, { returnCondition: 'UNSELLABLE' })
+  assert.equal(disagreeing.error, quarantine.wmsUnsellableRefundRefusal({ mode: 'UNKNOWN' }))
+  await nothingWritten()
+  await db.shipmentLine.deleteMany({ where: { shipmentId: otherShipment.id } })
+  await db.shipment.delete({ where: { id: otherShipment.id } })
+  await db.externalWmsBinding.delete({ where: { id: otherBinding.id } })
+  await db.warehouse.delete({ where: { id: other.id } })
 
   // No binding, but the warehouse system holds the order (a SYNCED push link): refused the same way.
   await db.externalWmsBinding.delete({ where: { id: binding.id } })
   await db.wmsOrderPushLink.create({ data: { orderId: r.orderId, connector: 'mintsoft', state: 'SYNCED' } })
   const pushed = await sales.createRefund(r.orderId, r.lines, 'qc return', w.qar.id, { returnCondition: 'UNSELLABLE' })
   assert.equal(pushed.success, false)
-  assert.equal(pushed.error, quarantine.WMS_UNSELLABLE_REFUND_REFUSAL)
+  assert.equal(pushed.error, quarantine.wmsUnsellableRefundRefusal({ mode: 'UNKNOWN' }), 'no bound shipment: both routes are given')
   await nothingWritten()
 
   // Control: neither, the same unsellable return is quarantined.
