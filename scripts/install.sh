@@ -10950,18 +10950,33 @@ CRON_ENV_FILE="${APP_DIR}/.env"
 CRON_LOG_FILE="${LOG_DIR}/cron.log"
 CRON_BASE="http://localhost:${APP_PORT}/api/cron"
 
-# schedule|slug|label pairs for the bootstrap set
+# schedule|slug|label pairs for the bootstrap set. Each schedule is the job's registry default
+# (defaultSchedule in lib/cron-jobs/*.ts), so the first Save & Apply in the scheduler writes the same
+# times; tests/security/install-cron-secret.test.ts holds them equal. The success summary below is
+# printed from this same array.
 CRON_JOBS=(
   "30 0 * * *|xero-chart-sync|Xero Chart of Accounts Refresh"
   "0 1 * * *|account-balance-snapshot|Account Balance Snapshot"
-  "0 6 * * *|fx-rates|FX Rate Update"
+  "0 7 * * *|fx-rates|FX Rate Update"
   "0 3 * * *|activity-cleanup|Activity Log Cleanup"
-  "0 2 * * *|backup|Database Backup"
+  "0 1 * * *|backup|Database Backup"
   "0 * * * *|wc-reconcile|WooCommerce Reconciliation"
   "*/15 * * * *|delivery-status|Delivery Status Check"
   "*/15 * * * *|refund-reservation-release|Refund Reservation Release"
   "*/15 * * * *|wc-withdrawal-sweep|WooCommerce Withdrawal Sweep"
 )
+
+# A cron schedule in words, for the summary: "HH:MM daily", "hourly", "every N min", or the expression.
+describe_cron_schedule() {
+  local sched="$1" min hour dom mon dow
+  read -r min hour dom mon dow <<< "${sched}"
+  if [[ "${dom} ${mon} ${dow}" == "* * *" ]]; then
+    if [[ "${min}" =~ ^[0-9]+$ && "${hour}" =~ ^[0-9]+$ ]]; then printf '%02d:%02d daily' "${hour}" "${min}"; return; fi
+    if [[ "${min}" == "0" && "${hour}" == "*" ]]; then printf 'hourly'; return; fi
+    if [[ "${min}" =~ ^\*/([0-9]+)$ && "${hour}" == "*" ]]; then printf 'every %s min' "${BASH_REMATCH[1]}"; return; fi
+  fi
+  printf '%s' "${sched}"
+}
 
 # Build the fresh managed block into a temp file (cleaned up on ANY exit —
 # Codex r9: the temp file must not leak if the pipeline below fails).
@@ -11192,11 +11207,11 @@ die_if_legacy_cron_lines_remain "this installer"
 
 if [[ "${CRON_BOOTSTRAP_WRITTEN}" == "yes" ]]; then
   success "Cron jobs configured:"
-  echo "  - 02:00 Daily scheduled backup (if enabled in settings)"
-  echo "  - 03:00 Activity log cleanup"
-  echo "  - 04:00 WooCommerce backup reconciliation and stock retry drain"
-  echo "  - Every 15 min Delivery status polling"
-  echo "  - 06:00 FX rate update"
+  # Printed from CRON_JOBS itself, so the summary cannot drift from what was written.
+  for job in "${CRON_JOBS[@]}"; do
+    IFS='|' read -r sched slug label <<< "$job"
+    echo "  - $(describe_cron_schedule "${sched}"): ${label} (${slug})"
+  done
 else
   success "Cron jobs left to the application's own scheduler settings."
 fi

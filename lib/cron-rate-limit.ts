@@ -258,15 +258,19 @@ export type CronRateLimitOptions = {
  *   an incident consumed the legitimate caller's quota.
  * - Every job's limit is derived from its registry schedule (cronRateLimitFor) and always leaves
  *   headroom above exact cadence: sub-hourly jobs get their runs per hour plus spare, hourly and
- *   N-hourly/daily jobs get three runs per cadence window (scheduled run plus two for retries and jitter). Do not pass a per-route `max`/`windowMs`
+ *   N-hourly jobs get three runs per cadence window, and a daily job three runs per 24 h window (cronRateLimitForCadence:
+ *   the scheduled run plus two for retries and jitter). A Xero-live job (XERO_LIVE_CRON_JOBS) also spends its rolling daily
+ *   run budget in production (cronXeroDailyBudget), whatever its per-window limit. Do not pass a per-route `max`/`windowMs`
  *   equal to the cadence (a 5-minute cron at exactly 12/hour, an hourly cron at exactly 1/hour);
  *   jitter, retries, and boundary timing will deny legitimate scheduled runs. Routes should not
  *   override at all; the census test in tests/security/cron-rate-limit.test.ts enforces that.
  * - Fail-open on backend error is DELIBERATE here (checkRateLimit is called
  *   without `failClosed`): cron routes are already gated by CRON_SECRET, so a
  *   rate-limit backend outage must not block legitimate scheduled jobs. This is
- *   the opposite trade-off from the auth endpoints (login/reset/TOTP/step-up),
- *   which fail closed because they are the primary brute-force barrier.
+ *   the opposite trade-off from the rate-limited auth endpoints (password reset,
+ *   TOTP, step-up), which fail closed because they are the primary brute-force
+ *   barrier. Password login is not throttled here at all: it is DB-backed
+ *   (lib/auth/login-throttle.ts) and survives a restart.
  * - `E2E_CRON_RATE_LIMIT_MAX` is a test/CI-only override for the full-chain
  *   e2e rig, where one suite run legitimately triggers a batch cron many times
  *   (e.g. OC-08 and X-01 both drive accounting-daily-batch). It is guarded
@@ -324,8 +328,8 @@ export function cronRateLimitGlobalKey(jobName: string): string {
  * budget — 20 live sweeps a day, tenant-wide, whatever the caller does.
  *
  * Consequence for the rig, which is the intended trade: X-04 spends 3 of the 20 per run, so ~6 runs a day
- * before it 429s. The backend is memory-backed, so restarting ims-e2e-dev.service clears it (the same
- * restart that clears the login limiter).
+ * before it 429s. With the default memory backend, restarting ims-e2e-dev.service clears it (a restart does NOT clear
+ * the password-login throttle, which is kept in the database: lib/auth/login-throttle.ts).
  */
 export const E2E_GLOBAL_CAP_WINDOW_MS = 24 * 60 * 60_000
 

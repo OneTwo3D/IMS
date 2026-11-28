@@ -1,0 +1,4 @@
+### Ops scripts match the host: stage unit, installer cron summary, rate-limit comments (ops)
+- `deploy/systemd/ims-stage-dev.service` is now the unit the stage host actually runs (hardened `next dev` as `ims` from `/opt/ims/onetwo3d-ims`), and `scripts/install-stage-dev-service.sh` installs it from the checkout it is run from instead of a directory that no longer exists.
+- `scripts/install.sh` writes its bootstrap cron jobs at the registry defaults (backup 01:00, FX rates 07:00) and prints the "Cron jobs configured" summary from the same list (it now names every job written, with wc-reconcile hourly). An existing install's crontab is unchanged until `install.sh` is re-run or the Scheduler is saved.
+- Comment fixes in `lib/cron-rate-limit.ts`: the daily-cadence limit and the Xero daily run budget, and password-login throttling being DB-backed.

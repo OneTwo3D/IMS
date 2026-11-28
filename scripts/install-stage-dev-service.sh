@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
+# Installs the stage host's ims-stage-dev.service (hardened `next dev`, User=ims, /opt/ims/onetwo3d-ims) from the copy in
+# THIS checkout's deploy/systemd/, which is the source of truth for the unit, then reloads systemd and enables and
+# starts it. Run as root on the stage host: sudo bash scripts/install-stage-dev-service.sh
 set -euo pipefail
 
 SERVICE_NAME="ims-stage-dev.service"
-REPO_DIR="/root/ims/onetwo3d-ims-isolated"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SOURCE_UNIT="${REPO_DIR}/deploy/systemd/${SERVICE_NAME}"
 TARGET_UNIT="/etc/systemd/system/${SERVICE_NAME}"
 

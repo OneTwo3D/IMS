@@ -116,7 +116,7 @@ After the dev server starts, log in as the user you just created. The first visi
 For production deployments, also configure:
 
 - **CRON_SECRET** — required for the scheduled-job endpoints to authenticate (the system fails fast on startup if unset in production).
-- **Backup cron** — schedule `/api/cron/backup` daily (the installer's bootstrap crontab writes it at 02:00; the scheduler default is 01:00 and the job is off until enabled); see [Backup & Restore](docs/backup-restore.md).
+- **Backup cron** — schedule `/api/cron/backup` daily (the installer's bootstrap crontab and the scheduler both default to 01:00; in the scheduler the job is off until enabled); see [Backup & Restore](docs/backup-restore.md).
 - **Multi-instance rate limits** — set `RATE_LIMIT_BACKEND=redis` and `REDIS_URL` if running multiple replicas.
 
 The [Installation & Deployment](docs/installation.md) guide covers the full deployment surface.

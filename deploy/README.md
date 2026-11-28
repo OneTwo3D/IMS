@@ -5,15 +5,15 @@
 | Unit | Purpose | Status |
 |------|---------|--------|
 | `systemd/ims-stage.service` | Production build (`next start`) as a non-root, loopback-only, sandboxed service | **Current** |
-| `systemd/ims-stage-dev.service` | `next dev` as root, from `/root/ims/onetwo3d-ims-isolated`, hostname `127.0.0.1` in the file (its `Description` says DEPRECATED, local dev only) | **Deprecated — do not run on any internet-facing host** (see `onetwo3d-ims-k0ei` / `dg42`) |
+| `systemd/ims-stage-dev.service` | The stage host's installed unit: hardened `next dev` (hot reload) as `ims` from `/opt/ims/onetwo3d-ims`, systemd sandboxing, `HOSTNAME=0.0.0.0` because the ingress proxy reaches it over the LAN. Installed by `scripts/install-stage-dev-service.sh` from this file | **Current on stage** (dev mode; `ims-stage.service` is the production-build target) |
 | `systemd/ims-e2e-dev.service` | Full-chain E2E rig: `next start` as `ims` on port 3002 with its own database; see [`docs/ops/full-chain-e2e-runbook.md`](../docs/ops/full-chain-e2e-runbook.md) | Current |
 
-The dev unit ran the Next.js development server as **root**, in `NODE_ENV=development`,
-bound to `0.0.0.0` behind the public staging hostname. Dev mode leaks stack traces
-and source to clients, is not DoS-hardened, and a dev-cache corruption took staging
-fully down during the security review. `ims-stage.service` replaces it.
-
-The stage host does not currently run either file as written: its installed `/etc/systemd/system/ims-stage-dev.service` is a hardened `next dev` variant (`User=ims`, `/opt/ims/onetwo3d-ims`, hot reload, `HOSTNAME=0.0.0.0` because the ingress proxy reaches it over the LAN) that is not the copy in `deploy/systemd/`.
+The dev unit used to run the Next.js development server as **root**, from `/root`, bound to `0.0.0.0` behind the
+public staging hostname. It was hardened in place on the stage host (`User=ims`, `/opt/ims/onetwo3d-ims`, systemd
+sandboxing) and that installed unit is now the copy in `deploy/systemd/ims-stage-dev.service`; change the unit there and
+re-run `scripts/install-stage-dev-service.sh` as root to apply it. It still runs `next dev` in `NODE_ENV=development`,
+which shows stack traces and source to clients and is not DoS-hardened, so `ims-stage.service` (a production build)
+remains the target for any host exposed beyond staging.
 
 ## One-time migration to `ims-stage.service`
 

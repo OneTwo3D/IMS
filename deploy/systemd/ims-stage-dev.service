@@ -1,24 +1,59 @@
-# DEPRECATED — do NOT run on any internet-facing host.
-# Runs `next dev` as root on 0.0.0.0 (leaks source/stack traces, unsandboxed,
-# root privileges). Replaced by ims-stage.service; see deploy/README.md and
-# onetwo3d-ims-k0ei / dg42. Kept only as a local-development reference.
+# Source of truth for the stage host's ims-stage-dev.service: scripts/install-stage-dev-service.sh installs
+# THIS file to /etc/systemd/system/. It holds no secrets (they are read from the tree's .env at start).
+#
+# IMS staging server — hardened dev mode (hot reload preserved).
+#
+# Kept on `next dev` deliberately so code changes on the working tree are served
+# immediately (this is a staging box iterated on live). Hardened vs the previous
+# root/0.0.0.0 unit: runs as the unprivileged `ims` user, out of /root, with
+# systemd sandboxing. Bind stays on all interfaces because the ingress proxy
+# (OpenLiteSpeed on the LAN) reaches this host over the LAN, not loopback.
+
 [Unit]
-Description=IMS Stage Development Server (DEPRECATED — local dev only)
+Description=IMS Stage Development Server (hardened dev; hot reload)
 After=network.target
 
 [Service]
 Type=simple
-User=root
-WorkingDirectory=/root/ims/onetwo3d-ims-isolated
-EnvironmentFile=-/root/ims/onetwo3d-ims-isolated/.env.local
+User=ims
+Group=ims
+
+WorkingDirectory=/opt/ims/onetwo3d-ims
+EnvironmentFile=-/opt/ims/onetwo3d-ims/.env
 Environment=NODE_ENV=development
 Environment=NEXT_PUBLIC_APP_URL=https://ims-stage.onetwo3d.co.uk
 Environment=AUTH_URL=https://ims-stage.onetwo3d.co.uk
 Environment=PORT=3000
-Environment=HOSTNAME=127.0.0.1
-ExecStart=/usr/bin/npm run dev -- --hostname 127.0.0.1 --port 3000
+Environment=HOSTNAME=0.0.0.0
+# npm/next need a writable HOME + cache; keep them inside the (writable) app dir.
+Environment=HOME=/opt/ims/onetwo3d-ims
+Environment=NPM_CONFIG_CACHE=/opt/ims/onetwo3d-ims/.npm-cache
+
+ExecStart=/usr/bin/npm run dev -- --hostname 0.0.0.0 --port 3000
 Restart=always
 RestartSec=5
+
+# --- sandboxing (moderate: safe for a hot-reloading dev server) ---
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+# `full` protects /usr, /boot, /etc read-only while leaving the app's /opt tree
+# writable — avoids the strict-mode breakage risk for a dev server that compiles
+# and writes .next continuously.
+ProtectSystem=full
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+# NOTE: no MemoryDenyWriteExecute (breaks the V8 JIT).
+
+# NOT `SupplementaryGroups=crontab` (o3d-jjdm), as installed on the stage host today. Under NoNewPrivileges=true the
+# setgid transition on /usr/bin/crontab does not happen, so a Settings -> System -> Scheduler save fails with a
+# permission error under this unit and the host crontab is managed by hand (or by install.sh / deploy.sh as root).
+# To let the in-app Scheduler write it, add the two lines ims-stage.service carries and re-run
+# scripts/install-stage-dev-service.sh.
 
 [Install]
 WantedBy=multi-user.target
