@@ -424,7 +424,7 @@ A refund of units that never shipped only releases the demand: the stock was nev
 
 ### Refund-time cost
 
-When a refund returns stock, the COGS reversal and the returned stock are valued at the cost **originally posted when the units shipped** (the shipment's own COGS records), not at the cost layer's current value. A landed-cost revaluation after the shipment therefore does not change what the refund reverses: it gives back exactly the cost that left COGS, so COGS for those units nets to zero. Only an old shipment with no posted cost on record (a dispatch from before FIFO snapshots and COGS records existed) falls back to the cost recorded on the shipment.
+When a refund returns stock, the COGS reversal and the returned stock are valued at the cost **originally posted when the units shipped** (the shipment's own COGS records), not at the cost layer's current value. The refund reverses exactly the cost originally posted at dispatch, and the returned stock re-enters at that cost. A landed-cost revaluation posted to COGS after the shipment is not reversed: by design, that difference stays in COGS for the refunded units. Do not journal it out. Only an old shipment with no posted cost on record (a dispatch from before FIFO snapshots and COGS records existed) falls back to the cost recorded on the shipment.
 
 ### Refunds that return no stock, and returns whose cost is unknown
 
@@ -626,7 +626,7 @@ Two cases are refused instead of posting wrongly. Both show as a failed entry un
 
 ## Invoice Generation
 
-**The accounting (Xero) invoice and the IMS invoice number are separate.** The sales invoice is queued to the accounting system when the order is created, or when a draft is finalised, whatever the setting below (posted as AUTHORISED, or DRAFT while the *Sales invoices* posting mode is `draft`; see [Xero sync](xero-sync.md)).
+**The accounting (Xero) invoice and the IMS invoice number are separate.** The sales invoice is queued to the accounting system (while sales-invoice sync is on) when the order is created, or when a draft is finalised, whatever the setting below (posted as AUTHORISED, or DRAFT while the *Sales invoices* posting mode is `draft`; see [Xero sync](xero-sync.md)).
 
 The setting in **Settings > Sales Settings** (`invoice_trigger`) only decides when IMS gives the order its **invoice number** (and invoice date):
 
@@ -634,7 +634,7 @@ The setting in **Settings > Sales Settings** (`invoice_trigger`) only decides wh
 - **On shipment**: the number is generated when the order is shipped (not for an order held short).
 - **On payment**: the number is generated when the order becomes paid (marked as paid, or a payment brings it to fully paid; not for a cancelled order).
 
-An invoice number already queued with the accounting invoice is adopted rather than a second one minted. An order whose invoice number comes from the storefront (WooCommerce PDF Invoices) is never given one by IMS; the number appears once WooCommerce has created the invoice.
+An invoice number already queued with the accounting invoice is adopted rather than a second one minted. A WooCommerce order (its invoice number comes from the storefront's PDF Invoices plugin) is never given one by IMS; the number appears once WooCommerce has created the invoice.
 
 ### Deleting an invoice that has synced to Xero
 
