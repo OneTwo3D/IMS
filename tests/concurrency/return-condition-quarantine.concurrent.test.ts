@@ -506,7 +506,7 @@ test('refund dialog: an unsellable return of units shipped from a 3PL (WMS-bound
   await db.wmsOrderPushLink.create({ data: { orderId: r.orderId, connector: 'mintsoft', state: 'SYNCED' } })
   const pushed = await sales.createRefund(r.orderId, r.lines, 'qc return', w.qar.id, { returnCondition: 'UNSELLABLE' })
   assert.equal(pushed.success, false)
-  assert.equal(pushed.error, quarantine.wmsUnsellableRefundRefusal('UNKNOWN'), 'no bound shipment: both routes are given')
+  assert.equal(pushed.error, quarantine.wmsUnsellableRefundRefusal({ mode: 'UNKNOWN' }), 'no bound shipment: both routes are given')
   await nothingWritten()
 
   // Control: neither, the same unsellable return is quarantined.
