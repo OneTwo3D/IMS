@@ -415,7 +415,7 @@ export async function purgeExpiredData(): Promise<{
             { NOT: UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE },
             { NOT: UNRESOLVED_ABANDONED_CLAIM_WHERE },
             { NOT: EXTERNAL_DOCUMENT_EVIDENCE_WHERE },
-            // Owner ruling 2026-11-28: the posted invoice records (the rows a refund reads the posted tax codes from) are kept, stated here rather than left to the exemption above.
+            // Owner ruling 2026-11-28: the posted invoice records (the rows a refund reads the posted tax codes from) are never deleted, stated here rather than left to the exemption above. They are compacted to a projection by the pass below, not exempt from it.
             { NOT: POSTED_INVOICE_RECORD_WHERE },
           ],
         },
@@ -606,7 +606,7 @@ export async function purgeExpiredData(): Promise<{
         const isPostedRecord = row.connector === 'xero' && row.referenceType === 'SalesOrder' && (row.type === 'SALES_INVOICE' || row.type === 'SALES_INVOICE_UPDATE')
           && namesADocument({ externalTransactionId: row.externalTransactionId })
           && ledgerStanding({ status: row.status, externalTransactionId: row.externalTransactionId, abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null, settlementBasis: row.settlementBasis ?? null }) === 'CONFIRMED_POSTED'
-        const keptPayload = isPostedRecord ? postedInvoicePayloadProjection(row.payload) : invoiceRowTombstonePayload(row.type, row.payload)
+        const keptPayload = isPostedRecord ? postedInvoicePayloadProjection(row.payload) : invoiceRowTombstonePayload(row)
         const { count } = await db.accountingSyncLog.updateMany({
           // THE WHOLE SELECTION PREDICATE, RE-ASSERTED — not just the row id and the compaction stamp
           // (o3d-bqw7 r3, Codex HIGH). The read and the write are separate statements, so every
@@ -626,7 +626,8 @@ export async function purgeExpiredData(): Promise<{
           where: {
             ...compactableWhere,
             id: row.id,
-            ...(accountNets ? { payload: { equals: row.payload as Prisma.InputJsonValue } } : {}),
+            // The kept payload was derived from the payload read above, as the journal's summary was: equality makes a write over a payload that changed since a no-op (re-selected next run).
+            ...(accountNets || keptPayload ? { payload: { equals: row.payload as Prisma.InputJsonValue } } : {}),
           },
           data: {
             ...backReferenceEvidenceTombstone(now),

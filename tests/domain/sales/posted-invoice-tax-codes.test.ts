@@ -136,7 +136,10 @@ test('the retention projection keeps the posted codes and non-personal fields, d
 })
 
 test('every other invoice row retention compacts keeps only the document id it names', () => {
-  assert.deepEqual(invoiceRowTombstonePayload('SALES_INVOICE_UPDATE', { accountingInvoiceId: 'inv-1', contactName: 'x' }), { accountingInvoiceId: 'inv-1' })
-  assert.equal(invoiceRowTombstonePayload('SALES_INVOICE', { lines: [] }), null)
-  assert.equal(invoiceRowTombstonePayload('CREDIT_NOTE', { accountingInvoiceId: 'inv-1' }), null)
+  const base = { connector: 'xero', referenceType: 'SalesOrder' }
+  assert.deepEqual(invoiceRowTombstonePayload({ ...base, type: 'SALES_INVOICE_UPDATE', payload: { accountingInvoiceId: 'inv-1', contactName: 'x', _connectionProvenance: 'org-1' } }), { accountingInvoiceId: 'inv-1', _connectionProvenance: 'org-1' })
+  assert.equal(invoiceRowTombstonePayload({ ...base, type: 'SALES_INVOICE', payload: { lines: [] } }), null)
+  assert.equal(invoiceRowTombstonePayload({ ...base, type: 'CREDIT_NOTE', payload: { accountingInvoiceId: 'inv-1' } }), null)
+  assert.equal(invoiceRowTombstonePayload({ connector: 'qoblex', referenceType: 'SalesOrder', type: 'SALES_INVOICE_UPDATE', payload: { accountingInvoiceId: 'inv-1' } }), null, 'another connector compacts to {}')
+  assert.equal(invoiceRowTombstonePayload({ connector: 'xero', referenceType: 'PurchaseOrder', type: 'SALES_INVOICE_UPDATE', payload: { accountingInvoiceId: 'inv-1' } }), null, 'another reference type compacts to {}')
 })

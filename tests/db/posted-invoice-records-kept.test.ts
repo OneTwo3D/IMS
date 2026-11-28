@@ -4,8 +4,8 @@ import test from 'node:test'
 import { config } from 'dotenv'
 
 /**
- * POSTED INVOICE RECORDS ARE KEPT (owner ruling 2026-11-28), against a real Postgres: the sync-log retention run neither deletes nor compacts the connector-confirmed SALES_INVOICE / SALES_INVOICE_UPDATE rows of an
- * order (the record a refund reads the posted tax codes from), while other old rows are still pruned or compacted; and a refund of an invoiced order that had to read the CURRENT codes writes one WARNING (and is not
+ * POSTED INVOICE RECORDS ARE KEPT (owner ruling 2026-11-28), against a real Postgres: the sync-log retention run never deletes the connector-confirmed SALES_INVOICE / SALES_INVOICE_UPDATE rows of an order and compacts
+ * their payload to a projection of the posted tax codes (no names, emails or line text), while other old rows are still pruned or compacted to `{}`; and a refund of an invoiced order that had to read the CURRENT codes writes one WARNING (and is not
  * refused), where a refund with the record present writes none and behaves as before. Gated on RUN_DB_RETENTION_TESTS (npm run test:db).
  */
 const skip = process.env.RUN_DB_RETENTION_TESTS !== '1'
@@ -69,6 +69,60 @@ test('[db] retention keeps the posted codes of the posted invoice rows (a projec
   assert.equal(record?.shippingCode, 'SH')
   assert.deepEqual(byId.get(asserted.id)?.payload, {}, 'an asserted row is still compacted to nothing')
   assert.equal(byId.has(prunable.id), false, 'an unrelated old shadow row is still pruned')
+})
+
+test('[db] every other row retention compacts still compacts to exactly {}; a second purge leaves a projection row untouched; a compacted posted row and a tombstone keep their origin record', { skip }, async (t) => {
+  const { db, Prisma, purgeExpiredData } = await load()
+  const { readAccountingOriginRecord, carryAccountingOriginRecordFrom } = await import('../../lib/connectors/accounting-connection-provenance')
+  const D = (v: string) => new Prisma.Decimal(v)
+  const invoiceId = `inv-${randomUUID()}`
+  const order = await db.salesOrder.create({
+    data: { orderNumber: `PE-${randomUUID().slice(0, 8)}`, status: 'SHIPPED', currency: 'GBP', fxRateToBase: D('1'), subtotalForeign: D('1'), subtotalBase: D('1'), taxForeign: D('0'), taxBase: D('0'), totalForeign: D('1'), totalBase: D('1'), accountingInvoiceId: invoiceId },
+    select: { id: true },
+  })
+  const old = new Date(Date.now() - 400 * 24 * 3600 * 1000)
+  const ids: string[] = []
+  t.after(async () => {
+    await db.accountingSyncLog.deleteMany({ where: { id: { in: ids } } }).catch(() => {})
+    await db.salesOrder.delete({ where: { id: order.id } }).catch(() => {})
+  })
+  const body = { accountingInvoiceId: invoiceId, contactName: 'Someone', lines: [{ description: 'x', accountCode: '200', debit: 1, credit: 0 }], _connectionProvenance: 'org-1' }
+  const mk = async (data: Record<string, unknown>) => {
+    const row = await db.accountingSyncLog.create({ data: { connector: 'xero', referenceType: 'SalesOrder', referenceId: order.id, createdAt: old, syncedAt: old, payload: body, connectionProvenance: 'org-1', ...data } as never, select: { id: true } })
+    ids.push(row.id)
+    return row.id
+  }
+  // Asserted rows (a person typed the id) are compacted whatever their type: each must still become exactly {}.
+  const asserted = { status: 'SYNCED', settlementBasis: 'OPERATOR_ASSERTION', externalTransactionId: `x-${randomUUID()}` }
+  const creditNote = await mk({ ...asserted, type: 'CREDIT_NOTE', referenceType: 'SalesOrderRefund' })
+  const purchase = await mk({ ...asserted, type: 'PURCHASE_INVOICE', referenceType: 'PurchaseInvoice' })
+  const journal = await mk({ ...asserted, type: 'COGS_REVERSAL', referenceType: 'SalesOrder' })
+  const otherConnector = await mk({ ...asserted, type: 'SALES_INVOICE', connector: 'qoblex' })
+  const otherReference = await mk({ ...asserted, type: 'SALES_INVOICE_UPDATE', referenceType: 'PurchaseOrder' })
+  // The posted record (confirmed, names the document) and an unproven newer update (a tombstone).
+  const posted = await mk({ type: 'SALES_INVOICE', status: 'SYNCED', externalTransactionId: invoiceId })
+  const tomb = await mk({ type: 'SALES_INVOICE_UPDATE', status: 'CANCELLED', attemptRevision: 1, processingStartedAt: old, syncedAt: null })
+  await purgeExpiredData()
+  const rows = new Map((await db.accountingSyncLog.findMany({ where: { id: { in: ids } }, select: { id: true, payload: true, payloadAccountNets: true, connectionProvenance: true, backReferenceEvidenceCompactedAt: true } })).map((r) => [r.id, r]))
+  for (const [name, id] of [['credit note', creditNote], ['purchase invoice', purchase], ['non-xero invoice', otherConnector], ['non-order invoice update', otherReference]] as const) {
+    assert.deepEqual(rows.get(id)?.payload, {}, `${name} compacts to exactly {}`)
+  }
+  assert.deepEqual(rows.get(journal)?.payload, {}, 'a journal compacts to exactly {} (its summary is kept in payloadAccountNets)')
+  assert.ok(rows.get(journal)?.payloadAccountNets, 'the journal summary is written')
+  // The two kept shapes still answer the origin check, and the origin travels onto a follow-up.
+  for (const id of [posted, tomb]) {
+    const row = rows.get(id)!
+    assert.ok(row.backReferenceEvidenceCompactedAt)
+    const record = { payload: row.payload, connectionProvenance: row.connectionProvenance, backReferenceEvidenceCompactedAt: row.backReferenceEvidenceCompactedAt }
+    assert.deepEqual(readAccountingOriginRecord(record), { state: 'stamped', provenance: 'org-1' })
+    assert.equal(carryAccountingOriginRecordFrom({}, record)._connectionProvenance, 'org-1')
+  }
+  // A second purge leaves the projection row exactly as the first left it.
+  const before = rows.get(posted)!
+  await purgeExpiredData()
+  const after = await db.accountingSyncLog.findUnique({ where: { id: posted }, select: { payload: true, backReferenceEvidenceCompactedAt: true } })
+  assert.deepEqual(after?.payload, before.payload)
+  assert.equal(after?.backReferenceEvidenceCompactedAt?.getTime(), before.backReferenceEvidenceCompactedAt?.getTime())
 })
 
 test('[db] compacting a newer unproven update keeps the document id it names, so the reader answers "no record" rather than reading the older version', { skip }, async (t) => {

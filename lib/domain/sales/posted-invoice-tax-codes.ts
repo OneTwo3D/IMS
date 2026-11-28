@@ -16,6 +16,7 @@
  */
 import type { db } from '@/lib/db'
 import type { Prisma } from '@/app/generated/prisma/client'
+import { ACCOUNTING_PAYLOAD_CONNECTION_KEY } from '@/lib/connectors/accounting-connection-provenance'
 import { ledgerStanding, NAMES_A_DOCUMENT_WHERE, PROVEN_LEDGER_FACT_WHERE } from '@/lib/domain/accounting/ledger-standing'
 import { toDecimal } from '@/lib/domain/math/decimal'
 import type { DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
@@ -40,12 +41,14 @@ export const POSTED_INVOICE_RECORD_WHERE: Prisma.AccountingSyncLogWhereInput = {
   ],
 }
 
-const PROJECTED_LINE_KEYS = ['taxRateId', 'taxRateBasis', 'taxType', 'quantity', 'unitAmount', 'discountAmount', 'accountCode', 'itemCode'] as const
+const PROJECTED_LINE_KEYS = ['taxRateId', 'taxRateBasis', 'taxType', 'quantity', 'unitAmount', 'discountAmount', 'accountCode', 'itemCode', 'noTaxKind', 'lineAmount', 'taxAmount'] as const
 const PROJECTED_PART_KEYS = ['taxRateId', 'taxRateBasis', 'taxType', 'amount'] as const
 const PROJECTED_SCALAR_KEYS = [
   'accountingInvoiceId', 'invoiceNumber', 'date', 'dateUnknown', 'dueDate', 'currency', 'currencyRateToBase', 'lineAmountsIncludeTax', 'orderTotal',
   'shippingAmount', 'shippingAccountCode', 'shippingTaxType', 'shippingTaxRateId', 'shippingTaxRateBasis',
   'discountAmount', 'discountAccountCode', 'discountTaxType', 'discountTaxRateId', 'discountTaxRateBasis',
+  // The row's origin stamp (a compacted row's origin check reads it from the payload beside the column), the EU treatment record and the posting mode: none of them personal.
+  ACCOUNTING_PAYLOAD_CONNECTION_KEY, '_euVatTreatment', '_postingMode',
 ] as const
 
 function pick(source: unknown, keys: readonly string[]): Record<string, unknown> {
@@ -72,11 +75,17 @@ export function postedInvoicePayloadProjection(payload: unknown): Record<string,
   return out
 }
 
-/** What retention leaves of ANY sales invoice / update row it compacts that is not a posted record: the document id it names (so a compacted newer update stays a candidate of the reader's walk), nothing else. */
-export function invoiceRowTombstonePayload(type: string, payload: unknown): Record<string, unknown> | null {
-  if (type !== 'SALES_INVOICE' && type !== 'SALES_INVOICE_UPDATE') return null
-  const id = typeof payload === 'object' && payload !== null ? (payload as Record<string, unknown>).accountingInvoiceId : undefined
-  return typeof id === 'string' && id.trim() !== '' ? { accountingInvoiceId: id } : null
+/**
+ * What retention leaves of a xero SALES_INVOICE / SALES_INVOICE_UPDATE row of an order that it compacts and that is not a posted record: the document id it names (so a compacted newer update stays a candidate of
+ * the reader's walk) and the row's origin stamp (so its origin check still reads it), nothing else. Null for any other connector, reference type or type: those compact to exactly `{}` as before.
+ */
+export function invoiceRowTombstonePayload(row: { connector?: string | null; referenceType?: string | null; type: string; payload: unknown }): Record<string, unknown> | null {
+  if (row.connector !== 'xero' || row.referenceType !== 'SalesOrder') return null
+  if (row.type !== 'SALES_INVOICE' && row.type !== 'SALES_INVOICE_UPDATE') return null
+  const record = typeof row.payload === 'object' && row.payload !== null ? (row.payload as Record<string, unknown>) : {}
+  const id = record.accountingInvoiceId
+  if (typeof id !== 'string' || id.trim() === '') return null
+  return { accountingInvoiceId: id, ...pick(record, [ACCOUNTING_PAYLOAD_CONNECTION_KEY]) }
 }
 
 export type PostedInvoiceTaxCodes = {
@@ -187,7 +196,7 @@ export async function readPostedInvoiceTaxCodes(
 }
 
 /**
- * `readPostedInvoiceTaxCodes` with the REASON when there is no record: `no-record` (no sync row speaks for the document: Xeroom-posted, hand-linked or none left), `in-flight` (the newest row is an update still
+ * `readPostedInvoiceRecord`: `readPostedInvoiceTaxCodes` above with the REASON when there is no record: `no-record` (no sync row speaks for the document: Xeroom-posted, hand-linked or none left), `in-flight` (the newest row is an update still
  * PENDING or PROCESSING) or `unusable` (the newest row is not a connector-confirmed fact, or its payload is unreadable).
  */
 export async function readPostedInvoiceRecord(
