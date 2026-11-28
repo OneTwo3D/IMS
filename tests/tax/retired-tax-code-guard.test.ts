@@ -104,9 +104,9 @@ test('the retired-codes setting is parsed defensively', () => {
 
 // ---- the census: every producer that builds a payload with tax codes binds them -------------------------------------------
 const PRODUCERS: Array<[string, RegExp, string]> = [
-  ['app/actions/sales.ts', /\.\.\.rateBinding\(l\.taxRateId, 'sales_line'\)/, 'sales invoice / update: line rate'],
-  ['app/actions/sales.ts', /\.\.\.rateBinding\(orderDefaultRate\?\.id, 'plain', 'shipping'\)/, 'sales invoice / update: shipping rate'],
-  ['app/actions/sales.ts', /\.\.\.rateBinding\(orderDefaultRate\?\.id, 'plain', 'discount'\)/, 'sales invoice / update: discount rate'],
+  ['app/actions/sales.ts', /: rateBinding\(l\.taxRateId, 'sales_line'\)\),/, 'sales invoice / update: line rate (a posted code that is no longer current is bound under postedFromRateId, which the guard never scans)'],
+  ['app/actions/sales.ts', /: rateBinding\(orderDefaultRate\?\.id, 'plain', 'shipping'\)\),/, 'sales invoice / update: shipping rate'],
+  ['app/actions/sales.ts', /: rateBinding\(orderDefaultRate\?\.id, 'plain', 'discount'\)\),/, 'sales invoice / update: discount rate'],
   ['app/actions/sales.ts', /return rateBinding\(own\.taxRateId, 'sales_line'\)/, 'sales credit note / refund lines'],
   ['lib/connectors/woocommerce/sync/order-import.ts', /rateBinding\(rateNow\?\.id, 'sales_line'\)/, 'WooCommerce import: line rate from the persisted rates'],
   ['lib/connectors/woocommerce/sync/order-import.ts', /rateBinding\(\(shippingRateNow \?\? defaultRateNow\)\?\.id, 'plain', 'shipping'\)/, 'WooCommerce import: shipping rate'],

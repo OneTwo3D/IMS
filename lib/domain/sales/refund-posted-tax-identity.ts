@@ -943,7 +943,11 @@ export function creditNoteLineTaxTypeResolver(input: {
   orderDefaultTaxType?: string | null
   /** lineId -> the code the order's posted invoice carried that line on (posted-invoice-tax-codes.ts); it wins over the line's CURRENT rate code, which is only the fallback for an order with no posted record. */
   postedTaxTypeByLineId?: ReadonlyMap<string, string>
-}): (refundLine: { accountingTaxType?: string | null; lineId?: string | null }) => string | null {
+  /** The code the posted invoice carried SHIPPING on: the last resort for a no-snapshot shipping line only. */
+  shippingTaxType?: string | null
+  /** The code the posted invoice carried the single header-rate DISCOUNT line on: the last resort for a no-snapshot discount line only. */
+  headerDiscountTaxType?: string | null
+}): (refundLine: { accountingTaxType?: string | null; lineId?: string | null; lineKind?: string | null }) => string | null {
   const bySalesLineId = new Map(input.orderLines.map((line) => [
     line.id,
     resolveSalesLineTaxType({
@@ -955,6 +959,8 @@ export function creditNoteLineTaxTypeResolver(input: {
   return (refundLine) => refundLine.accountingTaxType
     ?? (refundLine.lineId ? input.postedTaxTypeByLineId?.get(refundLine.lineId) ?? null : null)
     ?? (refundLine.lineId ? bySalesLineId.get(refundLine.lineId) ?? null : null)
+    // Per line KIND (a posted invoice carried shipping and the header discount on the default code as it was THEN): shipping takes the posted shipping code, the discount the posted header discount code, every other line the current default.
+    ?? (refundLine.lineKind === 'shipping' ? input.shippingTaxType ?? null : refundLine.lineKind === 'discount' ? input.headerDiscountTaxType ?? null : null)
     ?? input.orderDefaultTaxType
     ?? null
 }
