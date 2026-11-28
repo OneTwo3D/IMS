@@ -1421,6 +1421,20 @@ Operators correct the underlying issue (in IMS or in the accounting system) and 
 sync from the Sync Dashboard. Once the row transitions out of `FAILED`, the alert disappears
 automatically.
 
+### Xero call budget (950 a day, 55 a minute)
+
+Xero allows 1,000 API calls per organisation in a rolling 24 hours and 60 a minute. IMS keeps itself under that with its own counter per organisation: **950 calls in any rolling 24 hours** and **55 in any rolling minute**. When the counter is full, IMS does not send the call at all.
+
+What happens to the work that was refused (sales invoices, invoice updates, credit notes, bills, payments, allocations, journals and the daily batch alike):
+
+- The row is **not failed and no retry is used up**, however many times it is refused. It stays queued (Pending) and is offered again once the oldest calls have fallen out of the window: IMS works out that wait itself (for the day limit, until the oldest counted call is 24 hours old; for the minute limit, about the next minute), with a floor of 30 seconds so a near-empty wait can never turn into a tight loop. A refused attempt costs no Xero call, so waiting rows do not use up the budget they are waiting for.
+- A manual journal (including the daily-batch journals) that is refused this way is handed back for the same computed wait instead of being offered again straight away at the next tick.
+- Xero's own `429` reply keeps its existing handling and is not changed by this.
+- A call made while IMS holds database locks (a credit note void for a refund delete) is still never sent when the budget is full; the work is retried from the queue, now after the computed wait.
+- The Sync Log message for such a row ends with a bracketed tag `[ims-xero-local-budget kind=day|minute wait=...ms]`. It is what IMS recognises, so an operator can tell a budget wait from a real failure.
+
+Limits to know about: the counter lives in memory **per IMS process**, so a restart empties it, and it **counts only IMS's own calls**. Anything else connected to the same Xero organisation (for example Xeroom) uses the same 1,000 a day without IMS seeing it, so Xero's own `429` can arrive before IMS's counter is full; that case is handled as before. The scheduled jobs that call Xero also have their own daily run limits, which are unchanged.
+
 ### When a Retry Is Refused
 
 A retry of a **payment** — a customer receipt, a supplier payment, or a credit-note allocation — is

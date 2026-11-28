@@ -10,6 +10,7 @@ import { holdInvoiceOnRegimePolicyChange, REGIME_ACCOUNT_CHANGED_REFUSAL, REGIME
 import { resolveSalesPostContact } from '@/lib/domain/erasure/accounting-contact'
 import { withLedgerCheck } from '@/lib/domain/accounting/hand-post-instruction'
 import { getRateLimitBackoffMs, isRateLimitError } from './deferral'
+import { localBudgetDeferMs } from './deferral'
 import { pendingDeletionError } from '@/lib/domain/accounting/document-delete-pending'
 import { isOutboundWriteHeldText } from '@/lib/security/outbound-write-hold-constants'
 import { isOutboundWriteHeldError } from '@/lib/security/outbound-write-grant'
@@ -1079,11 +1080,24 @@ export async function markSyncLogForFollowUpRetry(
   entry: { retryCount: number },
   error: unknown,
   client?: Pick<Prisma.TransactionClient, 'accountingSyncLog'>,
-): Promise<{ errorMessage: string; finalFailure: boolean }> {
+): Promise<{ errorMessage: string; finalFailure: boolean; deferredMs?: number }> {
   const errorMessage = `Xero follow-up work failed after connector post: ${String(error)}`
+  const conn = client ?? db
+  // IMS's own call budget (day or minute cap) refused the follow-up's Xero call: nothing is wrong with the work, so no retry is spent and the
+  // row is not failed; it is offered again once calls fall out of the window. Xero's own 429 keeps its existing handling.
+  const budgetDeferMs = localBudgetDeferMs(String(error))
+  if (budgetDeferMs != null) {
+    const deferred = await conn.accountingSyncLog.updateMany({
+      where: { id: attempt.id, attemptRevision: attempt.attemptRevision, retryCount: entry.retryCount },
+      // Same write as the spending path below minus the retry: the row has no gate column, so the WAIT is the outbox job's (deferred by `deferredMs`);
+      // on the direct runner the row is offered again at the next tick, which costs no Xero call (the budget refuses locally).
+      data: { status: 'PENDING', errorMessage, processingStartedAt: null },
+    })
+    if (deferred.count > 0) return { errorMessage, finalFailure: false, deferredMs: budgetDeferMs }
+    // Lost the race: another worker moved the row. Fall through to the ordinary re-read below via the normal path.
+  }
   const retryCount = entry.retryCount + 1
   const finalFailure = retryCount >= MAX_RETRIES
-  const conn = client ?? db
   // Optimistic-concurrency guard: only advance from the retryCount we observed.
   // Two workers handling the same sync log (e.g. duplicate outbox jobs pointing
   // at one AccountingSyncLog) must not both increment from a stale value and
@@ -3193,7 +3207,11 @@ export async function recordAndReleaseUnsentTransportRefusal(
     : null
   // A row the PRODUCER-SIDE HOLD handed back waits a short fixed interval instead of none: there is no replay window racing it, and offering it
   // again every tick would only re-ask a question whose answer changes when the owner records a confirmation.
-  const handBackDelayMs = unsentHandBackDelayMs(args.notPosted.reason)
+  // A transport refusal whose cause is IMS's own call budget (day or minute cap) waits until calls fall out of the window instead of coming
+  // straight back every tick: it can only be refused again until then. ONLY when the dispatch marker was provably released (the replay
+  // window is then not racing this row); a standing marker keeps the immediate hand-back, which costs no Xero call.
+  const budgetDeferMs = args.notPosted.reason === 'transport-refused' && markerReleased === true ? localBudgetDeferMs(args.notPosted.message) : null
+  const handBackDelayMs = budgetDeferMs ?? unsentHandBackDelayMs(args.notPosted.reason)
   const released = await releaseUnsentTransportRefusal(
     tx, args.entry.id, args.lease, args.attempt, args.notPosted.message, new Date(Date.now() + handBackDelayMs),
   )
@@ -4320,6 +4338,9 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
       backReferenceEvidenceCompactedAt: entry.backReferenceEvidenceCompactedAt ?? null,
     }
 
+    // The claim as it stands NOW: starts as the sweep's snapshot and becomes the lease once it is open (the lease renews the claim, so the
+    // snapshot no longer matches the row). The release that hands a budget-refused row back must fence on this, or it matches nothing.
+    let activeClaim: HeldClaim = held
     try {
       // ONE read for all of it (o3d-dzip): the payload, the column and the compaction instant are one
       // record, and assembling them from two reads is how a disagreement gets manufactured.
@@ -4415,6 +4436,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
       // begins and posts NOTHING if it is gone; from here on every remote mutation inside processEntry
       // fences on it again, and the absolute deadline it fixes covers the preparation calls too.
       const lease = await openRemoteWriteLease(entry.id, claimedAt, undefined, undefined, stampingCustodyOptionsFor(entry.type))
+      if (lease) activeClaim = lease
       if (!lease) {
         await logActivity({
           entityType: 'SYSTEM',
@@ -4560,7 +4582,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
           // o3d-550x: the one fenced release — a displaced owner backing off here would hand the
           // row back to PENDING mid-post. o3d-e2mz: and fenced on the attempt, so a backoff cannot
           // reopen a row an operator has decided about.
-          await releaseClaimForRetry(db, entry.id, held, {
+          await releaseClaimForRetry(db, entry.id, activeClaim, {
             errorMessage,
             nextAttemptAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
           }, attempt)
@@ -4587,7 +4609,7 @@ async function processPendingXeroSyncDirect(): Promise<ProcessResult> {
       const errorMessage = String(e)
       if (isRateLimitError(errorMessage)) {
         // o3d-550x: the one fenced release. o3d-e2mz: on the attempt as well as the claim.
-        await releaseClaimForRetry(db, entry.id, held, {
+        await releaseClaimForRetry(db, entry.id, activeClaim, {
           errorMessage,
           nextAttemptAt: new Date(Date.now() + getRateLimitBackoffMs(entry.retryCount, errorMessage)),
         }, attempt)
@@ -4944,6 +4966,9 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
       backReferenceEvidenceCompactedAt: entry.backReferenceEvidenceCompactedAt ?? null,
     }
 
+    // The claim as it stands NOW: starts as the sweep's snapshot and becomes the lease once it is open (the lease renews the claim, so the
+    // snapshot no longer matches the row). The release that hands a budget-refused row back must fence on this, or it matches nothing.
+    let activeClaim: HeldClaim = held
     try {
       // ONE read for all of it (o3d-dzip): the payload, the column and the compaction instant are one
       // record, and assembling them from two reads is how a disagreement gets manufactured.
@@ -5040,6 +5065,8 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
             const nextRetry = await markSyncLogForFollowUpRetry(attempt, entry, followUpError, tx)
             if (nextRetry.finalFailure) {
               await markXeroOutboxPermanent(job, nextRetry.errorMessage, tx)
+            } else if (nextRetry.deferredMs != null) {
+              await deferOutboxWithoutSpendingAnAttempt(tx, job, nextRetry.errorMessage, nextRetry.deferredMs)
             } else {
               await markXeroOutboxRetry(job, nextRetry.errorMessage, tx)
             }
@@ -5062,6 +5089,7 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
       // second worker while the first is still legitimately working. Handed back for retry rather than
       // failed, because nothing was sent.
       const lease = await openRemoteWriteLease(entry.id, claimedAt, job, undefined, stampingCustodyOptionsFor(entry.type))
+      if (lease) activeClaim = lease
       if (!lease) {
         await markXeroOutboxRetry(job, lostClaimMessage(entry.id))
         await logActivity({
@@ -5212,6 +5240,8 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
             const nextRetry = await markSyncLogForFollowUpRetry(attempt, entry, followUpError, tx)
             if (nextRetry.finalFailure) {
               await markXeroOutboxPermanent(job, nextRetry.errorMessage, tx)
+            } else if (nextRetry.deferredMs != null) {
+              await deferOutboxWithoutSpendingAnAttempt(tx, job, nextRetry.errorMessage, nextRetry.deferredMs)
             } else {
               await markXeroOutboxRetry(job, nextRetry.errorMessage, tx)
             }
@@ -5232,7 +5262,7 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
           const retryDelayMs = getRateLimitBackoffMs(entry.retryCount, errorMessage)
           await db.$transaction(async (tx) => {
             // o3d-550x: the one fenced release. o3d-e2mz: on the attempt as well as the claim.
-            await releaseClaimForRetry(tx, entry.id, held, {
+            await releaseClaimForRetry(tx, entry.id, activeClaim, {
               errorMessage,
               nextAttemptAt: new Date(Date.now() + retryDelayMs),
             }, attempt)
@@ -5272,7 +5302,7 @@ export async function processPendingXeroSyncViaOutbox(options: { now?: () => num
         const retryDelayMs = getRateLimitBackoffMs(entry.retryCount, errorMessage)
         await db.$transaction(async (tx) => {
           // o3d-550x: the one fenced release. o3d-e2mz: on the attempt as well as the claim.
-          await releaseClaimForRetry(tx, entry.id, held, {
+          await releaseClaimForRetry(tx, entry.id, activeClaim, {
             errorMessage,
             nextAttemptAt: new Date(Date.now() + retryDelayMs),
           }, attempt)
