@@ -9,8 +9,12 @@
  *                                                               transaction that is rolled back (writes nothing)
  *   tsx scripts/purchase-fx-reconcile.ts [--po <id>] --apply    run the reconciliation now, under each order's row lock: it queues only the
  *                                                               exchange-rate difference that is still owed (idempotent; a second run queues nothing)
+ *   tsx scripts/purchase-fx-reconcile.ts --held [--apply]       only the orders with a held journal of a bill posted outside IMS (`held_since` set:
+ *                                                               no Xero organisation was connected). Reconnecting Xero does NOT catch them up by
+ *                                                               itself; after reconnecting the same organisation, `--held --apply` does, in one run.
+ *                                                               Every dry run starts with a banner listing these orders and what each is still owed.
  *
- * --po is refused for an order the switch never touched (it is not in the list the reconciliation covers).
+ * --po is refused for an order the switch never touched (it is not in the list the reconciliation covers), and together with --held.
  *
  * The journals it queues go through the normal accounting queue (and so to Xero only while Xero sync is on). Never key the same journal into the
  * ledger by hand as well: it would be booked twice.
@@ -41,11 +45,26 @@ async function main() {
     return
   }
   const only = valueOf('po')
+  const heldOnly = process.argv.includes('--held')
+  if (only && heldOnly) throw new Error('--po and --held cannot be combined: --held runs every order with a held journal.')
   const covered = await fx.purchaseFxOrdersToReconcile(db)
   if (only && !covered.includes(only)) throw new fx.PurchaseFxNotReconcilableError(only)
-  const ids = only ? [only] : covered
+  const ids = only ? [only] : heldOnly ? await fx.purchaseFxHeldOrders(db) : covered
   const apply = process.argv.includes('--apply')
-  console.log(`${apply ? '' : 'DRY RUN (pass --apply to queue; computed in a rolled-back transaction). '}${ids.length} order(s) covered.`)
+  if (!apply) {
+    // #1169 LOW-3: orders still owed a held catch-up. Reconnecting Xero does not catch them up by itself.
+    const held = await fx.listPurchaseFxHeldCatchUps()
+    if (held.length > 0) {
+      console.log(`HELD CATCH-UP OWED: ${held.length} order(s) have a journal of a bill posted outside IMS that was held while no Xero organisation was connected.`)
+      console.log('  Reconnecting Xero does not catch them up by itself: the next receipt or return of the order, or another bill\'s change, does, or, once the same')
+      console.log('  organisation is connected again, run `npm run purchase-fx:reconcile -- --held --apply` (a stale one needs `npm run purchase-fx:non-ims-bills`).')
+      for (const entry of held) {
+        console.log(`  ${entry.poId}:${entry.owed.map((j) => ` [owed now, bill ${j.invoiceNumber ?? j.invoiceId}: transit ${j.transitDelta}]`).join('')}`
+          + `${entry.stillHeld.map((id) => ` [bill ${id} still held: no Xero connection]`).join('')}${entry.stale.map((id) => ` [bill ${id} stale: confirm it again]`).join('')}`)
+      }
+    }
+  }
+  console.log(`${apply ? '' : 'DRY RUN (pass --apply to queue; computed in a rolled-back transaction). '}${ids.length} order(s) ${heldOnly ? 'with a held journal' : 'covered'}.`)
   // #1157 LOW-3: one order's failure (an unmapped account, a lock timeout) is reported and the run goes on; the exit code says some failed.
   let failed = 0
   for (const poId of ids) {
@@ -54,7 +73,8 @@ async function main() {
       const verb = apply ? 'queued' : 'would be queued'
       console.log(`  ${poId}: ${result.journals.length} journal(s) ${verb}${result.journals.map((j) => ` [bill ${j.invoiceNumber ?? j.invoiceId}: transit ${j.transitDelta}]`).join('')}`
         + `${result.notQueued.length ? `; ${result.notQueued.length} declined (reported)` : ''}${result.shadowed?.length ? `; ${result.shadowed.length} settled as a shadow` : ''}`)
-      // #1167 MED-1: confirmations of bills posted outside IMS whose journal is held (it catches up once the same Xero organisation is connected again)
+      // #1167 MED-1: confirmations of bills posted outside IMS whose journal is held (after the same Xero organisation is connected again, a reconcile run
+      // or the next order event catches it up; reconnecting alone does not)
       // or stale (it needs a new confirmation: npm run purchase-fx:non-ims-bills).
       for (const entry of result.stale ?? []) console.log(`    bill ${entry.invoiceId}: ${entry.held ? 'held: no Xero connection' : 'stale'}: ${entry.reason}`)
     } catch (error) {

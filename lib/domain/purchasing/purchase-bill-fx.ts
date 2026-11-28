@@ -622,7 +622,8 @@ export async function reconcilePurchaseBillFx(
     const { logActivityInTransaction } = await import('@/lib/activity-log')
     if (standing.kind === 'held') {
       staleReport.push({ invoiceId: row.invoiceId, reason: standing.reason, held: true })
-      // Reported once, when the journal is first held (the order stays in the re-run's list, so `purchase-fx:reconcile` catches it up after reconnecting).
+      // Reported once, when the journal is first held. Reconnecting catches nothing up by itself: the next order event or a reconcile run does
+      // (`purchase-fx:reconcile` lists the order as owed a held catch-up until then).
       if (!row.heldSince && !params.dryRun) {
         const marked = await tx.purchaseFxNonImsBillApproval.updateMany({ where: { id: row.id, heldSince: null }, data: { heldSince: params.at } })
         if (marked.count === 1) {
@@ -634,8 +635,10 @@ export async function reconcilePurchaseBillFx(
             tag: 'accounting',
             level: 'WARNING',
             description: withLedgerCheck(`The exchange-rate difference journal of bill ${bill.invoiceNumber ?? bill.id} of ${po.reference} (posted to Xero outside IMS) is held: no Xero organisation `
-              + 'is connected, so the one the bill was confirmed on cannot be compared. Once the same organisation is connected again, the next receipt, return or bill change of the order, '
-              + `or \`npm run purchase-fx:reconcile -- --po ${params.poId} --apply\`, catches it up. Connecting a different organisation makes the confirmation stale.`),
+              + 'is connected, so the one the bill was confirmed on cannot be compared. Reconnecting does not catch it up by itself: once the same organisation is '
+              + 'connected again, the next receipt or return of the order, or another bill\'s change, catches it up, or run '
+              + `\`npm run purchase-fx:reconcile -- --po ${params.poId} --apply\` (or \`-- --held --apply\` for every order held so). If any reconciliation of the `
+              + 'order runs while a different organisation is connected, the confirmation goes stale and the bill has to be confirmed again.'),
             metadata: { invoiceId: bill.id, reason: standing.reason },
           })
         }
@@ -1000,6 +1003,47 @@ export async function rerunPurchaseBillFx(poId: string, options: { at?: Date; dr
   }, { timeout: 60_000, maxWait: 10_000 })
   await reportPurchaseFxVarianceNotQueued(poId, po.reference, result)
   return result
+}
+
+/**
+ * #1169 LOW-3: the orders still owed a held catch-up. A confirmation of a bill posted outside IMS has `held_since` set while its journal is held for
+ * want of a Xero connection; the hold is cleared only by a reconciliation that runs (not a dry run) once the organisation can be compared again.
+ * Reconnecting Xero does not by itself catch anything up: the next receipt or return of the order, or another bill's change, does, or a reconcile run
+ * (`purchase-fx:reconcile --held --apply` for all of these). Read-only.
+ */
+export async function purchaseFxHeldOrders(client: Pick<Prisma.TransactionClient, 'purchaseFxNonImsBillApproval'>): Promise<string[]> {
+  const rows = await client.purchaseFxNonImsBillApproval.findMany({ where: { heldSince: { not: null } }, select: { poId: true }, distinct: ['poId'] })
+  return rows.map((row) => row.poId).sort()
+}
+
+export type PurchaseFxHeldCatchUp = {
+  poId: string
+  /** What a reconcile run would queue for the order now (empty while it is still held). */
+  owed: PurchaseBillFxReconcileResult['journals']
+  /** Bills whose journal is still held: no Xero organisation connected, so what they owe is known only once it is. */
+  stillHeld: string[]
+  /** Bills whose confirmation is (or would now be marked) stale: they need a new confirmation, not a catch-up. */
+  stale: string[]
+}
+
+/**
+ * #1169 LOW-3: per order with a held confirmation, a dry run (rolled back, writes nothing) of what it is still owed. An order whose hold has ended
+ * and that owes nothing is left out (the next reconcile run clears its `held_since`).
+ */
+export async function listPurchaseFxHeldCatchUps(options: { at?: Date } = {}): Promise<PurchaseFxHeldCatchUp[]> {
+  const { db } = await import('@/lib/db')
+  const out: PurchaseFxHeldCatchUp[] = []
+  for (const poId of await purchaseFxHeldOrders(db)) {
+    const result = await rerunPurchaseBillFx(poId, { at: options.at, dryRun: true })
+    const entry: PurchaseFxHeldCatchUp = {
+      poId,
+      owed: result.journals,
+      stillHeld: (result.stale ?? []).filter((x) => x.held).map((x) => x.invoiceId),
+      stale: (result.stale ?? []).filter((x) => !x.held).map((x) => x.invoiceId),
+    }
+    if (entry.owed.length > 0 || entry.stillHeld.length > 0 || entry.stale.length > 0) out.push(entry)
+  }
+  return out
 }
 
 export type PurchaseFxInFlightOrder = {

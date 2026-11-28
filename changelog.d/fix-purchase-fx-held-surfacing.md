@@ -1,0 +1,5 @@
+### Per-event FX rates for purchasing: orders still owed a held catch-up are listed, and caught up in one command
+- Still behind `purchase_event_fx_rates_enabled` (off) and its interlock (still off); with the switch off nothing changes.
+- Every dry run of `npm run purchase-fx:reconcile` now starts with a "held catch-up owed" banner: the orders with a held journal of a bill posted outside IMS (`held_since` set), each with what it is owed now, or that it is still held or stale.
+- `npm run purchase-fx:reconcile -- --held --apply` catches up exactly those orders after the same Xero organisation is connected again (`--held` alone is a dry run; refused together with `--po`).
+- Corrected the wording: reconnecting Xero does not catch a held journal up by itself; the next receipt or return of the order, another bill's change, or a reconcile run does. A confirmation goes stale if any reconciliation of the order runs while a different organisation is connected. A credit note against such a bill uses the IMS bill's booked rate.
