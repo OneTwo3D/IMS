@@ -845,9 +845,9 @@ Helper plugin 1.3.0 does not feed exchange rates to any currency plugin on the s
 The **Sync Log** tab shows the last 100 synchronisation events. Each entry includes:
 
 - **Direction** — From store (import) or To store (push)
-- **Type** — ORDER, Product, or StockLevel
+- **Type** — the entity the row is about: for example SalesOrder, Product, StockLevel (older rows and a few flows use ORDER or SalesOrderEdit)
 - **External ID** — the storefront entity ID
-- **Status** — SYNCED, FAILED, or SKIPPED
+- **Status** — PENDING (queued or in flight), SYNCED, FAILED, or QUARANTINED (a refund IMS parked on purpose until a person resolves it)
 - **Error** — details if the sync failed
 
 Use this log to troubleshoot sync issues and verify that orders and products are flowing correctly.
@@ -866,7 +866,7 @@ What you see while it is held:
 
 ## Cron Jobs
 
-WooCommerce is now webhook-first. Scheduled jobs exist for backup reconciliation and retry draining, not as the primary intake path.
+WooCommerce is now webhook-first. Scheduled jobs exist for backup reconciliation, retry draining and the withdrawal backstop, not as the primary intake path. Three jobs belong to WooCommerce, all on by default and all on **Settings > System > Scheduler**: `wc-reconcile` (hourly), `shopping-webhook-inbox` (every 5 minutes: processes stored webhook deliveries, including product and refund ones, and retries queued order completions) and `wc-withdrawal-sweep` (every 15 minutes: re-checks orders IMS refused, by order ID).
 
 ### Primary scheduled endpoint
 
@@ -875,8 +875,9 @@ Use `/api/cron/wc-reconcile` as the scheduled WooCommerce endpoint. By default i
 What it does:
 
 1. Reconciles orders if order webhooks are not active or the daily backup reconcile is due
-2. Reconciles products if product webhooks are not active or the daily backup reconcile is due
-3. Runs the daily stock catch-up by draining queued retry jobs and force-pushing current stock
+2. Runs the cancellation backstop (a cancellation or trash WooCommerce holds but no delivery brought) and retries releases of sales invoices held back for their WooCommerce number
+3. Reconciles products if **product sync is on** and its direction is WooCommerce to IMS or both, and product webhooks are not active or the daily backup reconcile is due
+4. When stock sync is on: records the stock corrections refunds still owe the store, drains queued stock retry jobs, and (once every 24 hours, in windows) force-pushes current stock
 
 Order reconcile also backfills orders that were intentionally skipped while `wc_initial_import_completed` was not yet `true`. The reconcile path uses its own `last_wc_order_reconcile_at` cursor, so the first reconcile after initial import completion can import those missed live orders.
 
@@ -921,5 +922,5 @@ Stock sync and order allocation use warehouses marked with **Sync to Store**:
 | Webhooks not received | Verify the webhook secret matches in both systems (after a rotation, re-run "Setup Webhooks"; the old secret is accepted for 48 hours only). Check the Sync Log for entries. Try "Setup Webhooks" again. |
 | Wrong tax on imported orders | Import tax rates from WooCommerce and verify the mappings on the Tax Rates tab |
 | Stock not updating in WC | Ensure stock sync is enabled and at least one warehouse has **Sync to Store** checked |
-| Duplicate orders | Order import is idempotent — duplicates are skipped. Check the Sync Log for SKIPPED entries. |
+| Duplicate orders | Order import is idempotent — a delivery for an order IMS already holds is recognised and not imported again (it writes no new order). Check the order's own Sync Log entries and its WooCommerce order ID. |
 | Consumer secret rejected | Re-enter the full consumer secret (not the masked version). Generate a new key in WooCommerce if needed. |

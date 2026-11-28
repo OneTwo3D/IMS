@@ -1,0 +1,2 @@
+### Docs: integrations docs synced with the code (docsync A5)
+- Corrected the integrations docs (architecture.md, agent overview, the WooCommerce and Xero help pages) against the code: cron table and rate limits, webhook URLs, sync-log statuses and retry controls, the Xero call and run budgets, posted-invoice retention projection, and the retired QuickBooks, Shopify and ShipHero connectors. Docs: only.
