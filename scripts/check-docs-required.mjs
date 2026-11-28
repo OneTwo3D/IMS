@@ -6,14 +6,15 @@
 //
 // - Behaviour-bearing paths, documentation paths and the narrow exclusions are the tables below. Each
 //   entry carries the reason it is there, and the failure message prints the paths that triggered it.
-// - The opt-out is a line in a changelog.d fragment ADDED by this PR (a `+` line of the diff, so an older
-//   fragment's marker cannot be reused):
-//       Docs: none — <reason of at least 20 characters>
-//   The separator may be an em dash, an en dash, `-`, `--` or `:`. It sits in the reviewed diff, next to the
-//   change it excuses, and the release cut carries it into CHANGELOG.md, so it stays auditable. A bare
-//   `Docs: none`, or a placeholder or junk reason, fails. Only a fragment the PR ADDS counts (an edit of an
-//   older fragment cannot carry one). `Docs: none — revert of #<n>` is accepted as is, and a range whose every
-//   commit is a git revert (`Revert "…"`) passes. The check prints every reason it accepted.
+// - The opt-out is a line in a changelog.d fragment ADDED by this PR (a `+` line of a file the diff adds; a line
+//   added to an older fragment does not count. A renamed or copied fragment also shows as a new file, and the
+//   reviewer then sees the whole file, marker included, as added):
+//       Docs: none — <reason: at least 20 characters and 3 words, no run of one repeated character>
+//   `Docs: none` must be followed by a separator or the end of the line to be a marker. The separator may be an
+//   em dash, an en dash, `-`, `--` or `:`. It sits in the reviewed diff, next to the change it excuses, and the
+//   release cut carries it into CHANGELOG.md, so it stays auditable. A bare `Docs: none`, or a placeholder or
+//   junk reason (fewer than 3 words, or a run like `xxxxx`), fails. `Docs: none — revert of #<n>` is accepted
+//   whatever its length. The check prints every reason it accepted.
 // - The comparison is merge-base(base, head)..head, as in check-migration-conventions.mjs: a pull request
 //   compares against origin/<base branch>; a push compares the event's `before` SHA (or HEAD^, with a
 //   warning, when that SHA is not in the clone). In CI an empty range (base == head, or a head that is an
@@ -107,8 +108,6 @@ const PLACEHOLDER_REASON_RE = /^(<[^>]*>|n\/?a|none|tbd|todo|nothing|no docs?|-+
 const REPEATED_RUN_RE = /(\S)\1{4,}/
 /** `Docs: none — revert of #123`: a revert restores the docs of the change it undoes. */
 const REVERT_REASON_RE = /^revert of #\d+$/i
-/** A git revert's default subject. */
-const REVERT_SUBJECT_RE = /^Revert "/
 // A marker is `Docs: none` followed by a separator or the end of the line, so prose such as "Docs: none of the
 // help pages changed" is not mistaken for a malformed marker.
 const MARKER_PREFIX_RE = /^\s*(?:[-*]\s+)?docs\s*:\s*none\s*(?:[—–:-]|$)/i
@@ -193,16 +192,8 @@ export function findOptOuts(addedLines) {
   return { accepted, errors }
 }
 
-/** Every commit of the range is a git revert (`Revert "…"`): it restores the documentation of what it undoes. */
-export function isRevertOnly(commitSubjects) {
-  return Array.isArray(commitSubjects) && commitSubjects.length > 0 && commitSubjects.every((s) => REVERT_SUBJECT_RE.test(s))
-}
-
-/**
- * The decision. Pure: the changed paths, the added lines and (optionally) the commit subjects in, a verdict and its explanation out.
- * @param {{ changedFiles: string[], addedLines: Array<{ file: string, line: string, newFile?: boolean }>, commitSubjects?: string[] }} input
- */
-export function evaluateDocsRequired({ changedFiles, addedLines, commitSubjects = [] }) {
+/** The decision. Pure: the changed paths and the added lines in, a verdict and its explanation out. */
+export function evaluateDocsRequired({ changedFiles, addedLines }) {
   const behaviour = changedFiles.filter(isBehaviourPath)
   const docs = changedFiles.filter(isDocPath)
   const { accepted, errors } = findOptOuts(addedLines)
@@ -224,10 +215,6 @@ export function evaluateDocsRequired({ changedFiles, addedLines, commitSubjects 
   if (accepted.length > 0) {
     lines.push(`Docs-required check passed by opt-out: ${behaviour.length} behaviour-bearing file(s) changed and no documentation file.`)
     for (const a of accepted) lines.push(`Accepted reason (${a.file}): ${a.reason}`)
-    return { ok: true, behaviour, docs, accepted, lines }
-  }
-  if (isRevertOnly(commitSubjects)) {
-    lines.push(`Docs-required check passed: every commit is a revert (${commitSubjects.length}); a revert restores the documentation of what it undoes.`)
     return { ok: true, behaviour, docs, accepted, lines }
   }
   lines.push(
@@ -347,8 +334,7 @@ function main() {
       addedLines = addedLines.concat(readFileSync(file, 'utf8').split(/\r?\n/).map((line) => ({ file, line, newFile: true })))
     }
   }
-  const commitSubjects = git(['log', '--no-merges', '--format=%s', `${mergeBase}..${headRef}`]).split(/\r?\n/).filter(Boolean)
-  const result = evaluateDocsRequired({ changedFiles, addedLines, commitSubjects })
+  const result = evaluateDocsRequired({ changedFiles, addedLines })
 
   const range = local ? `${mergeBase.slice(0, 12)}..working tree (uncommitted and untracked files included)` : `${mergeBase.slice(0, 12)}..${headRef}`
   const out = [...result.lines, `(Compared merge-base(${base}, ${headRef}) = ${range}.)`].join('\n')

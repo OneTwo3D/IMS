@@ -17,7 +17,6 @@ import {
   findOptOuts,
   isBehaviourPath,
   isDocPath,
-  isRevertOnly,
   MIN_REASON_LENGTH,
   parseAddedLines,
   reasonProblem,
@@ -209,16 +208,11 @@ test('L6: a marker counts only in a fragment the change ADDS', () => {
   assert.equal(r.ok, false)
 })
 
-// [mutation: drop the revert reason; drop the revert-only pass; pass a range with one non-revert commit]
-test('L7: "Docs: none - revert of #N" is accepted, and a range of git reverts only passes', () => {
+// [mutation: drop the revert reason]
+test('L7: "Docs: none - revert of #N" is accepted whatever its length; a revert with no marker still needs one', () => {
   assert.equal(findOptOuts([{ file: 'changelog.d/x.md', line: `Docs: none ${EM} revert of #1234` }]).accepted.length, 1)
   assert.equal(reasonProblem('Revert of #7'), null)
   assert.ok(reasonProblem('revert of something'))
-  assert.equal(isRevertOnly(['Revert "feat: x (#12)"']), true)
-  assert.equal(isRevertOnly(['Revert "feat: x (#12)"', 'fix: y']), false)
-  assert.equal(isRevertOnly([]), false)
-  assert.equal(evaluateDocsRequired({ changedFiles: ['lib/a.ts'], addedLines: [], commitSubjects: ['Revert "feat: x (#12)"'] }).ok, true)
-  assert.equal(evaluateDocsRequired({ changedFiles: ['lib/a.ts'], addedLines: [], commitSubjects: ['Revert "feat: x"', 'more code'] }).ok, false)
 })
 
 // [mutation: keep the unanchored *.md exclusion]
@@ -421,15 +415,15 @@ test('e2e L6: a marker added to an OLDER fragment does not excuse a code change'
   assert.match(r.out, /FAILED/)
 })
 
-// [mutation: read only non-merge subjects as reverts when one is not]
-test('e2e L7: a range made only of git reverts passes without docs', (t) => {
+// MED-1 (#1180 review): a commit subject proves nothing, so a revert commit with no marker is not excused.
+test('e2e L7: a commit titled Revert "..." with no docs and no marker still fails', (t) => {
   const { dir, g, put, commit, base } = repo(t)
   g('update-ref', 'refs/remotes/origin/development', base)
   put('lib/a.ts', 'export const a = 2\n')
   commit('Revert "feat: a (#12)"')
   const r = run(dir, { CI: 'true', GITHUB_BASE_REF: 'development' })
-  assert.equal(r.status, 0, r.out)
-  assert.match(r.out, /every commit is a revert/)
+  assert.equal(r.status, 1, r.out)
+  assert.match(r.out, /FAILED/)
 })
 
 // [mutation: compare only committed changes locally]
