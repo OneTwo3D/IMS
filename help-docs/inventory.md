@@ -440,12 +440,12 @@ A product's **reorder point**, **safety stock** and **reorder quantity** are set
 
 ## FIFO Cost Layers
 
-Every time stock comes in, a new FIFO cost layer is created recording the warehouse, the quantity and the unit cost. Layers are laid by purchase receipts (manual, warehouse book-in, or a Mintsoft Align To WMS increase), build orders, opening stock, stock additions, transfer receipts and refund restocks. When stock is sold or consumed, the oldest layers in that warehouse are used first (a supplier return takes only the layers of the purchase-order line it returns). This ensures your cost of goods sold accurately reflects purchase prices over time.
+Every time stock comes in, a new FIFO cost layer is created recording the warehouse, the quantity and the unit cost. Layers are laid by purchase receipts (manual, warehouse book-in, or a Mintsoft Align To WMS increase), build orders (including the components a disassembly releases), opening stock, stock additions, transfer receipts and refund restocks. When stock is sold or consumed, the oldest layers in that warehouse are used first (a supplier return takes only the layers of the purchase-order line it returns). This ensures your cost of goods sold accurately reflects purchase prices over time.
 
 - **Landed cost** is added to the layers of the goods it belongs to, so cost of goods sold carries the all-in cost. A supplier credit cannot take a layer below 0.00 per line; the part the floor cannot absorb is reported on the purchase order.
 - **The product page** shows the **FIFO Cost Layers** card, the COGS value and the average unit cost to roles holding `inventory.prices` (Admin, Manager, Finance); other roles do not receive the figures.
 - A **Kit** holds no layers of its own (its components do), and a Non-Inventory product holds none at all.
-- The rules for choosing a cost when you add stock by hand are in [Stock Control](stock-control.md#fifo-and-cost-layers).
+- The rules for choosing a cost when you add stock by hand are in [Stock Control](stock-control.md#single-adjustment).
 
 
 ## Lifecycle Status
