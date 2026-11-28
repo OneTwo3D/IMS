@@ -425,7 +425,7 @@ export function purchaseOrderNetPayableForeign(po: {
   freightCostLines: ReadonlyArray<{ amountForeign: DecimalInput; vatable: boolean }>
   supplierRateReverseCharge: boolean
 }): Prisma.Decimal {
-  const factor = headerDiscountFactorForPo({ subtotalBase: po.subtotalForeign, lines: po.lines.map((line) => ({ totalBase: line.totalForeign })) })
+  const factor = headerDiscountFactorForPo({ subtotalBase: toDecimal(po.subtotalForeign), lines: po.lines.map((line) => ({ totalBase: toDecimal(line.totalForeign) })) })
   const reverseChargeLines: NetPayableLine[] = po.lines
     .filter((line) => line.taxRate?.reverseCharge === true)
     .map((line) => ({ totalForeign: toDecimal(line.totalForeign).mul(factor), taxRateValue: line.taxRate!.rate, taxReverseCharge: true }))
