@@ -2,6 +2,7 @@ import { db } from '@/lib/db'
 import { buildTemplateCsv, toCsv, csvResponse } from '@/lib/csv'
 import { requireApiAuth } from '@/lib/auth/server'
 import { hasPermission } from '@/lib/permissions'
+import { canViewStockValue } from '@/lib/security/stock-position-policy'
 import { readStockAdjustmentReasonCostRequired, splitReasonFromNote } from '@/lib/domain/inventory/stock-adjustment-policy'
 
 // unitCost (base currency) is optional but REQUIRED for a positive adjustment of a
@@ -49,6 +50,7 @@ export async function GET(req: Request) {
     take: 10000,
   })
 
+  const includeCost = canViewStockValue(session.user.role)
   const rows = movements.map((m) => {
     const isAddition = !!m.toWarehouseId
     const warehouse = isAddition
@@ -58,7 +60,8 @@ export async function GET(req: Request) {
       sku: m.product.sku,
       warehouseCode: warehouse?.code ?? '',
       qty: String(isAddition ? Number(m.qty) : -Number(m.qty)),
-      unitCost: isAddition && m.unitCostBase != null ? String(Number(m.unitCostBase)) : '',
+      // Unit cost is a cost figure: blank (column kept) without inventory.prices. A blank unitCost on re-import books at the latest layer cost.
+      unitCost: includeCost && isAddition && m.unitCostBase != null ? String(Number(m.unitCostBase)) : '',
     }
     if (!reasonCostRequired) return { ...base, note: m.note ?? '' }
     const split = splitReasonFromNote(m.note, reasonNames)

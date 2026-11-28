@@ -137,7 +137,7 @@ for (const f of FIXTURES) {
       unitCostBase: D(1), referenceType: null, referenceId: null, note: null,
     }))
     const ledgerClient = ledgerClientFor(rows, Prisma as unknown as typeof PrismaRuntime)
-    const ledger = await getStockMovementLedgerReport({ dateFrom: dayAfter, dateTo: f.d1 }, { client: ledgerClient as never, paginate: false })
+    const ledger = await getStockMovementLedgerReport({ dateFrom: dayAfter, dateTo: f.d1, includeCost: true }, { client: ledgerClient as never, paginate: false })
     assert.equal(Number(ledger.totals.openingValueBase), Number(val0), 'ledger opening = valuation as-of D0')
     assert.equal(Number(ledger.totals.closingValueBase), Number(val1), 'ledger closing = valuation as-of D1')
     assert.equal(Number(ledger.totals.movementValueBase), Number(f.expect.ledgerMovement))
@@ -213,7 +213,7 @@ test('ledger, COGS and turnover windows start and end at London midnights (BST: 
       aggregate: async () => ({ _sum: { qty: null, totalValueBase: null } }),
     },
   }
-  await getStockMovementLedgerReport({ dateFrom: '2026-07-01', dateTo: '2026-07-31' }, { client: spy as never, paginate: false })
+  await getStockMovementLedgerReport({ dateFrom: '2026-07-01', dateTo: '2026-07-31', includeCost: true }, { client: spy as never, paginate: false })
   const w = JSON.stringify(wheres[0])
   assert.match(w, /"gte":"2026-06-30T23:00:00.000Z"/)
   assert.match(w, /"lt":"2026-07-31T23:00:00.000Z"/)

@@ -46,6 +46,9 @@ export type InventoryLedgerFilters = {
   status?: string
   reference?: string
   minValue?: string
+  // Stock value / unit cost / write-off value. Fail closed: value fields are present (and minValue applies) only when exactly true,
+  // so callers set it only for roles holding inventory.prices (canViewStockValue). Otherwise value fields are omitted, not nulled.
+  includeCost?: boolean
   page?: number
   pageSize?: number
 }
@@ -96,9 +99,10 @@ export type InventoryLedgerReportRow = {
   direction: 'in' | 'out' | 'neutral'
   qty: string
   signedQty: string
-  unitCostBase: string | null
-  totalValueBase: string
-  signedValueBase: string
+  // unitCostBase, totalValueBase and signedValueBase are present only with includeCost (inventory.prices).
+  unitCostBase?: string | null
+  totalValueBase?: string
+  signedValueBase?: string
   referenceType: string | null
   referenceId: string | null
   referenceLabel: string
@@ -115,9 +119,9 @@ export type InventoryLedgerReport = {
     openingQty: string
     movementQty: string
     closingQty: string
-    openingValueBase: string
-    movementValueBase: string
-    closingValueBase: string
+    openingValueBase?: string
+    movementValueBase?: string
+    closingValueBase?: string
   }
   generatedAt: string
 }
@@ -129,9 +133,9 @@ export type StockAdjustmentReportRow = InventoryLedgerReportRow & {
 
 export type StockAdjustmentReport = Omit<InventoryLedgerReport, 'rows'> & {
   rows: StockAdjustmentReportRow[]
-  reasonSummary: Array<{ reasonName: string; count: number; qty: string; valueBase: string }>
-  userSummary: Array<{ userName: string; count: number; valueBase: string; captured: boolean }>
-  skuSummary: Array<{ sku: string; productName: string; count: number; qty: string; valueBase: string }>
+  reasonSummary: Array<{ reasonName: string; count: number; qty: string; valueBase?: string }>
+  userSummary: Array<{ userName: string; count: number; valueBase?: string; captured: boolean }>
+  skuSummary: Array<{ sku: string; productName: string; count: number; qty: string; valueBase?: string }>
 }
 
 export type StockTransferReportRow = {
@@ -153,7 +157,7 @@ export type StockTransferReportRow = {
   driftQty: string
   movementOutQty: string
   movementInQty: string
-  movementValueBase: string
+  movementValueBase?: string
   href: string
 }
 
@@ -166,7 +170,7 @@ export type StockTransferReport = {
     driftQty: string
     inTransitCount: number
     overdueCount: number
-    movementValueBase: string
+    movementValueBase?: string
   }
   generatedAt: string
 }
@@ -183,7 +187,7 @@ export type StockCountReportRow = {
   expectedQty: string
   countedQty: string | null
   varianceQty: string
-  linkedAdjustmentValueBase: string | null
+  linkedAdjustmentValueBase?: string | null
   adjustmentEvidence: 'linked' | 'missing'
   completedAt: string | null
   createdAt: string
@@ -196,7 +200,7 @@ export type StockCountReport = {
     expectedQty: string
     countedQty: string
     varianceQty: string
-    linkedAdjustmentValueBase: string
+    linkedAdjustmentValueBase?: string
     missingAdjustmentEvidenceRows: number
     repeatOffenderSkus: number
   }
@@ -370,7 +374,7 @@ function movementWhere(filters: InventoryLedgerFilters, dateOverride?: Prisma.Da
   const product = normalizeTextFilter(filters.product)
   const reference = normalizeTextFilter(filters.reference)
   const type = normalizeMovementType(filters.type)
-  const minValue = filters.minValue && Number.isFinite(Number(filters.minValue)) ? Number(filters.minValue) : null
+  const minValue = filters.includeCost === true && filters.minValue && Number.isFinite(Number(filters.minValue)) ? Number(filters.minValue) : null
   const createdAt = dateOverride ?? dateRangeWhere(filters)
 
   if (createdAt) and.push({ createdAt })
@@ -544,8 +548,14 @@ export async function getStockMovementLedgerReport(
     ? await movementTotals(client, movementWhere(filters, { lt: businessDayWindow(from, from).gte }))
     : { qty: ZERO, valueBase: ZERO }
 
+  const costVisible = filters.includeCost === true
   return {
-    rows: rows.map(mapMovementRow),
+    rows: rows.map((row) => {
+      const mapped = mapMovementRow(row)
+      if (costVisible) return mapped
+      const { unitCostBase: _unitCostBase, totalValueBase: _totalValueBase, signedValueBase: _signedValueBase, ...rest } = mapped
+      return rest
+    }),
     pageInfo: info,
     dateFrom: from?.toISOString().slice(0, 10) ?? null,
     dateTo: parseDateOnly(filters.dateTo)?.toISOString().slice(0, 10) ?? null,
@@ -553,9 +563,11 @@ export async function getStockMovementLedgerReport(
       openingQty: decimalString(opening.qty),
       movementQty: decimalString(movement.qty),
       closingQty: decimalString(opening.qty.add(movement.qty)),
-      openingValueBase: moneyString(opening.valueBase),
-      movementValueBase: moneyString(movement.valueBase),
-      closingValueBase: moneyString(opening.valueBase.add(movement.valueBase)),
+      ...(costVisible ? {
+        openingValueBase: moneyString(opening.valueBase),
+        movementValueBase: moneyString(movement.valueBase),
+        closingValueBase: moneyString(opening.valueBase.add(movement.valueBase)),
+      } : {}),
     },
     generatedAt: new Date().toISOString(),
   }
@@ -587,8 +599,8 @@ export async function getStockAdjustmentReport(
     return { ...row, reasonName: reason.reasonName, reasonMatched: reason.matched }
   })
   const [reasonSummary, skuSummary] = await Promise.all([
-    getAdjustmentReasonSummary(client, adjustmentFilters, reasons),
-    getAdjustmentSkuSummary(client, adjustmentFilters),
+    getAdjustmentReasonSummary(client, adjustmentFilters, reasons, filters.includeCost === true),
+    getAdjustmentSkuSummary(client, adjustmentFilters, filters.includeCost === true),
   ])
 
   const totalCount = await client.stockMovement.count({ where: movementWhere(adjustmentFilters) })
@@ -597,7 +609,7 @@ export async function getStockAdjustmentReport(
     ...ledger,
     rows,
     reasonSummary,
-    userSummary: [{ userName: 'Not captured on StockMovement', count: totalCount, valueBase: ledger.totals.movementValueBase, captured: false }],
+    userSummary: [{ userName: 'Not captured on StockMovement', count: totalCount, ...(filters.includeCost === true ? { valueBase: ledger.totals.movementValueBase } : {}), captured: false }],
     skuSummary,
   }
 }
@@ -606,6 +618,7 @@ async function getAdjustmentReasonSummary(
   client: InventoryLedgerReportClient,
   filters: InventoryLedgerFilters,
   reasons: Array<{ name: string }>,
+  costVisible: boolean,
 ): Promise<StockAdjustmentReport['reasonSummary']> {
   const grouped = await client.stockMovement.groupBy({
     by: ['note'],
@@ -622,15 +635,19 @@ async function getAdjustmentReasonSummary(
     current.valueBase = current.valueBase.add(row._sum.totalValueBase == null ? ZERO : toDecimal(row._sum.totalValueBase))
     totals.set(reason.reasonName, current)
   }
+  // Without inventory.prices the top-10 is chosen by count, not value, so the ordering cannot leak value.
   return [...totals.entries()]
-    .map(([reasonName, value]) => ({ reasonName, count: value.count, qty: decimalString(value.qty), valueBase: moneyString(value.valueBase) }))
-    .sort((a, b) => toDecimal(b.valueBase).cmp(toDecimal(a.valueBase)) || a.reasonName.localeCompare(b.reasonName))
+    .sort(([aName, a], [bName, b]) => (costVisible
+      ? b.valueBase.cmp(a.valueBase) || aName.localeCompare(bName)
+      : b.count - a.count || aName.localeCompare(bName)))
+    .map(([reasonName, value]) => ({ reasonName, count: value.count, qty: decimalString(value.qty), ...(costVisible ? { valueBase: moneyString(value.valueBase) } : {}) }))
     .slice(0, 10)
 }
 
 async function getAdjustmentSkuSummary(
   client: InventoryLedgerReportClient,
   filters: InventoryLedgerFilters,
+  costVisible: boolean,
 ): Promise<StockAdjustmentReport['skuSummary']> {
   const grouped = await client.stockMovement.groupBy({
     by: ['productId'],
@@ -646,15 +663,18 @@ async function getAdjustmentSkuSummary(
   return grouped
     .map((row) => {
       const product = productById.get(row.productId)
-      return {
+      const value = row._sum.totalValueBase == null ? ZERO : toDecimal(row._sum.totalValueBase)
+      return { value, row: {
         sku: product?.sku ?? row.productId,
         productName: product?.name ?? row.productId,
         count: row._count._all,
         qty: decimalString(row._sum.qty == null ? ZERO : toDecimal(row._sum.qty)),
-        valueBase: moneyString(row._sum.totalValueBase == null ? ZERO : toDecimal(row._sum.totalValueBase)),
-      }
+        ...(costVisible ? { valueBase: moneyString(value) } : {}),
+      } }
     })
-    .sort((a, b) => toDecimal(b.valueBase).cmp(toDecimal(a.valueBase)) || a.sku.localeCompare(b.sku))
+    // Without inventory.prices the top-10 is chosen by count, not value, so the ordering cannot leak value.
+    .sort((a, b) => (costVisible ? b.value.cmp(a.value) : b.row.count - a.row.count) || a.row.sku.localeCompare(b.row.sku))
+    .map(({ row }) => row)
     .slice(0, 10)
 }
 
@@ -777,7 +797,7 @@ export async function getStockTransferReport(
       driftQty: decimalString(requestedQty.sub(receivedQty)),
       movementOutQty: decimalString(movement.outQty),
       movementInQty: decimalString(movement.inQty),
-      movementValueBase: moneyString(movement.valueBase),
+      ...(filters.includeCost === true ? { movementValueBase: moneyString(movement.valueBase) } : {}),
       href: `/stock-control/transfers?reference=${encodeURIComponent(transfer.reference)}`,
     }
   })
@@ -797,7 +817,7 @@ export async function getStockTransferReport(
       driftQty: decimalString(totalRequested.sub(totalReceived)),
       inTransitCount,
       overdueCount: rows.filter((row) => row.overdue).length,
-      movementValueBase: moneyString(totalValue),
+      ...(filters.includeCost === true ? { movementValueBase: moneyString(totalValue) } : {}),
     },
     generatedAt: new Date().toISOString(),
   }
@@ -908,7 +928,7 @@ export async function getStockCountReport(
       expectedQty: decimalString(toDecimal(line.expectedQty)),
       countedQty: counted == null ? null : decimalString(counted),
       varianceQty: decimalString(variance),
-      linkedAdjustmentValueBase: movementValue == null ? null : moneyString(movementValue),
+      ...(filters.includeCost === true ? { linkedAdjustmentValueBase: movementValue == null ? null : moneyString(movementValue) } : {}),
       adjustmentEvidence: movementValue == null ? 'missing' : 'linked',
       completedAt: count.completedAt?.toISOString() ?? null,
       createdAt: count.createdAt.toISOString(),
@@ -924,7 +944,7 @@ export async function getStockCountReport(
       expectedQty: decimalString(totalsAggregate._sum.expectedQty == null ? ZERO : toDecimal(totalsAggregate._sum.expectedQty)),
       countedQty: decimalString(totalsAggregate._sum.countedQty == null ? ZERO : toDecimal(totalsAggregate._sum.countedQty)),
       varianceQty: decimalString(totalsAggregate._sum.variance == null ? ZERO : toDecimal(totalsAggregate._sum.variance)),
-      linkedAdjustmentValueBase: moneyString(linkedValue),
+      ...(filters.includeCost === true ? { linkedAdjustmentValueBase: moneyString(linkedValue) } : {}),
       missingAdjustmentEvidenceRows,
       repeatOffenderSkus: repeatGroups.length,
     },

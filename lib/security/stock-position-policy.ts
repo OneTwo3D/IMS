@@ -12,3 +12,12 @@ export const STOCK_POSITION_REPORT_LINKS = [
 export function canAccessStockPositionReports(role: string): boolean {
   return hasPermission(role, 'analytics') || role === 'WAREHOUSE'
 }
+
+/**
+ * Stock value and unit cost are cost figures: only roles holding inventory.prices (Admin, Manager, Finance) may see them on a
+ * stock-position report. Warehouse and read-only roles still see quantities. Pass the result as `includeCost` to the report
+ * functions so the value fields never leave the server for other roles.
+ */
+export function canViewStockValue(role: string): boolean {
+  return hasPermission(role, 'inventory.prices')
+}

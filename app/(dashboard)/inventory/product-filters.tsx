@@ -23,9 +23,11 @@ type Props = {
   supplierId?: string
   productCategories: { id: string; name: string; parentId: string | null; path: string }[]
   supplierOptions: { id: string; name: string }[]
+  /** inventory.prices: offers the COGS Value column in the column picker. */
+  canSeeStockValue?: boolean
 }
 
-export function ProductFilters({ search, type, lifecycleStatus, categoryId, supplierId, productCategories, supplierOptions }: Props) {
+export function ProductFilters({ search, type, lifecycleStatus, categoryId, supplierId, productCategories, supplierOptions, canSeeStockValue = false }: Props) {
   const router = useRouter()
   const pathname = usePathname()
   const [isPending, startTransition] = useTransition()
@@ -176,7 +178,7 @@ export function ProductFilters({ search, type, lifecycleStatus, categoryId, supp
             Columns
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="w-56">
-            {ALL_COLUMNS.map((c) => (
+            {ALL_COLUMNS.filter((c) => canSeeStockValue || c.key !== 'inventoryValue').map((c) => (
               <DropdownMenuCheckboxItem
                 key={c.key}
                 checked={!!visible[c.key]}

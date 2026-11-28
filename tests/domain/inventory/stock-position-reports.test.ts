@@ -88,7 +88,7 @@ test('stock-on-hand report enriches as-of rows, totals the full filtered set, an
   })
 
   const report = await getStockOnHandReport(
-    { pageSize: 50 },
+    { includeCost: true, pageSize: 50 },
     { deps: { client, getOnHandAsOf } },
   )
   assert.equal(report.pageInfo.totalRows, 2)
@@ -134,7 +134,7 @@ test('stock-on-hand current report keeps live reservation scope', async () => {
   })
 
   const report = await getStockOnHandReport(
-    {},
+    { includeCost: true },
     { paginate: false, deps: { client, getOnHandAsOf } },
   )
 
@@ -185,7 +185,7 @@ test('stock-on-hand as-of report uses reservation snapshots when available', asy
   })
 
   const report = await getStockOnHandReport(
-    {},
+    { includeCost: true },
     { paginate: false, deps: { client, getOnHandAsOf } },
   )
 
@@ -227,7 +227,7 @@ test('stock-on-hand as-of report surfaces missing reservation snapshots and mark
   })
 
   const report = await getStockOnHandReport(
-    {},
+    { includeCost: true },
     { paginate: false, deps: { client, getOnHandAsOf } },
   )
 
@@ -277,7 +277,7 @@ test('stock-on-hand as-of report treats sparse missing rows as zero reserved whe
   })
 
   const report = await getStockOnHandReport(
-    {},
+    { includeCost: true },
     { paginate: false, deps: { client, getOnHandAsOf } },
   )
 
@@ -336,7 +336,7 @@ test('stock-on-hand as-of report marks mixed snapshot and current fallback rows 
   })
 
   const report = await getStockOnHandReport(
-    {},
+    { includeCost: true },
     { paginate: false, deps: { client, getOnHandAsOf } },
   )
 
@@ -382,7 +382,7 @@ test('stock-on-hand current reverse replay uses current reservations instead of 
   })
 
   const report = await getStockOnHandReport(
-    {},
+    { includeCost: true },
     { paginate: false, deps: { client, getOnHandAsOf } },
   )
 
@@ -440,7 +440,7 @@ test('stock-on-hand reservation snapshot lookup filters cross-pair noise', async
   })
 
   const report = await getStockOnHandReport(
-    {},
+    { includeCost: true },
     { paginate: false, deps: { client, getOnHandAsOf } },
   )
 

@@ -116,7 +116,8 @@ export type ProductRow = {
   allocatedStock: string    // sum of reservedQty across all warehouses
   availableStock: string    // totalStock - allocatedStock
   incomingStock: string     // in-transit transfers + open PO lines
-  inventoryValue: string  // sum of remainingQty * unitCostBase
+  // sum of remainingQty * unitCostBase; null (never computed) for roles without inventory.prices
+  inventoryValue: string | null
   createdAt: Date
   updatedAt: Date
 }
@@ -147,6 +148,7 @@ export type ProductDetail = ProductRow & {
     incomingPoQty: string        // open PO lines destined for this warehouse
   }[]
   incomingPoQty: string    // open PO lines with no warehouse assigned yet (unassigned)
+  // Always empty for roles without inventory.prices: unit costs are cost figures.
   costLayers: { id: string; receivedAt: Date; receivedQty: string; remainingQty: string; unitCostBase: string }[]
 }
 
@@ -211,10 +213,11 @@ export async function listProducts(params: {
           },
         },
         stockLevels: { select: { quantity: true, reservedQty: true } },
-        costLayers: {
+        // Cost layers feed only the COGS Value figure, so they are not read at all without inventory.prices.
+        ...(canSeePrices ? { costLayers: {
           where: { remainingQty: { gt: 0 } },
           select: { remainingQty: true, unitCostBase: true },
-        },
+        } } : {}),
       },
       orderBy: isComputedSort ? { sku: 'asc' } : { [sortField]: sortDir },
       // For computed sorts, fetch all rows so we can sort in memory then paginate
@@ -339,9 +342,11 @@ export async function listProducts(params: {
     allocatedStock: allocatedStock.toFixed(2),
     availableStock: availableStock.toFixed(2),
     incomingStock: incomingStock.toFixed(2),
-    inventoryValue: p.costLayers
-      .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostBase), 0)
-      .toFixed(2),
+    inventoryValue: canSeePrices
+      ? (('costLayers' in p ? p.costLayers : []) as Array<{ remainingQty: Prisma.Decimal; unitCostBase: Prisma.Decimal }>)
+        .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostBase), 0)
+        .toFixed(2)
+      : null,
     createdAt: p.createdAt,
     updatedAt: p.updatedAt,
   }}
@@ -386,10 +391,11 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
           include: { warehouse: { select: { id: true, code: true, name: true, type: true } } },
           orderBy: { warehouse: { code: 'asc' } },
         },
-        costLayers: {
-          orderBy: { receivedAt: 'asc' },
+        // Cost layers are not read at all without inventory.prices.
+        ...(canSeePrices ? { costLayers: {
+          orderBy: { receivedAt: 'asc' as const },
           where: { remainingQty: { gt: 0 } },
-        },
+        } } : {}),
       },
     }),
     // Allocated: active sales order lines, grouped by shipFromWarehouseId
@@ -421,6 +427,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
   ])
 
   if (!p) return null
+  const costLayers: Array<{ id: string; receivedAt: Date; receivedQty: Prisma.Decimal; remainingQty: Prisma.Decimal; unitCostBase: Prisma.Decimal }> = 'costLayers' in p ? p.costLayers : []
 
   // Build per-warehouse maps
   const allocatedByWarehouse = new Map<string, number>()
@@ -514,8 +521,8 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
 
   // For KIT/BOM: compute unit cost from components; BOM also uses actual stock
   const isKitOrBom = p.type === 'KIT' || p.type === 'BOM'
-  const kitUnitCostBase = isKitOrBom ? await computeKitUnitCostBase(p.id) : 0
-  const fifoInventoryValue = p.costLayers
+  const kitUnitCostBase = isKitOrBom && canSeePrices ? await computeKitUnitCostBase(p.id) : 0
+  const fifoInventoryValue = costLayers
     .reduce((sum, c) => sum + Number(c.remainingQty) * Number(c.unitCostBase), 0)
   const totalStockQty = p.stockLevels.reduce((sum, s) => sum + Number(s.quantity), 0)
   // Switch return_condition_check_enabled: stock in a quarantine warehouse is on hand but never available (nothing changes with the switch off).
@@ -523,9 +530,12 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
   const isQuarantineLevel = (level: { warehouse: { type: string } }): boolean => conditionCheck && isQuarantineWarehouseType(level.warehouse.type)
   const quarantinedQty = p.stockLevels.filter(isQuarantineLevel).reduce((sum, s) => sum + Number(s.quantity), 0)
   const variantQuarantine = await loadQuarantineQtyByProduct(db, conditionCheck, variantIds)
-  const inventoryValue = isKitOrBom
-    ? (p.type === 'BOM' ? kitUnitCostBase * totalStockQty : kitUnitCostBase).toFixed(2)
-    : fifoInventoryValue.toFixed(2)
+  // Stock value and unit cost are cost figures: withheld here, on the server, for roles without inventory.prices.
+  const inventoryValue = !canSeePrices
+    ? null
+    : isKitOrBom
+      ? (p.type === 'BOM' ? kitUnitCostBase * totalStockQty : kitUnitCostBase).toFixed(2)
+      : fifoInventoryValue.toFixed(2)
 
   return {
     id: p.id,
@@ -613,7 +623,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
         (variantQuarantine.get(v.id)?.toNumber() ?? 0)
       ).toFixed(2),
       incomingStock: (variantIncomingMap.get(v.id) ?? 0).toFixed(2),
-      inventoryValue: '0.00',
+      inventoryValue: canSeePrices ? '0.00' : null,
       createdAt: v.createdAt,
       updatedAt: v.updatedAt,
     })),
@@ -659,7 +669,7 @@ export async function getProduct(id: string): Promise<ProductDetail | null> {
       }
       return rows
     })(),
-    costLayers: p.costLayers.map((c) => ({
+    costLayers: !canSeePrices ? [] : costLayers.map((c) => ({
       id: c.id,
       receivedAt: c.receivedAt,
       receivedQty: c.receivedQty.toString(),

@@ -10,19 +10,24 @@ import {
 } from '@/lib/domain/inventory/stock-position-reports'
 import { getDeadStockReport, getInventoryAgingReport, InventoryHealthSourceLimitError } from '@/lib/domain/inventory/inventory-health-reports'
 import { getSlowStockReport, parseMinValue, parseNonNegativeInteger, type SlowStockFilters } from '@/lib/domain/inventory/slow-stock-report'
-import { hasPermission } from '@/lib/permissions'
 import { stockPositionApiAccessDenied } from '@/lib/security/stock-position-access'
+import { canViewStockValue } from '@/lib/security/stock-position-policy'
 import { sourceLimitCsvResponse } from '@/lib/csv-source-limit'
 
 const EXPORT_COLUMNS: Record<string, string[]> = {
   'inventory-aging': ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'bucket', 'minAgeDays', 'maxAgeDays', 'qty', 'valueBase', 'source'],
-  // valueBase is dropped for roles without inventory.prices (see slowStockColumns).
+  // valueBase is dropped for roles without inventory.prices (see columnsFor).
   'slow-stock': ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'stockUnit', 'qty', 'valueBase', 'oldestLayerAt', 'oldestLayerAgeDays', 'ageBand', 'lastSaleAt', 'daysSinceLastSale', 'soldQtyInWindow', 'ratePer30Days', 'monthsOfCover'],
   'dead-stock': ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'qty', 'valueBase', 'daysSinceLastSale', 'lastSaleAt', 'firstStockedAt'],
 }
 
 const STOCK_POSITION_CSV_ROW_LIMIT = 50000
 export const STOCK_ON_HAND_CSV_HEADERS = ['sku', 'mpn', 'productName', 'productType', 'category', 'suppliers', 'warehouseCode', 'warehouseName', 'stockUnit', 'quantity', 'reservedQty', 'availableQty', 'unitCostBase', 'totalValueBase', 'reservationQtySource', 'reservationSnapshotDate', 'reservationSourceCount']
+// unitCostBase and totalValueBase are dropped for roles without inventory.prices.
+const COST_COLUMNS = new Set(['valueBase', 'unitCostBase', 'totalValueBase'])
+function columnsFor(columns: string[], includeCost: boolean): string[] {
+  return includeCost ? columns : columns.filter((column) => !COST_COLUMNS.has(column))
+}
 
 type StockPositionExportDeps = {
   requireApiAuth: typeof requireApiAuth
@@ -50,8 +55,9 @@ function one(req: NextRequest, key: string): string | undefined {
   return req.nextUrl.searchParams.get(key) ?? undefined
 }
 
-function stockPositionFilters(req: NextRequest): StockPositionFilters {
+function stockPositionFilters(req: NextRequest, includeCost: boolean): StockPositionFilters {
   return {
+    includeCost,
     asOf: one(req, 'asOf'),
     dateFrom: one(req, 'dateFrom') ?? one(req, 'from'),
     dateTo: one(req, 'dateTo') ?? one(req, 'to'),
@@ -119,12 +125,14 @@ export async function getStockPositionExportResponse(
   const denied = resolvedDeps.accessDenied(session)
   if (denied) return denied
 
+  // Stock value and unit cost are cost figures: only inventory.prices roles get them, in the data and in the export columns.
+  const includeCost = canViewStockValue(session.user.role)
   const type = req.nextUrl.searchParams.get('type') ?? 'stock-on-hand'
   const date = new Date().toISOString().slice(0, 10)
 
   switch (type) {
     case 'stock-on-hand': {
-      const report = await resolvedDeps.getStockOnHandReport(stockPositionFilters(req), { paginate: false })
+      const report = await resolvedDeps.getStockOnHandReport(stockPositionFilters(req, includeCost), { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
       const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((r) => r.productId))
@@ -141,21 +149,20 @@ export async function getStockPositionExportResponse(
         quantity: r.quantity,
         reservedQty: r.reservedQty,
         availableQty: r.availableQty,
-        unitCostBase: r.unitCostBase ?? '',
-        totalValueBase: r.totalValueBase,
+        ...(includeCost ? { unitCostBase: r.unitCostBase ?? '', totalValueBase: r.totalValueBase ?? '' } : {}),
         reservationQtySource: r.reservationQtySource,
         reservationSnapshotDate: r.reservationSnapshotDate ?? '',
         reservationSourceCount: r.reservationSourceCount ?? 'unknown',
       }))
       return csvResponseFor(req, 
-        toCsv(data, STOCK_ON_HAND_CSV_HEADERS),
+        toCsv(data, columnsFor(STOCK_ON_HAND_CSV_HEADERS, includeCost)),
         `stock-on-hand-${date}.csv`,
         { asOf: report.asOf, source: report.source, generatedAt: report.generatedAt },
       )
     }
 
     case 'stock-allocations': {
-      const report = await resolvedDeps.getStockAllocationReport(stockPositionFilters(req), { paginate: false })
+      const report = await resolvedDeps.getStockAllocationReport(stockPositionFilters(req, includeCost), { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
       const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((r) => r.productId))
@@ -185,7 +192,7 @@ export async function getStockPositionExportResponse(
     }
 
     case 'negative-stock': {
-      const report = await resolvedDeps.getNegativeStockReport(stockPositionFilters(req), { paginate: false })
+      const report = await resolvedDeps.getNegativeStockReport(stockPositionFilters(req, includeCost), { paginate: false })
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
       const mpnByProductId = await resolvedDeps.loadMpnByProductId(report.rows.map((r) => r.productId))
@@ -213,12 +220,12 @@ export async function getStockPositionExportResponse(
     }
 
     case 'inventory-aging': {
-      const report = await resolvedDeps.getInventoryAgingReport(stockPositionFilters(req), { paginate: false }).catch((error: unknown) => {
+      const report = await resolvedDeps.getInventoryAgingReport(stockPositionFilters(req, includeCost), { paginate: false }).catch((error: unknown) => {
         if (error instanceof InventoryHealthSourceLimitError) return error
         throw error
       })
       if (report instanceof InventoryHealthSourceLimitError) {
-        return sourceLimitCsvResponse(report, EXPORT_COLUMNS['inventory-aging'], `inventory-aging-${date}.csv`)
+        return sourceLimitCsvResponse(report, columnsFor(EXPORT_COLUMNS['inventory-aging'], includeCost), `inventory-aging-${date}.csv`)
       }
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
@@ -237,19 +244,19 @@ export async function getStockPositionExportResponse(
         minAgeDays: r.minAgeDays,
         maxAgeDays: r.maxAgeDays ?? '',
         qty: r.qty,
-        valueBase: r.valueBase,
+        ...(includeCost ? { valueBase: r.valueBase ?? '' } : {}),
         source: r.source,
       }))
-      return csvResponseFor(req, toCsv(data, EXPORT_COLUMNS['inventory-aging']), `inventory-aging-${date}.csv`)
+      return csvResponseFor(req, toCsv(data, columnsFor(EXPORT_COLUMNS['inventory-aging'], includeCost)), `inventory-aging-${date}.csv`)
     }
 
     case 'dead-stock': {
-      const report = await resolvedDeps.getDeadStockReport(stockPositionFilters(req), { paginate: false }).catch((error: unknown) => {
+      const report = await resolvedDeps.getDeadStockReport(stockPositionFilters(req, includeCost), { paginate: false }).catch((error: unknown) => {
         if (error instanceof InventoryHealthSourceLimitError) return error
         throw error
       })
       if (report instanceof InventoryHealthSourceLimitError) {
-        return sourceLimitCsvResponse(report, EXPORT_COLUMNS['dead-stock'], `dead-stock-${date}.csv`)
+        return sourceLimitCsvResponse(report, columnsFor(EXPORT_COLUMNS['dead-stock'], includeCost), `dead-stock-${date}.csv`)
       }
       const oversized = rejectOversizedExport(report.pageInfo.totalRows)
       if (oversized) return oversized
@@ -265,17 +272,15 @@ export async function getStockPositionExportResponse(
         warehouseName: r.warehouseName,
         stockUnit: r.stockUnit,
         qty: r.qty,
-        valueBase: r.valueBase,
+        ...(includeCost ? { valueBase: r.valueBase ?? '' } : {}),
         daysSinceLastSale: r.daysSinceLastSale ?? '',
         lastSaleAt: r.lastSaleAt ?? '',
         firstStockedAt: r.firstStockedAt ?? '',
       }))
-      return csvResponseFor(req, toCsv(data, EXPORT_COLUMNS['dead-stock']), `dead-stock-${date}.csv`)
+      return csvResponseFor(req, toCsv(data, columnsFor(EXPORT_COLUMNS['dead-stock'], includeCost)), `dead-stock-${date}.csv`)
     }
 
     case 'slow-stock': {
-      // Cost and value are cost figures: only roles holding inventory.prices get the value column and value ordering.
-      const includeCost = hasPermission(session.user.role, 'inventory.prices')
       const columns = slowStockColumns(includeCost)
       const report = await resolvedDeps.getSlowStockReport(slowStockFilters(req, includeCost), { paginate: false }).catch((error: unknown) => {
         if (error instanceof InventoryHealthSourceLimitError) return error

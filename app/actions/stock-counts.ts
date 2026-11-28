@@ -6,6 +6,7 @@ import { Prisma } from '@/app/generated/prisma/client'
 import { db } from '@/lib/db'
 import { logActivity } from '@/lib/activity-log'
 import { requirePermission } from '@/lib/auth/server'
+import { canViewStockValue } from '@/lib/security/stock-position-policy'
 import { enqueueStockSync } from '@/lib/shopping'
 import { isOperationalProductStatus } from '@/lib/products/lifecycle'
 import { classifyStockCountWmsPolicy, computeStockCountPostings, describeStockCountDrift, detectStockCountDrift, makeStockCountReference, type StockCountDrift, type StockCountLineForPost } from '@/lib/domain/inventory/stock-count'
@@ -160,23 +161,25 @@ async function unitCostsForWarehouse(warehouseId: string, productIds: string[]):
   return new Map(rows.filter((r) => r.unitCost != null).map((r) => [r.productId, new Prisma.Decimal(r.unitCost!).toDecimalPlaces(6).toNumber()]))
 }
 
-async function mapCountsWithCost(rows: Array<Prisma.StockCountGetPayload<{ select: typeof COUNT_SELECT }>>): Promise<StockCountRow[]> {
+// Unit cost is a cost figure: the cost layers are not even read unless the caller holds inventory.prices (canViewStockValue), so every
+// line's unitCost is null for other roles. Triage (small variance, review) uses quantity and percentage only, never value.
+async function mapCountsWithCost(rows: Array<Prisma.StockCountGetPayload<{ select: typeof COUNT_SELECT }>>, costVisible: boolean): Promise<StockCountRow[]> {
   return Promise.all(rows.map(async (r) => {
     const open = r.status === 'DRAFT' || r.status === 'IN_PROGRESS'
-    return mapCount(r, open ? await unitCostsForWarehouse(r.warehouseId, r.lines.map((l) => l.productId)) : undefined)
+    return mapCount(r, costVisible && open ? await unitCostsForWarehouse(r.warehouseId, r.lines.map((l) => l.productId)) : undefined)
   }))
 }
 
 export async function getStockCounts(limit = 100): Promise<StockCountRow[]> {
-  await requirePermission('stock_control.adjust')
+  const session = await requirePermission('stock_control.adjust')
   const rows = await db.stockCount.findMany({ orderBy: { createdAt: 'desc' }, take: limit, select: COUNT_SELECT })
-  return mapCountsWithCost(rows)
+  return mapCountsWithCost(rows, canViewStockValue(session.user.role))
 }
 
 export async function getStockCount(id: string): Promise<StockCountRow | null> {
-  await requirePermission('stock_control.adjust')
+  const session = await requirePermission('stock_control.adjust')
   const row = await db.stockCount.findUnique({ where: { id }, select: COUNT_SELECT })
-  return row ? (await mapCountsWithCost([row]))[0]! : null
+  return row ? (await mapCountsWithCost([row], canViewStockValue(session.user.role)))[0]! : null
 }
 
 const createSchema = z.object({

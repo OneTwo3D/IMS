@@ -87,7 +87,8 @@ export type InventoryAgingReportRow = {
   minAgeDays: number
   maxAgeDays: number | null
   qty: string
-  valueBase: string
+  // valueBase (here, in totals and in bucketSummary) is present only when requested with includeCost (inventory.prices).
+  valueBase?: string
   source: InventoryAgingSource
 }
 
@@ -98,19 +99,21 @@ export type InventoryAgingReport = {
   pageInfo: PageInfo
   totals: {
     qty: string
-    valueBase: string
+    valueBase?: string
   }
   bucketSummary: Array<{
     bucket: string
     minAgeDays: number
     maxAgeDays: number | null
     qty: string
-    valueBase: string
+    valueBase?: string
   }>
   notices: string[]
 }
 
-export type DeadStockReportRow = DeadStockRow & {
+export type DeadStockReportRow = Omit<DeadStockRow, 'valueBase'> & {
+  // Present only when requested with includeCost (inventory.prices); omitted for other roles.
+  valueBase?: string
   warehouseId: string
   warehouseCode: string
   warehouseName: string
@@ -128,7 +131,7 @@ export type DeadStockReport = {
   pageInfo: PageInfo
   totals: {
     qty: string
-    valueBase: string
+    valueBase?: string
     neverSoldRows: number
   }
   notices: string[]
@@ -421,7 +424,7 @@ function toReportRows(layers: AgingLayerWithContext[], asOf: Date, buckets?: Agi
         rowsByBucket.set(key, {
           ...current,
           qty: roundQuantity(toDecimal(current.qty).add(bucket.qty), 4).toString(),
-          valueBase: roundQuantity(toDecimal(current.valueBase).add(bucket.valueBase), 6).toString(),
+          valueBase: roundQuantity(toDecimal(current.valueBase ?? 0).add(bucket.valueBase), 6).toString(),
         })
       } else {
         rowsByBucket.set(key, {
@@ -454,7 +457,7 @@ function summarizeBuckets(rows: InventoryAgingReportRow[]): InventoryAgingReport
       valueBase: new Prisma.Decimal(0),
     }
     current.qty = current.qty.add(toDecimal(row.qty))
-    current.valueBase = current.valueBase.add(toDecimal(row.valueBase))
+    current.valueBase = current.valueBase.add(toDecimal(row.valueBase ?? 0))
     byBucket.set(row.bucket, current)
   }
   return [...byBucket.entries()]
@@ -480,9 +483,13 @@ export async function getInventoryAgingReport(
   const rows = toReportRows(layers, asOf, options.buckets)
   const totals = rows.reduce((sum, row) => ({
     qty: sum.qty.add(toDecimal(row.qty)),
-    valueBase: sum.valueBase.add(toDecimal(row.valueBase)),
+    valueBase: sum.valueBase.add(toDecimal(row.valueBase ?? 0)),
   }), { qty: new Prisma.Decimal(0), valueBase: new Prisma.Decimal(0) })
-  const paged = options.paginate === false ? { rows, pageInfo: pageInfo(rows.length, 1, Math.max(rows.length, 1)) } : paginate(rows, filters)
+  // Value is a cost figure: it leaves the server only for inventory.prices roles (filters.includeCost). Strip before paging.
+  const costVisible = filters.includeCost === true
+  const bucketSummary = summarizeBuckets(rows)
+  const outputRows = costVisible ? rows : rows.map(({ valueBase: _valueBase, ...rest }) => rest)
+  const paged = options.paginate === false ? { rows: outputRows, pageInfo: pageInfo(outputRows.length, 1, Math.max(outputRows.length, 1)) } : paginate(outputRows, filters)
   const kitNotice = productType === ProductType.KIT
     ? 'Virtual KIT SKUs hold no cost layers of their own, so there is nothing to age for this filter; age their component SKUs instead.'
     : 'Virtual KIT SKUs are excluded from the aging list; their component SKUs are aged from their own cost layers.'
@@ -495,10 +502,10 @@ export async function getInventoryAgingReport(
     pageInfo: paged.pageInfo,
     totals: {
       qty: roundQuantity(totals.qty, 4).toString(),
-      valueBase: roundQuantity(totals.valueBase, 6).toString(),
+      ...(costVisible ? { valueBase: roundQuantity(totals.valueBase, 6).toString() } : {}),
     },
-    bucketSummary: summarizeBuckets(rows),
-    notices: [kitNotice, valueNotice],
+    bucketSummary: costVisible ? bucketSummary : bucketSummary.map(({ valueBase: _valueBase, ...rest }) => rest),
+    notices: costVisible ? [kitNotice, valueNotice] : [kitNotice],
   }
 }
 
@@ -513,7 +520,7 @@ export function emptyInventoryAgingReportForSourceLimit(
     generatedAt: now.toISOString(),
     rows: [],
     pageInfo: pageInfo(0, 1, clampPageSize(filters.pageSize)),
-    totals: { qty: '0', valueBase: '0' },
+    totals: filters.includeCost === true ? { qty: '0', valueBase: '0' } : { qty: '0' },
     bucketSummary: [],
     notices: [sourceLimitNotice(error)],
   }
@@ -624,7 +631,8 @@ async function loadDeadStockPositions(
   const missingCostLayerCount = positions.filter((position) => toDecimal(position.valueBase).eq(0)).length
   return {
     positions,
-    notices: missingCostLayerCount > 0
+    // The count of zero-value rows is itself a statement about value, so it is only given to roles that see value.
+    notices: filters.includeCost === true && missingCostLayerCount > 0
       ? [`${missingCostLayerCount.toLocaleString()} stocked row(s) have no positive cost-layer value; dead-stock value is reported as 0 for those rows.`]
       : [],
   }
@@ -883,12 +891,17 @@ export async function getDeadStockReport(
       warehouseId: position.warehouseId,
     }
   }) as DeadStockReportRow[]
+  const costVisible = filters.includeCost === true
+  // calculateDeadStock orders by value descending, which would leak the relative value of each row (and decide which rows land on
+  // page one) to roles without inventory.prices; those roles get a SKU / warehouse order instead.
+  if (!costVisible) rows.sort((a, b) => a.sku.localeCompare(b.sku) || a.warehouseCode.localeCompare(b.warehouseCode))
   const totals = rows.reduce((sum, row) => ({
     qty: sum.qty.add(toDecimal(row.qty)),
-    valueBase: sum.valueBase.add(toDecimal(row.valueBase)),
+    valueBase: sum.valueBase.add(toDecimal(row.valueBase ?? 0)),
     neverSoldRows: sum.neverSoldRows + (row.lastSaleAt == null ? 1 : 0),
   }), { qty: new Prisma.Decimal(0), valueBase: new Prisma.Decimal(0), neverSoldRows: 0 })
-  const paged = options.paginate === false ? { rows, pageInfo: pageInfo(rows.length, 1, Math.max(rows.length, 1)) } : paginate(rows, filters)
+  const outputRows = costVisible ? rows : rows.map(({ valueBase: _valueBase, ...rest }) => rest)
+  const paged = options.paginate === false ? { rows: outputRows, pageInfo: pageInfo(outputRows.length, 1, Math.max(outputRows.length, 1)) } : paginate(outputRows, filters)
 
   return {
     asOf: asOf.toISOString(),
@@ -900,7 +913,7 @@ export async function getDeadStockReport(
     pageInfo: paged.pageInfo,
     totals: {
       qty: roundQuantity(totals.qty, 4).toString(),
-      valueBase: roundQuantity(totals.valueBase, 6).toString(),
+      ...(costVisible ? { valueBase: roundQuantity(totals.valueBase, 6).toString() } : {}),
       neverSoldRows: totals.neverSoldRows,
     },
     notices: [
@@ -928,7 +941,7 @@ export function emptyDeadStockReportForSourceLimit(
     velocityWindowDateTo: dateOnly(velocityWindow.dateTo),
     rows: [],
     pageInfo: pageInfo(0, 1, clampPageSize(filters.pageSize)),
-    totals: { qty: '0', valueBase: '0', neverSoldRows: 0 },
+    totals: filters.includeCost === true ? { qty: '0', valueBase: '0', neverSoldRows: 0 } : { qty: '0', neverSoldRows: 0 },
     notices: [sourceLimitNotice(error)],
   }
 }

@@ -40,7 +40,7 @@ Click the **Columns** button to show or hide table columns. Your selection is sa
   includes units the WMS stock-sync alignment brought in, which raise stock and lay cost layers
   without recording a receipt against the transfer line. A transfer the WMS has fully accounted
   for therefore shows nothing incoming, and its own ASN is not added a second time on top.
-- **COGS Value** — total inventory value from FIFO cost layers (visible by default)
+- **COGS Value** — total inventory value from FIFO cost layers (visible by default). Only roles holding the `inventory.prices` permission (Admin, Manager, Finance) see it; for Warehouse and Read-only users the column is not shown and the value is not sent to the browser. The same roles see the COGS value, average unit cost and **FIFO Cost Layers** card on a product page, and the `inventoryValue` column of the product CSV export (blank for other roles).
 - **Variants**, **Created**, **Updated** — additional metadata columns
 
 ### CSV Export

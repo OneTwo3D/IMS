@@ -13,6 +13,7 @@ import {
   type DeadStockReportRow,
 } from '@/lib/domain/inventory/inventory-health-reports'
 import { requireStockPositionReportAccess } from '@/lib/security/stock-position-access'
+import { canViewStockValue } from '@/lib/security/stock-position-policy'
 import { formatMoneyCode } from '@/lib/utils'
 import {
   StockPositionReportPage,
@@ -36,10 +37,11 @@ function positiveInteger(value: string | undefined): { value: number | undefined
   return { value: undefined, notice: `Threshold value "${value}" was invalid; using 90 days.` }
 }
 
-function filtersFromSearch(searchParams: SearchParams): { filters: StockPositionFilters; thresholdNotice: string | null } {
+function filtersFromSearch(searchParams: SearchParams, includeCost: boolean): { filters: StockPositionFilters; thresholdNotice: string | null } {
   const threshold = positiveInteger(one(searchParams.thresholdDays))
   return {
     filters: {
+      includeCost,
       asOf: one(searchParams.asOf),
       warehouseId: one(searchParams.warehouseId),
       categoryId: one(searchParams.categoryId),
@@ -58,9 +60,11 @@ function daysSinceLastSale(row: DeadStockReportRow): string {
 }
 
 export default async function DeadStockPage({ searchParams }: { searchParams: Promise<SearchParams> }) {
-  await requireStockPositionReportAccess()
+  const session = await requireStockPositionReportAccess()
+  // Value is a cost figure: only inventory.prices roles get it, and the report omits it server-side otherwise.
+  const costVisible = canViewStockValue(session.user.role)
   const resolvedSearchParams = await searchParams
-  const { filters, thresholdNotice } = filtersFromSearch(resolvedSearchParams)
+  const { filters, thresholdNotice } = filtersFromSearch(resolvedSearchParams, costVisible)
   const [report, filterOptions, organisation] = await Promise.all([
     getDeadStockReport(filters).catch((error: unknown) => {
       if (error instanceof InventoryHealthSourceLimitError) return emptyDeadStockReportForSourceLimit(filters, error)
@@ -98,13 +102,13 @@ export default async function DeadStockPage({ searchParams }: { searchParams: Pr
       render: (row) => `${row.qty} ${row.stockUnit}`,
       footer: report.totals.qty,
     },
-    {
+    ...(costVisible ? [{
       key: 'value',
       label: `Value (${currency})`,
-      align: 'right',
-      render: (row) => formatMoneyCode(Number(row.valueBase), currency),
-      footer: formatMoneyCode(Number(report.totals.valueBase), currency),
-    },
+      align: 'right' as const,
+      render: (row: DeadStockReportRow) => formatMoneyCode(Number(row.valueBase ?? '0'), currency),
+      footer: formatMoneyCode(Number(report.totals.valueBase ?? '0'), currency),
+    }] : []),
   ]
 
   return (
@@ -121,7 +125,7 @@ export default async function DeadStockPage({ searchParams }: { searchParams: Pr
       summary={[
         { label: 'Dead-stock rows', value: report.pageInfo.totalRows.toLocaleString(), tone: report.pageInfo.totalRows > 0 ? 'warning' : 'default' },
         { label: 'Quantity', value: report.totals.qty },
-        { label: `Value (${currency})`, value: formatMoneyCode(Number(report.totals.valueBase), currency), tone: decimalStringPositive(report.totals.valueBase) ? 'warning' : 'default' },
+        ...(costVisible ? [{ label: `Value (${currency})`, value: formatMoneyCode(Number(report.totals.valueBase ?? '0'), currency), tone: decimalStringPositive(report.totals.valueBase ?? '0') ? 'warning' as const : 'default' as const }] : []),
         { label: 'Never sold', value: report.totals.neverSoldRows.toLocaleString() },
         { label: 'Threshold', value: `${report.thresholdDays} days` },
       ]}

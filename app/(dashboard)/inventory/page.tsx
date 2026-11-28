@@ -62,6 +62,7 @@ export default async function InventoryPage({
         productCategories={categories}
         supplierId={sp.supplierId}
         supplierOptions={supplierOptions}
+        canSeeStockValue={canEditPrices}
       />
 
       <ProductTable
@@ -72,6 +73,7 @@ export default async function InventoryPage({
         searchParams={{ search: sp.search, type: sp.type, lifecycleStatus: sp.lifecycleStatus, categoryId: sp.categoryId, supplierId: sp.supplierId, sort: sp.sort, dir: sp.dir }}
         canEdit={canEdit}
         canEditPrices={canEditPrices}
+        canSeeStockValue={canEditPrices}
       />
     </div>
   )

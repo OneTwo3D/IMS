@@ -166,6 +166,8 @@ Safeguards: you cannot change your own role away from Administrator, deactivate 
 
 The **Role Permissions** panel on Settings > Users shows a one-line summary of each role. Refunds, and seeing cost prices, are limited to the Administrator, Manager and Finance roles; Warehouse and Read Only users do not see cost prices.
 
+**Stock value.** Seeing stock value and unit cost is the `inventory.prices` permission, held by Administrator, Manager and Finance only. It covers every stock report (Stock on Hand, Inventory Aging, Dead Stock, Slow Stock, the Stock Movement Ledger, Stock Adjustments, Stock Transfers and Stock Counts, including their CSV exports and the minimum-value filters), the **COGS Value** column on the product list, and the COGS value, average unit cost and FIFO cost layers on a product page. For other roles the figures are not sent to the browser at all, so they cannot be read from the page source or a download; those roles still see quantities. This also covers stock counts (the **Est. value** column and value sort) and the stock-levels and adjustments CSV exports (cost columns left blank). Not part of this rule: supplier prices and purchase costs, and manufacturing cost lines, which are governed by their own permissions.
+
 ## Permission System
 
 The system includes a role-based access control (RBAC) layer. Permissions control:

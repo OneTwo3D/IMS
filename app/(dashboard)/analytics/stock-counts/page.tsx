@@ -12,6 +12,7 @@ import {
   stockPositionSelectedFilterOptionInputs,
 } from '@/lib/domain/inventory/stock-position-reports'
 import { requireInventoryLedgerReportAccess } from '@/lib/security/inventory-ledger-access'
+import { canViewStockValue } from '@/lib/security/stock-position-policy'
 import { formatMoneyCode } from '@/lib/utils'
 import {
   InventoryLedgerReportPage,
@@ -21,9 +22,11 @@ import {
 export const metadata: Metadata = { title: 'Stock Counts' }
 
 export default async function StockCountsReportPage({ searchParams }: { searchParams: Promise<InventoryLedgerSearchParams> }) {
-  await requireInventoryLedgerReportAccess()
+  const session = await requireInventoryLedgerReportAccess()
+  // Adjustment value is a cost figure: only inventory.prices roles get it, and the report omits it server-side otherwise.
+  const costVisible = canViewStockValue(session.user.role)
   const resolvedSearchParams = await searchParams
-  const filters = inventoryLedgerFiltersFromSearch(resolvedSearchParams, { includeStatus: true })
+  const filters = { ...inventoryLedgerFiltersFromSearch(resolvedSearchParams, { includeStatus: true }), includeCost: costVisible }
   const [report, filterOptions, organisation] = await Promise.all([
     getStockCountReport(filters),
     getStockPositionFilterOptions(stockPositionSelectedFilterOptionInputs(filters)),
@@ -38,13 +41,13 @@ export default async function StockCountsReportPage({ searchParams }: { searchPa
     { key: 'expected', label: 'Book qty', align: 'right', render: (row) => row.expectedQty, footer: report.totals.expectedQty },
     { key: 'counted', label: 'Counted qty', align: 'right', render: (row) => row.countedQty ?? 'Open', footer: report.totals.countedQty },
     { key: 'variance', label: 'Variance', align: 'right', render: (row) => row.varianceQty, footer: report.totals.varianceQty },
-    {
+    ...(costVisible ? [{
       key: 'value',
       label: `Adjustment value (${currency})`,
-      align: 'right',
-      render: (row) => row.linkedAdjustmentValueBase == null ? 'No evidence' : formatMoneyCode(Number(row.linkedAdjustmentValueBase), currency),
-      footer: formatMoneyCode(Number(report.totals.linkedAdjustmentValueBase), currency),
-    },
+      align: 'right' as const,
+      render: (row: StockCountReportRow) => row.linkedAdjustmentValueBase == null ? 'No evidence' : formatMoneyCode(Number(row.linkedAdjustmentValueBase), currency),
+      footer: formatMoneyCode(Number(report.totals.linkedAdjustmentValueBase ?? '0'), currency),
+    }] : []),
     { key: 'completed', label: 'Completed', render: (row) => row.completedAt?.slice(0, 10) ?? 'Open' },
   ]
 
@@ -61,7 +64,7 @@ export default async function StockCountsReportPage({ searchParams }: { searchPa
       columns={columns}
       summary={[
         { label: 'Variance qty', value: report.totals.varianceQty, tone: Number(report.totals.varianceQty) !== 0 ? 'warning' : 'default' },
-        { label: `Linked value (${currency})`, value: formatMoneyCode(Number(report.totals.linkedAdjustmentValueBase), currency) },
+        ...(costVisible ? [{ label: `Linked value (${currency})`, value: formatMoneyCode(Number(report.totals.linkedAdjustmentValueBase ?? '0'), currency) }] : []),
         { label: 'Missing evidence rows', value: report.totals.missingAdjustmentEvidenceRows.toLocaleString(), tone: report.totals.missingAdjustmentEvidenceRows > 0 ? 'warning' : 'default' },
         { label: 'Repeat-offender SKUs', value: report.totals.repeatOffenderSkus.toLocaleString() },
       ]}
