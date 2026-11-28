@@ -235,6 +235,8 @@ Bundle handling is component-driven:
 
 To set up a Kit, use the **Kit Components** editor on the product page: search for a product, add it, and enter the quantity of each component required per Kit. The quantity box steps in whole numbers (minimum 0); a line with a blank or zero quantity is ignored when you click **Save Kit Components**. A product can only appear once in the list. If another Kit or BOM already has exactly the same components and quantities, an amber **Duplicate component configuration** notice names it, which helps catch an accidentally copied recipe; it is a warning and does not stop you saving.
 
+**Components that are not stock-tracked.** A **Non-Inventory** component (a leaflet, gift wrap, a service or fee) puts no limit on the kit's stock: kit availability, the WooCommerce stock push, allocation and dispatch ignore it, and the packing slip lists it under "Also pack (not stock-tracked)". While the warehouse connector (Mintsoft) is switched on, such a kit is shown as 0 in the shop, because the warehouse bundle cannot include a part with no warehouse product. A Kit cannot be saved (in the editor, the CSV import or a BOM-to-Kit conversion) with a **Variable** parent as a component (choose a specific variation) or with only Non-Inventory components (make it a Non-Inventory product instead). A kit that already has either fails closed at 0 and cannot be allocated.
+
 A Kit's recipe is simply its component list. There is no separate stored "Kit" record, so nothing else needs maintaining; the older Kit tables have been removed. One visible consequence: the **Inventory Aging** report filtered to Type **Kit** is now empty and shows a notice saying virtual Kit SKUs hold no cost layers of their own. Age the component SKUs instead.
 
 **Kit components cannot be changed while sales orders are still in flight against them.** Allocation,
@@ -406,8 +408,8 @@ The same proposal also appears in the **HS Code Classification** card on the pro
 Each product displays four stock figures per warehouse:
 
 - **On Hand** -- Total physical stock in the warehouse.
-- **Allocated** -- Quantity reserved by confirmed sales orders. Click the figure to see which orders hold the allocation.
-- **Available** -- On Hand minus Allocated.
+- **Allocated** -- Quantity reserved by sales orders (and by open manufacturing orders). An order holds its reservation until its shipment actually ships: a shipment that is picking or packed still holds it, and only the units not yet shipped count. Click the figure to see which orders hold the allocation.
+- **Available** -- On Hand minus Allocated. A warehouse of type **Quarantine** (unsellable returns, only while the condition check on returns is switched on) counts in On Hand but never in Available. See [Stock Control](stock-control.md#quarantine-unsellable-returns-switched-off-by-default).
 - **Incoming** -- Quantity on open purchase orders or inbound transfers, net of everything that has
   already arrived by any route (a manual receipt, a WMS book-in, or a WMS stock-sync alignment).
   Click the figure to see the source POs or transfers.
@@ -438,7 +440,12 @@ A product's **reorder point**, **safety stock** and **reorder quantity** are set
 
 ## FIFO Cost Layers
 
-Every time stock is received (from a purchase order or build order), a new FIFO cost layer is created recording the quantity and unit cost. When stock is sold or consumed, the oldest layers are used first. This ensures your cost of goods sold accurately reflects purchase prices over time.
+Every time stock comes in, a new FIFO cost layer is created recording the warehouse, the quantity and the unit cost. Layers are laid by purchase receipts (manual, warehouse book-in, or a Mintsoft Align To WMS increase), build orders (including the components a disassembly releases), opening stock, stock additions, transfer receipts and refund restocks. When stock is sold or consumed, the oldest layers in that warehouse are used first (a supplier return takes only the layers of the purchase-order line it returns). This ensures your cost of goods sold accurately reflects purchase prices over time.
+
+- **Landed cost** is added to the layers of the goods it belongs to, so cost of goods sold carries the all-in cost. A supplier credit cannot take a layer below 0.00 per line; the part the floor cannot absorb is reported on the purchase order.
+- **The product page** shows the **FIFO Cost Layers** card, the COGS value and the average unit cost to roles holding `inventory.prices` (Admin, Manager, Finance); other roles do not receive the figures.
+- A **Kit** holds no layers of its own (its components do), and a Non-Inventory product holds none at all.
+- The rules for choosing a cost when you add stock by hand are in [Stock Control](stock-control.md#single-adjustment).
 
 
 ## Lifecycle Status

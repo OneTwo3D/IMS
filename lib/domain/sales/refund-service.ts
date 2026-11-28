@@ -38,7 +38,7 @@ import { findGrossOverPaidBalance, findOverAllocatedRefundTarget, invalidQuantit
 import { orderDiscountReversal, refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
 import { discountSplitEntryTaxType, parseDiscountTaxSplit } from '@/lib/domain/sales/discount-tax-split'
 import { refreshedDiscountSplit } from '@/lib/domain/sales/discount-tax-split-codes'
-import { postedAwareRateIndex, postedDiscountTaxType, postedHeaderDiscountTaxType, postedShippingTaxType, postedTaxTypeByLineId, readPostedInvoiceRecord, readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
+import { postedAwareRateIndex, postedCodesAmbiguityRefusal, postedDiscountTaxType, postedHeaderDiscountTaxType, postedShippingTaxType, postedTaxTypeByLineId, readPostedInvoiceRecord, readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { planSplitDiscountReversal } from '@/lib/domain/sales/discount-tax-split-plan'
 import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basis'
 import { resolveSchemePostingSnapshot } from '@/lib/domain/sales/refund-scheme-posting'
@@ -4363,6 +4363,9 @@ export async function createSalesOrderRefund(
     // The shipping line and the single (header-rate) discount line were posted on the order default rate's code as it was THEN, which the record states when it names the rate it was read from; else the current default.
     const shippingTaxType = postedShippingTaxType(postedInvoiceCodes) ?? orderDefaultTaxType
     const headerDiscountTaxType = postedHeaderDiscountTaxType(postedInvoiceCodes) ?? orderDefaultTaxType
+    // A rate the posted record gives two different codes is REFUSED, not read on its current code (that would be a guess): the refund lines' rates here, the split's rates where the discount is cut.
+    const ambiguousPosted = postedCodesAmbiguityRefusal(postedInvoiceCodes, refundLines.map((l) => (l.lineId ? so.lines.find((x) => x.id === l.lineId)?.taxRateId : null)))
+    if (ambiguousPosted) return { error: ambiguousPosted } as const
 
     // AN EXCHANGE IS CHECKED BEFORE ANYTHING IS WRITTEN: under the order lock, the replacement lines may be added now, or the whole refund is refused (nothing created).
     if (input.exchange) {
@@ -4463,6 +4466,8 @@ export async function createSalesOrderRefund(
         if (so.discountRestatement != null) {
           return { error: 'This order\'s discount was restated after it was invoiced, so its reversal cannot be worked out automatically, and no refund was created.' } as const
         }
+        const ambiguousSplit = postedCodesAmbiguityRefusal(postedInvoiceCodes, discountSplit.map((entry) => entry.taxRateId))
+        if (ambiguousSplit) return { error: ambiguousSplit } as const
         const priorRows = await tx.salesOrderRefundLine.findMany({
           where: { refund: { orderId: input.orderId } },
           select: { salesOrderLineId: true, lineKind: true, totalForeign: true, totalBase: true, discountTaxRateId: true },
@@ -6222,7 +6227,7 @@ export async function createSalesOrderRefund(
  *
  * Returns the refusal, or null when the posting still agrees with the money.
  */
-async function fenceRetryPostedTax(
+export async function fenceRetryPostedTax(
   tx: Prisma.TransactionClient,
   orderId: string,
   order: {
@@ -6285,12 +6290,14 @@ async function fenceRetryPostedTax(
   const postedTaxTypeOf = creditNoteLineTaxTypeResolver({
     orderLines: order.lines,
     reverseChargeSalesTaxType,
-    orderDefaultTaxType: postedShippingTaxType(postedCodes) ?? (order.taxRateName
+    orderDefaultTaxType: order.taxRateName
       ? (await tx.taxRate.findFirst({
           where: { name: order.taxRateName, active: true },
           select: { accountingTaxType: true },
         }))?.accountingTaxType ?? null
-      : null),
+      : null,
+    shippingTaxType: postedShippingTaxType(postedCodes),
+    headerDiscountTaxType: postedHeaderDiscountTaxType(postedCodes),
     postedTaxTypeByLineId: postedTaxTypeByLineId(order.lines, postedCodes),
   })
   const baseCurrency = await resolveBaseCurrencyCode(tx)

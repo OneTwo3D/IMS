@@ -91,7 +91,7 @@ type GuardClient = {
  * list does not carry (a stale Demo code) is therefore not valid; one that is live (a swap) is. A client that cannot answer (a structural double without the Xero store) is judged on the format alone.
  * Reads only; the caller holds the selection lock.
  */
-async function validLiveCodes(c: GuardClient, codes: readonly string[]): Promise<Set<string>> {
+export async function validLiveCodes(c: GuardClient, codes: readonly string[]): Promise<Set<string>> {
   const wellFormed = [...new Set(codes)].filter((code) => XERO_TAX_TYPE_FORMAT.test(code))
   const valid = new Set(wellFormed.filter((code) => !isOrganisationSpecificTaxType(code)))
   const custom = wellFormed.filter((code) => isOrganisationSpecificTaxType(code))
