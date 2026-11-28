@@ -40,6 +40,7 @@ type SyncRow = {
   /** o3d-v7sy: which reader's evidence this row is. The delete guard and the daily-batch recreate
    * verdict both select on it, so retention's exemption is keyed on it too. */
   referenceType?: string
+  connector?: string
   externalTransactionId?: string | null
   backReferenceCheckedAt?: Date | null
   backReferenceEvidenceCompactedAt?: Date | null
@@ -74,7 +75,8 @@ type Where = {
   createdAt?: { lt: Date }
   status?: { notIn?: string[]; in?: string[] } | string
   type?: { in?: string[]; notIn?: string[] }
-  referenceType?: { in?: string[] }
+  referenceType?: { in?: string[] } | string
+  connector?: string
   externalTransactionId?: { not: string | null } | string | null
   backReferenceCheckedAt?: null
   backReferenceEvidenceCompactedAt?: null
@@ -121,7 +123,10 @@ function matches(row: SyncRow, where: Where): boolean {
   // collapse to its `OR` and every SYNCED row anywhere would look retained — and the v7sy tests
   // below would pass whether the reference-type restriction existed or not, which is the same
   // vacuity this file's header warns about for the clauses that came before it.
-  if (where.referenceType?.in && !where.referenceType.in.includes(row.referenceType ?? '')) return false
+  if (typeof where.referenceType === 'object' && where.referenceType.in && !where.referenceType.in.includes(row.referenceType ?? '')) return false
+  // POSTED_INVOICE_RECORD_WHERE (the posted invoice records retention keeps) names one connector and one reference type by equality; an unknown key would be ignored and the exemption would read as universal.
+  if (typeof where.referenceType === 'string' && row.referenceType !== where.referenceType) return false
+  if (where.connector !== undefined && (row.connector ?? 'xero') !== where.connector) return false
   if ('abandonedBeforeRemoteCall' in where && (row.abandonedBeforeRemoteCall ?? null) !== where.abandonedBeforeRemoteCall) {
     return false
   }

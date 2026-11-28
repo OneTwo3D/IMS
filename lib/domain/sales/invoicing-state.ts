@@ -33,7 +33,7 @@
  * queued; there is no per-shipment invoice and no consolidated invoice). The only measurable shortfall is therefore
  * QUANTITY: the quantity on the latest counted IMS invoice document's lines against the quantity on the order's lines now.
  * Fewer units invoiced than ordered is PARTIALLY_INVOICED; at least as many is FULLY_INVOICED. A document whose lines are
- * not readable (retention compacted the payload) and a Xeroom-found or link-only invoice (IMS cannot read what that
+ * not readable (an old row's payload compacted by retention to `{}`; a posted invoice's row keeps its line quantities) and a Xeroom-found or link-only invoice (IMS cannot read what that
  * document covers; the incumbent raises one invoice for the whole order) read FULLY_INVOICED: an invoice exists, and
  * IMS does not guess a shortfall it cannot measure.
  *

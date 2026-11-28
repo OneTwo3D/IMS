@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { postedDiscountTaxType, postedHeaderDiscountTaxType, postedLineTaxType, postedShippingTaxType, postedTaxCodesFromPayload, postedTaxTypeByLineId, withPostedCodeRates } from '@/lib/domain/sales/posted-invoice-tax-codes'
+import { postedDiscountTaxType, postedHeaderDiscountTaxType, postedLineTaxType, postedShippingTaxType, postedTaxCodesFromPayload, postedTaxTypeByLineId, withPostedCodeRates, postedInvoicePayloadProjection, invoiceRowTombstonePayload } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { creditNoteLineTaxTypeResolver, resolvePostedRefundTaxIdentity, buildTaxTypeRateIndex } from '@/lib/domain/sales/refund-posted-tax-identity'
 
 /**
@@ -114,4 +114,32 @@ test('the record keeps the basis each code was bound on: goods and discount part
   })!
   assert.deepEqual(posted.rateIdsByCode.get('L'), [{ rateId: 'R', basis: 'sales_line' }])
   assert.deepEqual(posted.rateIdsByCode.get('S'), [{ rateId: 'R', basis: 'plain' }], 'bound once on the plain basis')
+})
+
+test('the retention projection keeps the posted codes and non-personal fields, drops names, emails, line text and the reference, and reads exactly like the original', () => {
+  const original = {
+    contactName: 'A Person', contactEmail: 'a@example.test', reference: 'SO-1', accountingInvoiceId: 'inv-1', date: '2026-01-02', currency: 'GBP',
+    lines: [{ description: 'secret text', quantity: 2, unitAmount: 5, taxType: 'L', taxRateId: 'R', taxRateBasis: 'sales_line', itemCode: 'SKU' }],
+    shippingTaxType: 'S', shippingTaxRateId: 'R', shippingTaxRateBasis: 'plain', discountTaxType: 'H', discountTaxRateId: 'R',
+    discountParts: [{ amount: 3, taxType: 'P', taxRateId: 'R', taxRateBasis: 'sales_line' }],
+  }
+  const projection = postedInvoicePayloadProjection(original)
+  const text = JSON.stringify(projection)
+  for (const gone of ['A Person', 'a@example.test', 'secret text', 'SO-1']) assert.equal(text.includes(gone), false, gone)
+  assert.equal(projection._compactedProjection, true)
+  const a = postedTaxCodesFromPayload(original)!
+  const b = postedTaxCodesFromPayload(projection)!
+  assert.deepEqual([...b.lineCodeByRateId], [...a.lineCodeByRateId])
+  assert.deepEqual([...b.discountCodeByRateId], [...a.discountCodeByRateId])
+  assert.equal(b.shippingCode, a.shippingCode)
+  assert.equal(b.headerDiscountCode, a.headerDiscountCode)
+})
+
+test('every other invoice row retention compacts keeps only the document id it names', () => {
+  const base = { connector: 'xero', referenceType: 'SalesOrder' }
+  assert.deepEqual(invoiceRowTombstonePayload({ ...base, type: 'SALES_INVOICE_UPDATE', payload: { accountingInvoiceId: 'inv-1', contactName: 'x', _connectionProvenance: 'org-1' } }), { accountingInvoiceId: 'inv-1', _connectionProvenance: 'org-1' })
+  assert.equal(invoiceRowTombstonePayload({ ...base, type: 'SALES_INVOICE', payload: { lines: [] } }), null)
+  assert.equal(invoiceRowTombstonePayload({ ...base, type: 'CREDIT_NOTE', payload: { accountingInvoiceId: 'inv-1' } }), null)
+  assert.equal(invoiceRowTombstonePayload({ connector: 'qoblex', referenceType: 'SalesOrder', type: 'SALES_INVOICE_UPDATE', payload: { accountingInvoiceId: 'inv-1' } }), null, 'another connector compacts to {}')
+  assert.equal(invoiceRowTombstonePayload({ connector: 'xero', referenceType: 'PurchaseOrder', type: 'SALES_INVOICE_UPDATE', payload: { accountingInvoiceId: 'inv-1' } }), null, 'another reference type compacts to {}')
 })

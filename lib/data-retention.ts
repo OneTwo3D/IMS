@@ -13,6 +13,8 @@ import { POSTABLE_ACCOUNTING_SYNC_STATUSES } from '@/lib/domain/accounting/posta
 import { WC_REFUND_PARK_RECOVERED_ACTION, WC_REFUND_PARK_VERIFICATION_MIGRATION } from '@/lib/domain/sales/refund-park-recovery'
 import { openWcCompletionRefusalRowSql, openWcOrderEditDriftRowSql, pendingAdmissionRefusalRowSql, recoveryAccusedRowSql, unresolvedWcOrderRowSql } from '@/lib/domain/sales/wc-sync-row-families'
 import { EXTERNAL_DOCUMENT_EVIDENCE_WHERE } from '@/lib/domain/accounting/external-document-evidence'
+import { ledgerStanding, namesADocument } from '@/lib/domain/accounting/ledger-standing'
+import { invoiceRowTombstonePayload, POSTED_INVOICE_RECORD_WHERE, postedInvoicePayloadProjection } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { REMOTE_MONEY_EVIDENCE_TYPES } from '@/lib/domain/accounting/remote-money-evidence'
 import { UNRESOLVED_ABANDONED_CLAIM_WHERE } from '@/lib/domain/accounting/unresolved-abandoned-claim'
 import {
@@ -413,6 +415,8 @@ export async function purgeExpiredData(): Promise<{
             { NOT: UNRESOLVED_BACK_REFERENCE_EVIDENCE_WHERE },
             { NOT: UNRESOLVED_ABANDONED_CLAIM_WHERE },
             { NOT: EXTERNAL_DOCUMENT_EVIDENCE_WHERE },
+            // Owner ruling 2026-11-28: the posted invoice records (the rows a refund reads the posted tax codes from) are never deleted, stated here rather than left to the exemption above. They are compacted to a projection by the pass below, not exempt from it.
+            { NOT: POSTED_INVOICE_RECORD_WHERE },
           ],
         },
       }),
@@ -564,7 +568,7 @@ export async function purgeExpiredData(): Promise<{
       if (remaining <= 0) break
       const page = await db.accountingSyncLog.findMany({
         where: keptWhole.length > 0 ? { ...compactableWhere, id: { notIn: keptWhole } } : compactableWhere,
-        select: { id: true, type: true, referenceType: true, externalTransactionId: true, payload: true },
+        select: { id: true, type: true, referenceType: true, externalTransactionId: true, payload: true, connector: true, status: true, settlementBasis: true, abandonedBeforeRemoteCall: true },
         orderBy: { createdAt: 'asc' },
         take: Math.min(BACK_REFERENCE_EVIDENCE_COMPACTION_PAGE_SIZE, remaining),
       })
@@ -596,6 +600,13 @@ export async function purgeExpiredData(): Promise<{
           }
           accountNets = summary as unknown as Prisma.InputJsonValue
         }
+        // THE POSTED INVOICE RECORD (owner ruling: keep the tax codes, not the whole payload): a connector-confirmed invoice / update row of an order is reduced to its projection (the posted codes and the
+        // non-personal fields other readers use; names, emails, line text and the reference are removed). Any other invoice / update row keeps only the document id it names, so a compacted newer update
+        // stays a candidate of the reader's walk (and answers "no record") rather than letting an older version speak.
+        const isPostedRecord = row.connector === 'xero' && row.referenceType === 'SalesOrder' && (row.type === 'SALES_INVOICE' || row.type === 'SALES_INVOICE_UPDATE')
+          && namesADocument({ externalTransactionId: row.externalTransactionId })
+          && ledgerStanding({ status: row.status, externalTransactionId: row.externalTransactionId, abandonedBeforeRemoteCall: row.abandonedBeforeRemoteCall ?? null, settlementBasis: row.settlementBasis ?? null }) === 'CONFIRMED_POSTED'
+        const keptPayload = isPostedRecord ? postedInvoicePayloadProjection(row.payload) : invoiceRowTombstonePayload(row)
         const { count } = await db.accountingSyncLog.updateMany({
           // THE WHOLE SELECTION PREDICATE, RE-ASSERTED — not just the row id and the compaction stamp
           // (o3d-bqw7 r3, Codex HIGH). The read and the write are separate statements, so every
@@ -615,10 +626,12 @@ export async function purgeExpiredData(): Promise<{
           where: {
             ...compactableWhere,
             id: row.id,
-            ...(accountNets ? { payload: { equals: row.payload as Prisma.InputJsonValue } } : {}),
+            // The kept payload was derived from the payload read above, as the journal's summary was: equality makes a write over a payload that changed since a no-op (re-selected next run).
+            ...(accountNets || keptPayload ? { payload: { equals: row.payload as Prisma.InputJsonValue } } : {}),
           },
           data: {
             ...backReferenceEvidenceTombstone(now),
+            ...(keptPayload ? { payload: keptPayload as Prisma.InputJsonValue } : {}),
             ...(accountNets ? { payloadAccountNets: accountNets } : {}),
             // Keys only — no name, address, amount or document text. See the migration.
             followUpObligations: followUpObligationsOwedBy(row),
