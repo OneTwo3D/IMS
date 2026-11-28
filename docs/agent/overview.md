@@ -126,10 +126,11 @@ onetwo3d-ims/
    - CSV import/export with BOM and variant support
 
 2. **Order-to-Cash** — Sales order full lifecycle:
-   - Workflow: DRAFT → PENDING_PAYMENT → ON_HOLD → PROCESSING → ALLOCATED → PICKING → PACKING → SHIPPED → COMPLETED/DELIVERED
+   - Workflow: DRAFT → PENDING_PAYMENT → ON_HOLD → PROCESSING → ALLOCATED → PICKING → PACKING → SHIPPED → COMPLETED/DELIVERED, or CANCELLED (`SalesOrderStatus`); the refund state (`SalesOrder.refundStatus`) and the invoicing state are separate from the status
    - Multi-warehouse auto-allocation with intelligent allocation rules
    - Shipment management with tracking
-   - Auto/manual invoice generation (configurable trigger)
+   - The accounting invoice is queued at order creation or draft finalisation; the IMS invoice number follows `invoice_trigger` (manual, on shipment, on payment)
+   - Refunds (credit notes, return stock at the originally posted cost, WooCommerce refund import), and behind switches: returns in transit, the return condition check with quarantine warehouses, exchanges inside a return, refund delete
    - Payment tracking against invoices and credit notes
    - Multi-currency with VAT handling and order/line discounts
    - PDF generation and email delivery
