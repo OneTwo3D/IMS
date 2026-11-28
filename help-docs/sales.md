@@ -422,11 +422,9 @@ stock held until someone reconciled it by hand.
 
 A refund of units that never shipped only releases the demand: the stock was never taken out of the warehouse, so there is nothing to put back and no stock is returned for those units. The refund button is available once an order has shipped, or to top up an order that is already partly refunded.
 
-### Refund-time cost revaluation
+### Refund-time cost
 
-When a refund processes returned stock, the system uses the **current** cost-layer unit cost — not the snapshot recorded at shipment time. This means if a landed-cost revaluation has changed the unit cost since the original shipment, the refund's COGS reversal uses the up-to-date value. The returned stock is also valued at the current cost.
-
-This keeps the returned-stock balance sheet entry aligned with the live cost layers. Note that the COGS reversal amount may differ from the originally-posted COGS amount by the revaluation delta — this is the expected behaviour for single-snapshot accounting.
+When a refund returns stock, the COGS reversal and the returned stock are valued at the cost **originally posted when the units shipped** (the shipment's own COGS records), not at the cost layer's current value. A landed-cost revaluation after the shipment therefore does not change what the refund reverses: it gives back exactly the cost that left COGS, so COGS for those units nets to zero. Only an old shipment with no posted cost on record (a dispatch from before FIFO snapshots and COGS records existed) falls back to the cost recorded on the shipment.
 
 ### Refunds that return no stock, and returns whose cost is unknown
 
@@ -436,9 +434,7 @@ Every unit that is restocked carries a cost layer at the **issued cost** of the 
 
 ### Refunds without a shipment source
 
-If a sales order line was allocated but never shipped, the refund rejects with a clear message: *"Cannot return refunded stock for product X: no shipped stock source exists"*. The system refuses to silently restock from an allocation-only source — there's no actual stock movement to reverse.
-
-You can still process the refund as cash-only by leaving the return warehouse unset.
+A refund you record by hand with a return warehouse on an order that has **no shipment at all** is refused with *"Cannot return refunded stock before the order has shipped"*: there is no stock movement to reverse, and IMS never restocks from an allocation. Process it as cash-only by leaving the return warehouse unset (on a partly shipped order, the units that never shipped only release their reservation; see *Refunds on a partly shipped order*). A WooCommerce refund cannot be refused: units that never shipped are not restocked, and if nothing it refunds has shipped, no return warehouse is recorded at all.
 
 ### Warehouse-scoped idempotency
 
@@ -630,11 +626,15 @@ Two cases are refused instead of posting wrongly. Both show as a failed entry un
 
 ## Invoice Generation
 
-Invoices can be generated either manually or automatically. The trigger for automatic invoice generation is configurable in **Settings > Sales Settings**. Options include:
+**The accounting (Xero) invoice and the IMS invoice number are separate.** The sales invoice is queued to the accounting system when the order is created, or when a draft is finalised, whatever the setting below (posted as AUTHORISED, or DRAFT while the *Sales invoices* posting mode is `draft`; see [Xero sync](xero-sync.md)).
 
-- **Manual** — you generate the invoice yourself when ready
-- **On ship** — invoice is created automatically when the order is shipped
-- **On paid** — invoice is created automatically when payment is received in full
+The setting in **Settings > Sales Settings** (`invoice_trigger`) only decides when IMS gives the order its **invoice number** (and invoice date):
+
+- **Manual only** (the default): you generate the number yourself from the order detail page.
+- **On shipment**: the number is generated when the order is shipped (not for an order held short).
+- **On payment**: the number is generated when the order becomes paid (marked as paid, or a payment brings it to fully paid; not for a cancelled order).
+
+An invoice number already queued with the accounting invoice is adopted rather than a second one minted. An order whose invoice number comes from the storefront (WooCommerce PDF Invoices) is never given one by IMS; the number appears once WooCommerce has created the invoice.
 
 ### Deleting an invoice that has synced to Xero
 
