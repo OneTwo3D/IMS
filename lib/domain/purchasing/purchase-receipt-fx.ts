@@ -4,6 +4,8 @@ import { resolveBaseCurrencyCode } from '@/lib/base-currency'
 import { getFxRateToBase, isMissingFxRateError } from '@/lib/currencies/fx-lookup'
 import type { PrepaymentReadDeps, XeroSupplierPrepayment } from '@/lib/connectors/xero/prepayments'
 import { headerDiscountFactorForPo } from '@/lib/domain/purchasing/landed-cost-allocation'
+import { billNetPayableForeign, type NetPayableLine } from '@/lib/domain/purchasing/bill-net-payable'
+import { currencyMinorUnit, toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 import { isPurchaseEventFxEnabled } from '@/lib/domain/purchasing/purchase-event-fx-settings'
 import { PURCHASE_PRICE_VARIANCE_ACCOUNT_KEY, REALISED_FX_ACCOUNT_KEY } from '@/lib/domain/settings/system-switches'
 
@@ -379,6 +381,7 @@ async function applyPrepaymentAnswerUnderLock(
     if (po.fxNoPrepaymentCheckedAt) await tx.$executeRaw`UPDATE purchase_orders SET fx_no_prepayment_checked_at = NULL WHERE id = ${po.id}`
     if (!existing) {
       await tx.purchaseOrderFxLock.create({ data: { poId: po.id, source: PURCHASE_FX_SOURCE_XERO_PREPAYMENT, ...found, readAt: ctx.now, readById: ctx.userId } })
+      await warnOnPrepaymentTotalMismatch(tx, po, found, ctx.userId)
       return { kind: 'locked', changed: true, replaced: false, lock: found } as const
     }
     const same = existing.xeroPrepaymentId === found.xeroPrepaymentId && new Prisma.Decimal(existing.rateToBase).eq(found.rateToBase)
@@ -395,7 +398,86 @@ async function applyPrepaymentAnswerUnderLock(
       } as const
     }
     await tx.purchaseOrderFxLock.update({ where: { id: existing.id }, data: { ...found, readAt: ctx.now, readById: ctx.userId } })
+    // Warned when the stored prepayment (or its total) is new, not on every re-read of the same one.
+    if (existing.xeroPrepaymentId !== found.xeroPrepaymentId || !new Prisma.Decimal(existing.prepaymentTotal).eq(found.prepaymentTotal)) {
+      await warnOnPrepaymentTotalMismatch(tx, po, found, ctx.userId)
+    }
     return { kind: 'locked', changed: !same, replaced: !same, lock: found } as const
+  })
+}
+
+/**
+ * #1142 LOW-2 / #1173 MED-1: what the order says is owed to the supplier, foreign currency, to compare a prepayment with. It is the order's
+ * `totalForeign` (goods net of line and header discount, the supplier's additional costs, and VAT on both) LESS the VAT the buyer accounts for itself
+ * under reverse charge, which the supplier is never paid:
+ *  - each goods line whose tax rate is reverse charge: its net after the header discount x its rate, rounded per line, exactly as a bill's
+ *    reverse-charge VAT is worked out (`billReverseChargeVatForeign`);
+ *  - each vatable additional cost, when the supplier's default rate (the rate the order puts on additional costs) is reverse charge: its amount x the
+ *    order's rate, the same way.
+ * Pure.
+ */
+export function purchaseOrderNetPayableForeign(po: {
+  currency: string
+  totalForeign: DecimalInput
+  subtotalForeign: DecimalInput
+  taxRatePercent: DecimalInput | null
+  lines: ReadonlyArray<{ totalForeign: DecimalInput; taxRate: { rate: DecimalInput; reverseCharge: boolean } | null }>
+  freightCostLines: ReadonlyArray<{ amountForeign: DecimalInput; vatable: boolean }>
+  supplierRateReverseCharge: boolean
+}): Prisma.Decimal {
+  const factor = headerDiscountFactorForPo({ subtotalBase: toDecimal(po.subtotalForeign), lines: po.lines.map((line) => ({ totalBase: toDecimal(line.totalForeign) })) })
+  const reverseChargeLines: NetPayableLine[] = po.lines
+    .filter((line) => line.taxRate?.reverseCharge === true)
+    .map((line) => ({ totalForeign: toDecimal(line.totalForeign).mul(factor), taxRateValue: line.taxRate!.rate, taxReverseCharge: true }))
+  if (po.supplierRateReverseCharge && po.taxRatePercent != null) {
+    for (const cost of po.freightCostLines) {
+      if (cost.vatable) reverseChargeLines.push({ totalForeign: cost.amountForeign, taxRateValue: po.taxRatePercent, taxReverseCharge: true })
+    }
+  }
+  return billNetPayableForeign({ totalForeign: po.totalForeign, totalBase: 0, lines: reverseChargeLines }, po.currency)
+}
+
+/**
+ * #1142 LOW-2: when a prepayment is stored as the order's lock, a WARNING (console and activity log, in the lock's transaction) if its total is not what
+ * the order says is owed to the supplier (`purchaseOrderNetPayableForeign`: the order total with its additional costs, less self-accounted reverse-charge
+ * VAT). #1173 LOW-4: a difference of up to ONE MINOR UNIT of the currency (0.01 GBP, 1 JPY) is rounding and is not reported. Only the order as it stands
+ * when the prepayment is stored is checked (a later edit of the order is not compared again). Advisory only: the lock, the rate and every receipt are
+ * exactly as without it.
+ */
+async function warnOnPrepaymentTotalMismatch(
+  tx: Prisma.TransactionClient,
+  po: PoForPrepayment,
+  found: PrepaymentLockData,
+  userId: string | null,
+): Promise<void> {
+  const order = await tx.purchaseOrder.findUnique({
+    where: { id: po.id },
+    select: {
+      currency: true, totalForeign: true, subtotalForeign: true, taxRatePercent: true,
+      lines: { select: { totalForeign: true, taxRate: { select: { rate: true, reverseCharge: true } } } },
+      freightCostLines: { select: { amountForeign: true, vatable: true } },
+      supplier: { select: { taxRate: { select: { reverseCharge: true } } } },
+    },
+  })
+  if (!order) return
+  const poTotal = purchaseOrderNetPayableForeign({ ...order, supplierRateReverseCharge: order.supplier.taxRate?.reverseCharge === true })
+  const difference = found.prepaymentTotal.minus(poTotal)
+  if (difference.abs().lte(currencyMinorUnit(order.currency))) return
+  const description = `The Xero prepayment ${found.xeroPrepaymentId} locked for ${po.reference} totals ${found.prepaymentTotal.toFixed(2)} ${found.currency}, but the order `
+    + `says ${poTotal.toFixed(2)} ${po.currency} is owed to the supplier (its total with additional costs, less any reverse-charge VAT; difference ${difference.toFixed(2)}). The goods rate is locked from it all the same. If it is not a `
+    + 'deposit or part payment, check its amount and reference in Xero.'
+  console.warn(`[purchase-fx] ${description}`)
+  const { logActivityInTransaction } = await import('@/lib/activity-log')
+  // Like the lock's own activity entry, not tied to a user row (the reader is in the metadata, as on the lock's read_by_id).
+  await logActivityInTransaction(tx, {
+    userId: null,
+    entityType: 'PURCHASE_ORDER',
+    entityId: po.id,
+    action: 'xero_prepayment_total_mismatch',
+    tag: 'purchase',
+    level: 'WARNING',
+    description,
+    metadata: { readById: userId, xeroPrepaymentId: found.xeroPrepaymentId, prepaymentTotal: found.prepaymentTotal.toString(), poNetPayableForeign: poTotal.toString(), poTotalForeign: order.totalForeign.toString(), difference: difference.toString() },
   })
 }
 

@@ -271,6 +271,11 @@ export function multiplyMoney(a: DecimalInput, b: DecimalInput): Decimal {
   return toDecimal(a).mul(toDecimal(b))
 }
 
+/** One minor unit of the currency (0.01 for GBP, 1 for JPY), as a Decimal. */
+export function currencyMinorUnit(currency: string): Decimal {
+  return toDecimal(1).div(toDecimal(10).pow(currencyPrecision(currency)))
+}
+
 export function roundMoney(value: DecimalInput, currency: string): Decimal {
   return toDecimal(value).toDecimalPlaces(currencyPrecision(currency), Prisma.Decimal.ROUND_HALF_UP)
 }
