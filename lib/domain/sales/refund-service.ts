@@ -38,13 +38,12 @@ import { findGrossOverPaidBalance, findOverAllocatedRefundTarget, invalidQuantit
 import { orderDiscountReversal, refundableBase, refundableNet } from '@/lib/domain/sales/refund-line-net'
 import { discountSplitEntryTaxType, parseDiscountTaxSplit } from '@/lib/domain/sales/discount-tax-split'
 import { refreshedDiscountSplit } from '@/lib/domain/sales/discount-tax-split-codes'
-import { postedDiscountTaxType, postedTaxTypeByLineId, readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
+import { postedAwareRateIndex, postedDiscountTaxType, postedHeaderDiscountTaxType, postedShippingTaxType, postedTaxTypeByLineId, readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { planSplitDiscountReversal } from '@/lib/domain/sales/discount-tax-split-plan'
 import { storedAmountsIncludeVat } from '@/lib/domain/sales/sales-order-vat-basis'
 import { resolveSchemePostingSnapshot } from '@/lib/domain/sales/refund-scheme-posting'
 import {
   RATE_EPSILON,
-  buildTaxTypeRateIndex,
   chargedShippingMoney,
   creditNoteLineTaxTypeResolver,
   creditNotePostedNet,
@@ -4360,6 +4359,9 @@ export async function createSalesOrderRefund(
     // reverses the invoice's goods lines and discount on the codes it posted with; a rate remapped since only affects invoices not yet posted.
     const postedInvoiceCodes = await readPostedInvoiceTaxCodes(tx, so.id, so.accountingInvoiceId)
     const postedCodeByLineId = postedTaxTypeByLineId(so.lines, postedInvoiceCodes)
+    // The shipping line and the single (header-rate) discount line were posted on the order default rate's code as it was THEN, which the record states when it names the rate it was read from; else the current default.
+    const shippingTaxType = postedShippingTaxType(postedInvoiceCodes) ?? orderDefaultTaxType
+    const headerDiscountTaxType = postedHeaderDiscountTaxType(postedInvoiceCodes) ?? orderDefaultTaxType
 
     // AN EXCHANGE IS CHECKED BEFORE ANYTHING IS WRITTEN: under the order lock, the replacement lines may be added now, or the whole refund is refused (nothing created).
     if (input.exchange) {
@@ -4569,7 +4571,7 @@ export async function createSalesOrderRefund(
     // The rate an EARLIER refund line was actually posted at: its persisted tax code (else the code the credit note falls back to), priced like the payload; null when it cannot be.
     let publicPriorRateOf: ((row: { salesOrderLineId: string | null; accountingTaxType: string | null }) => number | null) | null = null
     if (input.deriveSaleLineNetsFromStoredBalance) {
-      const salesRates = buildTaxTypeRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))
+      const salesRates = postedAwareRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }), postedInvoiceCodes)
       const taxTypeOfLine = creditNoteLineTaxTypeResolver({ orderLines: so.lines, reverseChargeSalesTaxType, orderDefaultTaxType, postedTaxTypeByLineId: postedCodeByLineId })
       const findPostedRate = (lineId: string): number | null => {
         const taxType = taxTypeOfLine({ accountingTaxType: null, lineId })
@@ -4606,7 +4608,7 @@ export async function createSalesOrderRefund(
       // credit counts at the higher of the line's charged rate and the order's rate, a reversal (negative net, e.g. the discount) at no VAT, so neither is understated.
       publicGrossRateOf = (lineId, net, discountCode) => {
         // A discount reversal of an apportioned order posts under its own rate's code, so that is the rate it is valued at (not the order default's).
-        const type = lineId ? taxTypeOfLine({ accountingTaxType: null, lineId }) : (discountCode ?? orderDefaultTaxType)
+        const type = lineId ? taxTypeOfLine({ accountingTaxType: null, lineId }) : (discountCode ?? (net < 0 ? headerDiscountTaxType : shippingTaxType))
         const priced = type ? priceSnapshottedTaxIdentity({ accountingTaxType: type, rateByTaxType: salesRates, label: 'refund line' }) : null
         if (priced?.ok) return priced.rate.toNumber()
         if (net < 0) return 0
@@ -4683,7 +4685,7 @@ export async function createSalesOrderRefund(
       if (lineKind === 'sale') {
         return { accountingTaxType: orderSingleSafeTaxType, reverseCharge: orderUniformlyReverseCharged }
       }
-      return { accountingTaxType: orderDefaultTaxType, reverseCharge: null }
+      return { accountingTaxType: lineKind === 'shipping' ? shippingTaxType : lineKind === 'discount' ? headerDiscountTaxType : orderDefaultTaxType, reverseCharge: null }
     }
 
     // External refund deliveries provide a stable replay key. Manual refunds
@@ -4760,7 +4762,7 @@ export async function createSalesOrderRefund(
         where: { usedFor: { not: 'PURCHASE' } },
         select: { accountingTaxType: true, rate: true },
       })
-      const rateByTaxType = buildTaxTypeRateIndex(salesTaxRates)
+      const rateByTaxType = postedAwareRateIndex(salesTaxRates, postedInvoiceCodes)
       const identityMoved = (target: string, was: string, now: string) => ({
         error:
           withLedgerCheck(`The VAT identity of ${target} changed while this refund was being recorded — it was ${was} ` +
@@ -5199,13 +5201,14 @@ export async function createSalesOrderRefund(
     // does not slip a stale, unfenced credit note through.
     // ---------------------------------------------------------------------------------------------
     if (input.creditNotePostingEnabled) {
-      const postingRates = buildTaxTypeRateIndex(
+      const postingRates = postedAwareRateIndex(
         await tx.taxRate.findMany({
           // Priced from SALES-usable rates only: a PURCHASE-only rate sharing an accountingTaxType with
           // an output code would otherwise read as an ambiguous mapping (mirrors the inbox's context).
           where: { usedFor: { not: 'PURCHASE' } },
           select: { accountingTaxType: true, rate: true },
         }),
+        postedInvoiceCodes,
       )
       // Codex r6 #3: a WooCommerce-imported order's total VAT is the plain sum of its components, so
       // its coupon residual has no VAT netted off it. Read from the order's own provenance.
@@ -5338,7 +5341,7 @@ export async function createSalesOrderRefund(
               }
               continue
             }
-            const pricedDiscount = priceRefundTaxIdentity({ kind: 'shipping', orderDefaultTaxType, reverseChargeSalesTaxType, rateByTaxType: postingRates, label: discountLabel })
+            const pricedDiscount = priceRefundTaxIdentity({ kind: 'shipping', orderDefaultTaxType: headerDiscountTaxType, reverseChargeSalesTaxType, rateByTaxType: postingRates, label: discountLabel })
             // A default code that cannot be priced is not refused here: the leg is left to the cumulative ceiling and the post-time refusal, as before.
             if (pricedDiscount.ok) {
               const rateRefusal = orderDiscountReversalRateRefusal({ postedRate: pricedDiscount.vatRate, chargedRate: so.taxRatePercent, label: discountLabel })
@@ -5374,7 +5377,7 @@ export async function createSalesOrderRefund(
           // checked here and the identity snapshotted below cannot differ by construction.
           lineTaxRate: refundLine.lineId ? salesLineTaxById.get(refundLine.lineId) ?? null : null,
           postedTaxType: refundLine.lineId ? postedCodeByLineId.get(refundLine.lineId) ?? null : null,
-          orderDefaultTaxType,
+          orderDefaultTaxType: lineKind === 'shipping' ? shippingTaxType : orderDefaultTaxType,
           orderUniform: {
             singleSafeTaxType: orderSingleSafeTaxType,
             uniformlyReverseCharged: orderUniformlyReverseCharged,
@@ -5464,7 +5467,7 @@ export async function createSalesOrderRefund(
         const label = 'The reversed shipping and order discount together'
         const pricedDefault = priceRefundTaxIdentity({
           kind: 'shipping',
-          orderDefaultTaxType,
+          orderDefaultTaxType: shippingTaxType,
           reverseChargeSalesTaxType,
           rateByTaxType: postingRates,
           label,
@@ -5541,7 +5544,7 @@ export async function createSalesOrderRefund(
     let frozenRates: Array<string | null> | null = null
     let frozenGross: number | null = null
     if (schemeSnapshot?.scheme === true) {
-      const index = buildTaxTypeRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))
+      const index = postedAwareRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }), postedInvoiceCodes)
       let gross = toDecimal(0)
       let complete = true
       frozenRates = refundLines.map((refundLine) => {
@@ -5561,7 +5564,7 @@ export async function createSalesOrderRefund(
     let postedLineRates: Array<string | null>
     if (frozenRates !== null) postedLineRates = frozenRates
     else {
-      const postedIndex = buildTaxTypeRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }))
+      const postedIndex = postedAwareRateIndex(await tx.taxRate.findMany({ where: { usedFor: { not: 'PURCHASE' } }, select: { accountingTaxType: true, rate: true } }), postedInvoiceCodes)
       postedLineRates = refundLines.map((refundLine) => {
         const kind: 'sale' | 'shipping' | 'discount' = refundLine.lineKind === 'shipping' ? 'shipping' : refundLine.lineKind === 'discount' ? 'discount' : 'sale'
         const code = resolveRefundLineTaxIdentity(refundLine.lineId, kind, refundLine.discountTaxIdentity).accountingTaxType
@@ -6190,6 +6193,7 @@ export async function createSalesOrderRefund(
  */
 async function fenceRetryPostedTax(
   tx: Prisma.TransactionClient,
+  orderId: string,
   order: {
     currency: string
     taxForeign: DecimalInput
@@ -6197,11 +6201,14 @@ async function fenceRetryPostedTax(
     discountAmount: DecimalInput
     /** The order's default rate BY NAME — the poster's last fallback, resolved the same way here. */
     taxRateName: string | null
+    /** The posted invoice's id: the retry prices and resolves a line with no snapshot on the codes that invoice was posted with. */
+    accountingInvoiceId?: string | null
     shoppingLinks: readonly { connector: string }[]
     lines: readonly {
       id: string
       totalForeign: DecimalInput
       taxForeign: DecimalInput
+      taxRateId?: string | null
       /** The line's own TaxRate, for the re-derivation the poster does on a line with no snapshot. */
       taxRate: { accountingTaxType: string | null; reverseCharge: boolean | null } | null
     }[]
@@ -6216,11 +6223,14 @@ async function fenceRetryPostedTax(
   /** Settings → Accounting, for the per-line reverse-charge swap the poster's fallback applies. */
   reverseChargeSalesTaxType: string | null | undefined,
 ): Promise<string | null> {
-  const rateByTaxType = buildTaxTypeRateIndex(
+  // The codes the order's posted invoice carried (null: none), the same read the creation fence and the credit-note builder make: a snapshotted refund line's old code is priced at the rate it was posted at.
+  const postedCodes = await readPostedInvoiceTaxCodes(tx, orderId, order.accountingInvoiceId)
+  const rateByTaxType = postedAwareRateIndex(
     await tx.taxRate.findMany({
       where: { usedFor: { not: 'PURCHASE' } },
       select: { accountingTaxType: true, rate: true },
     }),
+    postedCodes,
   )
   const orderTaxIsSumOfComponents = order.shoppingLinks.some((link) => link.connector === 'woocommerce')
   const chargedShipping = {
@@ -6244,12 +6254,13 @@ async function fenceRetryPostedTax(
   const postedTaxTypeOf = creditNoteLineTaxTypeResolver({
     orderLines: order.lines,
     reverseChargeSalesTaxType,
-    orderDefaultTaxType: order.taxRateName
+    orderDefaultTaxType: postedShippingTaxType(postedCodes) ?? (order.taxRateName
       ? (await tx.taxRate.findFirst({
           where: { name: order.taxRateName, active: true },
           select: { accountingTaxType: true },
         }))?.accountingTaxType ?? null
-      : null,
+      : null),
+    postedTaxTypeByLineId: postedTaxTypeByLineId(order.lines, postedCodes),
   })
   const baseCurrency = await resolveBaseCurrencyCode(tx)
   const legs: PostedCreditNoteLeg[] = []
@@ -6535,11 +6546,13 @@ export async function retrySalesOrderRefundAccounting(
               // two things the credit-note payload builder falls back to for a line with no snapshot.
               // The fence has to read them or it cannot see the lines the poster will post.
               taxRateName: true,
+              accountingInvoiceId: true,
               lines: {
                 select: {
                   id: true,
                   totalForeign: true,
                   taxForeign: true,
+                  taxRateId: true,
                   taxRate: { select: { accountingTaxType: true, reverseCharge: true } },
                 },
               },
@@ -6598,6 +6611,7 @@ export async function retrySalesOrderRefundAccounting(
       const postedTaxRefusal = input.creditNotePostingEnabled && refund.eas182StatedTaxForeign == null
         ? await fenceRetryPostedTax(
             tx,
+            refund.order.id,
             refund.order,
             replayLines,
             refund.chargeback,

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { postedDiscountTaxType, postedLineTaxType, postedTaxCodesFromPayload, postedTaxTypeByLineId } from '@/lib/domain/sales/posted-invoice-tax-codes'
+import { postedDiscountTaxType, postedHeaderDiscountTaxType, postedLineTaxType, postedShippingTaxType, postedTaxCodesFromPayload, postedTaxTypeByLineId, withPostedCodeRates } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { creditNoteLineTaxTypeResolver, resolvePostedRefundTaxIdentity, buildTaxTypeRateIndex } from '@/lib/domain/sales/refund-posted-tax-identity'
 
 /**
@@ -84,4 +84,26 @@ test('the posted-VAT identity of a linked line is the posted code, priced from t
   // The posted code is not swapped a second time for a reverse-charged line.
   const rc = resolvePostedRefundTaxIdentity({ ...base, lineTaxRate: { accountingTaxType: 'NEW-A', reverseCharge: true }, reverseChargeSalesTaxType: 'RC-NEW', postedTaxType: 'OLD-A' })
   assert.equal(rc.ok && rc.accountingTaxType, 'OLD-A')
+})
+
+test('shipping and the header-rate discount are read only when the record binds them to the rate they were read from', () => {
+  const bound = postedTaxCodesFromPayload({ lines: [], shippingTaxType: 'S', shippingTaxRateId: 'R', discountTaxType: 'H', discountTaxRateId: 'R' })!
+  assert.equal(postedShippingTaxType(bound), 'S')
+  assert.equal(postedHeaderDiscountTaxType(bound), 'H')
+  const unbound = postedTaxCodesFromPayload({ lines: [], shippingTaxType: 'S', discountTaxType: 'H' })!
+  assert.equal(postedShippingTaxType(unbound), null, 'a retyped (scheme) payload lost its bindings: not read')
+  assert.equal(postedHeaderDiscountTaxType(unbound), null)
+  const parts = postedTaxCodesFromPayload({ lines: [], discountTaxType: 'H', discountTaxRateId: 'R', discountParts: [{ amount: 1, taxType: 'P', taxRateId: 'R' }] })!
+  assert.equal(postedHeaderDiscountTaxType(parts), null, 'with per-rate parts the header code is not the discount\'s')
+  assert.equal(postedShippingTaxType(null), null)
+})
+
+test('the posted code\'s rate is unioned into the index: a code on no row is priced at the posted rate, a code mapped to another rate stays ambiguous', () => {
+  const posted = { ...postedTaxCodesFromPayload({ lines: [] })!, ratesByCode: new Map([['OLD', new Set(['0.05'])], ['BOTH', new Set(['0.05'])]]) }
+  const index = withPostedCodeRates(buildTaxTypeRateIndex([{ accountingTaxType: 'NEW', rate: '0.05' }, { accountingTaxType: 'BOTH', rate: '0.2' }]), posted)
+  assert.deepEqual([...index.get('OLD')!], ['0.05'])
+  assert.deepEqual([...index.get('NEW')!], ['0.05'])
+  assert.equal(index.get('BOTH')!.size, 2, 'the table disagrees with the posted rate: ambiguous, so the fence refuses')
+  const untouched = buildTaxTypeRateIndex([{ accountingTaxType: 'NEW', rate: '0.05' }])
+  assert.equal(withPostedCodeRates(untouched, null), untouched)
 })

@@ -11,18 +11,20 @@
  * rather than inventing a figure here.
  */
 import {
-  buildTaxTypeRateIndex,
   creditNoteLineTaxTypeResolver,
   creditNotePostedNet,
   priceSnapshottedTaxIdentity,
   type PostedRefundTaxRate,
 } from '@/lib/domain/sales/refund-posted-tax-identity'
+import { postedAwareRateIndex, postedTaxTypeByLineId, type PostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { toDecimal, type DecimalInput } from '@/lib/domain/math/decimal'
 
 export function creditNoteLineFacts(input: {
   orderCurrency: string
   baseCurrency: string
-  orderLines: readonly { id: string; taxRate?: PostedRefundTaxRate | null }[]
+  orderLines: readonly { id: string; taxRateId?: string | null; taxRate?: PostedRefundTaxRate | null }[]
+  /** The codes the order's posted invoice carried (readPostedInvoiceTaxCodes): a line with no snapshot is read on them, and priced at the rate they were posted at. */
+  postedCodes?: PostedInvoiceTaxCodes | null
   reverseChargeSalesTaxType?: string | null
   orderDefaultTaxType?: string | null
   /** Sales-usable tax rates (every rate that is not PURCHASE-only). */
@@ -40,8 +42,9 @@ export function creditNoteLineFacts(input: {
     orderLines: input.orderLines,
     reverseChargeSalesTaxType: input.reverseChargeSalesTaxType,
     orderDefaultTaxType: input.orderDefaultTaxType,
+    postedTaxTypeByLineId: postedTaxTypeByLineId(input.orderLines, input.postedCodes ?? null),
   })
-  const rateByTaxType = buildTaxTypeRateIndex(input.taxRates)
+  const rateByTaxType = postedAwareRateIndex(input.taxRates, input.postedCodes ?? null)
   return input.refundLines.map((line) => {
     const taxType = taxTypeOf({ accountingTaxType: line.accountingTaxType, lineId: line.salesOrderLineId })
     // o3d-hqvrp.321: the rate STORED at creation wins, so a tax mapping edited since cannot change a posted credit note's VAT or gross. Only a refund with none stored (older rows) is priced from the current table, and says so.
