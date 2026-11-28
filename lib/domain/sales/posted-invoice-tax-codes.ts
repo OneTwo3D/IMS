@@ -42,12 +42,12 @@ export const POSTED_INVOICE_RECORD_WHERE: Prisma.AccountingSyncLogWhereInput = {
   ],
 }
 
-const PROJECTED_LINE_KEYS = ['taxRateId', 'taxRateBasis', 'taxType', 'quantity', 'unitAmount', 'discountAmount', 'accountCode', 'itemCode', 'noTaxKind', 'lineAmount', 'taxAmount'] as const
-const PROJECTED_PART_KEYS = ['taxRateId', 'taxRateBasis', 'taxType', 'amount'] as const
+const PROJECTED_LINE_KEYS = ['taxRateId', 'taxRateBasis', 'postedFromRateId', 'postedFromRateBasis', 'taxType', 'quantity', 'unitAmount', 'discountAmount', 'accountCode', 'itemCode', 'noTaxKind', 'lineAmount', 'taxAmount'] as const
+const PROJECTED_PART_KEYS = ['taxRateId', 'taxRateBasis', 'postedFromRateId', 'postedFromRateBasis', 'taxType', 'amount'] as const
 const PROJECTED_SCALAR_KEYS = [
   'accountingInvoiceId', 'invoiceNumber', 'date', 'dateUnknown', 'dueDate', 'currency', 'currencyRateToBase', 'lineAmountsIncludeTax', 'orderTotal',
-  'shippingAmount', 'shippingAccountCode', 'shippingTaxType', 'shippingTaxRateId', 'shippingTaxRateBasis',
-  'discountAmount', 'discountAccountCode', 'discountTaxType', 'discountTaxRateId', 'discountTaxRateBasis',
+  'shippingAmount', 'shippingAccountCode', 'shippingTaxType', 'shippingTaxRateId', 'shippingTaxRateBasis', 'shippingPostedFromRateId', 'shippingPostedFromRateBasis',
+  'discountAmount', 'discountAccountCode', 'discountTaxType', 'discountTaxRateId', 'discountTaxRateBasis', 'discountPostedFromRateId', 'discountPostedFromRateBasis',
   // The row's origin stamp (a compacted row's origin check reads it from the payload beside the column), the EU treatment record and the posting mode: none of them personal.
   ACCOUNTING_PAYLOAD_CONNECTION_KEY, '_euVatTreatment', '_postingMode',
 ] as const
@@ -102,6 +102,10 @@ export type PostedInvoiceTaxCodes = {
   headerDiscountCode: string | null
   /** The code the shipping line was posted on, when it names the rate it was read from; else null. */
   shippingCode: string | null
+  /** The rate the record says the shipping code was read from (the default rate at the time), or null. An update keeps the posted code only while that is still the order's default rate. */
+  shippingRateId: string | null
+  /** The rate the record says the discount's header code was read from (the default rate at the time), or null: the header line's, and the no-rate part's. */
+  discountRateId: string | null
   /**
    * code -> the rates the record bound it to, each with the BASIS it was bound on: `sales_line` for a goods line or a discount part (a reverse-charged rate's code there is the swap code), `plain` for the
    * header discount and shipping (posted on the rate's own code, reverse-charged or not).
@@ -115,6 +119,14 @@ export type PostedInvoiceTaxCodes = {
 
 const text = (value: unknown): string | null => (typeof value === 'string' && value.trim() !== '' ? value : null)
 
+/**
+ * The rate a payload field's code was read from: its binding key, else the `posted…` key an UPDATE writes when it re-sends a POSTED code that is no longer the rate's current code (it must not bind that code to the rate:
+ * the retired-code guard would read the binding as "the code this rate carries now" and refuse a rate a re-key cleared). The posted key (`posted…FromRateId`) is one the guard never reads: its binding scan matches `taxRateId` and `<word>TaxRateId` only.
+ */
+function boundRateId(record: Record<string, unknown>, bindingKey: string, postedKey: string): string | null {
+  return text(record[bindingKey]) ?? text(record[postedKey])
+}
+
 /** rate id -> code over a list of payload objects; a rate the record gives two different codes is left out of the map (ambiguous, never guessed) and named in `ambiguousInto`, where the refund refuses it. */
 function codesByRate(items: unknown, ambiguousInto?: Set<string>): Map<string, string> {
   const out = new Map<string, string>()
@@ -123,7 +135,7 @@ function codesByRate(items: unknown, ambiguousInto?: Set<string>): Map<string, s
   for (const item of items) {
     if (typeof item !== 'object' || item === null) continue
     const record = item as Record<string, unknown>
-    const rateId = text(record.taxRateId)
+    const rateId = boundRateId(record, 'taxRateId', 'postedFromRateId')
     const code = text(record.taxType)
     if (!rateId || !code) continue
     const known = out.get(rateId)
@@ -145,13 +157,15 @@ export function postedTaxCodesFromPayload(payload: unknown): PostedInvoiceTaxCod
     if (typeof part !== 'object' || part === null) continue
     const p = part as Record<string, unknown>
     const code = text(p.taxType)
-    if (code && !text(p.taxRateId)) noRateCodes.add(code)
+    if (code && !boundRateId(p, 'taxRateId', 'postedFromRateId')) noRateCodes.add(code)
   }
   const ambiguousRateIds = new Set<string>()
   const lineCodeByRateId = codesByRate(record.lines, ambiguousRateIds)
   const discountCodeByRateId = codesByRate(parts, ambiguousRateIds)
-  const headerDiscountCode = text(record.discountTaxRateId) ? text(record.discountTaxType) : null
-  const shippingCode = text(record.shippingTaxRateId) ? text(record.shippingTaxType) : null
+  const discountRateId = boundRateId(record, 'discountTaxRateId', 'discountPostedFromRateId')
+  const shippingRateId = boundRateId(record, 'shippingTaxRateId', 'shippingPostedFromRateId')
+  const headerDiscountCode = discountRateId ? text(record.discountTaxType) : null
+  const shippingCode = shippingRateId ? text(record.shippingTaxType) : null
   const rateIdsByCode = new Map<string, Array<{ rateId: string; basis: 'sales_line' | 'plain' }>>()
   const bind = (code: string | null, rateId: string | null, basis: 'sales_line' | 'plain') => {
     if (!code || !rateId) return
@@ -161,8 +175,8 @@ export function postedTaxCodesFromPayload(payload: unknown): PostedInvoiceTaxCod
   }
   for (const [rateId, code] of lineCodeByRateId) bind(code, rateId, 'sales_line')
   for (const [rateId, code] of discountCodeByRateId) bind(code, rateId, 'sales_line')
-  bind(headerDiscountCode, text(record.discountTaxRateId), 'plain')
-  bind(shippingCode, text(record.shippingTaxRateId), 'plain')
+  bind(headerDiscountCode, discountRateId, 'plain')
+  bind(shippingCode, shippingRateId, 'plain')
   return {
     lineCodeByRateId,
     discountCodeByRateId,
@@ -170,6 +184,8 @@ export function postedTaxCodesFromPayload(payload: unknown): PostedInvoiceTaxCod
     hasDiscountParts: parts.length > 0,
     headerDiscountCode,
     shippingCode,
+    shippingRateId,
+    discountRateId,
     rateIdsByCode,
     ratesByCode: new Map(),
     ambiguousRateIds,
@@ -191,11 +207,20 @@ export function postedTaxCodesFromPayload(payload: unknown): PostedInvoiceTaxCod
  */
 export type PostedRecordAbsence = 'no-record' | 'in-flight' | 'unusable'
 
+export type PostedRecordReadOptions = {
+  reverseChargeSalesTaxType?: string | null
+  /**
+   * For the UPDATE builder only: when the newest row is IMS's own SALES_INVOICE_UPDATE still PENDING or PROCESSING, read ITS payload (it was built from the confirmed record behind it, which must exist: the walk
+   * still requires a connector-confirmed row further back) instead of answering "in flight". A refund never sets it: it reverses what the ledger holds.
+   */
+  allowPendingUpdate?: boolean
+}
+
 export async function readPostedInvoiceTaxCodes(
   client: Pick<typeof db, 'accountingSyncLog' | 'taxRate'>,
   orderId: string,
   accountingInvoiceId: string | null | undefined,
-  options: { reverseChargeSalesTaxType?: string | null } = {},
+  options: PostedRecordReadOptions = {},
 ): Promise<PostedInvoiceTaxCodes | null> {
   return (await readPostedInvoiceRecord(client, orderId, accountingInvoiceId, options)).codes
 }
@@ -208,7 +233,7 @@ export async function readPostedInvoiceRecord(
   client: Pick<typeof db, 'accountingSyncLog' | 'taxRate'>,
   orderId: string,
   accountingInvoiceId: string | null | undefined,
-  options: { reverseChargeSalesTaxType?: string | null } = {},
+  options: PostedRecordReadOptions = {},
 ): Promise<{ codes: PostedInvoiceTaxCodes | null; reason: PostedRecordAbsence | null }> {
   const none = (reason: PostedRecordAbsence) => ({ codes: null, reason })
   if (!accountingInvoiceId) return none('no-record')
@@ -221,22 +246,25 @@ export async function readPostedInvoiceRecord(
       OR: [{ externalTransactionId: accountingInvoiceId }, { payload: { path: ['accountingInvoiceId'], equals: accountingInvoiceId } }],
     },
     orderBy: [{ createdAt: 'desc' }, { id: 'desc' }],
-    select: { id: true, status: true, externalTransactionId: true, abandonedBeforeRemoteCall: true, settlementBasis: true, attemptRevision: true, processingStartedAt: true },
+    select: { id: true, type: true, status: true, externalTransactionId: true, abandonedBeforeRemoteCall: true, settlementBasis: true, attemptRevision: true, processingStartedAt: true },
     take: 25,
   })
   let chosen: string | null = null
+  let pendingUpdate: string | null = null
   for (const row of candidates) {
     // A failure that was never claimed made no request (no claim, no document id): the only "no remote attempt" evidence the row carries.
     const neverSent = row.status === 'FAILED' && row.attemptRevision === 0 && row.processingStartedAt === null
     const standing = ledgerStanding(row, { couldHaveReachedLedger: neverSent ? false : undefined })
     if (standing === 'PROVEN_NOT_POSTED' || standing === 'SHADOW_NOT_SENT_BY_IMS') continue
+    if (standing === 'LIVE_WORK' && options.allowPendingUpdate && pendingUpdate === null && row.type === 'SALES_INVOICE_UPDATE') { pendingUpdate = row.id; continue }
     if (standing !== 'CONFIRMED_POSTED') return none(standing === 'LIVE_WORK' ? 'in-flight' : 'unusable')
     chosen = row.id
     break
   }
-  if (chosen === null) return none('no-record')
+  if (chosen === null) return none(pendingUpdate ? 'in-flight' : 'no-record')
   const body = await client.accountingSyncLog.findUnique({ where: { id: chosen }, select: { payload: true } })
-  const codes = body ? postedTaxCodesFromPayload(body.payload) : null
+  const pendingBody = pendingUpdate ? await client.accountingSyncLog.findUnique({ where: { id: pendingUpdate }, select: { payload: true } }) : null
+  const codes = (pendingBody ? postedTaxCodesFromPayload(pendingBody.payload) : null) ?? (body ? postedTaxCodesFromPayload(body.payload) : null)
   if (!codes) return none('unusable')
   const rateIds = [...new Set([...codes.rateIdsByCode.values()].flatMap((bound) => bound.map((b) => b.rateId)))]
   if (rateIds.length === 0) return { codes, reason: null }
@@ -285,20 +313,26 @@ export function postedLineTaxType(posted: PostedInvoiceTaxCodes | null, taxRateI
  * The code this split group's discount part was posted on, or null when the invoice carried no per-rate parts or does not state it. A group with a rate: its part's code, else its goods lines' code
  * (one derivation for both). A group with no rate: the parts' order-default code.
  */
-export function postedDiscountTaxType(posted: PostedInvoiceTaxCodes | null, entry: Pick<DiscountTaxSplitEntry, 'taxRateId'>): string | null {
+export function postedDiscountTaxType(posted: PostedInvoiceTaxCodes | null, entry: Pick<DiscountTaxSplitEntry, 'taxRateId'>, currentDefaultRateId?: string | null): string | null {
   if (!posted || !posted.hasDiscountParts) return null
   if (entry.taxRateId) return posted.discountCodeByRateId.get(entry.taxRateId) ?? posted.lineCodeByRateId.get(entry.taxRateId) ?? null
+  // The no-rate group was posted on the order default's code of THAT time: kept only while the order's default rate is still the one it was read from.
+  if (currentDefaultRateId !== undefined && posted.discountRateId !== currentDefaultRateId) return null
   return posted.orderDefaultDiscountCode
 }
 
-/** The code the single header-rate discount line was posted on (an order with no per-rate parts), or null. */
-export function postedHeaderDiscountTaxType(posted: PostedInvoiceTaxCodes | null): string | null {
-  return posted && !posted.hasDiscountParts ? posted.headerDiscountCode : null
+/** The code the single header-rate discount line was posted on (an order with no per-rate parts), or null. With `currentDefaultRateId` it is kept only while that is still the default rate the record read it from. */
+export function postedHeaderDiscountTaxType(posted: PostedInvoiceTaxCodes | null, currentDefaultRateId?: string | null): string | null {
+  if (!posted || posted.hasDiscountParts) return null
+  if (currentDefaultRateId !== undefined && posted.discountRateId !== currentDefaultRateId) return null
+  return posted.headerDiscountCode
 }
 
-/** The code the shipping line was posted on, or null. */
-export function postedShippingTaxType(posted: PostedInvoiceTaxCodes | null): string | null {
-  return posted?.shippingCode ?? null
+/** The code the shipping line was posted on, or null. With `currentDefaultRateId` it is kept only while that is still the default rate the record read it from (a WooCommerce zero-rated postage names its own rate, and an edit that changes the header rate moves it). */
+export function postedShippingTaxType(posted: PostedInvoiceTaxCodes | null, currentDefaultRateId?: string | null): string | null {
+  if (!posted) return null
+  if (currentDefaultRateId !== undefined && posted.shippingRateId !== currentDefaultRateId) return null
+  return posted.shippingCode
 }
 
 /** lineId -> the code that order line was posted on, for every line whose rate the posted record states (a line with no rate, or an unstated one, is absent: its code is derived as before). */

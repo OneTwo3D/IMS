@@ -150,6 +150,7 @@ import {
 } from '@/lib/domain/sales/sales-order-vat-basis'
 import { coversDocumentTotal } from '@/lib/domain/accounting/paid-coverage'
 import { refreshedDiscountSplit } from '@/lib/domain/sales/discount-tax-split-codes'
+import { validLiveCodes } from '@/lib/tax/retired-tax-code-guard'
 import { postedAwareRateIndex, postedCodesAmbiguityRefusal, postedDiscountTaxType, postedHeaderDiscountTaxType, readPostedInvoiceRecord, updateLineTaxType, postedShippingTaxType, postedTaxTypeByLineId, readPostedInvoiceTaxCodes } from '@/lib/domain/sales/posted-invoice-tax-codes'
 import { discountSplitEntryTaxType, discountSplitTaxCodeRefusal, invoiceDiscountParts, parseDiscountTaxSplit, type DiscountTaxSplitEntry } from '@/lib/domain/sales/discount-tax-split'
 import { decideChargebackOrderDiscount, resolvePostedOrderDiscount } from '@/lib/domain/accounting/posted-order-discount'
@@ -1965,6 +1966,7 @@ export async function updateSalesOrder(id: string, input: CreateSoInput, expecte
     if (e instanceof SalesInvoiceOriginalDateUnknownError) return { success: false, error: `The edit was refused, so nothing was changed: ${e.message}` }
     if (e instanceof PendingDocumentDeletionError) return { success: false, error: e.message }
     if (e instanceof SalesInvoiceDiscountSplitTaxCodeError) return { success: false, error: `The edit was refused, so nothing was changed: ${e.message}` }
+    if (e instanceof SalesInvoicePostedCodesAmbiguousError) return { success: false, error: `The edit was refused, so nothing was changed: ${e.message}` }
     if (e instanceof SalesInvoiceDoesNotReconcileError || e instanceof SalesInvoiceNotQueuedError) return { success: false, error: `The edit would leave the order's invoice out of step with its total, so nothing was changed: ${e.message}` }
     await logActivity({
       entityType: 'SALES_ORDER',
@@ -2188,8 +2190,22 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   // AN UPDATE OF A POSTED INVOICE KEEPS ITS POSTED CODES (owner ruling: a later remap only affects new invoices). Each line whose VAT rate the posted record names is sent on the code that rate's lines were posted
   // on; a new rate, a line with no rate and the no-tax fee take the current code. The same for the discount's per-rate parts, the single header-rate discount and shipping. With no usable record (none, an update in
   // flight, an unreadable one) every code is the current one, as before, and the update writes an activity WARNING saying so (below). A first post has no accounting invoice id and reads nothing.
-  const postedRecord = so.accountingInvoiceId ? await readPostedInvoiceRecord(reader, so.id, so.accountingInvoiceId, { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }) : null
-  const posted = postedRecord?.codes ?? null
+  const postedRecord = so.accountingInvoiceId ? await readPostedInvoiceRecord(reader, so.id, so.accountingInvoiceId, { reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType, allowPendingUpdate: true }) : null
+  let posted = postedRecord?.codes ?? null
+  // The reason the update falls back to the current codes (the warning's), when it does.
+  let postedFallbackReason: string | null = postedRecord && posted === null ? (postedRecord.reason ?? 'no-record') : null
+  // A posted code the tenant has since ARCHIVED (the organisation-specific codes of the active Xero tenant, as the retired-code guard reads them) would be refused by the ledger: the update falls back to the current codes.
+  if (posted) {
+    const postedCodes = [...new Set([...posted.rateIdsByCode.keys(), ...(posted.orderDefaultDiscountCode ? [posted.orderDefaultDiscountCode] : [])])]
+    // Only checked when the active tenant's tax list is known: with no stored tenant nothing can be said about a code, and the posted code stays.
+    const tenant = await reader.accountingToken.findUnique({ where: { connector: 'xero' }, select: { tenantId: true } })
+    if (tenant) {
+      const live = await validLiveCodes(reader as never, postedCodes)
+      if (postedCodes.some((code) => !live.has(code) && !isNoTaxType(code))) { posted = null; postedFallbackReason = 'archived-code' }
+    }
+  }
+  // A record that names no line's rate (an older WooCommerce invoice, a scheme-retyped one) cannot keep any line's code: flagged like a missing record, though the update still builds.
+  if (posted && posted.lineCodeByRateId.size === 0 && so.lines.some((l) => l.taxRateId)) postedFallbackReason = 'record-names-no-line-rates'
   const postedAmbiguity = postedCodesAmbiguityRefusal(posted, [...so.lines.map((l) => l.taxRateId), ...(storedDiscountSplit ?? []).map((entry) => entry.taxRateId)])
   if (postedAmbiguity) throw new SalesInvoicePostedCodesAmbiguousError(postedAmbiguity, so.currency)
   const discountPartsOrNull = discountSplit
@@ -2197,13 +2213,13 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
         split: discountSplit,
         lineAmountsIncludeTax,
         totalAmount: discountForeign,
-        taxTypeOf: (entry) => postedDiscountTaxType(posted, entry) ?? discountSplitEntryTaxType(entry, { orderDefaultTaxType, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }),
+        taxTypeOf: (entry) => postedDiscountTaxType(posted, entry, orderDefaultRate?.id ?? null) ?? discountSplitEntryTaxType(entry, { orderDefaultTaxType, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }),
       })
     : []
   if (discountPartsOrNull === null) throw new SalesInvoiceDiscountSplitError(discountForeign, so.currency)
   // A group with no tax code would reach the sync processor and be refused there ("NOTHING WAS SENT"): refused here, so the create, edit or finalisation that queues it is rolled back with a reason.
   // The same rule the save and the finalisation ask first (discountSplitTaxCodeRefusalFor); this is the backstop under the order's own transaction.
-  const discountSplitCodeRefusal = discountSplit ? discountSplitTaxCodeRefusal(discountSplit.filter((entry) => postedDiscountTaxType(posted, entry) === null), { orderDefaultTaxType, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }, 'invoice') : null
+  const discountSplitCodeRefusal = discountSplit ? discountSplitTaxCodeRefusal(discountSplit.filter((entry) => postedDiscountTaxType(posted, entry, orderDefaultRate?.id ?? null) === null), { orderDefaultTaxType, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }, 'invoice') : null
   if (discountSplitCodeRefusal) throw new SalesInvoiceDiscountSplitTaxCodeError(discountSplitCodeRefusal, so.currency)
   const discountParts = discountPartsOrNull
 
@@ -2232,6 +2248,15 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     dateUnknown = true
   }
 
+  // Shipping and the single header discount keep the posted code only while the order's default rate is still the rate the record read it from (an edit that changes the header rate, or a WooCommerce zero-rated postage bound
+  // to its own rate, takes the current code, as it always did).
+  const shippingSentType = postedShippingTaxType(posted, orderDefaultRate?.id ?? null) ?? orderDefaultTaxType ?? undefined
+  const discountSentType = postedHeaderDiscountTaxType(posted, orderDefaultRate?.id ?? null) ?? orderDefaultTaxType ?? undefined
+  const currentPartType = (rateId: string): string | null => {
+    const entry = (discountSplit ?? []).find((e) => e.taxRateId === rateId)
+    return entry ? discountSplitEntryTaxType(entry, { orderDefaultTaxType, reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType }) : null
+  }
+
   const payload = {
     invoiceNumber: accountingInvoiceNumber,
     contactName: so.customerName ?? 'Unknown',
@@ -2256,11 +2281,15 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
       // It is sent on the explicit no-tax code, naming why, as the importer's own invoice sends it: left to the fall-through it takes the order's TAXABLE
       // default code and the ledger adds VAT to a fee nobody charged VAT on. Derived from the stored line, so a clone carries it with the line.
       const isNoTaxFee = isStoredUntaxedFee(l)
-      const taxType = isNoTaxFee ? NO_TAX_TYPE : updateLineTaxType(posted, l.taxRateId, resolveSalesLineTaxType({
+      const currentLineTaxType = resolveSalesLineTaxType({
         baseTaxType: l.taxRate?.accountingTaxType ?? orderDefaultTaxType,
         reverseCharge: l.taxRate?.reverseCharge,
         reverseChargeSalesTaxType: settings.reverseChargeSalesTaxType,
-      }))
+      })
+      const taxType = isNoTaxFee ? NO_TAX_TYPE : updateLineTaxType(posted, l.taxRateId, currentLineTaxType)
+      // A POSTED code that is no longer the rate's current code is bound under the `posted…` key the retired-code guard never reads: the guard reads a binding as "the code this rate carries now" and would refuse a re-sent
+      // posted code for a rate a re-key cleared, for ever. The reader (postedTaxCodesFromPayload) reads either key, so the next refund or update still finds the rate.
+      const keptPostedCode = !isNoTaxFee && taxType !== currentLineTaxType
       return {
         itemCode: l.sku ?? undefined,
         description: l.description ?? l.sku ?? 'Item',
@@ -2270,7 +2299,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
         taxType,
         // The rate this line's code was read from (never sent), bound whenever the line has one, with the basis the code was derived on (a sales goods line): the enqueue guard checks a retired code is
         // still that rate's code and, for a rate a re-key cleared, that the type sent is the one this same derivation gives now. lib/tax/retired-tax-code-guard.ts.
-        ...rateBinding(l.taxRateId, 'sales_line'),
+        ...(keptPostedCode && l.taxRateId ? { postedFromRateId: l.taxRateId, postedFromRateBasis: 'sales_line' } : rateBinding(l.taxRateId, 'sales_line')),
         ...(isNoTaxFee ? { noTaxKind: 'fee-no-tax' as const } : {}),
         discountAmount: discForeign > 0 ? discForeign : undefined,
       }
@@ -2278,14 +2307,14 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
     shippingAmount: shippingSendForeign > 0 ? shippingSendForeign : undefined,
     shippingDescription: 'Shipping',
     shippingAccountCode: settings.shippingAccount || undefined,
-    shippingTaxType: postedShippingTaxType(posted) ?? orderDefaultTaxType ?? undefined,
-    ...rateBinding(orderDefaultRate?.id, 'plain', 'shipping'),
+    shippingTaxType: shippingSentType,
+    ...(shippingSentType !== (orderDefaultTaxType ?? undefined) && orderDefaultRate?.id ? { shippingPostedFromRateId: orderDefaultRate.id, shippingPostedFromRateBasis: 'plain' } : rateBinding(orderDefaultRate?.id, 'plain', 'shipping')),
     discountAmount: discountForeign > 0 ? discountForeign : undefined,
     discountAccountCode: settings.discountAccount || undefined,
-    discountTaxType: postedHeaderDiscountTaxType(posted) ?? orderDefaultTaxType ?? undefined,
-    ...rateBinding(orderDefaultRate?.id, 'plain', 'discount'),
+    discountTaxType: discountSentType,
+    ...(discountSentType !== (orderDefaultTaxType ?? undefined) && orderDefaultRate?.id ? { discountPostedFromRateId: orderDefaultRate.id, discountPostedFromRateBasis: 'plain' } : rateBinding(orderDefaultRate?.id, 'plain', 'discount')),
     ...(discountParts.length > 0
-      ? { discountParts: discountParts.map((part) => ({ amount: part.amount, taxType: part.taxType ?? undefined, ...rateBinding(part.taxRateId, 'sales_line') })) }
+      ? { discountParts: discountParts.map((part) => ({ amount: part.amount, taxType: part.taxType ?? undefined, ...(part.taxRateId && part.taxType !== (currentPartType(part.taxRateId) ?? undefined) ? { postedFromRateId: part.taxRateId, postedFromRateBasis: 'sales_line' } : rateBinding(part.taxRateId, 'sales_line')) })) }
       : {}),
     lineAmountsIncludeTax,
     // o3d-hqvrp.389, behind `xero_round_to_order_total_enabled` (off by default; with it off the payload is byte for byte what it was): the connector posts a Rounding line so the
@@ -2324,20 +2353,30 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
   if (reconciliation) throw new SalesInvoiceDoesNotReconcileError(reconciliation, so.currency)
   if (options?.checkOnly) return
 
-  // An UPDATE of a posted invoice with no usable record of the codes it was posted with falls back to the rates' CURRENT codes (a remap since posting would move the invoice's lines onto new codes): flagged, once per queued update.
-  if (so.accountingInvoiceId && posted === null) {
-    await (reader as unknown as { activityLog: Pick<typeof db.activityLog, 'create'> }).activityLog.create({
-      data: {
-        entityType: 'SALES_ORDER',
-        entityId: so.id,
-        action: 'sales_invoice_update_used_current_tax_codes',
-        tag: 'sales',
-        level: 'WARNING',
-        description: `The update of invoice ${accountingInvoiceNumber} was built on the tax rates' CURRENT codes, not the codes the invoice was posted with, because IMS holds no usable record of them (${postedRecord?.reason === 'in-flight' ? 'an earlier update is still in flight' : postedRecord?.reason === 'unusable' ? 'the newest invoice record is not usable' : 'no record of the posted invoice'}). If a tax rate was re-mapped since the invoice was posted, check the invoice's VAT in the accounting system after the update.`,
-        metadata: { orderId: so.id, accountingInvoiceId: so.accountingInvoiceId, reason: postedRecord?.reason ?? 'no-record', lines: so.lines.map((l, i) => ({ description: l.description, taxRateId: l.taxRateId, accountingTaxType: payload.lines[i]?.taxType ?? null })) },
-      },
-    })
-  }
+  // An UPDATE of a posted invoice built on the rates' CURRENT codes because IMS has no usable record of the posted ones (none, an unconfirmed update behind none, an unreadable one, a posted code the tenant archived, a record that
+  // names no line's rate) is flagged with an activity WARNING, written only when the update is really queued (an edit that is refused or shadowed writes nothing).
+  const fallbackWarning = so.accountingInvoiceId && postedFallbackReason !== null
+    ? async () => {
+        const reasonText: Record<string, string> = {
+          'no-record': 'no record of the posted invoice',
+          'in-flight': 'an earlier update is still in flight and no confirmed record sits behind it',
+          unusable: 'the newest invoice record is not usable',
+          'archived-code': 'a posted tax code has since been archived in the accounting system',
+          'record-names-no-line-rates': 'the posted record names no VAT rate for its lines',
+        }
+        await (reader as unknown as { activityLog: Pick<typeof db.activityLog, 'create'> }).activityLog.create({
+          data: {
+            entityType: 'SALES_ORDER',
+            entityId: so.id,
+            action: 'sales_invoice_update_used_current_tax_codes',
+            tag: 'sales',
+            level: 'WARNING',
+            description: `The update of invoice ${accountingInvoiceNumber} was built on the tax rates' CURRENT codes, not the codes the invoice was posted with, because ${reasonText[postedFallbackReason!] ?? postedFallbackReason}. If a tax rate was re-mapped since the invoice was posted, check the invoice's VAT in the accounting system after the update.`,
+            metadata: { orderId: so.id, accountingInvoiceId: so.accountingInvoiceId, reason: postedFallbackReason, lines: so.lines.map((l, i) => ({ description: l.description, taxRateId: l.taxRateId, accountingTaxType: payload.lines[i]?.taxType ?? null })) },
+          },
+        })
+      }
+    : null
 
   if (options?.updateInTx) {
     // AN EDIT OF A CONFIRMED ORDER WITH A POSTED INVOICE: the update of that document is queued INSIDE the edit's transaction (the caller holds the order row lock and has already rewritten the lines, which `reader` -- the same
@@ -2365,6 +2404,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
         // chartConnector RESTATED (not merely spread): the census of transactional enqueues reads own properties of the argument object.
         const outcome = await queueAccountingSyncTxWithOutcome(tx, { ...queueParams, chartConnector: queueParams.chartConnector })
         options.onUpdateOutcome?.(outcome)
+        if (outcome.queued && fallbackWarning) await fallbackWarning()
         return outcome
       },
       logActivity,
@@ -2416,7 +2456,7 @@ async function queueSalesInvoiceForOrder(id: string, options?: { checkOnly?: boo
       documentConnector: asRoutableAccountingConnector(so.accountingInvoiceConnector),
     }, {
       getActiveAccountingConnectorInfo,
-      queueAccountingSync: queueUpdate,
+      queueAccountingSync: fallbackWarning ? async (queueParams: Parameters<typeof queueUpdate>[0]) => { const outcome = await queueUpdate(queueParams); if (outcome.queued) await fallbackWarning(); return outcome } : queueUpdate,
       logActivity,
       // o3d-j625 r4: the refusal lands in the exception inbox, where an operator will find it.
       // r10: the outcome is deliberately dropped here — this site reports the refusal and has nothing
@@ -4168,6 +4208,7 @@ export async function createRefund(
     if (e instanceof SalesInvoiceOriginalDateUnknownError) return { success: false, error: `The exchange was refused, so nothing was recorded: ${e.message}` }
     if (e instanceof PendingDocumentDeletionError) return { success: false, error: e.message }
     if (e instanceof SalesInvoiceDiscountSplitTaxCodeError) return { success: false, error: `The exchange was refused, so nothing was recorded: ${e.message}` }
+    if (e instanceof SalesInvoicePostedCodesAmbiguousError) return { success: false, error: `The exchange was refused, so nothing was recorded: ${e.message}` }
     if (e instanceof SalesInvoiceDoesNotReconcileError || e instanceof SalesInvoiceNotQueuedError) return { success: false, error: `The exchange would leave the order's invoice out of step with its total, so nothing was recorded: ${e.message}` }
     if (options?.externalRefundId && isExternalRefundIdUniqueConflict(e)) {
       // o3d-7yf: externalRefundId is globally unique, so this conflict may be a CROSS-ORDER race — the

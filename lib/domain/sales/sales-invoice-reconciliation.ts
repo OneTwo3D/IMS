@@ -107,11 +107,13 @@ export class SalesInvoiceDiscountSplitTaxCodeError extends SalesInvoiceDoesNotRe
   }
 }
 
-/** An update of a posted invoice touches a VAT rate the posted record gives two different codes: refused rather than guessed (postedCodesAmbiguityRefusal). */
-export class SalesInvoicePostedCodesAmbiguousError extends SalesInvoiceDoesNotReconcileError {
-  constructor(message: string, currency: string) {
-    super({ expected: 0, orderTotal: 0, difference: 0 }, currency)
-    this.message = `${message} It was not queued and the order was not moved or saved.`
+/**
+ * An update of a posted invoice touches a VAT rate the posted record gives two different codes: refused rather than guessed (postedCodesAmbiguityRefusal). Deliberately NOT a reconciliation error: the invoice
+ * does not disagree with the order's total, so the "out of step with its total" wording and the problem figures would be false; its callers refuse it with the edit / exchange wording.
+ */
+export class SalesInvoicePostedCodesAmbiguousError extends Error {
+  constructor(message: string, readonly currency: string) {
+    super(`${message} It was not queued and the order was not moved or saved.`)
     this.name = 'SalesInvoicePostedCodesAmbiguousError'
   }
 }
